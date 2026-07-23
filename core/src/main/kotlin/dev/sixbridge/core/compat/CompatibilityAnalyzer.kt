@@ -45,7 +45,7 @@ class CompatibilityAnalyzer(
             readStringSet(manifest["permissions"]) +
                 readStringSet(manifest["optional_permissions"])
             ).toSet()
-        val apiScan = scanApiCalls(extensionRoot)
+        val apiScan = scanApiCalls(extensionRoot, manifest)
         val usedApis = (
             apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
             ).toSortedSet()
@@ -179,14 +179,18 @@ class CompatibilityAnalyzer(
         )
     }
 
-    private fun scanApiCalls(root: Path): ApiScan {
+    private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()
         var dynamicUsage = false
+        val runtimeScripts = manifestRuntimeScripts(root, manifest)
         Files.walk(root).use { paths ->
             paths.filter { path ->
                 path.isRegularFile() &&
                     path.extension.lowercase() in SCRIPT_EXTENSIONS &&
-                    ".test." !in path.fileName.toString()
+                    (
+                        ".test." !in path.fileName.toString().lowercase() ||
+                            path.toAbsolutePath().normalize() in runtimeScripts
+                        )
             }.forEach { path ->
                 val source = runCatching { path.readText() }.getOrDefault("")
                 val sourceWithoutComments = maskJsLiteralsAndComments(
@@ -286,6 +290,27 @@ class CompatibilityAnalyzer(
         return ApiScan(found, dynamicUsage)
     }
 
+    private fun manifestRuntimeScripts(root: Path, manifest: JsonObject): Set<Path> {
+        val resources = mutableSetOf<String>()
+        (manifest["background"] as? JsonObject)
+            ?.stringOrNull("service_worker")
+            ?.let(resources::add)
+        (manifest["content_scripts"] as? JsonArray)?.forEach { item ->
+            val script = item as? JsonObject ?: return@forEach
+            resources += readStringSet(script["js"])
+        }
+        (manifest["action"] as? JsonObject)
+            ?.stringOrNull("default_popup")
+            ?.let(resources::add)
+        manifest.stringOrNull("options_page")?.let(resources::add)
+        (manifest["options_ui"] as? JsonObject)
+            ?.stringOrNull("page")
+            ?.let(resources::add)
+        return resources.mapTo(mutableSetOf()) {
+            root.resolve(it).toAbsolutePath().normalize()
+        }
+    }
+
     private fun validateResources(
         root: Path,
         manifest: JsonObject,
@@ -372,6 +397,8 @@ class CompatibilityAnalyzer(
         val masked = source.toCharArray()
         var state = CODE
         var index = 0
+        var regexCharacterClass = false
+        val templateExpressionDepths = mutableListOf<Int>()
 
         fun mask(position: Int) {
             if (masked[position] != '\r' && masked[position] != '\n') {
@@ -380,9 +407,24 @@ class CompatibilityAnalyzer(
         }
 
         while (index < masked.size) {
-            val current = masked[index]
+            val current = source[index]
             when (state) {
                 CODE -> when {
+                    templateExpressionDepths.isNotEmpty() && current == '{' -> {
+                        val last = templateExpressionDepths.lastIndex
+                        templateExpressionDepths[last]++
+                        index++
+                    }
+                    templateExpressionDepths.isNotEmpty() && current == '}' -> {
+                        val last = templateExpressionDepths.lastIndex
+                        templateExpressionDepths[last]--
+                        if (templateExpressionDepths[last] == 0) {
+                            templateExpressionDepths.removeAt(last)
+                            mask(index)
+                            state = TEMPLATE_TEXT
+                        }
+                        index++
+                    }
                     current == '\'' -> {
                         state = SINGLE_QUOTED
                         if (maskLiterals) mask(index)
@@ -394,29 +436,34 @@ class CompatibilityAnalyzer(
                         index++
                     }
                     current == '`' -> {
-                        state = TEMPLATE_QUOTED
-                        if (maskLiterals) mask(index)
+                        state = TEMPLATE_TEXT
+                        mask(index)
                         index++
                     }
-                    current == '/' && masked.getOrNull(index + 1) == '/' -> {
+                    current == '/' && source.getOrNull(index + 1) == '/' -> {
                         mask(index)
                         mask(index + 1)
                         state = LINE_COMMENT
                         index += 2
                     }
-                    current == '/' && masked.getOrNull(index + 1) == '*' -> {
+                    current == '/' && source.getOrNull(index + 1) == '*' -> {
                         mask(index)
                         mask(index + 1)
                         state = BLOCK_COMMENT
                         index += 2
                     }
+                    current == '/' && isRegexLiteralStart(source, index) -> {
+                        mask(index)
+                        regexCharacterClass = false
+                        state = REGEX_LITERAL
+                        index++
+                    }
                     else -> index++
                 }
-                SINGLE_QUOTED, DOUBLE_QUOTED, TEMPLATE_QUOTED -> {
+                SINGLE_QUOTED, DOUBLE_QUOTED -> {
                     val closing = when (state) {
                         SINGLE_QUOTED -> '\''
-                        DOUBLE_QUOTED -> '"'
-                        else -> '`'
+                        else -> '"'
                     }
                     if (current == '\\' && index + 1 < masked.size) {
                         if (maskLiterals) {
@@ -430,6 +477,29 @@ class CompatibilityAnalyzer(
                         if (current == closing) state = CODE
                     }
                 }
+                TEMPLATE_TEXT -> when {
+                    current == '\\' && index + 1 < masked.size -> {
+                        mask(index)
+                        mask(index + 1)
+                        index += 2
+                    }
+                    current == '`' -> {
+                        mask(index)
+                        state = CODE
+                        index++
+                    }
+                    current == '$' && source.getOrNull(index + 1) == '{' -> {
+                        mask(index)
+                        mask(index + 1)
+                        templateExpressionDepths += 1
+                        state = CODE
+                        index += 2
+                    }
+                    else -> {
+                        mask(index)
+                        index++
+                    }
+                }
                 LINE_COMMENT -> {
                     if (current == '\r' || current == '\n') {
                         state = CODE
@@ -439,7 +509,7 @@ class CompatibilityAnalyzer(
                     index++
                 }
                 BLOCK_COMMENT -> {
-                    if (current == '*' && masked.getOrNull(index + 1) == '/') {
+                    if (current == '*' && source.getOrNull(index + 1) == '/') {
                         mask(index)
                         mask(index + 1)
                         state = CODE
@@ -449,9 +519,54 @@ class CompatibilityAnalyzer(
                         index++
                     }
                 }
+                REGEX_LITERAL -> when {
+                    current == '\r' || current == '\n' -> {
+                        state = CODE
+                        index++
+                    }
+                    current == '\\' && index + 1 < masked.size -> {
+                        mask(index)
+                        mask(index + 1)
+                        index += 2
+                    }
+                    current == '[' && !regexCharacterClass -> {
+                        mask(index)
+                        regexCharacterClass = true
+                        index++
+                    }
+                    current == ']' && regexCharacterClass -> {
+                        mask(index)
+                        regexCharacterClass = false
+                        index++
+                    }
+                    current == '/' && !regexCharacterClass -> {
+                        mask(index)
+                        index++
+                        while (source.getOrNull(index)?.isLetter() == true) {
+                            mask(index)
+                            index++
+                        }
+                        state = CODE
+                    }
+                    else -> {
+                        mask(index)
+                        index++
+                    }
+                }
             }
         }
         return masked.concatToString()
+    }
+
+    private fun isRegexLiteralStart(source: String, slashIndex: Int): Boolean {
+        var previous = slashIndex - 1
+        while (previous >= 0 && source[previous].isWhitespace()) previous--
+        if (previous < 0) return true
+        if (source[previous] in REGEX_PREFIX_CHARS) return true
+        if (!source[previous].isJavaIdentifierPart()) return false
+        var wordStart = previous
+        while (wordStart > 0 && source[wordStart - 1].isJavaIdentifierPart()) wordStart--
+        return source.substring(wordStart, previous + 1) in REGEX_PREFIX_KEYWORDS
     }
 
     private fun maskHtmlOutsideScripts(source: String): String {
@@ -578,9 +693,29 @@ class CompatibilityAnalyzer(
         private const val CODE = 0
         private const val SINGLE_QUOTED = 1
         private const val DOUBLE_QUOTED = 2
-        private const val TEMPLATE_QUOTED = 3
+        private const val TEMPLATE_TEXT = 3
         private const val LINE_COMMENT = 4
         private const val BLOCK_COMMENT = 5
+        private const val REGEX_LITERAL = 6
+        private val REGEX_PREFIX_CHARS = setOf(
+            '(', '[', '{', '=', ':', ',', ';', '!', '?',
+            '&', '|', '+', '-', '*', '%', '^', '~', '<', '>',
+        )
+        private val REGEX_PREFIX_KEYWORDS = setOf(
+            "await",
+            "case",
+            "delete",
+            "do",
+            "else",
+            "in",
+            "instanceof",
+            "of",
+            "return",
+            "throw",
+            "typeof",
+            "void",
+            "yield",
+        )
         private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")

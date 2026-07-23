@@ -452,6 +452,96 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `scans manifest referenced runtime scripts even when names contain test`() {
+        val source = Files.createTempDirectory("six-runtime-test-named-scripts")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Runtime test-named scripts",
+              "version": "1",
+              "background": {"service_worker": "worker.test.js"},
+              "content_scripts": [{
+                "matches": ["<all_urls>"],
+                "js": ["content.test.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+        source.resolve("worker.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+        source.resolve("content.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("webstorePrivate" in report.usedApis)
+        assertTrue("downloads" in report.usedApis)
+    }
+
+    @Test
+    fun `does not treat regex character class slash star as a block comment`() {
+        val source = Files.createTempDirectory("six-regex-comment-boundary")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Regex comment boundary",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            const slashOrStar = /[/*]/;
+            chrome.webstorePrivate.install();
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("webstorePrivate" in report.usedApis)
+    }
+
+    @Test
+    fun `scans template expressions while ignoring template text`() {
+        val source = Files.createTempDirectory("six-template-expression-root")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Template expression root",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        val background = source.resolve("background.js")
+        background.writeText(
+            """const message = `chrome.webstorePrivate browser`;""",
+        )
+
+        val textOnlyReport = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, textOnlyReport.status)
+        assertTrue(textOnlyReport.usedApis.isEmpty())
+
+        background.writeText(
+            """const message = `chrome browser ${'$'}{use(chrome)}`;""",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
     fun `scans a large minified string without exhausting the regex stack`() {
         val source = Files.createTempDirectory("six-large-minified-string")
         source.resolve("manifest.json").writeText(
