@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "SIX Bridge Technical Gate",
+  "version": "1.0.1",
+  "description": "Minimal extension used to prove Samsung Internet dev_ext wrapper loading.",
+  "permissions": [
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "SIX Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
