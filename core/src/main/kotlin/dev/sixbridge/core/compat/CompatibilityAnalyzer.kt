@@ -193,11 +193,16 @@ class CompatibilityAnalyzer(
                         )
             }.forEach { path ->
                 val source = runCatching { path.readText() }.getOrDefault("")
+                val apiSource = if (path.extension.lowercase() == "html") {
+                    scanHtmlScripts(source).inlineSource
+                } else {
+                    source
+                }
                 val sourceWithoutComments = maskJsLiteralsAndComments(
-                    source,
+                    apiSource,
                     maskLiterals = false,
                 )
-                val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
+                val codeOnly = maskJsLiteralsAndComments(apiSource, maskLiterals = true)
                 val aliases = mutableSetOf<String>()
                 val consumedRoots = mutableSetOf<Int>()
                 ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments)
@@ -283,16 +288,11 @@ class CompatibilityAnalyzer(
                 ) {
                     dynamicUsage = true
                 }
-                val rootScanCode = if (path.extension.lowercase() == "html") {
-                    maskHtmlOutsideScripts(codeOnly)
-                } else {
-                    codeOnly
-                }
-                ROOT_SCHEME_LITERAL_REGEX.findAll(rootScanCode).forEach { match ->
+                ROOT_SCHEME_LITERAL_REGEX.findAll(codeOnly).forEach { match ->
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
-                if (ROOT_TOKEN.findAll(rootScanCode).any {
+                if (ROOT_TOKEN.findAll(codeOnly).any {
                         it.range.first !in consumedRoots
                     }
                 ) {
@@ -347,7 +347,7 @@ class CompatibilityAnalyzer(
             val resource = pending[pendingIndex++]
             val source = runCatching { resource.readText() }.getOrDefault("")
             val dependencies = when (resource.extension.lowercase()) {
-                "html" -> htmlScriptDependencies(source)
+                "html" -> scanHtmlScripts(source).dependencies
                 "js", "mjs", "cjs" -> javaScriptDependencies(source)
                 else -> emptySet()
             }
@@ -382,41 +382,314 @@ class CompatibilityAnalyzer(
         return target.takeIf { insideRealRoot }
     }
 
-    private fun htmlScriptDependencies(source: String): Set<String> {
+    private fun scanHtmlScripts(source: String): HtmlScriptScan {
         val dependencies = mutableSetOf<String>()
+        val inlineSource = source.map {
+            if (it == '\r' || it == '\n') it else ' '
+        }.toCharArray()
         var cursor = 0
         while (cursor < source.length) {
-            val opening = source.indexOf("<script", cursor, ignoreCase = true)
-            if (opening < 0) break
-            val nameEnd = opening + "<script".length
-            if (source.getOrNull(nameEnd)?.let { !it.isWhitespace() && it != '>' } == true) {
-                cursor = nameEnd
+            if (source.startsWith("<!--", cursor)) {
+                val commentEnd = source.indexOf("-->", cursor + 4)
+                if (commentEnd < 0) break
+                cursor = commentEnd + 3
                 continue
             }
-            val openingEnd = source.indexOf('>', nameEnd)
-            if (openingEnd < 0) break
-            val tag = source.substring(opening, openingEnd + 1)
-            SCRIPT_SRC_ATTRIBUTE.find(tag)?.groupValues?.get(2)?.let(dependencies::add)
-            cursor = openingEnd + 1
+            if (source[cursor] != '<') {
+                cursor++
+                continue
+            }
+            val scriptNameEnd = cursor + "<script".length
+            val isScript = source.regionMatches(
+                cursor,
+                "<script",
+                0,
+                "<script".length,
+                ignoreCase = true,
+            ) && isHtmlTagNameBoundary(source.getOrNull(scriptNameEnd))
+            if (!isScript) {
+                val tagEnd = findHtmlTagEnd(source, cursor + 1) ?: break
+                cursor = tagEnd + 1
+                continue
+            }
+
+            val openingEnd = findHtmlTagEnd(source, scriptNameEnd) ?: break
+            val scriptSource = readScriptSourceAttribute(
+                source,
+                scriptNameEnd,
+                openingEnd,
+            )
+            scriptSource?.let(dependencies::add)
+            val bodyStart = openingEnd + 1
+            val closingStart = findClosingScriptTag(source, bodyStart)
+            val bodyEnd = closingStart ?: source.length
+            if (scriptSource == null) {
+                for (index in bodyStart until bodyEnd) {
+                    inlineSource[index] = source[index]
+                }
+            }
+            if (closingStart == null) break
+            val closingNameEnd = closingStart + "</script".length
+            val closingEnd = findHtmlTagEnd(source, closingNameEnd) ?: break
+            cursor = closingEnd + 1
         }
-        return dependencies
+        return HtmlScriptScan(dependencies, inlineSource.concatToString())
     }
+
+    private fun findHtmlTagEnd(source: String, start: Int): Int? {
+        var quote: Char? = null
+        var cursor = start
+        while (cursor < source.length) {
+            val current = source[cursor]
+            if (quote != null) {
+                if (current == quote) quote = null
+            } else if (current == '\'' || current == '"') {
+                quote = current
+            } else if (current == '>') {
+                return cursor
+            }
+            cursor++
+        }
+        return null
+    }
+
+    private fun readScriptSourceAttribute(
+        source: String,
+        start: Int,
+        tagEnd: Int,
+    ): String? {
+        var cursor = start
+        while (cursor < tagEnd) {
+            while (cursor < tagEnd &&
+                (source[cursor].isWhitespace() || source[cursor] == '/')
+            ) {
+                cursor++
+            }
+            val nameStart = cursor
+            while (cursor < tagEnd &&
+                !source[cursor].isWhitespace() &&
+                source[cursor] != '=' &&
+                source[cursor] != '/'
+            ) {
+                cursor++
+            }
+            if (cursor == nameStart) {
+                cursor++
+                continue
+            }
+            val name = source.substring(nameStart, cursor)
+            while (cursor < tagEnd && source[cursor].isWhitespace()) cursor++
+            var value: String? = null
+            if (cursor < tagEnd && source[cursor] == '=') {
+                cursor++
+                while (cursor < tagEnd && source[cursor].isWhitespace()) cursor++
+                if (cursor < tagEnd && (source[cursor] == '\'' || source[cursor] == '"')) {
+                    val quote = source[cursor++]
+                    val valueStart = cursor
+                    while (cursor < tagEnd && source[cursor] != quote) cursor++
+                    value = source.substring(valueStart, cursor)
+                    if (cursor < tagEnd) cursor++
+                } else {
+                    val valueStart = cursor
+                    while (cursor < tagEnd &&
+                        !source[cursor].isWhitespace() &&
+                        source[cursor] != '>'
+                    ) {
+                        cursor++
+                    }
+                    value = source.substring(valueStart, cursor)
+                }
+            }
+            if (name.equals("src", ignoreCase = true)) return value.orEmpty()
+        }
+        return null
+    }
+
+    private fun findClosingScriptTag(source: String, start: Int): Int? {
+        var cursor = start
+        while (cursor < source.length) {
+            val closing = source.indexOf("</script", cursor, ignoreCase = true)
+            if (closing < 0) return null
+            val nameEnd = closing + "</script".length
+            if (isHtmlTagNameBoundary(source.getOrNull(nameEnd))) return closing
+            cursor = nameEnd
+        }
+        return null
+    }
+
+    private fun isHtmlTagNameBoundary(value: Char?): Boolean =
+        value == null || value.isWhitespace() || value == '/' || value == '>'
 
     private fun javaScriptDependencies(source: String): Set<String> {
         val sourceWithoutComments = maskJsLiteralsAndComments(source, maskLiterals = false)
         val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
         val dependencies = mutableSetOf<String>()
-        STATIC_MODULE_SPECIFIER.findAll(sourceWithoutComments)
-            .filter { it.startsInCode(codeOnly) }
-            .forEach { dependencies += it.groupValues[2] }
-        IMPORT_SCRIPTS_CALL.findAll(sourceWithoutComments)
-            .filter { it.startsInCode(codeOnly) }
-            .forEach { call ->
-                STRING_LITERAL.findAll(call.groupValues[1]).forEach { literal ->
-                    dependencies += literal.groupValues[2]
+        var cursor = 0
+        while (cursor < codeOnly.length) {
+            if (!codeOnly[cursor].isJavaIdentifierStart()) {
+                cursor++
+                continue
+            }
+            val identifierEnd = readJavaScriptIdentifierEnd(codeOnly, cursor)
+            val identifier = codeOnly.substring(cursor, identifierEnd)
+            cursor = when (identifier) {
+                "importScripts" -> scanImportScriptsDependencies(
+                    sourceWithoutComments,
+                    codeOnly,
+                    identifierEnd,
+                    dependencies,
+                )
+                "import", "export" -> scanStaticModuleDependency(
+                    sourceWithoutComments,
+                    codeOnly,
+                    identifierEnd,
+                    identifier == "import",
+                    dependencies,
+                )
+                else -> identifierEnd
+            }
+        }
+        return dependencies
+    }
+
+    private fun scanStaticModuleDependency(
+        source: String,
+        codeOnly: String,
+        start: Int,
+        isImport: Boolean,
+        dependencies: MutableSet<String>,
+    ): Int {
+        var cursor = skipMaskedWhitespace(source, start)
+        if (isImport &&
+            (source.getOrNull(cursor) == '(' || source.getOrNull(cursor) == '.')
+        ) {
+            return cursor + 1
+        }
+        if (isImport) {
+            readJavaScriptString(source, cursor)?.let { literal ->
+                dependencies += literal.value
+                return literal.end
+            }
+        } else if (source.getOrNull(cursor) != '{' && source.getOrNull(cursor) != '*') {
+            return cursor
+        }
+        while (cursor < source.length) {
+            if (source[cursor] == ';') return cursor + 1
+            if (codeOnly[cursor].isJavaIdentifierStart()) {
+                val identifierEnd = readJavaScriptIdentifierEnd(codeOnly, cursor)
+                if (codeOnly.substring(cursor, identifierEnd) == "from") {
+                    val specifierStart = skipMaskedWhitespace(source, identifierEnd)
+                    val literal = readJavaScriptString(source, specifierStart)
+                    if (literal != null) {
+                        dependencies += literal.value
+                        return literal.end
+                    }
+                }
+                cursor = identifierEnd
+            } else {
+                cursor++
+            }
+        }
+        return cursor
+    }
+
+    private fun scanImportScriptsDependencies(
+        source: String,
+        codeOnly: String,
+        start: Int,
+        dependencies: MutableSet<String>,
+    ): Int {
+        var cursor = skipMaskedWhitespace(source, start)
+        if (source.getOrNull(cursor) != '(') return cursor
+        cursor++
+        while (cursor < source.length) {
+            cursor = skipMaskedWhitespace(source, cursor)
+            if (source.getOrNull(cursor) == ')') return cursor + 1
+            val literal = readJavaScriptString(source, cursor)
+            if (literal != null) {
+                val afterLiteral = skipMaskedWhitespace(source, literal.end)
+                if (source.getOrNull(afterLiteral) == ',' ||
+                    source.getOrNull(afterLiteral) == ')'
+                ) {
+                    dependencies += literal.value
+                }
+                cursor = afterLiteral
+            }
+            cursor = skipJavaScriptArgument(source, codeOnly, cursor)
+            when (source.getOrNull(cursor)) {
+                ',' -> cursor++
+                ')' -> return cursor + 1
+                null -> return cursor
+                else -> cursor++
+            }
+        }
+        return cursor
+    }
+
+    private fun skipJavaScriptArgument(
+        source: String,
+        codeOnly: String,
+        start: Int,
+    ): Int {
+        var cursor = start
+        var parentheses = 0
+        var brackets = 0
+        var braces = 0
+        while (cursor < source.length) {
+            val literal = readJavaScriptString(source, cursor)
+            if (literal != null) {
+                cursor = literal.end
+                continue
+            }
+            val current = codeOnly[cursor]
+            when (current) {
+                '(' -> parentheses++
+                ')' -> if (parentheses == 0 && brackets == 0 && braces == 0) {
+                    return cursor
+                } else if (parentheses > 0) {
+                    parentheses--
+                }
+                '[' -> brackets++
+                ']' -> if (brackets > 0) brackets--
+                '{' -> braces++
+                '}' -> if (braces > 0) braces--
+                ',' -> if (parentheses == 0 && brackets == 0 && braces == 0) {
+                    return cursor
                 }
             }
-        return dependencies
+            cursor++
+        }
+        return cursor
+    }
+
+    private fun skipMaskedWhitespace(source: String, start: Int): Int {
+        var cursor = start
+        while (cursor < source.length && source[cursor].isWhitespace()) cursor++
+        return cursor
+    }
+
+    private fun readJavaScriptIdentifierEnd(source: String, start: Int): Int {
+        var cursor = start + 1
+        while (source.getOrNull(cursor)?.isJavaIdentifierPart() == true) cursor++
+        return cursor
+    }
+
+    private fun readJavaScriptString(source: String, start: Int): JavaScriptString? {
+        val quote = source.getOrNull(start)
+        if (quote != '\'' && quote != '"') return null
+        var cursor = start + 1
+        while (cursor < source.length) {
+            when (source[cursor]) {
+                '\\' -> cursor += if (cursor + 1 < source.length) 2 else 1
+                quote -> return JavaScriptString(
+                    source.substring(start + 1, cursor),
+                    cursor + 1,
+                )
+                '\r', '\n' -> return null
+                else -> cursor++
+            }
+        }
+        return null
     }
 
     private fun validateResources(
@@ -753,28 +1026,6 @@ class CompatibilityAnalyzer(
     private fun MatchResult.startsInCode(codeOnly: String): Boolean =
         codeOnly.getOrNull(range.first)?.isJavaIdentifierStart() == true
 
-    private fun maskHtmlOutsideScripts(source: String): String {
-        val masked = source.map { if (it == '\r' || it == '\n') it else ' ' }.toCharArray()
-        var cursor = 0
-        while (cursor < source.length) {
-            val opening = source.indexOf("<script", cursor, ignoreCase = true)
-            if (opening < 0) break
-            val openingEnd = source.indexOf('>', opening)
-            if (openingEnd < 0) break
-            val closing = source.indexOf("</script", openingEnd + 1, ignoreCase = true)
-                .takeIf { it >= 0 }
-                ?: source.length
-            for (index in openingEnd + 1 until closing) {
-                masked[index] = source[index]
-            }
-            if (closing == source.length) break
-            val closingEnd = source.indexOf('>', closing)
-            if (closingEnd < 0) break
-            cursor = closingEnd + 1
-        }
-        return masked.concatToString()
-    }
-
     private fun JsonObject.stringOrNull(name: String): String? =
         (get(name) as? JsonPrimitive)
             ?.takeIf { it.isString }
@@ -847,6 +1098,16 @@ class CompatibilityAnalyzer(
         val dynamicUsage: Boolean,
     )
 
+    private data class HtmlScriptScan(
+        val dependencies: Set<String>,
+        val inlineSource: String,
+    )
+
+    private data class JavaScriptString(
+        val value: String,
+        val end: Int,
+    )
+
     companion object {
         private val SCRIPT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
         private val API_CALL_REGEX =
@@ -874,15 +1135,6 @@ class CompatibilityAnalyzer(
         private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
         private val ROOT_SCHEME_LITERAL_REGEX =
             Regex("""\b(?:chrome|browser)\b(?:-extension)?\s*:""")
-        private val SCRIPT_SRC_ATTRIBUTE =
-            Regex("""(?:^|\s)src\s*=\s*(["'])([^"']+)\1""", RegexOption.IGNORE_CASE)
-        private val STATIC_MODULE_SPECIFIER = Regex(
-            """\b(?:import\s+(?:[^;\r\n]*?\s+from\s+)?|""" +
-                """export\s+[^;\r\n]*?\s+from\s+)(["'])([^"']+)\1""",
-        )
-        private val IMPORT_SCRIPTS_CALL =
-            Regex("""\bimportScripts\s*\(([^)\r\n]*)\)""")
-        private val STRING_LITERAL = Regex("""(["'])([^"']+)\1""")
         private const val CODE = 0
         private const val SINGLE_QUOTED = 1
         private const val DOUBLE_QUOTED = 2
