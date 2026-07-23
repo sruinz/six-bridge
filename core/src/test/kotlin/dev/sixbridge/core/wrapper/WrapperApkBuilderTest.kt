@@ -155,4 +155,32 @@ class WrapperApkBuilderTest {
 
         assertEquals(first.versionCode + 1, second.versionCode)
     }
+
+    @Test
+    fun `uses the higher existing APK version when the store rolls back`() {
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 version rollback 검증을 실행할 수 없습니다.")
+        val source = Files.createTempDirectory("six-wrapper-version-rollback-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Version rollback","version":"1"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val crx = Crx3.pack(source, keyPair)
+        val localRoot = Files.createTempDirectory("six-wrapper-version-rollback-local")
+        val builder = WrapperApkBuilder(sdk, localRoot)
+        val output = Files.createTempFile("six-wrapper-version-rollback", ".apk")
+        builder.build(WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output))
+        localRoot.resolve("versions/${crx.extensionId}.txt").writeText("6")
+        val seventh = builder.build(
+            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output),
+        )
+        localRoot.resolve("versions/${crx.extensionId}.txt").writeText("3")
+
+        val next = builder.build(
+            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output),
+        )
+
+        assertEquals(7, seventh.versionCode)
+        assertEquals(8, next.versionCode)
+    }
 }

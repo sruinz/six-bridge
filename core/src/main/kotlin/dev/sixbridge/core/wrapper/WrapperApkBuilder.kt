@@ -403,14 +403,15 @@ private class VersionStore(
             throw error
         }
         return try {
-            val current = if (file.exists()) {
+            val storedVersion = if (file.exists()) {
                 file.readText().trim().toIntOrNull()
                     ?: throw IllegalArgumentException(
                         "versionCode 저장 파일이 손상되었습니다: $file",
                     )
             } else {
-                existingOutputVersion()
+                0
             }
+            val current = maxOf(storedVersion, existingOutputVersion())
             require(current >= 0) { "versionCode 저장 값은 음수일 수 없습니다." }
             require(current < Int.MAX_VALUE) { "versionCode가 최대값에 도달했습니다." }
             VersionReservation(file, current + 1, channel, lock)

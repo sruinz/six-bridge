@@ -257,8 +257,10 @@ class AdbDeviceClient(
             "wrapper Android manifest extension-id metadata가 올바르지 않습니다."
         }
 
-        val discovery = application.children.filter { it.name == "activity" }.any { activity ->
-            activity.children.filter { it.name == "intent-filter" }.any { filter ->
+        val discoveryActivities = application.children
+            .filter { it.name == "activity" }
+            .filter { activity ->
+                activity.children.filter { it.name == "intent-filter" }.any { filter ->
                 val actions = filter.children.filter { it.name == "action" }
                     .mapNotNull { it.attributes["name"] }
                     .toSet()
@@ -272,10 +274,13 @@ class AdbDeviceClient(
                         it.attributes["scheme"] == "six" &&
                             it.attributes["host"] == "ex"
                     }
+                }
             }
-        }
-        require(discovery) {
+        require(discoveryActivities.isNotEmpty()) {
             "wrapper Android manifest에 VIEW/BROWSABLE six://ex Activity가 없습니다."
+        }
+        require(discoveryActivities.any { it.attributes["exported"] == "true" }) {
+            "wrapper Android manifest discovery Activity는 exported=true여야 합니다."
         }
 
         val expectedAuthority = "${descriptor.wrapperPackage}.contentprovider"

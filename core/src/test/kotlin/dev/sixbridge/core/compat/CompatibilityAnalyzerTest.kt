@@ -339,4 +339,138 @@ class CompatibilityAnalyzerTest {
         assertEquals(CompatibilityStatus.UNKNOWN, report.status)
         assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
     }
+
+    @Test
+    fun `marks unconsumed browser root references unknown`() {
+        val source = Files.createTempDirectory("six-unconsumed-browser-root")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Unconsumed browser roots",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            let api;
+            api = globalThis.chrome;
+            api.debugger.attach({});
+            use(browser);
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
+    fun `ignores browser root words in comments and strings`() {
+        val source = Files.createTempDirectory("six-comment-string-browser-root")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Comment and string roots",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            // use(chrome)
+            /* return browser; */
+            const examples = "chrome browser globalThis.chrome";
+            const environments = { chrome: true, browser: false };
+            const internalUrl = /^(?:chrome:|chrome-extension:|browser:)/;
+            chrome.storage.local.get("browser");
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+    }
+
+    @Test
+    fun `ignores browser words in HTML text and scans inline scripts`() {
+        val source = Files.createTempDirectory("six-html-browser-text")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "HTML browser text",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <p>Restart your browser after installation.</p>
+            <script>chrome.storage.local.get("value");</script>
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+    }
+
+    @Test
+    fun `ignores non-runtime test scripts that mock the browser root`() {
+        val source = Files.createTempDirectory("six-browser-mock-test-script")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Browser mock test script",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText("chrome.storage.local.get('value');")
+        source.resolve("background.test.mjs").writeText(
+            """
+            const chrome = { storage: { local: {} } };
+            runInContext({ chrome });
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+    }
+
+    @Test
+    fun `scans a large minified string without exhausting the regex stack`() {
+        val source = Files.createTempDirectory("six-large-minified-string")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Large minified string",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """const payload="${"a".repeat(600_000)}";chrome.storage.local.get("value");""",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+    }
 }

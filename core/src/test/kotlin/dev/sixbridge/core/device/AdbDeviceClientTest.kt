@@ -172,6 +172,11 @@ class AdbDeviceClientTest {
             ContractCase("wrong-crx-id", otherPacked.bytes, ContractVariant.VALID),
             ContractCase("metadata", packed.bytes, ContractVariant.METADATA),
             ContractCase("discovery-uri", packed.bytes, ContractVariant.DISCOVERY_URI),
+            ContractCase(
+                "discovery-exported",
+                packed.bytes,
+                ContractVariant.DISCOVERY_EXPORTED,
+            ),
             ContractCase("provider-authority", packed.bytes, ContractVariant.PROVIDER_AUTHORITY),
             ContractCase("provider-exported", packed.bytes, ContractVariant.PROVIDER_EXPORTED),
         )
@@ -306,6 +311,7 @@ class AdbDeviceClientTest {
                     extensionId
                 },
                 discoveryHost = if (variant == ContractVariant.DISCOVERY_URI) "wrong" else "ex",
+                discoveryExported = variant != ContractVariant.DISCOVERY_EXPORTED,
                 providerAuthority = if (variant == ContractVariant.PROVIDER_AUTHORITY) {
                     "$packageName.wrong"
                 } else {
@@ -394,6 +400,7 @@ class AdbDeviceClientTest {
         extensionId: String,
         metadataId: String,
         discoveryHost: String,
+        discoveryExported: Boolean,
         providerAuthority: String,
         providerExported: Boolean,
     ) = """
@@ -407,7 +414,7 @@ class AdbDeviceClientTest {
                 <meta-data android:name="extension-id" android:value="$metadataId" />
                 <activity
                     android:name="dev.sixbridge.runtime.SixDiscoveryActivity"
-                    android:exported="true">
+                    android:exported="$discoveryExported">
                     <intent-filter>
                         <action android:name="android.intent.action.VIEW" />
                         <category android:name="android.intent.category.DEFAULT" />
@@ -443,6 +450,7 @@ class AdbDeviceClientTest {
         VALID,
         METADATA,
         DISCOVERY_URI,
+        DISCOVERY_EXPORTED,
         PROVIDER_AUTHORITY,
         PROVIDER_EXPORTED,
     }

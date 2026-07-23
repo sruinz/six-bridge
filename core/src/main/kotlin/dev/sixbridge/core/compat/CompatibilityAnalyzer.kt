@@ -184,15 +184,26 @@ class CompatibilityAnalyzer(
         var dynamicUsage = false
         Files.walk(root).use { paths ->
             paths.filter { path ->
-                path.isRegularFile() && path.extension.lowercase() in SCRIPT_EXTENSIONS
+                path.isRegularFile() &&
+                    path.extension.lowercase() in SCRIPT_EXTENSIONS &&
+                    ".test." !in path.fileName.toString()
             }.forEach { path ->
                 val source = runCatching { path.readText() }.getOrDefault("")
+                val sourceWithoutComments = maskJsLiteralsAndComments(
+                    source,
+                    maskLiterals = false,
+                )
+                val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
                 val aliases = mutableSetOf<String>()
-                ROOT_ALIAS_DECLARATION.findAll(source).forEach { declaration ->
+                val consumedRoots = mutableSetOf<Int>()
+                ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments).forEach { declaration ->
                     val kind = declaration.groupValues[1]
                     val alias = declaration.groupValues[2]
                     val expression = declaration.groupValues[3].trim()
-                    val dynamicExpression = STRING_LITERAL_REGEX.replace(expression, "")
+                    val dynamicExpression = maskJsLiteralsAndComments(
+                        expression,
+                        maskLiterals = true,
+                    )
                     val directAlias = aliases.singleOrNull { it == expression }
                     val referencesAlias = aliases.any {
                         Regex(
@@ -204,19 +215,32 @@ class CompatibilityAnalyzer(
                         (STATIC_ROOT_EXPRESSION.matches(expression) || directAlias != null)
                     ) {
                         aliases += alias
+                        if (STATIC_ROOT_EXPRESSION.matches(expression)) {
+                            ROOT_TOKEN.findAll(declaration.groups[3]!!.value).forEach { root ->
+                                consumedRoots += declaration.groups[3]!!.range.first +
+                                    root.range.first
+                            }
+                        }
                     } else if (
-                        ROOT_REFERENCE.containsMatchIn(dynamicExpression) || referencesAlias
+                        DYNAMIC_GLOBAL_ROOT_LOOKUP.containsMatchIn(dynamicExpression) ||
+                        referencesAlias
                     ) {
                         dynamicUsage = true
                     }
                 }
-                API_CALL_REGEX.findAll(source).forEach { match ->
+                API_CALL_REGEX.findAll(sourceWithoutComments).forEach { match ->
                     found += match.groupValues[1]
+                    consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
+                        match.range.first
                 }
-                BRACKET_API_REGEX.findAll(source).forEach { match ->
+                BRACKET_API_REGEX.findAll(sourceWithoutComments).forEach { match ->
                     found += match.groupValues[1]
+                    consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
+                        match.range.first
                 }
-                DESTRUCTURING_REGEX.findAll(source).forEach { match ->
+                DESTRUCTURING_REGEX.findAll(sourceWithoutComments).forEach { match ->
+                    consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
+                        match.range.first
                     match.groupValues[1].split(',').forEach { binding ->
                         val namespace = binding.trim()
                             .substringBefore(':')
@@ -226,20 +250,35 @@ class CompatibilityAnalyzer(
                     }
                 }
                 aliases.forEach { alias ->
-                    aliasMemberRegex(alias).findAll(source).forEach { match ->
+                    aliasMemberRegex(alias).findAll(sourceWithoutComments).forEach { match ->
                         found += match.groupValues[1]
                     }
-                    aliasBracketRegex(alias).findAll(source).forEach { match ->
+                    aliasBracketRegex(alias).findAll(sourceWithoutComments).forEach { match ->
                         found += match.groupValues[1]
                     }
-                    if (aliasDynamicBracketRegex(alias).containsMatchIn(source)) {
+                    if (aliasDynamicBracketRegex(alias).containsMatchIn(sourceWithoutComments)) {
                         dynamicUsage = true
                     }
                 }
-                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(source)) {
+                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(sourceWithoutComments)) {
                     dynamicUsage = true
                 }
-                if (NATIVE_MESSAGING_REGEX.containsMatchIn(source)) {
+                val rootScanCode = if (path.extension.lowercase() == "html") {
+                    maskHtmlOutsideScripts(codeOnly)
+                } else {
+                    codeOnly
+                }
+                ROOT_SCHEME_LITERAL_REGEX.findAll(rootScanCode).forEach { match ->
+                    consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
+                        match.range.first
+                }
+                if (ROOT_TOKEN.findAll(rootScanCode).any {
+                        it.range.first !in consumedRoots
+                    }
+                ) {
+                    dynamicUsage = true
+                }
+                if (NATIVE_MESSAGING_REGEX.containsMatchIn(sourceWithoutComments)) {
                     found += "nativeMessaging"
                 }
             }
@@ -328,6 +367,114 @@ class CompatibilityAnalyzer(
             !value.startsWith("/") &&
             '\\' !in value &&
             ':' !in value
+
+    private fun maskJsLiteralsAndComments(source: String, maskLiterals: Boolean): String {
+        val masked = source.toCharArray()
+        var state = CODE
+        var index = 0
+
+        fun mask(position: Int) {
+            if (masked[position] != '\r' && masked[position] != '\n') {
+                masked[position] = ' '
+            }
+        }
+
+        while (index < masked.size) {
+            val current = masked[index]
+            when (state) {
+                CODE -> when {
+                    current == '\'' -> {
+                        state = SINGLE_QUOTED
+                        if (maskLiterals) mask(index)
+                        index++
+                    }
+                    current == '"' -> {
+                        state = DOUBLE_QUOTED
+                        if (maskLiterals) mask(index)
+                        index++
+                    }
+                    current == '`' -> {
+                        state = TEMPLATE_QUOTED
+                        if (maskLiterals) mask(index)
+                        index++
+                    }
+                    current == '/' && masked.getOrNull(index + 1) == '/' -> {
+                        mask(index)
+                        mask(index + 1)
+                        state = LINE_COMMENT
+                        index += 2
+                    }
+                    current == '/' && masked.getOrNull(index + 1) == '*' -> {
+                        mask(index)
+                        mask(index + 1)
+                        state = BLOCK_COMMENT
+                        index += 2
+                    }
+                    else -> index++
+                }
+                SINGLE_QUOTED, DOUBLE_QUOTED, TEMPLATE_QUOTED -> {
+                    val closing = when (state) {
+                        SINGLE_QUOTED -> '\''
+                        DOUBLE_QUOTED -> '"'
+                        else -> '`'
+                    }
+                    if (current == '\\' && index + 1 < masked.size) {
+                        if (maskLiterals) {
+                            mask(index)
+                            mask(index + 1)
+                        }
+                        index += 2
+                    } else {
+                        if (maskLiterals) mask(index)
+                        index++
+                        if (current == closing) state = CODE
+                    }
+                }
+                LINE_COMMENT -> {
+                    if (current == '\r' || current == '\n') {
+                        state = CODE
+                    } else {
+                        mask(index)
+                    }
+                    index++
+                }
+                BLOCK_COMMENT -> {
+                    if (current == '*' && masked.getOrNull(index + 1) == '/') {
+                        mask(index)
+                        mask(index + 1)
+                        state = CODE
+                        index += 2
+                    } else {
+                        mask(index)
+                        index++
+                    }
+                }
+            }
+        }
+        return masked.concatToString()
+    }
+
+    private fun maskHtmlOutsideScripts(source: String): String {
+        val masked = source.map { if (it == '\r' || it == '\n') it else ' ' }.toCharArray()
+        var cursor = 0
+        while (cursor < source.length) {
+            val opening = source.indexOf("<script", cursor, ignoreCase = true)
+            if (opening < 0) break
+            val openingEnd = source.indexOf('>', opening)
+            if (openingEnd < 0) break
+            val closing = source.indexOf("</script", openingEnd + 1, ignoreCase = true)
+                .takeIf { it >= 0 }
+                ?: source.length
+            for (index in openingEnd + 1 until closing) {
+                masked[index] = source[index]
+            }
+            if (closing == source.length) break
+            val closingEnd = source.indexOf('>', closing)
+            if (closingEnd < 0) break
+            cursor = closingEnd + 1
+        }
+        return masked.concatToString()
+    }
 
     private fun JsonObject.stringOrNull(name: String): String? =
         (get(name) as? JsonPrimitive)
@@ -423,13 +570,17 @@ class CompatibilityAnalyzer(
         private val STATIC_ROOT_EXPRESSION = Regex(
             """(?:(?:globalThis|window|self)\s*(?:\?\.|\.)\s*)?(?:chrome|browser)""",
         )
-        private val ROOT_REFERENCE = Regex(
-            """\b(?:chrome|browser)\b(?!\s*(?:\?\.|\.|\[\s*["']))|""" +
-                """(?:globalThis|window|self)\s*\[""",
-        )
-        private val STRING_LITERAL_REGEX = Regex(
-            """"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`""",
-        )
+        private val DYNAMIC_GLOBAL_ROOT_LOOKUP =
+            Regex("""(?:globalThis|window|self)\s*\[""")
+        private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
+        private val ROOT_SCHEME_LITERAL_REGEX =
+            Regex("""\b(?:chrome|browser)\b(?:-extension)?\s*:""")
+        private const val CODE = 0
+        private const val SINGLE_QUOTED = 1
+        private const val DOUBLE_QUOTED = 2
+        private const val TEMPLATE_QUOTED = 3
+        private const val LINE_COMMENT = 4
+        private const val BLOCK_COMMENT = 5
         private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")
