@@ -46,9 +46,14 @@
 - 확장 활성화
 - 삼성 인터넷 재실행 뒤 활성 상태 유지
 
-모바일 UI에서 action 팝업 접근이 어려워 실제 확장 런타임 실행 여부는 아직
-최종 확인하지 않았다. 일반 HTTPS 페이지에 표시되는 `SIX Bridge OK` 진단
-배지로 content script, background service worker, runtime 메시징,
-`storage.local` 실행을 확인한 뒤 게이트 A를 완료한다.
+### 런타임 실행
 
-Android 관리자 앱 단계는 게이트 A가 완료될 때까지 시작하지 않는다.
+- 일반 HTTPS 페이지에서 `SIX Bridge OK` 배지가 한 번 표시됐다.
+- 배지는 8초 뒤 제거됐고 새로고침 시 한 번 다시 표시됐다.
+- 삼성 인터넷을 재시작한 뒤에도 재활성화 없이 다른 HTTPS 페이지에서
+  배지가 표시됐다.
+- 이 결과로 content script, MV3 background service worker, runtime 메시징,
+  `storage.local` 경로의 실제 실행을 확인했다.
+
+게이트 A를 완료했다. 다음 단계는 네 확장의 Fold7 호환성 검증이며 Android
+관리자 앱 구현은 네 확장 검증 결과를 기록한 뒤 시작한다.
