@@ -72,4 +72,21 @@ class ExtensionInputResolverTest {
             ExtensionInputResolver().resolve(zip.toString())
         }
     }
+
+    @Test
+    fun `rejects high compression byte array extraction`() {
+        val zip = Files.createTempFile("six-byte-zip-bomb", ".zip")
+        ZipOutputStream(Files.newOutputStream(zip)).use { output ->
+            output.putNextEntry(ZipEntry("manifest.json"))
+            output.write(ByteArray(1024 * 1024))
+            output.closeEntry()
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionZip.extract(
+                Files.readAllBytes(zip),
+                Files.createTempDirectory("six-byte-zip-output"),
+            )
+        }
+    }
 }

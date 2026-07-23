@@ -25,6 +25,7 @@ data class ResolvedExtensionInput(
     val sourceRoot: Path? = null,
     val crxBytes: ByteArray? = null,
     val expectedExtensionId: String? = null,
+    val projectIdentity: String? = null,
 )
 
 class UnsupportedInputException(message: String) : IllegalArgumentException(message)

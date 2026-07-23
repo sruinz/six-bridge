@@ -146,12 +146,23 @@ class BuildCommand : Callable<Int> {
     @Option(names = ["--output"], description = ["출력 .six 경로"])
     var output: Path? = null
 
+    @Option(
+        names = ["--identity"],
+        description = ["markerless 업데이트 ZIP에 사용할 source project identity"],
+    )
+    var projectIdentity: String? = null
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
         val profile = BrowserProfileJson.decode(profilePath.readText())
-        val result = SixBridgeService(root.workspace).build(input, profile, output)
+        val result = SixBridgeService(root.workspace).build(
+            input,
+            profile,
+            output,
+            projectIdentity,
+        )
         spec.commandLine().out.println("extensionId=${result.extensionId}")
         spec.commandLine().out.println("compatibility=${result.compatibility.status.name.lowercase()}")
         spec.commandLine().out.println("crx=${result.crx.toAbsolutePath()}")

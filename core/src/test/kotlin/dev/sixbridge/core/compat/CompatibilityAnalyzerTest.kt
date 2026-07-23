@@ -269,7 +269,67 @@ class CompatibilityAnalyzerTest {
             """
             const namespace = "downloads";
             chrome[namespace].download({});
-            const api = browser;
+            const rootName = "chrome";
+            const api = globalThis[rootName];
+            api.downloads.search({});
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
+    fun `detects optional chaining namespaces and static root aliases`() {
+        val source = Files.createTempDirectory("six-optional-alias-apis")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Optional and alias APIs",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            chrome?.debugger?.attach({});
+            browser?.downloads;
+            const api = globalThis.chrome;
+            api.debugger.attach({});
+            const second = chrome;
+            second["downloads"].search({});
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("debugger" in report.usedApis)
+        assertTrue("downloads" in report.usedApis)
+        assertEquals(setOf("debugger", "downloads"), report.unsupportedApis)
+    }
+
+    @Test
+    fun `marks an unprovable indirect root alias unknown`() {
+        val source = Files.createTempDirectory("six-indirect-dynamic-alias")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Indirect dynamic alias",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            const root = chrome;
+            const api = useBrowser ? root : fallback;
             api.downloads.search({});
             """.trimIndent(),
         )

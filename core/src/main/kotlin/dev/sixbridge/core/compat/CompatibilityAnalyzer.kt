@@ -187,6 +187,29 @@ class CompatibilityAnalyzer(
                 path.isRegularFile() && path.extension.lowercase() in SCRIPT_EXTENSIONS
             }.forEach { path ->
                 val source = runCatching { path.readText() }.getOrDefault("")
+                val aliases = mutableSetOf<String>()
+                ROOT_ALIAS_DECLARATION.findAll(source).forEach { declaration ->
+                    val kind = declaration.groupValues[1]
+                    val alias = declaration.groupValues[2]
+                    val expression = declaration.groupValues[3].trim()
+                    val dynamicExpression = STRING_LITERAL_REGEX.replace(expression, "")
+                    val directAlias = aliases.singleOrNull { it == expression }
+                    val referencesAlias = aliases.any {
+                        Regex(
+                            """\b${Regex.escape(it)}\b""" +
+                                """(?!\s*(?:\?\.|\.|\[\s*["']))""",
+                        ).containsMatchIn(dynamicExpression)
+                    }
+                    if (kind == "const" &&
+                        (STATIC_ROOT_EXPRESSION.matches(expression) || directAlias != null)
+                    ) {
+                        aliases += alias
+                    } else if (
+                        ROOT_REFERENCE.containsMatchIn(dynamicExpression) || referencesAlias
+                    ) {
+                        dynamicUsage = true
+                    }
+                }
                 API_CALL_REGEX.findAll(source).forEach { match ->
                     found += match.groupValues[1]
                 }
@@ -202,9 +225,18 @@ class CompatibilityAnalyzer(
                         if (API_NAME.matches(namespace)) found += namespace
                     }
                 }
-                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(source) ||
-                    BROWSER_ALIAS_REGEX.containsMatchIn(source)
-                ) {
+                aliases.forEach { alias ->
+                    aliasMemberRegex(alias).findAll(source).forEach { match ->
+                        found += match.groupValues[1]
+                    }
+                    aliasBracketRegex(alias).findAll(source).forEach { match ->
+                        found += match.groupValues[1]
+                    }
+                    if (aliasDynamicBracketRegex(alias).containsMatchIn(source)) {
+                        dynamicUsage = true
+                    }
+                }
+                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(source)) {
                     dynamicUsage = true
                 }
                 if (NATIVE_MESSAGING_REGEX.containsMatchIn(source)) {
@@ -372,18 +404,32 @@ class CompatibilityAnalyzer(
     companion object {
         private val SCRIPT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
         private val API_CALL_REGEX =
-            Regex("""(?:chrome|browser)\s*\.\s*([A-Za-z][A-Za-z0-9_]*)""")
+            Regex("""(?:chrome|browser)\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""")
         private val BRACKET_API_REGEX =
-            Regex("""(?:chrome|browser)\s*\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""")
-        private val DESTRUCTURING_REGEX =
-            Regex("""(?:const|let|var)\s*\{([^}]*)}\s*=\s*(?:chrome|browser)\b""")
-        private val DYNAMIC_BRACKET_REGEX =
-            Regex("""(?:chrome|browser)\s*\[\s*(?!["'])""")
-        private val BROWSER_ALIAS_REGEX =
             Regex(
-                """(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*""" +
-                    """(?:chrome|browser)[ \t]*(?=;|\r?\n|$)""",
+                """(?:chrome|browser)\s*(?:\?\.)?\s*""" +
+                    """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
             )
+        private val DESTRUCTURING_REGEX =
+            Regex(
+                """(?:const|let|var)\s*\{([^}]*)}\s*=\s*""" +
+                    """(?:(?:globalThis|window|self)\s*\.\s*)?(?:chrome|browser)\b""",
+            )
+        private val DYNAMIC_BRACKET_REGEX =
+            Regex("""(?:chrome|browser)\s*(?:\?\.)?\s*\[\s*(?!["'])""")
+        private val ROOT_ALIAS_DECLARATION = Regex(
+            """\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\r\n]+)""",
+        )
+        private val STATIC_ROOT_EXPRESSION = Regex(
+            """(?:(?:globalThis|window|self)\s*(?:\?\.|\.)\s*)?(?:chrome|browser)""",
+        )
+        private val ROOT_REFERENCE = Regex(
+            """\b(?:chrome|browser)\b(?!\s*(?:\?\.|\.|\[\s*["']))|""" +
+                """(?:globalThis|window|self)\s*\[""",
+        )
+        private val STRING_LITERAL_REGEX = Regex(
+            """"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`""",
+        )
         private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")
@@ -398,6 +444,7 @@ class CompatibilityAnalyzer(
             "cookies",
             "declarativeContent",
             "declarativeNetRequest",
+            "debugger",
             "downloads",
             "history",
             "i18n",
@@ -423,6 +470,19 @@ class CompatibilityAnalyzer(
             "webNavigation",
             "webRequest",
             "windows",
+        )
+
+        private fun aliasMemberRegex(alias: String) = Regex(
+            """\b${Regex.escape(alias)}\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""",
+        )
+
+        private fun aliasBracketRegex(alias: String) = Regex(
+            """\b${Regex.escape(alias)}\s*(?:\?\.)?\s*""" +
+                """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
+        )
+
+        private fun aliasDynamicBracketRegex(alias: String) = Regex(
+            """\b${Regex.escape(alias)}\s*(?:\?\.)?\s*\[\s*(?!["'])""",
         )
     }
 }

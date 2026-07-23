@@ -10,7 +10,6 @@ import java.nio.file.Path
 import java.util.Base64
 import java.util.zip.ZipFile
 import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.io.path.isDirectory
@@ -19,17 +18,23 @@ import kotlin.io.path.readText
 
 object ExtensionZip {
     fun create(sourceRoot: Path, output: Path, publicKey: ByteArray? = null) {
-        Files.write(output, createBytes(sourceRoot, publicKey))
+        Files.write(output, createBytes(sourceRoot, publicKey, includeProjectMarker = true))
     }
 
-    fun createBytes(sourceRoot: Path, publicKey: ByteArray? = null): ByteArray {
+    fun createBytes(
+        sourceRoot: Path,
+        publicKey: ByteArray? = null,
+        includeProjectMarker: Boolean = false,
+    ): ByteArray {
         require(sourceRoot.isDirectory()) { "확장 소스 디렉터리가 아닙니다: $sourceRoot" }
         require(sourceRoot.resolve("manifest.json").isRegularFile()) {
             "manifest.json 파일이 없습니다: $sourceRoot"
         }
         val paths = Files.walk(sourceRoot).use { stream ->
             stream.filter { it.isRegularFile() }
-                .filter { path -> shouldInclude(sourceRoot.relativize(path)) }
+                .filter { path ->
+                    shouldInclude(sourceRoot.relativize(path), includeProjectMarker)
+                }
                 .sorted(compareBy { sourceRoot.relativize(it).invariantSeparatorsPathString })
                 .toList()
         }
@@ -60,31 +65,13 @@ object ExtensionZip {
     }
 
     fun extract(bytes: ByteArray, destination: Path): Path {
-        Files.createDirectories(destination)
-        var entryCount = 0
-        var totalSize = 0L
-        ZipInputStream(bytes.inputStream()).use { zip ->
-            while (true) {
-                val entry = zip.nextEntry ?: break
-                entryCount += 1
-                require(entryCount <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
-                validateEntry(entry)
-                val output = destination.resolve(entry.name).normalize()
-                if (!output.startsWith(destination)) {
-                    throw IllegalArgumentException("ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}")
-                }
-                if (entry.isDirectory) {
-                    Files.createDirectories(output)
-                } else {
-                    Files.createDirectories(output.parent)
-                    totalSize += copyLimited(zip, output)
-                    require(totalSize <= MAX_TOTAL_SIZE) {
-                        "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
-                    }
-                }
-            }
+        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        return try {
+            Files.write(temporary, bytes)
+            extract(temporary, destination)
+        } finally {
+            Files.deleteIfExists(temporary)
         }
-        return locateManifestRoot(destination)
     }
 
     fun extract(zipPath: Path, destination: Path): Path {
@@ -92,7 +79,11 @@ object ExtensionZip {
         ZipFile(zipPath.toFile()).use { zip ->
             require(zip.size() <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
             var declaredTotal = 0L
+            val names = mutableSetOf<String>()
             zip.entries().asSequence().forEach { entry ->
+                require(names.add(entry.name)) {
+                    "ZIP 중복 항목을 거부했습니다: ${entry.name}"
+                }
                 validateEntry(entry)
                 if (!entry.isDirectory) {
                     declaredTotal += entry.size
@@ -134,9 +125,14 @@ object ExtensionZip {
         return json.encodeToString(JsonObject.serializer(), withKey).toByteArray()
     }
 
-    private fun shouldInclude(relative: Path): Boolean {
+    private fun shouldInclude(relative: Path, includeProjectMarker: Boolean): Boolean {
         val components = relative.map { it.toString() }
         if (components.any { it in EXCLUDED_DIRECTORIES }) return false
+        if (!includeProjectMarker &&
+            relative.fileName.toString() == SourceProjectIdentityStore.MARKER_FILE
+        ) {
+            return false
+        }
         return relative.fileName.toString() !in EXCLUDED_FILES
     }
 

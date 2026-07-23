@@ -7,6 +7,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.nio.channels.FileChannel
 import java.nio.channels.FileLock
 import java.security.MessageDigest
@@ -47,7 +48,9 @@ class WrapperApkBuilder(
         }
         val packageName = "dev.sixbridge.ext.${request.extensionId}"
         val versionStore = VersionStore(localRoot.resolve("versions"))
-        val versionReservation = versionStore.reserve(request.extensionId)
+        val versionReservation = versionStore.reserve(request.extensionId) {
+            existingOutputVersion(request.outputApk)
+        }
         val versionCode = versionReservation.value
         try {
             val signer = WrapperSigningStore(toolchain, localRoot.resolve("keystore"))
@@ -183,6 +186,20 @@ class WrapperApkBuilder(
         )
     }
 
+    private fun existingOutputVersion(outputApk: Path): Int {
+        if (!outputApk.exists() || Files.size(outputApk) == 0L) return 0
+        val badging = ProcessRunner.run(
+            listOf(toolchain.aapt2.toString(), "dump", "badging", outputApk.toString()),
+        ).stdout
+        return PACKAGE_BADGING.find(badging)
+            ?.groupValues
+            ?.get(1)
+            ?.toIntOrNull()
+            ?: throw IllegalArgumentException(
+                "기존 output APK versionCode를 읽을 수 없습니다: $outputApk",
+            )
+    }
+
     private fun assembleApk(
         baseApk: Path,
         classesDex: Path,
@@ -273,6 +290,8 @@ class WrapperApkBuilder(
         private val EXTENSION_ID = Regex("[a-p]{32}")
         private val SIGNER_SHA_REGEX =
             Regex("""Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F:]+)""")
+        private val PACKAGE_BADGING =
+            Regex("""package: name='[^']+' versionCode='(\d+)'""")
 
         private val DISCOVERY_ACTIVITY_SOURCE = """
             package dev.sixbridge.runtime;
@@ -369,7 +388,7 @@ class WrapperApkBuilder(
 private class VersionStore(
     private val directory: Path,
 ) {
-    fun reserve(extensionId: String): VersionReservation {
+    fun reserve(extensionId: String, existingOutputVersion: () -> Int): VersionReservation {
         directory.createDirectories()
         val file = directory.resolve("$extensionId.txt")
         val channel = FileChannel.open(
@@ -385,10 +404,14 @@ private class VersionStore(
         }
         return try {
             val current = if (file.exists()) {
-                file.readText().trim().toIntOrNull() ?: 0
+                file.readText().trim().toIntOrNull()
+                    ?: throw IllegalArgumentException(
+                        "versionCode 저장 파일이 손상되었습니다: $file",
+                    )
             } else {
-                0
+                existingOutputVersion()
             }
+            require(current >= 0) { "versionCode 저장 값은 음수일 수 없습니다." }
             require(current < Int.MAX_VALUE) { "versionCode가 최대값에 도달했습니다." }
             VersionReservation(file, current + 1, channel, lock)
         } catch (error: Throwable) {
@@ -445,57 +468,91 @@ private class WrapperSigningStore(
         directory.createDirectories()
         if (!passwordFile.exists()) {
             val password = ByteArray(32).also(SecureRandom()::nextBytes)
-            passwordFile.writeText(
+            createOwnerOnlyFile(passwordFile)
+            Files.writeString(
+                passwordFile,
                 Base64.getUrlEncoder().withoutPadding().encodeToString(password),
                 StandardCharsets.US_ASCII,
+                StandardOpenOption.TRUNCATE_EXISTING,
             )
-            restrictOwner(passwordFile)
         }
         if (!keyStore.exists()) {
-            ProcessRunner.run(
-                listOf(
-                    toolchain.keytool.toString(),
-                    "-genkeypair",
-                    "-keystore",
-                    keyStore.toString(),
-                    "-storetype",
-                    "PKCS12",
-                    "-storepass:file",
-                    passwordFile.toString(),
-                    "-keypass:file",
-                    passwordFile.toString(),
-                    "-alias",
-                    ALIAS,
-                    "-keyalg",
-                    "RSA",
-                    "-keysize",
-                    "3072",
-                    "-validity",
-                    "3650",
-                    "-dname",
-                    "CN=SIX Bridge Development,O=SIX Bridge,C=KR",
-                    "-noprompt",
-                ),
+            val privateDirectory = Files.createTempDirectory(
+                directory,
+                ".wrapper-keystore-",
+                PosixFilePermissions.asFileAttribute(OWNER_DIRECTORY),
             )
-            restrictOwner(keyStore)
+            val temporaryKeyStore = privateDirectory.resolve("wrapper.p12")
+            try {
+                ProcessRunner.run(
+                    listOf(
+                        toolchain.keytool.toString(),
+                        "-genkeypair",
+                        "-keystore",
+                        temporaryKeyStore.toString(),
+                        "-storetype",
+                        "PKCS12",
+                        "-storepass:file",
+                        passwordFile.toString(),
+                        "-keypass:file",
+                        passwordFile.toString(),
+                        "-alias",
+                        ALIAS,
+                        "-keyalg",
+                        "RSA",
+                        "-keysize",
+                        "3072",
+                        "-validity",
+                        "3650",
+                        "-dname",
+                        "CN=SIX Bridge Development,O=SIX Bridge,C=KR",
+                        "-noprompt",
+                    ),
+                )
+                restrictOwner(temporaryKeyStore)
+                Files.move(
+                    temporaryKeyStore,
+                    keyStore,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+                restrictOwner(keyStore)
+            } finally {
+                Files.deleteIfExists(temporaryKeyStore)
+                Files.deleteIfExists(privateDirectory)
+            }
         }
+        restrictOwner(passwordFile)
+        restrictOwner(keyStore)
+    }
+
+    private fun createOwnerOnlyFile(path: Path) {
+        require(Files.getFileStore(path.parent).supportsFileAttributeView("posix")) {
+            "owner-only 권한을 적용할 수 없는 파일 시스템입니다: $path"
+        }
+        Files.createFile(path, PosixFilePermissions.asFileAttribute(OWNER_ONLY))
+        restrictOwner(path)
     }
 
     private fun restrictOwner(path: Path) {
         require(Files.getFileStore(path).supportsFileAttributeView("posix")) {
             "owner-only 권한을 적용할 수 없는 파일 시스템입니다: $path"
         }
-        val permissions = setOf(
-            PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE,
-        )
-        Files.setPosixFilePermissions(path, permissions)
-        require(Files.getPosixFilePermissions(path) == permissions) {
+        Files.setPosixFilePermissions(path, OWNER_ONLY)
+        require(Files.getPosixFilePermissions(path) == OWNER_ONLY) {
             "owner-only 권한 적용을 확인할 수 없습니다: $path"
         }
     }
 
     companion object {
         const val ALIAS = "sixbridge"
+        private val OWNER_ONLY = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+        )
+        private val OWNER_DIRECTORY = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_EXECUTE,
+        )
     }
 }

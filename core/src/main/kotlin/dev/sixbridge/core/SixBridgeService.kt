@@ -10,6 +10,7 @@ import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.ResolvedExtensionInput
+import dev.sixbridge.core.input.SourceProjectIdentityStore
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
@@ -53,8 +54,9 @@ class SixBridgeService(
         input: String,
         profile: BrowserProfile,
         outputBundle: Path? = null,
+        projectIdentity: String? = null,
     ): SixBuildResult {
-        val resolved = inputResolver.resolve(input)
+        val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
         val source = resolved.sourceRoot
             ?: throw IllegalArgumentException("빌드할 확장 소스를 입력에서 추출하지 못했습니다.")
         val compatibility = compatibilityAnalyzer.analyze(source, profile)
@@ -117,6 +119,7 @@ class SixBridgeService(
             return PreparedCrx(parsed.extensionId, original)
         }
         val keyManager = ExtensionKeyManager(localRoot.resolve("keystore/crx"))
+        val identityStore = SourceProjectIdentityStore(localRoot.resolve("source-identities"))
         val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText())
             as? JsonObject
             ?: throw IllegalArgumentException("manifest.json의 루트가 객체가 아닙니다.")
@@ -144,7 +147,9 @@ class SixBridgeService(
             }
             existing
         } else {
-            val logicalIdentity =
+            val projectIdentity = identityStore.resolve(resolved, source)
+            val logicalIdentity = "project-$projectIdentity"
+            val manifestIdentity =
                 "manifest-${sha256(manifestName.lowercase().toByteArray()).take(32)}"
             val legacyInput = when (resolved.kind) {
                 ExtensionInputKind.SOURCE_DIRECTORY -> source.toAbsolutePath().normalize().toString()
@@ -155,8 +160,15 @@ class SixBridgeService(
             val legacyIdentity = "source-${sha256(legacyInput.toByteArray()).take(24)}"
             val leaf = source.fileName.toString()
             val existing = keyManager.getExisting(logicalIdentity)
-                ?: leaf.takeIf(EXTENSION_ID::matches)?.let(keyManager::getExisting)
-                ?: keyManager.getExisting(legacyIdentity)
+                ?: listOfNotNull(
+                    leaf.takeIf(EXTENSION_ID::matches),
+                    manifestIdentity,
+                    legacyIdentity,
+                ).firstNotNullOfOrNull { legacy ->
+                    keyManager.getExisting(legacy)?.takeIf {
+                        identityStore.claimLegacy(legacy, projectIdentity)
+                    }
+                }
             (existing ?: keyManager.getOrCreate(logicalIdentity)).also {
                 keyManager.persist(logicalIdentity, it)
             }

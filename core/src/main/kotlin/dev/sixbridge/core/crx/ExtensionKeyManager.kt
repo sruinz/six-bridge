@@ -3,6 +3,7 @@ package dev.sixbridge.core.crx
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -25,10 +26,8 @@ class ExtensionKeyManager(
         val generated = KeyPairGenerator.getInstance("RSA")
             .apply { initialize(2048) }
             .generateKeyPair()
-        privatePath.writeBytes(generated.private.encoded)
-        publicPath.writeBytes(generated.public.encoded)
-        restrictOwner(privatePath)
-        restrictOwner(publicPath)
+        writeOwnerOnly(privatePath, generated.private.encoded)
+        writeOwnerOnly(publicPath, generated.public.encoded)
         return generated
     }
 
@@ -71,8 +70,8 @@ class ExtensionKeyManager(
         val safeIdentity = safeIdentity(identity)
         val privatePath = keyRoot.resolve("$safeIdentity.pk8")
         val publicPath = keyRoot.resolve("$safeIdentity.pub")
-        if (!privatePath.exists()) privatePath.writeBytes(keyPair.private.encoded)
-        if (!publicPath.exists()) publicPath.writeBytes(keyPair.public.encoded)
+        if (!privatePath.exists()) writeOwnerOnly(privatePath, keyPair.private.encoded)
+        if (!publicPath.exists()) writeOwnerOnly(publicPath, keyPair.public.encoded)
         restrictOwner(privatePath)
         restrictOwner(publicPath)
     }
@@ -95,5 +94,21 @@ class ExtensionKeyManager(
         require(Files.getPosixFilePermissions(path) == permissions) {
             "owner-only 권한 적용을 확인할 수 없습니다: $path"
         }
+    }
+
+    private fun writeOwnerOnly(path: Path, bytes: ByteArray) {
+        require(Files.getFileStore(path.parent).supportsFileAttributeView("posix")) {
+            "owner-only 권한을 적용할 수 없는 파일 시스템입니다: $path"
+        }
+        Files.createFile(path, PosixFilePermissions.asFileAttribute(OWNER_ONLY))
+        Files.write(path, bytes)
+        restrictOwner(path)
+    }
+
+    companion object {
+        private val OWNER_ONLY = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+        )
     }
 }

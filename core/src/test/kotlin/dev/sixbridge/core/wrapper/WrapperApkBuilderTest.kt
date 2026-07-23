@@ -10,6 +10,7 @@ import kotlin.io.path.readBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -35,7 +36,14 @@ class WrapperApkBuilderTest {
 
         val result = WrapperApkBuilder(sdk, localRoot).build(request)
         val manifest = ProcessRunner.run(
-            listOf(sdk.apkAnalyzer.toString(), "manifest", "print", output.toString()),
+            listOf(
+                sdk.aapt2.toString(),
+                "dump",
+                "xmltree",
+                output.toString(),
+                "--file",
+                "AndroidManifest.xml",
+            ),
         ).stdout
         val signature = ProcessRunner.run(
             listOf(sdk.apkSigner.toString(), "verify", "--verbose", output.toString()),
@@ -43,8 +51,8 @@ class WrapperApkBuilderTest {
 
         assertEquals("dev.sixbridge.ext.${crx.extensionId}", result.packageName)
         assertEquals(1, result.versionCode)
-        assertTrue("""android:scheme="six"""" in manifest)
-        assertTrue("""android:host="ex"""" in manifest)
+        assertTrue(""":scheme(0x01010027)="six"""" in manifest)
+        assertTrue(""":host(0x01010028)="ex"""" in manifest)
         assertTrue("extension-id" in manifest)
         assertTrue("${result.packageName}.contentprovider" in manifest)
         assertTrue(
@@ -98,5 +106,53 @@ class WrapperApkBuilderTest {
         assertTrue(first.signerSha256.isNotBlank())
         assertEquals(first.signerSha256, second.signerSha256)
         assertTrue(outputs.resolve("one.apk").readBytes().isNotEmpty())
+    }
+
+    @Test
+    fun `rejects a corrupt version store instead of resetting it`() {
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 version 저장 검증을 실행할 수 없습니다.")
+        val source = Files.createTempDirectory("six-wrapper-corrupt-version-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Corrupt version","version":"1"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val crx = Crx3.pack(source, keyPair)
+        val localRoot = Files.createTempDirectory("six-wrapper-corrupt-version-local")
+        val builder = WrapperApkBuilder(sdk, localRoot)
+        val output = Files.createTempFile("six-wrapper-corrupt-version", ".apk")
+        builder.build(WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output))
+        localRoot.resolve("versions/${crx.extensionId}.txt").writeText("broken")
+
+        assertFailsWith<IllegalArgumentException> {
+            builder.build(
+                WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output),
+            )
+        }
+    }
+
+    @Test
+    fun `uses an existing output APK as the version floor when the store is missing`() {
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 version 하한 검증을 실행할 수 없습니다.")
+        val source = Files.createTempDirectory("six-wrapper-version-floor-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Version floor","version":"1"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val crx = Crx3.pack(source, keyPair)
+        val localRoot = Files.createTempDirectory("six-wrapper-version-floor-local")
+        val builder = WrapperApkBuilder(sdk, localRoot)
+        val output = Files.createTempFile("six-wrapper-version-floor", ".apk")
+        val first = builder.build(
+            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output),
+        )
+        Files.delete(localRoot.resolve("versions/${crx.extensionId}.txt"))
+
+        val second = builder.build(
+            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output),
+        )
+
+        assertEquals(first.versionCode + 1, second.versionCode)
     }
 }

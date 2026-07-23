@@ -2,11 +2,14 @@ package dev.sixbridge.core.device
 
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.bundle.ExtensionDescriptor
+import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.ProcessRunner
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.time.Instant
+import java.util.zip.ZipFile
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 
@@ -158,6 +161,7 @@ class AdbDeviceClient(
 
     private fun verifyWrapperApk(apk: Path, descriptor: ExtensionDescriptor) {
         val toolchain = AndroidToolchain.locate()
+        verifyEmbeddedCrx(apk, descriptor)
         val badging = ProcessRunner.run(
             listOf(toolchain.aapt2.toString(), "dump", "badging", apk.toString()),
         ).stdout
@@ -172,6 +176,17 @@ class AdbDeviceClient(
         require(actualVersionCode == descriptor.wrapperVersionCode) {
             "wrapper APK versionCode가 descriptor와 일치하지 않습니다."
         }
+        val manifestTree = ProcessRunner.run(
+            listOf(
+                toolchain.aapt2.toString(),
+                "dump",
+                "xmltree",
+                apk.toString(),
+                "--file",
+                "AndroidManifest.xml",
+            ),
+        ).stdout
+        verifyAndroidContract(manifestTree, descriptor)
         val certificates = ProcessRunner.run(
             listOf(
                 toolchain.apkSigner.toString(),
@@ -191,6 +206,136 @@ class AdbDeviceClient(
         }
     }
 
+    private fun verifyEmbeddedCrx(apk: Path, descriptor: ExtensionDescriptor) {
+        val embedded = ZipFile(apk.toFile()).use { zip ->
+            val matches = zip.entries().asSequence()
+                .filter { it.name == EMBEDDED_CRX && !it.isDirectory }
+                .toList()
+            require(matches.size == 1) {
+                "wrapper APK는 $EMBEDDED_CRX 파일을 정확히 하나 포함해야 합니다."
+            }
+            val entry = matches.single()
+            require(entry.size in 1..MAX_EMBEDDED_CRX_SIZE) {
+                "wrapper APK embedded CRX 크기가 올바르지 않습니다."
+            }
+            zip.getInputStream(entry).use { input ->
+                input.readNBytes((MAX_EMBEDDED_CRX_SIZE + 1).toInt())
+            }.also {
+                require(it.size.toLong() <= MAX_EMBEDDED_CRX_SIZE) {
+                    "wrapper APK embedded CRX가 너무 큽니다."
+                }
+            }
+        }
+        require(sha256(embedded) == descriptor.crxSha256) {
+            "wrapper APK embedded CRX SHA-256이 descriptor와 일치하지 않습니다."
+        }
+        val parsed = Crx3.parse(embedded)
+        require(parsed.extensionId == descriptor.extensionId) {
+            "wrapper APK embedded CRX ID가 descriptor와 일치하지 않습니다."
+        }
+    }
+
+    private fun verifyAndroidContract(xmlTree: String, descriptor: ExtensionDescriptor) {
+        val root = parseManifestTree(xmlTree)
+        require(root.name == "manifest" &&
+            root.attributes["package"] == descriptor.wrapperPackage
+        ) {
+            "wrapper Android manifest package가 descriptor와 일치하지 않습니다."
+        }
+        val applications = root.children.filter { it.name == "application" }
+        require(applications.size == 1) {
+            "wrapper Android manifest application 계약이 올바르지 않습니다."
+        }
+        val application = applications.single()
+        val metadataMatches = application.children
+            .filter {
+                it.name == "meta-data" &&
+                    it.attributes["name"] == "extension-id" &&
+                    it.attributes["value"] == descriptor.extensionId
+            }
+        require(metadataMatches.size == 1) {
+            "wrapper Android manifest extension-id metadata가 올바르지 않습니다."
+        }
+
+        val discovery = application.children.filter { it.name == "activity" }.any { activity ->
+            activity.children.filter { it.name == "intent-filter" }.any { filter ->
+                val actions = filter.children.filter { it.name == "action" }
+                    .mapNotNull { it.attributes["name"] }
+                    .toSet()
+                val categories = filter.children.filter { it.name == "category" }
+                    .mapNotNull { it.attributes["name"] }
+                    .toSet()
+                val data = filter.children.filter { it.name == "data" }
+                "android.intent.action.VIEW" in actions &&
+                    "android.intent.category.BROWSABLE" in categories &&
+                    data.any {
+                        it.attributes["scheme"] == "six" &&
+                            it.attributes["host"] == "ex"
+                    }
+            }
+        }
+        require(discovery) {
+            "wrapper Android manifest에 VIEW/BROWSABLE six://ex Activity가 없습니다."
+        }
+
+        val expectedAuthority = "${descriptor.wrapperPackage}.contentprovider"
+        val providers = application.children
+            .filter {
+                it.name == "provider" &&
+                    it.attributes["authorities"] == expectedAuthority
+            }
+        require(providers.size == 1) {
+            "wrapper Android manifest provider authority가 올바르지 않습니다."
+        }
+        require(providers.single().attributes["exported"] == "true") {
+            "wrapper Android manifest provider는 exported=true여야 합니다."
+        }
+    }
+
+    private fun parseManifestTree(output: String): ManifestNode {
+        val roots = mutableListOf<ManifestNode>()
+        val stack = mutableListOf<Pair<Int, ManifestNode>>()
+        output.lineSequence().forEach { line ->
+            val indent = line.indexOfFirst { !it.isWhitespace() }.takeIf { it >= 0 }
+                ?: return@forEach
+            val trimmed = line.trimStart()
+            when {
+                trimmed.startsWith("E: ") -> {
+                    while (stack.isNotEmpty() && stack.last().first >= indent) {
+                        stack.removeLast()
+                    }
+                    val name = trimmed.removePrefix("E: ").substringBefore(' ').trim()
+                    val node = ManifestNode(name)
+                    stack.lastOrNull()?.second?.children?.add(node) ?: roots.add(node)
+                    stack += indent to node
+                }
+                trimmed.startsWith("A: ") && stack.isNotEmpty() -> {
+                    val encoded = trimmed.removePrefix("A: ")
+                    val equals = encoded.indexOf('=')
+                    if (equals > 0) {
+                        val name = encoded.substring(0, equals)
+                            .substringAfterLast(':')
+                            .substringBefore('(')
+                            .trim()
+                        val value = encoded.substring(equals + 1)
+                            .substringBefore(" (Raw:")
+                            .trim()
+                            .removeSurrounding("\"")
+                        stack.last().second.attributes[name] = value
+                    }
+                }
+            }
+        }
+        return roots.singleOrNull { it.name == "manifest" }
+            ?: throw IllegalArgumentException("wrapper Android manifest tree를 읽을 수 없습니다.")
+    }
+
+    private data class ManifestNode(
+        val name: String,
+        val attributes: MutableMap<String, String> = linkedMapOf(),
+        val children: MutableList<ManifestNode> = mutableListOf(),
+    )
+
     private fun adb(serial: String, vararg arguments: String): String =
         ProcessRunner.run(listOf(adb, "-s", serial) + arguments).stdout
 
@@ -209,10 +354,17 @@ class AdbDeviceClient(
     }
 
     companion object {
+        private const val EMBEDDED_CRX = "assets/extension.crx"
+        private const val MAX_EMBEDDED_CRX_SIZE = 128L * 1024 * 1024
         private val EXTENSION_ID = Regex("[a-p]{32}")
         private val PACKAGE_BADGING =
             Regex("""package: name='([^']+)' versionCode='(\d+)'""")
         private val SIGNER_SHA =
             Regex("""Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F:]+)""")
+
+        private fun sha256(bytes: ByteArray): String =
+            MessageDigest.getInstance("SHA-256")
+                .digest(bytes)
+                .joinToString("") { "%02x".format(it) }
     }
 }
