@@ -1,0 +1,18 @@
+.gradle/
+build/
+**/build/
+.idea/
+*.iml
+.DS_Store
+*.apk
+*.apk.idsig
+*.crx
+
+# SIX Bridge keeps extension sources and all signing material local.
+.local/
+
+# Generated proof-of-concept artifacts.
+dist/
+
+# Subagent-driven development scratch state.
+.superpowers/
