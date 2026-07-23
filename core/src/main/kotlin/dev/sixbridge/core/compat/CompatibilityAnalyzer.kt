@@ -182,7 +182,7 @@ class CompatibilityAnalyzer(
     private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()
         var dynamicUsage = false
-        val runtimeScripts = manifestRuntimeScripts(root, manifest)
+        val runtimeScripts = runtimeResourceClosure(root, manifest)
         Files.walk(root).use { paths ->
             paths.filter { path ->
                 path.isRegularFile() &&
@@ -200,7 +200,9 @@ class CompatibilityAnalyzer(
                 val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
                 val aliases = mutableSetOf<String>()
                 val consumedRoots = mutableSetOf<Int>()
-                ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments).forEach { declaration ->
+                ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments)
+                    .filter { it.startsInCode(codeOnly) }
+                    .forEach { declaration ->
                     val kind = declaration.groupValues[1]
                     val alias = declaration.groupValues[2]
                     val expression = declaration.groupValues[3].trim()
@@ -232,17 +234,23 @@ class CompatibilityAnalyzer(
                         dynamicUsage = true
                     }
                 }
-                API_CALL_REGEX.findAll(sourceWithoutComments).forEach { match ->
+                API_CALL_REGEX.findAll(sourceWithoutComments)
+                    .filter { it.startsInCode(codeOnly) }
+                    .forEach { match ->
                     found += match.groupValues[1]
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
-                BRACKET_API_REGEX.findAll(sourceWithoutComments).forEach { match ->
+                BRACKET_API_REGEX.findAll(sourceWithoutComments)
+                    .filter { it.startsInCode(codeOnly) }
+                    .forEach { match ->
                     found += match.groupValues[1]
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
-                DESTRUCTURING_REGEX.findAll(sourceWithoutComments).forEach { match ->
+                DESTRUCTURING_REGEX.findAll(sourceWithoutComments)
+                    .filter { it.startsInCode(codeOnly) }
+                    .forEach { match ->
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                     match.groupValues[1].split(',').forEach { binding ->
@@ -254,17 +262,25 @@ class CompatibilityAnalyzer(
                     }
                 }
                 aliases.forEach { alias ->
-                    aliasMemberRegex(alias).findAll(sourceWithoutComments).forEach { match ->
+                    aliasMemberRegex(alias).findAll(sourceWithoutComments)
+                        .filter { it.startsInCode(codeOnly) }
+                        .forEach { match ->
                         found += match.groupValues[1]
                     }
-                    aliasBracketRegex(alias).findAll(sourceWithoutComments).forEach { match ->
+                    aliasBracketRegex(alias).findAll(sourceWithoutComments)
+                        .filter { it.startsInCode(codeOnly) }
+                        .forEach { match ->
                         found += match.groupValues[1]
                     }
-                    if (aliasDynamicBracketRegex(alias).containsMatchIn(sourceWithoutComments)) {
+                    if (aliasDynamicBracketRegex(alias).findAll(sourceWithoutComments)
+                            .any { it.startsInCode(codeOnly) }
+                    ) {
                         dynamicUsage = true
                     }
                 }
-                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(sourceWithoutComments)) {
+                if (DYNAMIC_BRACKET_REGEX.findAll(sourceWithoutComments)
+                        .any { it.startsInCode(codeOnly) }
+                ) {
                     dynamicUsage = true
                 }
                 val rootScanCode = if (path.extension.lowercase() == "html") {
@@ -282,7 +298,9 @@ class CompatibilityAnalyzer(
                 ) {
                     dynamicUsage = true
                 }
-                if (NATIVE_MESSAGING_REGEX.containsMatchIn(sourceWithoutComments)) {
+                if (NATIVE_MESSAGING_REGEX.findAll(sourceWithoutComments)
+                        .any { it.startsInCode(codeOnly) }
+                ) {
                     found += "nativeMessaging"
                 }
             }
@@ -290,7 +308,7 @@ class CompatibilityAnalyzer(
         return ApiScan(found, dynamicUsage)
     }
 
-    private fun manifestRuntimeScripts(root: Path, manifest: JsonObject): Set<Path> {
+    private fun runtimeResourceClosure(root: Path, manifest: JsonObject): Set<Path> {
         val resources = mutableSetOf<String>()
         (manifest["background"] as? JsonObject)
             ?.stringOrNull("service_worker")
@@ -306,9 +324,99 @@ class CompatibilityAnalyzer(
         (manifest["options_ui"] as? JsonObject)
             ?.stringOrNull("page")
             ?.let(resources::add)
-        return resources.mapTo(mutableSetOf()) {
-            root.resolve(it).toAbsolutePath().normalize()
+
+        val normalizedRoot = root.toAbsolutePath().normalize()
+        val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
+            ?: return emptySet()
+        val runtimeResources = mutableSetOf<Path>()
+        val pending = mutableListOf<Path>()
+        var pendingIndex = 0
+
+        fun enqueue(base: Path, resource: String) {
+            val path = resolveLocalRuntimeResource(
+                normalizedRoot,
+                realRoot,
+                base,
+                resource,
+            ) ?: return
+            if (runtimeResources.add(path)) pending.add(path)
         }
+
+        resources.forEach { enqueue(normalizedRoot, it) }
+        while (pendingIndex < pending.size) {
+            val resource = pending[pendingIndex++]
+            val source = runCatching { resource.readText() }.getOrDefault("")
+            val dependencies = when (resource.extension.lowercase()) {
+                "html" -> htmlScriptDependencies(source)
+                "js", "mjs", "cjs" -> javaScriptDependencies(source)
+                else -> emptySet()
+            }
+            dependencies.forEach { enqueue(resource.parent, it) }
+        }
+        return runtimeResources
+    }
+
+    private fun resolveLocalRuntimeResource(
+        root: Path,
+        realRoot: Path,
+        base: Path,
+        resource: String,
+    ): Path? {
+        if (resource.isBlank() ||
+            '\\' in resource ||
+            ':' in resource ||
+            '?' in resource ||
+            '#' in resource ||
+            resource.startsWith("//")
+        ) {
+            return null
+        }
+        val target = if (resource.startsWith("/")) {
+            root.resolve(resource.removePrefix("/"))
+        } else {
+            base.resolve(resource)
+        }.toAbsolutePath().normalize()
+        if (!target.startsWith(root) || !target.isRegularFile()) return null
+        val insideRealRoot = runCatching { target.toRealPath().startsWith(realRoot) }
+            .getOrDefault(false)
+        return target.takeIf { insideRealRoot }
+    }
+
+    private fun htmlScriptDependencies(source: String): Set<String> {
+        val dependencies = mutableSetOf<String>()
+        var cursor = 0
+        while (cursor < source.length) {
+            val opening = source.indexOf("<script", cursor, ignoreCase = true)
+            if (opening < 0) break
+            val nameEnd = opening + "<script".length
+            if (source.getOrNull(nameEnd)?.let { !it.isWhitespace() && it != '>' } == true) {
+                cursor = nameEnd
+                continue
+            }
+            val openingEnd = source.indexOf('>', nameEnd)
+            if (openingEnd < 0) break
+            val tag = source.substring(opening, openingEnd + 1)
+            SCRIPT_SRC_ATTRIBUTE.find(tag)?.groupValues?.get(2)?.let(dependencies::add)
+            cursor = openingEnd + 1
+        }
+        return dependencies
+    }
+
+    private fun javaScriptDependencies(source: String): Set<String> {
+        val sourceWithoutComments = maskJsLiteralsAndComments(source, maskLiterals = false)
+        val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
+        val dependencies = mutableSetOf<String>()
+        STATIC_MODULE_SPECIFIER.findAll(sourceWithoutComments)
+            .filter { it.startsInCode(codeOnly) }
+            .forEach { dependencies += it.groupValues[2] }
+        IMPORT_SCRIPTS_CALL.findAll(sourceWithoutComments)
+            .filter { it.startsInCode(codeOnly) }
+            .forEach { call ->
+                STRING_LITERAL.findAll(call.groupValues[1]).forEach { literal ->
+                    dependencies += literal.groupValues[2]
+                }
+            }
+        return dependencies
     }
 
     private fun validateResources(
@@ -398,7 +506,10 @@ class CompatibilityAnalyzer(
         var state = CODE
         var index = 0
         var regexCharacterClass = false
+        var regexAllowed = true
+        var pendingControlKeyword: String? = null
         val templateExpressionDepths = mutableListOf<Int>()
+        val controlParentheses = mutableListOf<String?>()
 
         fun mask(position: Int) {
             if (masked[position] != '\r' && masked[position] != '\n') {
@@ -413,6 +524,8 @@ class CompatibilityAnalyzer(
                     templateExpressionDepths.isNotEmpty() && current == '{' -> {
                         val last = templateExpressionDepths.lastIndex
                         templateExpressionDepths[last]++
+                        pendingControlKeyword = null
+                        regexAllowed = true
                         index++
                     }
                     templateExpressionDepths.isNotEmpty() && current == '}' -> {
@@ -423,19 +536,45 @@ class CompatibilityAnalyzer(
                             mask(index)
                             state = TEMPLATE_TEXT
                         }
+                        pendingControlKeyword = null
+                        regexAllowed = false
+                        index++
+                    }
+                    current.isWhitespace() -> index++
+                    current.isJavaIdentifierStart() -> {
+                        var end = index + 1
+                        while (source.getOrNull(end)?.isJavaIdentifierPart() == true) end++
+                        val word = source.substring(index, end)
+                        if (!(pendingControlKeyword == "for" && word == "await")) {
+                            pendingControlKeyword = word.takeIf {
+                                it in CONTROL_PAREN_KEYWORDS
+                            }
+                        }
+                        regexAllowed = word in REGEX_PREFIX_KEYWORDS
+                        index = end
+                    }
+                    current.isDigit() -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         index++
                     }
                     current == '\'' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         state = SINGLE_QUOTED
                         if (maskLiterals) mask(index)
                         index++
                     }
                     current == '"' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         state = DOUBLE_QUOTED
                         if (maskLiterals) mask(index)
                         index++
                     }
                     current == '`' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         state = TEMPLATE_TEXT
                         mask(index)
                         index++
@@ -452,13 +591,60 @@ class CompatibilityAnalyzer(
                         state = BLOCK_COMMENT
                         index += 2
                     }
-                    current == '/' && isRegexLiteralStart(source, index) -> {
+                    current == '/' && regexAllowed -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         mask(index)
                         regexCharacterClass = false
                         state = REGEX_LITERAL
                         index++
                     }
-                    else -> index++
+                    current == '/' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = true
+                        index++
+                    }
+                    current == '(' -> {
+                        controlParentheses.add(pendingControlKeyword)
+                        pendingControlKeyword = null
+                        regexAllowed = true
+                        index++
+                    }
+                    current == ')' -> {
+                        regexAllowed = if (controlParentheses.isEmpty()) {
+                            false
+                        } else {
+                            controlParentheses.removeAt(controlParentheses.lastIndex) != null
+                        }
+                        pendingControlKeyword = null
+                        index++
+                    }
+                    current == '[' || current == '{' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = true
+                        index++
+                    }
+                    current == ']' || current == '}' || current == '.' -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
+                        index++
+                    }
+                    (current == '+' || current == '-') &&
+                        source.getOrNull(index + 1) == current -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
+                        index += 2
+                    }
+                    current in REGEX_PREFIX_CHARS -> {
+                        pendingControlKeyword = null
+                        regexAllowed = true
+                        index++
+                    }
+                    else -> {
+                        pendingControlKeyword = null
+                        regexAllowed = false
+                        index++
+                    }
                 }
                 SINGLE_QUOTED, DOUBLE_QUOTED -> {
                     val closing = when (state) {
@@ -486,6 +672,8 @@ class CompatibilityAnalyzer(
                     current == '`' -> {
                         mask(index)
                         state = CODE
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         index++
                     }
                     current == '$' && source.getOrNull(index + 1) == '{' -> {
@@ -493,6 +681,8 @@ class CompatibilityAnalyzer(
                         mask(index + 1)
                         templateExpressionDepths += 1
                         state = CODE
+                        pendingControlKeyword = null
+                        regexAllowed = true
                         index += 2
                     }
                     else -> {
@@ -546,6 +736,8 @@ class CompatibilityAnalyzer(
                             mask(index)
                             index++
                         }
+                        pendingControlKeyword = null
+                        regexAllowed = false
                         state = CODE
                     }
                     else -> {
@@ -558,16 +750,8 @@ class CompatibilityAnalyzer(
         return masked.concatToString()
     }
 
-    private fun isRegexLiteralStart(source: String, slashIndex: Int): Boolean {
-        var previous = slashIndex - 1
-        while (previous >= 0 && source[previous].isWhitespace()) previous--
-        if (previous < 0) return true
-        if (source[previous] in REGEX_PREFIX_CHARS) return true
-        if (!source[previous].isJavaIdentifierPart()) return false
-        var wordStart = previous
-        while (wordStart > 0 && source[wordStart - 1].isJavaIdentifierPart()) wordStart--
-        return source.substring(wordStart, previous + 1) in REGEX_PREFIX_KEYWORDS
-    }
+    private fun MatchResult.startsInCode(codeOnly: String): Boolean =
+        codeOnly.getOrNull(range.first)?.isJavaIdentifierStart() == true
 
     private fun maskHtmlOutsideScripts(source: String): String {
         val masked = source.map { if (it == '\r' || it == '\n') it else ' ' }.toCharArray()
@@ -690,6 +874,15 @@ class CompatibilityAnalyzer(
         private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
         private val ROOT_SCHEME_LITERAL_REGEX =
             Regex("""\b(?:chrome|browser)\b(?:-extension)?\s*:""")
+        private val SCRIPT_SRC_ATTRIBUTE =
+            Regex("""(?:^|\s)src\s*=\s*(["'])([^"']+)\1""", RegexOption.IGNORE_CASE)
+        private val STATIC_MODULE_SPECIFIER = Regex(
+            """\b(?:import\s+(?:[^;\r\n]*?\s+from\s+)?|""" +
+                """export\s+[^;\r\n]*?\s+from\s+)(["'])([^"']+)\1""",
+        )
+        private val IMPORT_SCRIPTS_CALL =
+            Regex("""\bimportScripts\s*\(([^)\r\n]*)\)""")
+        private val STRING_LITERAL = Regex("""(["'])([^"']+)\1""")
         private const val CODE = 0
         private const val SINGLE_QUOTED = 1
         private const val DOUBLE_QUOTED = 2
@@ -716,6 +909,8 @@ class CompatibilityAnalyzer(
             "void",
             "yield",
         )
+        private val CONTROL_PAREN_KEYWORDS =
+            setOf("if", "while", "for", "with", "switch", "catch")
         private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")

@@ -542,6 +542,146 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `scans test named scripts loaded by a runtime popup`() {
+        val source = Files.createTempDirectory("six-popup-script-dependency")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Popup script dependency",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """<script src="popup.test.js"></script>""",
+        )
+        source.resolve("popup.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("webstorePrivate" in report.usedApis)
+    }
+
+    @Test
+    fun `scans test named scripts loaded by importScripts`() {
+        val source = Files.createTempDirectory("six-import-scripts-dependency")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "ImportScripts dependency",
+              "version": "1",
+              "background": {"service_worker": "worker.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("worker.js").writeText(
+            """importScripts("helper.test.js");""",
+        )
+        source.resolve("helper.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("downloads" in report.usedApis)
+    }
+
+    @Test
+    fun `scans test named static import and export dependencies`() {
+        val source = Files.createTempDirectory("six-static-module-dependencies")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Static module dependencies",
+              "version": "1",
+              "background": {
+                "service_worker": "worker.js",
+                "type": "module"
+              }
+            }
+            """.trimIndent(),
+        )
+        source.resolve("worker.js").writeText(
+            """
+            import "./imported.test.js";
+            export { helper } from "./exported.test.js";
+            """.trimIndent(),
+        )
+        source.resolve("imported.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+        source.resolve("exported.test.js").writeText(
+            "export const helper = () => chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("webstorePrivate" in report.usedApis)
+        assertTrue("downloads" in report.usedApis)
+    }
+
+    @Test
+    fun `recognizes a regex literal after a control condition`() {
+        val source = Files.createTempDirectory("six-control-condition-regex")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Control condition regex",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            if (ready) /[/*]/.test(value);
+            chrome.webstorePrivate.install();
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("webstorePrivate" in report.usedApis)
+    }
+
+    @Test
+    fun `ignores API calls in strings while scanning real calls`() {
+        val source = Files.createTempDirectory("six-api-call-string")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "API call string",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            const example = "chrome.webstorePrivate.install()";
+            chrome.storage.local.get("value");
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+    }
+
+    @Test
     fun `scans a large minified string without exhausting the regex stack`() {
         val source = Files.createTempDirectory("six-large-minified-string")
         source.resolve("manifest.json").writeText(
