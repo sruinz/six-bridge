@@ -26,7 +26,11 @@ class BrowserProfileExtractorTest {
             zip.closeEntry()
             zip.putNextEntry(ZipEntry("lib/arm64-v8a/libterrace.so"))
             zip.write(
-                """{"namespace":"storage"}{"namespace":"tabs"}{"namespace":"offscreen"}"""
+                """
+                {"namespace":"storage"}{"namespace":"tabs"}{"namespace":"offscreen"}
+                {"namespace":"debugger"}{"namespace":"downloads"}
+                {"namespace":"nativeMessaging"}{"namespace":"webstorePrivate"}
+                """.trimIndent()
                     .toByteArray(),
             )
             zip.closeEntry()
@@ -40,7 +44,12 @@ class BrowserProfileExtractorTest {
         assertTrue(profile.wrapperContract.extensionMetadata)
         assertTrue(profile.wrapperContract.contentProvider)
         assertTrue(profile.wrapperContract.devExtensionPath)
-        assertTrue(profile.isSupportedBaseline)
+        assertFalse(profile.isSupportedBaseline)
+        assertEquals(ProfileSupport.UNKNOWN, profile.support)
+        val encoded = BrowserProfileJson.encode(profile)
+        assertTrue("\"detectedApis\"" in encoded)
+        assertTrue("\"debugger\"" in encoded)
+        assertTrue("\"webstorePrivate\"" in encoded)
     }
 
     @Test

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.profile
 
 import java.io.InputStream
+import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
@@ -57,7 +58,10 @@ class BrowserProfileExtractor {
             versionName = versionName,
             versionCode = versionCode,
             majorVersion = majorVersion,
-            supportedApis = scan.namespaces.toSortedSet(),
+            supportedApis = (
+                scan.namespaces intersect BrowserProfile.POC_SUPPORTED_APIS
+                ).toSortedSet(),
+            detectedApis = scan.namespaces.toSortedSet(),
             wrapperContract = WrapperContract(
                 discoveryUri = "six://ex" in scan.markers,
                 extensionMetadata = "extension-id" in scan.markers,
@@ -65,6 +69,7 @@ class BrowserProfileExtractor {
                 devExtensionPath = "dev_ext" in scan.markers,
             ),
             sourceApkSha256 = sha256(browserApk),
+            sourceApkSignerSha256 = readSignerSha256(browserApk).orEmpty(),
             profileDifferences = differences,
         )
     }
@@ -100,6 +105,28 @@ class BrowserProfileExtractor {
             process.inputStream.bufferedReader().readText().trim().takeIf { it.isNotEmpty() }
         }.getOrNull()
 
+    private fun readSignerSha256(browserApk: Path): String? {
+        val apkSigner = apkSignerCandidates().firstOrNull { it.exists() } ?: return null
+        return runCatching {
+            val process = ProcessBuilder(
+                apkSigner.toString(),
+                "verify",
+                "--print-certs",
+                browserApk.toString(),
+            ).start()
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return null
+            }
+            if (process.exitValue() != 0) return null
+            SIGNER_SHA_REGEX.find(process.inputStream.bufferedReader().readText())
+                ?.groupValues
+                ?.get(1)
+                ?.replace(":", "")
+                ?.lowercase()
+        }.getOrNull()
+    }
+
     private fun apkAnalyzerCandidates(): List<Path> = buildList {
         System.getenv("ANDROID_SDK_ROOT")?.let { root ->
             add(Path.of(root, "cmdline-tools/latest/bin/apkanalyzer"))
@@ -120,6 +147,24 @@ class BrowserProfileExtractor {
             ),
         )
     }.distinct()
+
+    private fun apkSignerCandidates(): List<Path> = buildList {
+        listOfNotNull(
+            System.getenv("ANDROID_SDK_ROOT"),
+            System.getenv("ANDROID_HOME"),
+            "/opt/homebrew/share/android-commandlinetools",
+            Path.of(System.getProperty("user.home"), "Library/Android/sdk").toString(),
+        ).distinct().forEach { rootValue ->
+            val buildTools = Path.of(rootValue, "build-tools")
+            if (Files.isDirectory(buildTools)) {
+                Files.list(buildTools).use { versions ->
+                    versions.sorted(Comparator.reverseOrder()).forEach { version ->
+                        add(version.resolve("apksigner"))
+                    }
+                }
+            }
+        }
+    }
 
     private fun sha256(path: Path): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -192,5 +237,7 @@ class BrowserProfileExtractor {
             Regex("""versionCode[\s:=_-]*(\d{6,})""")
         private val VERSION_CODE_FILENAME_REGEX =
             Regex("""-(\d{6,})_""")
+        private val SIGNER_SHA_REGEX =
+            Regex("""Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F:]+)""")
     }
 }

@@ -4,7 +4,11 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
@@ -43,117 +47,124 @@ class WrapperApkBuilder(
         }
         val packageName = "dev.sixbridge.ext.${request.extensionId}"
         val versionStore = VersionStore(localRoot.resolve("versions"))
-        val versionCode = versionStore.next(request.extensionId)
-        val signer = WrapperSigningStore(toolchain, localRoot.resolve("keystore"))
-        signer.ensure()
-        Files.createDirectories(request.outputApk.toAbsolutePath().parent)
-        val work = Files.createTempDirectory("sixbridge-wrapper-")
-        val manifest = work.resolve("AndroidManifest.xml")
-        manifest.writeText(
-            androidManifest(
-                packageName = packageName,
-                extensionId = request.extensionId,
-                extensionName = request.extensionName,
-                versionCode = versionCode,
-            ),
-        )
-        val javaSourceRoot = work.resolve("src/dev/sixbridge/runtime").createDirectories()
-        javaSourceRoot.resolve("SixDiscoveryActivity.java").writeText(DISCOVERY_ACTIVITY_SOURCE)
-        javaSourceRoot.resolve("ExtensionProvider.java").writeText(PROVIDER_SOURCE)
-        val classes = work.resolve("classes").createDirectories()
-        compileRuntime(javaSourceRoot, classes)
-        val dex = work.resolve("dex").createDirectories()
-        ProcessRunner.run(
-            listOf(
-                toolchain.d8.toString(),
-                "--min-api",
-                "30",
-                "--output",
-                dex.toString(),
-            ) + Files.walk(classes).use { stream ->
-                stream.filter { it.fileName.toString().endsWith(".class") }
-                    .map(Path::toString)
-                    .toList()
-            },
-        )
+        val versionReservation = versionStore.reserve(request.extensionId)
+        val versionCode = versionReservation.value
+        try {
+            val signer = WrapperSigningStore(toolchain, localRoot.resolve("keystore"))
+            signer.ensure()
+            Files.createDirectories(request.outputApk.toAbsolutePath().parent)
+            val work = Files.createTempDirectory("sixbridge-wrapper-")
+            val manifest = work.resolve("AndroidManifest.xml")
+            manifest.writeText(
+                androidManifest(
+                    packageName = packageName,
+                    extensionId = request.extensionId,
+                    extensionName = request.extensionName,
+                    versionCode = versionCode,
+                ),
+            )
+            val javaSourceRoot = work.resolve("src/dev/sixbridge/runtime").createDirectories()
+            javaSourceRoot.resolve("SixDiscoveryActivity.java").writeText(
+                DISCOVERY_ACTIVITY_SOURCE,
+            )
+            javaSourceRoot.resolve("ExtensionProvider.java").writeText(PROVIDER_SOURCE)
+            val classes = work.resolve("classes").createDirectories()
+            compileRuntime(javaSourceRoot, classes)
+            val dex = work.resolve("dex").createDirectories()
+            ProcessRunner.run(
+                listOf(
+                    toolchain.d8.toString(),
+                    "--min-api",
+                    "30",
+                    "--output",
+                    dex.toString(),
+                ) + Files.walk(classes).use { stream ->
+                    stream.filter { it.fileName.toString().endsWith(".class") }
+                        .map(Path::toString)
+                        .toList()
+                },
+            )
 
-        val base = work.resolve("base.apk")
-        ProcessRunner.run(
-            listOf(
-                toolchain.aapt2.toString(),
-                "link",
-                "-o",
-                base.toString(),
-                "-I",
-                toolchain.androidJar.toString(),
-                "--manifest",
-                manifest.toString(),
-                "--min-sdk-version",
-                "30",
-                "--target-sdk-version",
-                "36",
-                "--version-code",
-                versionCode.toString(),
-                "--version-name",
-                "1.0.$versionCode",
-            ),
-        )
-        val assembled = work.resolve("assembled.apk")
-        assembleApk(
-            baseApk = base,
-            classesDex = dex.resolve("classes.dex"),
-            crxBytes = request.crxBytes,
-            output = assembled,
-        )
-        val aligned = work.resolve("aligned.apk")
-        ProcessRunner.run(
-            listOf(
-                toolchain.zipAlign.toString(),
-                "-f",
-                "4",
-                assembled.toString(),
-                aligned.toString(),
-            ),
-        )
-        ProcessRunner.run(
-            listOf(
-                toolchain.apkSigner.toString(),
-                "sign",
-                "--ks",
-                signer.keyStore.toString(),
-                "--ks-type",
-                "PKCS12",
-                "--ks-key-alias",
-                WrapperSigningStore.ALIAS,
-                "--ks-pass",
-                "file:${signer.passwordFile}",
-                "--out",
-                request.outputApk.toString(),
-                aligned.toString(),
-            ),
-        )
-        val verify = ProcessRunner.run(
-            listOf(
-                toolchain.apkSigner.toString(),
-                "verify",
-                "--verbose",
-                "--print-certs",
-                request.outputApk.toString(),
-            ),
-        )
-        val signerSha = SIGNER_SHA_REGEX.find(verify.stdout)
-            ?.groupValues
-            ?.get(1)
-            ?.replace(":", "")
-            ?.lowercase()
-            ?: sha256(signer.keyStore.readBytes())
-        versionStore.commit(request.extensionId, versionCode)
-        return WrapperBuildResult(
-            outputApk = request.outputApk,
-            packageName = packageName,
-            versionCode = versionCode,
-            signerSha256 = signerSha,
-        )
+            val base = work.resolve("base.apk")
+            ProcessRunner.run(
+                listOf(
+                    toolchain.aapt2.toString(),
+                    "link",
+                    "-o",
+                    base.toString(),
+                    "-I",
+                    toolchain.androidJar.toString(),
+                    "--manifest",
+                    manifest.toString(),
+                    "--min-sdk-version",
+                    "30",
+                    "--target-sdk-version",
+                    "36",
+                    "--version-code",
+                    versionCode.toString(),
+                    "--version-name",
+                    "1.0.$versionCode",
+                ),
+            )
+            val assembled = work.resolve("assembled.apk")
+            assembleApk(
+                baseApk = base,
+                classesDex = dex.resolve("classes.dex"),
+                crxBytes = request.crxBytes,
+                output = assembled,
+            )
+            val aligned = work.resolve("aligned.apk")
+            ProcessRunner.run(
+                listOf(
+                    toolchain.zipAlign.toString(),
+                    "-f",
+                    "4",
+                    assembled.toString(),
+                    aligned.toString(),
+                ),
+            )
+            ProcessRunner.run(
+                listOf(
+                    toolchain.apkSigner.toString(),
+                    "sign",
+                    "--ks",
+                    signer.keyStore.toString(),
+                    "--ks-type",
+                    "PKCS12",
+                    "--ks-key-alias",
+                    WrapperSigningStore.ALIAS,
+                    "--ks-pass",
+                    "file:${signer.passwordFile}",
+                    "--out",
+                    request.outputApk.toString(),
+                    aligned.toString(),
+                ),
+            )
+            val verify = ProcessRunner.run(
+                listOf(
+                    toolchain.apkSigner.toString(),
+                    "verify",
+                    "--verbose",
+                    "--print-certs",
+                    request.outputApk.toString(),
+                ),
+            )
+            val signerSha = SIGNER_SHA_REGEX.find(verify.stdout)
+                ?.groupValues
+                ?.get(1)
+                ?.replace(":", "")
+                ?.lowercase()
+                ?: sha256(signer.keyStore.readBytes())
+            versionReservation.commit()
+            return WrapperBuildResult(
+                outputApk = request.outputApk,
+                packageName = packageName,
+                versionCode = versionCode,
+                signerSha256 = signerSha,
+            )
+        } finally {
+            versionReservation.close()
+        }
     }
 
     private fun compileRuntime(sourceRoot: Path, classes: Path) {
@@ -358,16 +369,68 @@ class WrapperApkBuilder(
 private class VersionStore(
     private val directory: Path,
 ) {
-    fun next(extensionId: String): Int {
+    fun reserve(extensionId: String): VersionReservation {
+        directory.createDirectories()
         val file = directory.resolve("$extensionId.txt")
-        val current = if (file.exists()) file.readText().trim().toIntOrNull() ?: 0 else 0
-        require(current < Int.MAX_VALUE) { "versionCode가 최대값에 도달했습니다." }
-        return current + 1
+        val channel = FileChannel.open(
+            directory.resolve("$extensionId.lock"),
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+        )
+        val lock = try {
+            channel.lock()
+        } catch (error: Throwable) {
+            channel.close()
+            throw error
+        }
+        return try {
+            val current = if (file.exists()) {
+                file.readText().trim().toIntOrNull() ?: 0
+            } else {
+                0
+            }
+            require(current < Int.MAX_VALUE) { "versionCode가 최대값에 도달했습니다." }
+            VersionReservation(file, current + 1, channel, lock)
+        } catch (error: Throwable) {
+            lock.release()
+            channel.close()
+            throw error
+        }
+    }
+}
+
+private class VersionReservation(
+    private val file: Path,
+    val value: Int,
+    private val channel: FileChannel,
+    private val lock: FileLock,
+) : AutoCloseable {
+    private var committed = false
+
+    fun commit() {
+        check(!committed) { "versionCode reservation은 한 번만 commit할 수 있습니다." }
+        val temporary = Files.createTempFile(file.parent, ".${file.fileName}", ".tmp")
+        try {
+            Files.writeString(
+                temporary,
+                value.toString(),
+                StandardOpenOption.TRUNCATE_EXISTING,
+            )
+            Files.move(
+                temporary,
+                file,
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+            committed = true
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
     }
 
-    fun commit(extensionId: String, value: Int) {
-        directory.createDirectories()
-        directory.resolve("$extensionId.txt").writeText(value.toString())
+    override fun close() {
+        if (lock.isValid) lock.release()
+        if (channel.isOpen) channel.close()
     }
 }
 
@@ -419,14 +482,16 @@ private class WrapperSigningStore(
     }
 
     private fun restrictOwner(path: Path) {
-        runCatching {
-            Files.setPosixFilePermissions(
-                path,
-                setOf(
-                    PosixFilePermission.OWNER_READ,
-                    PosixFilePermission.OWNER_WRITE,
-                ),
-            )
+        require(Files.getFileStore(path).supportsFileAttributeView("posix")) {
+            "owner-only 권한을 적용할 수 없는 파일 시스템입니다: $path"
+        }
+        val permissions = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+        )
+        Files.setPosixFilePermissions(path, permissions)
+        require(Files.getPosixFilePermissions(path) == permissions) {
+            "owner-only 권한 적용을 확인할 수 없습니다: $path"
         }
     }
 

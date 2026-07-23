@@ -14,6 +14,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -25,6 +26,7 @@ data class ExtensionDescriptor(
     val version: String,
     val sourceKind: String,
     val crxSha256: String,
+    val wrapperSha256: String,
     val wrapperPackage: String,
     val wrapperVersionCode: Int,
     val signerSha256: String,
@@ -69,16 +71,25 @@ object SixBundle {
                     "SixBundle 항목은 ${requiredEntries.sorted()}만 포함해야 합니다. 감지: ${names.sorted()}",
                 )
             }
-            val wrapper = zip.getInputStream(zip.getEntry("wrapper.apk")).readBytes()
-            val extensionJson = zip.getInputStream(zip.getEntry("extension.json"))
-                .bufferedReader()
-                .readText()
-            val compatibilityJson = zip.getInputStream(zip.getEntry("compatibility.json"))
-                .bufferedReader()
-                .readText()
+            var totalSize = 0L
+            requiredEntries.forEach { name ->
+                val entry = zip.getEntry(name)
+                validateEntry(entry)
+                totalSize += entry.size
+            }
+            require(totalSize <= MAX_TOTAL_SIZE) { "SixBundle 압축 해제 크기가 제한을 초과합니다." }
+            val wrapper = readEntry(zip, "wrapper.apk", MAX_WRAPPER_SIZE)
+            val extensionJson = readEntry(zip, "extension.json", MAX_METADATA_SIZE)
+                .decodeToString()
+            val compatibilityJson = readEntry(zip, "compatibility.json", MAX_METADATA_SIZE)
+                .decodeToString()
+            val extension = decodeExtension(extensionJson)
+            require(sha256(wrapper) == extension.wrapperSha256) {
+                "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
+            }
             SixBundleContents(
                 wrapperApk = wrapper,
-                extension = decodeExtension(extensionJson),
+                extension = extension,
                 compatibility = decodeCompatibility(compatibilityJson),
             )
         }
@@ -98,6 +109,7 @@ object SixBundle {
                 "version" to JsonPrimitive(value.version),
                 "sourceKind" to JsonPrimitive(value.sourceKind),
                 "crxSha256" to JsonPrimitive(value.crxSha256),
+                "wrapperSha256" to JsonPrimitive(value.wrapperSha256),
                 "wrapperPackage" to JsonPrimitive(value.wrapperPackage),
                 "wrapperVersionCode" to JsonPrimitive(value.wrapperVersionCode),
                 "signerSha256" to JsonPrimitive(value.signerSha256),
@@ -145,20 +157,45 @@ object SixBundle {
 
     private fun decodeExtension(value: String): ExtensionDescriptor {
         val objectValue = json.parseToJsonElement(value).jsonObject
-        return ExtensionDescriptor(
+        require(objectValue.requiredInt("schemaVersion") == SCHEMA_VERSION) {
+            "지원하지 않는 extension.json schemaVersion입니다."
+        }
+        val descriptor = ExtensionDescriptor(
             extensionId = objectValue.requiredString("extensionId"),
             name = objectValue.requiredString("name"),
             version = objectValue.requiredString("version"),
             sourceKind = objectValue.requiredString("sourceKind"),
             crxSha256 = objectValue.requiredString("crxSha256"),
+            wrapperSha256 = objectValue.requiredString("wrapperSha256"),
             wrapperPackage = objectValue.requiredString("wrapperPackage"),
-            wrapperVersionCode = objectValue.getValue("wrapperVersionCode").jsonPrimitive.int,
+            wrapperVersionCode = objectValue.requiredInt("wrapperVersionCode"),
             signerSha256 = objectValue.requiredString("signerSha256"),
         )
+        require(EXTENSION_ID.matches(descriptor.extensionId)) {
+            "올바르지 않은 extension ID입니다."
+        }
+        require(descriptor.sourceKind in SOURCE_KINDS) { "올바르지 않은 sourceKind입니다." }
+        require(SHA256.matches(descriptor.crxSha256)) { "올바르지 않은 CRX SHA-256입니다." }
+        require(SHA256.matches(descriptor.wrapperSha256)) {
+            "올바르지 않은 wrapper SHA-256입니다."
+        }
+        require(SHA256.matches(descriptor.signerSha256)) {
+            "올바르지 않은 signer SHA-256입니다."
+        }
+        require(descriptor.wrapperVersionCode > 0) { "wrapperVersionCode는 양수여야 합니다." }
+        require(
+            descriptor.wrapperPackage == "dev.sixbridge.ext.${descriptor.extensionId}",
+        ) {
+            "wrapper package가 extension ID와 일치하지 않습니다."
+        }
+        return descriptor
     }
 
     private fun decodeCompatibility(value: String): CompatibilityReport {
         val objectValue = json.parseToJsonElement(value).jsonObject
+        require(objectValue.requiredInt("schemaVersion") == SCHEMA_VERSION) {
+            "지원하지 않는 compatibility.json schemaVersion입니다."
+        }
         return CompatibilityReport(
             status = CompatibilityStatus.valueOf(
                 objectValue.requiredString("status").uppercase(),
@@ -198,7 +235,15 @@ object SixBundle {
     }
 
     private fun JsonObject.requiredString(name: String): String =
-        getValue(name).jsonPrimitive.content
+        getValue(name).jsonPrimitive.let { primitive ->
+            require(primitive.isString && primitive.content.isNotBlank()) {
+                "$name 필드는 비어 있지 않은 문자열이어야 합니다."
+            }
+            primitive.content
+        }
+
+    private fun JsonObject.requiredInt(name: String): Int =
+        getValue(name).jsonPrimitive.int
 
     private fun JsonObject.stringSet(name: String): Set<String> =
         getValue(name).jsonArray.map { it.jsonPrimitive.content }.toSet()
@@ -211,4 +256,42 @@ object SixBundle {
         zip.write(bytes)
         zip.closeEntry()
     }
+
+    private fun validateEntry(entry: ZipEntry) {
+        require(!entry.isDirectory && entry.size in 0..MAX_WRAPPER_SIZE) {
+            "SixBundle 항목 크기가 제한을 초과합니다: ${entry.name}"
+        }
+        if (entry.compressedSize > 0 && entry.size > 0) {
+            require(entry.size.toDouble() / entry.compressedSize <= MAX_COMPRESSION_RATIO) {
+                "SixBundle 압축 비율이 제한을 초과합니다: ${entry.name}"
+            }
+        }
+    }
+
+    private fun readEntry(zip: ZipFile, name: String, limit: Long): ByteArray {
+        val bytes = zip.getInputStream(zip.getEntry(name)).use { input ->
+            input.readNBytes((limit + 1).toInt())
+        }
+        require(bytes.size.toLong() <= limit) { "SixBundle 항목이 너무 큽니다: $name" }
+        return bytes
+    }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private const val SCHEMA_VERSION = 1
+    private const val MAX_METADATA_SIZE = 1024L * 1024
+    private const val MAX_WRAPPER_SIZE = 128L * 1024 * 1024
+    private const val MAX_TOTAL_SIZE = MAX_WRAPPER_SIZE + (2 * MAX_METADATA_SIZE)
+    private const val MAX_COMPRESSION_RATIO = 100.0
+    private val EXTENSION_ID = Regex("[a-p]{32}")
+    private val SHA256 = Regex("[0-9a-f]{64}")
+    private val SOURCE_KINDS = setOf(
+        "SOURCE_DIRECTORY",
+        "ZIP",
+        "CRX3",
+        "CHROME_WEB_STORE",
+    )
 }

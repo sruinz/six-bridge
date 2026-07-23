@@ -14,11 +14,16 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.Base64
 import kotlin.io.path.copyTo
 import kotlin.io.path.isRegularFile
+import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
 
 data class SixBuildResult(
@@ -82,6 +87,7 @@ class SixBridgeService(
             version = compatibility.extensionVersion ?: "0",
             sourceKind = resolved.kind.name,
             crxSha256 = sha256(packed.bytes),
+            wrapperSha256 = sha256(wrapperOutput.toFile().readBytes()),
             wrapperPackage = wrapper.packageName,
             wrapperVersionCode = wrapper.versionCode,
             signerSha256 = wrapper.signerSha256,
@@ -111,20 +117,57 @@ class SixBridgeService(
             return PreparedCrx(parsed.extensionId, original)
         }
         val keyManager = ExtensionKeyManager(localRoot.resolve("keystore/crx"))
-        val leaf = source.fileName.toString()
-        val identity = if (EXTENSION_ID.matches(leaf)) {
-            leaf
+        val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText())
+            as? JsonObject
+            ?: throw IllegalArgumentException("manifest.json의 루트가 객체가 아닙니다.")
+        val manifestName = (manifest["name"] as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.content
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: throw IllegalArgumentException("manifest name이 비어 있습니다.")
+        val manifestKey = (manifest["key"] as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.content
+        val key = if (manifestKey != null) {
+            val publicKey = runCatching { Base64.getDecoder().decode(manifestKey) }
+                .getOrElse {
+                    throw IllegalArgumentException("manifest key가 올바른 Base64가 아닙니다.")
+                }
+            val expectedId = Crx3.extensionId(publicKey)
+            val existing = keyManager.findByExtensionId(expectedId)
+                ?: throw IllegalArgumentException(
+                    "manifest key에 대응하는 기존 CRX 개인 키가 없습니다: $expectedId",
+                )
+            require(existing.public.encoded.contentEquals(publicKey)) {
+                "manifest 공개 키가 기존 CRX key pair와 일치하지 않습니다."
+            }
+            existing
         } else {
-            val stableInput = when (resolved.kind) {
+            val logicalIdentity =
+                "manifest-${sha256(manifestName.lowercase().toByteArray()).take(32)}"
+            val legacyInput = when (resolved.kind) {
                 ExtensionInputKind.SOURCE_DIRECTORY -> source.toAbsolutePath().normalize().toString()
                 ExtensionInputKind.ZIP ->
                     Path.of(resolved.originalInput).toAbsolutePath().normalize().toString()
                 else -> resolved.originalInput
             }
-            "source-${sha256(stableInput.toByteArray()).take(24)}"
+            val legacyIdentity = "source-${sha256(legacyInput.toByteArray()).take(24)}"
+            val leaf = source.fileName.toString()
+            val existing = keyManager.getExisting(logicalIdentity)
+                ?: leaf.takeIf(EXTENSION_ID::matches)?.let(keyManager::getExisting)
+                ?: keyManager.getExisting(legacyIdentity)
+            (existing ?: keyManager.getOrCreate(logicalIdentity)).also {
+                keyManager.persist(logicalIdentity, it)
+            }
         }
-        val key = keyManager.getOrCreate(identity)
         val packed = Crx3.pack(source, key)
+        if (manifestKey != null) {
+            val declaredId = Crx3.extensionId(Base64.getDecoder().decode(manifestKey))
+            require(packed.extensionId == declaredId) {
+                "packed CRX ID가 manifest key의 extension ID와 일치하지 않습니다."
+            }
+        }
         keyManager.persist(packed.extensionId, key)
         return PreparedCrx(packed.extensionId, packed.bytes)
     }

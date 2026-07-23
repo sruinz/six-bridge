@@ -3,6 +3,8 @@ package dev.sixbridge.core.input
 import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
 import java.security.KeyPairGenerator
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -54,6 +56,20 @@ class ExtensionInputResolverTest {
         assertEquals("fchehlladkkanoekpjffcfffpfbdaalj", chrome.expectedExtensionId)
         assertFailsWith<UnsupportedInputException> {
             resolver.resolve("https://microsoftedge.microsoft.com/addons/detail/example/abcdefghijkl")
+        }
+    }
+
+    @Test
+    fun `rejects zip entries whose compression ratio exceeds the extraction limit`() {
+        val zip = Files.createTempFile("six-zip-bomb", ".zip")
+        ZipOutputStream(Files.newOutputStream(zip)).use { output ->
+            output.putNextEntry(ZipEntry("manifest.json"))
+            output.write(ByteArray(1024 * 1024))
+            output.closeEntry()
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionInputResolver().resolve(zip.toString())
         }
     }
 }

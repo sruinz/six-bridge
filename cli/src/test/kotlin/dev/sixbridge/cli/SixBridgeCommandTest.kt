@@ -85,6 +85,8 @@ class SixBridgeCommandTest {
                     majorVersion = 30,
                     supportedApis = setOf("storage"),
                     wrapperContract = WrapperContract.complete(),
+                    sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+                    sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
                 ),
             ),
         )

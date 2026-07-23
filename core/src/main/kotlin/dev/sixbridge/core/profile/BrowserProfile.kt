@@ -30,14 +30,21 @@ data class BrowserProfile(
     val versionCode: Long,
     val majorVersion: Int,
     val supportedApis: Set<String>,
+    val detectedApis: Set<String> = supportedApis,
     val wrapperContract: WrapperContract,
     val sourceApkSha256: String = "",
+    val sourceApkSignerSha256: String = "",
     val profileDifferences: List<String> = emptyList(),
 ) {
     val isSupportedBaseline: Boolean
         get() = majorVersion == SUPPORTED_MAJOR_VERSION &&
             wrapperContract.isComplete &&
-            profileDifferences.isEmpty()
+            sourceApkSignerSha256 == SAMSUNG_SIGNER_SHA256 &&
+            profileDifferences.isEmpty() &&
+            (
+                versionName != BASELINE_VERSION ||
+                    sourceApkSha256 == BASELINE_APK_SHA256
+                )
 
     val support: ProfileSupport
         get() = if (isSupportedBaseline) ProfileSupport.SUPPORTED else ProfileSupport.UNKNOWN
@@ -45,6 +52,21 @@ data class BrowserProfile(
     companion object {
         const val SUPPORTED_MAJOR_VERSION = 30
         const val BASELINE_VERSION = "30.0.2.61"
+        const val BASELINE_APK_SHA256 =
+            "6fad5501a3f9823c7dd9fafdfe1204f7246e487c8dea9c192426c07c8c48c981"
+        const val SAMSUNG_SIGNER_SHA256 =
+            "34df0e7a9f1cf1892e45c056b4973cd81ccf148a4050d11aea4ac5a65f900a42"
+
+        val POC_SUPPORTED_APIS = setOf(
+            "action",
+            "contextMenus",
+            "i18n",
+            "offscreen",
+            "runtime",
+            "storage",
+            "tabs",
+            "webRequest",
+        )
 
         val BASELINE_APIS = setOf(
             "action",

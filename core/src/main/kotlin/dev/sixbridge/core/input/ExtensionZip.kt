@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Base64
@@ -32,6 +33,14 @@ object ExtensionZip {
                 .sorted(compareBy { sourceRoot.relativize(it).invariantSeparatorsPathString })
                 .toList()
         }
+        require(paths.size <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
+        var totalSize = 0L
+        paths.forEach { path ->
+            val size = Files.size(path)
+            require(size <= MAX_ENTRY_SIZE) { "ZIP 개별 파일 크기가 제한을 초과합니다: $path" }
+            totalSize += size
+            require(totalSize <= MAX_TOTAL_SIZE) { "ZIP 전체 크기가 제한을 초과합니다." }
+        }
         return ByteArrayOutputStream().run {
             ZipOutputStream(this).use { zip ->
                 paths.forEach { path ->
@@ -52,9 +61,14 @@ object ExtensionZip {
 
     fun extract(bytes: ByteArray, destination: Path): Path {
         Files.createDirectories(destination)
+        var entryCount = 0
+        var totalSize = 0L
         ZipInputStream(bytes.inputStream()).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
+                entryCount += 1
+                require(entryCount <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
+                validateEntry(entry)
                 val output = destination.resolve(entry.name).normalize()
                 if (!output.startsWith(destination)) {
                     throw IllegalArgumentException("ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}")
@@ -63,7 +77,10 @@ object ExtensionZip {
                     Files.createDirectories(output)
                 } else {
                     Files.createDirectories(output.parent)
-                    Files.copy(zip, output)
+                    totalSize += copyLimited(zip, output)
+                    require(totalSize <= MAX_TOTAL_SIZE) {
+                        "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+                    }
                 }
             }
         }
@@ -73,6 +90,18 @@ object ExtensionZip {
     fun extract(zipPath: Path, destination: Path): Path {
         Files.createDirectories(destination)
         ZipFile(zipPath.toFile()).use { zip ->
+            require(zip.size() <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
+            var declaredTotal = 0L
+            zip.entries().asSequence().forEach { entry ->
+                validateEntry(entry)
+                if (!entry.isDirectory) {
+                    declaredTotal += entry.size
+                    require(declaredTotal <= MAX_TOTAL_SIZE) {
+                        "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+                    }
+                }
+            }
+            var totalSize = 0L
             val entries = zip.entries()
             while (entries.hasMoreElements()) {
                 val entry = entries.nextElement()
@@ -85,7 +114,10 @@ object ExtensionZip {
                 } else {
                     Files.createDirectories(output.parent)
                     zip.getInputStream(entry).use { input ->
-                        Files.copy(input, output)
+                        totalSize += copyLimited(input, output)
+                        require(totalSize <= MAX_TOTAL_SIZE) {
+                            "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+                        }
                     }
                 }
             }
@@ -121,6 +153,40 @@ object ExtensionZip {
         return candidates.single()
     }
 
+    private fun validateEntry(entry: ZipEntry) {
+        if (!entry.isDirectory && entry.size >= 0) {
+            require(entry.size <= MAX_ENTRY_SIZE) {
+                "ZIP 개별 항목 크기가 제한을 초과합니다: ${entry.name}"
+            }
+        }
+        if (entry.size > 0 && entry.compressedSize > 0) {
+            require(entry.size.toDouble() / entry.compressedSize <= MAX_COMPRESSION_RATIO) {
+                "ZIP 압축 비율이 제한을 초과합니다: ${entry.name}"
+            }
+        }
+    }
+
+    private fun copyLimited(input: InputStream, output: Path): Long {
+        var size = 0L
+        Files.newOutputStream(output).use { target ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                size += read
+                require(size <= MAX_ENTRY_SIZE) {
+                    "ZIP 개별 항목 크기가 제한을 초과합니다: $output"
+                }
+                target.write(buffer, 0, read)
+            }
+        }
+        return size
+    }
+
     private val EXCLUDED_DIRECTORIES = setOf(".git", ".gradle", "node_modules")
     private val EXCLUDED_FILES = setOf(".DS_Store")
+    private const val MAX_ENTRIES = 10_000
+    private const val MAX_ENTRY_SIZE = 128L * 1024 * 1024
+    private const val MAX_TOTAL_SIZE = 512L * 1024 * 1024
+    private const val MAX_COMPRESSION_RATIO = 100.0
 }

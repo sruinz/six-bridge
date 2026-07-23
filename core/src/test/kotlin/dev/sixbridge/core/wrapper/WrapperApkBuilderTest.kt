@@ -2,6 +2,7 @@ package dev.sixbridge.core.wrapper
 
 import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 import java.security.KeyPairGenerator
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -10,11 +11,13 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.test.fail
 
 class WrapperApkBuilderTest {
     @Test
     fun `builds a signed wrapper with the Samsung discovery contract`() {
-        val sdk = AndroidToolchain.locateOrNull() ?: return
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 wrapper 배포 검증을 실행할 수 없습니다.")
         val source = Files.createTempDirectory("six-wrapper-source")
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Tiny","version":"1.0.0"}""",
@@ -58,7 +61,8 @@ class WrapperApkBuilderTest {
 
     @Test
     fun `increments wrapper version while retaining package and signing key`() {
-        val sdk = AndroidToolchain.locateOrNull() ?: return
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 wrapper 업데이트 검증을 실행할 수 없습니다.")
         val source = Files.createTempDirectory("six-wrapper-update-source")
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Update","version":"1"}""",
@@ -79,6 +83,18 @@ class WrapperApkBuilderTest {
         assertEquals(first.packageName, second.packageName)
         assertEquals(first.versionCode + 1, second.versionCode)
         assertTrue(localRoot.resolve("keystore/wrapper.p12").toFile().isFile)
+        val ownerOnly = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+        )
+        assertEquals(
+            ownerOnly,
+            Files.getPosixFilePermissions(localRoot.resolve("keystore/wrapper.p12")),
+        )
+        assertEquals(
+            ownerOnly,
+            Files.getPosixFilePermissions(localRoot.resolve("keystore/wrapper.pass")),
+        )
         assertTrue(first.signerSha256.isNotBlank())
         assertEquals(first.signerSha256, second.signerSha256)
         assertTrue(outputs.resolve("one.apk").readBytes().isNotEmpty())

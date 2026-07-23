@@ -26,6 +26,8 @@ class CompatibilityAnalyzerTest {
             "webRequest",
         ),
         wrapperContract = WrapperContract.complete(),
+        sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+        sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
 
     @Test
@@ -93,6 +95,9 @@ class CompatibilityAnalyzerTest {
         )
 
         val blocked = CompatibilityAnalyzer().analyze(source, profile)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"New browser","version":"1"}""",
+        )
         val unknown = CompatibilityAnalyzer().analyze(
             source,
             profile.copy(majorVersion = 31),
@@ -125,5 +130,153 @@ class CompatibilityAnalyzerTest {
 
         assertTrue(report.manifestKeyPresent)
         assertEquals(32, report.manifestKeyExtensionId?.length)
+    }
+
+    @Test
+    fun `blocks blank manifest identity fields`() {
+        val source = Files.createTempDirectory("six-blank-manifest")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"  ","version":""}""",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.BLOCKED, report.status)
+        assertTrue(report.issues.any { it.code == "manifest_identity_invalid" })
+    }
+
+    @Test
+    fun `blocks missing and escaping declared resources`() {
+        val source = Files.createTempDirectory("six-invalid-resources")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Invalid resources",
+              "version": "1",
+              "background": {"service_worker": "missing.js"},
+              "content_scripts": [{"matches": ["<all_urls>"], "js": ["../outside.js"]}],
+              "action": {"default_popup": "/absolute.html"},
+              "options_ui": {"page": "missing-options.html"}
+            }
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.BLOCKED, report.status)
+        assertTrue(report.issues.any { it.code == "manifest_resource_invalid" })
+    }
+
+    @Test
+    fun `blocks a declared resource symlink that resolves outside the extension root`() {
+        val source = Files.createTempDirectory("six-symlink-resource")
+        val outside = Files.createTempFile("six-outside-resource", ".js")
+        Files.createSymbolicLink(source.resolve("background.js"), outside)
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Symlink resource",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.BLOCKED, report.status)
+        assertTrue(report.issues.any { it.code == "manifest_resource_invalid" })
+    }
+
+    @Test
+    fun `accepts existing service worker content action and options resources`() {
+        val source = Files.createTempDirectory("six-valid-resources")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Valid resources",
+              "version": "1",
+              "background": {"service_worker": "background.js"},
+              "content_scripts": [{
+                "matches": ["<all_urls>"],
+                "js": ["content.js"],
+                "css": ["content.css"]
+              }],
+              "action": {"default_popup": "popup.html"},
+              "options_page": "options.html"
+            }
+            """.trimIndent(),
+        )
+        listOf(
+            "background.js",
+            "content.js",
+            "content.css",
+            "popup.html",
+            "options.html",
+        ).forEach { source.resolve(it).writeText("") }
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+    }
+
+    @Test
+    fun `detects bracket and object destructuring API namespaces`() {
+        val source = Files.createTempDirectory("six-bracket-apis")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Bracket APIs",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            chrome["downloads"].download({});
+            browser['downloads'].search({});
+            const { downloads } = chrome;
+            downloads.erase({});
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertTrue("downloads" in report.usedApis)
+        assertTrue("downloads" in report.unsupportedApis)
+    }
+
+    @Test
+    fun `marks computed namespace and browser object aliases unknown`() {
+        val source = Files.createTempDirectory("six-dynamic-apis")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Dynamic APIs",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            const namespace = "downloads";
+            chrome[namespace].download({});
+            const api = browser;
+            api.downloads.search({});
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
     }
 }

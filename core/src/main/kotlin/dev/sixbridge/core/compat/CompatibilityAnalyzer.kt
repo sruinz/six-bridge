@@ -4,6 +4,7 @@ import dev.sixbridge.core.profile.BrowserProfile
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import java.nio.file.Files
@@ -35,22 +36,76 @@ class CompatibilityAnalyzer(
             )
         }
 
-        val manifestVersion = manifest["manifest_version"]?.jsonPrimitive?.intOrNull
-        val name = manifest["name"]?.jsonPrimitive?.content
-        val version = manifest["version"]?.jsonPrimitive?.content
-        val manifestKey = manifest["key"]?.jsonPrimitive?.content
+        val manifestVersion = (manifest["manifest_version"] as? JsonPrimitive)?.intOrNull
+        val name = manifest.stringOrNull("name")
+        val version = manifest.stringOrNull("version")
+        val manifestKey = manifest.stringOrNull("key")
         val manifestKeyExtensionId = manifestKey?.let(::extensionIdFromManifestKey)
         val permissions = (
             readStringSet(manifest["permissions"]) +
                 readStringSet(manifest["optional_permissions"])
             ).toSet()
-        val apiCalls = scanApiCalls(extensionRoot)
+        val apiScan = scanApiCalls(extensionRoot)
         val usedApis = (
-            apiCalls + permissions.filter { it in KNOWN_API_NAMESPACES }
+            apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
             ).toSortedSet()
         val unsupported = (usedApis - profile.supportedApis).toSortedSet()
         val issues = mutableListOf<CompatibilityIssue>()
 
+        if (manifestVersion != 3) {
+            issues += CompatibilityIssue(
+                code = "manifest_version_unsupported",
+                message = "Manifest V3만 PoC 지원 대상입니다. 감지 값: $manifestVersion",
+                blocking = true,
+            )
+            return report(
+                CompatibilityStatus.BLOCKED,
+                manifestVersion,
+                name,
+                version,
+                manifestKey,
+                manifestKeyExtensionId,
+                permissions,
+                usedApis,
+                unsupported,
+                issues,
+            )
+        }
+        if (name.isNullOrBlank() || version.isNullOrBlank()) {
+            issues += CompatibilityIssue(
+                code = "manifest_identity_invalid",
+                message = "manifest name과 version은 비어 있지 않은 문자열이어야 합니다.",
+                blocking = true,
+            )
+            return report(
+                CompatibilityStatus.BLOCKED,
+                manifestVersion,
+                name,
+                version,
+                manifestKey,
+                manifestKeyExtensionId,
+                permissions,
+                usedApis,
+                unsupported,
+                issues,
+            )
+        }
+        val resourceIssues = validateResources(extensionRoot, manifest)
+        if (resourceIssues.isNotEmpty()) {
+            issues += resourceIssues
+            return report(
+                CompatibilityStatus.BLOCKED,
+                manifestVersion,
+                name,
+                version,
+                manifestKey,
+                manifestKeyExtensionId,
+                permissions,
+                usedApis,
+                unsupported,
+                issues,
+            )
+        }
         if (!profile.isSupportedBaseline) {
             issues += CompatibilityIssue(
                 code = "browser_profile_unknown",
@@ -70,15 +125,14 @@ class CompatibilityAnalyzer(
                 issues,
             )
         }
-
-        if (manifestVersion != 3) {
+        if (apiScan.dynamicUsage) {
             issues += CompatibilityIssue(
-                code = "manifest_version_unsupported",
-                message = "Manifest V3만 PoC 지원 대상입니다. 감지 값: $manifestVersion",
+                code = "api_usage_dynamic",
+                message = "계산된 namespace 또는 browser 객체 alias는 안전하게 판정할 수 없습니다.",
                 blocking = true,
             )
             return report(
-                CompatibilityStatus.BLOCKED,
+                CompatibilityStatus.UNKNOWN,
                 manifestVersion,
                 name,
                 version,
@@ -125,8 +179,9 @@ class CompatibilityAnalyzer(
         )
     }
 
-    private fun scanApiCalls(root: Path): Set<String> {
+    private fun scanApiCalls(root: Path): ApiScan {
         val found = mutableSetOf<String>()
+        var dynamicUsage = false
         Files.walk(root).use { paths ->
             paths.filter { path ->
                 path.isRegularFile() && path.extension.lowercase() in SCRIPT_EXTENSIONS
@@ -135,13 +190,117 @@ class CompatibilityAnalyzer(
                 API_CALL_REGEX.findAll(source).forEach { match ->
                     found += match.groupValues[1]
                 }
+                BRACKET_API_REGEX.findAll(source).forEach { match ->
+                    found += match.groupValues[1]
+                }
+                DESTRUCTURING_REGEX.findAll(source).forEach { match ->
+                    match.groupValues[1].split(',').forEach { binding ->
+                        val namespace = binding.trim()
+                            .substringBefore(':')
+                            .substringBefore('=')
+                            .trim()
+                        if (API_NAME.matches(namespace)) found += namespace
+                    }
+                }
+                if (DYNAMIC_BRACKET_REGEX.containsMatchIn(source) ||
+                    BROWSER_ALIAS_REGEX.containsMatchIn(source)
+                ) {
+                    dynamicUsage = true
+                }
                 if (NATIVE_MESSAGING_REGEX.containsMatchIn(source)) {
                     found += "nativeMessaging"
                 }
             }
         }
-        return found
+        return ApiScan(found, dynamicUsage)
     }
+
+    private fun validateResources(
+        root: Path,
+        manifest: JsonObject,
+    ): List<CompatibilityIssue> {
+        val declared = mutableListOf<Pair<String, kotlinx.serialization.json.JsonElement?>>()
+        if ("background" in manifest && manifest["background"] !is JsonObject) {
+            declared += "background" to null
+        }
+        (manifest["background"] as? JsonObject)?.let { background ->
+            if ("service_worker" in background) {
+                declared += "background.service_worker" to background["service_worker"]
+            }
+        }
+        if ("content_scripts" in manifest && manifest["content_scripts"] !is JsonArray) {
+            declared += "content_scripts" to null
+        }
+        (manifest["content_scripts"] as? JsonArray)?.forEachIndexed { index, item ->
+            val script = item as? JsonObject
+            if (script == null) {
+                declared += "content_scripts[$index]" to null
+            } else {
+                listOf("js", "css").forEach { kind ->
+                    (script[kind] as? JsonArray)?.forEachIndexed { resourceIndex, resource ->
+                        declared +=
+                            "content_scripts[$index].$kind[$resourceIndex]" to resource
+                    }
+                    if (kind in script && script[kind] !is JsonArray) {
+                        declared += "content_scripts[$index].$kind" to null
+                    }
+                }
+            }
+        }
+        if ("action" in manifest && manifest["action"] !is JsonObject) {
+            declared += "action" to null
+        }
+        (manifest["action"] as? JsonObject)?.let { action ->
+            if ("default_popup" in action) {
+                declared += "action.default_popup" to action["default_popup"]
+            }
+        }
+        if ("options_page" in manifest) {
+            declared += "options_page" to manifest["options_page"]
+        }
+        if ("options_ui" in manifest && manifest["options_ui"] !is JsonObject) {
+            declared += "options_ui" to null
+        }
+        (manifest["options_ui"] as? JsonObject)?.let { options ->
+            if ("page" in options) declared += "options_ui.page" to options["page"]
+        }
+
+        val normalizedRoot = root.toAbsolutePath().normalize()
+        val realRoot = normalizedRoot.toRealPath()
+        return declared.mapNotNull { (field, element) ->
+            val resource = (element as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.content
+            val target = resource?.takeIf(::isSafeResourcePath)
+                ?.let { normalizedRoot.resolve(it).normalize() }
+            val insideRealRoot = target?.takeIf { it.isRegularFile() }?.let {
+                runCatching { it.toRealPath().startsWith(realRoot) }.getOrDefault(false)
+            } ?: false
+            if (target == null ||
+                !target.startsWith(normalizedRoot) ||
+                !insideRealRoot
+            ) {
+                CompatibilityIssue(
+                    code = "manifest_resource_invalid",
+                    message = "$field 리소스가 없거나 확장 루트 밖을 가리킵니다: $resource",
+                    blocking = true,
+                )
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun isSafeResourcePath(value: String): Boolean =
+        value.isNotBlank() &&
+            !value.startsWith("/") &&
+            '\\' !in value &&
+            ':' !in value
+
+    private fun JsonObject.stringOrNull(name: String): String? =
+        (get(name) as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.content
 
     private fun readStringSet(element: kotlinx.serialization.json.JsonElement?): Set<String> =
         (element as? JsonArray)
@@ -205,10 +364,27 @@ class CompatibilityAnalyzer(
         }
     }.getOrNull()
 
+    private data class ApiScan(
+        val namespaces: Set<String>,
+        val dynamicUsage: Boolean,
+    )
+
     companion object {
         private val SCRIPT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
         private val API_CALL_REGEX =
-            Regex("""(?:chrome|browser)\.([A-Za-z][A-Za-z0-9_]*)""")
+            Regex("""(?:chrome|browser)\s*\.\s*([A-Za-z][A-Za-z0-9_]*)""")
+        private val BRACKET_API_REGEX =
+            Regex("""(?:chrome|browser)\s*\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""")
+        private val DESTRUCTURING_REGEX =
+            Regex("""(?:const|let|var)\s*\{([^}]*)}\s*=\s*(?:chrome|browser)\b""")
+        private val DYNAMIC_BRACKET_REGEX =
+            Regex("""(?:chrome|browser)\s*\[\s*(?!["'])""")
+        private val BROWSER_ALIAS_REGEX =
+            Regex(
+                """(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*""" +
+                    """(?:chrome|browser)[ \t]*(?=;|\r?\n|$)""",
+            )
+        private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")
         private val KNOWN_API_NAMESPACES = setOf(

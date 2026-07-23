@@ -56,8 +56,8 @@ mkdir -p "$evidence_dir"
       ;;
   esac
 
-  provider_magic=$(adb -s "$serial" shell \
-    "content read --uri 'content://$package_name.contentprovider' | head -c 4")
+  provider_magic=$(adb -s "$serial" shell content read \
+    --uri "content://$package_name.contentprovider" | head -c 4)
   echo "providerMagic=$provider_magic"
   if [ "$provider_magic" != "Cr24" ]; then
     echo "ContentProvider did not return a CRX3 stream." >&2

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.crx
 
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 import java.security.KeyPairGenerator
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -56,6 +57,13 @@ class Crx3Test {
         assertEquals(
             Crx3.extensionId(first.public.encoded),
             Crx3.extensionId(second.public.encoded),
+        )
+        assertEquals(
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+            ),
+            Files.getPosixFilePermissions(keyRoot.resolve("smart-context-menu.pk8")),
         )
     }
 }
