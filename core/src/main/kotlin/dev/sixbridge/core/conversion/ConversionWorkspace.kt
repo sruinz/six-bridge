@@ -27,11 +27,13 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 class ConversionWorkspace : AutoCloseable {
-    private val root = PendingTempCleanup.createTempDirectory("sixbridge-conversion-")
+    private val rootOwner = OwnedTempTree.create("sixbridge-conversion-")
+    private val root = rootOwner.rootPath
     private val ownedWorkingRoots = mutableListOf<Path>()
     private val ownedSnapshots = IdentityHashMap<ExtensionSnapshot, Unit>()
     private val pendingCleanup = ConcurrentHashMap.newKeySet<Path>()
     private var lifecycle = Lifecycle.OPEN
+    private var closeFailures = 0
 
     @Synchronized
     fun snapshot(
@@ -39,10 +41,11 @@ class ConversionWorkspace : AutoCloseable {
         requireOwnerOnlyMarker: Boolean = true,
     ): ExtensionSnapshot {
         requireOpen()
-        val snapshotRoot = PendingTempCleanup.createTempDirectory(
-            root,
+        val snapshotOwner = OwnedTempTree.create(
+            rootOwner,
             "snapshot-",
         )
+        val snapshotRoot = snapshotOwner.rootPath
         return try {
             val sourceProjectIdentity = SourceProjectIdentityStore.readSourceMarker(
                 source,
@@ -52,15 +55,21 @@ class ConversionWorkspace : AutoCloseable {
                 sourceRoot = source,
                 includeProjectMarker = true,
             )
-            val original = PendingTempCleanup.registerCreated(
-                ExtensionZip.extract(
-                    sourceZip,
-                    snapshotRoot.resolve("original"),
-                ),
+            val originalOwner = OwnedTempTree.createNamed(
+                snapshotOwner,
+                "original",
             )
-            val working = NativeWorkspaceTree.copy(
+            val original = ExtensionZip.extractInto(
+                sourceZip,
+                originalOwner.rootPath,
+            )
+            val workingOwner = OwnedTempTree.createNamed(
+                snapshotOwner,
+                "working",
+            )
+            val working = NativeWorkspaceTree.copyInto(
                 original,
-                snapshotRoot.resolve("working"),
+                workingOwner.rootPath,
             )
             require(
                 sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
@@ -189,6 +198,13 @@ class ConversionWorkspace : AutoCloseable {
         if (failure == null) {
             lifecycle = Lifecycle.CLOSED
         } else {
+            closeFailures += 1
+            if (closeFailures >= MAX_CLOSE_FAILURES_BEFORE_ABANDON) {
+                OwnedTempTree.abandon(rootOwner)
+                pendingCleanup.clear()
+                lifecycle = Lifecycle.CLOSED
+                throw OwnedTempAbandonedException()
+            }
             throw requireNotNull(failure)
         }
     }
@@ -685,7 +701,14 @@ class ConversionWorkspace : AutoCloseable {
             )
             var stagedRoot: Path? = null
             try {
-                stagedRoot = NativeWorkspaceTree.copy(root, stageDestination)
+                val stageOwner = OwnedTempTree.createNamed(
+                    parent,
+                    stageDestination.fileName.toString(),
+                )
+                stagedRoot = NativeWorkspaceTree.copyInto(
+                    root,
+                    stageOwner.rootPath,
+                )
                 TransactionContext.activate(
                     originalRoot = originalRoot,
                     stagedRoot = stagedRoot,
@@ -721,8 +744,8 @@ class ConversionWorkspace : AutoCloseable {
                     "staged conversion tree가 publish 직전에 변경되었습니다."
                 }
                 Ownership.verifyOriginalLocked(record)
-                moveDirectory(root, backup)
                 try {
+                    moveDirectory(root, backup)
                     check(
                         WorkspaceTreeDigest.capture(backup) == sourceTree.state,
                     ) {
@@ -970,4 +993,8 @@ class ConversionWorkspace : AutoCloseable {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        const val MAX_CLOSE_FAILURES_BEFORE_ABANDON = 2
+    }
 }

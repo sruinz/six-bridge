@@ -202,6 +202,7 @@ class ConversionWorkspaceTest {
         val workspace = ConversionWorkspace()
         val snapshot = workspace.snapshot(source)
         val workingRoot = snapshot.workingRoot
+        workingRoot.resolve("owned-proof.txt").writeText("owned")
         val movedRoot = workingRoot.resolveSibling("${workingRoot.fileName}-moved")
         val closeTask = FutureTask { workspace.close() }
         val closeThread = Thread(closeTask, "anchored-close-victim")
@@ -230,6 +231,12 @@ class ConversionWorkspaceTest {
             assertTrue(Files.isDirectory(outside, LinkOption.NOFOLLOW_LINKS))
             assertTrue(Files.isSymbolicLink(workingRoot))
             assertTrue(Files.isDirectory(movedRoot, LinkOption.NOFOLLOW_LINKS))
+            assertFalse(
+                Files.exists(
+                    movedRoot.resolve("owned-proof.txt"),
+                    LinkOption.NOFOLLOW_LINKS,
+                ),
+            )
 
             Files.delete(workingRoot)
             Files.move(movedRoot, workingRoot, StandardCopyOption.ATOMIC_MOVE)
@@ -331,6 +338,43 @@ class ConversionWorkspaceTest {
             assertTrue(Files.exists(identityless, LinkOption.NOFOLLOW_LINKS))
         } finally {
             workspace.close()
+        }
+    }
+
+    @Test
+    fun `second persistent close failure abandons handles without deleting replacements`() {
+        val workspace = ConversionWorkspace()
+        val snapshot = workspace.snapshot(source("six-explicit-abandon"))
+        val working = snapshot.workingRoot
+        val moved = working.resolveSibling("${working.fileName}-abandoned")
+        val outside = Files.createTempDirectory("six-explicit-abandon-outside")
+        outside.resolve("proof.txt").writeText("outside")
+        Files.move(working, moved, StandardCopyOption.ATOMIC_MOVE)
+        Files.createSymbolicLink(working, outside)
+        try {
+            assertFailsWith<OwnedTempCleanupException> {
+                workspace.close()
+            }
+            val abandoned = assertFailsWith<OwnedTempAbandonedException> {
+                workspace.close()
+            }
+
+            assertEquals(
+                "소유 handle을 닫고 임시 경로는 삭제하지 않았습니다.",
+                abandoned.message,
+            )
+            assertTrue(Files.isSymbolicLink(working))
+            assertTrue(Files.isDirectory(moved, LinkOption.NOFOLLOW_LINKS))
+            assertEquals("outside", outside.resolve("proof.txt").readText())
+            workspace.close()
+        } finally {
+            runCatching { Files.deleteIfExists(working) }
+            runCatching {
+                Files.walk(moved).use { paths ->
+                    paths.sorted(Comparator.reverseOrder())
+                        .forEach(Files::deleteIfExists)
+                }
+            }
         }
     }
 

@@ -37,7 +37,8 @@ class NativeWorkspaceTreeTest {
             )
         }
 
-        NativeWorkspaceTree.copy(source, destination)
+        val destinationOwner = OwnedTempTree.createAt(destination)
+        NativeWorkspaceTree.copyInto(source, destinationOwner.rootPath)
         try {
             assertEquals(
                 "preserved",
@@ -52,7 +53,7 @@ class NativeWorkspaceTreeTest {
                 WorkspaceTreeDigest.provenanceSha256(destination),
             )
         } finally {
-            OwnedTempTree.delete(destination)
+            OwnedTempTree.delete(destinationOwner)
         }
     }
 
@@ -65,11 +66,15 @@ class NativeWorkspaceTreeTest {
         }.isSuccess
         if (!linked) return
 
-        assertFailsWith<IllegalStateException> {
-            NativeWorkspaceTree.copy(
-                source,
-                source.resolveSibling("${source.fileName}-copy"),
-            )
+        val destination = OwnedTempTree.createAt(
+            source.resolveSibling("${source.fileName}-copy"),
+        )
+        try {
+            assertFailsWith<IllegalStateException> {
+                NativeWorkspaceTree.copyInto(source, destination.rootPath)
+            }
+        } finally {
+            OwnedTempTree.delete(destination)
         }
     }
 

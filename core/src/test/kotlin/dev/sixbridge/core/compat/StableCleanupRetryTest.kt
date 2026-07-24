@@ -155,6 +155,12 @@ class StableCleanupRetryTest {
             )
             assertFalse(Files.exists(missingRoot, NOFOLLOW_LINKS))
             assertTrue(Files.exists(movedRoot, NOFOLLOW_LINKS))
+            assertFalse(
+                Files.exists(
+                    movedRoot.resolve("canonical"),
+                    NOFOLLOW_LINKS,
+                ),
+            )
 
             Files.move(movedRoot, missingRoot, StandardCopyOption.ATOMIC_MOVE)
             val retrySource = Files.createTempDirectory("six-stable-missing-retry")

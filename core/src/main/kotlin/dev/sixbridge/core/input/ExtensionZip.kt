@@ -85,8 +85,43 @@ object ExtensionZip {
     }
 
     fun extract(zipPath: Path, destination: Path): Path {
-        val validatedEntryCount = validateUnixEntryTypes(zipPath)
         val normalizedDestination = prepareExtractionRoot(destination)
+        return extractArchive(
+            zipPath,
+            normalizedDestination,
+            destination,
+        )
+    }
+
+    fun extractInto(bytes: ByteArray, destination: Path): Path {
+        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        return try {
+            Files.write(temporary, bytes)
+            extractInto(temporary, destination)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    fun extractInto(zipPath: Path, destination: Path): Path {
+        val normalizedDestination = destination.toAbsolutePath().normalize()
+        requireExtractionDirectory(normalizedDestination)
+        require(Files.list(normalizedDestination).use { it.findAny().isEmpty }) {
+            "ZIP 압축 해제 대상은 등록 직후의 빈 디렉터리여야 합니다."
+        }
+        return extractArchive(
+            zipPath,
+            normalizedDestination,
+            normalizedDestination,
+        )
+    }
+
+    private fun extractArchive(
+        zipPath: Path,
+        normalizedDestination: Path,
+        resultRoot: Path,
+    ): Path {
+        val validatedEntryCount = validateUnixEntryTypes(zipPath)
         ZipFile(zipPath.toFile()).use { zip ->
             require(zip.size() == validatedEntryCount) {
                 "ZIP 중앙 디렉터리 항목 수가 일치하지 않습니다."
@@ -139,7 +174,7 @@ object ExtensionZip {
                 }
             }
         }
-        return locateManifestRoot(destination)
+        return locateManifestRoot(resultRoot)
     }
 
     private fun validateUnixEntryTypes(zipPath: Path): Int =

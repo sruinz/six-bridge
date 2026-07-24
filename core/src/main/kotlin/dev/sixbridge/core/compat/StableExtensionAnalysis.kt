@@ -1,7 +1,7 @@
 package dev.sixbridge.core.compat
 
+import dev.sixbridge.core.conversion.OwnedTempDirectory
 import dev.sixbridge.core.conversion.OwnedTempTree
-import dev.sixbridge.core.conversion.PendingTempCleanup
 import dev.sixbridge.core.input.ExtensionZip
 import java.nio.file.Path
 import java.security.MessageDigest
@@ -11,7 +11,7 @@ internal class StableExtensionAnalysis private constructor(
     @get:JvmSynthetic val root: Path,
     @get:JvmSynthetic val sourceArchive: ByteArray,
     @get:JvmSynthetic val sourceSha256: String,
-    private val temporaryRoot: Path,
+    private val temporaryRoot: OwnedTempDirectory,
     private val liveSource: Path?,
 ) : AutoCloseable {
     @JvmSynthetic
@@ -34,7 +34,7 @@ internal class StableExtensionAnalysis private constructor(
         @JvmSynthetic
         fun captureLive(source: Path): StableExtensionAnalysis {
             val sourceRoot = source.toAbsolutePath().normalize()
-            val temporary = PendingTempCleanup.createTempDirectory(
+            val temporary = OwnedTempTree.create(
                 "sixbridge-analysis-",
             )
             return try {
@@ -42,9 +42,13 @@ internal class StableExtensionAnalysis private constructor(
                     sourceRoot,
                     includeProjectMarker = true,
                 )
-                val stableRoot = ExtensionZip.extract(
+                val canonical = OwnedTempTree.createNamed(
+                    temporary,
+                    "canonical",
+                )
+                val stableRoot = ExtensionZip.extractInto(
                     archive,
-                    temporary.resolve("canonical"),
+                    canonical.rootPath,
                 )
                 StableExtensionAnalysis(
                     root = stableRoot,
@@ -61,14 +65,18 @@ internal class StableExtensionAnalysis private constructor(
 
         @JvmSynthetic
         fun fromArchive(bytes: ByteArray): StableExtensionAnalysis {
-            val temporary = PendingTempCleanup.createTempDirectory(
+            val temporary = OwnedTempTree.create(
                 "sixbridge-analysis-",
             )
             return try {
                 val archive = bytes.copyOf()
-                val stableRoot = ExtensionZip.extract(
+                val canonical = OwnedTempTree.createNamed(
+                    temporary,
+                    "canonical",
+                )
+                val stableRoot = ExtensionZip.extractInto(
                     archive,
-                    temporary.resolve("canonical"),
+                    canonical.rootPath,
                 )
                 StableExtensionAnalysis(
                     root = stableRoot,
@@ -83,9 +91,12 @@ internal class StableExtensionAnalysis private constructor(
             }
         }
 
-        private fun cleanupFailure(path: Path, failure: Throwable) {
+        private fun cleanupFailure(
+            owner: OwnedTempDirectory,
+            failure: Throwable,
+        ) {
             try {
-                OwnedTempTree.delete(path)
+                OwnedTempTree.delete(owner)
             } catch (cleanupError: Throwable) {
                 failure.addSuppressed(cleanupError)
             }

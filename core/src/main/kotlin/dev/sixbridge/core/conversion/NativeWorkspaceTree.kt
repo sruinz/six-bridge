@@ -10,33 +10,30 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
 
 internal object NativeWorkspaceTree {
-    fun copy(source: Path, destination: Path): Path {
+    fun copyInto(source: Path, destination: Path): Path {
         val sourceRoot = source.toAbsolutePath().normalize()
         val targetRoot = destination.toAbsolutePath().normalize()
         check(
             Files.isDirectory(sourceRoot, NOFOLLOW_LINKS) &&
                 !Files.isSymbolicLink(sourceRoot) &&
-                !Files.exists(targetRoot, NOFOLLOW_LINKS),
+                Files.isDirectory(targetRoot, NOFOLLOW_LINKS) &&
+                !Files.isSymbolicLink(targetRoot) &&
+                Files.list(targetRoot).use { it.findAny().isEmpty },
         ) {
             "native workspace copy 경계를 확인할 수 없습니다."
         }
+        PendingTempCleanup.requireOwned(targetRoot)
         val before = WorkspaceTreeDigest.capture(sourceRoot)
-        PendingTempCleanup.createDirectory(targetRoot)
-        try {
-            copyTree(sourceRoot, targetRoot)
-            val sourceAfter = WorkspaceTreeDigest.capture(sourceRoot)
-            val target = WorkspaceTreeDigest.capture(targetRoot)
-            check(before == sourceAfter) {
-                "native workspace source가 copy 중 변경되었습니다."
-            }
-            check(before.provenanceSha256 == target.provenanceSha256) {
-                "native workspace metadata 또는 content를 보존하지 못했습니다."
-            }
-            return targetRoot
-        } catch (error: Throwable) {
-            deleteTree(targetRoot)
-            throw error
+        copyTree(sourceRoot, targetRoot)
+        val sourceAfter = WorkspaceTreeDigest.capture(sourceRoot)
+        val target = WorkspaceTreeDigest.capture(targetRoot)
+        check(before == sourceAfter) {
+            "native workspace source가 copy 중 변경되었습니다."
         }
+        check(before.provenanceSha256 == target.provenanceSha256) {
+            "native workspace metadata 또는 content를 보존하지 못했습니다."
+        }
+        return targetRoot
     }
 
     private fun copyTree(sourceRoot: Path, targetRoot: Path) {
@@ -133,9 +130,5 @@ internal object NativeWorkspaceTree {
         if (targetPosix == null && targetAcl == null) {
             WorkspacePermissionPolicy.requireMetadataSupport(target)
         }
-    }
-
-    private fun deleteTree(path: Path) {
-        OwnedTempTree.delete(path)
     }
 }
