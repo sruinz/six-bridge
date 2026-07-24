@@ -6,9 +6,11 @@ import java.nio.channels.ServerSocketChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
+import java.util.Comparator
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
@@ -18,7 +20,6 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
@@ -188,6 +189,57 @@ class ConversionWorkspaceTest {
     }
 
     @Test
+    fun `close never follows a working root replaced by an external symlink`() {
+        val source = source("six-working-root-swap")
+        source.resolve("0000-swap-trigger.txt").writeText("trigger")
+        repeat(2_500) { index ->
+            source.resolve("padding-${index.toString().padStart(4, '0')}.txt")
+                .writeText("workspace-$index")
+        }
+        val outside = Files.createTempDirectory("six-cleanup-outside")
+        val outsideProof = outside.resolve("padding-2499.txt")
+        outsideProof.writeText("outside")
+        val workspace = ConversionWorkspace()
+        val snapshot = workspace.snapshot(source)
+        val workingRoot = snapshot.workingRoot
+        val movedRoot = workingRoot.resolveSibling("${workingRoot.fileName}-moved")
+        val closeTask = FutureTask { workspace.close() }
+        val closeThread = Thread(closeTask, "anchored-close-victim")
+        val swapTask = FutureTask {
+            val trigger = workingRoot.resolve("0000-swap-trigger.txt")
+            while (Files.exists(trigger)) Thread.onSpinWait()
+            Files.move(workingRoot, movedRoot, StandardCopyOption.ATOMIC_MOVE)
+            Files.createSymbolicLink(workingRoot, outside)
+        }
+        val swapThread = Thread(swapTask, "working-root-swap-attacker")
+        swapThread.start()
+        closeThread.start()
+
+        try {
+            swapTask.get(10, TimeUnit.SECONDS)
+            closeTask.get(10, TimeUnit.SECONDS)
+
+            assertEquals("outside", outsideProof.readText())
+            assertTrue(Files.isDirectory(outside, LinkOption.NOFOLLOW_LINKS))
+            assertFalse(Files.exists(workingRoot, LinkOption.NOFOLLOW_LINKS))
+            assertFalse(Files.exists(movedRoot, LinkOption.NOFOLLOW_LINKS))
+        } finally {
+            closeThread.join(5_000)
+            swapThread.join(5_000)
+            runCatching { Files.deleteIfExists(workingRoot) }
+            runCatching {
+                if (Files.exists(movedRoot, LinkOption.NOFOLLOW_LINKS)) {
+                    Files.walk(movedRoot).use { paths ->
+                        paths.sorted(Comparator.reverseOrder())
+                            .forEach(Files::deleteIfExists)
+                    }
+                }
+            }
+            runCatching { workspace.close() }
+        }
+    }
+
+    @Test
     fun `rejects symlinks fifos and sockets in source trees`() {
         val symlinkSource = source("six-symlink-source")
         Files.createSymbolicLink(
@@ -216,7 +268,7 @@ class ConversionWorkspaceTest {
     }
 
     @Test
-    fun `close remains closing and retries a real leftover on second close`() {
+    fun `close reenumerates and removes one concurrent late child`() {
         val source = source("six-close-retry")
         repeat(2_500) { index ->
             source.resolve("padding-$index.txt").writeText("padding-$index")
@@ -237,15 +289,8 @@ class ConversionWorkspaceTest {
         val attackerThread = Thread(attacker, "close-cleanup-attacker")
         attackerThread.start()
         try {
-            assertFails { workspace.close() }
-            assertEquals(late, attacker.get(5, TimeUnit.SECONDS))
-            assertTrue(Files.exists(workspaceRoot))
-            assertFailsWith<IllegalStateException> {
-                workspace.snapshot(source)
-            }
-
             workspace.close()
-
+            assertEquals(late, attacker.get(5, TimeUnit.SECONDS))
             assertFalse(Files.exists(workspaceRoot))
             workspace.close()
         } finally {
@@ -255,7 +300,7 @@ class ConversionWorkspaceTest {
     }
 
     @Test
-    fun `snapshot failure preserves the original error and close retries cleanup`() {
+    fun `snapshot failure preserves the original error while cleanup absorbs late children`() {
         val source = source("six-snapshot-cleanup-retry")
         repeat(2_500) { index ->
             source.resolve("padding-$index.txt").writeText("padding-$index")
@@ -294,13 +339,8 @@ class ConversionWorkspaceTest {
             }.cause ?: error("snapshot failure cause가 없습니다.")
             val late = attacker.get(5, TimeUnit.SECONDS)
 
-            assertTrue(error.suppressedExceptions.isNotEmpty())
-            assertEquals(
-                "snapshot 임시 경로를 정리하지 못했습니다.",
-                error.suppressedExceptions.single().message,
-            )
-            assertEquals(null, error.suppressedExceptions.single().cause)
-            assertTrue(Files.exists(late))
+            assertTrue(error.suppressedExceptions.isEmpty())
+            assertFalse(Files.exists(late))
 
             workspace.close()
 

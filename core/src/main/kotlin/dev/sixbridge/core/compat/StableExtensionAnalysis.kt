@@ -1,8 +1,8 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.conversion.OwnedTempTree
+import dev.sixbridge.core.conversion.PendingTempCleanup
 import dev.sixbridge.core.input.ExtensionZip
-import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.jvm.JvmSynthetic
@@ -34,7 +34,7 @@ internal class StableExtensionAnalysis private constructor(
         @JvmSynthetic
         fun captureLive(source: Path): StableExtensionAnalysis {
             val sourceRoot = source.toAbsolutePath().normalize()
-            val temporary = Files.createTempDirectory(
+            val temporary = PendingTempCleanup.createTempDirectory(
                 "sixbridge-analysis-",
             )
             return try {
@@ -61,7 +61,7 @@ internal class StableExtensionAnalysis private constructor(
 
         @JvmSynthetic
         fun fromArchive(bytes: ByteArray): StableExtensionAnalysis {
-            val temporary = Files.createTempDirectory(
+            val temporary = PendingTempCleanup.createTempDirectory(
                 "sixbridge-analysis-",
             )
             return try {

@@ -227,14 +227,7 @@ object ExtensionZip {
         includeProjectMarker: Boolean,
     ): List<SourceEntry> {
         val inventory = captureInventory(sourceRoot, includeProjectMarker)
-        val files = inventory
-        require(files.size <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
-        var totalSize = 0L
-        files.forEach { entry ->
-            totalSize += entry.size
-            require(totalSize <= MAX_TOTAL_SIZE) { "ZIP 전체 크기가 제한을 초과합니다." }
-        }
-        val entries = files.map { entry ->
+        val entries = inventory.map { entry ->
             readSourceEntry(entry)
         }
         val finalInventory = captureInventory(sourceRoot, includeProjectMarker)
@@ -242,7 +235,7 @@ object ExtensionZip {
             "snapshot 중 확장 소스 inventory가 변경되었습니다."
         }
         entries.forEach { expected ->
-            val inventoryEntry = files.single { it.name == expected.name }
+            val inventoryEntry = inventory.single { it.name == expected.name }
             val verified = readSourceEntry(inventoryEntry)
             require(expected.sha256 == verified.sha256) {
                 "snapshot 중 확장 소스 파일 hash가 변경되었습니다: ${inventoryEntry.path}"
@@ -258,6 +251,7 @@ object ExtensionZip {
         val normalizedPaths = mutableMapOf<String, String>()
         val foldedPaths = mutableMapOf<String, String>()
         val inventory = mutableListOf<SourceInventoryEntry>()
+        var totalSize = 0L
         Files.walkFileTree(
             sourceRoot,
             object : SimpleFileVisitor<Path>() {
@@ -265,11 +259,12 @@ object ExtensionZip {
                     directory: Path,
                     attributes: BasicFileAttributes,
                 ): FileVisitResult {
-                    if (
-                        directory != sourceRoot &&
-                        isExcludedDirectory(sourceRoot.relativize(directory))
-                    ) {
-                        return FileVisitResult.SKIP_SUBTREE
+                    if (directory != sourceRoot) {
+                        val relative = sourceRoot.relativize(directory)
+                        requireNoExcludedDirectoryAlias(relative)
+                        if (isExcludedDirectory(relative)) {
+                            return FileVisitResult.SKIP_SUBTREE
+                        }
                     }
                     return FileVisitResult.CONTINUE
                 }
@@ -279,6 +274,7 @@ object ExtensionZip {
                     attributes: BasicFileAttributes,
                 ): FileVisitResult {
                     val relativePath = sourceRoot.relativize(path)
+                    requireNoExcludedAliases(relativePath)
                     if (!shouldInclude(relativePath, includeProjectMarker)) {
                         return FileVisitResult.CONTINUE
                     }
@@ -294,6 +290,14 @@ object ExtensionZip {
                     require(attributes.size() <= MAX_ENTRY_SIZE) {
                         "ZIP 개별 파일 크기가 제한을 초과합니다: $path"
                     }
+                    require(inventory.size < MAX_ENTRIES) {
+                        "ZIP 항목 수가 제한을 초과합니다: 감지 항목=${inventory.size + 1}"
+                    }
+                    require(attributes.size() <= MAX_TOTAL_SIZE - totalSize) {
+                        "ZIP 전체 크기가 제한을 초과합니다: " +
+                            "누적 바이트=${totalSize + attributes.size()}"
+                    }
+                    totalSize += attributes.size()
                     inventory += SourceInventoryEntry(
                         path = path,
                         name = name,
@@ -393,6 +397,30 @@ object ExtensionZip {
 
     private fun isExcludedDirectory(relative: Path): Boolean =
         relative.any { it.toString() in EXCLUDED_DIRECTORIES }
+
+    private fun requireNoExcludedDirectoryAlias(relative: Path) {
+        relative.forEach { component ->
+            val raw = component.toString()
+            val canonical = canonicalSegment(raw)
+            require(raw in EXCLUDED_DIRECTORIES || canonical !in CANONICAL_EXCLUDED_DIRECTORIES) {
+                "제외 디렉터리 이름의 canonical alias를 거부했습니다: $raw"
+            }
+        }
+    }
+
+    private fun requireNoExcludedAliases(relative: Path) {
+        requireNoExcludedDirectoryAlias(relative)
+        val raw = relative.fileName.toString()
+        val canonical = canonicalSegment(raw)
+        require(raw in EXCLUDED_FILES || canonical !in CANONICAL_EXCLUDED_FILES) {
+            "제외 파일 이름의 canonical alias를 거부했습니다: $raw"
+        }
+    }
+
+    private fun canonicalSegment(value: String): String =
+        Normalizer.normalize(value, Normalizer.Form.NFKC)
+            .uppercase(Locale.ROOT)
+            .lowercase(Locale.ROOT)
 
     private fun locateManifestRoot(extracted: Path): Path {
         if (Files.isRegularFile(extracted.resolve("manifest.json"), LinkOption.NOFOLLOW_LINKS)) {
@@ -610,6 +638,10 @@ object ExtensionZip {
 
     private val EXCLUDED_DIRECTORIES = setOf(".git", ".gradle", "node_modules")
     private val EXCLUDED_FILES = setOf(".DS_Store")
+    private val CANONICAL_EXCLUDED_DIRECTORIES =
+        EXCLUDED_DIRECTORIES.mapTo(mutableSetOf(), ::canonicalSegment)
+    private val CANONICAL_EXCLUDED_FILES =
+        EXCLUDED_FILES.mapTo(mutableSetOf(), ::canonicalSegment)
     private val FILE_CREATE_OPTIONS = setOf<OpenOption>(
         StandardOpenOption.CREATE_NEW,
         StandardOpenOption.WRITE,

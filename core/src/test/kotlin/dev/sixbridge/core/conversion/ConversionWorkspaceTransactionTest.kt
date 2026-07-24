@@ -239,7 +239,7 @@ class ConversionWorkspaceTransactionTest {
     }
 
     @Test
-    fun `successful backup cleanup failure is retried by close`() {
+    fun `successful backup cleanup absorbs one concurrent late child`() {
         val workspace = ConversionWorkspace()
         val snapshot = workspace.snapshot(storageExtension(padding = 1_500))
         val pool = Executors.newSingleThreadExecutor()
@@ -256,11 +256,8 @@ class ConversionWorkspaceTransactionTest {
         try {
             workspace.transform(snapshot, profile, plan(snapshot))
             val backup = cleanupRace.get(5, TimeUnit.SECONDS)
-            assertTrue(Files.exists(backup.resolve("late-cleanup.txt")))
-
-            workspace.close()
-
             assertFalse(Files.exists(backup))
+            workspace.close()
         } finally {
             pool.shutdownNow()
             workspace.close()

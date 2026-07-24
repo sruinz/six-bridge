@@ -27,7 +27,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 class ConversionWorkspace : AutoCloseable {
-    private val root = Files.createTempDirectory("sixbridge-conversion-")
+    private val root = PendingTempCleanup.createTempDirectory("sixbridge-conversion-")
     private val ownedWorkingRoots = mutableListOf<Path>()
     private val ownedSnapshots = IdentityHashMap<ExtensionSnapshot, Unit>()
     private val pendingCleanup = ConcurrentHashMap.newKeySet<Path>()

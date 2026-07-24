@@ -4,6 +4,7 @@ import java.net.URI
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -55,6 +56,95 @@ class ExtensionZipTest {
         }
 
         assertEquals(listOf("manifest.json"), names)
+    }
+
+    @Test
+    fun `rejects canonical aliases of excluded directory and file names`() {
+        val aliases = listOf(
+            ".GIT" to true,
+            "．ｇｉｔ" to true,
+            "NODE_MODULES" to true,
+            "ｎｏｄｅ＿ｍｏｄｕｌｅｓ" to true,
+            ".ds_store" to false,
+            "．ＤＳ＿Ｓｔｏｒｅ" to false,
+        )
+
+        aliases.forEach { (alias, directory) ->
+            val source = Files.createTempDirectory("six-excluded-alias")
+            source.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Alias","version":"1"}""",
+            )
+            val entry = source.resolve(alias)
+            if (directory) {
+                Files.createDirectories(entry).resolve("payload.js").writeText("payload")
+            } else {
+                entry.writeText("metadata")
+            }
+
+            val error = assertFailsWith<IllegalArgumentException> {
+                ExtensionZip.createBytes(source)
+            }
+            assertTrue(error.message.orEmpty().contains("제외"))
+        }
+    }
+
+    @Test
+    fun `rejects a large excluded alias tree before traversing its contents`() {
+        val source = Files.createTempDirectory("six-large-excluded-alias")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Large alias","version":"1"}""",
+        )
+        val alias = Files.createDirectories(source.resolve("ＮＯＤＥ＿ＭＯＤＵＬＥＳ"))
+        repeat(10_100) { index ->
+            alias.resolve("entry-$index.js").writeText("")
+        }
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            ExtensionZip.createBytes(source)
+        }
+
+        assertTrue(error.message.orEmpty().contains("제외"))
+        assertFalse(error.message.orEmpty().contains("항목 수"))
+    }
+
+    @Test
+    fun `stops source traversal as soon as the included entry limit is exceeded`() {
+        val source = Files.createTempDirectory("six-source-entry-limit")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Entry limit","version":"1"}""",
+        )
+        repeat(10_000) { index ->
+            source.resolve("entry-${index.toString().padStart(5, '0')}.js")
+                .writeText("")
+        }
+        val error = assertFailsWith<IllegalArgumentException> {
+            ExtensionZip.createBytes(source)
+        }
+
+        assertTrue(error.message.orEmpty().contains("감지 항목=10001"))
+    }
+
+    @Test
+    fun `stops source traversal as soon as cumulative size exceeds the limit`() {
+        val source = Files.createTempDirectory("six-source-total-limit")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Size limit","version":"1"}""",
+        )
+        repeat(5) { index ->
+            Files.newByteChannel(
+                source.resolve("large-$index.bin"),
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE,
+            ).use { channel ->
+                channel.position(128L * 1024 * 1024 - 1)
+                channel.write(java.nio.ByteBuffer.wrap(byteArrayOf(0)))
+            }
+        }
+        val error = assertFailsWith<IllegalArgumentException> {
+            ExtensionZip.createBytes(source)
+        }
+
+        assertTrue(error.message.orEmpty().contains("누적 바이트="))
     }
 
     @Test
