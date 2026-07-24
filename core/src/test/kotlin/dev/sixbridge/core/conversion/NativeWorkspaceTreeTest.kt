@@ -38,19 +38,22 @@ class NativeWorkspaceTreeTest {
         }
 
         NativeWorkspaceTree.copy(source, destination)
-
-        assertEquals(
-            "preserved",
-            destination.resolve("node_modules/cache/entry.js").readText(),
-        )
-        assertTrue(Files.isDirectory(destination.resolve("empty")))
-        assertEquals(modified, Files.getLastModifiedTime(destination.resolve(
-            "node_modules/cache/entry.js",
-        )))
-        assertEquals(
-            WorkspaceTreeDigest.provenanceSha256(source),
-            WorkspaceTreeDigest.provenanceSha256(destination),
-        )
+        try {
+            assertEquals(
+                "preserved",
+                destination.resolve("node_modules/cache/entry.js").readText(),
+            )
+            assertTrue(Files.isDirectory(destination.resolve("empty")))
+            assertEquals(modified, Files.getLastModifiedTime(destination.resolve(
+                "node_modules/cache/entry.js",
+            )))
+            assertEquals(
+                WorkspaceTreeDigest.provenanceSha256(source),
+                WorkspaceTreeDigest.provenanceSha256(destination),
+            )
+        } finally {
+            OwnedTempTree.delete(destination)
+        }
     }
 
     @Test

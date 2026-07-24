@@ -189,7 +189,7 @@ class ConversionWorkspaceTest {
     }
 
     @Test
-    fun `close never follows a working root replaced by an external symlink`() {
+    fun `close retains a replaced working root owner without deleting the replacement`() {
         val source = source("six-working-root-swap")
         source.resolve("0000-swap-trigger.txt").writeText("trigger")
         repeat(2_500) { index ->
@@ -217,10 +217,24 @@ class ConversionWorkspaceTest {
 
         try {
             swapTask.get(10, TimeUnit.SECONDS)
-            closeTask.get(10, TimeUnit.SECONDS)
+            val error = assertFailsWith<ExecutionException> {
+                closeTask.get(10, TimeUnit.SECONDS)
+            }.cause ?: error("working root replacement cleanup 실패 원인이 없습니다.")
 
+            assertEquals(
+                "소유한 임시 경로를 정리하지 못했습니다.",
+                error.message,
+            )
+            assertEquals(null, error.cause)
             assertEquals("outside", outsideProof.readText())
             assertTrue(Files.isDirectory(outside, LinkOption.NOFOLLOW_LINKS))
+            assertTrue(Files.isSymbolicLink(workingRoot))
+            assertTrue(Files.isDirectory(movedRoot, LinkOption.NOFOLLOW_LINKS))
+
+            Files.delete(workingRoot)
+            Files.move(movedRoot, workingRoot, StandardCopyOption.ATOMIC_MOVE)
+            workspace.close()
+
             assertFalse(Files.exists(workingRoot, LinkOption.NOFOLLOW_LINKS))
             assertFalse(Files.exists(movedRoot, LinkOption.NOFOLLOW_LINKS))
         } finally {
@@ -236,6 +250,87 @@ class ConversionWorkspaceTest {
                 }
             }
             runCatching { workspace.close() }
+        }
+    }
+
+    @Test
+    fun `retained child owner handle survives its parent path replacement`() {
+        val source = source("six-parent-handle-retained")
+        source.resolve("content.js").writeText("content")
+        val outside = Files.createTempDirectory("six-parent-handle-outside")
+        val outsideProof = outside.resolve("outside-proof.txt")
+        outsideProof.writeText("outside")
+        val workspace = ConversionWorkspace()
+        val snapshot = workspace.snapshot(source)
+        val snapshotRoot = requireNotNull(snapshot.workingRoot.parent)
+        val movedSnapshotRoot = snapshotRoot.resolveSibling(
+            "${snapshotRoot.fileName}-moved",
+        )
+        Files.move(
+            snapshotRoot,
+            movedSnapshotRoot,
+            StandardCopyOption.ATOMIC_MOVE,
+        )
+        Files.createSymbolicLink(snapshotRoot, outside)
+
+        try {
+            val error = assertFailsWith<OwnedTempCleanupException> {
+                workspace.close()
+            }
+
+            assertEquals(null, error.cause)
+            assertEquals("outside", outsideProof.readText())
+            assertTrue(Files.isSymbolicLink(snapshotRoot))
+            assertTrue(Files.isDirectory(movedSnapshotRoot, LinkOption.NOFOLLOW_LINKS))
+            assertFalse(
+                Files.exists(
+                    movedSnapshotRoot.resolve("working"),
+                    LinkOption.NOFOLLOW_LINKS,
+                ),
+            )
+
+            Files.delete(snapshotRoot)
+            Files.move(
+                movedSnapshotRoot,
+                snapshotRoot,
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+            workspace.close()
+        } finally {
+            runCatching { Files.deleteIfExists(snapshotRoot) }
+            runCatching {
+                if (Files.exists(movedSnapshotRoot, LinkOption.NOFOLLOW_LINKS)) {
+                    Files.walk(movedSnapshotRoot).use { paths ->
+                        paths.sorted(Comparator.reverseOrder())
+                            .forEach(Files::deleteIfExists)
+                    }
+                }
+            }
+            runCatching { workspace.close() }
+        }
+    }
+
+    @Test
+    fun `identityless path cannot enter process pending cleanup`() {
+        val workspace = ConversionWorkspace()
+        val snapshot = workspace.snapshot(source("six-identityless-cleanup"))
+        val workspaceRoot = requireNotNull(requireNotNull(snapshot.originalRoot.parent).parent)
+        val identityless = Files.createDirectories(
+            workspaceRoot.resolve("identityless"),
+        )
+        identityless.resolve("proof.txt").writeText("preserve")
+
+        try {
+            assertFailsWith<OwnedTempCleanupException> {
+                OwnedTempTree.delete(identityless)
+            }
+            ConversionWorkspace().use { retryTrigger ->
+                assertTrue(Files.exists(identityless, LinkOption.NOFOLLOW_LINKS))
+                retryTrigger.snapshot(source("six-identityless-trigger"))
+            }
+            assertTrue(Files.exists(identityless, LinkOption.NOFOLLOW_LINKS))
+        } finally {
+            workspace.close()
         }
     }
 

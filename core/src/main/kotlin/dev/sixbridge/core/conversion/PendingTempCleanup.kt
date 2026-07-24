@@ -18,153 +18,294 @@ import java.nio.file.attribute.DosFileAttributeView
 import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
 import java.util.EnumSet
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.jvm.JvmSynthetic
 
 internal object PendingTempCleanup {
-    private data class Owner(
-        val root: Path,
-        val parent: Path,
-        val name: Path,
-        val fileKey: Any,
-    )
+    private class Owner(
+        @Volatile var root: Path,
+        val parentPath: Path,
+        @Volatile var name: Path,
+        val rootFileKey: Any,
+        val parentFileKey: Any,
+        val parentHandle: SecureDirectoryStream<Path>,
+        val token: UUID,
+        val parentToken: UUID?,
+    ) {
+        val lock = ReentrantLock()
+
+        @Volatile
+        var pending: Boolean = false
+    }
 
     private val owners = ConcurrentHashMap<Path, Owner>()
-    private val pending = ConcurrentHashMap.newKeySet<Path>()
-    private val unanchoredPending = ConcurrentHashMap.newKeySet<Path>()
-
-    init {
-        runCatching {
-            Runtime.getRuntime().addShutdownHook(
-                Thread(
-                    {
-                        repeat(SHUTDOWN_RETRY_PASSES) {
-                            if (pending.isEmpty() && unanchoredPending.isEmpty()) {
-                                return@Thread
-                            }
-                            retryPending()
-                        }
-                    },
-                    "sixbridge-temp-cleanup",
-                ),
-            )
-        }
-    }
 
     @JvmSynthetic
     fun createTempDirectory(prefix: String): Path {
         retryPending()
         val created = Files.createTempDirectory(prefix)
-        return try {
-            registerRoot(created)
+        return registerTopLevel(created)
+    }
+
+    @JvmSynthetic
+    fun createTempDirectory(parent: Path, prefix: String): Path {
+        retryPending()
+        val normalizedParent = parent.toAbsolutePath().normalize()
+        requireRegistered(normalizedParent)
+        val created = try {
+            Files.createTempDirectory(normalizedParent, prefix)
         } catch (_: Exception) {
-            unanchoredPending.add(created.toAbsolutePath().normalize())
             throw OwnedTempCleanupException()
+        }
+        return registerCreated(created)
+    }
+
+    @JvmSynthetic
+    fun createDirectory(path: Path): Path {
+        val normalized = path.toAbsolutePath().normalize()
+        val parent = requireNotNull(normalized.parent)
+        val parentOwner = owners[parent]
+        try {
+            Files.createDirectory(normalized)
+        } catch (_: Exception) {
+            throw OwnedTempCleanupException()
+        }
+        return if (parentOwner == null) {
+            registerTopLevel(normalized)
+        } else {
+            registerCreated(normalized)
+        }
+    }
+
+    @JvmSynthetic
+    fun registerCreated(path: Path): Path {
+        val normalized = path.toAbsolutePath().normalize()
+        val parent = requireNotNull(normalized.parent)
+        val parentOwner = requireRegistered(parent)
+        val handle = retainedChildHandle(parentOwner)
+        return try {
+            register(
+                root = normalized,
+                parentPath = parent,
+                parentHandle = handle,
+                parentToken = parentOwner.token,
+            )
+        } catch (_: Exception) {
+            runCatching { handle.close() }
+            throw OwnedTempCleanupException()
+        }
+    }
+
+    @JvmSynthetic
+    fun move(from: Path, to: Path): Path {
+        val source = from.toAbsolutePath().normalize()
+        val destination = to.toAbsolutePath().normalize()
+        val owner = requireRegistered(source)
+        return owner.lock.withLock {
+            try {
+                check(destination.parent == owner.parentPath)
+                check(owners[destination] == null)
+                verifyOwner(owner)
+                check(readAttributesOrNull(owner.parentHandle, destination.fileName) == null)
+                owner.parentHandle.move(
+                    owner.name,
+                    owner.parentHandle,
+                    destination.fileName,
+                )
+                val moved = readAttributes(owner.parentHandle, destination.fileName)
+                check(
+                    moved.isDirectory &&
+                        !moved.isSymbolicLink &&
+                        moved.fileKey() == owner.rootFileKey,
+                )
+                check(readAttributesOrNull(owner.parentHandle, owner.name) == null)
+                check(owners.remove(source, owner))
+                owner.root = destination
+                owner.name = destination.fileName
+                check(owners.putIfAbsent(destination, owner) == null)
+                destination
+            } catch (_: Exception) {
+                throw OwnedTempCleanupException()
+            }
         }
     }
 
     @JvmSynthetic
     fun delete(path: Path) {
         val target = path.toAbsolutePath().normalize()
-        val owner = ownerFor(target) ?: throw OwnedTempCleanupException()
-        pending.add(target)
+        val owner = owners[target] ?: throw OwnedTempCleanupException()
         try {
-            deleteAnchored(owner, target)
+            deleteRegistered(owner)
         } catch (_: Exception) {
             throw OwnedTempCleanupException()
         }
-        pending.remove(target)
-        if (target == owner.root) {
-            owners.remove(owner.root, owner)
-            pending.removeIf { it.startsWith(owner.root) }
-        }
     }
 
-    private fun registerRoot(created: Path): Path {
-        val root = created.toRealPath(NOFOLLOW_LINKS)
+    private fun registerTopLevel(created: Path): Path {
+        val root = try {
+            created.toRealPath(NOFOLLOW_LINKS)
+        } catch (_: Exception) {
+            throw OwnedTempCleanupException()
+        }
         val parent = requireNotNull(root.parent)
-        val name = root.fileName
-        val owner = openSecure(parent) { directory ->
-            val attributes = readAttributes(directory, name)
-            require(attributes.isDirectory && !attributes.isSymbolicLink)
-            Owner(
-                root = root,
-                parent = parent,
-                name = name,
-                fileKey = requireNotNull(attributes.fileKey()),
-            )
+        val stream = try {
+            Files.newDirectoryStream(parent)
+        } catch (_: Exception) {
+            throw OwnedTempCleanupException()
         }
-        check(owners.putIfAbsent(root, owner) == null)
-        return root
+        if (stream !is SecureDirectoryStream<Path>) {
+            runCatching { stream.close() }
+            throw OwnedTempCleanupException()
+        }
+        return try {
+            register(
+                root = root,
+                parentPath = parent,
+                parentHandle = stream,
+                parentToken = null,
+            )
+        } catch (_: Exception) {
+            runCatching { stream.close() }
+            throw OwnedTempCleanupException()
+        }
     }
 
-    private fun ownerFor(target: Path): Owner? =
-        owners.values
-            .filter { target.startsWith(it.root) }
-            .maxByOrNull { it.root.nameCount }
+    private fun register(
+        root: Path,
+        parentPath: Path,
+        parentHandle: SecureDirectoryStream<Path>,
+        parentToken: UUID?,
+    ): Path {
+        val normalizedRoot = root.toAbsolutePath().normalize()
+        val normalizedParent = parentPath.toAbsolutePath().normalize()
+        check(normalizedRoot.parent == normalizedParent)
+        val pathParent = Files.readAttributes(
+            normalizedParent,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        val pathRoot = Files.readAttributes(
+            normalizedRoot,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        val handleParent = readAttributes(parentHandle)
+        check(
+            pathParent.isDirectory &&
+                !pathParent.isSymbolicLink &&
+                pathParent.fileKey() != null &&
+                pathParent.fileKey() == handleParent.fileKey(),
+        )
+        check(
+            pathRoot.isDirectory &&
+                !pathRoot.isSymbolicLink &&
+                pathRoot.fileKey() != null,
+        )
+        val name = singleName(normalizedRoot.fileName.toString())
+        val rootAttributes = readAttributes(parentHandle, name)
+        check(
+            rootAttributes.isDirectory &&
+                !rootAttributes.isSymbolicLink &&
+                rootAttributes.fileKey() == pathRoot.fileKey(),
+        )
+        val owner = Owner(
+            root = normalizedRoot,
+            parentPath = normalizedParent,
+            name = name,
+            rootFileKey = requireNotNull(pathRoot.fileKey()),
+            parentFileKey = requireNotNull(handleParent.fileKey()),
+            parentHandle = parentHandle,
+            token = UUID.randomUUID(),
+            parentToken = parentToken,
+        )
+        check(owners.putIfAbsent(normalizedRoot, owner) == null)
+        return normalizedRoot
+    }
+
+    private fun retainedChildHandle(owner: Owner): SecureDirectoryStream<Path> =
+        owner.lock.withLock {
+            try {
+                verifyOwner(owner)
+                owner.parentHandle.newDirectoryStream(
+                    owner.name,
+                    NOFOLLOW_LINKS,
+                )
+            } catch (_: Exception) {
+                throw OwnedTempCleanupException()
+            }
+        }
+
+    private fun requireRegistered(path: Path): Owner =
+        owners[path.toAbsolutePath().normalize()]
+            ?: throw OwnedTempCleanupException()
 
     private fun retryPending() {
-        unanchoredPending.toList().forEach { created ->
-            runCatching {
-                val root = registerRoot(created)
-                unanchoredPending.remove(created)
-                pending.add(root)
+        owners.values
+            .filter(Owner::pending)
+            .sortedByDescending { it.root.nameCount }
+            .forEach { owner ->
+                runCatching { deleteRegistered(owner) }
             }
-        }
-        pending.toList().forEach { target ->
-            runCatching { delete(target) }
-        }
     }
 
-    private fun deleteAnchored(owner: Owner, target: Path) {
-        val relative = owner.root.relativize(target)
-        openSecure(owner.parent) { parent ->
-            val rootAttributes = readAttributesOrNull(parent, owner.name)
-            if (rootAttributes == null) return@openSecure
-            check(
-                rootAttributes.isDirectory &&
-                    !rootAttributes.isSymbolicLink &&
-                    rootAttributes.fileKey() == owner.fileKey,
+    private fun deleteRegistered(owner: Owner) {
+        owner.lock.withLock {
+            check(owners[owner.root] === owner)
+            owner.pending = true
+            childrenOf(owner)
+                .sortedByDescending { it.root.nameCount }
+                .forEach(::deleteRegistered)
+            verifyParent(owner)
+            deleteEntry(
+                parent = owner.parentHandle,
+                name = owner.name,
+                expectedFileKey = owner.rootFileKey,
+                missingIsFailure = true,
             )
-            if (relative.toString().isEmpty()) {
-                deleteEntry(parent, owner.name, owner.fileKey)
-            } else {
-                parent.newDirectoryStream(owner.name, NOFOLLOW_LINKS).use { root ->
-                    withParent(
-                        directory = root,
-                        components = relative.map { it.toString() },
-                        index = 0,
-                    ) { targetParent, targetName ->
-                        deleteEntry(targetParent, targetName)
-                    }
-                }
-            }
+            check(owners.remove(owner.root, owner))
+            owner.pending = false
+            runCatching { owner.parentHandle.close() }
         }
     }
 
-    private fun withParent(
-        directory: SecureDirectoryStream<Path>,
-        components: List<String>,
-        index: Int,
-        action: (SecureDirectoryStream<Path>, Path) -> Unit,
-    ) {
-        val name = singleName(components[index])
-        if (index == components.lastIndex) {
-            action(directory, name)
-            return
-        }
-        directory.newDirectoryStream(name, NOFOLLOW_LINKS).use { child ->
-            withParent(child, components, index + 1, action)
-        }
+    private fun childrenOf(parent: Owner): List<Owner> =
+        owners.values.filter { it.parentToken == parent.token }
+
+    private fun verifyOwner(owner: Owner) {
+        verifyParent(owner)
+        val attributes = readAttributes(owner.parentHandle, owner.name)
+        check(
+            attributes.isDirectory &&
+                !attributes.isSymbolicLink &&
+                attributes.fileKey() == owner.rootFileKey,
+        )
+    }
+
+    private fun verifyParent(owner: Owner) {
+        val attributes = readAttributes(owner.parentHandle)
+        check(
+            attributes.isDirectory &&
+                !attributes.isSymbolicLink &&
+                attributes.fileKey() == owner.parentFileKey,
+        )
     }
 
     private fun deleteEntry(
         parent: SecureDirectoryStream<Path>,
         name: Path,
         expectedFileKey: Any? = null,
+        missingIsFailure: Boolean = false,
     ) {
         repeat(MAX_DELETE_PASSES) {
-            val attributes = readAttributesOrNull(parent, name) ?: return
+            val attributes = readAttributesOrNull(parent, name)
+                ?: if (missingIsFailure) {
+                    throw NoSuchFileException(name.toString())
+                } else {
+                    return
+                }
             if (expectedFileKey != null) {
                 check(attributes.fileKey() == expectedFileKey)
             }
@@ -178,7 +319,8 @@ internal object PendingTempCleanup {
                                 deleteEntry(child, childName)
                             }
                     }
-                } catch (_: NoSuchFileException) {
+                } catch (error: NoSuchFileException) {
+                    if (missingIsFailure) throw error
                     return
                 } catch (_: NotDirectoryException) {
                     return@repeat
@@ -187,7 +329,8 @@ internal object PendingTempCleanup {
                 try {
                     parent.deleteDirectory(name)
                     return
-                } catch (_: NoSuchFileException) {
+                } catch (error: NoSuchFileException) {
+                    if (missingIsFailure) throw error
                     return
                 } catch (_: DirectoryNotEmptyException) {
                     return@repeat
@@ -203,7 +346,8 @@ internal object PendingTempCleanup {
                 try {
                     parent.deleteFile(name)
                     return
-                } catch (_: NoSuchFileException) {
+                } catch (error: NoSuchFileException) {
+                    if (missingIsFailure) throw error
                     return
                 } catch (_: IOException) {
                     return@repeat
@@ -260,6 +404,15 @@ internal object PendingTempCleanup {
 
     private fun readAttributes(
         directory: SecureDirectoryStream<Path>,
+    ): BasicFileAttributes =
+        requireNotNull(
+            directory.getFileAttributeView(
+                BasicFileAttributeView::class.java,
+            ),
+        ).readAttributes()
+
+    private fun readAttributes(
+        directory: SecureDirectoryStream<Path>,
         name: Path,
     ): BasicFileAttributes =
         requireNotNull(
@@ -290,15 +443,5 @@ internal object PendingTempCleanup {
             )
         }
 
-    private fun <T> openSecure(
-        parent: Path,
-        block: (SecureDirectoryStream<Path>) -> T,
-    ): T =
-        Files.newDirectoryStream(parent).use { stream ->
-            require(stream is SecureDirectoryStream<Path>)
-            block(stream)
-        }
-
     private const val MAX_DELETE_PASSES = 8
-    private const val SHUTDOWN_RETRY_PASSES = 3
 }

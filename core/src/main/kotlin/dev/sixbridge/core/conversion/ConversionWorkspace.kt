@@ -39,7 +39,10 @@ class ConversionWorkspace : AutoCloseable {
         requireOwnerOnlyMarker: Boolean = true,
     ): ExtensionSnapshot {
         requireOpen()
-        val snapshotRoot = Files.createTempDirectory(root, "snapshot-")
+        val snapshotRoot = PendingTempCleanup.createTempDirectory(
+            root,
+            "snapshot-",
+        )
         return try {
             val sourceProjectIdentity = SourceProjectIdentityStore.readSourceMarker(
                 source,
@@ -49,9 +52,11 @@ class ConversionWorkspace : AutoCloseable {
                 sourceRoot = source,
                 includeProjectMarker = true,
             )
-            val original = ExtensionZip.extract(
-                sourceZip,
-                snapshotRoot.resolve("original"),
+            val original = PendingTempCleanup.registerCreated(
+                ExtensionZip.extract(
+                    sourceZip,
+                    snapshotRoot.resolve("original"),
+                ),
             )
             val working = NativeWorkspaceTree.copy(
                 original,
@@ -867,7 +872,7 @@ class ConversionWorkspace : AutoCloseable {
         }
 
         private fun moveDirectory(from: Path, to: Path) {
-            Files.move(from, to, ATOMIC_MOVE)
+            PendingTempCleanup.move(from, to)
         }
 
     }

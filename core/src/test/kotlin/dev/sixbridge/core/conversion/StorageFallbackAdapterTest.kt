@@ -463,7 +463,8 @@ class StorageFallbackAdapterTest {
     @Test
     fun `rejects a parent directory symlink swap without touching its target`() {
         val source = extension("chrome.storage.sync.get('a');")
-        ConversionWorkspace().use { workspace ->
+        val workspace = ConversionWorkspace()
+        try {
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
             val plan = conversionPlanFor(snapshot.originalRoot, fallbackProfile)
@@ -477,7 +478,10 @@ class StorageFallbackAdapterTest {
             val linked = runCatching {
                 Files.createSymbolicLink(originalParent, outside)
             }.isSuccess
-            if (!linked) return
+            if (!linked) {
+                Files.move(movedParent, originalParent)
+                return
+            }
 
             assertFailsWith<IllegalStateException> {
                 workspace.transform(
@@ -489,6 +493,17 @@ class StorageFallbackAdapterTest {
 
             assertEquals("unchanged", outside.resolve("sentinel.txt").readText())
             assertFalse(Files.exists(outside.resolve("content.js")))
+            assertFailsWith<OwnedTempCleanupException> {
+                workspace.close()
+            }
+            assertTrue(Files.isSymbolicLink(originalParent))
+            assertTrue(Files.isDirectory(movedParent))
+
+            Files.delete(originalParent)
+            Files.move(movedParent, originalParent)
+            workspace.close()
+        } finally {
+            runCatching { workspace.close() }
         }
     }
 

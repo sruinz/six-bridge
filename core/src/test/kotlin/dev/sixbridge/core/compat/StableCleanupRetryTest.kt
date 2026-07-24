@@ -108,6 +108,70 @@ class StableCleanupRetryTest {
         }
     }
 
+    @Test
+    fun `missing stable root remains pending until the same inode returns`() {
+        val source = Files.createTempDirectory("six-stable-missing-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Missing","version":"1"}""",
+        )
+        source.resolve("0000-missing-trigger.txt").writeText("trigger")
+        repeat(2_500) { index ->
+            source.resolve("padding-${index.toString().padStart(4, '0')}.txt")
+                .writeText("padding-$index")
+        }
+        val rootsBefore = analysisRoots()
+        val analysisTask = FutureTask {
+            CompatibilityAnalyzer().analyze(source, profile)
+        }
+        val analysisThread = Thread(analysisTask, "stable-missing-victim")
+        analysisThread.start()
+        val missingRoot = waitForNewAnalysisRoot(rootsBefore)
+        val movedRoot = missingRoot.resolveSibling("${missingRoot.fileName}-missing")
+        val attacker = FutureTask {
+            val trigger = missingRoot.resolve(
+                "canonical/0000-missing-trigger.txt",
+            )
+            while (!Files.exists(trigger)) {
+                check(!analysisTask.isDone) {
+                    "stable missing trigger를 관찰하기 전에 분석이 종료되었습니다."
+                }
+                Thread.onSpinWait()
+            }
+            while (Files.exists(trigger)) Thread.onSpinWait()
+            Files.move(missingRoot, movedRoot, StandardCopyOption.ATOMIC_MOVE)
+        }
+        val attackerThread = Thread(attacker, "stable-missing-attacker")
+        attackerThread.start()
+
+        try {
+            val error = assertFailsWith<ExecutionException> {
+                analysisTask.get(15, TimeUnit.SECONDS)
+            }.cause ?: error("stable missing cleanup 실패 원인이 없습니다.")
+            attacker.get(5, TimeUnit.SECONDS)
+
+            assertEquals(
+                "소유한 임시 경로를 정리하지 못했습니다.",
+                error.message,
+            )
+            assertFalse(Files.exists(missingRoot, NOFOLLOW_LINKS))
+            assertTrue(Files.exists(movedRoot, NOFOLLOW_LINKS))
+
+            Files.move(movedRoot, missingRoot, StandardCopyOption.ATOMIC_MOVE)
+            val retrySource = Files.createTempDirectory("six-stable-missing-retry")
+            retrySource.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Retry","version":"1"}""",
+            )
+            CompatibilityAnalyzer().analyze(retrySource, profile)
+
+            assertFalse(Files.exists(missingRoot, NOFOLLOW_LINKS))
+        } finally {
+            analysisThread.join(5_000)
+            attackerThread.join(5_000)
+            deleteTestTree(movedRoot)
+            deleteTestTree(missingRoot)
+        }
+    }
+
     private fun analysisRoots(): Set<Path> {
         val temporary = Path.of(System.getProperty("java.io.tmpdir"))
         return Files.list(temporary).use { paths ->

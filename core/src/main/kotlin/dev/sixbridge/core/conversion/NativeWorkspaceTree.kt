@@ -21,6 +21,7 @@ internal object NativeWorkspaceTree {
             "native workspace copy 경계를 확인할 수 없습니다."
         }
         val before = WorkspaceTreeDigest.capture(sourceRoot)
+        PendingTempCleanup.createDirectory(targetRoot)
         try {
             copyTree(sourceRoot, targetRoot)
             val sourceAfter = WorkspaceTreeDigest.capture(sourceRoot)
@@ -42,7 +43,7 @@ internal object NativeWorkspaceTree {
         val entries = Files.walk(sourceRoot).use { paths ->
             paths.sorted().toList()
         }
-        entries.forEach { source ->
+        entries.filter { it != sourceRoot }.forEach { source ->
             val attributes = Files.readAttributes(
                 source,
                 BasicFileAttributes::class.java,
@@ -54,11 +55,7 @@ internal object NativeWorkspaceTree {
             ) {
                 "native workspace에는 일반 파일과 디렉터리만 허용됩니다."
             }
-            val target = if (source == sourceRoot) {
-                targetRoot
-            } else {
-                targetRoot.resolve(sourceRoot.relativize(source).toString())
-            }
+            val target = targetRoot.resolve(sourceRoot.relativize(source).toString())
             if (attributes.isDirectory) {
                 Files.createDirectory(target)
             } else {
