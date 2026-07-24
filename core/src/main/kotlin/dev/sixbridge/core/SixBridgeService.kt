@@ -17,6 +17,7 @@ import dev.sixbridge.core.draft.DraftSigningKeyStore
 import dev.sixbridge.core.draft.DraftSourceKind
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.draft.SixDraftPayload
+import dev.sixbridge.core.draft.VerifiedSixDraft
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.ExtensionZip
@@ -26,8 +27,11 @@ import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.security.KeyPair
+import java.util.ArrayDeque
 
 data class SixBuildResult(
     val extensionId: String,
@@ -53,6 +57,7 @@ class SixBridgeService(
     private val workspaceRoot: Path,
     private val inputResolver: ExtensionInputResolver = ExtensionInputResolver(),
     private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(),
+    private val draftReader: (Path) -> VerifiedSixDraft = SixDraft::read,
     private val toolchainProvider: () -> AndroidToolchain = { AndroidToolchain.locate() },
 ) {
     private val localRoot = workspaceRoot.resolve(".local")
@@ -60,7 +65,9 @@ class SixBridgeService(
     fun analyze(input: String, profile: BrowserProfile): CompatibilityReport {
         val resolved = inputResolver.resolve(input)
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
-            pipeline.analyze(resolved, profile)
+            userInputBoundary("확장 입력을 분석할 수 없습니다.") {
+                pipeline.analyze(resolved, profile)
+            }
         }
     }
 
@@ -70,21 +77,43 @@ class SixBridgeService(
         outputDraft: Path,
         projectIdentity: String? = null,
         approvedAdapterIds: Iterable<String> = emptyList(),
+        protectedInputs: Iterable<Path> = emptyList(),
     ): SixDraftResult {
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
+        validateProjectIdentity(projectIdentity)
+        val target = outputDraft.toAbsolutePath().normalize()
+        ProtectedOutputPolicy.requireSafe(
+            workspaceRoot = workspaceRoot,
+            localRoot = localRoot,
+            resolved = resolved,
+            outputs = listOf(target),
+            protectedInputs = protectedInputs,
+            rejectProtectedFileParents = false,
+        )
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
+            userInputBoundary("확장 입력을 분석할 수 없습니다.") {
+                pipeline.analyze(resolved, profile)
+            }
             val prepared = pipeline.prepare(resolved, profile, approvedAdapterIds)
             val applied = prepared.compatibilityAfter.adapterDecisions
                 .filter { it.applied }
                 .sortedWith(compareBy({ it.id }, { it.version }))
+            val originalExtensionId = authoritativeOriginalExtensionId(
+                resolved,
+                prepared.compatibilityBefore,
+                prepared.compatibilityAfter,
+            )
             val before = prepared.compatibilityBefore.copy(
-                originalExtensionId = resolved.expectedExtensionId
-                    ?: prepared.compatibilityBefore.originalExtensionId,
+                originalExtensionId = originalExtensionId,
             )
             val after = if (applied.isEmpty()) {
                 before.copy(convertedExtensionId = before.originalExtensionId)
             } else {
-                prepared.compatibilityAfter
+                prepared.compatibilityAfter.also {
+                    check(it.originalExtensionId == originalExtensionId) {
+                        "변환 결과의 원본 extension ID가 authoritative ID와 다릅니다."
+                    }
+                }
             }
             val sourceIdentity = prepared.logicalIdentity
                 ?: resolved.expectedExtensionId
@@ -133,13 +162,12 @@ class SixBridgeService(
                 compatibilityBefore = before,
                 compatibilityAfter = after,
             )
-            val target = outputDraft.toAbsolutePath().normalize()
             val key = DraftSigningKeyStore(
                 trustedRoot = workspaceRoot,
                 keyRoot = localRoot.resolve("keystore/draft-transfer"),
             ).getOrCreate()
             SixDraft.write(target, payload, key)
-            SixDraft.read(target)
+            verifyWrittenDraft(payload, key, draftReader(target))
             SixDraftResult(
                 draft = target,
                 conversionState = after.conversionState,
@@ -160,9 +188,24 @@ class SixBridgeService(
         outputBundle: Path? = null,
         projectIdentity: String? = null,
         approvedAdapterIds: Iterable<String> = emptyList(),
+        protectedInputs: Iterable<Path> = emptyList(),
     ): SixBuildResult {
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
+        validateProjectIdentity(projectIdentity)
+        val requestedBundle = outputBundle?.toAbsolutePath()?.normalize()
+            ?: workspaceRoot.resolve("dist/pending.six").toAbsolutePath().normalize()
+        ProtectedOutputPolicy.requireSafe(
+            workspaceRoot = workspaceRoot,
+            localRoot = localRoot,
+            resolved = resolved,
+            outputs = listOf(requestedBundle),
+            protectedInputs = protectedInputs,
+            rejectProtectedFileParents = true,
+        )
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
+            userInputBoundary("확장 입력을 분석할 수 없습니다.") {
+                pipeline.analyze(resolved, profile)
+            }
             val prepared = pipeline.prepare(
                 resolved,
                 profile,
@@ -180,6 +223,14 @@ class SixBridgeService(
             require(targets.toSet().size == targets.size) {
                 "CRX, wrapper APK와 SixBundle 출력 경로가 서로 달라야 합니다."
             }
+            ProtectedOutputPolicy.requireSafe(
+                workspaceRoot = workspaceRoot,
+                localRoot = localRoot,
+                resolved = resolved,
+                outputs = targets,
+                protectedInputs = protectedInputs,
+                rejectProtectedFileParents = false,
+            )
             val wrapperDraft = prepared.artifactDirectory.resolve("wrapper.apk")
             SecureBuildPublisher.copyExistingOutput(wrapperOutput, wrapperDraft)
             val wrapper = WrapperApkBuilder(toolchainProvider(), localRoot).build(
@@ -279,6 +330,70 @@ class SixBridgeService(
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
+    private fun authoritativeOriginalExtensionId(
+        resolved: ResolvedExtensionInput,
+        before: CompatibilityReport,
+        after: CompatibilityReport,
+    ): String? {
+        val candidates = listOfNotNull(
+            resolved.expectedExtensionId,
+            after.originalExtensionId,
+            before.originalExtensionId,
+            before.manifestKeyExtensionId,
+        ).distinct()
+        check(candidates.size <= 1) {
+            "입력, 변환 결과와 manifest key의 원본 extension ID가 서로 다릅니다."
+        }
+        return candidates.singleOrNull()
+    }
+
+    private fun verifyWrittenDraft(
+        expected: SixDraftPayload,
+        signingKey: KeyPair,
+        actual: VerifiedSixDraft,
+    ) {
+        val payload = actual.payload
+        val matches = actual.signerPublicKey.contentEquals(signingKey.public.encoded) &&
+            actual.signerFingerprint == sha256(signingKey.public.encoded) &&
+            payload.sourceKind == expected.sourceKind &&
+            payload.draftJson.contentEquals(expected.draftJson) &&
+            payload.inputJson.contentEquals(expected.inputJson) &&
+            payload.source.contentEquals(expected.source) &&
+            payload.conversionPlanJson.contentEquals(expected.conversionPlanJson) &&
+            payload.compatibilityBeforeJson.contentEquals(
+                expected.compatibilityBeforeJson,
+            ) &&
+            payload.compatibilityAfterJson.contentEquals(
+                expected.compatibilityAfterJson,
+            ) &&
+            payload.expectedJson.contentEquals(expected.expectedJson)
+        if (!matches) {
+            throw DraftSelfVerificationException(
+                "게시된 SixDraft가 생성 의도 또는 서명 key와 다릅니다.",
+            )
+        }
+    }
+
+    private fun validateProjectIdentity(value: String?) {
+        if (value != null && !Regex("[0-9a-f]{32}").matches(value)) {
+            throw SixBridgeUserInputException(
+                "source project identity는 소문자 16진수 32자리여야 합니다.",
+            )
+        }
+    }
+
+    private inline fun <T> userInputBoundary(
+        message: String,
+        block: () -> T,
+    ): T = try {
+        block()
+    } catch (error: IllegalArgumentException) {
+        throw SixBridgeUserInputException(
+            "$message ${error.message}",
+            error,
+        )
+    }
+
     private data class PreparedCrx(
         val extensionId: String,
         val bytes: ByteArray,
@@ -288,4 +403,105 @@ class SixBridgeService(
         private const val CORE_VERSION = "0.1.0-SNAPSHOT"
     }
 
+}
+
+open class SixBridgeUserInputException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalArgumentException(message, cause)
+
+class UnsafeOutputException(message: String) :
+    SixBridgeUserInputException(message)
+
+class DraftSelfVerificationException(message: String) :
+    IllegalStateException(message)
+
+private object ProtectedOutputPolicy {
+    private val persistentRoots = listOf(
+        "keystore",
+        "source-identities",
+        "extensions",
+        "versions",
+    )
+
+    fun requireSafe(
+        workspaceRoot: Path,
+        localRoot: Path,
+        resolved: ResolvedExtensionInput,
+        outputs: Collection<Path>,
+        protectedInputs: Iterable<Path>,
+        rejectProtectedFileParents: Boolean,
+    ) {
+        val candidates = outputs.map(::anchored)
+        val protectedTrees = buildList {
+            if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY) {
+                add(requireNotNull(resolved.sourceRoot))
+            }
+            persistentRoots.forEach { add(localRoot.resolve(it)) }
+        }.map(::anchored)
+        val protectedFiles = buildList {
+            if (
+                resolved.kind == ExtensionInputKind.ZIP ||
+                resolved.kind == ExtensionInputKind.CRX3
+            ) {
+                add(Path.of(resolved.originalInput))
+            }
+            addAll(protectedInputs)
+        }.map(::anchored)
+        val workspace = anchored(workspaceRoot)
+        val local = anchored(localRoot)
+        check(local.startsWith(workspace)) {
+            "SIX Bridge local root가 workspace 밖에 있습니다."
+        }
+        candidates.forEach { candidate ->
+            protectedTrees.forEach { protected ->
+                if (candidate.startsWith(protected) || protected.startsWith(candidate)) {
+                    throw UnsafeOutputException(
+                        "출력 경로가 보호된 source 또는 영구 상태와 겹칩니다: $candidate",
+                    )
+                }
+            }
+            protectedFiles.forEach { protected ->
+                val exactOverlap = candidate == protected || protected.startsWith(candidate)
+                val protectedName = protected.fileName?.toString().orEmpty()
+                val sharedParent = rejectProtectedFileParents &&
+                    candidate.parent == protected.parent &&
+                    (
+                        protectedName.endsWith(".crx", ignoreCase = true) ||
+                            protectedName.endsWith(
+                                "-wrapper.apk",
+                                ignoreCase = true,
+                            )
+                        )
+                if (exactOverlap || sharedParent) {
+                    throw UnsafeOutputException(
+                        "출력 경로가 입력 archive 또는 profile과 겹칩니다: $candidate",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun anchored(path: Path): Path {
+        val absolute = path.toAbsolutePath().normalize()
+        var existing = absolute
+        val missing = ArrayDeque<String>()
+        while (!Files.exists(existing, NOFOLLOW_LINKS)) {
+            val name = existing.fileName ?: throw UnsafeOutputException(
+                "출력 경로를 기준점에 고정할 수 없습니다: $absolute",
+            )
+            missing.addFirst(name.toString())
+            existing = existing.parent ?: throw UnsafeOutputException(
+                "출력 경로를 기준점에 고정할 수 없습니다: $absolute",
+            )
+        }
+        if (Files.isSymbolicLink(existing)) {
+            throw UnsafeOutputException(
+                "출력 또는 보호 경로 자체가 symlink입니다: $existing",
+            )
+        }
+        var anchored = existing.toRealPath()
+        missing.forEach { anchored = anchored.resolve(it) }
+        return anchored.normalize()
+    }
 }

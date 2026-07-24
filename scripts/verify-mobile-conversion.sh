@@ -63,4 +63,4 @@ if [ "$first_hash" != "$second_hash" ]; then
   exit 1
 fi
 echo "deterministic hash matched"
-echo "SixDraft verified"
+"$cli" verify-draft --input "$first"

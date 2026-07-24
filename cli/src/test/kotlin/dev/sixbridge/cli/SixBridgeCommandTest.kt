@@ -1,5 +1,6 @@
 package dev.sixbridge.cli
 
+import dev.sixbridge.core.SixBridgeService
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.profile.BrowserProfile
@@ -20,6 +21,7 @@ import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -144,14 +146,16 @@ class SixBridgeCommandTest {
         ).forEach { id ->
             assertTrue("\"id\": \"$id\"" in json)
         }
+        val evidencePaths = """"relativePath":\s*"([^"]+)"""".toRegex()
+            .findAll(json)
+            .map { it.groupValues[1] }
+            .toList()
+        assertTrue(evidencePaths.isNotEmpty())
         assertTrue(
-            """"relativePath":\s*"([^"]+)"""".toRegex()
-                .findAll(json)
-                .map { it.groupValues[1] }
-                .all { path ->
+            evidencePaths.all { path ->
                     !Path.of(path).isAbsolute &&
                         path.split('/', '\\').none { it == ".." }
-                },
+            },
         )
     }
 
@@ -288,6 +292,163 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `draft refuses to overwrite its browser profile`() {
+        val workspace = Files.createTempDirectory("six-cli-profile-overlap")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val profile = writeProfile(workspace)
+        val before = profile.readBytes()
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", profile.toString(),
+        )
+
+        assertEquals(2, result.exitCode, result.error)
+        assertContentEquals(before, profile.readBytes())
+    }
+
+    @Test
+    fun `verify draft performs an independent strict read`() {
+        val workspace = Files.createTempDirectory("six-cli-draft-verify")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val profile = writeProfile(workspace)
+        val output = workspace.resolve("plain.sixdraft")
+        assertEquals(
+            0,
+            execute(
+                "--workspace", workspace.toString(),
+                "draft",
+                "--input", source.toString(),
+                "--profile", profile.toString(),
+                "--output", output.toString(),
+            ).exitCode,
+        )
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "verify-draft",
+            "--input", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        assertTrue("SixDraft verified" in result.output)
+    }
+
+    @Test
+    fun `invalid draft and unsafe draft key state are internal failures`() {
+        val invalidWorkspace = Files.createTempDirectory("six-cli-invalid-draft")
+        val invalidDraft = invalidWorkspace.resolve("invalid.sixdraft")
+            .also { it.writeText("not a draft") }
+        val invalid = execute(
+            "--workspace", invalidWorkspace.toString(),
+            "verify-draft",
+            "--input", invalidDraft.toString(),
+        )
+        assertEquals(1, invalid.exitCode, invalid.error)
+
+        val workspace = Files.createTempDirectory("six-cli-key-safety")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val profile = writeProfile(workspace)
+        val first = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", workspace.resolve("first.sixdraft").toString(),
+        )
+        assertEquals(0, first.exitCode, first.error)
+        Files.delete(
+            workspace.resolve(".local/keystore/draft-transfer/draft-transfer.pub"),
+        )
+
+        val unsafe = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", workspace.resolve("second.sixdraft").toString(),
+        )
+        assertEquals(1, unsafe.exitCode, unsafe.error)
+    }
+
+    @Test
+    fun `self verification replacement is an internal CLI failure`() {
+        val workspace = Files.createTempDirectory("six-cli-self-verify-failure")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val profile = writeProfile(workspace)
+        val replacingReader: (Path) -> dev.sixbridge.core.draft.VerifiedSixDraft = { path ->
+            val original = SixDraft.read(path)
+            path.writeBytes(
+                SixDraft.createBytes(
+                    original.payload,
+                    KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
+                ),
+            )
+            SixDraft.read(path)
+        }
+
+        val result = executeWith(
+            serviceFactory = { root ->
+                SixBridgeService(
+                    workspaceRoot = root,
+                    draftReader = replacingReader,
+                )
+            },
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", workspace.resolve("replaced.sixdraft").toString(),
+        )
+
+        assertEquals(1, result.exitCode, result.error)
+    }
+
+    @Test
+    fun `malformed source and profile remain user input errors`() {
+        val workspace = Files.createTempDirectory("six-cli-malformed-input")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText("{")
+        val profile = writeProfile(workspace)
+        val malformedSource = execute(
+            "--workspace", workspace.toString(),
+            "analyze",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+        )
+        assertEquals(2, malformedSource.exitCode, malformedSource.error)
+
+        val validSource = workspace.resolve("valid").also(Files::createDirectory)
+        validSource.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        profile.writeText("{}")
+        val malformedProfile = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", validSource.toString(),
+            "--profile", profile.toString(),
+            "--output", workspace.resolve("invalid.sixdraft").toString(),
+        )
+        assertEquals(2, malformedProfile.exitCode, malformedProfile.error)
+    }
+
+    @Test
     fun `approval order does not change draft hash`() {
         val workspace = Files.createTempDirectory("six-cli-draft-order")
         val profile = writeProfile(workspace)
@@ -350,9 +511,16 @@ class SixBridgeCommandTest {
     }
 
     private fun execute(vararg arguments: String): Execution {
+        return executeWith(::SixBridgeService, *arguments)
+    }
+
+    private fun executeWith(
+        serviceFactory: (Path) -> SixBridgeService,
+        vararg arguments: String,
+    ): Execution {
         val output = StringWriter()
         val error = StringWriter()
-        val command = createCommandLine()
+        val command = createCommandLine(serviceFactory)
         command.out = PrintWriter(output)
         command.err = PrintWriter(error)
         return Execution(

@@ -1,10 +1,15 @@
 package dev.sixbridge.cli
 
 import dev.sixbridge.core.SixBridgeService
+import dev.sixbridge.core.SixBridgeUserInputException
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.MissingAdapterApprovalException
+import dev.sixbridge.core.crx.InvalidCrxException
 import dev.sixbridge.core.device.AdbDeviceClient
+import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.input.UnsupportedInputException
 import dev.sixbridge.core.profile.BrowserProfileExtractor
 import dev.sixbridge.core.profile.BrowserProfileJson
 import picocli.CommandLine
@@ -23,8 +28,10 @@ fun main(args: Array<String>) {
     exitProcess(createCommandLine().execute(*args))
 }
 
-fun createCommandLine(): CommandLine {
-    val command = CommandLine(SixBridgeCommand())
+fun createCommandLine(
+    serviceFactory: (Path) -> SixBridgeService = ::SixBridgeService,
+): CommandLine {
+    val command = CommandLine(SixBridgeCommand(serviceFactory))
     command.executionExceptionHandler = CommandLine.IExecutionExceptionHandler { error, line, _ ->
         line.err.println("오류: ${error.message}")
         if (System.getenv("SIXBRIDGE_DEBUG") == "1") {
@@ -32,7 +39,11 @@ fun createCommandLine(): CommandLine {
         }
         when (error) {
             is MissingAdapterApprovalException -> 4
-            is IllegalArgumentException -> 2
+            is AdapterApprovalException,
+            is SixBridgeUserInputException,
+            is UnsupportedInputException,
+            is InvalidCrxException,
+            -> 2
             else -> 1
         }
     }
@@ -48,11 +59,14 @@ fun createCommandLine(): CommandLine {
         ProfileCommand::class,
         AnalyzeCommand::class,
         DraftCommand::class,
+        VerifyDraftCommand::class,
         BuildCommand::class,
         DeviceCommand::class,
     ],
 )
-class SixBridgeCommand : Runnable {
+class SixBridgeCommand(
+    private val serviceFactory: (Path) -> SixBridgeService = ::SixBridgeService,
+) : Runnable {
     @Option(
         names = ["--workspace"],
         description = ["프로젝트 루트 (기본값: 현재 디렉터리)"],
@@ -62,6 +76,8 @@ class SixBridgeCommand : Runnable {
     override fun run() {
         CommandLine(this).usage(System.out)
     }
+
+    fun service(): SixBridgeService = serviceFactory(workspace)
 }
 
 @Command(
@@ -118,8 +134,8 @@ class AnalyzeCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        val profile = BrowserProfileJson.decode(profilePath.readText())
-        val report = SixBridgeService(root.workspace).analyze(input, profile)
+        val profile = readProfile(profilePath)
+        val report = root.service().analyze(input, profile)
         val encoded = SixBundle.encodeCompatibility(report)
         if (output == null) {
             spec.commandLine().out.println(encoded)
@@ -169,13 +185,14 @@ class DraftCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        val profile = BrowserProfileJson.decode(profilePath.readText())
-        val result = SixBridgeService(root.workspace).draft(
+        val profile = readProfile(profilePath)
+        val result = root.service().draft(
             input = input,
             profile = profile,
             outputDraft = output,
             projectIdentity = projectIdentity,
             approvedAdapterIds = approvedAdapterIds,
+            protectedInputs = listOf(profilePath),
         )
         spec.commandLine().out.println(
             "conversion=${result.conversionState.name.lowercase()}",
@@ -184,6 +201,26 @@ class DraftCommand : Callable<Int> {
         spec.commandLine().out.println("sourceSha256=${result.sourceSha256}")
         spec.commandLine().out.println("transformedSha256=${result.transformedSha256}")
         spec.commandLine().out.println("draft=${result.draft}")
+        return 0
+    }
+}
+
+@Command(
+    name = "verify-draft",
+    hidden = true,
+    mixinStandardHelpOptions = true,
+    description = ["SixDraft를 strict reader로 독립 검증합니다."],
+)
+class VerifyDraftCommand : Callable<Int> {
+    @Option(names = ["--input"], required = true)
+    lateinit var input: Path
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        SixDraft.read(input)
+        spec.commandLine().out.println("SixDraft verified")
         return 0
     }
 }
@@ -219,13 +256,14 @@ class BuildCommand : Callable<Int> {
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
-        val profile = BrowserProfileJson.decode(profilePath.readText())
-        val result = SixBridgeService(root.workspace).build(
+        val profile = readProfile(profilePath)
+        val result = root.service().build(
             input,
             profile,
             output,
             projectIdentity,
             approvedAdapterIds,
+            listOf(profilePath),
         )
         spec.commandLine().out.println(
             "conversion=${result.compatibility.conversionState.name.lowercase()}",
@@ -240,6 +278,15 @@ class BuildCommand : Callable<Int> {
         spec.commandLine().out.println("bundle=${result.bundle.toAbsolutePath()}")
         return 0
     }
+}
+
+private fun readProfile(path: Path) = try {
+    BrowserProfileJson.decode(path.readText())
+} catch (error: Exception) {
+    throw SixBridgeUserInputException(
+        "브라우저 profile을 읽을 수 없습니다. ${error.message}",
+        error,
+    )
 }
 
 @Command(
