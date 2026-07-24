@@ -34,6 +34,16 @@ internal data class LocalSourcePublication(
     val trustedRoot: Path = requireNotNull(destination.toAbsolutePath().normalize().parent),
 )
 
+internal data class PublicationTargetGuard(
+    val path: Path,
+    val identity: WorkspacePathIdentity?,
+)
+
+internal data class PublicationGuard(
+    val parentIdentity: WorkspacePathIdentity,
+    val targets: List<PublicationTargetGuard>,
+)
+
 internal enum class BuildCrashPoint {
     AFTER_OUTPUT_BACKUP,
     AFTER_PARTIAL_OUTPUT,
@@ -94,6 +104,7 @@ internal object SecureBuildPublisher {
     fun publish(
         outputs: Map<Path, ByteArray>,
         localSource: LocalSourcePublication? = null,
+        expectedGuard: PublicationGuard? = null,
     ) {
         require(outputs.isNotEmpty()) {
             "publish할 산출물이 없습니다."
@@ -101,13 +112,55 @@ internal object SecureBuildPublisher {
         val normalized = outputs.entries.map { (path, bytes) ->
             path.toAbsolutePath().normalize() to ByteOutputContent(bytes.copyOf())
         }
-        publishPrepared(normalized, localSource)
+        publishPrepared(normalized, localSource, expectedGuard)
+    }
+
+    @JvmSynthetic
+    internal fun capturePublicationGuard(
+        outputs: Collection<Path>,
+        expectedParent: PublicationGuard? = null,
+    ): PublicationGuard {
+        require(outputs.isNotEmpty()) {
+            "publication guard를 만들 출력이 없습니다."
+        }
+        val normalized = outputs.map { it.toAbsolutePath().normalize() }
+        val parent = normalized.map { requireNotNull(it.parent) }.distinct()
+            .singleOrNull()
+            ?: throw IllegalArgumentException("모든 출력은 같은 디렉터리에 있어야 합니다.")
+        if (expectedParent == null) {
+            Files.createDirectories(parent)
+        } else {
+            requirePublicationGuard(expectedParent, parent, expectedParent.targets.map {
+                it.path
+            })
+        }
+        val parentIdentity = expectedParent?.parentIdentity
+            ?: WorkspacePermissionPolicy.captureIdentity(parent)
+        return PublicationGuard(
+            parentIdentity = parentIdentity,
+            targets = normalized.map { target ->
+                PublicationTargetGuard(
+                    path = target,
+                    identity = capturePublicationTarget(target),
+                )
+            },
+        )
+    }
+
+    @JvmSynthetic
+    internal fun requirePublicationGuard(guard: PublicationGuard) {
+        requirePublicationGuard(
+            guard,
+            guard.parentIdentity.path,
+            guard.targets.map { it.path },
+        )
     }
 
     internal fun publishSingleStream(
         output: Path,
         expectedSize: Long,
         expectedSha256: String,
+        expectedGuard: PublicationGuard? = null,
         writer: (SeekableByteChannel) -> Unit,
     ) {
         require(expectedSize >= 0L) { "stream output 크기는 음수일 수 없습니다." }
@@ -123,12 +176,14 @@ internal object SecureBuildPublisher {
                 ),
             ),
             null,
+            expectedGuard,
         )
     }
 
     private fun publishPrepared(
         normalized: List<Pair<Path, OutputContent>>,
         localSource: LocalSourcePublication?,
+        expectedGuard: PublicationGuard?,
     ) {
         require(normalized.map(Pair<Path, OutputContent>::first).toSet().size == normalized.size) {
             "정규화된 출력 경로가 서로 겹칩니다."
@@ -139,8 +194,11 @@ internal object SecureBuildPublisher {
         val parent = normalized.map { requireNotNull(it.first.parent) }.distinct()
             .singleOrNull()
             ?: throw IllegalArgumentException("모든 출력은 같은 디렉터리에 있어야 합니다.")
+        expectedGuard?.let {
+            requirePublicationGuard(it, parent, normalized.map { output -> output.first })
+        }
         Files.createDirectories(parent)
-        withPublicationLock(parent) {
+        withPublicationLock(parent, expectedGuard) {
             recoverPendingLocked(parent)
         val outputTransaction = OutputTransaction(parent, normalized)
         val localTransaction = localSource?.let(::LocalSourceTransaction)
@@ -336,7 +394,7 @@ internal object SecureBuildPublisher {
         val normalized = outputs.map { it.toAbsolutePath().normalize() }
         val parent = normalized.map { requireNotNull(it.parent) }.distinct().single()
         if (!Files.isDirectory(parent, NOFOLLOW_LINKS)) return
-        withPublicationLock(parent) {
+        withPublicationLock(parent, null) {
             recoverPendingLocked(parent)
         }
     }
@@ -2139,6 +2197,7 @@ internal object SecureBuildPublisher {
 
     private fun <T> withPublicationLock(
         parent: Path,
+        expectedGuard: PublicationGuard?,
         block: () -> T,
     ): T {
         val normalized = parent.toAbsolutePath().normalize()
@@ -2148,6 +2207,13 @@ internal object SecureBuildPublisher {
         return processLock.withLock {
             secureDirectory(normalized).use { handle ->
                 validateDirectoryHandle(normalized, handle)
+                expectedGuard?.let {
+                    requirePublicationGuard(
+                        it,
+                        normalized,
+                        it.targets.map { target -> target.path },
+                    )
+                }
                 val lockName = singleName(PUBLICATION_LOCK_FILE)
                 if (attributesOrNull(handle, lockName) == null) {
                     try {
@@ -2210,6 +2276,13 @@ internal object SecureBuildPublisher {
                         try {
                             BuildPublicationFaultInjection.afterPublicationLock()
                             validateDirectoryHandle(normalized, handle)
+                            expectedGuard?.let {
+                                requirePublicationGuard(
+                                    it,
+                                    normalized,
+                                    it.targets.map { target -> target.path },
+                                )
+                            }
                             require(
                                 attributesOrNull(handle, lockName)?.fileKey() == lockFileKey,
                             ) {
@@ -2681,6 +2754,51 @@ internal object SecureBuildPublisher {
 
     private fun strictUnixLinks(path: Path): Long =
         (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number).toLong()
+
+    private fun capturePublicationTarget(path: Path): WorkspacePathIdentity? {
+        if (!Files.exists(path, NOFOLLOW_LINKS)) return null
+        val attributes = Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+            "기존 output은 identity가 확인되는 일반 파일이어야 합니다: $path"
+        }
+        require(strictUnixLinks(path) == 1L) {
+            "기존 output hardlink는 허용되지 않습니다: $path"
+        }
+        return WorkspacePermissionPolicy.captureIdentity(path)
+    }
+
+    private fun requirePublicationGuard(
+        guard: PublicationGuard,
+        parent: Path,
+        targets: Collection<Path>,
+    ) {
+        val normalizedParent = parent.toAbsolutePath().normalize()
+        val normalizedTargets = targets.map { it.toAbsolutePath().normalize() }
+        require(guard.parentIdentity.path == normalizedParent) {
+            "publication guard parent가 출력 parent와 다릅니다."
+        }
+        require(guard.targets.map { it.path }.toSet() == normalizedTargets.toSet()) {
+            "publication guard target이 실제 출력과 다릅니다."
+        }
+        WorkspacePermissionPolicy.requireSameIdentity(guard.parentIdentity)
+        guard.targets.forEach { target ->
+            val expected = target.identity
+            if (expected == null) {
+                require(!Files.exists(target.path, NOFOLLOW_LINKS)) {
+                    "초기에는 없던 output이 publication 전에 생겼습니다: ${target.path}"
+                }
+            } else {
+                require(strictUnixLinks(target.path) == 1L) {
+                    "기존 output hardlink는 허용되지 않습니다: ${target.path}"
+                }
+                WorkspacePermissionPolicy.requireSameIdentity(expected)
+            }
+        }
+    }
 
     private fun stableFileIdentity(
         path: Path,

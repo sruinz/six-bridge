@@ -6,6 +6,7 @@ import java.nio.file.Path
 import java.nio.file.attribute.AclEntryPermission
 import java.nio.file.attribute.AclEntryType
 import java.nio.file.attribute.AclFileAttributeView
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
 
@@ -34,6 +35,14 @@ internal data class WorkspaceAccessState(
     val owner: String,
     val posixPermissions: List<String>?,
     val aclEntries: List<WorkspaceAclState>?,
+)
+
+internal data class WorkspacePathIdentity(
+    val path: Path,
+    val fileKey: Any,
+    val device: Long,
+    val inode: Long,
+    val access: WorkspaceAccessState,
 )
 
 internal object WorkspacePermissionPolicy {
@@ -74,6 +83,49 @@ internal object WorkspacePermissionPolicy {
             "workspace metadata를 검증할 수 없는 filesystem입니다."
         }
         return capture.state
+    }
+
+    fun captureIdentity(path: Path): WorkspacePathIdentity {
+        val normalized = path.toAbsolutePath().normalize()
+        val before = Files.readAttributes(
+            normalized,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        check(
+            (before.isDirectory || before.isRegularFile) &&
+                !before.isSymbolicLink &&
+                before.fileKey() != null,
+        ) {
+            "path identity를 확인할 수 없습니다: $normalized"
+        }
+        val unix = Files.readAttributes(
+            normalized,
+            "unix:dev,ino",
+            NOFOLLOW_LINKS,
+        )
+        val identity = WorkspacePathIdentity(
+            path = normalized,
+            fileKey = requireNotNull(before.fileKey()),
+            device = (unix["dev"] as Number).toLong(),
+            inode = (unix["ino"] as Number).toLong(),
+            access = captureState(normalized),
+        )
+        val after = Files.readAttributes(
+            normalized,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        check(after.fileKey() == identity.fileKey) {
+            "path identity가 조회 중 변경되었습니다: $normalized"
+        }
+        return identity
+    }
+
+    fun requireSameIdentity(expected: WorkspacePathIdentity) {
+        check(captureIdentity(expected.path) == expected) {
+            "path identity 또는 접근 상태가 변경되었습니다: ${expected.path}"
+        }
     }
 
     private fun capture(path: Path): AccessCapture {

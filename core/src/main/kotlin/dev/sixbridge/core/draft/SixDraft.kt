@@ -1,5 +1,6 @@
 package dev.sixbridge.core.draft
 
+import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.conversion.WorkspaceAccessState
 import dev.sixbridge.core.conversion.WorkspacePermissionPolicy
@@ -314,6 +315,48 @@ sealed interface VerifiedSixDraft {
     fun openSourceStream(): InputStream
 }
 
+internal object DraftSourceStreams {
+    private const val BUFFER_SIZE = 64 * 1024
+
+    fun contentEquals(first: InputStream, second: InputStream): Boolean =
+        first.use { left ->
+            second.use { right ->
+                val leftBuffer = ByteArray(BUFFER_SIZE)
+                val rightBuffer = ByteArray(BUFFER_SIZE)
+                while (true) {
+                    val leftCount = left.read(leftBuffer)
+                    val rightCount = right.read(rightBuffer)
+                    require(leftCount != 0 && rightCount != 0) {
+                        "SixDraft source stream 읽기가 진행되지 않습니다."
+                    }
+                    if (leftCount != rightCount) return@use false
+                    if (leftCount < 0) return@use true
+                    if (!leftBuffer.contentEquals(
+                            rightBuffer,
+                            0,
+                            leftCount,
+                        )
+                    ) {
+                        return@use false
+                    }
+                }
+                @Suppress("UNREACHABLE_CODE")
+                false
+            }
+        }
+
+    private fun ByteArray.contentEquals(
+        other: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Boolean {
+        for (index in offset until offset + length) {
+            if (this[index] != other[index]) return false
+        }
+        return true
+    }
+}
+
 class InvalidSixDraftException(message: String, cause: Throwable? = null) :
     IllegalArgumentException(message, cause)
 
@@ -330,6 +373,21 @@ object SixDraft {
         output: Path,
         payload: SixDraftPayload,
         signingKey: KeyPair,
+    ): Path = writeInternal(output, payload, signingKey, null)
+
+    @JvmSynthetic
+    internal fun writeGuarded(
+        output: Path,
+        payload: SixDraftPayload,
+        signingKey: KeyPair,
+        expectedGuard: PublicationGuard,
+    ): Path = writeInternal(output, payload, signingKey, expectedGuard)
+
+    private fun writeInternal(
+        output: Path,
+        payload: SixDraftPayload,
+        signingKey: KeyPair,
+        expectedGuard: PublicationGuard?,
     ): Path {
         return invalidDraftBoundary("SixDraft 파일을 쓸 수 없습니다.") {
             val entries = signedEntries(payload, signingKey)
@@ -346,6 +404,7 @@ object SixDraft {
                 output = absolute,
                 expectedSize = counter.count,
                 expectedSha256 = expectedHash,
+                expectedGuard = expectedGuard,
             ) { channel ->
                 val raw = Channels.newOutputStream(channel)
                 writeStored(
