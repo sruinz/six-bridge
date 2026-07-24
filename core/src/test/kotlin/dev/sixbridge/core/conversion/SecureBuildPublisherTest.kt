@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.ByteBuffer
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.util.Base64
@@ -20,6 +21,27 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SecureBuildPublisherTest {
+    @Test
+    fun `stream writer IO failure preserves existing output and leaves no partial final`() {
+        val parent = Files.createTempDirectory("six-publish-stream-failure")
+        val output = parent.resolve("draft.sixdraft")
+        Files.writeString(output, "old")
+
+        assertFails {
+            SecureBuildPublisher.publishSingleStream(
+                output = output,
+                expectedSize = 7,
+                expectedSha256 = "0".repeat(64),
+            ) { channel ->
+                channel.write(ByteBuffer.wrap("partial".encodeToByteArray()))
+                throw java.io.IOException("실제 stream writer 실패")
+            }
+        }
+
+        assertEquals("old", Files.readString(output))
+        assertNoTransactionDebris(parent)
+    }
+
     @Test
     fun `reserved internal output names are rejected before creating the parent`() {
         val root = Files.createTempDirectory("six-reserved-output-root")

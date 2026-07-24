@@ -1,6 +1,13 @@
 package dev.sixbridge.core.draft
 
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.AdapterDecision
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.input.ExtensionInputKind
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -84,34 +91,16 @@ class SixDraftTest {
 
     @Test
     fun `expected plan hash binds semantic plan proof rather than plan document bytes`() {
-        val source = "semantic-plan-source".encodeToByteArray()
-        val planProof = "a".repeat(64)
-        val plan = """
-            {"schemaVersion":1,"planSha256":"$planProof","adapters":[]}
-        """.trimIndent().encodeToByteArray()
-        val before = """{"schemaVersion":3}""".encodeToByteArray()
-        val after = """{"schemaVersion":3}""".encodeToByteArray()
-        val draftPayload = SixDraftPayload.create(
-            draftJson = """{"schemaVersion":1}""".encodeToByteArray(),
-            inputJson = """{"schemaVersion":1}""".encodeToByteArray(),
-            sourceKind = DraftSourceKind.ZIP,
-            source = source,
-            conversionPlanJson = plan,
-            compatibilityBeforeJson = before,
-            compatibilityAfterJson = after,
-            expectedJson = """
-                {
-                  "schemaVersion":1,
-                  "sourceSha256":"${sha256(source)}",
-                  "reportSha256":"${sha256(after)}",
-                  "planSha256":"$planProof"
-                }
-            """.trimIndent().encodeToByteArray(),
-        )
+        val draftPayload = payload(DraftSourceKind.ZIP)
 
         val verified = SixDraft.read(
             SixDraft.createBytes(draftPayload, keyPair()),
         )
+        val plan = verified.payload.conversionPlanJson
+        val expected = Json.parseToJsonElement(
+            verified.payload.expectedJson.decodeToString(),
+        ) as JsonObject
+        val planProof = (expected.getValue("planSha256") as JsonPrimitive).content
 
         assertContentEquals(plan, verified.payload.conversionPlanJson)
         assertFalse(sha256(plan) == planProof)
@@ -201,14 +190,17 @@ class SixDraftTest {
         val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
         assertSignatureMutationRejected(bytes, "algorithm", "SHA256withRSA")
 
+        val entries = readEntries(bytes).toMutableMap()
+        entries["draft.json"] = entries.getValue("draft.json")
+            .decodeToString()
+            .replace("\"schemaVersion\":1", "\"schemaVersion\":2")
+            .encodeToByteArray()
+        entries.remove("draft-signature.json")
+        entries["draft-signature.json"] = SixDraftJson.encodeSignature(
+            DraftSignature.sign(entries, keyPair()),
+        )
         assertFailsWith<InvalidSixDraftException> {
-            SixDraft.createBytes(
-                payload(
-                    DraftSourceKind.ZIP,
-                    draftJson = """{"schemaVersion":2}""".encodeToByteArray(),
-                ),
-                keyPair(),
-            )
+            SixDraft.read(storedArchive(entries))
         }
     }
 
@@ -293,6 +285,64 @@ class SixDraftTest {
     }
 
     @Test
+    fun `reserved strong encryption and DOS directory flags fail closed`() {
+        val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        listOf(0x0040, 0x2000, 0x4000).forEach { unsupported ->
+            val patched = patchEntry(bytes, "draft.json") { archive, local, central ->
+                putLe16(
+                    archive,
+                    local + 6,
+                    le16(archive, local + 6) or unsupported,
+                )
+                putLe16(
+                    archive,
+                    central + 8,
+                    le16(archive, central + 8) or unsupported,
+                )
+            }
+            assertFailsWith<InvalidSixDraftException>("flag=$unsupported") {
+                SixDraft.read(patched)
+            }
+        }
+
+        val dosDirectory = patchCentralEntry(bytes, "draft.json") { archive, offset ->
+            archive[offset + 5] = 0
+            putLe32(archive, offset + 38, 0x10)
+        }
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(dosDirectory)
+        }
+    }
+
+    @Test
+    fun `ZIP64 extra comment and trailing bytes fail closed`() {
+        val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        val entries = readEntries(bytes)
+        val ordinaryExtra = storedArchive(
+            entries,
+            "draft.json" to byteArrayOf(
+                0xfe.toByte(), 0xca.toByte(), 4, 0, 0, 0, 0, 0,
+            ),
+        )
+        val zip64Extra = patchEntry(
+            ordinaryExtra,
+            "draft.json",
+        ) { archive, local, central ->
+            putLe16(archive, local + 30 + le16(archive, local + 26), 1)
+            putLe16(archive, central + 46 + le16(archive, central + 28), 1)
+        }
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(zip64Extra)
+        }
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(bytes + byteArrayOf(1))
+        }
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(storedArchive(entries, comment = "comment"))
+        }
+    }
+
+    @Test
     fun `path reader rejects a symlink without changing signing keys`() {
         val trusted = Files.createTempDirectory("six-draft-path-trusted")
         val store = DraftSigningKeyStore(trusted, trusted.resolve("keys"))
@@ -330,41 +380,69 @@ class SixDraftTest {
             readEntries(bytes).getValue("draft-signature.json").decodeToString(),
         ) as JsonObject
 
-    private fun payload(
-        kind: DraftSourceKind,
-        draftJson: ByteArray = """{"schemaVersion":1,"coreVersion":"test"}"""
-            .encodeToByteArray(),
-    ): SixDraftPayload {
+    private fun payload(kind: DraftSourceKind): SixDraftPayload {
         if (kind == DraftSourceKind.CRX) return validCrxPayload()
         val source = "source-body-${kind.name}".encodeToByteArray()
-        val planProof = "c".repeat(64)
-        val plan = """
-            {
-              "schemaVersion":1,
-              "planSha256":"$planProof",
-              "adapters":["storage-fallback"]
-            }
-        """.trimIndent().encodeToByteArray()
-        val before = """{"schemaVersion":3,"status":"partial"}""".encodeToByteArray()
-        val after = """{"schemaVersion":3,"status":"compatible"}""".encodeToByteArray()
-        val expected = """
-            {
-              "schemaVersion": 1,
-              "sourceSha256": "${sha256(source)}",
-              "reportSha256": "${sha256(after)}",
-              "planSha256": "$planProof"
-            }
-        """.trimIndent().encodeToByteArray()
+        val originalSource = "1".repeat(64)
+        val profile = "2".repeat(64)
+        val decision = AdapterDecision(
+            id = "storage-fallback",
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.AUTOMATIC,
+            applied = false,
+            evidence = emptyList(),
+            changes = listOf("storage.sync -> storage.local"),
+            remainingLimitations = emptyList(),
+        )
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Draft ZIP",
+            extensionVersion = "1",
+            declaredPermissions = setOf("storage"),
+            usedApis = setOf("storage.sync"),
+            unsupportedApis = setOf("storage.sync"),
+            issues = emptyList(),
+            conversionState = ConversionState.AUTOMATIC,
+            adapterDecisions = listOf(decision),
+            sourceSha256 = originalSource,
+            browserProfileSha256 = profile,
+        )
+        val after = before.copy(
+            status = CompatibilityStatus.COMPATIBLE,
+            usedApis = setOf("storage.local"),
+            unsupportedApis = emptySet(),
+            conversionState = ConversionState.CONVERTED,
+            adapterDecisions = listOf(decision.copy(applied = true)),
+            convertedExtensionId = "a".repeat(32),
+            sourceSha256 = sha256(source),
+        )
+        val identity = "six-draft-test"
+        val draft = DraftMetadata.create(
+            coreVersion = "test",
+            adapterVersions = mapOf("storage-fallback" to 1),
+            sourceIdentity = identity,
+        )
+        val input = DraftInputMetadata(
+            inputKind = ExtensionInputKind.SOURCE_DIRECTORY,
+            originalSourceSha256 = originalSource,
+            browserProfileSha256 = profile,
+            originalExtensionId = null,
+            originalExtensionVersion = "1",
+            sourceIdentity = identity,
+        )
         return SixDraftPayload.create(
-            draftJson = draftJson,
-            inputJson = """{"schemaVersion":1,"kind":"${kind.name.lowercase()}"}"""
-                .encodeToByteArray(),
+            draft = draft,
+            input = input,
             sourceKind = kind,
             source = source,
-            conversionPlanJson = plan,
-            compatibilityBeforeJson = before,
-            compatibilityAfterJson = after,
-            expectedJson = expected,
+            plan = DraftConversionPlan.create(
+                before,
+                listOf(DraftSelectedAdapter("storage-fallback", 1)),
+            ),
+            compatibilityBefore = before,
+            compatibilityAfter = after,
         )
     }
 
@@ -379,28 +457,39 @@ class SixDraftTest {
             KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
                 .generateKeyPair(),
         )
-        val planProof = "b".repeat(64)
-        val plan = """
-            {"schemaVersion":1,"planSha256":"$planProof","adapters":[]}
-        """.trimIndent().encodeToByteArray()
-        val before = """{"schemaVersion":3}""".encodeToByteArray()
-        val after = """{"schemaVersion":3}""".encodeToByteArray()
+        val profile = "4".repeat(64)
+        val payloadHash = sha256(packed.zipBytes)
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "Draft CRX",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.PASSTHROUGH,
+            originalExtensionId = packed.extensionId,
+            sourceSha256 = payloadHash,
+            browserProfileSha256 = profile,
+        )
+        val after = before.copy(convertedExtensionId = packed.extensionId)
+        val identity = "six-draft-crx-test"
         return SixDraftPayload.create(
-            draftJson = """{"schemaVersion":1}""".encodeToByteArray(),
-            inputJson = """{"schemaVersion":1,"kind":"crx"}""".encodeToByteArray(),
+            draft = DraftMetadata.create("test", emptyMap(), identity),
+            input = DraftInputMetadata(
+                ExtensionInputKind.CRX3,
+                payloadHash,
+                profile,
+                packed.extensionId,
+                "1",
+                identity,
+            ),
             sourceKind = DraftSourceKind.CRX,
             source = packed.bytes,
-            conversionPlanJson = plan,
-            compatibilityBeforeJson = before,
-            compatibilityAfterJson = after,
-            expectedJson = """
-                {
-                  "schemaVersion":1,
-                  "sourceSha256":"${sha256(Crx3.parse(packed.bytes).zipBytes)}",
-                  "reportSha256":"${sha256(after)}",
-                  "planSha256":"$planProof"
-                }
-            """.trimIndent().encodeToByteArray(),
+            plan = DraftConversionPlan.create(before, emptyList()),
+            compatibilityBefore = before,
+            compatibilityAfter = after,
         )
     }
 
@@ -418,9 +507,14 @@ class SixDraftTest {
         return result
     }
 
-    private fun storedArchive(entries: Map<String, ByteArray>): ByteArray =
+    private fun storedArchive(
+        entries: Map<String, ByteArray>,
+        extra: Pair<String, ByteArray>? = null,
+        comment: String? = null,
+    ): ByteArray =
         ByteArrayOutputStream().also { output ->
             ZipOutputStream(output).use { zip ->
+                if (comment != null) zip.setComment(comment)
                 entries.toSortedMap().forEach { (name, bytes) ->
                     val crc = CRC32().apply { update(bytes) }
                     zip.putNextEntry(
@@ -430,6 +524,7 @@ class SixDraftTest {
                             size = bytes.size.toLong()
                             compressedSize = size
                             this.crc = crc.value
+                            if (extra?.first == name) this.extra = extra.second
                         },
                     )
                     zip.write(bytes)

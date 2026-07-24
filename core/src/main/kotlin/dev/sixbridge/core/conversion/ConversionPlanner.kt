@@ -116,9 +116,19 @@ sealed interface ConversionPlan {
 }
 
 internal object ConversionPlanProof {
+    fun digestDecisions(
+        report: CompatibilityReport,
+        selectedAdapters: List<AdapterDecision>,
+    ): String = digestInternal(report, selectedAdapters)
+
     fun digest(
         report: CompatibilityReport,
         selectedAdapters: List<SelectedAdapter>,
+    ): String = digestInternal(report, selectedAdapters.map(SelectedAdapter::toDecision))
+
+    private fun digestInternal(
+        report: CompatibilityReport,
+        selectedAdapters: List<AdapterDecision>,
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.field("schema", "conversion-plan-proof-v2")
@@ -175,10 +185,7 @@ internal object ConversionPlanProof {
         )
         digest.count("selectedAdapters", selectedAdapters.size)
         selectedAdapters.forEachIndexed { index, selected ->
-            digest.decision(
-                "selectedAdapters[$index]",
-                selected.toDecision(),
-            )
+            digest.decision("selectedAdapters[$index]", selected)
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }

@@ -1,17 +1,23 @@
 package dev.sixbridge.core.draft
 
+import dev.sixbridge.core.conversion.SecureBuildPublisher
+import dev.sixbridge.core.conversion.deepImmutableCopy
 import java.io.ByteArrayOutputStream
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.security.DigestOutputStream
 import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.nio.channels.FileChannel
 import java.nio.charset.CodingErrorAction
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.StandardOpenOption.READ
-import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyPair
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.LinkedHashSet
 import java.util.zip.CRC32
@@ -28,22 +34,32 @@ enum class DraftSourceKind(
 }
 
 class SixDraftPayload private constructor(
-    draftJson: ByteArray,
-    inputJson: ByteArray,
+    val draft: DraftMetadata,
+    val input: DraftInputMetadata,
     val sourceKind: DraftSourceKind,
     source: ByteArray,
-    conversionPlanJson: ByteArray,
-    compatibilityBeforeJson: ByteArray,
-    compatibilityAfterJson: ByteArray,
-    expectedJson: ByteArray,
+    val plan: DraftConversionPlan,
+    compatibilityBefore: dev.sixbridge.core.compat.CompatibilityReport,
+    compatibilityAfter: dev.sixbridge.core.compat.CompatibilityReport,
+    copySource: Boolean,
 ) {
-    private val stableDraftJson = draftJson.copyOf()
-    private val stableInputJson = inputJson.copyOf()
-    private val stableSource = source.copyOf()
-    private val stableConversionPlanJson = conversionPlanJson.copyOf()
-    private val stableCompatibilityBeforeJson = compatibilityBeforeJson.copyOf()
-    private val stableCompatibilityAfterJson = compatibilityAfterJson.copyOf()
-    private val stableExpectedJson = expectedJson.copyOf()
+    val compatibilityBefore = compatibilityBefore.deepImmutableCopy()
+    val compatibilityAfter = compatibilityAfter.deepImmutableCopy()
+    private val stableSource = if (copySource) source.copyOf() else source
+    private val stableDraftJson = SixDraftJson.encodeDraft(draft)
+    private val stableInputJson = SixDraftJson.encodeInput(input)
+    private val stableConversionPlanJson = SixDraftJson.encodePlan(plan)
+    private val stableCompatibilityBeforeJson =
+        SixDraftJson.encodeCompatibility(compatibilityBefore)
+    private val stableCompatibilityAfterJson =
+        SixDraftJson.encodeCompatibility(compatibilityAfter)
+    private val stableExpectedJson = SixDraftJson.encodeExpected(
+        DraftExpected(
+            sourceSha256 = requireNotNull(compatibilityAfter.sourceSha256),
+            reportSha256 = DraftSignature.sha256(stableCompatibilityAfterJson),
+            planSha256 = plan.planSha256,
+        ),
+    )
 
     val draftJson: ByteArray
         get() = stableDraftJson.copyOf()
@@ -60,19 +76,59 @@ class SixDraftPayload private constructor(
     val expectedJson: ByteArray
         get() = stableExpectedJson.copyOf()
 
+    fun openSourceStream(): InputStream = ByteArrayInputStream(stableSource)
+
     @JvmSynthetic
     internal fun entries(): LinkedHashMap<String, ByteArray> = linkedMapOf(
-        "draft.json" to stableDraftJson.copyOf(),
-        "input.json" to stableInputJson.copyOf(),
-        sourceKind.entryName to stableSource.copyOf(),
-        "conversion-plan.json" to stableConversionPlanJson.copyOf(),
-        "compatibility-before.json" to stableCompatibilityBeforeJson.copyOf(),
-        "compatibility-after.json" to stableCompatibilityAfterJson.copyOf(),
-        "expected.json" to stableExpectedJson.copyOf(),
+        "draft.json" to stableDraftJson,
+        "input.json" to stableInputJson,
+        sourceKind.entryName to stableSource,
+        "conversion-plan.json" to stableConversionPlanJson,
+        "compatibility-before.json" to stableCompatibilityBeforeJson,
+        "compatibility-after.json" to stableCompatibilityAfterJson,
+        "expected.json" to stableExpectedJson,
     )
 
     companion object {
         fun create(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            sourceKind: DraftSourceKind,
+            source: ByteArray,
+            plan: DraftConversionPlan,
+            compatibilityBefore: dev.sixbridge.core.compat.CompatibilityReport,
+            compatibilityAfter: dev.sixbridge.core.compat.CompatibilityReport,
+        ): SixDraftPayload = try {
+            validateSemantics(
+                draft,
+                input,
+                sourceKind,
+                source,
+                plan,
+                compatibilityBefore,
+                compatibilityAfter,
+            )
+            SixDraftPayload(
+                draft,
+                input,
+                sourceKind,
+                source,
+                plan,
+                compatibilityBefore,
+                compatibilityAfter,
+                copySource = true,
+            )
+        } catch (error: InvalidSixDraftException) {
+            throw error
+        } catch (error: Exception) {
+            throw InvalidSixDraftException(
+                "SixDraft payload 의미 결합이 올바르지 않습니다. ${error.message}",
+                error,
+            )
+        }
+
+        @JvmSynthetic
+        internal fun decode(
             draftJson: ByteArray,
             inputJson: ByteArray,
             sourceKind: DraftSourceKind,
@@ -81,46 +137,152 @@ class SixDraftPayload private constructor(
             compatibilityBeforeJson: ByteArray,
             compatibilityAfterJson: ByteArray,
             expectedJson: ByteArray,
-        ): SixDraftPayload = SixDraftPayload(
-            draftJson,
-            inputJson,
-            sourceKind,
-            source,
-            conversionPlanJson,
-            compatibilityBeforeJson,
-            compatibilityAfterJson,
-            expectedJson,
-        )
+        ): SixDraftPayload {
+            val draft = SixDraftJson.decodeDraft(draftJson)
+            val input = SixDraftJson.decodeInput(inputJson)
+            val plan = SixDraftJson.decodePlan(conversionPlanJson)
+            val before = SixDraftJson.decodeCompatibility(
+                "compatibility-before.json",
+                compatibilityBeforeJson,
+            )
+            val after = SixDraftJson.decodeCompatibility(
+                "compatibility-after.json",
+                compatibilityAfterJson,
+            )
+            val expected = SixDraftJson.decodeExpected(expectedJson)
+            validateSemantics(draft, input, sourceKind, source, plan, before, after)
+            require(expected == DraftExpected(
+                sourceSha256 = requireNotNull(after.sourceSha256),
+                reportSha256 = DraftSignature.sha256(
+                    SixDraftJson.encodeCompatibility(after),
+                ),
+                planSha256 = plan.planSha256,
+            )) {
+                "expected.json 의미 결합이 일치하지 않습니다."
+            }
+            return SixDraftPayload(
+                draft,
+                input,
+                sourceKind,
+                source,
+                plan,
+                before,
+                after,
+                copySource = false,
+            )
+        }
+
+        private fun validateSemantics(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            sourceKind: DraftSourceKind,
+            source: ByteArray,
+            plan: DraftConversionPlan,
+            before: dev.sixbridge.core.compat.CompatibilityReport,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ) {
+            before.validate()
+            after.validate()
+            require(draft.sourceIdentity == input.sourceIdentity) {
+                "draft와 input sourceIdentity가 일치하지 않습니다."
+            }
+            require(before.sourceSha256 == input.originalSourceSha256) {
+                "변환 전 보고서가 원본 source와 일치하지 않습니다."
+            }
+            require(before.browserProfileSha256 == input.browserProfileSha256) {
+                "변환 전 보고서가 browser profile과 일치하지 않습니다."
+            }
+            require(before.extensionVersion == input.originalExtensionVersion) {
+                "변환 전 보고서가 원본 extension version과 일치하지 않습니다."
+            }
+            require(before.originalExtensionId == input.originalExtensionId) {
+                "변환 전 보고서가 원본 extension ID와 일치하지 않습니다."
+            }
+            require(after.browserProfileSha256 == input.browserProfileSha256) {
+                "변환 후 보고서가 browser profile과 일치하지 않습니다."
+            }
+            require(after.originalExtensionId == input.originalExtensionId) {
+                "변환 후 보고서가 원본 extension ID와 일치하지 않습니다."
+            }
+            require(plan.reportSourceSha256 == before.sourceSha256 &&
+                plan.browserProfileSha256 == before.browserProfileSha256 &&
+                plan.reportSha256 == SixDraftJson.compatibilitySha256(before)
+            ) {
+                "변환 계획 provenance가 변환 전 보고서와 일치하지 않습니다."
+            }
+            val beforeDecisions = before.adapterDecisions.associateBy { it.id to it.version }
+            val selectedDecisions = plan.selectedAdapters.map { selected ->
+                requireNotNull(beforeDecisions[selected.id to selected.version]) {
+                    "변환 계획 어댑터가 변환 전 보고서에 없습니다."
+                }
+            }
+            require(
+                plan.planSha256 ==
+                    dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
+                        before,
+                        selectedDecisions,
+                    ),
+            ) {
+                "변환 계획 proof가 보고서와 일치하지 않습니다."
+            }
+            plan.selectedAdapters.forEach {
+                require(draft.adapterVersions[it.id] == it.version) {
+                    "draft adapter version이 계획과 일치하지 않습니다."
+                }
+            }
+            val selected = plan.selectedAdapters.map { it.id to it.version }
+            val applied = after.adapterDecisions.filter { it.applied }
+                .map { it.id to it.version }
+            require(applied.sortedWith(compareBy<Pair<String, Int>> { it.first }.thenBy { it.second }) ==
+                selected.sortedWith(compareBy<Pair<String, Int>> { it.first }.thenBy { it.second })
+            ) {
+                "변환 후 적용 어댑터가 계획과 일치하지 않습니다."
+            }
+            val expectedState = if (selected.isEmpty()) {
+                dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH
+            } else {
+                dev.sixbridge.core.conversion.ConversionState.CONVERTED
+            }
+            require(after.conversionState == expectedState) {
+                "변환 후 conversionState가 계획과 일치하지 않습니다."
+            }
+            if (selected.isEmpty()) {
+                require(after.convertedExtensionId == input.originalExtensionId) {
+                    "passthrough 결과 extension ID가 원본과 일치하지 않습니다."
+                }
+            } else {
+                require(after.convertedExtensionId != null) {
+                    "변환 결과 extension ID가 필요합니다."
+                }
+            }
+            if (sourceKind == DraftSourceKind.CRX) {
+                require(selected.isEmpty() &&
+                    input.inputKind in setOf(
+                        dev.sixbridge.core.input.ExtensionInputKind.CRX3,
+                        dev.sixbridge.core.input.ExtensionInputKind.CHROME_WEB_STORE,
+                    )
+                ) {
+                    "source.crx는 CRX passthrough에만 사용할 수 있습니다."
+                }
+            }
+            val actualSourceSha256 = if (sourceKind == DraftSourceKind.CRX) {
+                dev.sixbridge.core.crx.Crx3.verifiedPayloadSha256(source)
+            } else {
+                DraftSignature.sha256(source)
+            }
+            require(after.sourceSha256 == actualSourceSha256) {
+                "변환 후 보고서 source가 실제 source entry와 일치하지 않습니다."
+            }
+        }
     }
 }
 
-class VerifiedSixDraft private constructor(
-    val payload: SixDraftPayload,
-    val signerFingerprint: String,
-    signerPublicKey: ByteArray,
-    names: Set<String>,
-) {
-    private val stablePublicKey = signerPublicKey.copyOf()
+sealed interface VerifiedSixDraft {
+    val payload: SixDraftPayload
+    val signerFingerprint: String
     val signerPublicKey: ByteArray
-        get() = stablePublicKey.copyOf()
-    val entryNames: Set<String> = Collections.unmodifiableSet(
-        LinkedHashSet(names.sorted()),
-    )
-
-    companion object {
-        @JvmSynthetic
-        internal fun create(
-            payload: SixDraftPayload,
-            signerFingerprint: String,
-            signerPublicKey: ByteArray,
-            names: Set<String>,
-        ): VerifiedSixDraft = VerifiedSixDraft(
-            payload,
-            signerFingerprint,
-            signerPublicKey,
-            names,
-        )
-    }
+    val entryNames: Set<String>
+    fun openSourceStream(): InputStream
 }
 
 class InvalidSixDraftException(message: String, cause: Throwable? = null) :
@@ -131,14 +293,7 @@ object SixDraft {
         payload: SixDraftPayload,
         signingKey: KeyPair,
     ): ByteArray = invalidDraftBoundary("SixDraft를 만들 수 없습니다.") {
-        val entries = payload.entries()
-        validateUnsignedEntrySet(entries.keys)
-        validateEntrySizes(entries)
-        SixDraftJson.validatePayload(entries, payload.sourceKind.entryName)
-        val signature = DraftSignature.sign(entries, signingKey)
-        entries[DraftSignature.ENTRY_NAME] = SixDraftJson.encodeSignature(signature)
-        validateEntrySet(entries.keys)
-        validateEntrySizes(entries)
+        val entries = signedEntries(payload, signingKey)
         writeStored(entries)
     }
 
@@ -147,44 +302,53 @@ object SixDraft {
         payload: SixDraftPayload,
         signingKey: KeyPair,
     ): Path {
-        val bytes = createBytes(payload, signingKey)
-        val absolute = output.toAbsolutePath().normalize()
-        val parent = requireNotNull(absolute.parent) {
-            "SixDraft 출력 경로의 상위 디렉터리가 없습니다."
+        return invalidDraftBoundary("SixDraft 파일을 쓸 수 없습니다.") {
+            val entries = signedEntries(payload, signingKey)
+            val digest = MessageDigest.getInstance("SHA-256")
+            val counter = CountingOutputStream(
+                DigestOutputStream(OutputStream.nullOutputStream(), digest),
+            )
+            writeStored(entries, counter)
+            val expectedHash = digest.digest().joinToString("") {
+                "%02x".format(it)
+            }
+            val absolute = output.toAbsolutePath().normalize()
+            SecureBuildPublisher.publishSingleStream(
+                output = absolute,
+                expectedSize = counter.count,
+                expectedSha256 = expectedHash,
+            ) { channel ->
+                val raw = Channels.newOutputStream(channel)
+                writeStored(
+                    entries,
+                    object : OutputStream() {
+                        override fun write(value: Int) = raw.write(value)
+                        override fun write(bytes: ByteArray, offset: Int, length: Int) =
+                            raw.write(bytes, offset, length)
+                        override fun flush() = raw.flush()
+                        override fun close() = flush()
+                    },
+                )
+            }
+            absolute
         }
-        require(Files.isDirectory(parent, NOFOLLOW_LINKS)) {
-            "SixDraft 출력 상위 경로가 실제 디렉터리가 아닙니다."
-        }
-        FileChannel.open(absolute, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { channel ->
-            val buffer = ByteBuffer.wrap(bytes)
-            while (buffer.hasRemaining()) channel.write(buffer)
-            channel.force(true)
-        }
-        return absolute
     }
 
     fun read(input: Path): VerifiedSixDraft =
         invalidDraftBoundary("SixDraft 파일을 읽을 수 없습니다.") {
             val absolute = input.toAbsolutePath().normalize()
-            val before = Files.readAttributes(
-                absolute,
-                BasicFileAttributes::class.java,
-                NOFOLLOW_LINKS,
-            )
-            require(before.isRegularFile && !before.isSymbolicLink) {
-                "SixDraft 입력은 symlink가 아닌 일반 파일이어야 합니다."
-            }
-            require(before.size() <= MAX_ARCHIVE_SIZE) {
+            val before = pathState(absolute)
+            require(before.size <= MAX_ARCHIVE_SIZE) {
                 "SixDraft archive 크기가 제한을 초과합니다."
             }
-            require(before.size() <= Int.MAX_VALUE) {
+            require(before.size <= Int.MAX_VALUE) {
                 "SixDraft archive를 메모리에서 검증할 수 없습니다."
             }
             val bytes = FileChannel.open(absolute, READ, NOFOLLOW_LINKS).use { channel ->
-                require(channel.size() == before.size()) {
+                require(pathState(absolute) == before && channel.size() == before.size) {
                     "SixDraft 파일이 읽기 전에 변경되었습니다."
                 }
-                val buffer = ByteBuffer.allocate(before.size().toInt())
+                val buffer = ByteBuffer.allocate(before.size.toInt())
                 while (buffer.hasRemaining()) {
                     require(channel.read(buffer) >= 0) {
                         "SixDraft 파일을 완전히 읽지 못했습니다."
@@ -193,18 +357,12 @@ object SixDraft {
                 require(channel.read(ByteBuffer.allocate(1)) < 0) {
                     "SixDraft 파일이 읽는 동안 커졌습니다."
                 }
+                require(pathState(absolute) == before) {
+                    "SixDraft 파일이 읽는 동안 변경되었습니다."
+                }
                 buffer.array()
             }
-            val after = Files.readAttributes(
-                absolute,
-                BasicFileAttributes::class.java,
-                NOFOLLOW_LINKS,
-            )
-            require(
-                before.fileKey() == after.fileKey() &&
-                    before.size() == after.size() &&
-                    before.lastModifiedTime() == after.lastModifiedTime(),
-            ) {
+            require(pathState(absolute) == before) {
                 "SixDraft 파일이 읽는 동안 변경되었습니다."
             }
             readVerified(bytes)
@@ -212,7 +370,10 @@ object SixDraft {
 
     fun read(bytes: ByteArray): VerifiedSixDraft =
         invalidDraftBoundary("SixDraft bytes를 읽을 수 없습니다.") {
-            readVerified(bytes.copyOf())
+            require(bytes.size.toLong() <= MAX_ARCHIVE_SIZE) {
+                "SixDraft archive 크기가 제한을 초과합니다."
+            }
+            readVerified(bytes)
         }
 
     private fun readVerified(bytes: ByteArray): VerifiedSixDraft {
@@ -227,14 +388,13 @@ object SixDraft {
             "source.crx" in entries -> DraftSourceKind.CRX
             else -> throw IllegalArgumentException("SixDraft source entry가 없습니다.")
         }
-        SixDraftJson.validatePayload(entries, sourceKind.entryName)
         val signature = SixDraftJson.decodeSignature(
             entries.getValue(DraftSignature.ENTRY_NAME),
         )
         require(DraftSignature.verify(entries, signature)) {
             "SixDraft Ed25519 전달 서명이 일치하지 않습니다."
         }
-        val payload = SixDraftPayload.create(
+        val payload = SixDraftPayload.decode(
             draftJson = entries.getValue("draft.json"),
             inputJson = entries.getValue("input.json"),
             sourceKind = sourceKind,
@@ -244,7 +404,7 @@ object SixDraft {
             compatibilityAfterJson = entries.getValue("compatibility-after.json"),
             expectedJson = entries.getValue("expected.json"),
         )
-        return VerifiedSixDraft.create(
+        return VerifiedImpl(
             payload = payload,
             signerFingerprint = DraftSignature.fingerprint(signature.publicKey),
             signerPublicKey = signature.publicKey,
@@ -252,9 +412,58 @@ object SixDraft {
         )
     }
 
+    private fun pathState(path: Path): DraftPathState {
+        val attributes = Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(
+            attributes.isRegularFile &&
+                !attributes.isSymbolicLink &&
+                attributes.fileKey() != null,
+        ) {
+            "SixDraft 입력은 identity가 확인되는 일반 파일이어야 합니다."
+        }
+        val links = (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number)
+            .toLong()
+        require(links == 1L) {
+            "SixDraft 입력 hardlink는 허용되지 않습니다."
+        }
+        return DraftPathState(
+            fileKey = requireNotNull(attributes.fileKey()),
+            device = (Files.getAttribute(path, "unix:dev", NOFOLLOW_LINKS) as Number)
+                .toLong(),
+            inode = (Files.getAttribute(path, "unix:ino", NOFOLLOW_LINKS) as Number)
+                .toLong(),
+            links = links,
+            size = attributes.size(),
+            modified = attributes.lastModifiedTime().toMillis(),
+        )
+    }
+
+    private fun signedEntries(
+        payload: SixDraftPayload,
+        signingKey: KeyPair,
+    ): LinkedHashMap<String, ByteArray> {
+        val entries = payload.entries()
+        validateUnsignedEntrySet(entries.keys)
+        validateEntrySizes(entries)
+        val signature = DraftSignature.sign(entries, signingKey)
+        entries[DraftSignature.ENTRY_NAME] = SixDraftJson.encodeSignature(signature)
+        validateEntrySet(entries.keys)
+        validateEntrySizes(entries)
+        return entries
+    }
+
     private fun writeStored(entries: Map<String, ByteArray>): ByteArray =
-        ByteArrayOutputStream().also { output ->
-            ZipOutputStream(output).use { zip ->
+        ByteArrayOutputStream().also { writeStored(entries, it) }.toByteArray()
+
+    private fun writeStored(
+        entries: Map<String, ByteArray>,
+        output: OutputStream,
+    ) {
+        ZipOutputStream(output).use { zip ->
                 entries.toSortedMap().forEach { (name, bytes) ->
                     val crc = CRC32().apply { update(bytes) }
                     zip.putNextEntry(
@@ -270,7 +479,7 @@ object SixDraft {
                     zip.closeEntry()
                 }
             }
-        }.toByteArray()
+    }
 
     private fun validateEntrySet(names: Set<String>) {
         require(names.size <= MAX_ENTRIES) {
@@ -343,6 +552,51 @@ object SixDraft {
     internal const val MAX_SOURCE_SIZE = 512L * 1024 * 1024
     internal const val MAX_TOTAL_SIZE = 520L * 1024 * 1024
     private const val MAX_ARCHIVE_SIZE = MAX_TOTAL_SIZE + 16L * 1024 * 1024
+
+    private data class DraftPathState(
+        val fileKey: Any,
+        val device: Long,
+        val inode: Long,
+        val links: Long,
+        val size: Long,
+        val modified: Long,
+    )
+
+    private class VerifiedImpl(
+        override val payload: SixDraftPayload,
+        override val signerFingerprint: String,
+        signerPublicKey: ByteArray,
+        names: Set<String>,
+    ) : VerifiedSixDraft {
+        private val stablePublicKey = signerPublicKey.copyOf()
+        override val signerPublicKey: ByteArray
+            get() = stablePublicKey.copyOf()
+        override val entryNames: Set<String> = Collections.unmodifiableSet(
+            LinkedHashSet(names.sorted()),
+        )
+
+        override fun openSourceStream(): InputStream = payload.openSourceStream()
+    }
+
+    private class CountingOutputStream(
+        private val delegate: OutputStream,
+    ) : OutputStream() {
+        var count: Long = 0L
+            private set
+
+        override fun write(value: Int) {
+            delegate.write(value)
+            count++
+        }
+
+        override fun write(bytes: ByteArray, offset: Int, length: Int) {
+            delegate.write(bytes, offset, length)
+            count += length
+        }
+
+        override fun flush() = delegate.flush()
+        override fun close() = delegate.close()
+    }
 }
 
 private object StrictDraftArchive {
@@ -476,12 +730,20 @@ private object StrictDraftArchive {
             }
             val name = decodeName(bytes, cursor + CENTRAL_HEADER_SIZE, nameLength)
             validateName(name)
+            validateExtra(
+                bytes,
+                cursor + CENTRAL_HEADER_SIZE + nameLength,
+                extraLength,
+            )
             require(names.add(name)) {
                 "SixDraft 중앙 directory 중복 entry를 거부했습니다: $name"
             }
             val madeBy = le16(bytes, cursor + 4)
             val host = madeBy ushr 8
             val externalAttributes = unsigned32(bytes, cursor + 38)
+            require(externalAttributes and DOS_SPECIAL_ATTRIBUTES == 0L) {
+                "SixDraft DOS directory 또는 특수 entry를 거부했습니다: $name"
+            }
             if (host == UNIX_HOST) {
                 val fileType = ((externalAttributes ushr 16).toInt()) and UNIX_TYPE_MASK
                 require(fileType == 0 || fileType == UNIX_REGULAR) {
@@ -550,6 +812,11 @@ private object StrictDraftArchive {
             }
             val name = decodeName(bytes, cursor + LOCAL_HEADER_SIZE, nameLength)
             validateName(name)
+            validateExtra(
+                bytes,
+                cursor + LOCAL_HEADER_SIZE + nameLength,
+                extraLength,
+            )
             require(names.add(name)) {
                 "SixDraft 로컬 중복 entry를 거부했습니다: $name"
             }
@@ -636,11 +903,29 @@ private object StrictDraftArchive {
             local.dataOffset >= 0
 
     private fun validateFlags(flags: Int) {
-        require(flags and ENCRYPTED_FLAG == 0) {
-            "SixDraft 암호화 entry는 허용되지 않습니다."
+        require(flags and ALLOWED_FLAGS.inv() == 0) {
+            "SixDraft 암호화, reserved 또는 지원하지 않는 flag는 허용되지 않습니다."
         }
-        require(flags and DATA_DESCRIPTOR_FLAG == 0) {
-            "SixDraft data descriptor entry는 허용되지 않습니다."
+    }
+
+    private fun validateExtra(bytes: ByteArray, offset: Int, length: Int) {
+        requireRange(bytes, offset, length)
+        var cursor = offset
+        val end = offset + length
+        while (cursor < end) {
+            require(end - cursor >= 4) {
+                "SixDraft ZIP extra field가 손상되었습니다."
+            }
+            val id = le16(bytes, cursor)
+            val size = le16(bytes, cursor + 2)
+            cursor += 4
+            require(size <= end - cursor) {
+                "SixDraft ZIP extra field 길이가 손상되었습니다."
+            }
+            require(id != ZIP64_EXTRA_ID) {
+                "SixDraft ZIP64 extra field는 허용되지 않습니다."
+            }
+            cursor += size
         }
     }
 
@@ -710,8 +995,10 @@ private object StrictDraftArchive {
     private const val CENTRAL_HEADER_SIZE = 46
     private const val EOCD_SIZE = 22
     private const val ZIP64_SENTINEL = 0xffff_ffffL
-    private const val ENCRYPTED_FLAG = 0x0001
-    private const val DATA_DESCRIPTOR_FLAG = 0x0008
+    private const val UTF8_FLAG = 0x0800
+    private const val ALLOWED_FLAGS = UTF8_FLAG
+    private const val ZIP64_EXTRA_ID = 0x0001
+    private const val DOS_SPECIAL_ATTRIBUTES = 0x10L or 0x40L
     private const val UNIX_HOST = 3
     private const val UNIX_TYPE_MASK = 0xf000
     private const val UNIX_REGULAR = 0x8000

@@ -31,7 +31,7 @@ class ParsedCrx internal constructor(
     publicKey: ByteArray,
     val signaturesVerified: Boolean,
 ) {
-    private val stableZipBytes = zipBytes.copyOf()
+    private val stableZipBytes = zipBytes
     private val stablePublicKey = publicKey.copyOf()
 
     val zipBytes: ByteArray
@@ -70,10 +70,9 @@ object Crx3 {
         val signedHeaderData = Proto.message(
             Proto.bytes(field = 1, value = crxIdBytes),
         )
-        val signatureInput = signatureInput(signedHeaderData, zipBytes)
         val signature = Signature.getInstance("SHA256withRSA").run {
             initSign(keyPair.private)
-            update(signatureInput)
+            updateSignedPayload(signedHeaderData, zipBytes, 0, zipBytes.size)
             sign()
         }
         val proof = Proto.message(
@@ -99,21 +98,61 @@ object Crx3 {
     }
 
     fun parse(bytes: ByteArray): ParsedCrx {
-        if (bytes.size < 12 || !bytes.copyOfRange(0, 4).contentEquals(MAGIC)) {
+        val verified = verifyView(bytes, 0, bytes.size)
+        return ParsedCrx(
+            extensionId = verified.extensionId,
+            zipBytes = bytes.copyOfRange(verified.zipOffset, verified.zipEnd),
+            publicKey = verified.publicKey,
+            signaturesVerified = true,
+        )
+    }
+
+    fun verifiedPayloadSha256(
+        bytes: ByteArray,
+        offset: Int = 0,
+        length: Int = bytes.size - offset,
+    ): String {
+        val verified = verifyView(bytes, offset, length)
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(bytes, verified.zipOffset, verified.zipEnd - verified.zipOffset)
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun verifyView(
+        bytes: ByteArray,
+        offset: Int,
+        length: Int,
+    ): VerifiedCrxView {
+        if (offset < 0 || length < 0 || offset > bytes.size - length) {
+            throw InvalidCrxException("CRX3 byte 범위가 올바르지 않습니다.")
+        }
+        val end = offset + length
+        if (length < 12 ||
+            bytes[offset] != MAGIC[0] ||
+            bytes[offset + 1] != MAGIC[1] ||
+            bytes[offset + 2] != MAGIC[2] ||
+            bytes[offset + 3] != MAGIC[3]
+        ) {
             throw InvalidCrxException("CRX3 magic header가 없습니다.")
         }
-        val version = readUInt32(bytes, 4)
+        val version = readUInt32(bytes, offset + 4)
         if (version != VERSION) {
             throw InvalidCrxException("지원하지 않는 CRX 버전입니다: $version")
         }
-        val headerLength = readUInt32(bytes, 8)
-        if (headerLength < 0 || 12L + headerLength > bytes.size) {
+        val headerLength = readUInt32(bytes, offset + 8)
+        if (headerLength < 0 ||
+            headerLength > MAX_HEADER_SIZE ||
+            12L + headerLength > length
+        ) {
             throw InvalidCrxException("CRX3 헤더 길이가 손상되었습니다.")
         }
-        val headerEnd = 12 + headerLength
-        val header = bytes.copyOfRange(12, headerEnd)
-        val zipBytes = bytes.copyOfRange(headerEnd, bytes.size)
-        if (zipBytes.size < 4 || zipBytes[0] != 'P'.code.toByte() || zipBytes[1] != 'K'.code.toByte()) {
+        val headerStart = offset + 12
+        val headerEnd = headerStart + headerLength
+        val header = bytes.copyOfRange(headerStart, headerEnd)
+        if (end - headerEnd < 4 ||
+            bytes[headerEnd] != 'P'.code.toByte() ||
+            bytes[headerEnd + 1] != 'K'.code.toByte()
+        ) {
             throw InvalidCrxException("CRX3 ZIP payload가 없습니다.")
         }
 
@@ -127,23 +166,30 @@ object Crx3 {
             throw InvalidCrxException("CRX3 crx_id 길이가 올바르지 않습니다.")
         }
 
-        val input = signatureInput(signedHeaderData, zipBytes)
         val proofs = buildList {
             fields[2].orEmpty().forEach { add(ProofKind.RSA to it) }
             fields[3].orEmpty().forEach { add(ProofKind.ECDSA to it) }
         }
         val verifiedPublicKey = proofs.firstNotNullOfOrNull { (kind, encodedProof) ->
-            verifyProof(kind, encodedProof, crxId, input)
+            verifyProof(
+                kind,
+                encodedProof,
+                crxId,
+                signedHeaderData,
+                bytes,
+                headerEnd,
+                end - headerEnd,
+            )
         }
         if (verifiedPublicKey == null) {
             throw InvalidCrxException("CRX3 서명을 검증할 수 없습니다.")
         }
 
-        return ParsedCrx(
+        return VerifiedCrxView(
             extensionId = extensionIdFromCrxId(crxId),
-            zipBytes = zipBytes,
             publicKey = verifiedPublicKey,
-            signaturesVerified = true,
+            zipOffset = headerEnd,
+            zipEnd = end,
         )
     }
 
@@ -164,7 +210,10 @@ object Crx3 {
         kind: ProofKind,
         encodedProof: ByteArray,
         expectedCrxId: ByteArray,
-        signatureInput: ByteArray,
+        signedHeaderData: ByteArray,
+        source: ByteArray,
+        zipOffset: Int,
+        zipLength: Int,
     ): ByteArray? = runCatching {
         val proof = Proto.parse(encodedProof)
         val publicKeyBytes = proof[1]?.firstOrNull() ?: return null
@@ -176,7 +225,12 @@ object Crx3 {
         val publicKey = readPublicKey(kind, publicKeyBytes)
         val verified = Signature.getInstance(kind.signatureAlgorithm).run {
             initVerify(publicKey)
-            update(signatureInput)
+            updateSignedPayload(
+                signedHeaderData,
+                source,
+                zipOffset,
+                zipLength,
+            )
             verify(signatureBytes)
         }
         publicKeyBytes.takeIf { verified }?.copyOf()
@@ -186,14 +240,17 @@ object Crx3 {
         KeyFactory.getInstance(kind.keyAlgorithm)
             .generatePublic(X509EncodedKeySpec(encoded))
 
-    private fun signatureInput(signedHeaderData: ByteArray, zipBytes: ByteArray) =
-        ByteArrayOutputStream().run {
-            write(SIGNED_DATA_CONTEXT)
-            write(uint32(signedHeaderData.size))
-            write(signedHeaderData)
-            write(zipBytes)
-            toByteArray()
-        }
+    private fun Signature.updateSignedPayload(
+        signedHeaderData: ByteArray,
+        source: ByteArray,
+        offset: Int,
+        length: Int,
+    ) {
+        update(SIGNED_DATA_CONTEXT)
+        update(uint32(signedHeaderData.size))
+        update(signedHeaderData)
+        update(source, offset, length)
+    }
 
     private fun uint32(value: Int): ByteArray =
         ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
@@ -208,6 +265,13 @@ object Crx3 {
         RSA("RSA", "SHA256withRSA"),
         ECDSA("EC", "SHA256withECDSA"),
     }
+
+    private data class VerifiedCrxView(
+        val extensionId: String,
+        val publicKey: ByteArray,
+        val zipOffset: Int,
+        val zipEnd: Int,
+    )
 
     private object Proto {
         fun bytes(field: Int, value: ByteArray): ByteArray {
@@ -295,6 +359,8 @@ object Crx3 {
                 toByteArray()
             }
     }
+
+    private const val MAX_HEADER_SIZE = 1024 * 1024
 
     private val MAGIC = byteArrayOf('C'.code.toByte(), 'r'.code.toByte(), '2'.code.toByte(), '4'.code.toByte())
     private const val VERSION = 3

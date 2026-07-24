@@ -99,9 +99,38 @@ internal object SecureBuildPublisher {
             "publish할 산출물이 없습니다."
         }
         val normalized = outputs.entries.map { (path, bytes) ->
-            path.toAbsolutePath().normalize() to bytes.copyOf()
+            path.toAbsolutePath().normalize() to ByteOutputContent(bytes.copyOf())
         }
-        require(normalized.map(Pair<Path, ByteArray>::first).toSet().size == normalized.size) {
+        publishPrepared(normalized, localSource)
+    }
+
+    internal fun publishSingleStream(
+        output: Path,
+        expectedSize: Long,
+        expectedSha256: String,
+        writer: (SeekableByteChannel) -> Unit,
+    ) {
+        require(expectedSize >= 0L) { "stream output 크기는 음수일 수 없습니다." }
+        require(SHA256_PATTERN.matches(expectedSha256)) {
+            "stream output SHA-256 형식이 올바르지 않습니다."
+        }
+        publishPrepared(
+            listOf(
+                output.toAbsolutePath().normalize() to StreamOutputContent(
+                    expectedSize,
+                    expectedSha256,
+                    writer,
+                ),
+            ),
+            null,
+        )
+    }
+
+    private fun publishPrepared(
+        normalized: List<Pair<Path, OutputContent>>,
+        localSource: LocalSourcePublication?,
+    ) {
+        require(normalized.map(Pair<Path, OutputContent>::first).toSet().size == normalized.size) {
             "정규화된 출력 경로가 서로 겹칩니다."
         }
         normalized.forEach { (path, _) ->
@@ -416,14 +445,14 @@ internal object SecureBuildPublisher {
 
     private class OutputTransaction(
         private val parent: Path,
-        outputs: List<Pair<Path, ByteArray>>,
+        outputs: List<Pair<Path, OutputContent>>,
     ) {
-        private val targets = outputs.mapIndexed { index, (path, bytes) ->
+        private val targets = outputs.mapIndexed { index, (path, content) ->
             OutputTarget(
                 index = index,
                 path = path,
                 name = singleName(path.fileName.toString()),
-                bytes = bytes,
+                content = content,
             )
         }
         private var owner: OwnedTempDirectory? = null
@@ -455,12 +484,10 @@ internal object SecureBuildPublisher {
                     target.originalSha256 = if (target.original == null) {
                         null
                     } else {
-                        sha256(
-                            parentHandle.newByteChannel(
-                                target.name,
-                                setOf(READ, NOFOLLOW_LINKS),
-                            ).use { it.readAllBytes() },
-                        )
+                        parentHandle.newByteChannel(
+                            target.name,
+                            setOf(READ, NOFOLLOW_LINKS),
+                        ).use(::sha256Channel)
                     }
                 }
             }
@@ -513,7 +540,7 @@ internal object SecureBuildPublisher {
                 afterCreated()
                 targets.forEach { target ->
                     val name = singleName("new-${target.index}")
-                    writeNew(stageHandle, name, target.bytes)
+                    writeNew(stageHandle, name, target.content)
                     target.stagedName = name
                     target.staged = requireNotNull(
                         targetState(
@@ -1937,8 +1964,8 @@ internal object SecureBuildPublisher {
         val index: Int,
         val path: Path,
         val name: Path,
-        val bytes: ByteArray,
-        val newSha256: String = sha256(bytes),
+        val content: OutputContent,
+        val newSha256: String = content.sha256,
         var original: FileState? = null,
         var originalSha256: String? = null,
         var staged: FileState? = null,
@@ -1946,6 +1973,32 @@ internal object SecureBuildPublisher {
         var backupName: Path? = null,
         var wasPublished: Boolean = false,
     )
+
+    private sealed interface OutputContent {
+        val size: Long
+        val sha256: String
+        fun writeTo(channel: SeekableByteChannel)
+    }
+
+    private class ByteOutputContent(
+        private val bytes: ByteArray,
+    ) : OutputContent {
+        override val size: Long = bytes.size.toLong()
+        override val sha256: String = sha256(bytes)
+
+        override fun writeTo(channel: SeekableByteChannel) {
+            val buffer = ByteBuffer.wrap(bytes)
+            while (buffer.hasRemaining()) channel.write(buffer)
+        }
+    }
+
+    private class StreamOutputContent(
+        override val size: Long,
+        override val sha256: String,
+        private val writer: (SeekableByteChannel) -> Unit,
+    ) : OutputContent {
+        override fun writeTo(channel: SeekableByteChannel) = writer(channel)
+    }
 
     private data class FileState(
         val identity: StableFileIdentity,
@@ -1997,16 +2050,64 @@ internal object SecureBuildPublisher {
     private fun writeNew(
         directory: SecureDirectoryStream<Path>,
         name: Path,
-        bytes: ByteArray,
+        content: OutputContent,
     ) {
         directory.newByteChannel(
             name,
             setOf(CREATE_NEW, WRITE, NOFOLLOW_LINKS),
         ).use { channel ->
-            val buffer = ByteBuffer.wrap(bytes)
-            while (buffer.hasRemaining()) channel.write(buffer)
+            val digesting = DigestingChannel(channel)
+            content.writeTo(digesting)
+            require(digesting.written == content.size) {
+                "staged output 크기가 예상값과 일치하지 않습니다."
+            }
+            require(digesting.digestHex() == content.sha256) {
+                "staged output SHA-256이 예상값과 일치하지 않습니다."
+            }
             (channel as? java.nio.channels.FileChannel)?.force(true)
         }
+    }
+
+    private class DigestingChannel(
+        private val delegate: SeekableByteChannel,
+    ) : SeekableByteChannel by delegate {
+        private val digest = MessageDigest.getInstance("SHA-256")
+        var written: Long = 0L
+            private set
+
+        override fun write(source: ByteBuffer): Int {
+            require(delegate.position() == written) {
+                "stream output은 순차 쓰기만 허용됩니다."
+            }
+            val before = source.position()
+            val count = delegate.write(source)
+            if (count > 0) {
+                val view = source.duplicate().apply {
+                    position(before)
+                    limit(before + count)
+                }
+                digest.update(view)
+                written += count
+            }
+            return count
+        }
+
+        override fun position(newPosition: Long): SeekableByteChannel {
+            require(newPosition == written) {
+                "stream output seek는 허용되지 않습니다."
+            }
+            return this
+        }
+
+        override fun truncate(size: Long): SeekableByteChannel {
+            require(size == written) {
+                "stream output truncate는 허용되지 않습니다."
+            }
+            return this
+        }
+
+        fun digestHex(): String =
+            digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun SeekableByteChannel.readAllBytes(): ByteArray {
@@ -2612,6 +2713,32 @@ internal object SecureBuildPublisher {
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
+    private fun sha256Channel(channel: SeekableByteChannel): String {
+        val size = channel.size()
+        require(size in 0..MAX_PUBLISHED_OUTPUT_BYTES) {
+            "게시 산출물 크기가 검증 상한을 초과합니다."
+        }
+        require(channel.position() == 0L) {
+            "게시 산출물 hash channel 시작 위치가 올바르지 않습니다."
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteBuffer.allocate(64 * 1024)
+        var read = 0L
+        while (true) {
+            val count = channel.read(buffer)
+            if (count < 0) break
+            if (count == 0) continue
+            read += count
+            buffer.flip()
+            digest.update(buffer)
+            buffer.clear()
+        }
+        require(read == size && channel.size() == size) {
+            "게시 산출물이 hash 중 변경되었습니다."
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private data class FileProof(
         val sha256: String,
         val identity: String,
@@ -2626,11 +2753,10 @@ internal object SecureBuildPublisher {
         require(state.links == 1L) {
             "journal recovery 파일의 hard link는 허용되지 않습니다."
         }
-        val digest = sha256(
-            handle.newByteChannel(name, setOf(READ, NOFOLLOW_LINKS)).use {
-                it.readAllBytes()
-            },
-        )
+        val digest = handle.newByteChannel(
+            name,
+            setOf(READ, NOFOLLOW_LINKS),
+        ).use(::sha256Channel)
         requireSameState(
             state,
             targetState(handle, name, absolute),
@@ -2717,6 +2843,7 @@ internal object SecureBuildPublisher {
     private const val PUBLICATION_LOCK_FILE = ".sixbridge-build-publisher.lock"
     private const val JOURNAL_FILE = ".sixbridge-publish-journal.v1"
     private const val MAX_EXISTING_OUTPUT_BYTES = 512L * 1024 * 1024
+    private const val MAX_PUBLISHED_OUTPUT_BYTES = 536L * 1024 * 1024
     private const val INTERNAL_NAMESPACE_PREFIX = ".sixbridge-"
     private val SHA256_PATTERN = Regex("[0-9a-f]{64}")
     private val STABLE_IDENTITY_PATTERN = Regex("[1-9][0-9]*:[1-9][0-9]*")

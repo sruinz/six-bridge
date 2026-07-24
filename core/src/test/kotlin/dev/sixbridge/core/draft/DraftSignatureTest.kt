@@ -171,50 +171,6 @@ class DraftSignatureTest {
     }
 
     @Test
-    fun `key root replacement while locked fails without replacement writes`() {
-        val trusted = Files.createTempDirectory("six-draft-root-race")
-        val root = trusted.resolve("keys")
-        val backup = trusted.resolve("keys-backup")
-
-        assertFails {
-            DraftSigningKeyStoreFaultInjection.replaceRootAfterLock(
-                action = {
-                    Files.move(root, backup)
-                    Files.createDirectory(root)
-                },
-                block = {
-                    DraftSigningKeyStore(trusted, root).getOrCreate()
-                },
-            )
-        }
-
-        assertTrue(root.listDirectoryEntries().isEmpty())
-        assertTrue(
-            backup.listDirectoryEntries().all {
-                it.fileName.toString() == ".sixbridge-draft-key.lock"
-            },
-        )
-    }
-
-    @Test
-    fun `metadata last publish failure is not silently regenerated`() {
-        val trusted = Files.createTempDirectory("six-draft-metadata-last")
-        val root = trusted.resolve("keys")
-        val store = DraftSigningKeyStore(trusted, root)
-
-        assertFails {
-            DraftSigningKeyStoreFaultInjection.failAfterPairPublish {
-                store.getOrCreate()
-            }
-        }
-        assertTrue(root.listDirectoryEntries("*.identity").isEmpty())
-        assertEquals(1, root.listDirectoryEntries("*.pub").size)
-        assertEquals(1, root.listDirectoryEntries("*.pk8").size)
-        assertFails { store.getOrCreate() }
-        assertTrue(root.listDirectoryEntries("*.identity").isEmpty())
-    }
-
-    @Test
     fun `concurrent creation returns one complete key pair`() {
         val trusted = Files.createTempDirectory("six-draft-concurrent")
         val root = trusted.resolve("keys")

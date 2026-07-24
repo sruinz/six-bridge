@@ -3,6 +3,7 @@ package dev.sixbridge.core.crx
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -44,6 +45,36 @@ class Crx3Test {
 
         assertFailsWith<InvalidCrxException> {
             Crx3.parse(packed)
+        }
+    }
+
+    @Test
+    fun `verified payload hash validates a CRX without copying its ZIP`() {
+        val source = Files.createTempDirectory("six-crx-stream-hash")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Tiny","version":"1"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+            .generateKeyPair()
+        val packed = Crx3.pack(source, keyPair)
+        val prefix = ByteArray(17) { 3 }
+        val container = prefix + packed.bytes + ByteArray(11) { 4 }
+
+        assertEquals(
+            MessageDigest.getInstance("SHA-256")
+                .digest(packed.zipBytes)
+                .joinToString("") { "%02x".format(it) },
+            Crx3.verifiedPayloadSha256(
+                container,
+                prefix.size,
+                packed.bytes.size,
+            ),
+        )
+
+        container[prefix.size + packed.bytes.lastIndex] =
+            (container[prefix.size + packed.bytes.lastIndex].toInt() xor 1).toByte()
+        assertFailsWith<InvalidCrxException> {
+            Crx3.verifiedPayloadSha256(container, prefix.size, packed.bytes.size)
         }
     }
 
