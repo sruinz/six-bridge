@@ -173,6 +173,17 @@ class MobilePatternAnalyzer(
             popup,
         )
         if (applied) {
+            if (OPTIONS_PAGE_ACCESSIBLE_FEATURE !in profile.supportedFeatures) {
+                return optionEntryDecision(
+                    manifestPath = manifestPath,
+                    popup = popup,
+                    disposition = AdapterDisposition.UNAVAILABLE,
+                    applied = false,
+                    limitations = listOf(
+                        "browser profile에서 삼성 Add-ons option page 진입을 확인하지 못했습니다.",
+                    ),
+                )
+            }
             return optionEntryDecision(
                 manifestPath = manifestPath,
                 popup = popup,

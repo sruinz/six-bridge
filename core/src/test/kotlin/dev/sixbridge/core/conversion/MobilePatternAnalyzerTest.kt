@@ -452,6 +452,36 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
+    fun `exact applied provenance still requires verified profile evidence`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('content');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        writeOptionsUi(source, "popup.html")
+        Files.createDirectories(source.resolve("_sixbridge"))
+        source.resolve("_sixbridge/action-popup-entry.v2.json").writeText(
+            """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(
+            source,
+            profile.copy(supportedFeatures = emptySet()),
+        ).decision("action-popup-entry")
+
+        assertNotNull(decision)
+        assertEquals(2, decision.version)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertFalse(decision.applied)
+        assertEquals(emptyList(), decision.changes)
+        assertEquals(
+            listOf("browser profile에서 삼성 Add-ons option page 진입을 확인하지 못했습니다."),
+            decision.remainingLimitations,
+        )
+    }
+
+    @Test
     fun `does not report applied for missing tampered or popup mismatched provenance`() {
         listOf(
             null to "popup.html",
