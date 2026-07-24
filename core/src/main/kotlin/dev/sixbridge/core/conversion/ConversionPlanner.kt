@@ -45,6 +45,7 @@ class ConversionPlanner(
                         )
             }
             .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
+            .map(::SelectedAdapter)
         return ConversionPlan(
             report = report,
             selectedAdapters = selected,
@@ -54,7 +55,7 @@ class ConversionPlanner(
 
 data class ConversionPlan(
     val report: CompatibilityReport,
-    val selectedAdapters: List<AdapterDecision>,
+    val selectedAdapters: List<SelectedAdapter>,
 )
 
 enum class ConversionPlanningFailure {

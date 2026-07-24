@@ -219,6 +219,7 @@ class RuntimeResourceIndex private constructor(
         ): Path? {
             if (resource.isBlank() ||
                 '\\' in resource ||
+                '%' in resource ||
                 ':' in resource ||
                 '?' in resource ||
                 '#' in resource ||

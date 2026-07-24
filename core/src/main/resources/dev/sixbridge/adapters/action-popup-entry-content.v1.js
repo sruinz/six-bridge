@@ -1,4 +1,5 @@
 (() => {
+  if (globalThis.top !== globalThis.self) return;
   const installedKey = "__sixbridgeActionPopupEntryV1";
   if (globalThis[installedKey]) return;
   globalThis[installedKey] = true;

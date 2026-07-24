@@ -29,7 +29,18 @@ class ConversionPlannerTest {
             ),
             plan.selectedAdapters.map { it.id },
         )
-        assertFalse(plan.selectedAdapters.any { it.applied })
+        val selected: List<SelectedAdapter> = plan.selectedAdapters
+        assertFalse(selected.any { it.applied })
+    }
+
+    @Test
+    fun `mobile adapters accept only planner selected capabilities`() {
+        val applyParameter = MobileAdapter::class.java.methods
+            .single { it.name == "apply" }
+            .parameterTypes
+            .last()
+
+        assertEquals(SelectedAdapter::class.java, applyParameter)
     }
 
     @Test

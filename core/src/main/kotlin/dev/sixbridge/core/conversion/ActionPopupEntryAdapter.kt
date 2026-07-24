@@ -1,5 +1,6 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -15,7 +16,8 @@ class ActionPopupEntryAdapter : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.ACTION_POPUP_ENTRY
     override val version: Int = 1
 
-    override fun apply(workingRoot: Path, decision: AdapterDecision): AdapterDecision {
+    override fun apply(workingRoot: Path, selected: SelectedAdapter): AdapterDecision {
+        val decision = selected.decision
         if (decision.id != id || decision.version != version ||
             decision.disposition != AdapterDisposition.REQUIRES_APPROVAL
         ) {
@@ -29,18 +31,19 @@ class ActionPopupEntryAdapter : MobileAdapter {
             ?.stringOrNull(DEFAULT_POPUP)
             ?.takeIf { it.isNotBlank() }
             ?: return decision
+        val canonicalPopupPath = ActionPopupEntrySafety.canonicalResourcePath(popupPath)
+            ?: throw IllegalStateException("popup 경로가 안전하지 않습니다: $popupPath")
+        verifyResource(workingRoot, canonicalPopupPath, "popup")
         val contentScripts = manifest[CONTENT_SCRIPTS] as? JsonArray ?: return decision
         if (contentScripts.none(::hasJavaScript)) return decision
 
         val contentBytes = resourceBytes(CONTENT_RESOURCE_PATH)
-        val backgroundBytes = generatedBackgroundBytes(popupPath)
+        val backgroundBytes = generatedBackgroundBytes(canonicalPopupPath)
         val backgroundPlan = backgroundPlan(workingRoot, manifest)
         val assets = buildList {
             add(Asset(CONTENT_RELATIVE_PATH, contentBytes))
             add(Asset(BACKGROUND_RELATIVE_PATH, backgroundBytes))
-            backgroundPlan.bootstrapBytes?.let {
-                add(Asset(BOOTSTRAP_RELATIVE_PATH, it))
-            }
+            backgroundPlan.bootstrapAsset?.let(::add)
         }
         assets.forEach { preflightAsset(workingRoot, it) }
 
@@ -88,50 +91,73 @@ class ActionPopupEntryAdapter : MobileAdapter {
         val background = manifest[BACKGROUND] as? JsonObject
         val worker = background?.stringOrNull(SERVICE_WORKER)
             ?: return BackgroundPlan(BACKGROUND_RELATIVE_PATH, null)
-        val canonicalWorker = canonicalResourcePath(worker)
+        val canonicalWorker = ActionPopupEntrySafety.canonicalResourcePath(worker)
             ?: throw IllegalStateException("service worker 경로가 안전하지 않습니다: $worker")
         val module = background.stringOrNull(TYPE) == MODULE
         return when (canonicalWorker) {
             BACKGROUND_RELATIVE_PATH -> BackgroundPlan(BACKGROUND_RELATIVE_PATH, null)
-            BOOTSTRAP_RELATIVE_PATH -> {
-                val bootstrapPath = workingRoot.resolve(BOOTSTRAP_RELATIVE_PATH)
+            CONTENT_RELATIVE_PATH ->
+                throw IllegalStateException("content adapter를 service worker로 사용할 수 없습니다.")
+            else -> if (Path.of(canonicalWorker).fileName.toString() == BOOTSTRAP_FILE_NAME) {
+                val bootstrapPath = workingRoot.resolve(canonicalWorker)
                 if (!Files.isRegularFile(bootstrapPath, NOFOLLOW_LINKS)) {
                     throw IllegalStateException("generated bootstrap provenance를 확인할 수 없습니다.")
                 }
                 val originalWorker = parseOriginalWorker(
                     Files.readString(bootstrapPath),
                     module,
+                    canonicalWorker,
                 )
                 verifyOriginalWorker(workingRoot, originalWorker)
+                val bootstrapBytes = bootstrapBytes(originalWorker, module)
                 BackgroundPlan(
-                    BOOTSTRAP_RELATIVE_PATH,
-                    bootstrapBytes(originalWorker, module),
+                    canonicalWorker,
+                    Asset(canonicalWorker, bootstrapBytes),
                 )
-            }
-            CONTENT_RELATIVE_PATH ->
-                throw IllegalStateException("content adapter를 service worker로 사용할 수 없습니다.")
-            else -> {
+            } else {
                 verifyOriginalWorker(workingRoot, canonicalWorker)
+                val bootstrapPath = generatedBootstrapPath(canonicalWorker)
                 BackgroundPlan(
-                    BOOTSTRAP_RELATIVE_PATH,
-                    bootstrapBytes(canonicalWorker, module),
+                    bootstrapPath,
+                    Asset(bootstrapPath, bootstrapBytes(canonicalWorker, module)),
                 )
             }
         }
     }
 
     private fun verifyOriginalWorker(workingRoot: Path, relativePath: String) {
-        val worker = workingRoot.resolve(relativePath).normalize()
-        if (!worker.startsWith(workingRoot.normalize()) ||
-            !Files.isRegularFile(worker, NOFOLLOW_LINKS)
-        ) {
-            throw IllegalStateException("원본 service worker를 확인할 수 없습니다: $relativePath")
+        val worker = verifyResource(workingRoot, relativePath, "원본 service worker")
+        if (ActionPopupEntrySafety.usesWorkerUrl(Files.readString(worker))) {
+            throw IllegalStateException(
+                "원본 service worker가 자신의 URL에 의존해 bootstrap semantics를 보존할 수 없습니다.",
+            )
         }
     }
 
+    private fun verifyResource(
+        workingRoot: Path,
+        relativePath: String,
+        label: String,
+    ): Path {
+        val root = workingRoot.toAbsolutePath().normalize()
+        val resource = root.resolve(relativePath).normalize()
+        if (!resource.startsWith(root) ||
+            !Files.isRegularFile(resource, NOFOLLOW_LINKS)
+        ) {
+            throw IllegalStateException("$label 리소스를 확인할 수 없습니다: $relativePath")
+        }
+        return resource
+    }
+
     private fun bootstrapBytes(originalWorker: String, module: Boolean): ByteArray {
-        val originalImport = JsonPrimitive("../$originalWorker").toString()
-        val adapterImport = JsonPrimitive("./$BACKGROUND_FILE_NAME").toString()
+        val bootstrapPath = generatedBootstrapPath(originalWorker)
+        val bootstrapDirectory = relativeParent(bootstrapPath)
+        val originalImport = JsonPrimitive(
+            relativeImport(bootstrapDirectory, originalWorker),
+        ).toString()
+        val adapterImport = JsonPrimitive(
+            relativeImport(bootstrapDirectory, BACKGROUND_RELATIVE_PATH),
+        ).toString()
         val source = if (module) {
             "import $originalImport;\nimport $adapterImport;\n"
         } else {
@@ -140,37 +166,95 @@ class ActionPopupEntryAdapter : MobileAdapter {
         return source.toByteArray(UTF_8)
     }
 
-    private fun parseOriginalWorker(source: String, module: Boolean): String {
-        val adapterImport = JsonPrimitive("./$BACKGROUND_FILE_NAME").toString()
-        val encodedOriginal = if (module) {
-            val suffix = ";\nimport $adapterImport;\n"
-            if (!source.startsWith("import ") || !source.endsWith(suffix)) {
+    private fun parseOriginalWorker(
+        source: String,
+        module: Boolean,
+        bootstrapPath: String,
+    ): String {
+        val bootstrapDirectory = relativeParent(bootstrapPath)
+        val encodedImports = if (module) {
+            if (!source.startsWith("import ") || !source.endsWith(";\n")) {
                 throw IllegalStateException("generated module bootstrap provenance가 일치하지 않습니다.")
             }
-            source.removePrefix("import ").removeSuffix(suffix)
+            source.removeSuffix(";\n")
+                .split(";\nimport ")
+                .takeIf { it.size == 2 }
+                ?.mapIndexed { index, value ->
+                    if (index == 0) value.removePrefix("import ") else value
+                }
         } else {
             val prefix = "importScripts("
-            val suffix = ", $adapterImport);\n"
+            val suffix = ");\n"
             if (!source.startsWith(prefix) || !source.endsWith(suffix)) {
                 throw IllegalStateException("generated classic bootstrap provenance가 일치하지 않습니다.")
             }
-            source.removePrefix(prefix).removeSuffix(suffix)
+            runCatching {
+                Json.parseToJsonElement(
+                    "[${source.removePrefix(prefix).removeSuffix(suffix)}]",
+                ) as? JsonArray
+            }.getOrNull()
+                ?.takeIf { it.size == 2 }
+                ?.map { it.toString() }
         }
-        val importPath = runCatching {
-            (Json.parseToJsonElement(encodedOriginal) as? JsonPrimitive)
+            ?: throw IllegalStateException("generated bootstrap import 개수가 일치하지 않습니다.")
+        val imports = encodedImports.map { encoded ->
+            runCatching {
+                (Json.parseToJsonElement(encoded) as? JsonPrimitive)
                 ?.takeIf(JsonPrimitive::isString)
                 ?.content
-        }.getOrNull()
-            ?: throw IllegalStateException("generated bootstrap import를 해석할 수 없습니다.")
-        if (!importPath.startsWith("../")) {
-            throw IllegalStateException("generated bootstrap import 기준 경로가 올바르지 않습니다.")
+            }.getOrNull()
+                ?: throw IllegalStateException("generated bootstrap import를 해석할 수 없습니다.")
         }
-        val original = canonicalResourcePath(importPath.removePrefix("../"))
-            ?: throw IllegalStateException("generated bootstrap 원본 경로가 안전하지 않습니다.")
-        if (JsonPrimitive("../$original").toString() != encodedOriginal) {
-            throw IllegalStateException("generated bootstrap 원본 경로가 canonical하지 않습니다.")
+        val original = resolveGeneratedImport(bootstrapDirectory, imports[0])
+        val adapter = resolveGeneratedImport(bootstrapDirectory, imports[1])
+        if (adapter != BACKGROUND_RELATIVE_PATH ||
+            generatedBootstrapPath(original) != bootstrapPath ||
+            !bootstrapBytes(original, module).contentEquals(source.toByteArray(UTF_8))
+        ) {
+            throw IllegalStateException("generated bootstrap provenance가 일치하지 않습니다.")
         }
         return original
+    }
+
+    private fun generatedBootstrapPath(originalWorker: String): String {
+        val parent = relativeParent(originalWorker)
+        return if (parent.isEmpty()) {
+            BOOTSTRAP_FILE_NAME
+        } else {
+            "$parent/$BOOTSTRAP_FILE_NAME"
+        }
+    }
+
+    private fun relativeParent(relativePath: String): String =
+        Path.of(relativePath).parent
+            ?.invariantSeparatorsPathString
+            .orEmpty()
+
+    private fun relativeImport(fromDirectory: String, target: String): String {
+        val from = Path.of(fromDirectory.ifEmpty { "." })
+        val relative = from.relativize(Path.of(target))
+            .normalize()
+            .invariantSeparatorsPathString
+        return if (relative.startsWith("../")) relative else "./$relative"
+    }
+
+    private fun resolveGeneratedImport(baseDirectory: String, importPath: String): String {
+        if (!ActionPopupEntrySafety.isSafeUrlPath(importPath) ||
+            importPath.startsWith("/")
+        ) {
+            throw IllegalStateException("generated bootstrap import 경로가 안전하지 않습니다.")
+        }
+        val base = Path.of(baseDirectory.ifEmpty { "." })
+        val resolved = base.resolve(importPath)
+            .normalize()
+            .invariantSeparatorsPathString
+        if (resolved == ".." || resolved.startsWith("../")) {
+            throw IllegalStateException("generated bootstrap import가 확장 루트를 벗어납니다.")
+        }
+        if (relativeImport(baseDirectory, resolved) != importPath) {
+            throw IllegalStateException("generated bootstrap import가 canonical하지 않습니다.")
+        }
+        return resolved.removePrefix("./")
     }
 
     private fun generatedBackgroundBytes(popupPath: String): ByteArray {
@@ -227,25 +311,7 @@ class ActionPopupEntryAdapter : MobileAdapter {
     ): Boolean = (element as? JsonPrimitive)
         ?.takeIf(JsonPrimitive::isString)
         ?.content
-        ?.let(::canonicalResourcePath) == CONTENT_RELATIVE_PATH
-
-    private fun canonicalResourcePath(value: String): String? {
-        if (value.isBlank() ||
-            '\\' in value ||
-            ':' in value ||
-            '?' in value ||
-            '#' in value ||
-            value.startsWith("//")
-        ) {
-            return null
-        }
-        return runCatching {
-            Path.of(value.removePrefix("/"))
-                .normalize()
-                .invariantSeparatorsPathString
-                .takeIf { it.isNotBlank() && it != ".." && !it.startsWith("../") }
-        }.getOrNull()
-    }
+        ?.let(ActionPopupEntrySafety::canonicalResourcePath) == CONTENT_RELATIVE_PATH
 
     private fun JsonObject.stringOrNull(name: String): String? =
         (get(name) as? JsonPrimitive)
@@ -262,7 +328,7 @@ class ActionPopupEntryAdapter : MobileAdapter {
 
     private data class BackgroundPlan(
         val manifestWorker: String,
-        val bootstrapBytes: ByteArray?,
+        val bootstrapAsset: Asset?,
     )
 
     private companion object {
@@ -278,12 +344,43 @@ class ActionPopupEntryAdapter : MobileAdapter {
 
         const val CONTENT_FILE_NAME = "action-popup-entry-content.v1.js"
         const val BACKGROUND_FILE_NAME = "action-popup-entry-background.v1.js"
-        const val BOOTSTRAP_FILE_NAME = "action-popup-entry-bootstrap.v1.js"
+        const val BOOTSTRAP_FILE_NAME = "_sixbridge-action-popup-entry-bootstrap.v1.js"
         const val CONTENT_RELATIVE_PATH = "_sixbridge/$CONTENT_FILE_NAME"
         const val BACKGROUND_RELATIVE_PATH = "_sixbridge/$BACKGROUND_FILE_NAME"
-        const val BOOTSTRAP_RELATIVE_PATH = "_sixbridge/$BOOTSTRAP_FILE_NAME"
         const val CONTENT_RESOURCE_PATH = "dev/sixbridge/adapters/$CONTENT_FILE_NAME"
         const val BACKGROUND_RESOURCE_PATH = "dev/sixbridge/adapters/$BACKGROUND_FILE_NAME"
         const val POPUP_PLACEHOLDER = "__SIXBRIDGE_POPUP_PATH_JSON__"
     }
+}
+
+internal object ActionPopupEntrySafety {
+    private val WORKER_URL = Regex(
+        """\b(?:self|globalThis)\s*\.\s*location\b|""" +
+            """\bimport\s*\.\s*meta\s*\.\s*url\b|""" +
+            """\blocation\s*\.\s*(?:href|origin|pathname|protocol|host|hostname|port|search|hash)\b""",
+    )
+
+    fun usesWorkerUrl(source: String): Boolean =
+        WORKER_URL.containsMatchIn(
+            JavaScriptLexicalMask.mask(source, maskLiterals = true),
+        )
+
+    fun canonicalResourcePath(value: String): String? {
+        if (!isSafeUrlPath(value)) return null
+        return runCatching {
+            Path.of(value.removePrefix("/"))
+                .normalize()
+                .invariantSeparatorsPathString
+                .takeIf { it.isNotBlank() && it != ".." && !it.startsWith("../") }
+        }.getOrNull()
+    }
+
+    fun isSafeUrlPath(value: String): Boolean =
+        value.isNotBlank() &&
+            !value.startsWith("//") &&
+            '\\' !in value &&
+            '%' !in value &&
+            ':' !in value &&
+            '?' !in value &&
+            '#' !in value
 }

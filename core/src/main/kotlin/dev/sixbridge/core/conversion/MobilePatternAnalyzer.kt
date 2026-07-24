@@ -38,7 +38,7 @@ class MobilePatternAnalyzer(
         val decisions = mutableListOf<AdapterDecision>()
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
-        popupDecision(manifestPath, manifest, profile)?.let(decisions::add)
+        popupDecision(manifestPath, manifest, index, profile)?.let(decisions::add)
         val storage = storageDecision(index, profile)
         storage.decision?.let(decisions::add)
         if (storage.unknown) {
@@ -109,6 +109,7 @@ class MobilePatternAnalyzer(
     private fun popupDecision(
         manifestPath: Path,
         manifest: JsonObject,
+        index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): AdapterDecision? {
         if (ACTION_POPUP_USER_ACCESSIBLE in profile.supportedFeatures) return null
@@ -127,6 +128,13 @@ class MobilePatternAnalyzer(
             }
             if ("tabs" !in profile.supportedApis) {
                 add("tabs namespace가 없어 popup을 extension tab으로 열 수 없습니다.")
+            }
+            if (index.scripts.any {
+                    RuntimeResourceIndex.ResourceRole.BACKGROUND in it.roles &&
+                        ActionPopupEntrySafety.usesWorkerUrl(it.source)
+                }
+            ) {
+                add("원본 service worker가 자신의 URL에 의존해 bootstrap semantics를 보존할 수 없습니다.")
             }
         }
         val unavailable = unavailableLimitations.isNotEmpty()

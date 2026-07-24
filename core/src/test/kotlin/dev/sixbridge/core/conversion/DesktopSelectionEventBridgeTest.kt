@@ -34,8 +34,8 @@ class DesktopSelectionEventBridgeTest {
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
-            val decision = automaticDecision(working)
-            val applied = DesktopSelectionEventBridge().apply(working, decision)
+            val selection = automaticSelection(working)
+            val applied = DesktopSelectionEventBridge().apply(working, selection)
 
             assertTrue(applied.applied)
             val manifest = Json.parseToJsonElement(working.resolve("manifest.json").readText()) as JsonObject
@@ -62,12 +62,12 @@ class DesktopSelectionEventBridgeTest {
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
         val bridge = DesktopSelectionEventBridge()
-        val decision = automaticDecision(source)
+        val selection = automaticSelection(source)
 
-        bridge.apply(source, decision)
+        bridge.apply(source, selection)
         val manifestBefore = source.resolve("manifest.json").readBytes()
         val zipBefore = ExtensionZip.createBytes(source)
-        val reapplied = bridge.apply(source, decision)
+        val reapplied = bridge.apply(source, selection)
 
         assertTrue(reapplied.applied)
         assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
@@ -87,7 +87,7 @@ class DesktopSelectionEventBridgeTest {
                 content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
             )
 
-            val applied = DesktopSelectionEventBridge().apply(source, automaticDecision(source))
+            val applied = DesktopSelectionEventBridge().apply(source, automaticSelection(source))
 
             assertTrue(applied.applied)
             val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
@@ -112,12 +112,12 @@ class DesktopSelectionEventBridgeTest {
                 document.addEventListener("pointerup", () => use(getSelection()));
             """.trimIndent(),
         )
-        val bridge = DesktopSelectionEventBridge()
-
-        val unavailable = MobilePatternAnalyzer().analyze(sensitive, profile)
-            .adapterDecisions.single()
+        val unavailableReport = MobilePatternAnalyzer().analyze(sensitive, profile)
+        val unavailable = unavailableReport.adapterDecisions.single()
         assertEquals(AdapterDisposition.UNAVAILABLE, unavailable.disposition)
-        assertFalse(bridge.apply(sensitive, unavailable).applied)
+        assertTrue(
+            ConversionPlanner().plan(unavailableReport, emptySet()).selectedAdapters.isEmpty(),
+        )
         assertFalse(Files.exists(sensitive.resolve("_sixbridge")))
 
         assertNull(
@@ -147,10 +147,11 @@ class DesktopSelectionEventBridgeTest {
                 files = files + ("unrelated.js" to "document.addEventListener('click', () => {});"),
             )
             val report = MobilePatternAnalyzer().analyze(source, profile)
-            val decision = report
-                .adapterDecisions.singleOrNull()
+            val decision = report.adapterDecisions.singleOrNull()
             assertNotNull(decision, "$scripts ${report.status} ${report.issues}")
-            val applied = DesktopSelectionEventBridge().apply(source, decision)
+            val selection = ConversionPlanner().plan(report, emptySet())
+                .selectedAdapters.single()
+            val applied = DesktopSelectionEventBridge().apply(source, selection)
             val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
 
             assertTrue(applied.applied)
@@ -170,7 +171,7 @@ class DesktopSelectionEventBridgeTest {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
-        val decision = automaticDecision(source)
+        val selection = automaticSelection(source)
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
               {"matches":["<all_urls>"],"js":["content.js","_sixbridge/desktop-selection-event-bridge.v1.js","content.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
@@ -187,7 +188,7 @@ class DesktopSelectionEventBridgeTest {
             ).readBytes(),
         )
 
-        DesktopSelectionEventBridge().apply(source, decision)
+        DesktopSelectionEventBridge().apply(source, selection)
 
         val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
         assertEquals(
@@ -205,7 +206,7 @@ class DesktopSelectionEventBridgeTest {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
-        val decision = automaticDecision(source)
+        val selection = automaticSelection(source)
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
               {"matches":["<all_urls>"],"js":["content.js","./_sixbridge/desktop-selection-event-bridge.v1.js","/_sixbridge/desktop-selection-event-bridge.v1.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
@@ -214,7 +215,7 @@ class DesktopSelectionEventBridgeTest {
         )
         writeGeneratedAsset(source)
 
-        DesktopSelectionEventBridge().apply(source, decision)
+        DesktopSelectionEventBridge().apply(source, selection)
 
         val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
         assertEquals(
@@ -235,7 +236,7 @@ class DesktopSelectionEventBridgeTest {
         val assetBefore = asset.readBytes()
 
         assertFailsWith<IllegalStateException> {
-            DesktopSelectionEventBridge().apply(source, automaticDecision(source))
+            DesktopSelectionEventBridge().apply(source, automaticSelection(source))
         }
 
         assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
@@ -253,7 +254,7 @@ class DesktopSelectionEventBridgeTest {
         val parentBefore = parent.readBytes()
 
         val error = runCatching {
-            DesktopSelectionEventBridge().apply(source, automaticDecision(source))
+            DesktopSelectionEventBridge().apply(source, automaticSelection(source))
         }.exceptionOrNull()
 
         assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
@@ -261,12 +262,13 @@ class DesktopSelectionEventBridgeTest {
         assertTrue(error is IllegalStateException)
     }
 
-    private fun automaticDecision(source: Path): AdapterDecision {
-        val decision = MobilePatternAnalyzer().analyze(source, profile)
+    private fun automaticSelection(source: Path): SelectedAdapter {
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+        val decision = report
             .adapterDecisions.singleOrNull()
         assertNotNull(decision)
         assertEquals(AdapterDisposition.AUTOMATIC, decision.disposition)
-        return decision
+        return ConversionPlanner().plan(report, emptySet()).selectedAdapters.single()
     }
 
     private fun scriptPaths(block: JsonObject): List<String> =

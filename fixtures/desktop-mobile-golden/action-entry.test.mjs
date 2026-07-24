@@ -77,6 +77,36 @@ test("content entry uses a closed shadow root and messages only for a trusted cl
   assert.equal(messages[0].type, "sixbridge:open-action-popup:v1");
 });
 
+test("content entry exits without DOM or messaging work in a child frame", async () => {
+  let documentReads = 0;
+  let runtimeReads = 0;
+  const document = new Proxy(
+    {},
+    {
+      get() {
+        documentReads += 1;
+        throw new Error("child frame must not read document");
+      },
+    },
+  );
+  const chrome = {
+    get runtime() {
+      runtimeReads += 1;
+      throw new Error("child frame must not read runtime");
+    },
+  };
+
+  vm.runInNewContext(await readFile(contentUrl, "utf8"), {
+    chrome,
+    document,
+    self: {},
+    top: {},
+  });
+
+  assert.equal(documentReads, 0);
+  assert.equal(runtimeReads, 0);
+});
+
 test("background opens only the fixed message at the generated extension URL", async () => {
   let listener;
   const created = [];

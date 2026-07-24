@@ -391,6 +391,7 @@ class CompatibilityAnalyzer(
         value.isNotBlank() &&
             !value.startsWith("//") &&
             '\\' !in value &&
+            '%' !in value &&
             ':' !in value &&
             '?' !in value &&
             '#' !in value
