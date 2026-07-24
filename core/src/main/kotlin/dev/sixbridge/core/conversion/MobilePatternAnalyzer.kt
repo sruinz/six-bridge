@@ -39,7 +39,7 @@ class MobilePatternAnalyzer(
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
         popupDecision(manifestPath, manifest, index, profile)?.let(decisions::add)
-        val storage = storageDecision(index, profile)
+        val storage = storageDecision(extensionRoot, index, profile)
         storage.decision?.let(decisions::add)
         if (storage.unknown) {
             issues += CompatibilityIssue(
@@ -165,15 +165,20 @@ class MobilePatternAnalyzer(
     }
 
     private fun storageDecision(
+        extensionRoot: Path,
         index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): StorageDecision {
         val rewriter = JavaScriptTokenRewriter()
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
+        val convertedSources = mutableMapOf<String, String>()
         index.scripts.forEach { script ->
             val rewrite = rewriter.rewrite(script.source)
             if (isStandaloneJavaScript(script.relativePath)) {
+                if (rewrite.replacements.isNotEmpty()) {
+                    convertedSources[script.relativePath] = rewrite.source
+                }
                 safeEvidence += rewrite.replacements.map { access ->
                     SourceEvidence(
                         relativePath = script.relativePath,
@@ -258,6 +263,11 @@ class MobilePatternAnalyzer(
                 StorageDecision(unknown = true)
             }
         }
+        val capability = StorageFallbackCapability.create(
+            extensionRoot,
+            index,
+            convertedSources,
+        )
         return StorageDecision(
             decision = AdapterDecision(
                 id = STORAGE_FALLBACK,
@@ -265,9 +275,10 @@ class MobilePatternAnalyzer(
                 risk = AdapterRisk.SAFE,
                 disposition = AdapterDisposition.AUTOMATIC,
                 applied = false,
-                evidence = safeEvidence
-                    .distinct()
-                    .sortedWith(
+                evidence = (
+                    safeEvidence +
+                        capability.evidence()
+                    ).distinct().sortedWith(
                         compareBy(
                             SourceEvidence::relativePath,
                             SourceEvidence::line,
@@ -275,7 +286,10 @@ class MobilePatternAnalyzer(
                         ),
                     ),
                 changes = listOf("정적인 storage.sync member를 storage.local로 변경합니다."),
-                remainingLimitations = listOf("기기 간 storage 동기화가 제공되지 않습니다."),
+                remainingLimitations = listOf(
+                    "기기 간 storage 동기화가 제공되지 않습니다.",
+                    "기존 storage.sync 데이터는 자동 이관되지 않아 초기 설정이 사라진 것처럼 보일 수 있습니다.",
+                ),
             ),
         )
     }
@@ -535,14 +549,14 @@ class MobilePatternAnalyzer(
     private fun conversionState(decisions: List<AdapterDecision>): ConversionState =
         when {
             decisions.any {
+                it.disposition == AdapterDisposition.UNAVAILABLE
+            } -> ConversionState.UNAVAILABLE
+            decisions.any {
                 it.disposition == AdapterDisposition.REQUIRES_APPROVAL
             } -> ConversionState.REQUIRES_APPROVAL
             decisions.any {
                 it.disposition == AdapterDisposition.AUTOMATIC
             } -> ConversionState.AUTOMATIC
-            decisions.any {
-                it.disposition == AdapterDisposition.UNAVAILABLE
-            } -> ConversionState.UNAVAILABLE
             else -> ConversionState.PASSTHROUGH
         }
 

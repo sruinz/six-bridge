@@ -4,12 +4,9 @@ import dev.sixbridge.core.compat.RuntimeResourceIndex
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
-import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 
 class StorageFallbackAdapter : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.STORAGE_FALLBACK
@@ -27,15 +24,41 @@ class StorageFallbackAdapter : MobileAdapter {
         ) {
             return decision.copy(applied = false, changes = emptyList())
         }
+        val capabilityEvidence = decision.evidence.filter {
+            it.relativePath == StorageFallbackCapability.EVIDENCE_PATH
+        }.singleOrNull() ?: throw IllegalStateException(
+            "storage fallback capability evidence가 정확히 하나가 아닙니다.",
+        )
+        val capability = StorageFallbackCapability.parse(capabilityEvidence)
+            ?: throw IllegalStateException(
+                "storage fallback closure 또는 feature proof가 올바르지 않습니다.",
+            )
+        return ConversionWorkspaceTransaction().run(workingRoot) { stagedRoot ->
+            applyToStagedTree(stagedRoot, decision, capability)
+        }
+    }
 
-        val root = verifiedRoot(workingRoot)
-        val manifestPath = verifiedFile(root, MANIFEST)
-        val manifest = runCatching {
-            Json.parseToJsonElement(Files.readString(manifestPath, UTF_8)) as? JsonObject
-        }.getOrNull() ?: throw IllegalStateException("manifest.json을 해석할 수 없습니다.")
+    private fun applyToStagedTree(
+        stagedRoot: Path,
+        decision: AdapterDecision,
+        capability: StorageFallbackCapability,
+    ): AdapterDecision {
+        val root = verifiedRoot(stagedRoot)
+        val manifest = manifest(root)
         val index = RuntimeResourceIndex.create(root, manifest)
         if (index.unresolvedDependency) {
             throw IllegalStateException("runtime dependency를 완전히 해석할 수 없습니다.")
+        }
+        val currentClosure = StorageFallbackCapability.currentClosureSha256(
+            root,
+            index,
+        )
+        val sourceState = when (currentClosure) {
+            capability.sourceClosureSha256 -> true
+            capability.convertedClosureSha256 -> false
+            else -> throw IllegalStateException(
+                "승인된 manifest 또는 runtime closure가 현재 staged tree와 다릅니다.",
+            )
         }
 
         val rewriter = JavaScriptTokenRewriter()
@@ -65,8 +88,17 @@ class StorageFallbackAdapter : MobileAdapter {
                         "승인 후 안전하지 않은 storage 접근이 발견되었습니다: $relativePath",
                     )
                 }
-                RewriteFile(relativePath, target, bytes, result)
+                RewriteFile(relativePath, target, source, result)
             }
+
+        val tokenEvidence = decision.evidence
+            .filter { it.relativePath != StorageFallbackCapability.EVIDENCE_PATH }
+            .distinct()
+            .sortedWith(EVIDENCE_ORDER)
+        if (!sourceState) {
+            verifyReapplication(tokenEvidence, files)
+            return decision.copy(applied = true, changes = emptyList())
+        }
 
         val currentEvidence = files.flatMap { file ->
             file.result.replacements.map { access ->
@@ -75,44 +107,47 @@ class StorageFallbackAdapter : MobileAdapter {
                     line = access.line,
                     detail = StorageFallbackEvidence.detail(
                         access.root,
-                        file.originalBytes.toString(UTF_8),
+                        file.source,
                         file.result.source,
                     ),
                 )
             }
         }.distinct().sortedWith(EVIDENCE_ORDER)
-        val expectedEvidence = decision.evidence.distinct().sortedWith(EVIDENCE_ORDER)
-        if (currentEvidence.isEmpty()) {
-            verifyReapplication(expectedEvidence, files)
-            return decision.copy(applied = true, changes = emptyList())
-        }
-        if (currentEvidence != expectedEvidence) {
-            throw IllegalStateException("승인된 storage 근거와 현재 runtime source가 다릅니다.")
+        if (currentEvidence != tokenEvidence || currentEvidence.isEmpty()) {
+            throw IllegalStateException("승인된 storage token 근거와 현재 source가 다릅니다.")
         }
 
-        val changes = files.flatMap { file ->
-            file.result.replacements.map { access ->
-                "${file.relativePath}:${access.line} storage.sync → storage.local"
-            }
-        }.distinct().sorted()
-        val writes = files
-            .filter { it.result.source != it.originalBytes.toString(UTF_8) }
-            .map { file ->
-                PendingWrite(
-                    path = file.path,
-                    relativePath = file.relativePath,
-                    originalBytes = file.originalBytes,
-                    replacementBytes = file.result.source.toByteArray(UTF_8),
-                )
-            }
-        installAtomically(root, writes)
+        val convertedSources = files
+            .filter { it.result.replacements.isNotEmpty() }
+            .associate { it.relativePath to it.result.source }
+        val expected = StorageFallbackCapability.create(
+            root,
+            index,
+            convertedSources,
+        )
+        if (expected != capability) {
+            throw IllegalStateException("승인된 storage closure 변환 결과와 현재 계획이 다릅니다.")
+        }
+        files.filter { it.result.source != it.source }.forEach { file ->
+            Files.writeString(file.path, file.result.source, UTF_8)
+        }
+        val convertedManifest = manifest(root)
+        val convertedIndex = RuntimeResourceIndex.create(root, convertedManifest)
+        if (convertedIndex.unresolvedDependency ||
+            StorageFallbackCapability.currentClosureSha256(
+                root,
+                convertedIndex,
+            ) != capability.convertedClosureSha256
+        ) {
+            throw IllegalStateException("완성된 storage fallback closure 검증에 실패했습니다.")
+        }
         return decision.copy(
             applied = true,
-            changes = changes,
-            remainingLimitations = (
-                decision.remainingLimitations +
-                    "storage.sync 데이터는 이 기기에서 storage.local에만 저장됩니다."
-                ).distinct(),
+            changes = files.flatMap { file ->
+                file.result.replacements.map { access ->
+                    "${file.relativePath}:${access.line} storage.sync → storage.local"
+                }
+            }.distinct().sorted(),
         )
     }
 
@@ -129,16 +164,13 @@ class StorageFallbackAdapter : MobileAdapter {
         val expectedKeys = expectedEvidence.map { evidence ->
             val parsed = StorageFallbackEvidence.parse(evidence.detail)
                 ?: throw IllegalStateException(
-                    "승인된 storage 근거 형식을 확인할 수 없습니다.",
+                    "승인된 storage token 근거 형식을 확인할 수 없습니다.",
                 )
             val file = filesByPath[evidence.relativePath]
                 ?: throw IllegalStateException(
-                    "승인된 storage 파일을 현재 runtime 색인에서 찾을 수 없습니다.",
+                    "승인된 storage 파일을 runtime closure에서 찾을 수 없습니다.",
                 )
-            if (StorageFallbackEvidence.sha256(
-                    file.originalBytes.toString(UTF_8),
-                ) != parsed.convertedSha256
-            ) {
+            if (StorageFallbackEvidence.sha256(file.source) != parsed.convertedSha256) {
                 throw IllegalStateException(
                     "승인 후 storage 변환 파일이 변경되었습니다: ${evidence.relativePath}",
                 )
@@ -146,95 +178,29 @@ class StorageFallbackAdapter : MobileAdapter {
             EvidenceKey(
                 relativePath = evidence.relativePath,
                 line = evidence.line ?: throw IllegalStateException(
-                    "승인된 storage 근거에 line이 없습니다.",
+                    "승인된 storage token 근거에 line이 없습니다.",
                 ),
                 root = parsed.root,
             )
         }.toSet()
         if (expectedKeys.isEmpty() || !localKeys.containsAll(expectedKeys)) {
-            throw IllegalStateException("승인된 storage 변환 결과를 현재 파일에서 확인할 수 없습니다.")
+            throw IllegalStateException("승인된 storage 변환 결과를 현재 closure에서 확인할 수 없습니다.")
         }
     }
 
-    private fun installAtomically(root: Path, writes: List<PendingWrite>) {
-        if (writes.isEmpty()) return
-        writes.forEach { write ->
-            val current = verifiedFile(
-                root,
-                root.relativize(write.path).joinToString("/") { it.toString() },
-            )
-            if (current != write.path ||
-                !Files.readAllBytes(current).contentEquals(write.originalBytes)
-            ) {
-                throw IllegalStateException(
-                    "storage 변환 직전에 파일이 변경되었습니다: ${write.relativePath}",
-                )
-            }
-        }
-
-        val staged = mutableListOf<StagedWrite>()
-        try {
-            writes.forEach { write ->
-                val temporary = Files.createTempFile(
-                    write.path.parent,
-                    ".sixbridge-storage-",
-                    ".tmp",
-                )
-                Files.write(temporary, write.replacementBytes)
-                staged += StagedWrite(write, temporary)
-            }
-            writes.forEach { write ->
-                if (!Files.readAllBytes(
-                        verifiedFile(root, write.relativePath),
-                    ).contentEquals(write.originalBytes)
-                ) {
-                    throw IllegalStateException(
-                        "storage 변환 중 파일이 변경되었습니다: ${write.relativePath}",
-                    )
-                }
-            }
-            val installed = mutableListOf<PendingWrite>()
-            try {
-                staged.forEach { stagedWrite ->
-                    atomicReplace(stagedWrite.temporary, stagedWrite.write.path)
-                    installed += stagedWrite.write
-                }
-            } catch (error: Throwable) {
-                installed.asReversed().forEach { write ->
-                    runCatching {
-                        val rollback = Files.createTempFile(
-                            write.path.parent,
-                            ".sixbridge-storage-rollback-",
-                            ".tmp",
-                        )
-                        Files.write(rollback, write.originalBytes)
-                        atomicReplace(rollback, write.path)
-                    }.exceptionOrNull()?.let(error::addSuppressed)
-                }
-                throw error
-            }
-        } finally {
-            staged.forEach { Files.deleteIfExists(it.temporary) }
-        }
+    private fun manifest(root: Path): JsonObject {
+        val path = verifiedFile(root, MANIFEST)
+        return runCatching {
+            Json.parseToJsonElement(Files.readString(path, UTF_8)) as? JsonObject
+        }.getOrNull() ?: throw IllegalStateException("manifest.json을 해석할 수 없습니다.")
     }
 
-    private fun atomicReplace(source: Path, destination: Path) {
-        try {
-            Files.move(source, destination, ATOMIC_MOVE, REPLACE_EXISTING)
-        } catch (error: AtomicMoveNotSupportedException) {
-            throw IllegalStateException(
-                "원자적 파일 교체를 지원하지 않아 storage 변환을 중단합니다.",
-                error,
-            )
-        }
-    }
-
-    private fun verifiedRoot(workingRoot: Path): Path {
-        val root = workingRoot.toAbsolutePath().normalize()
+    private fun verifiedRoot(stagedRoot: Path): Path {
+        val root = stagedRoot.toAbsolutePath().normalize()
         if (!Files.isDirectory(root, NOFOLLOW_LINKS) ||
             Files.isSymbolicLink(root)
         ) {
-            throw IllegalStateException("working root 경계를 확인할 수 없습니다.")
+            throw IllegalStateException("staged working root 경계를 확인할 수 없습니다.")
         }
         return root.toRealPath()
     }
@@ -278,20 +244,8 @@ class StorageFallbackAdapter : MobileAdapter {
     private data class RewriteFile(
         val relativePath: String,
         val path: Path,
-        val originalBytes: ByteArray,
+        val source: String,
         val result: RewriteResult,
-    )
-
-    private data class PendingWrite(
-        val path: Path,
-        val relativePath: String,
-        val originalBytes: ByteArray,
-        val replacementBytes: ByteArray,
-    )
-
-    private data class StagedWrite(
-        val write: PendingWrite,
-        val temporary: Path,
     )
 
     private data class EvidenceKey(

@@ -885,9 +885,10 @@ class CompatibilityAnalyzerTest {
 
         val report = CompatibilityAnalyzer().analyze(source, profile)
 
-        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
         assertEquals(setOf("storage"), report.usedApis)
         assertTrue(report.unsupportedApis.isEmpty())
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
     }
 
     @Test
@@ -1251,9 +1252,10 @@ class CompatibilityAnalyzerTest {
 
         val report = CompatibilityAnalyzer().analyze(source, profile)
 
-        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
         assertEquals(setOf("storage"), report.usedApis)
         assertTrue(report.unsupportedApis.isEmpty())
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
     }
 
     @Test

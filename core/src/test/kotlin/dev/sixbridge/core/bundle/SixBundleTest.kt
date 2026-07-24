@@ -128,6 +128,49 @@ class SixBundleTest {
     }
 
     @Test
+    fun `storage fallback capability survives compatibility JSON roundtrip`() {
+        val capability =
+            "schema=1; source-closure-sha256=${"c".repeat(64)}; " +
+                "converted-closure-sha256=${"d".repeat(64)}; " +
+                "storage.local=supported; storage.sync=unavailable"
+        val compatibility = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "Storage",
+            extensionVersion = "1",
+            declaredPermissions = setOf("storage"),
+            usedApis = setOf("storage"),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.AUTOMATIC,
+            adapterDecisions = listOf(
+                AdapterDecision(
+                    id = "storage-fallback",
+                    version = 1,
+                    risk = AdapterRisk.SAFE,
+                    disposition = AdapterDisposition.AUTOMATIC,
+                    applied = false,
+                    evidence = listOf(
+                        SourceEvidence(
+                            "@sixbridge/storage-fallback-capability",
+                            null,
+                            capability,
+                        ),
+                    ),
+                    changes = listOf("정적인 storage.sync member를 storage.local로 변경합니다."),
+                    remainingLimitations = listOf("기기 간 동기화가 제공되지 않습니다."),
+                ),
+            ),
+        )
+
+        val roundtripped = SixBundle.read(
+            bundleWithCompatibility(compatibility),
+        ).compatibility
+
+        assertEquals(compatibility, roundtripped)
+    }
+
+    @Test
     fun `reads schema v1 compatibility with passthrough defaults`() {
         val bundle = validBundle()
         rewrite(bundle) { name, bytes ->
@@ -235,6 +278,23 @@ class SixBundleTest {
     }
 
     private fun validBundle(): java.nio.file.Path {
+        return bundleWithCompatibility(
+            CompatibilityReport(
+                status = CompatibilityStatus.COMPATIBLE,
+                manifestVersion = 3,
+                extensionName = "Tiny",
+                extensionVersion = "1.0.0",
+                declaredPermissions = emptySet(),
+                usedApis = emptySet(),
+                unsupportedApis = emptySet(),
+                issues = emptyList(),
+            ),
+        )
+    }
+
+    private fun bundleWithCompatibility(
+        compatibility: CompatibilityReport,
+    ): java.nio.file.Path {
         val wrapper = Files.createTempFile("six-bundle-wrapper", ".apk")
         wrapper.writeBytes(byteArrayOf(0x50, 0x4b, 1, 2, 3))
         return Files.createTempFile("six-bundle-valid", ".six").also { output ->
@@ -253,16 +313,7 @@ class SixBundleTest {
                     wrapperVersionCode = 7,
                     signerSha256 = "b".repeat(64),
                 ),
-                CompatibilityReport(
-                    status = CompatibilityStatus.COMPATIBLE,
-                    manifestVersion = 3,
-                    extensionName = "Tiny",
-                    extensionVersion = "1.0.0",
-                    declaredPermissions = emptySet(),
-                    usedApis = emptySet(),
-                    unsupportedApis = emptySet(),
-                    issues = emptyList(),
-                ),
+                compatibility,
             )
         }
     }

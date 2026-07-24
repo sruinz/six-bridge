@@ -9,6 +9,7 @@ import java.util.Comparator
 
 class ConversionWorkspace : AutoCloseable {
     private val root = Files.createTempDirectory("sixbridge-conversion-")
+    private val ownedWorkingRoots = mutableListOf<Path>()
     private var closed = false
 
     fun snapshot(
@@ -42,6 +43,8 @@ class ConversionWorkspace : AutoCloseable {
                 sourceZip,
                 snapshotRoot.resolve("working"),
             )
+            ConversionWorkspaceOwnership.register(working)
+            ownedWorkingRoots.add(working)
             ExtensionSnapshot(
                 sourceZip = sourceZip,
                 sourceSha256 = sha256(sourceZip),
@@ -58,6 +61,7 @@ class ConversionWorkspace : AutoCloseable {
     override fun close() {
         if (closed) return
         closed = true
+        ownedWorkingRoots.forEach(ConversionWorkspaceOwnership::unregister)
         deleteTree(root)
     }
 

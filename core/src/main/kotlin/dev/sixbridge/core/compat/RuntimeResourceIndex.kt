@@ -15,6 +15,8 @@ class RuntimeResourceIndex private constructor(
     val contentScriptEntryIndexesByRelativePath: Map<String, Set<Int>>,
     val scripts: List<RuntimeScript>,
     val unresolvedDependency: Boolean,
+    val rolesByRelativePath: Map<String, Set<ResourceRole>>,
+    val dependencyEdges: Set<RuntimeDependencyEdge>,
 ) {
     data class RuntimeScript(
         val relativePath: String,
@@ -30,6 +32,11 @@ class RuntimeResourceIndex private constructor(
         OPTIONS_PAGE,
     }
 
+    data class RuntimeDependencyEdge(
+        val fromRelativePath: String,
+        val toRelativePath: String,
+    )
+
     companion object {
         fun create(root: Path, manifest: JsonObject): RuntimeResourceIndex {
             val normalizedRoot = root.toAbsolutePath().normalize()
@@ -40,10 +47,13 @@ class RuntimeResourceIndex private constructor(
                     contentScriptEntryIndexesByRelativePath = emptyMap(),
                     scripts = emptyList(),
                     unresolvedDependency = true,
+                    rolesByRelativePath = emptyMap(),
+                    dependencyEdges = emptySet(),
                 )
             val rolesByResource = linkedMapOf<Path, MutableSet<ResourceRole>>()
             val contentScriptEntriesByResource = linkedMapOf<Path, MutableSet<Int>>()
             val pending = mutableListOf<Path>()
+            val dependencyEdges = linkedSetOf<RuntimeDependencyEdge>()
             var pendingIndex = 0
             var unresolvedDependency = false
 
@@ -52,13 +62,16 @@ class RuntimeResourceIndex private constructor(
                 resource: String,
                 roles: Set<ResourceRole>,
                 contentScriptEntryIndexes: Set<Int> = emptySet(),
-            ) {
+            ): Path? {
                 val path = resolveLocalRuntimeResource(
                     normalizedRoot,
                     realRoot,
                     base,
                     resource,
-                ) ?: return
+                ) ?: run {
+                    unresolvedDependency = true
+                    return null
+                }
                 val existingRoles = rolesByResource.getOrPut(path) {
                     pending.add(path)
                     mutableSetOf()
@@ -70,6 +83,7 @@ class RuntimeResourceIndex private constructor(
                 if ((rolesChanged || entriesChanged) && path !in pending.drop(pendingIndex)) {
                     pending.add(path)
                 }
+                return path
             }
 
             (manifest["background"] as? JsonObject)
@@ -156,12 +170,18 @@ class RuntimeResourceIndex private constructor(
                 }
                 if (dependencyScan.unresolvedDependency) unresolvedDependency = true
                 dependencyScan.dependencies.forEach {
-                    enqueue(
+                    val dependency = enqueue(
                         resource.parent,
                         it,
                         roles,
                         contentScriptEntriesByResource[resource].orEmpty().toSet(),
                     )
+                    if (dependency != null) {
+                        dependencyEdges += RuntimeDependencyEdge(
+                            fromRelativePath = relativePath(normalizedRoot, resource),
+                            toRelativePath = relativePath(normalizedRoot, dependency),
+                        )
+                    }
                 }
             }
 
@@ -208,6 +228,15 @@ class RuntimeResourceIndex private constructor(
                     },
                 scripts = scripts,
                 unresolvedDependency = unresolvedDependency,
+                rolesByRelativePath = rolesByResource.entries.associate { (path, roles) ->
+                    relativePath(normalizedRoot, path) to roles.toSortedSet()
+                },
+                dependencyEdges = dependencyEdges.toSortedSet(
+                    compareBy(
+                        RuntimeDependencyEdge::fromRelativePath,
+                        RuntimeDependencyEdge::toRelativePath,
+                    ),
+                ),
             )
         }
 

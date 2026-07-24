@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
 import java.util.Base64
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -319,10 +320,90 @@ class MobilePatternAnalyzerTest {
             val decision = report.decision("storage-fallback")
             assertNotNull(decision)
             assertEquals(AdapterDisposition.AUTOMATIC, decision.disposition)
-            assertEquals("content.js", decision.evidence.single().relativePath)
-            assertEquals(1, decision.evidence.single().line)
+            val tokenEvidence = decision.evidence.single {
+                it.relativePath == "content.js"
+            }
+            assertEquals(1, tokenEvidence.line)
             assertFalse(report.issues.any { it.code == "storage_area_unknown" })
         }
+    }
+
+    @Test
+    fun `unavailable conversion outranks approval and automatic decisions`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                document.addEventListener("mouseup", (event) => {
+                  if (event.isTrusted) use(getSelection());
+                });
+                chrome.storage.sync.get("value");
+            """.trimIndent(),
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        val fallbackProfile = profile.copy(
+            supportedFeatures = setOf("storage.local"),
+            unavailableFeatures = setOf("storage.sync"),
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertTrue(
+            report.adapterDecisions.any {
+                it.disposition == AdapterDisposition.UNAVAILABLE
+            },
+        )
+        assertTrue(
+            report.adapterDecisions.any {
+                it.disposition == AdapterDisposition.REQUIRES_APPROVAL
+            },
+        )
+        assertTrue(
+            report.adapterDecisions.any {
+                it.disposition == AdapterDisposition.AUTOMATIC
+            },
+        )
+        assertEquals(ConversionState.UNAVAILABLE, report.conversionState)
+    }
+
+    @Test
+    fun `approval outranks automatic while blocked and unknown compatibility remain unchanged`() {
+        val approvalAndAutomatic = extension(
+            contentFile = "content.js",
+            contentSource = "chrome.storage.sync.get('value');",
+            popup = "popup.html",
+        )
+        approvalAndAutomatic.resolve("popup.html").writeText("<p>popup</p>")
+        val fallbackProfile = profile.copy(
+            supportedFeatures = setOf("storage.local"),
+            unavailableFeatures = setOf("storage.sync"),
+        )
+        val approvalReport = MobilePatternAnalyzer().analyze(
+            approvalAndAutomatic,
+            fallbackProfile,
+        )
+        val unknown = extension(
+            contentFile = "content.js",
+            contentSource = "import(moduleName); chrome.storage.sync.get('value');",
+        )
+        val blocked = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('blocked manifest');",
+        )
+        blocked.resolve("manifest.json").writeText(
+            blocked.resolve("manifest.json").readText()
+                .replace("\"manifest_version\": 3", "\"manifest_version\": 2"),
+        )
+
+        assertEquals(ConversionState.REQUIRES_APPROVAL, approvalReport.conversionState)
+        assertEquals(
+            CompatibilityStatus.UNKNOWN,
+            MobilePatternAnalyzer().analyze(unknown, fallbackProfile).status,
+        )
+        assertEquals(
+            CompatibilityStatus.BLOCKED,
+            MobilePatternAnalyzer().analyze(blocked, fallbackProfile).status,
+        )
     }
 
     @Test

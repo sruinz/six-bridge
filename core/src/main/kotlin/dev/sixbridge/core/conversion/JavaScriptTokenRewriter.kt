@@ -42,64 +42,29 @@ class JavaScriptTokenRewriter {
         val localAccesses = mutableListOf<StaticStorageAccess>()
         val unsafe = mutableListOf<UnsafeStorageAccess>()
 
-        STATIC_STORAGE.findAll(codeOnly)
-            .filter { isGlobalRoot(codeOnly, it.range.first) }
-            .forEach { match ->
-                val root = requireNotNull(match.groups[1]).value
-                val areaGroup = requireNotNull(match.groups[2])
-                val access = StaticStorageAccess(
-                    root = root,
-                    area = areaGroup.value,
-                    areaStart = areaGroup.range.first,
-                    areaEndExclusive = areaGroup.range.last + 1,
-                    line = lineAt(source, areaGroup.range.first),
+        scanStorageMembers(source, codeOnly).forEach { access ->
+            when (access.kind) {
+                StorageMemberKind.SYNC -> syncAccesses += StaticStorageAccess(
+                    root = access.root,
+                    area = SYNC,
+                    areaStart = access.areaStart,
+                    areaEndExclusive = access.areaEndExclusive,
+                    line = lineAt(source, access.areaStart),
                 )
-                if (areaGroup.value == SYNC) {
-                    if (hasDirectAreaUse(codeOnly, areaGroup.range.last + 1)) {
-                        syncAccesses += access
-                    } else {
-                        unsafe += UnsafeStorageAccess(
-                            offset = match.range.first,
-                            line = lineAt(source, match.range.first),
-                            detail = "storage.sync 별칭 또는 값 참조를 정적으로 변환할 수 없습니다.",
-                        )
-                    }
-                } else {
-                    localAccesses += access
-                }
-            }
-
-        COMPUTED_STORAGE.findAll(codeOnly)
-            .filter { match ->
-                val root = ROOT_IDENTIFIER.find(match.value)
-                    ?: return@filter false
-                isGlobalRoot(
-                    codeOnly,
-                    match.range.first + root.range.first,
+                StorageMemberKind.LOCAL -> localAccesses += StaticStorageAccess(
+                    root = access.root,
+                    area = LOCAL,
+                    areaStart = access.areaStart,
+                    areaEndExclusive = access.areaEndExclusive,
+                    line = lineAt(source, access.areaStart),
+                )
+                StorageMemberKind.UNSAFE -> unsafe += UnsafeStorageAccess(
+                    offset = access.rootStart,
+                    line = lineAt(source, access.rootStart),
+                    detail = access.detail,
                 )
             }
-            .forEach { match ->
-                unsafe += UnsafeStorageAccess(
-                    offset = match.range.first,
-                    line = lineAt(source, match.range.first),
-                    detail = "계산된 storage 영역 접근을 정적으로 변환할 수 없습니다.",
-                )
-            }
-        DOUBLE_COMPUTED.findAll(codeOnly)
-            .filter { match ->
-                val root = requireNotNull(match.groups[1])
-                isGlobalRoot(codeOnly, root.range.first) &&
-                    computedRootMayBeStorage(
-                        source.substring(requireNotNull(match.groups[2]).range),
-                    )
-            }
-            .forEach { match ->
-                unsafe += UnsafeStorageAccess(
-                    offset = match.range.first,
-                    line = lineAt(source, match.range.first),
-                    detail = "계산된 storage 영역 접근을 정적으로 변환할 수 없습니다.",
-                )
-            }
+        }
         STORAGE_ALIAS.findAll(codeOnly)
             .filter { match ->
                 val rootStart = requireNotNull(match.groups[1]).range.first
@@ -169,11 +134,20 @@ class JavaScriptTokenRewriter {
             sourceWithoutComments,
         )
         if (rawStorageMention) {
-            EVAL_CALL.findAll(codeOnly).forEach { match ->
+            EVAL_IDENTIFIER.findAll(codeOnly).forEach { match ->
                 unsafe += UnsafeStorageAccess(
                     offset = match.range.first,
                     line = lineAt(source, match.range.first),
                     detail = "eval을 통한 storage 접근을 정적으로 변환할 수 없습니다.",
+                )
+            }
+        }
+        if (syncAccesses.isNotEmpty() || unsafe.isNotEmpty()) {
+            shadowBinding(codeOnly)?.let { binding ->
+                unsafe += UnsafeStorageAccess(
+                    offset = binding.range.first,
+                    line = lineAt(source, binding.range.first),
+                    detail = "chrome 또는 browser binding shadowing 가능성 때문에 자동 변환할 수 없습니다.",
                 )
             }
         }
@@ -211,6 +185,177 @@ class JavaScriptTokenRewriter {
         return source.getOrNull(cursor)?.isJavaIdentifierStart() == true
     }
 
+    private fun scanStorageMembers(
+        source: String,
+        codeOnly: String,
+    ): List<ScannedStorageMember> {
+        val results = mutableListOf<ScannedStorageMember>()
+        ROOT_IDENTIFIER.findAll(codeOnly).forEach { rootMatch ->
+            val rootStart = rootMatch.range.first
+            if (codeOnly.getOrNull(rootStart - 1)?.let(::isIdentifierPart) == true) {
+                return@forEach
+            }
+            val rootIsProperty = previousNonWhitespace(codeOnly, rootStart) in
+                setOf('.', '?')
+            val storage = readProperty(source, codeOnly, rootMatch.range.last + 1)
+                ?: return@forEach
+            val storageKey = storage.staticKey
+            if (storageKey != "storage") {
+                if (!(storage.computed && storageKey == null)) return@forEach
+            }
+            val area = readProperty(source, codeOnly, storage.endExclusive)
+                ?: return@forEach
+            if (rootIsProperty) {
+                if (area.staticKey == SYNC || area.staticKey == null) {
+                    results += ScannedStorageMember.unsafe(
+                        rootMatch.value,
+                        rootStart,
+                        area,
+                        "객체 속성의 chrome 또는 browser storage 접근을 안전하게 변환할 수 없습니다.",
+                    )
+                }
+                return@forEach
+            }
+            if (storage.computed) {
+                if (area.staticKey == SYNC || area.staticKey == null) {
+                    results += ScannedStorageMember.unsafe(
+                        rootMatch.value,
+                        rootStart,
+                        area,
+                        "계산된 storage 영역 접근을 정적으로 변환할 수 없습니다.",
+                    )
+                }
+                return@forEach
+            }
+            when {
+                area.computed && area.staticKey == SYNC ->
+                    results += ScannedStorageMember.unsafe(
+                        rootMatch.value,
+                        rootStart,
+                        area,
+                        "계산된 storage 영역 접근을 정적으로 변환할 수 없습니다.",
+                    )
+                area.computed && area.staticKey == null ->
+                    results += ScannedStorageMember.unsafe(
+                        rootMatch.value,
+                        rootStart,
+                        area,
+                        "계산된 storage 영역 접근을 정적으로 변환할 수 없습니다.",
+                    )
+                area.computed -> Unit
+                area.staticKey == SYNC &&
+                    hasDirectAreaUse(codeOnly, area.endExclusive) ->
+                    results += ScannedStorageMember(
+                        root = rootMatch.value,
+                        rootStart = rootStart,
+                        areaStart = area.keyStart,
+                        areaEndExclusive = area.keyEndExclusive,
+                        kind = StorageMemberKind.SYNC,
+                        detail = "",
+                    )
+                area.staticKey == SYNC ->
+                    results += ScannedStorageMember.unsafe(
+                        rootMatch.value,
+                        rootStart,
+                        area,
+                        "storage.sync 별칭 또는 값 참조를 정적으로 변환할 수 없습니다.",
+                    )
+                area.staticKey == LOCAL ->
+                    results += ScannedStorageMember(
+                        root = rootMatch.value,
+                        rootStart = rootStart,
+                        areaStart = area.keyStart,
+                        areaEndExclusive = area.keyEndExclusive,
+                        kind = StorageMemberKind.LOCAL,
+                        detail = "",
+                    )
+            }
+        }
+        return results
+    }
+
+    private fun readProperty(
+        source: String,
+        codeOnly: String,
+        start: Int,
+    ): JavaScriptProperty? {
+        var cursor = skipWhitespace(codeOnly, start)
+        var computed = false
+        if (codeOnly.startsWith("?.", cursor)) {
+            cursor = skipWhitespace(codeOnly, cursor + 2)
+            if (codeOnly.getOrNull(cursor) == '[') computed = true
+        } else if (codeOnly.getOrNull(cursor) == '.') {
+            cursor = skipWhitespace(codeOnly, cursor + 1)
+        } else if (codeOnly.getOrNull(cursor) == '[') {
+            computed = true
+        } else {
+            return null
+        }
+        if (!computed) {
+            if (codeOnly.getOrNull(cursor)?.isJavaIdentifierStart() != true) {
+                return null
+            }
+            var end = cursor + 1
+            while (codeOnly.getOrNull(end)?.isJavaIdentifierPart() == true) end++
+            return JavaScriptProperty(
+                staticKey = codeOnly.substring(cursor, end),
+                computed = false,
+                keyStart = cursor,
+                keyEndExclusive = end,
+                endExclusive = end,
+            )
+        }
+        val closing = matchingBracket(codeOnly, cursor) ?: return JavaScriptProperty(
+            staticKey = null,
+            computed = true,
+            keyStart = cursor,
+            keyEndExclusive = cursor + 1,
+            endExclusive = codeOnly.length,
+        )
+        val expression = source.substring(cursor + 1, closing).trim()
+        return JavaScriptProperty(
+            staticKey = staticComputedKey(expression),
+            computed = true,
+            keyStart = cursor + 1,
+            keyEndExclusive = closing,
+            endExclusive = closing + 1,
+        )
+    }
+
+    private fun matchingBracket(source: String, opening: Int): Int? {
+        var depth = 0
+        for (index in opening until source.length) {
+            when (source[index]) {
+                '[' -> depth++
+                ']' -> {
+                    depth--
+                    if (depth == 0) return index
+                }
+            }
+        }
+        return null
+    }
+
+    private fun staticComputedKey(expression: String): String? {
+        val withoutComments = JavaScriptLexicalMask.mask(
+            expression,
+            maskLiterals = false,
+        ).trim()
+        val quoted = COMPUTED_STRING.matchEntire(withoutComments)
+        if (quoted != null) return quoted.groupValues[2]
+        val template = COMPUTED_TEMPLATE.matchEntire(expression.trim())
+        return template?.groupValues?.get(1)
+    }
+
+    private fun shadowBinding(codeOnly: String): MatchResult? =
+        SHADOW_BINDINGS.firstNotNullOfOrNull { it.find(codeOnly) }
+
+    private fun previousNonWhitespace(source: String, start: Int): Char? {
+        var cursor = start - 1
+        while (cursor >= 0 && source[cursor].isWhitespace()) cursor--
+        return source.getOrNull(cursor)
+    }
+
     private fun staticMemberAfter(source: String, start: Int): String? {
         var cursor = skipWhitespace(source, start)
         if (source.startsWith("?.", cursor)) {
@@ -239,13 +384,6 @@ class JavaScriptTokenRewriter {
     private fun isIdentifierPart(value: Char): Boolean =
         value.isJavaIdentifierPart() || value == '$'
 
-    private fun computedRootMayBeStorage(expression: String): Boolean {
-        val literal = SIMPLE_STRING.matchEntire(expression.trim())
-            ?.groupValues
-            ?.get(2)
-        return literal == null || literal == "storage"
-    }
-
     private fun skipWhitespace(source: String, start: Int): Int {
         var cursor = start
         while (source.getOrNull(cursor)?.isWhitespace() == true) cursor++
@@ -262,48 +400,62 @@ class JavaScriptTokenRewriter {
         private const val ROOT = """(chrome|browser)"""
         private const val MEMBER = """\s*(?:\?\.|\.)\s*"""
 
-        private val STATIC_STORAGE = Regex(
-            ROOT + MEMBER + """storage\b""" + MEMBER + """(sync|local)\b""",
-        )
-        private val COMPUTED_STORAGE = Regex(
-            ROOT + """\s*(?:\?\.)?\s*\[[^\]\r\n]{1,160}]""" +
-                MEMBER + """sync\b""" +
-                "|" +
-                ROOT + MEMBER + """storage\b\s*(?:\?\.)?\s*""" +
-                """\[[^\]\r\n]{0,160}]""",
-        )
-        private val DOUBLE_COMPUTED = Regex(
-            ROOT + """\s*(?:\?\.)?\s*\[([^\]\r\n]{0,160})]""" +
-                """\s*(?:\?\.)?\s*\[[^\]\r\n]{0,160}]""",
-        )
         private val STORAGE_ALIAS = Regex(
-            """\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*""" +
+            """\b[A-Za-z_$][\w$]*\s*=\s*""" +
                 ROOT + MEMBER + """(storage)\b""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
         )
         private val STORAGE_DESTRUCTURING = Regex(
-            """\b(?:const|let|var)\s*\{[^}\r\n]*\bsync\b[^}\r\n]*}\s*=\s*""" +
+            """\b(?:const|let|var)\s*\{[^}]*\bsync\b[^}]*}\s*=\s*""" +
                 ROOT + MEMBER + """storage\b""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
         )
         private val ROOT_ALIAS = Regex(
             """\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*""" +
                 """(chrome|browser)\b""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
         )
         private val ROOT_STORAGE_DESTRUCTURING = Regex(
-            """\b(?:const|let|var)\s*\{[^}\r\n]*\bstorage\b""" +
-                """(?:\s*:\s*([A-Za-z_$][\w$]*))?[^}\r\n]*}\s*=\s*""" +
+            """\b(?:const|let|var)\s*\{[^}]*\bstorage\b""" +
+                """(?:\s*:\s*([A-Za-z_$][\w$]*))?[^}]*}\s*=\s*""" +
                 """(?:chrome|browser)\b""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
         )
         private val PROPERTY_ROOT_STORAGE = Regex(
             """(?:\?\.|\.)\s*(?:chrome|browser)\b""" +
                 MEMBER + """storage\b""" + MEMBER + """sync\b""",
         )
-        private val EVAL_CALL = Regex("""\beval\s*\(""")
+        private val EVAL_IDENTIFIER = Regex("""\beval\b""")
         private val RAW_STORAGE_MENTION = Regex(
-            """\b(?:chrome|browser)\b[^\r\n]{0,160}\bstorage\b""" +
-                """[^\r\n]{0,160}\bsync\b""",
+            """\b(?:chrome|browser)\b.*\bstorage\b.*\bsync\b""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
         )
         private val ROOT_IDENTIFIER = Regex("""\b(?:chrome|browser)\b""")
-        private val SIMPLE_STRING = Regex("""(["'])([A-Za-z_$][\w$]*)\1""")
+        private val COMPUTED_STRING = Regex("""(["'])([A-Za-z_$][\w$]*)\1""")
+        private val COMPUTED_TEMPLATE = Regex("""`([A-Za-z_$][\w$]*)`""")
+        private val SHADOW_BINDINGS = listOf(
+            Regex("""\b(?:var|let|const)\s+(?:chrome|browser)\b"""),
+            Regex("""\b(?:var|let|const)\s*[\{\[][^}\]]*\b(?:chrome|browser)\b"""),
+            Regex("""\b(?:class|function)\s+(?:chrome|browser)\b"""),
+            Regex("""\bfunction\b[^(]*\([^)]*\b(?:chrome|browser)\b[^)]*\)"""),
+            Regex("""\([^)]*\b(?:chrome|browser)\b[^)]*\)\s*=>"""),
+            Regex("""\b(?:chrome|browser)\b\s*=>"""),
+            Regex("""\bcatch\s*\([^)]*\b(?:chrome|browser)\b[^)]*\)"""),
+            Regex("""\bimport\s+(?:chrome|browser)\b"""),
+            Regex("""\bimport\s*\{[^}]*\b(?:chrome|browser)\b[^}]*}"""),
+            Regex("""\bimport\s+\*\s+as\s+(?:chrome|browser)\b"""),
+            Regex(
+                """\b(?:var|let|const)\b[^;]*,\s*(?:chrome|browser)\b""" +
+                    """\s*(?==|,|;)""",
+                setOf(RegexOption.DOT_MATCHES_ALL),
+            ),
+            Regex(
+                """\b(?!(?:if|for|while|switch|with|catch)\b)""" +
+                    """[A-Za-z_$][\w$]*\s*\([^)]*\b(?:chrome|browser)\b[^)]*\)\s*\{""",
+            ),
+            Regex("""(?:^|[;{}])\s*(?:chrome|browser)\s*="""),
+            Regex("""[\{\[][^}\]]*\b(?:chrome|browser)\b[^}\]]*[\}\]]\s*="""),
+        )
 
         private fun aliasStorageSyncUse(alias: String) = Regex(
             """\b${Regex.escape(alias)}\b""" +
@@ -313,6 +465,45 @@ class JavaScriptTokenRewriter {
         private fun aliasSyncUse(alias: String) = Regex(
             """\b${Regex.escape(alias)}\b""" + MEMBER + """sync\b""",
         )
+    }
+
+    private data class JavaScriptProperty(
+        val staticKey: String?,
+        val computed: Boolean,
+        val keyStart: Int,
+        val keyEndExclusive: Int,
+        val endExclusive: Int,
+    )
+
+    private data class ScannedStorageMember(
+        val root: String,
+        val rootStart: Int,
+        val areaStart: Int,
+        val areaEndExclusive: Int,
+        val kind: StorageMemberKind,
+        val detail: String,
+    ) {
+        companion object {
+            fun unsafe(
+                root: String,
+                rootStart: Int,
+                area: JavaScriptProperty,
+                detail: String,
+            ) = ScannedStorageMember(
+                root = root,
+                rootStart = rootStart,
+                areaStart = area.keyStart,
+                areaEndExclusive = area.keyEndExclusive,
+                kind = StorageMemberKind.UNSAFE,
+                detail = detail,
+            )
+        }
+    }
+
+    private enum class StorageMemberKind {
+        SYNC,
+        LOCAL,
+        UNSAFE,
     }
 }
 
