@@ -9,10 +9,13 @@ import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
+import java.nio.channels.WritableByteChannel
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.OpenOption
 import java.nio.file.Path
+import java.nio.file.SecureDirectoryStream
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.text.Normalizer
@@ -104,7 +107,7 @@ object ExtensionZip {
 
     fun extract(zipPath: Path, destination: Path): Path {
         val validatedEntryCount = validateUnixEntryTypes(zipPath)
-        Files.createDirectories(destination)
+        val normalizedDestination = prepareExtractionRoot(destination)
         ZipFile(zipPath.toFile()).use { zip ->
             require(zip.size() == validatedEntryCount) {
                 "ZIP 중앙 디렉터리 항목 수가 일치하지 않습니다."
@@ -132,19 +135,24 @@ object ExtensionZip {
                 ValidatedEntry(entry, name)
             }.toList()
             var totalSize = 0L
-            val normalizedDestination = destination.toAbsolutePath().normalize()
             validated.forEach { validatedEntry ->
                 val entry = validatedEntry.entry
+                val components = validatedEntry.name.split('/')
                 val output = normalizedDestination.resolve(validatedEntry.name).normalize()
                 require(output.startsWith(normalizedDestination)) {
                     "ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}"
                 }
                 if (entry.isDirectory) {
-                    Files.createDirectories(output)
+                    ensureDirectoryComponents(normalizedDestination, components)
                 } else {
-                    Files.createDirectories(output.parent)
+                    ensureDirectoryComponents(normalizedDestination, components.dropLast(1))
                     zip.getInputStream(entry).use { input ->
-                        totalSize += copyLimited(input, output)
+                        totalSize += copyLimited(
+                            input,
+                            normalizedDestination,
+                            components,
+                            output,
+                        )
                         require(totalSize <= MAX_TOTAL_SIZE) {
                             "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
                         }
@@ -495,33 +503,127 @@ object ExtensionZip {
     private fun littleEndianUnsignedInt(bytes: ByteArray, offset: Int): Long =
         littleEndianInt(bytes, offset).toLong() and 0xffff_ffffL
 
-    private fun copyLimited(input: InputStream, output: Path): Long {
-        var size = 0L
-        Files.newByteChannel(
-            output,
-            setOf<OpenOption>(
-                StandardOpenOption.CREATE_NEW,
-                StandardOpenOption.WRITE,
-                LinkOption.NOFOLLOW_LINKS,
-            ),
-        ).use { channel ->
-            val target = Channels.newOutputStream(channel)
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                size += read
-                require(size <= MAX_ENTRY_SIZE) {
-                    "ZIP 개별 항목 크기가 제한을 초과합니다: $output"
-                }
-                target.write(buffer, 0, read)
+    private fun prepareExtractionRoot(destination: Path): Path {
+        val normalized = destination.toAbsolutePath().normalize()
+        if (Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+            requireExtractionDirectory(normalized)
+            return normalized.toRealPath().also(::requireExtractionDirectory)
+        }
+
+        val missing = ArrayDeque<String>()
+        var existing = normalized
+        while (!Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
+            missing.addFirst(existing.fileName.toString())
+            existing = requireNotNull(existing.parent) {
+                "ZIP 압축 해제 경로의 기존 상위 디렉터리를 찾지 못했습니다: $destination"
             }
+        }
+        requireExtractionDirectory(existing)
+        return ensureDirectoryComponents(existing.toRealPath(), missing)
+    }
+
+    private fun ensureDirectoryComponents(root: Path, components: Iterable<String>): Path {
+        var current = root
+        requireExtractionDirectory(current)
+        components.forEach { component ->
+            val child = current.resolve(component)
+            try {
+                Files.createDirectory(child)
+            } catch (_: FileAlreadyExistsException) {
+                // 기존 컴포넌트는 아래 NOFOLLOW 속성 검증을 통과한 경우에만 허용한다.
+            }
+            requireExtractionDirectory(child)
+            current = child
+        }
+        return current
+    }
+
+    private fun requireExtractionDirectory(path: Path) {
+        val attributes = try {
+            Files.readAttributes(
+                path,
+                BasicFileAttributes::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            )
+        } catch (error: Exception) {
+            throw IllegalArgumentException(
+                "ZIP 압축 해제 디렉터리를 확인할 수 없습니다: $path",
+                error,
+            )
+        }
+        require(attributes.isDirectory && !attributes.isSymbolicLink) {
+            "ZIP 압축 해제 경로에 실제 디렉터리가 아닌 항목이 있습니다: $path"
+        }
+    }
+
+    private fun copyLimited(
+        input: InputStream,
+        root: Path,
+        components: List<String>,
+        output: Path,
+    ): Long {
+        val parent = requireNotNull(root.parent) {
+            "ZIP 압축 해제 루트의 안전한 상위 디렉터리를 찾지 못했습니다: $root"
+        }
+        Files.newDirectoryStream(parent).use { parentStream ->
+            require(parentStream is SecureDirectoryStream<Path>) {
+                "파일시스템이 안전한 ZIP 압축 해제를 지원하지 않습니다: $root"
+            }
+            parentStream.newDirectoryStream(
+                root.fileName,
+                LinkOption.NOFOLLOW_LINKS,
+            ).use { directory ->
+                return copyLimited(input, directory, components, output)
+            }
+        }
+    }
+
+    private fun copyLimited(
+        input: InputStream,
+        directory: SecureDirectoryStream<Path>,
+        components: List<String>,
+        output: Path,
+    ): Long = if (components.size == 1) {
+        directory.newByteChannel(
+            Path.of(components.single()),
+            FILE_CREATE_OPTIONS,
+        ).use { channel -> copyLimited(input, channel, output) }
+    } else {
+        directory.newDirectoryStream(
+            Path.of(components.first()),
+            LinkOption.NOFOLLOW_LINKS,
+        ).use { child ->
+            copyLimited(input, child, components.drop(1), output)
+        }
+    }
+
+    private fun copyLimited(
+        input: InputStream,
+        channel: WritableByteChannel,
+        output: Path,
+    ): Long {
+        var size = 0L
+        val target = Channels.newOutputStream(channel)
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            size += read
+            require(size <= MAX_ENTRY_SIZE) {
+                "ZIP 개별 항목 크기가 제한을 초과합니다: $output"
+            }
+            target.write(buffer, 0, read)
         }
         return size
     }
 
     private val EXCLUDED_DIRECTORIES = setOf(".git", ".gradle", "node_modules")
     private val EXCLUDED_FILES = setOf(".DS_Store")
+    private val FILE_CREATE_OPTIONS = setOf<OpenOption>(
+        StandardOpenOption.CREATE_NEW,
+        StandardOpenOption.WRITE,
+        LinkOption.NOFOLLOW_LINKS,
+    )
     private val WINDOWS_DRIVE = Regex("^[A-Za-z]:.*")
     private const val MAX_ENTRIES = 10_000
     private const val MAX_ENTRY_SIZE = 128L * 1024 * 1024

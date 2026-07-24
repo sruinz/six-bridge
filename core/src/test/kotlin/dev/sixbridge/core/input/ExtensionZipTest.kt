@@ -12,6 +12,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ExtensionZipTest {
@@ -183,6 +184,56 @@ class ExtensionZipTest {
         }
 
         assertEquals("""{"name":"existing"}""", Files.readString(existing))
+    }
+
+    @Test
+    fun `extracts a normal nested file`() {
+        val zip = zipWith(
+            "manifest.json" to """{"name":"nested"}""",
+            "assets/payload.js" to "inside",
+        )
+        val destination = Files.createTempDirectory("six-nested-output")
+
+        val extracted = ExtensionZip.extract(zip, destination)
+
+        assertEquals(destination, extracted)
+        assertEquals("inside", Files.readString(extracted.resolve("assets/payload.js")))
+    }
+
+    @Test
+    fun `rejects a symlink directory below the extraction destination`() {
+        val zip = zipWith(
+            "manifest.json" to """{"name":"nested-symlink"}""",
+            "assets/payload.js" to "outside",
+        )
+        val destination = Files.createTempDirectory("six-nested-symlink-output")
+        val external = Files.createTempDirectory("six-nested-symlink-target")
+        Files.createSymbolicLink(destination.resolve("assets"), external)
+
+        try {
+            assertFailsWith<IllegalArgumentException> {
+                ExtensionZip.extract(zip, destination)
+            }
+        } finally {
+            assertFalse(Files.exists(external.resolve("payload.js")))
+        }
+    }
+
+    @Test
+    fun `rejects an extraction destination that is itself a symlink`() {
+        val zip = zipWith("manifest.json" to """{"name":"destination-symlink"}""")
+        val parent = Files.createTempDirectory("six-destination-symlink-parent")
+        val external = Files.createTempDirectory("six-destination-symlink-target")
+        val destination = parent.resolve("output")
+        Files.createSymbolicLink(destination, external)
+
+        try {
+            assertFailsWith<IllegalArgumentException> {
+                ExtensionZip.extract(zip, destination)
+            }
+        } finally {
+            assertFalse(Files.exists(external.resolve("manifest.json")))
+        }
     }
 
     private fun zipWith(vararg entries: Pair<String, String>): Path =
