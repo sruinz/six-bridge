@@ -88,14 +88,18 @@ parent의 디렉터리인지 확인하고 다음을 검사한다.
 device smoke는 ContentProvider raw CRX를 evidence에 기록하지 않는다. byte
 기반으로 최대 128MiB까지만 수집한 뒤 `providerMagic`, `providerBytes`,
 `providerSha256` 비가역 요약만 텍스트 로그에 기록하고 임시 raw 파일은
-삭제한다.
+삭제한다. binary process의 stderr도 1MiB로 제한한다. 제한 초과 시 수집한
+stderr 원문을 폐기하고 고정 placeholder만 남기며, process tree 강제 종료,
+세 process stream close, daemon reader의 시간 제한 join을 수행한다. 임시
+stdout 파일은 symlink가 아닌 기존 일반 파일만 허용하고 실제 open에도
+`NOFOLLOW_LINKS`를 적용한다.
 
-2026-07-25 03:57 KST 최종 자동 검증 증거는 다음과 같다.
+2026-07-25 04:09 KST 최종 자동 검증 증거는 다음과 같다.
 
 - 전체 실행:
-  `.local/evidence/20260725-035733-smart-context-converted.log.mXoyOu`
+  `.local/evidence/20260725-040944-smart-context-converted.log.Wufwj5`
 - device smoke:
-  `.local/evidence/.smart-context-run.jkmveN/1784919466-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
+  `.local/evidence/.smart-context-run.KzpSGy/1784920198-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
 - 변환 전후 report:
   `.local/evidence/smart-context-before.json`,
   `.local/evidence/smart-context-after.json`
@@ -107,7 +111,7 @@ device smoke는 ContentProvider raw CRX를 evidence에 기록하지 않는다. b
 통과했다. provider byte 길이는 `290509`, SHA-256은
 `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f`로
 외부 CRX와 일치하며 raw CRX 필드는 없다. 최종 wrapper `versionCode`는
-`8`이다. 그러나 Fold7의 삼성
+`9`이다. 그러나 Fold7의 삼성
 인터넷 package는 `com.sec.android.app.sbrowser`로 일치하는 반면 버전은
 `30.0.0.67` (`versionCode 1300067502`)이고 적용 profile은 `30.0.2.61`
 (`versionCode 1300261502`)이므로 runtime 최종 합격으로 간주하지 않는다.

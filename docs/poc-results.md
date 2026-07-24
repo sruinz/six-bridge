@@ -162,10 +162,10 @@ popup 어댑터의 정확한 bytes와 wiring이 증명된 생성 content asset�
 |---|---|
 | 변환 extension ID | `dncifaeoabkkmddoeeccpjdkifeoemfd` |
 | wrapper package | `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` |
-| wrapper versionCode | `8` |
+| wrapper versionCode | `9` |
 | CRX SHA-256 | `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f` |
-| wrapper SHA-256 | `abd141114ed3d3d8c233e1b7dbd6ab8b18dc643dbabec54c86037b694192f219` |
-| SixBundle SHA-256 | `6eefc6320d86a66db9ab140bf6ab61dca62eb8503b7e169eed58a969dbdabf06` |
+| wrapper SHA-256 | `20fad1755b74bc11d53396f5a15ec106ea55bb647946dc9afa2f513adc28c639` |
+| SixBundle SHA-256 | `54117fc6e600d8c451dad2d9dfae45715ec1806a3db93b28f4dd9be925808e91` |
 
 공용 `verify-build`로 외부 CRX·wrapper와 SixBundle bytes, CRX ID·hash,
 wrapper package·versionCode·signer, embedded CRX, APK v3 서명, zipalign,
@@ -195,8 +195,8 @@ relative-path/content tree SHA-256은 실행 전후 모두
 - ContentProvider CRX3 stream: 성공
 
 증거는
-`.local/evidence/20260725-035733-smart-context-converted.log.mXoyOu`와
-`.local/evidence/.smart-context-run.jkmveN/1784919466-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
+`.local/evidence/20260725-040944-smart-context-converted.log.Wufwj5`와
+`.local/evidence/.smart-context-run.KzpSGy/1784920198-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
 있다.
 
 device smoke는 provider raw CRX를 로그에 넣지 않는다. 최종 evidence에는
@@ -204,6 +204,13 @@ device smoke는 provider raw CRX를 로그에 넣지 않는다. 최종 evidence�
 `providerSha256=18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f`
 요약만 있으며 `provider=<raw>` 필드는 없다. fake ADB의 NUL 뒤 sentinel이
 evidence에 전혀 나타나지 않는 회귀 테스트로 이 경계를 확인했다.
+
+binary process의 stderr는 byte 기준 1MiB로 제한한다. 큰 단일-line stderr가
+작은 테스트 상한을 넘으면 수집한 원문과 sentinel을 폐기하고 placeholder만
+남긴다. 이때 parent와 stdout/stderr pipe를 보유한 background descendant를
+모두 강제 종료하고, process stream close와 daemon reader bounded join으로
+무한 대기를 막는다. stdout 대상 symlink는 프로세스 시작 전에 거부하며 실제
+open에도 `NOFOLLOW_LINKS`를 사용한다.
 
 ### Runtime 보류 결과
 

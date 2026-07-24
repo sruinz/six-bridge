@@ -114,6 +114,69 @@ class AdbDeviceClientTest {
     }
 
     @Test
+    fun `binary process capture never exposes oversized single line stderr`() {
+        val sentinel = "SIX_STDERR_SENTINEL_SECRET"
+        val payload = "x".repeat(8 * 1024) + sentinel
+        val directory = Files.createTempDirectory("six-stderr-limit")
+        val pidFile = directory.resolve("pid")
+        val childPidFile = directory.resolve("child-pid")
+        val command = directory.resolve("command")
+        command.writeText(
+            """
+            #!/bin/sh
+            printf '%s' "${'$'}${'$'}" > "$pidFile"
+            sleep 60 &
+            printf '%s' "${'$'}!" > "$childPidFile"
+            printf '%s' '$payload' >&2
+            wait
+            """.trimIndent(),
+        )
+        check(command.toFile().setExecutable(true))
+        val output = Files.createTempFile("six-stderr-output", ".bin")
+
+        val error = assertFailsWith<ExternalToolException> {
+            ProcessRunner.runToFile(
+                command = listOf(command.toString()),
+                output = output,
+                maxStdoutBytes = 16,
+                maxStderrBytes = 32,
+                timeoutSeconds = 5,
+            )
+        }
+
+        assertTrue("stderr가 32 byte 제한을 초과했습니다." in error.message.orEmpty())
+        assertFalse(sentinel in error.message.orEmpty())
+        assertFalse(sentinel in error.result.stdout)
+        assertFalse(sentinel in error.result.stderr)
+        assertFalse(sentinel in output.readText())
+        assertProcessStopped(pidFile.readText().toLong())
+        assertProcessStopped(childPidFile.readText().toLong())
+    }
+
+    @Test
+    fun `binary process capture rejects an output symlink before start`() {
+        val fixture = adbFixture()
+        val directory = Files.createTempDirectory("six-output-symlink")
+        val target = directory.resolve("target").also {
+            it.writeText("외부 원본")
+        }
+        val output = directory.resolve("output")
+        Files.createSymbolicLink(output, target)
+
+        assertFailsWith<IllegalArgumentException> {
+            ProcessRunner.runToFile(
+                command = listOf(fixture.adb.toString()),
+                output = output,
+                maxStdoutBytes = 16,
+                maxStderrBytes = 16,
+            )
+        }
+
+        assertEquals("외부 원본", target.readText())
+        assertFalse(Files.exists(fixture.log))
+    }
+
+    @Test
     fun `rejects manipulated extension identity before invoking adb`() {
         val fixture = adbFixture()
         val malicious = "abc;touch-data-local-tmp-pwned"
@@ -606,6 +669,19 @@ class AdbDeviceClientTest {
             channel.position(size - 1)
             channel.write(java.nio.ByteBuffer.wrap(byteArrayOf(0)))
         }
+    }
+
+    private fun assertProcessStopped(pid: Long) {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2)
+        while (System.nanoTime() < deadline &&
+            java.lang.ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
+        ) {
+            Thread.sleep(10)
+        }
+        assertFalse(
+            java.lang.ProcessHandle.of(pid).map { it.isAlive }.orElse(false),
+            "process가 종료되지 않았습니다: $pid",
+        )
     }
 
     private data class AdbFixture(

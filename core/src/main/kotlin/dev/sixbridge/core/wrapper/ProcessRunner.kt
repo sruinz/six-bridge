@@ -1,11 +1,14 @@
 package dev.sixbridge.core.wrapper
 
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 data class ProcessResult(
@@ -74,11 +77,13 @@ object ProcessRunner {
         command: List<String>,
         output: Path,
         maxStdoutBytes: Long,
+        maxStderrBytes: Long = DEFAULT_MAX_STDERR_BYTES,
         workingDirectory: Path? = null,
         environment: Map<String, String> = emptyMap(),
         timeoutSeconds: Long = 120,
     ): FileProcessResult {
         require(maxStdoutBytes >= 0) { "stdout byte 제한은 음수일 수 없습니다." }
+        require(maxStderrBytes >= 0) { "stderr byte 제한은 음수일 수 없습니다." }
         require(Files.isRegularFile(output, NOFOLLOW_LINKS)) {
             "외부 도구 stdout 대상은 기존 일반 파일이어야 합니다."
         }
@@ -88,13 +93,22 @@ object ProcessRunner {
         val process = builder.start()
         val stdoutBytes = longArrayOf(0)
         val stdoutFailure = AtomicReference<Throwable?>()
-        val stderr = StringBuilder()
+        val stderrFailure = AtomicReference<Throwable?>()
+        val stderrSummary = AtomicReference<String?>()
+        val stderrOverflow = AtomicBoolean(false)
+        val terminationRequested = AtomicBoolean(false)
+        fun requestTermination() {
+            if (terminationRequested.compareAndSet(false, true)) {
+                terminateProcessTree(process)
+            }
+        }
         val stdoutThread = Thread {
             runCatching {
                 Files.newOutputStream(
                     output,
                     StandardOpenOption.WRITE,
                     StandardOpenOption.TRUNCATE_EXISTING,
+                    NOFOLLOW_LINKS,
                 ).use { destination ->
                     process.inputStream.use { source ->
                         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -113,44 +127,129 @@ object ProcessRunner {
                 }
             }.onFailure {
                 stdoutFailure.set(it)
-                process.destroyForcibly()
+                requestTermination()
             }
-        }.apply { start() }
+        }.apply {
+            name = "sixbridge-binary-stdout"
+            isDaemon = true
+            start()
+        }
         val stderrThread = Thread {
-            process.errorStream.bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
-                lines.forEach { stderr.appendLine(it) }
+            val captured = ByteArrayOutputStream(
+                minOf(maxStderrBytes, DEFAULT_BUFFER_SIZE.toLong()).toInt(),
+            )
+            runCatching {
+                process.errorStream.use { source ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var byteCount = 0L
+                    while (true) {
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        if (byteCount > maxStderrBytes - count) {
+                            captured.reset()
+                            stderrOverflow.set(true)
+                            stderrSummary.set(stderrLimitPlaceholder(maxStderrBytes))
+                            requestTermination()
+                            return@Thread
+                        }
+                        captured.write(buffer, 0, count)
+                        byteCount += count
+                    }
+                }
+                stderrSummary.set(captured.toString(StandardCharsets.UTF_8))
+            }.onFailure {
+                captured.reset()
+                stderrFailure.set(it)
+                stderrSummary.set(STDERR_CAPTURE_FAILURE_PLACEHOLDER)
+                requestTermination()
             }
-        }.apply { start() }
+        }.apply {
+            name = "sixbridge-binary-stderr"
+            isDaemon = true
+            start()
+        }
 
-        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-            process.destroyForcibly()
-            stdoutThread.join()
-            stderrThread.join()
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            requestTermination()
+        }
+        val abnormal = !completed ||
+            stdoutFailure.get() != null ||
+            stderrFailure.get() != null ||
+            stderrOverflow.get()
+        if (abnormal) {
+            terminateProcessTree(process)
+            process.waitFor(TERMINATION_WAIT_MILLIS, TimeUnit.MILLISECONDS)
+        }
+        var readersStopped = joinReaders(stdoutThread, stderrThread)
+        if (!readersStopped) {
+            terminateProcessTree(process)
+            readersStopped = joinReaders(stdoutThread, stderrThread)
+        }
+        val stderr = if (readersStopped) {
+            stderrSummary.get()
+                ?: if (stderrOverflow.get()) {
+                    stderrLimitPlaceholder(maxStderrBytes)
+                } else {
+                    STDERR_CAPTURE_FAILURE_PLACEHOLDER
+                }
+        } else {
+            STDERR_READER_STUCK_PLACEHOLDER
+        }
+        if (!completed) {
             throw ExternalToolException(
                 "외부 도구가 ${timeoutSeconds}초 안에 끝나지 않았습니다: ${command.first()}",
                 ProcessResult(
                     -1,
                     "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
-                    stderr.toString(),
+                    stderr,
                 ),
             )
         }
-        stdoutThread.join()
-        stderrThread.join()
+        if (!readersStopped) {
+            throw ExternalToolException(
+                "외부 도구 binary stream reader를 제한 시간 안에 종료하지 못했습니다.",
+                ProcessResult(
+                    safeExitValue(process),
+                    "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
+                    stderr,
+                ),
+            )
+        }
+        if (stderrOverflow.get()) {
+            throw ExternalToolException(
+                "외부 도구 stderr가 $maxStderrBytes byte 제한을 초과했습니다.",
+                ProcessResult(
+                    safeExitValue(process),
+                    "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
+                    stderrLimitPlaceholder(maxStderrBytes),
+                ),
+            )
+        }
         stdoutFailure.get()?.let { failure ->
             throw ExternalToolException(
                 "외부 도구 binary stdout 수집 실패: ${failure.message}",
                 ProcessResult(
-                    process.exitValue(),
+                    safeExitValue(process),
                     "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
-                    stderr.toString(),
+                    stderr,
+                ),
+            )
+        }
+        stderrFailure.get()?.let {
+            throw ExternalToolException(
+                "외부 도구 binary stderr 수집에 실패했습니다.",
+                ProcessResult(
+                    safeExitValue(process),
+                    "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
+                    STDERR_CAPTURE_FAILURE_PLACEHOLDER,
                 ),
             )
         }
         val result = FileProcessResult(
             process.exitValue(),
             stdoutBytes[0],
-            stderr.toString(),
+            stderr,
         )
         if (result.exitCode != 0) {
             throw ExternalToolException(
@@ -165,4 +264,47 @@ object ProcessRunner {
         }
         return result
     }
+
+    private fun terminateProcessTree(process: Process) {
+        val descendants = runCatching {
+            process.toHandle().descendants().toList().asReversed()
+        }.getOrDefault(emptyList())
+        descendants.forEach { runCatching { it.destroyForcibly() } }
+        runCatching { process.destroyForcibly() }
+        closeQuietly(process.outputStream)
+        closeQuietly(process.inputStream)
+        closeQuietly(process.errorStream)
+    }
+
+    private fun joinReaders(vararg readers: Thread): Boolean {
+        val deadline = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(READER_JOIN_TIMEOUT_MILLIS)
+        readers.forEach { reader ->
+            val remaining = deadline - System.nanoTime()
+            if (remaining > 0) {
+                val millis = TimeUnit.NANOSECONDS.toMillis(remaining)
+                    .coerceAtLeast(1)
+                reader.join(millis)
+            }
+        }
+        return readers.none(Thread::isAlive)
+    }
+
+    private fun closeQuietly(closeable: Closeable) {
+        runCatching { closeable.close() }
+    }
+
+    private fun safeExitValue(process: Process): Int =
+        runCatching { process.exitValue() }.getOrDefault(-1)
+
+    private fun stderrLimitPlaceholder(maximum: Long): String =
+        "<stderr omitted: exceeded $maximum byte limit>"
+
+    private const val DEFAULT_MAX_STDERR_BYTES = 1024L * 1024
+    private const val TERMINATION_WAIT_MILLIS = 2_000L
+    private const val READER_JOIN_TIMEOUT_MILLIS = 2_000L
+    private const val STDERR_CAPTURE_FAILURE_PLACEHOLDER =
+        "<stderr omitted: binary capture failed>"
+    private const val STDERR_READER_STUCK_PLACEHOLDER =
+        "<stderr omitted: reader did not terminate>"
 }
