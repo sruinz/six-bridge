@@ -134,6 +134,7 @@ class ConversionPipeline private constructor(
             rawAfter = rawAfter,
             applicationProof = applicationProof,
             transformed = transformed,
+            beforeDecisions = before.adapterDecisions,
         )
         val after = afterWithAdapters.copy(
             originalExtensionId = identity.originalExtensionId,
@@ -239,6 +240,7 @@ class ConversionPipeline private constructor(
         rawAfter: CompatibilityReport,
         applicationProof: VerifiedAdapterApplication?,
         transformed: Boolean,
+        beforeDecisions: List<AdapterDecision>,
     ): CompatibilityReport {
         if (!transformed) {
             return rawAfter.copy(conversionState = ConversionState.PASSTHROUGH)
@@ -248,18 +250,15 @@ class ConversionPipeline private constructor(
             "sealed adapter application proof가 완전하지 않습니다."
         }
         val selectedKeys = applied.mapTo(mutableSetOf()) { it.id to it.version }
-        val newDecisions = rawAfter.adapterDecisions.filter {
-            (it.id to it.version) !in selectedKeys
-        }
-        if (newDecisions.isNotEmpty()) {
-            throw ConversionValidationException(
-                "변환본 재분석에서 새 adapter 계획이 생겼습니다: " +
-                    newDecisions.map { it.id }.sorted(),
-            )
-        }
+        val beforeByKey = beforeDecisions.associateBy { it.id to it.version }
+        requireNoNewAdapterDecisions(
+            beforeDecisions,
+            applied,
+            rawAfter.adapterDecisions,
+        )
         val reapplied = rawAfter.adapterDecisions
             .associateBy { it.id to it.version }
-        val decisions = applied.map { decision ->
+        val appliedDecisions = applied.map { decision ->
             val current = reapplied[decision.id to decision.version]
             if (current != null) {
                 if (!current.applied ||
@@ -277,7 +276,30 @@ class ConversionPipeline private constructor(
             } else {
                 decision
             }
-        }.sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
+        }
+        val preservedDecisions = (beforeByKey.keys - selectedKeys).map { key ->
+            val before = beforeByKey.getValue(key)
+            val current = reapplied[key]
+                ?: throw ConversionValidationException(
+                    "변환본 재분석에서 미선택 adapter 근거가 사라졌습니다: ${before.id}",
+                )
+            if (current.id != before.id ||
+                current.version != before.version ||
+                current.risk != before.risk ||
+                current.disposition != before.disposition ||
+                current.applied != before.applied ||
+                !current.evidence.containsAll(before.evidence) ||
+                current.changes != before.changes ||
+                current.remainingLimitations != before.remainingLimitations
+            ) {
+                throw ConversionValidationException(
+                    "변환본 재분석에서 미선택 adapter 근거가 달라졌습니다: ${before.id}",
+                )
+            }
+            before
+        }
+        val decisions = (appliedDecisions + preservedDecisions)
+            .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
         return rawAfter.copy(
             conversionState = ConversionState.CONVERTED,
             adapterDecisions = decisions,
@@ -344,6 +366,24 @@ class ConversionPipeline private constructor(
         ): ConversionPipeline = ConversionPipeline(
             localRoot,
             compatibilityAnalyzer,
+        )
+    }
+}
+
+internal fun requireNoNewAdapterDecisions(
+    beforeDecisions: List<AdapterDecision>,
+    appliedDecisions: List<AdapterDecision>,
+    rawAfterDecisions: List<AdapterDecision>,
+) {
+    val allowedKeys = (beforeDecisions + appliedDecisions)
+        .mapTo(mutableSetOf()) { it.id to it.version }
+    val newDecisions = rawAfterDecisions.filter {
+        (it.id to it.version) !in allowedKeys
+    }
+    if (newDecisions.isNotEmpty()) {
+        throw ConversionValidationException(
+            "변환본 재분석에서 새 adapter 계획이 생겼습니다: " +
+                newDecisions.map { it.id }.sorted(),
         )
     }
 }

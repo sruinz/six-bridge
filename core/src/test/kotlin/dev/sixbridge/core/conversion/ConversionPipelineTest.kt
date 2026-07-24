@@ -386,6 +386,79 @@ class ConversionPipelineTest {
     }
 
     @Test
+    fun `conversion preserves an existing unselected unavailable decision`() {
+        val source = convertibleSource(
+            "six-pipeline-unavailable-preserved",
+            includePopup = true,
+        )
+        source.resolve("content.js").writeText(
+            source.resolve("content.js").readText() +
+                "\nglobalThis.sixbridgeProbe = chrome.storage.sync;\n",
+        )
+
+        val result = ConversionPipeline(
+            Files.createTempDirectory("six-pipeline-unavailable-local"),
+        ).use {
+            it.prepare(
+                resolvedSource(source),
+                profile(),
+                listOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY),
+            )
+        }
+
+        val before = result.compatibilityBefore.adapterDecisions.associateBy { it.id }
+        val after = result.compatibilityAfter.adapterDecisions.associateBy { it.id }
+        assertEquals(
+            AdapterDisposition.AUTOMATIC,
+            before.getValue(MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE).disposition,
+        )
+        assertEquals(
+            AdapterDisposition.REQUIRES_APPROVAL,
+            before.getValue(MobilePatternAnalyzer.ACTION_POPUP_ENTRY).disposition,
+        )
+        assertEquals(
+            AdapterDisposition.UNAVAILABLE,
+            before.getValue(MobilePatternAnalyzer.STORAGE_FALLBACK).disposition,
+        )
+        assertTrue(
+            after.getValue(MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE).applied,
+        )
+        assertTrue(after.getValue(MobilePatternAnalyzer.ACTION_POPUP_ENTRY).applied)
+        assertEquals(
+            before.getValue(MobilePatternAnalyzer.STORAGE_FALLBACK),
+            after.getValue(MobilePatternAnalyzer.STORAGE_FALLBACK),
+        )
+        assertFalse(after.getValue(MobilePatternAnalyzer.STORAGE_FALLBACK).applied)
+    }
+
+    @Test
+    fun `conversion still rejects a truly new adapter decision`() {
+        val before = MobilePatternAnalyzer().analyze(
+            convertibleSource("six-pipeline-new-adapter-before"),
+            profile(),
+        ).adapterDecisions
+        val applied = before.map { it.copy(applied = true) }
+        val newDecision = AdapterDecision(
+            id = MobilePatternAnalyzer.STORAGE_FALLBACK,
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.UNAVAILABLE,
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = listOf("새 제한"),
+        )
+
+        assertFailsWith<ConversionValidationException> {
+            requireNoNewAdapterDecisions(
+                beforeDecisions = before,
+                appliedDecisions = applied,
+                rawAfterDecisions = listOf(newDecision),
+            )
+        }
+    }
+
+    @Test
     fun `report hash is SHA-256 of final canonical compatibility bytes`() {
         val localRoot = Files.createTempDirectory("six-pipeline-report-hash")
         val result = ConversionPipeline(localRoot).use {

@@ -48,3 +48,60 @@ Chrome 웹 스토어 CRX와 개발 키로 다시 패킹한 CRX를 각각 시험�
 지원되는 storage, tabs, webRequest, offscreen 경로가 동작하고,
 `downloads`와 `nativeMessaging`이 다른 기능을 중단시키지 않은 채
 비지원으로 정확히 진단되면 PoC를 통과한다.
+
+## 게이트 C — 변환된 스마트 컨텍스트 메뉴
+
+실제 개발 source를 복사하거나 수정하지 않고 다음 명령으로 host 검증과
+Fold7 install/smoke를 연속 실행한다.
+
+```bash
+./scripts/fold7-converted-extension.sh \
+  --serial 'adb-DEVICE_SERIAL._adb-tls-connect._tcp'
+```
+
+기기 없이 host 결과만 만들 때는 `--host-only`를 사용한다. 다른 source나
+profile은 각각 `--source`, `--profile`로 지정한다. 스크립트는 실행 전에
+`.local/evidence`와 `dist`를 만들고 다음을 검사한다.
+
+- 변환 전 adapter decision
+- 같은 입력으로 만든 SixDraft 두 개의 strict 검증과 SHA-256 일치
+- `smart-context-converted.crx`,
+  `smart-context-converted-wrapper.apk`,
+  `smart-context-converted.six` basename 계약
+- CRX3 magic, SixBundle 항목·hash, wrapper embedded CRX
+- APK v3 서명, zipalign, metadata·Activity·Provider manifest 계약
+- 변환 후 selection·popup adapter 적용과 미적용 storage 제한 보존
+- 실제 source의 `git status --short`와 relative-path/content tree hash가
+  실행 전후 같은지 여부
+
+2026-07-25 03:11 KST 자동 검증 증거는 다음과 같다.
+
+- 전체 실행:
+  `.local/evidence/20260725-031118-smart-context-converted.log`
+- device smoke:
+  `.local/evidence/1784916691-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
+- 변환 전후 report:
+  `.local/evidence/smart-context-before.json`,
+  `.local/evidence/smart-context-after.json`
+- SixDraft:
+  `.local/evidence/smart-context-a.sixdraft`,
+  `.local/evidence/smart-context-b.sixdraft`
+
+이 실행에서 APK 설치, `six://ex` discovery, ContentProvider `Cr24` read는
+통과했다. 그러나 Fold7의 삼성 인터넷은 `30.0.0.67`
+(`versionCode 1300067502`)이고 적용 profile은 `30.0.2.61`이므로 runtime
+최종 합격으로 간주하지 않는다.
+
+정확히 일치하는 profile을 확보한 뒤 다음 항목은 사용자가 직접 확인해야 한다.
+
+1. Add-ons에서 변환 확장을 켠다.
+2. 일반 HTTPS 페이지에서 텍스트를 한 번 선택한다.
+3. 스마트 컨텍스트 UI가 한 번만 나타나고 중복 생성되지 않는지 확인한다.
+4. `확장 열기`가 기존 popup 페이지를 새 탭으로 여는지 확인한다.
+5. 설정을 변경하고 브라우저를 재시작해 `storage.local` 유지 여부를 확인한다.
+6. 해당 조작 시점 logcat에 service worker 예외, resource 누락, adapter
+   반복 실행이 없는지 확인한다.
+
+`storage.sync`는 이번 자동 검증에서 동작을 확인하지 않았다.
+`storage-fallback`은 source의 동적·계산된 접근을 안전하게 변환할 수 없어
+`unavailable`, `applied=false`로 보존됐다.

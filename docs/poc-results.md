@@ -2,6 +2,8 @@
 
 검증일: 2026-07-24
 
+모바일 변환 재검증일: 2026-07-25
+
 ## 호스트 검증
 
 - Kotlin core, CLI, 테스트 소스가 JDK 26과 JVM target 17에서 컴파일된다.
@@ -113,3 +115,93 @@ Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷�
 또한 제공된 기준 APK는 `30.0.2.61`이지만 실기기 설치 버전은
 `30.0.0.67`로 확인됐다. 네 확장의 최종 합격 판정은 브라우저 버전을
 일치시키거나 설치 버전의 프로필을 별도로 검증한 뒤 수행한다.
+
+## 스마트 컨텍스트 메뉴 모바일 변환 재검증
+
+### Host-side 결과
+
+2026-07-25 03:11 KST에 실제 개발 source를 범용 변환 pipeline에 입력했다.
+확장 ID·이름을 조건으로 한 별도 변환 분기는 사용하지 않았다.
+
+변환 전 decision은 다음과 같았다.
+
+| adapter | disposition | 적용 |
+|---|---|---:|
+| `desktop-selection-event-bridge` | `automatic` | 아니요 |
+| `action-popup-entry` | `requires-approval` | 아니요 |
+| `storage-fallback` | `unavailable` | 아니요 |
+
+`action-popup-entry`를 승인한 변환 결과 selection과 popup adapter가
+`applied=true`가 됐다. `storage-fallback`은 동적·계산된 storage 접근의
+의미를 안전하게 보존할 수 없어 원래 제한과 증거를 유지한
+`unavailable`, `applied=false`다.
+
+첫 실제 draft에서는 기존의 미선택 `unavailable` decision까지 새 adapter로
+잘못 판정하는 pipeline 결함이 발견됐다. 회귀 테스트를 먼저 추가한 뒤,
+변환 전에도 없고 적용 proof에도 없는 decision만 새 계획으로 차단하도록
+수정했다. 기존 미선택 decision은 위험도, disposition, 적용 상태, 원본
+evidence, 변경·제한 의미를 보존하며, 실제로 새 decision이 생기는 경우의
+fail-closed 동작은 별도 테스트로 유지했다.
+
+두 SixDraft는 strict reader 검증을 통과했고 SHA-256이 모두
+`56dc38969c43869732a82a78c640e86084c7cfa332a4c98be041e7d0e474f722`로
+일치했다. source archive SHA-256은
+`de0c607c94383a597905f260b635dc7d470dafe484fa6f5bd082154588fdcf81`,
+변환 archive SHA-256은
+`ca4761c486b54c88dda4439e92b67d908cd57448857e089d78648c2a34239bff`다.
+
+최종 자동 실행 산출물은 다음과 같다.
+
+| 항목 | 값 |
+|---|---|
+| 변환 extension ID | `dncifaeoabkkmddoeeccpjdkifeoemfd` |
+| wrapper package | `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` |
+| wrapper versionCode | `3` |
+| CRX SHA-256 | `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f` |
+| wrapper SHA-256 | `446960fe2d9ccac781e7a9d4cc42a1b90da81a800935a7233bcdea8fbaa43feb` |
+| SixBundle SHA-256 | `a097c8fa519d02f74b46066db435ae78b3edd0583f27e109929fcca8636b5fa4` |
+
+CRX3 magic, SixBundle 항목·descriptor hash, wrapper embedded CRX, APK v3
+서명, zipalign, metadata·Activity·Provider 계약을 모두 검사했다.
+
+실제 source repository에는 실행 전부터 다음 사용자 상태가 있었다.
+
+```text
+ D icon_master_backup.png
+?? icon_master123.png
+```
+
+relative-path/content tree SHA-256은 실행 전후 모두
+`2d5c1a951a76b2a071207ce6cc0bf1659642b20d53ff3e04b0a8a2139bd6f8bc`였고,
+위 Git 상태도 동일했다. source 파일을 수정·정리·커밋하지 않았다.
+
+### Fold7 자동 smoke 결과
+
+- 기기: `SM-F966N`
+- serial: `adb-DEVICE_SERIAL._adb-tls-connect._tcp`
+- 삼성 인터넷: `30.0.0.67`, `versionCode 1300067502`
+- 적용 profile: `30.0.2.61`
+- 래퍼 설치: 성공
+- `six://ex` discovery: 성공
+- ContentProvider CRX3 stream: 성공
+
+증거는
+`.local/evidence/20260725-031118-smart-context-converted.log`와
+`.local/evidence/1784916691-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에 있다.
+
+### Runtime 보류 결과
+
+브라우저와 profile 버전이 다르므로 변환 기능의 runtime 최종 합격은
+보류한다. 자동 smoke는 설치·discovery·provider 계약만 증명하며 다음
+항목을 증명하지 않는다.
+
+- Add-ons 활성화와 브라우저 재시작 후 유지
+- 한 selection당 스마트 컨텍스트 UI 한 번 표시
+- pointer·touch·selectionchange 중복 방지
+- `확장 열기`를 통한 popup 탭 진입
+- `storage.local` 설정 저장과 재시작 후 유지
+- 해당 사용자 조작 구간의 service worker 예외·resource 누락·무한 반복 부재
+
+`storage.sync`는 미검증이다. 일치 profile에서 위 항목을 사용자가 직접
+확인하기 전에는 스마트 컨텍스트 메뉴 모바일 변환을 최종 합격으로 기록하지
+않는다.
