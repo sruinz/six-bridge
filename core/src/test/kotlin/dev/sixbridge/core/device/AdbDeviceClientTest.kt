@@ -6,10 +6,12 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.wrapper.AndroidToolchain
+import dev.sixbridge.core.wrapper.ExternalToolException
 import dev.sixbridge.core.wrapper.ProcessRunner
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.util.zip.CRC32
@@ -17,6 +19,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.readLines
+import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -51,6 +54,63 @@ class AdbDeviceClientTest {
             },
         )
         assertFalse(commands.any { "content read --uri" in it || "head -c" in it })
+    }
+
+    @Test
+    fun `device smoke evidence never records raw provider bytes`() {
+        val sentinel = "SIX_PROVIDER_SENTINEL_SECRET"
+        val providerBytes = "Cr24".toByteArray() +
+            byteArrayOf(0) +
+            sentinel.toByteArray()
+        val fixture = adbFixture(
+            providerCommand = """printf 'Cr24\000$sentinel'""",
+        )
+        val extensionId = "abcdefghijklmnopabcdefghijklmnop"
+        val evidenceDirectory = Files.createTempDirectory("six-adb-private-evidence")
+
+        val result = AdbDeviceClient(fixture.adb.toString()).smoke(
+            bundle(
+                extensionId = extensionId,
+                wrapperPackage = "dev.sixbridge.ext.$extensionId",
+            ),
+            "serial-private",
+            evidenceDirectory,
+        )
+
+        val evidence = result.evidenceLog.readText()
+        assertTrue(result.providerReadable)
+        assertFalse(sentinel in evidence)
+        assertFalse("provider=Cr24" in evidence)
+        assertTrue("providerMagic=Cr24" in evidence)
+        assertTrue("providerBytes=${providerBytes.size}" in evidence)
+        assertTrue("providerSha256=${sha256(providerBytes)}" in evidence)
+    }
+
+    @Test
+    fun `binary process capture enforces its byte limit without exposing payload`() {
+        val sentinel = "SIX_BINARY_CAPTURE_SENTINEL"
+        val fixture = adbFixture(providerCommand = """printf '$sentinel'""")
+        val output = Files.createTempFile("six-bounded-process", ".bin")
+
+        val error = assertFailsWith<ExternalToolException> {
+            ProcessRunner.runToFile(
+                command = listOf(
+                    fixture.adb.toString(),
+                    "-s",
+                    "serial-private",
+                    "shell",
+                    "content",
+                    "read",
+                ),
+                output = output,
+                maxStdoutBytes = 4,
+            )
+        }
+
+        assertTrue(Files.size(output) <= 4)
+        assertFalse(sentinel in error.message.orEmpty())
+        assertFalse(sentinel in error.result.stdout)
+        assertFalse(sentinel in error.result.stderr)
     }
 
     @Test
@@ -271,9 +331,31 @@ class AdbDeviceClientTest {
         assertFailsWith<IllegalArgumentException> {
             BuildArtifactVerifier().verify(bundle, crx, wrongWrapper)
         }
+
+        val oversizedCrx = sparseFile(
+            "six-verify-build-oversized",
+            ".crx",
+            128L * 1024 * 1024 + 1,
+        )
+        val crxError = assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(bundle, oversizedCrx, wrapperPath)
+        }
+        assertTrue("외부 CRX 파일 크기" in crxError.message.orEmpty())
+
+        val oversizedWrapper = sparseFile(
+            "six-verify-build-oversized",
+            ".apk",
+            128L * 1024 * 1024 + 1,
+        )
+        val wrapperError = assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(bundle, crx, oversizedWrapper)
+        }
+        assertTrue("외부 wrapper APK 파일 크기" in wrapperError.message.orEmpty())
     }
 
-    private fun adbFixture(): AdbFixture {
+    private fun adbFixture(
+        providerCommand: String = """printf 'Cr24payload\n'""",
+    ): AdbFixture {
         val directory = Files.createTempDirectory("six-fake-adb")
         val log = directory.resolve("commands.log")
         val adb = directory.resolve("adb")
@@ -294,7 +376,7 @@ class AdbDeviceClientTest {
               *"install -r"*) printf 'Success\n' ;;
               *"pm path"*) printf 'package:/data/app/wrapper.apk\n' ;;
               *"resolve-activity"*) printf 'dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop/.Activity\n' ;;
-              *"content read"*) printf 'Cr24payload\n' ;;
+              *"content read"*) $providerCommand ;;
             esac
             """.trimIndent(),
         )
@@ -514,6 +596,17 @@ class AdbDeviceClientTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private fun sparseFile(
+        prefix: String,
+        suffix: String,
+        size: Long,
+    ): java.nio.file.Path = Files.createTempFile(prefix, suffix).also { path ->
+        Files.newByteChannel(path, StandardOpenOption.WRITE).use { channel ->
+            channel.position(size - 1)
+            channel.write(java.nio.ByteBuffer.wrap(byteArrayOf(0)))
+        }
+    }
 
     private data class AdbFixture(
         val adb: java.nio.file.Path,

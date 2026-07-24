@@ -162,14 +162,16 @@ popup 어댑터의 정확한 bytes와 wiring이 증명된 생성 content asset�
 |---|---|
 | 변환 extension ID | `dncifaeoabkkmddoeeccpjdkifeoemfd` |
 | wrapper package | `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` |
-| wrapper versionCode | `7` |
+| wrapper versionCode | `8` |
 | CRX SHA-256 | `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f` |
-| wrapper SHA-256 | `32ca0e42d04ab1ab38cb6dbde020d6110e70f59b95be4e9462d4bfc1eb3af694` |
-| SixBundle SHA-256 | `530fd41c0413d13bb1be5cf08a15579c836f854bdf7703e917a7e610e5e10f39` |
+| wrapper SHA-256 | `abd141114ed3d3d8c233e1b7dbd6ab8b18dc643dbabec54c86037b694192f219` |
+| SixBundle SHA-256 | `6eefc6320d86a66db9ab140bf6ab61dca62eb8503b7e169eed58a969dbdabf06` |
 
 공용 `verify-build`로 외부 CRX·wrapper와 SixBundle bytes, CRX ID·hash,
 wrapper package·versionCode·signer, embedded CRX, APK v3 서명, zipalign,
-metadata·Activity·Provider 구조화 manifest 계약을 모두 검사했다.
+metadata·Activity·Provider 구조화 manifest 계약을 모두 검사했다. 외부
+CRX와 wrapper는 각각 128MiB를 넘으면 읽기 전에 거부하고, 허용 범위에서는
+bounded read와 streaming compare를 사용한다.
 
 실제 source repository에는 실행 전부터 다음 사용자 상태가 있었다.
 
@@ -193,9 +195,15 @@ relative-path/content tree SHA-256은 실행 전후 모두
 - ContentProvider CRX3 stream: 성공
 
 증거는
-`.local/evidence/20260725-034404-smart-context-converted.log.YJ6n5Q`와
-`.local/evidence/.smart-context-run.STpnzC/1784918658-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
+`.local/evidence/20260725-035733-smart-context-converted.log.mXoyOu`와
+`.local/evidence/.smart-context-run.jkmveN/1784919466-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
 있다.
+
+device smoke는 provider raw CRX를 로그에 넣지 않는다. 최종 evidence에는
+`providerMagic=Cr24`, `providerBytes=290509`,
+`providerSha256=18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f`
+요약만 있으며 `provider=<raw>` 필드는 없다. fake ADB의 NUL 뒤 sentinel이
+evidence에 전혀 나타나지 않는 회귀 테스트로 이 경계를 확인했다.
 
 ### Runtime 보류 결과
 

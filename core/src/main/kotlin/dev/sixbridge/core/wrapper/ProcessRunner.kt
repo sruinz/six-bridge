@@ -1,12 +1,22 @@
 package dev.sixbridge.core.wrapper
 
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 data class ProcessResult(
     val exitCode: Int,
     val stdout: String,
+    val stderr: String,
+)
+
+data class FileProcessResult(
+    val exitCode: Int,
+    val stdoutBytes: Long,
     val stderr: String,
 )
 
@@ -55,6 +65,102 @@ object ProcessRunner {
             throw ExternalToolException(
                 "외부 도구 실행 실패(${result.exitCode}): ${command.joinToString(" ")}\n${result.stderr}",
                 result,
+            )
+        }
+        return result
+    }
+
+    fun runToFile(
+        command: List<String>,
+        output: Path,
+        maxStdoutBytes: Long,
+        workingDirectory: Path? = null,
+        environment: Map<String, String> = emptyMap(),
+        timeoutSeconds: Long = 120,
+    ): FileProcessResult {
+        require(maxStdoutBytes >= 0) { "stdout byte 제한은 음수일 수 없습니다." }
+        require(Files.isRegularFile(output, NOFOLLOW_LINKS)) {
+            "외부 도구 stdout 대상은 기존 일반 파일이어야 합니다."
+        }
+        val builder = ProcessBuilder(command)
+        if (workingDirectory != null) builder.directory(workingDirectory.toFile())
+        builder.environment().putAll(environment)
+        val process = builder.start()
+        val stdoutBytes = longArrayOf(0)
+        val stdoutFailure = AtomicReference<Throwable?>()
+        val stderr = StringBuilder()
+        val stdoutThread = Thread {
+            runCatching {
+                Files.newOutputStream(
+                    output,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                ).use { destination ->
+                    process.inputStream.use { source ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val count = source.read(buffer)
+                            if (count < 0) break
+                            if (stdoutBytes[0] > maxStdoutBytes - count) {
+                                throw IllegalArgumentException(
+                                    "외부 도구 stdout이 $maxStdoutBytes byte 제한을 초과했습니다.",
+                                )
+                            }
+                            destination.write(buffer, 0, count)
+                            stdoutBytes[0] += count
+                        }
+                    }
+                }
+            }.onFailure {
+                stdoutFailure.set(it)
+                process.destroyForcibly()
+            }
+        }.apply { start() }
+        val stderrThread = Thread {
+            process.errorStream.bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
+                lines.forEach { stderr.appendLine(it) }
+            }
+        }.apply { start() }
+
+        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            stdoutThread.join()
+            stderrThread.join()
+            throw ExternalToolException(
+                "외부 도구가 ${timeoutSeconds}초 안에 끝나지 않았습니다: ${command.first()}",
+                ProcessResult(
+                    -1,
+                    "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
+                    stderr.toString(),
+                ),
+            )
+        }
+        stdoutThread.join()
+        stderrThread.join()
+        stdoutFailure.get()?.let { failure ->
+            throw ExternalToolException(
+                "외부 도구 binary stdout 수집 실패: ${failure.message}",
+                ProcessResult(
+                    process.exitValue(),
+                    "<binary stdout omitted; bytes=${stdoutBytes[0]}>",
+                    stderr.toString(),
+                ),
+            )
+        }
+        val result = FileProcessResult(
+            process.exitValue(),
+            stdoutBytes[0],
+            stderr.toString(),
+        )
+        if (result.exitCode != 0) {
+            throw ExternalToolException(
+                "외부 도구 실행 실패(${result.exitCode}): " +
+                    "${command.joinToString(" ")}\n${result.stderr}",
+                ProcessResult(
+                    result.exitCode,
+                    "<binary stdout omitted; bytes=${result.stdoutBytes}>",
+                    result.stderr,
+                ),
             )
         }
         return result

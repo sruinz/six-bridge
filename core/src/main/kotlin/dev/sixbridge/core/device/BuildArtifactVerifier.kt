@@ -24,18 +24,22 @@ class BuildArtifactVerifier {
     ): BuildVerificationResult {
         val contents = SixBundle.read(bundle)
         val descriptor = contents.extension
-        val crxBytes = Files.readAllBytes(crx)
+        val crxBytes = readBoundedExternal(
+            crx,
+            "외부 CRX",
+            MAX_EXTERNAL_CRX_SIZE,
+        )
         require(sha256(crxBytes) == descriptor.crxSha256) {
             "외부 CRX SHA-256이 SixBundle descriptor와 일치하지 않습니다."
         }
         require(Crx3.parse(crxBytes).extensionId == descriptor.extensionId) {
             "외부 CRX ID가 SixBundle descriptor와 일치하지 않습니다."
         }
-        val wrapperBytes = Files.readAllBytes(wrapperApk)
-        require(wrapperBytes.contentEquals(contents.wrapperApk)) {
-            "외부 wrapper APK bytes가 SixBundle wrapper.apk와 일치하지 않습니다."
-        }
-        require(sha256(wrapperBytes) == descriptor.wrapperSha256) {
+        val wrapperSha256 = verifyExternalWrapper(
+            wrapperApk,
+            contents.wrapperApk,
+        )
+        require(wrapperSha256 == descriptor.wrapperSha256) {
             "외부 wrapper APK SHA-256이 SixBundle descriptor와 일치하지 않습니다."
         }
         val expectedPackage = "dev.sixbridge.ext.${descriptor.extensionId}"
@@ -48,6 +52,66 @@ class BuildArtifactVerifier {
             wrapperPackage = descriptor.wrapperPackage,
             wrapperVersionCode = descriptor.wrapperVersionCode,
         )
+    }
+
+    private fun readBoundedExternal(
+        path: Path,
+        label: String,
+        maximumSize: Long,
+    ): ByteArray {
+        val declaredSize = Files.size(path)
+        require(declaredSize in 1..maximumSize) {
+            "$label 파일 크기가 제한을 초과합니다."
+        }
+        val bytes = Files.newInputStream(path).use { input ->
+            input.readNBytes((maximumSize + 1).toInt())
+        }
+        require(bytes.size.toLong() <= maximumSize) {
+            "$label 파일 크기가 제한을 초과합니다."
+        }
+        require(bytes.size.toLong() == declaredSize) {
+            "$label 파일이 검증 중 변경되었습니다."
+        }
+        return bytes
+    }
+
+    private fun verifyExternalWrapper(
+        path: Path,
+        expected: ByteArray,
+    ): String {
+        val declaredSize = Files.size(path)
+        require(declaredSize in 1..MAX_EXTERNAL_WRAPPER_SIZE) {
+            "외부 wrapper APK 파일 크기가 제한을 초과합니다."
+        }
+        require(declaredSize == expected.size.toLong()) {
+            "외부 wrapper APK bytes가 SixBundle wrapper.apk와 일치하지 않습니다."
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(path).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var offset = 0
+            while (offset < expected.size) {
+                val count = input.read(
+                    buffer,
+                    0,
+                    minOf(buffer.size, expected.size - offset),
+                )
+                require(count >= 0) {
+                    "외부 wrapper APK가 검증 중 짧아졌습니다."
+                }
+                for (index in 0 until count) {
+                    require(buffer[index] == expected[offset + index]) {
+                        "외부 wrapper APK bytes가 SixBundle wrapper.apk와 일치하지 않습니다."
+                    }
+                }
+                digest.update(buffer, 0, count)
+                offset += count
+            }
+            require(input.read() == -1) {
+                "외부 wrapper APK가 검증 중 길어졌습니다."
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     internal fun verifyWrapper(
@@ -259,6 +323,8 @@ class BuildArtifactVerifier {
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val CONTENT_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
         const val MAX_EMBEDDED_CRX_SIZE = 128L * 1024 * 1024
+        const val MAX_EXTERNAL_CRX_SIZE = 128L * 1024 * 1024
+        const val MAX_EXTERNAL_WRAPPER_SIZE = 128L * 1024 * 1024
         val PACKAGE_BADGING = Regex("""package: name='([^']+)' versionCode='(\d+)'""")
         val SIGNER_SHA =
             Regex("""Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F:]+)""")
