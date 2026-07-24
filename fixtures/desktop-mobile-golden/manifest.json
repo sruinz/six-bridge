@@ -2,6 +2,12 @@
   "manifest_version": 3,
   "name": "Selection fixture",
   "version": "1",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://example.test/*"],

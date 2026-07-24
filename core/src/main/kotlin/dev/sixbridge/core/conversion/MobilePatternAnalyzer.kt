@@ -119,14 +119,26 @@ class MobilePatternAnalyzer(
             ?.mapNotNull { it as? JsonObject }
             ?.any { readStrings(it["js"]).isNotEmpty() }
             ?: false
-        if (!hasContentScript) return null
         val manifestSource = runCatching { manifestPath.readText() }.getOrDefault("")
         val popupOffset = DEFAULT_POPUP.find(manifestSource)?.range?.first ?: 0
+        val unavailableLimitations = buildList {
+            if (!hasContentScript) {
+                add("기존 content script가 없어 host permission을 늘리지 않고 진입점을 추가할 수 없습니다.")
+            }
+            if ("tabs" !in profile.supportedApis) {
+                add("tabs namespace가 없어 popup을 extension tab으로 열 수 없습니다.")
+            }
+        }
+        val unavailable = unavailableLimitations.isNotEmpty()
         return AdapterDecision(
             id = ACTION_POPUP_ENTRY,
             version = 1,
             risk = AdapterRisk.BEHAVIOR_CHANGE,
-            disposition = AdapterDisposition.REQUIRES_APPROVAL,
+            disposition = if (unavailable) {
+                AdapterDisposition.UNAVAILABLE
+            } else {
+                AdapterDisposition.REQUIRES_APPROVAL
+            },
             applied = false,
             evidence = listOf(
                 SourceEvidence(
@@ -135,8 +147,16 @@ class MobilePatternAnalyzer(
                     detail = "action.default_popup=$popup",
                 ),
             ),
-            changes = listOf("기존 content script에 action popup 보조 진입점을 추가합니다."),
-            remainingLimitations = listOf("popup이 브라우저 action UI가 아닌 별도 탭에서 열립니다."),
+            changes = if (unavailable) {
+                emptyList()
+            } else {
+                listOf("기존 content script에 action popup 보조 진입점을 추가합니다.")
+            },
+            remainingLimitations = if (unavailable) {
+                unavailableLimitations
+            } else {
+                listOf("popup이 브라우저 action UI가 아닌 별도 탭에서 열립니다.")
+            },
         )
     }
 
