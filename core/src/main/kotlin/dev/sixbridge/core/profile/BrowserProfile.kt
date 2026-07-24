@@ -1,5 +1,9 @@
 package dev.sixbridge.core.profile
 
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets.UTF_8
+import java.security.MessageDigest
+
 data class WrapperContract(
     val discoveryUri: Boolean,
     val extensionMetadata: Boolean,
@@ -55,6 +59,37 @@ data class BrowserProfile(
         require((supportedFeatures intersect unavailableFeatures).isEmpty()) {
             "지원 기능과 미지원 기능 증거는 겹칠 수 없습니다."
         }
+    }
+
+    fun canonicalSha256(): String {
+        validate()
+        val digest = MessageDigest.getInstance("SHA-256")
+        listOf(
+            browserPackage,
+            versionName,
+            versionCode.toString(),
+            majorVersion.toString(),
+            supportedApis.sorted().joinToString("\u0000"),
+            detectedApis.sorted().joinToString("\u0000"),
+            wrapperContract.discoveryUri.toString(),
+            wrapperContract.extensionMetadata.toString(),
+            wrapperContract.contentProvider.toString(),
+            wrapperContract.devExtensionPath.toString(),
+            sourceApkSha256,
+            sourceApkSignerSha256,
+            profileDifferences.joinToString("\u0000"),
+            supportedFeatures.sorted().joinToString("\u0000"),
+            unavailableFeatures.sorted().joinToString("\u0000"),
+        ).forEach { value ->
+            val bytes = value.toByteArray(UTF_8)
+            digest.update(
+                ByteBuffer.allocate(Int.SIZE_BYTES)
+                    .putInt(bytes.size)
+                    .array(),
+            )
+            digest.update(bytes)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     companion object {

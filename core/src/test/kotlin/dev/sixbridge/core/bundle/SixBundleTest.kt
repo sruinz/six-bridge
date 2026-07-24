@@ -63,6 +63,8 @@ class SixBundleTest {
             ),
             originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
             convertedExtensionId = "ponmlkjihgfedcbaponmlkjihgfedcba",
+            sourceSha256 = "c".repeat(64),
+            browserProfileSha256 = "d".repeat(64),
         )
 
         SixBundle.write(output, wrapper, descriptor, compatibility)

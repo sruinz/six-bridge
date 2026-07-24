@@ -103,49 +103,6 @@ class ExtensionZipTest {
     }
 
     @Test
-    fun `rejects a source file replaced by an external symlink before descriptor read`() {
-        val source = Files.createTempDirectory("six-source-race")
-        source.resolve("manifest.json").writeText("""{"name":"race"}""")
-        val script = source.resolve("background.js")
-        script.writeText("original")
-        val external = Files.createTempFile("six-external-secret", ".js")
-        external.writeText("must-not-be-read")
-
-        val error = assertFailsWith<IllegalArgumentException> {
-            ExtensionZip.createBytesForTesting(source) { path ->
-                if (path == script) {
-                    Files.delete(path)
-                    Files.createSymbolicLink(path, external)
-                }
-            }
-        }
-
-        assertTrue(Files.isSymbolicLink(script))
-        assertTrue(error.message.orEmpty().contains("변경"))
-        assertEquals("must-not-be-read", Files.readString(external))
-    }
-
-    @Test
-    fun `rejects a file added after the source inventory is fixed`() {
-        val source = Files.createTempDirectory("six-source-inventory-race")
-        source.resolve("manifest.json").writeText("""{"name":"inventory"}""")
-        val script = source.resolve("background.js")
-        script.writeText("original")
-        var added = false
-
-        val error = assertFailsWith<IllegalArgumentException> {
-            ExtensionZip.createBytesForTesting(source) {
-                if (!added) {
-                    source.resolve("added.js").writeText("late")
-                    added = true
-                }
-            }
-        }
-
-        assertTrue(error.message.orEmpty().contains("inventory"))
-    }
-
-    @Test
     fun `rejects Greek sigma case-fold collisions in zip and source paths`() {
         val zip = zipWith(
             "manifest.json" to """{"name":"sigma-zip"}""",

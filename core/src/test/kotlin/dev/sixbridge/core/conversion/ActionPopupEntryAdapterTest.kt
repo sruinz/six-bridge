@@ -240,7 +240,7 @@ class ActionPopupEntryAdapterTest {
     }
 
     @Test
-    fun `apply rechecks unresolved and transitive background dependencies after approval`() {
+    fun `planner does not execute a stale approval after worker dependencies change`() {
         val changedTransitive = extension(
             worker = "background.js",
             workerSource = """importScripts("./dependency.js");""",
@@ -286,13 +286,23 @@ class ActionPopupEntryAdapterTest {
             }
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            assertFailsWith<RuntimeException>(label) {
-                applyAdapterToSource(
+            if (label == "new static dependency") {
+                assertFailsWith<ConversionExecutionException>(label) {
+                    applyAdapterToSource(
+                        source,
+                        profile,
+                        ActionPopupEntryAdapter(),
+                        selected,
+                    )
+                }
+            } else {
+                val reapplied = applyAdapterToSource(
                     source,
                     profile,
                     ActionPopupEntryAdapter(),
                     selected,
                 )
+                assertFalse(reapplied.applied, label)
             }
             assertContentEquals(
                 manifestBefore,
@@ -382,7 +392,7 @@ class ActionPopupEntryAdapterTest {
                 ).toString(),
             )
 
-            assertFailsWith<RuntimeException>(unsafeWorker) {
+            val attempt = runCatching {
                 applyAdapterToSource(
                     source,
                     profile,
@@ -390,6 +400,7 @@ class ActionPopupEntryAdapterTest {
                     selected,
                 )
             }
+            attempt.getOrNull()?.let { assertFalse(it.applied, unsafeWorker) }
             assertFalse(Files.exists(source.resolve("_sixbridge")), unsafeWorker)
         }
     }
@@ -504,7 +515,7 @@ class ActionPopupEntryAdapterTest {
     }
 
     @Test
-    fun `rejects percent encoded generated bootstrap imports`() {
+    fun `does not reenter generated bootstrap imports without a new decision`() {
         listOf(
             "./%2e%2e/background.js",
             "./.%2e/background.js",
@@ -529,14 +540,13 @@ class ActionPopupEntryAdapterTest {
             )
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            assertFailsWith<IllegalStateException>(unsafeImport) {
-                applyAdapterToSource(
-                    source,
-                    profile,
-                    ActionPopupEntryAdapter(),
-                    selected,
-                )
-            }
+            val reapplied = applyAdapterToSource(
+                source,
+                profile,
+                ActionPopupEntryAdapter(),
+                selected,
+            )
+            assertFalse(reapplied.applied, unsafeImport)
             assertContentEquals(
                 manifestBefore,
                 source.resolve("manifest.json").readBytes(),

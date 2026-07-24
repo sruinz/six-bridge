@@ -4,6 +4,8 @@ import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.nio.file.Files
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -53,8 +55,11 @@ class ConversionCompositionTest {
     }
 
     @Test
-    fun `rolls back every adapter when a later adapter fails`() {
+    fun `rolls back when an externally observed stage is changed`() {
         val source = extension()
+        repeat(1_000) { index ->
+            source.resolve("padding-$index.txt").writeText("padding-$index")
+        }
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val plan = plan(snapshot.originalRoot)
@@ -63,14 +68,23 @@ class ConversionCompositionTest {
                 includeProjectMarker = true,
             )
 
-            assertFailsWith<ConversionExecutionException> {
-                workspace.transformForTesting(
-                    snapshot = snapshot,
-                    profile = profile,
-                    plan = plan,
-                    failAfterAdapterId =
-                        MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
+            val pool = Executors.newSingleThreadExecutor()
+            val mutation = pool.submit {
+                val stage = waitForSibling(
+                    requireNotNull(snapshot.workingRoot.parent),
+                    ".sixbridge-stage-",
                 )
+                val manifest = stage.resolve("manifest.json")
+                while (!Files.exists(manifest)) Thread.onSpinWait()
+                manifest.writeText("""{"manifest_version":3}""")
+            }
+            try {
+                assertFailsWith<ConversionExecutionException> {
+                    workspace.transform(snapshot, profile, plan)
+                }
+                mutation.get(5, TimeUnit.SECONDS)
+            } finally {
+                pool.shutdownNow()
             }
 
             assertTrue(
@@ -94,6 +108,60 @@ class ConversionCompositionTest {
 
             assertFailsWith<ConversionExecutionException> {
                 workspace.transform(snapshot, differentProfile, plan)
+            }
+        }
+    }
+
+    @Test
+    fun `rejects a planner capability replayed for a different source`() {
+        val first = extension()
+        val second = extension().also {
+            it.resolve("content.js").writeText(
+                it.resolve("content.js").readText() + "\nconsole.log('different');",
+            )
+        }
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(second)
+            val plan = plan(first)
+
+            assertFailsWith<ConversionExecutionException> {
+                workspace.transform(snapshot, profile, plan)
+            }
+        }
+    }
+
+    @Test
+    fun `rejects removed or reordered analyzer decisions`() {
+        listOf<(List<AdapterDecision>) -> List<AdapterDecision>>(
+            { decisions -> decisions.drop(1) },
+            { decisions -> decisions.reversed() },
+        ).forEach { mutate ->
+            val source = extension()
+            ConversionWorkspace().use { workspace ->
+                val snapshot = workspace.snapshot(source)
+                val report = MobilePatternAnalyzer().analyze(
+                    snapshot.originalRoot,
+                    profile,
+                )
+                val tampered = report.copy(
+                    adapterDecisions = mutate(report.adapterDecisions),
+                )
+                val plan = ConversionPlanner().plan(
+                    tampered,
+                    if (
+                        tampered.adapterDecisions.any {
+                            it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY
+                        }
+                    ) {
+                        setOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY)
+                    } else {
+                        emptySet()
+                    },
+                )
+
+                assertFailsWith<ConversionExecutionException> {
+                    workspace.transform(snapshot, profile, plan)
+                }
             }
         }
     }
@@ -133,4 +201,21 @@ class ConversionCompositionTest {
                 """.trimIndent(),
             )
         }
+
+    private fun waitForSibling(
+        parent: java.nio.file.Path,
+        prefix: String,
+    ): java.nio.file.Path {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            Files.list(parent).use { paths ->
+                paths.filter { it.fileName.toString().startsWith(prefix) }
+                    .findFirst()
+                    .orElse(null)
+                    ?.let { return it }
+            }
+            Thread.onSpinWait()
+        }
+        error("$prefix sibling을 관찰하지 못했습니다.")
+    }
 }

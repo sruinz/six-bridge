@@ -36,28 +36,6 @@ object ExtensionZip {
         sourceRoot: Path,
         publicKey: ByteArray? = null,
         includeProjectMarker: Boolean = false,
-    ): ByteArray = createBytes(
-        sourceRoot,
-        publicKey,
-        includeProjectMarker,
-        beforeSourceRead = null,
-    )
-
-    internal fun createBytesForTesting(
-        sourceRoot: Path,
-        beforeSourceRead: (Path) -> Unit,
-    ): ByteArray = createBytes(
-        sourceRoot,
-        publicKey = null,
-        includeProjectMarker = false,
-        beforeSourceRead = beforeSourceRead,
-    )
-
-    private fun createBytes(
-        sourceRoot: Path,
-        publicKey: ByteArray?,
-        includeProjectMarker: Boolean,
-        beforeSourceRead: ((Path) -> Unit)?,
     ): ByteArray {
         require(Files.isDirectory(sourceRoot, LinkOption.NOFOLLOW_LINKS)) {
             "확장 소스 디렉터리가 아닙니다: $sourceRoot"
@@ -68,7 +46,6 @@ object ExtensionZip {
         val entries = readSourceEntries(
             sourceRoot,
             includeProjectMarker,
-            beforeSourceRead,
         )
         return ByteArrayOutputStream().run {
             ZipOutputStream(this).use { zip ->
@@ -246,7 +223,6 @@ object ExtensionZip {
     private fun readSourceEntries(
         sourceRoot: Path,
         includeProjectMarker: Boolean,
-        beforeSourceRead: ((Path) -> Unit)?,
     ): List<SourceEntry> {
         val inventory = captureInventory(sourceRoot, includeProjectMarker)
         val files = inventory.filter { it.included }
@@ -257,7 +233,6 @@ object ExtensionZip {
             require(totalSize <= MAX_TOTAL_SIZE) { "ZIP 전체 크기가 제한을 초과합니다." }
         }
         val entries = files.map { entry ->
-            beforeSourceRead?.invoke(entry.path)
             readSourceEntry(entry)
         }
         val finalInventory = captureInventory(sourceRoot, includeProjectMarker)

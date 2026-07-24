@@ -6,7 +6,9 @@ import java.nio.channels.ServerSocketChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
+import java.lang.reflect.InvocationTargetException
 import kotlin.io.path.exists
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -60,6 +62,49 @@ class ConversionWorkspaceTest {
 
             assertTrue(snapshot.originalRoot.resolve(".sixbridge-project-id").exists())
             assertTrue(snapshot.workingRoot.resolve(".sixbridge-project-id").exists())
+        }
+    }
+
+    @Test
+    fun `rejects cross-copy A to B to A source provenance`() {
+        val source = source("six-cross-copy-aba")
+        val script = source.resolve("content.js")
+        val fixedTime = FileTime.fromMillis(1_700_000_000_000)
+        script.writeText("A")
+        Files.setLastModifiedTime(script, fixedTime)
+        val expected = WorkspaceTreeDigest.capture(source)
+        val original = NativeWorkspaceTree.copy(
+            source,
+            source.resolveSibling("${source.fileName}-original"),
+        )
+        script.writeText("B")
+        Files.setLastModifiedTime(script, fixedTime)
+        val working = NativeWorkspaceTree.copy(
+            source,
+            source.resolveSibling("${source.fileName}-working"),
+        )
+        script.writeText("A")
+        Files.setLastModifiedTime(script, fixedTime)
+        assertEquals(expected.provenanceSha256, WorkspaceTreeDigest
+            .capture(source).provenanceSha256)
+        assertEquals(expected.provenanceSha256, WorkspaceTreeDigest
+            .capture(original).provenanceSha256)
+        assertNotEquals(expected.provenanceSha256, WorkspaceTreeDigest
+            .capture(working).provenanceSha256)
+
+        ConversionWorkspace().use { workspace ->
+            val method = ConversionWorkspace::class.java.getDeclaredMethod(
+                "requireSnapshotCopy",
+                WorkspaceTreeDigest.State::class.java,
+                Path::class.java,
+                String::class.java,
+            ).also { it.isAccessible = true }
+
+            val error = assertFailsWith<InvocationTargetException> {
+                method.invoke(workspace, expected, working, "working")
+            }
+
+            assertTrue(error.cause is IllegalStateException)
         }
     }
 

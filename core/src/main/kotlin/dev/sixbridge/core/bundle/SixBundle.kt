@@ -172,6 +172,14 @@ object SixBundle {
                         value.convertedExtensionId?.let(::JsonPrimitive)
                             ?: kotlinx.serialization.json.JsonNull
                         ),
+                    "sourceSha256" to (
+                        value.sourceSha256?.let(::JsonPrimitive)
+                            ?: kotlinx.serialization.json.JsonNull
+                        ),
+                    "browserProfileSha256" to (
+                        value.browserProfileSha256?.let(::JsonPrimitive)
+                            ?: kotlinx.serialization.json.JsonNull
+                        ),
                 ),
             ),
         )
@@ -273,6 +281,16 @@ object SixBundle {
                 null
             } else {
                 objectValue.nullableString("convertedExtensionId")
+            },
+            sourceSha256 = if (schemaVersion < 3) {
+                null
+            } else {
+                objectValue.nullableString("sourceSha256")
+            },
+            browserProfileSha256 = if (schemaVersion < 3) {
+                null
+            } else {
+                objectValue.nullableString("browserProfileSha256")
             },
         ).also(CompatibilityReport::validate)
     }
@@ -400,7 +418,7 @@ object SixBundle {
         enumFromJson(value)
 
     private const val EXTENSION_SCHEMA_VERSION = 1
-    private const val COMPATIBILITY_SCHEMA_VERSION = 2
+    private const val COMPATIBILITY_SCHEMA_VERSION = 3
     private const val MAX_METADATA_SIZE = 1024L * 1024
     private const val MAX_WRAPPER_SIZE = 128L * 1024 * 1024
     private const val MAX_TOTAL_SIZE = MAX_WRAPPER_SIZE + (2 * MAX_METADATA_SIZE)

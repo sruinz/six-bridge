@@ -12,6 +12,8 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Path
+import java.security.MessageDigest
+import dev.sixbridge.core.input.ExtensionZip
 import kotlin.io.path.readText
 
 class MobilePatternAnalyzer(
@@ -26,14 +28,16 @@ class MobilePatternAnalyzer(
         if (compatibility.status == CompatibilityStatus.BLOCKED ||
             compatibility.status == CompatibilityStatus.UNKNOWN
         ) {
-            return compatibility
+            return verifySource(extensionRoot, compatibility)
         }
         val manifestPath = extensionRoot.resolve("manifest.json")
         val manifest = runCatching {
             json.parseToJsonElement(manifestPath.readText()) as? JsonObject
         }.getOrNull() ?: return compatibility
         val index = RuntimeResourceIndex.create(extensionRoot, manifest)
-        if (index.unresolvedDependency) return compatibility
+        if (index.unresolvedDependency) {
+            return verifySource(extensionRoot, compatibility)
+        }
 
         val decisions = mutableListOf<AdapterDecision>()
         val issues = compatibility.issues.toMutableList()
@@ -52,11 +56,30 @@ class MobilePatternAnalyzer(
         val sortedDecisions = decisions.sortedWith(
             compareBy(AdapterDecision::id, AdapterDecision::version),
         )
-        return compatibility.copy(
+        return verifySource(extensionRoot, compatibility.copy(
             issues = issues,
             conversionState = conversionState(sortedDecisions),
             adapterDecisions = sortedDecisions,
-        )
+        ))
+    }
+
+    private fun verifySource(
+        extensionRoot: Path,
+        report: CompatibilityReport,
+    ): CompatibilityReport {
+        if (report.sourceSha256 == null) return report
+        val current = MessageDigest.getInstance("SHA-256")
+            .digest(
+                ExtensionZip.createBytes(
+                    extensionRoot,
+                    includeProjectMarker = true,
+                ),
+            )
+            .joinToString("") { "%02x".format(it) }
+        check(report.sourceSha256 == current) {
+            "mobile pattern 분석 중 source provenance가 변경되었습니다."
+        }
+        return report
     }
 
     private fun selectionDecision(

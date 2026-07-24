@@ -38,7 +38,7 @@ class DesktopSelectionEventBridgeTest {
             val applied = workspace.transform(
                 snapshot,
                 profile,
-                conversionPlanOf(selection),
+                conversionPlanFor(snapshot.originalRoot, profile),
             ).single()
 
             assertTrue(applied.applied)
@@ -61,7 +61,7 @@ class DesktopSelectionEventBridgeTest {
     }
 
     @Test
-    fun `reapplying is a byte for byte no op including the packed zip`() {
+    fun `planner no-op after conversion is byte for byte stable`() {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
@@ -73,7 +73,7 @@ class DesktopSelectionEventBridgeTest {
         val zipBefore = ExtensionZip.createBytes(source)
         val reapplied = applyAdapterToSource(source, profile, bridge, selection)
 
-        assertTrue(reapplied.applied)
+        assertFalse(reapplied.applied)
         assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
         assertContentEquals(zipBefore, ExtensionZip.createBytes(source))
     }
@@ -181,7 +181,7 @@ class DesktopSelectionEventBridgeTest {
     }
 
     @Test
-    fun `canonicalizes generated shim placement and duplicates in the target block`() {
+    fun `planner does not reenter an already generated shim block`() {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
@@ -212,16 +212,17 @@ class DesktopSelectionEventBridgeTest {
         val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
         assertEquals(
             listOf(
+                "content.js",
                 "_sixbridge/desktop-selection-event-bridge.v1.js",
                 "content.js",
-                "content.js",
+                "_sixbridge/desktop-selection-event-bridge.v1.js",
             ),
             scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
         )
     }
 
     @Test
-    fun `canonicalizes generated shim aliases in the target block`() {
+    fun `planner leaves generated shim aliases unchanged without a decision`() {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
@@ -243,7 +244,12 @@ class DesktopSelectionEventBridgeTest {
 
         val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
         assertEquals(
-            listOf("_sixbridge/desktop-selection-event-bridge.v1.js", "content.js"),
+            listOf(
+                "content.js",
+                "./_sixbridge/desktop-selection-event-bridge.v1.js",
+                "/_sixbridge/desktop-selection-event-bridge.v1.js",
+                "_sixbridge/desktop-selection-event-bridge.v1.js",
+            ),
             scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
         )
     }

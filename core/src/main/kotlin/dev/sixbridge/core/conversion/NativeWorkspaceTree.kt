@@ -133,13 +133,8 @@ internal object NativeWorkspaceTree {
             targetAcl.acl = sourceAcl.acl
             return
         }
-        check(
-            System.getProperty("java.runtime.name")
-                .orEmpty()
-                .contains("Android", ignoreCase = true),
-        ) {
-            "metadata를 보존할 수 없는 filesystem입니다."
-        }
+        WorkspacePermissionPolicy.requireMetadataSupport(source)
+        WorkspacePermissionPolicy.requireMetadataSupport(target)
     }
 
     private fun deleteTree(path: Path) {

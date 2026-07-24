@@ -2,9 +2,13 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import javax.tools.ToolProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -60,13 +64,88 @@ class ConversionPlannerTest {
     }
 
     @Test
+    fun `workspace exposes no JVM test seam transaction or registry factory`() {
+        val exposed = ConversionWorkspace::class.java.methods
+            .filter {
+                it.declaringClass == ConversionWorkspace::class.java &&
+                    !it.isSynthetic
+            }
+
+        assertEquals(
+            setOf("snapshot", "transform", "close"),
+            exposed.mapTo(sortedSetOf()) { it.name },
+        )
+        assertFailsWith<ClassNotFoundException> {
+            Class.forName(
+                "dev.sixbridge.core.conversion.ConversionWorkspaceTransaction",
+            )
+        }
+        assertFailsWith<ClassNotFoundException> {
+            Class.forName(
+                "dev.sixbridge.core.conversion.MobileAdapterRegistry",
+            )
+        }
+    }
+
+    @Test
+    fun `plan is sealed immutable capability without data class copy surface`() {
+        val report = reportWith(
+            decision("desktop-selection-event-bridge", AdapterDisposition.AUTOMATIC),
+        )
+        val plan = ConversionPlanner().plan(report, emptySet())
+
+        assertTrue(ConversionPlan::class.java.isInterface)
+        assertFalse(
+            ConversionPlan::class.java.methods.any {
+                it.name == "copy" || it.name.startsWith("component")
+            },
+        )
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (plan.selectedAdapters as MutableList<SelectedAdapter>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (plan.report.adapterDecisions as MutableList<AdapterDecision>)
+                .clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (plan.report.declaredPermissions as MutableSet<String>)
+                .add("tabs")
+        }
+    }
+
+    @Test
+    fun `analyzer seals canonical source and browser profile digests`() {
+        val source = Files.createTempDirectory("six-plan-proof-")
+        source.resolve("manifest.json").toFile().writeText(
+            """{"manifest_version":3,"name":"Proof","version":"1"}""",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+
+        assertEquals(
+            sha256(
+                ExtensionZip.createBytes(
+                    source,
+                    includeProjectMarker = true,
+                ),
+            ),
+            report.sourceSha256,
+        )
+        assertEquals(profile.canonicalSha256(), report.browserProfileSha256)
+    }
+
+    @Test
     fun `external Java cannot construct or implement a selected capability`() {
         listOf(
             "ConstructSelectedAdapter.java",
             "ImplementSelectedAdapter.java",
             "ConstructPlannerImplementation.java",
+            "ConstructConversionPlan.java",
+            "ImplementConversionPlan.java",
             "ConstructAdapterExecutionContext.java",
-            "ActivateTransactionContext.java",
             "ConstructExtensionSnapshot.java",
         ).forEach { fixture ->
             val source = requireNotNull(
@@ -94,9 +173,14 @@ class ConversionPlannerTest {
                     "abstract" in diagnostics && "instantiated" in diagnostics,
                     diagnostics,
                 )
+            } else if (fixture == "ConstructConversionPlan.java") {
+                assertTrue(
+                    "abstract" in diagnostics &&
+                        "instantiated" in diagnostics,
+                    diagnostics,
+                )
             } else if (
                 fixture == "ConstructPlannerImplementation.java" ||
-                fixture == "ActivateTransactionContext.java" ||
                 fixture == "ConstructExtensionSnapshot.java"
             ) {
                 assertTrue("private access" in diagnostics, diagnostics)
@@ -132,7 +216,7 @@ class ConversionPlannerTest {
     }
 
     @Test
-    fun `execution context implementation is private and has no callable factory`() {
+    fun `workspace bytecode has only private nested execution implementations`() {
         val javap = Path.of(System.getProperty("java.home"), "bin", "javap")
         val process = ProcessBuilder(
             javap.toString(),
@@ -140,31 +224,29 @@ class ConversionPlannerTest {
             "-v",
             "-classpath",
             System.getProperty("java.class.path"),
-            "dev.sixbridge.core.conversion.ConversionWorkspaceTransaction" +
-                "\$TransactionContext",
+            ConversionWorkspace::class.java.name,
         ).redirectErrorStream(true).start()
         val output = process.inputStream.bufferedReader().use { it.readText() }
 
         assertEquals(0, process.waitFor(), output)
-        assertTrue(
-            "private dev.sixbridge.core.conversion." +
-                "ConversionWorkspaceTransaction\$TransactionContext();" in output,
-            output,
-        )
-        assertTrue(
-            "java/util/concurrent/atomic/AtomicBoolean" in output,
-            output,
-        )
-        val activateBlock = output
-            .substringAfter("public final void activate")
-            .substringBefore("public final void deactivate")
-        val deactivateBlock = output
-            .substringAfter("public final void deactivate")
-            .substringBefore("private final")
-        assertTrue("ACC_SYNTHETIC" in activateBlock, activateBlock)
-        assertTrue("ACC_SYNTHETIC" in deactivateBlock, deactivateBlock)
-        assertFalse("Companion" in output, output)
-        assertFalse("create(" in output, output)
+        assertFalse("transformForTesting" in output, output)
+        assertFalse("forTesting" in output, output)
+        assertFalse("MobileAdapterRegistry" in output, output)
+        ConversionWorkspace::class.java.declaredClasses
+            .filter {
+                it.simpleName in setOf(
+                    "Transaction",
+                    "TransactionContext",
+                    "AdapterRegistry",
+                    "Ownership",
+                )
+            }
+            .forEach { nested ->
+                assertTrue(
+                    java.lang.reflect.Modifier.isPrivate(nested.modifiers),
+                    "${nested.name} is not private",
+                )
+            }
     }
 
     @Test
@@ -234,6 +316,8 @@ class ConversionPlannerTest {
         unsupportedApis = emptySet(),
         issues = emptyList(),
         adapterDecisions = decisions.toList(),
+        sourceSha256 = "a".repeat(64),
+        browserProfileSha256 = "b".repeat(64),
     )
 
     private fun decision(
@@ -253,4 +337,22 @@ class ConversionPlannerTest {
         changes = emptyList(),
         remainingLimitations = emptyList(),
     )
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        val profile = BrowserProfile(
+            browserPackage = "com.sec.android.app.sbrowser",
+            versionName = "30.0.2.61",
+            versionCode = 1_300_261_502,
+            majorVersion = 30,
+            supportedApis = setOf("runtime"),
+            wrapperContract = WrapperContract.complete(),
+            sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+            sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        )
+    }
 }

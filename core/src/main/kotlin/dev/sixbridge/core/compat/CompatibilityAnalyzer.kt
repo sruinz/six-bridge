@@ -1,6 +1,7 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.input.ExtensionZip
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -21,6 +22,30 @@ class CompatibilityAnalyzer(
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
+        profile.validate()
+        val sourceBefore = canonicalSource(extensionRoot)
+        val report = analyzeUnsealed(extensionRoot, profile)
+        val sourceAfter = canonicalSource(extensionRoot)
+        check(
+            if (sourceBefore == null) {
+                sourceAfter == null
+            } else {
+                sourceAfter != null &&
+                    sourceBefore.contentEquals(sourceAfter)
+            },
+        ) {
+            "호환성 분석 중 source provenance가 변경되었습니다."
+        }
+        return report.copy(
+            sourceSha256 = sourceBefore?.let(::sha256),
+            browserProfileSha256 = profile.canonicalSha256(),
+        ).also(CompatibilityReport::validate)
+    }
+
+    private fun analyzeUnsealed(
+        extensionRoot: Path,
+        profile: BrowserProfile,
+    ): CompatibilityReport {
         val manifestPath = extensionRoot.resolve("manifest.json")
         if (!manifestPath.isRegularFile()) {
             return blocked("manifest_missing", "manifest.json 파일을 찾을 수 없습니다.")
@@ -178,6 +203,19 @@ class CompatibilityAnalyzer(
             issues,
         )
     }
+
+    private fun canonicalSource(extensionRoot: Path): ByteArray? =
+        runCatching {
+            ExtensionZip.createBytes(
+                extensionRoot,
+                includeProjectMarker = true,
+            )
+        }.getOrNull()
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()

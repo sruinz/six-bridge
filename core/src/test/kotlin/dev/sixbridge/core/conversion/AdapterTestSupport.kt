@@ -1,8 +1,6 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.input.ExtensionZip
-import dev.sixbridge.core.compat.CompatibilityReport
-import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.file.Files
 import java.nio.file.Path
@@ -21,8 +19,15 @@ internal fun applyAdapterToSource(
         workspace.transform(
             snapshot,
             profile,
-            conversionPlanOf(selected),
-        ).single().also {
+            conversionPlanFor(snapshot.originalRoot, profile),
+        ).singleOrNull { it.id == selected.id }
+            ?.also {
+                output = ExtensionZip.createBytes(
+                    snapshot.workingRoot,
+                    includeProjectMarker = true,
+                )
+            }
+            ?: selected.toDecision().also {
             output = ExtensionZip.createBytes(
                 snapshot.workingRoot,
                 includeProjectMarker = true,
@@ -33,21 +38,16 @@ internal fun applyAdapterToSource(
     return result
 }
 
-internal fun conversionPlanOf(
-    vararg selected: SelectedAdapter,
-): ConversionPlan = ConversionPlan(
-    report = CompatibilityReport(
-        status = CompatibilityStatus.COMPATIBLE,
-        manifestVersion = 3,
-        extensionName = "test",
-        extensionVersion = "1",
-        declaredPermissions = emptySet(),
-        usedApis = emptySet(),
-        unsupportedApis = emptySet(),
-        issues = emptyList(),
-    ),
-    selectedAdapters = selected.toList(),
-)
+internal fun conversionPlanFor(
+    source: Path,
+    profile: BrowserProfile,
+): ConversionPlan {
+    val report = MobilePatternAnalyzer().analyze(source, profile)
+    val approved = report.adapterDecisions
+        .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
+        .mapTo(sortedSetOf(), AdapterDecision::id)
+    return ConversionPlanner().plan(report, approved)
+}
 
 private fun replaceSourceTree(source: Path, bytes: ByteArray) {
     val extractedParent = Files.createTempDirectory("sixbridge-adapter-test-output-")

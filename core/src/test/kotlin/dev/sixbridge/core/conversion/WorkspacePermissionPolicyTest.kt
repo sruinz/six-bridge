@@ -5,58 +5,52 @@ import kotlin.test.assertEquals
 
 class WorkspacePermissionPolicyTest {
     @Test
-    fun `uses explicit Android app sandbox evidence when POSIX and ACL views are absent`() {
+    fun `rejects metadata without a concrete POSIX or ACL view`() {
         assertEquals(
-            WorkspacePermissionMode.ANDROID_APP_PRIVATE,
-            WorkspacePermissionPolicy.selectMode(
+            WorkspaceMetadataMode.UNSUPPORTED,
+            WorkspacePermissionPolicy.selectMetadataMode(
                 posixAvailable = false,
-                aclOwnerOnly = false,
-                runtimeName = "Android Runtime",
-                androidPrivatePathVerified = true,
+                aclAvailable = false,
             ),
         )
         assertEquals(
-            WorkspacePermissionMode.UNSUPPORTED,
-            WorkspacePermissionPolicy.selectMode(
-                posixAvailable = false,
-                aclOwnerOnly = false,
-                runtimeName = "Android Runtime",
-                androidPrivatePathVerified = false,
-            ),
-        )
-    }
-
-    @Test
-    fun `rejects an ordinary JVM filesystem without POSIX or owner-only ACL evidence`() {
-        assertEquals(
-            WorkspacePermissionMode.UNSUPPORTED,
-            WorkspacePermissionPolicy.selectMode(
-                posixAvailable = false,
-                aclOwnerOnly = false,
-                runtimeName = "OpenJDK Runtime Environment",
-                androidPrivatePathVerified = false,
-            ),
-        )
-    }
-
-    @Test
-    fun `prefers concrete POSIX or owner-only ACL evidence`() {
-        assertEquals(
-            WorkspacePermissionMode.POSIX_OWNER_ONLY,
-            WorkspacePermissionPolicy.selectMode(
+            WorkspaceMetadataMode.POSIX,
+            WorkspacePermissionPolicy.selectMetadataMode(
                 posixAvailable = true,
-                aclOwnerOnly = false,
-                runtimeName = "OpenJDK Runtime Environment",
-                androidPrivatePathVerified = false,
+                aclAvailable = false,
             ),
         )
+    }
+
+    @Test
+    fun `ACL metadata support does not require owner-only source ACL`() {
+        assertEquals(
+            WorkspaceMetadataMode.ACL,
+            WorkspacePermissionPolicy.selectMetadataMode(
+                posixAvailable = false,
+                aclAvailable = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `private workspace requires concrete owner-only policy`() {
         assertEquals(
             WorkspacePermissionMode.ACL_OWNER_ONLY,
-            WorkspacePermissionPolicy.selectMode(
+            WorkspacePermissionPolicy.selectPrivateMode(
                 posixAvailable = false,
+                posixOwnerOnly = false,
+                aclAvailable = true,
                 aclOwnerOnly = true,
-                runtimeName = "OpenJDK Runtime Environment",
-                androidPrivatePathVerified = false,
+            ),
+        )
+        assertEquals(
+            WorkspacePermissionMode.UNSUPPORTED,
+            WorkspacePermissionPolicy.selectPrivateMode(
+                posixAvailable = false,
+                posixOwnerOnly = false,
+                aclAvailable = true,
+                aclOwnerOnly = false,
             ),
         )
     }

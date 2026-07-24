@@ -6,6 +6,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.attribute.AclFileAttributeView
+import java.nio.file.attribute.AclEntry
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileOwnerAttributeView
 import java.nio.file.attribute.PosixFileAttributeView
@@ -53,7 +54,7 @@ internal object WorkspaceTreeDigest {
             digest.field(if (entry.type == "file") entry.size.toString() else "")
             digest.field(entry.contentSha256)
             if (includeMetadata) {
-                digest.field(entry.lastModifiedMillis.toString())
+                digest.field(entry.lastModified)
                 digest.field(entry.owner)
                 digest.field(entry.group)
                 digest.field(entry.permissions)
@@ -137,7 +138,9 @@ internal object WorkspaceTreeDigest {
                 "workspace tree entry identity를 확인할 수 없습니다."
             }.toString(),
             contentSha256 = contentSha256,
-            lastModifiedMillis = attributes.lastModifiedTime().toMillis(),
+            lastModified = attributes.lastModifiedTime()
+                .toInstant()
+                .let { "${it.epochSecond}:${it.nano}" },
             owner = owner,
             group = posix?.group()?.name.orEmpty(),
             permissions = posix?.permissions()
@@ -145,20 +148,19 @@ internal object WorkspaceTreeDigest {
                 ?.sorted()
                 ?.joinToString(",")
                 .orEmpty(),
-            acl = aclView?.acl
-                ?.map { entry ->
-                    listOf(
-                        entry.type().name,
-                        entry.principal().name,
-                        entry.flags().map(Enum<*>::name).sorted().joinToString(","),
-                        entry.permissions().map(Enum<*>::name).sorted().joinToString(","),
-                    ).joinToString(":")
-                }
-                ?.sorted()
-                ?.joinToString("|")
-                .orEmpty(),
+            acl = aclEntries(aclView?.acl.orEmpty()),
         )
     }
+
+    internal fun aclEntries(entries: List<AclEntry>): String =
+        entries.joinToString("|") { entry ->
+            listOf(
+                entry.type().name,
+                entry.principal().name,
+                entry.flags().map(Enum<*>::name).sorted().joinToString(","),
+                entry.permissions().map(Enum<*>::name).sorted().joinToString(","),
+            ).joinToString(":")
+        }
 
     private fun MessageDigest.field(value: String) {
         val bytes = value.toByteArray(UTF_8)
@@ -178,7 +180,7 @@ internal object WorkspaceTreeDigest {
         val size: Long,
         val fileKey: String,
         val contentSha256: String,
-        val lastModifiedMillis: Long,
+        val lastModified: String,
         val owner: String,
         val group: String,
         val permissions: String,

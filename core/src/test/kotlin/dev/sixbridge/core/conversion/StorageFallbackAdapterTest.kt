@@ -348,14 +348,12 @@ class StorageFallbackAdapterTest {
                 snapshot.workingRoot,
                 fallbackProfile,
             )
-            val selected = ConversionPlanner().plan(report, emptySet())
-                .selectedAdapters
-                .single { it.id == MobilePatternAnalyzer.STORAGE_FALLBACK }
+            val plan = ConversionPlanner().plan(report, emptySet())
 
             val applied = workspace.transform(
                 snapshot,
                 fallbackProfile,
-                conversionPlanOf(selected),
+                plan,
             ).single()
 
             assertTrue(applied.applied)
@@ -395,7 +393,7 @@ class StorageFallbackAdapterTest {
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
-            val selected = selected(working)
+            val plan = conversionPlanFor(snapshot.originalRoot, fallbackProfile)
             working.resolve("content.js").writeText("chrome.storage['sync'].get('a');")
             val before = treeBytes(working)
 
@@ -403,7 +401,7 @@ class StorageFallbackAdapterTest {
                 workspace.transform(
                     snapshot,
                     fallbackProfile,
-                    conversionPlanOf(selected),
+                    plan,
                 )
             }
 
@@ -417,7 +415,7 @@ class StorageFallbackAdapterTest {
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
-            val selected = selected(working)
+            val plan = conversionPlanFor(snapshot.originalRoot, fallbackProfile)
             working.resolve("content.js").writeText(
                 "chrome.storage.sync.get('a');\nconsole.log('changed');",
             )
@@ -427,7 +425,7 @@ class StorageFallbackAdapterTest {
                 workspace.transform(
                     snapshot,
                     fallbackProfile,
-                    conversionPlanOf(selected),
+                    plan,
                 )
             }
 
@@ -441,7 +439,7 @@ class StorageFallbackAdapterTest {
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
-            val selected = selected(working)
+            val plan = conversionPlanFor(snapshot.originalRoot, fallbackProfile)
             val outside = Files.createTempFile("sixbridge-storage-outside-", ".js")
             outside.writeText("chrome.storage.sync.get('outside');")
             val content = working.resolve("content.js")
@@ -455,7 +453,7 @@ class StorageFallbackAdapterTest {
                 workspace.transform(
                     snapshot,
                     fallbackProfile,
-                    conversionPlanOf(selected),
+                    plan,
                 )
             }
             assertEquals("chrome.storage.sync.get('outside');", outside.readText())
@@ -468,7 +466,7 @@ class StorageFallbackAdapterTest {
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
-            val selected = selected(working)
+            val plan = conversionPlanFor(snapshot.originalRoot, fallbackProfile)
             val originalParent = requireNotNull(working.parent)
             val movedParent = originalParent.resolveSibling(
                 "${originalParent.fileName}-moved",
@@ -485,7 +483,7 @@ class StorageFallbackAdapterTest {
                 workspace.transform(
                     snapshot,
                     fallbackProfile,
-                    conversionPlanOf(selected),
+                    plan,
                 )
             }
 
@@ -516,7 +514,10 @@ class StorageFallbackAdapterTest {
             ConversionWorkspace().use { workspace ->
                 val snapshot = workspace.snapshot(source)
                 val working = snapshot.workingRoot
-                val selected = selected(working)
+                val plan = conversionPlanFor(
+                    snapshot.originalRoot,
+                    fallbackProfile,
+                )
                 mutate(working)
                 val before = treeBytes(working)
 
@@ -524,7 +525,7 @@ class StorageFallbackAdapterTest {
                     workspace.transform(
                         snapshot,
                         fallbackProfile,
-                        conversionPlanOf(selected),
+                        plan,
                     )
                 }
 
@@ -557,44 +558,49 @@ class StorageFallbackAdapterTest {
                     }
                 },
             )
-            val selected = ConversionPlanner().plan(
+            val plan = ConversionPlanner().plan(
                 report.copy(adapterDecisions = listOf(tampered)),
                 emptySet(),
-            ).selectedAdapters.single()
+            )
 
             assertFailsWith<IllegalStateException> {
                 workspace.transform(
                     snapshot,
                     fallbackProfile,
-                    conversionPlanOf(selected),
+                    plan,
                 )
             }
         }
     }
 
     @Test
-    fun `registry routes another adapter selection without invoking storage`() {
+    fun `registry applies every automatic adapter in a planner-issued capability`() {
         val source = extension(
             content = """
                 document.addEventListener("mouseup", (event) => use(getSelection()));
                 chrome.storage.sync.get('a');
             """.trimIndent(),
         )
-        val selection = ConversionPlanner().plan(
-            MobilePatternAnalyzer().analyze(source, fallbackProfile),
-            emptySet(),
-        ).selectedAdapters.single {
-            it.id == MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE
-        }
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
-            val result = workspace.transform(
+            val plan = conversionPlanFor(
+                snapshot.originalRoot,
+                fallbackProfile,
+            )
+            val results = workspace.transform(
                 snapshot,
                 fallbackProfile,
-                conversionPlanOf(selection),
-            ).single()
+                plan,
+            )
 
-            assertTrue(result.applied)
+            assertEquals(
+                setOf(
+                    MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
+                    MobilePatternAnalyzer.STORAGE_FALLBACK,
+                ),
+                results.mapTo(sortedSetOf(), AdapterDecision::id),
+            )
+            assertTrue(results.all(AdapterDecision::applied))
             assertTrue(
                 Files.exists(
                     snapshot.workingRoot.resolve(
@@ -603,17 +609,10 @@ class StorageFallbackAdapterTest {
                 ),
             )
             assertTrue(
-                "chrome.storage.sync" in
+                "chrome.storage.local" in
                     snapshot.workingRoot.resolve("content.js").readText(),
             )
         }
-    }
-
-    private fun selected(source: Path): SelectedAdapter {
-        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
-        return ConversionPlanner().plan(report, emptySet())
-            .selectedAdapters
-            .single { it.id == MobilePatternAnalyzer.STORAGE_FALLBACK }
     }
 
     private fun extension(

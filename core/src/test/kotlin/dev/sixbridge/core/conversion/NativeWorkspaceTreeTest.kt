@@ -2,6 +2,11 @@ package dev.sixbridge.core.conversion
 
 import java.nio.file.Files
 import java.nio.file.attribute.FileTime
+import java.nio.file.attribute.AclEntry
+import java.nio.file.attribute.AclEntryPermission
+import java.nio.file.attribute.AclEntryType
+import java.nio.file.attribute.UserPrincipal
+import java.time.Instant
 import java.nio.file.attribute.PosixFilePermission
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
@@ -78,4 +83,47 @@ class NativeWorkspaceTreeTest {
 
         assertTrue(before != WorkspaceTreeDigest.provenanceSha256(source))
     }
+
+    @Test
+    fun `sub-millisecond mtime changes alter provenance digest`() {
+        val source = Files.createTempDirectory("sixbridge-native-nanos-")
+        val file = source.resolve("entry.js")
+        file.writeText("same")
+        Files.setLastModifiedTime(
+            file,
+            FileTime.from(Instant.ofEpochSecond(1_700_000_000, 123_456_000)),
+        )
+        val before = WorkspaceTreeDigest.provenanceSha256(source)
+
+        Files.setLastModifiedTime(
+            file,
+            FileTime.from(Instant.ofEpochSecond(1_700_000_000, 123_457_000)),
+        )
+
+        assertTrue(before != WorkspaceTreeDigest.provenanceSha256(source))
+    }
+
+    @Test
+    fun `ACL entry order remains part of provenance metadata`() {
+        val owner = principal("owner")
+        val system = principal("SYSTEM")
+        val first = acl(owner)
+        val second = acl(system)
+
+        assertTrue(
+            WorkspaceTreeDigest.aclEntries(listOf(first, second)) !=
+                WorkspaceTreeDigest.aclEntries(listOf(second, first)),
+        )
+    }
+
+    private fun principal(name: String) = object : UserPrincipal {
+        override fun getName(): String = name
+    }
+
+    private fun acl(principal: UserPrincipal): AclEntry =
+        AclEntry.newBuilder()
+            .setType(AclEntryType.ALLOW)
+            .setPrincipal(principal)
+            .setPermissions(AclEntryPermission.READ_DATA)
+            .build()
 }
