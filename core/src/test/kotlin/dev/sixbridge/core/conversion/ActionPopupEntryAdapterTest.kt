@@ -9,416 +9,144 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.io.path.createSymbolicLinkPointingTo
+import kotlin.io.path.deleteExisting
 import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
+import kotlin.test.assertFails
 import kotlin.test.assertFalse
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ActionPopupEntryAdapterTest {
     @Test
-    fun `requires approval before applying and then injects without changing permissions or originals`() {
-        val source = extension()
-        val manifestBefore = manifest(source)
+    fun `adds only options ui and deterministic provenance`() {
+        val source = extension(worker = "background.js")
         val contentBefore = source.resolve("content.js").readBytes()
+        val backgroundBefore = source.resolve("background.js").readBytes()
         val popupBefore = source.resolve("popup.html").readBytes()
-        val report = MobilePatternAnalyzer().analyze(source, profile)
+        val manifestBefore = manifest(source)
 
-        assertFailsWith<ConversionPlanningException> {
-            ConversionPlanner().plan(report, emptySet())
-        }
-        assertFalse(Files.exists(source.resolve("_sixbridge")))
-
-        val approved = ConversionPlanner()
-            .plan(report, setOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY))
-            .selectedAdapters
-            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        val applied = applyAdapterToSource(
-            source,
-            profile,
-            ActionPopupEntryAdapter(),
-            approved,
-        )
+        val applied = applyApproved(source)
         val updated = manifest(source)
 
         assertTrue(applied.applied)
         assertEquals(
-            listOf("_sixbridge/action-popup-entry-content.v1.js", "content.js"),
-            scripts((updated["content_scripts"] as JsonArray)[0] as JsonObject),
-        )
-        assertEquals(
-            listOf("_sixbridge/action-popup-entry-content.v1.js", "second.js"),
-            scripts((updated["content_scripts"] as JsonArray)[1] as JsonObject),
+            JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("popup.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                ),
+            ),
+            updated["options_ui"],
         )
         assertEquals(manifestBefore["permissions"], updated["permissions"])
         assertEquals(manifestBefore["host_permissions"], updated["host_permissions"])
-        assertEquals(
-            "_sixbridge/action-popup-entry-background.v1.js",
-            ((updated["background"] as JsonObject)["service_worker"] as JsonPrimitive).content,
-        )
+        assertEquals(manifestBefore["content_scripts"], updated["content_scripts"])
+        assertEquals(manifestBefore["background"], updated["background"])
         assertContentEquals(contentBefore, source.resolve("content.js").readBytes())
+        assertContentEquals(backgroundBefore, source.resolve("background.js").readBytes())
         assertContentEquals(popupBefore, source.resolve("popup.html").readBytes())
-    }
-
-    @Test
-    fun `does not apply without a popup or when accessibility is verified`() {
-        val withoutPopup = extension(popup = null)
-        val accessible = extension()
-        val changedAfterApproval = extension()
-        val selectedBeforePopupRemoval = approvedSelection(changedAfterApproval)
-        changedAfterApproval.resolve("manifest.json").writeText(
-            manifest(changedAfterApproval).let {
-                JsonObject(it - "action").toString()
-            },
-        )
-
-        assertNull(
-            MobilePatternAnalyzer().analyze(withoutPopup, profile)
-                .adapterDecisions.singleOrNull { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY },
-        )
-        assertNull(
-            MobilePatternAnalyzer().analyze(
-                accessible,
-                profile.copy(supportedFeatures = setOf("action.popup.user-accessible")),
-            ).adapterDecisions.singleOrNull {
-                it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY
-            },
-        )
-        assertFalse(
-            applyAdapterToSource(
-                changedAfterApproval,
-                profile,
-                ActionPopupEntryAdapter(),
-                selectedBeforePopupRemoval,
-            )
-                .applied,
-        )
-        assertFalse(Files.exists(changedAfterApproval.resolve("_sixbridge")))
-    }
-
-    @Test
-    fun `marks missing content scripts or tabs namespace unavailable`() {
-        val noContent = extension(hasContent = false)
-        val noTabs = extension()
-
-        val noContentDecision = MobilePatternAnalyzer().analyze(noContent, profile)
-            .adapterDecisions.single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        val noTabsDecision = MobilePatternAnalyzer().analyze(
-            noTabs,
-            profile.copy(supportedApis = profile.supportedApis - "tabs"),
-        ).adapterDecisions.single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-
-        assertEquals(AdapterDisposition.UNAVAILABLE, noContentDecision.disposition)
-        assertEquals(AdapterDisposition.UNAVAILABLE, noTabsDecision.disposition)
-        listOf(
-            MobilePatternAnalyzer().analyze(noContent, profile),
-            MobilePatternAnalyzer().analyze(
-                noTabs,
-                profile.copy(supportedApis = profile.supportedApis - "tabs"),
-            ),
-        ).forEach { report ->
-            val error = assertFailsWith<ConversionPlanningException> {
-                ConversionPlanner().plan(report, emptySet())
-            }
-            assertEquals(ConversionPlanningFailure.NO_APPLICABLE_ADAPTER, error.failure)
-        }
-    }
-
-    @Test
-    fun `preserves classic and module workers through canonical generated bootstraps`() {
-        listOf(null, "module").forEach { workerType ->
-            val source = extension(
-                worker = "/scripts/./background.js",
-                workerType = workerType,
-            )
-            val workerBefore = source.resolve("scripts/background.js").readBytes()
-            val applied = applyApproved(source)
-            val updatedBackground = manifest(source)["background"] as JsonObject
-            val bootstrap = source.resolve(
-                "scripts/_sixbridge-action-popup-entry-bootstrap.v1.js",
-            ).readText()
-
-            assertTrue(applied.applied)
-            assertEquals(
-                "scripts/_sixbridge-action-popup-entry-bootstrap.v1.js",
-                (updatedBackground["service_worker"] as JsonPrimitive).content,
-            )
-            assertEquals(
-                workerType,
-                (updatedBackground["type"] as? JsonPrimitive)?.content,
-            )
-            if (workerType == "module") {
-                assertTrue(
-                    bootstrap.startsWith(
-                        "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:module:",
-                    ),
-                )
-                assertTrue(
-                    bootstrap.endsWith(
-                    "import \"./background.js\";\n" +
-                        "import \"../_sixbridge/action-popup-entry-background.v1.js\";\n",
-                    ),
-                )
-            } else {
-                assertTrue(
-                    bootstrap.startsWith(
-                        "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:classic:",
-                    ),
-                )
-                assertTrue(
-                    bootstrap.endsWith(
-                    "importScripts(\"./background.js\", " +
-                        "\"../_sixbridge/action-popup-entry-background.v1.js\");\n",
-                    ),
-                )
-            }
-            assertContentEquals(workerBefore, source.resolve("scripts/background.js").readBytes())
-        }
-    }
-
-    @Test
-    fun `marks worker URL dependencies unavailable and rejects a stale selected capability`() {
-        val dependent = extension(
-            worker = "scripts/background.js",
-            workerSource = "globalThis.workerUrl = self.location.href;",
-        )
-        val report = MobilePatternAnalyzer().analyze(dependent, profile)
-        val decision = report.adapterDecisions
-            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-
-        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
-        val planningError = assertFailsWith<ConversionPlanningException> {
-            ConversionPlanner().plan(report, emptySet())
-        }
         assertEquals(
-            ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
-            planningError.failure,
+            """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
+            source.resolve("_sixbridge/action-popup-entry.v2.json").readText(),
         )
+    }
 
-        val changedAfterApproval = extension(worker = "scripts/background.js")
-        val selected = approvedSelection(changedAfterApproval)
-        changedAfterApproval.resolve("scripts/background.js")
-            .writeText("globalThis.workerUrl = self.location.href;")
+    @Test
+    fun `does not overwrite options ui or options page added after approval`() {
+        listOf(
+            "options_ui" to JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("settings.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                ),
+            ),
+            "options_page" to JsonPrimitive("settings.html"),
+        ).forEach { (name, value) ->
+            val source = extension()
+            source.resolve("settings.html").writeText("<p>settings</p>")
+            val selected = approvedSelection(source)
+            source.resolve("manifest.json").writeText(
+                JsonObject(manifest(source) + (name to value)).toString(),
+            )
+            val manifestBefore = source.resolve("manifest.json").readBytes()
 
-        assertFailsWith<ConversionPlanningException> {
-            applyAdapterToSource(
-                changedAfterApproval,
+            val result = applyAdapterToSource(
+                source,
                 profile,
                 ActionPopupEntryAdapter(),
                 selected,
             )
-        }
-        assertFalse(Files.exists(changedAfterApproval.resolve("_sixbridge")))
-    }
 
-    @Test
-    fun `conservatively detects worker URL access but ignores comments and plain strings`() {
-        listOf(
-            """new URL("worker.js", location);""",
-            "void location;",
-            """self["location"].href;""",
-            "self?.location.href;",
-            """new URL("worker.js", import.meta["url"]);""",
-        ).forEach { workerSource ->
-            val source = extension(
-                worker = "background.js",
-                workerType = "module",
-                workerSource = workerSource,
-            )
-            val decision = MobilePatternAnalyzer().analyze(source, profile)
-                .adapterDecisions
-                .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-
-            assertEquals(
-                AdapterDisposition.UNAVAILABLE,
-                decision.disposition,
-                workerSource,
-            )
-        }
-
-        val lexicalOnly = extension(
-            worker = "background.js",
-            workerSource = """
-                // location and import.meta are documentation words.
-                const text = "location import.meta";
-            """.trimIndent(),
-        )
-        val lexicalDecision = MobilePatternAnalyzer().analyze(lexicalOnly, profile)
-            .adapterDecisions
-            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        assertEquals(AdapterDisposition.REQUIRES_APPROVAL, lexicalDecision.disposition)
-    }
-
-    @Test
-    fun `planner does not execute a stale approval after worker dependencies change`() {
-        val changedTransitive = extension(
-            worker = "background.js",
-            workerSource = """importScripts("./dependency.js");""",
-        )
-        changedTransitive.resolve("dependency.js").writeText(
-            "globalThis.initiallySafe = true;",
-        )
-        val transitiveSelection = approvedSelection(changedTransitive)
-        changedTransitive.resolve("dependency.js").writeText(
-            """new URL("worker.js", location);""",
-        )
-        assertFailsWith<ConversionPlanningException>("changed transitive dependency") {
-            applyAdapterToSource(
-                changedTransitive,
-                profile,
-                ActionPopupEntryAdapter(),
-                transitiveSelection,
-            )
-        }
-        assertFalse(Files.exists(changedTransitive.resolve("_sixbridge")))
-
-        val cases = listOf(
-            Triple(
-                "new static dependency",
-                """importScripts("./dependency.js");""",
-                """self["location"].href;""",
-            ),
-            Triple(
-                "unresolved dependency",
-                "importScripts(nextScript);",
-                "",
-            ),
-        )
-        cases.forEach { (label, changedWorker, changedDependency) ->
-            val source = extension(
-                worker = "background.js",
-                workerSource = "globalThis.initiallySafe = true;",
-            )
-            val selected = approvedSelection(source)
-            source.resolve("background.js").writeText(changedWorker)
-            if (changedDependency.isNotEmpty()) {
-                source.resolve("dependency.js").writeText(changedDependency)
-            }
-            val manifestBefore = source.resolve("manifest.json").readBytes()
-
-            assertFailsWith<ConversionPlanningException>(label) {
-                applyAdapterToSource(
-                    source,
-                    profile,
-                    ActionPopupEntryAdapter(),
-                    selected,
-                )
-            }
+            assertFalse(result.applied, name)
             assertContentEquals(
                 manifestBefore,
                 source.resolve("manifest.json").readBytes(),
-                label,
+                name,
             )
-            assertFalse(Files.exists(source.resolve("_sixbridge")), label)
+            assertFalse(Files.exists(source.resolve("_sixbridge")), name)
         }
     }
 
     @Test
-    fun `generated bootstrap reapply rechecks transitive background dependencies`() {
-        val source = extension(
-            worker = "scripts/background.js",
-            workerSource = """importScripts("./dependency.js");""",
-        )
-        source.resolve("scripts/dependency.js").writeText(
-            "globalThis.initiallySafe = true;",
-        )
-        val selected = approvedSelection(source)
-        applyAdapterToSource(source, profile, ActionPopupEntryAdapter(), selected)
-        val manifestBefore = source.resolve("manifest.json").readBytes()
-        source.resolve("scripts/dependency.js").writeText(
-            """self["location"].href;""",
-        )
+    fun `rejects provenance path collisions before changing the manifest`() {
+        listOf<(Path) -> Unit>(
+            { marker ->
+                Files.createDirectories(marker.parent)
+                marker.writeText("foreign bytes")
+            },
+            { marker ->
+                Files.createDirectories(marker.parent)
+                Files.createDirectory(marker)
+                marker.resolve("foreign.txt").writeText("foreign directory")
+            },
+            { marker ->
+                Files.createDirectories(marker.parent)
+                val target = Files.createTempFile("six-action-provenance", ".json")
+                marker.createSymbolicLinkPointingTo(target)
+            },
+        ).forEachIndexed { index, createCollision ->
+            val source = extension()
+            val marker = source.resolve("_sixbridge/action-popup-entry.v2.json")
+            val manifestBefore = source.resolve("manifest.json").readBytes()
+            createCollision(marker)
 
-        assertFailsWith<ConversionPlanningException> {
-            applyAdapterToSource(
-                source,
-                profile,
-                ActionPopupEntryAdapter(),
-                selected,
+            assertFails("collision $index") {
+                applyApproved(source)
+            }
+
+            assertContentEquals(
+                manifestBefore,
+                source.resolve("manifest.json").readBytes(),
+                "collision $index",
             )
         }
-        assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
     }
 
     @Test
-    fun `analyzer marks only exact generated action assets and wiring as applied`() {
-        val source = extension(
-            worker = "scripts/background.js",
-            workerType = "module",
-        )
-        applyApproved(source)
-
-        val applied = MobilePatternAnalyzer().analyze(source, profile)
-            .adapterDecisions
-            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        assertTrue(applied.applied)
-
-        source.resolve("_sixbridge/action-popup-entry-background.v1.js")
-            .writeText("tampered generated asset")
-        val tampered = MobilePatternAnalyzer().analyze(source, profile)
-            .adapterDecisions
-            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        assertFalse(tampered.applied)
-    }
-
-    @Test
-    fun `rejects encoded and URL-like popup and worker paths`() {
-        val unsafeSegments = listOf(
-            "%2e%2e/popup.html",
-            ".%2e/popup.html",
-            "%2e./popup.html",
-            "%2fpopup.html",
-            "%5cpopup.html",
-            "https://example.test/popup.html",
-            "popup.html?mode=1",
-            "popup.html#fragment",
-            """folder\popup.html""",
-        )
-        unsafeSegments.forEach { unsafePopup ->
-            val source = extension(popup = unsafePopup)
-            val report = MobilePatternAnalyzer().analyze(source, profile)
-
-            assertEquals(
-                dev.sixbridge.core.compat.CompatibilityStatus.BLOCKED,
-                report.status,
-                unsafePopup,
-            )
-            assertTrue(report.adapterDecisions.isEmpty(), unsafePopup)
-        }
-
-        val unsafeWorkers = listOf(
-            "%2e%2e/background.js",
-            ".%2e/background.js",
-            "%2e./background.js",
-            "%2fbackground.js",
-            "%5cbackground.js",
-            "https://example.test/background.js",
-            "background.js?mode=1",
-            "background.js#fragment",
-            """folder\background.js""",
-        )
-        unsafeWorkers.forEach { unsafeWorker ->
-            val source = extension(worker = "background.js")
+    fun `rejects popup removed or replaced after approval`() {
+        listOf<(Path) -> Unit>(
+            { popup -> popup.deleteExisting() },
+            { popup ->
+                popup.deleteExisting()
+                val target = Files.createTempFile("six-action-popup", ".html")
+                popup.createSymbolicLinkPointingTo(target)
+            },
+            { popup ->
+                popup.deleteExisting()
+                Files.createDirectory(popup)
+            },
+        ).forEachIndexed { index, mutatePopup ->
+            val source = extension()
             val selected = approvedSelection(source)
-            val unsafeOutput = source.resolve(unsafeWorker.removePrefix("/")).normalize()
-            Files.createDirectories(unsafeOutput.parent)
-            unsafeOutput.writeText("globalThis.unsafeWorker = true;")
-            source.resolve("manifest.json").writeText(
-                JsonObject(
-                    manifest(source) + (
-                        "background" to JsonObject(
-                            mapOf("service_worker" to JsonPrimitive(unsafeWorker)),
-                        )
-                    ),
-                ).toString(),
-            )
+            mutatePopup(source.resolve("popup.html"))
+            val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            val attempt = runCatching {
+            assertFails("popup mutation $index") {
                 applyAdapterToSource(
                     source,
                     profile,
@@ -426,160 +154,130 @@ class ActionPopupEntryAdapterTest {
                     selected,
                 )
             }
-            attempt.getOrNull()?.let { assertFalse(it.applied, unsafeWorker) }
-            assertFalse(Files.exists(source.resolve("_sixbridge")), unsafeWorker)
-        }
-    }
 
-    @Test
-    fun `embeds the popup as an escaped JavaScript string`() {
-        val popup = "popup-\"quoted.html"
-        val source = extension(popup = popup)
-
-        applyApproved(source)
-
-        val generated = source.resolve(
-            "_sixbridge/action-popup-entry-background.v1.js",
-        ).readText()
-        assertTrue("""const popupPath = "popup-\"quoted.html";""" in generated)
-    }
-
-    @Test
-    fun `reapplying is a byte for byte no op for no worker classic and module forms`() {
-        listOf(
-            null to null,
-            "background.js" to null,
-            "background.js" to "module",
-        ).forEach { (worker, workerType) ->
-            val source = extension(worker = worker, workerType = workerType)
-            val adapter = ActionPopupEntryAdapter()
-            val selection = approvedSelection(source)
-
-            applyAdapterToSource(source, profile, adapter, selection)
-            val manifestBefore = source.resolve("manifest.json").readBytes()
-            val zipBefore = ExtensionZip.createBytes(source)
-            val reapplied = applyAdapterToSource(
-                source,
-                profile,
-                adapter,
-                selection,
+            assertContentEquals(
+                manifestBefore,
+                source.resolve("manifest.json").readBytes(),
+                "popup mutation $index",
             )
-
-            assertTrue(reapplied.applied)
-            assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
-            assertContentEquals(zipBefore, ExtensionZip.createBytes(source))
+            assertFalse(Files.exists(source.resolve("_sixbridge")), "popup mutation $index")
         }
     }
 
     @Test
-    fun `rejects generated asset collisions and parent conflicts before changing the manifest`() {
-        val collision = extension(worker = "background.js")
-        val collisionManifest = collision.resolve("manifest.json").readBytes()
-        val generated = collision.resolve("_sixbridge/action-popup-entry-content.v1.js")
-        Files.createDirectories(generated.parent)
-        generated.writeText("foreign bytes")
+    fun `reapplying is a manifest and zip byte for byte no op`() {
+        val source = extension(worker = "background.js")
+        val selected = approvedSelection(source)
+        applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            selected,
+        )
+        val manifestBefore = source.resolve("manifest.json").readBytes()
+        val zipBefore = ExtensionZip.createBytes(source)
 
-        assertFailsWith<IllegalStateException> {
-            applyApproved(collision)
-        }
-        assertContentEquals(collisionManifest, collision.resolve("manifest.json").readBytes())
-        assertEquals("foreign bytes", generated.readText())
-        assertFalse(
-            Files.exists(collision.resolve("_sixbridge/action-popup-entry-background.v1.js")),
+        val reapplied = applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            selected,
         )
 
-        val parentConflict = extension()
-        val parentManifest = parentConflict.resolve("manifest.json").readBytes()
-        parentConflict.resolve("_sixbridge").writeText("not a directory")
-
-        assertFailsWith<IllegalStateException> {
-            applyApproved(parentConflict)
-        }
-        assertContentEquals(parentManifest, parentConflict.resolve("manifest.json").readBytes())
+        assertTrue(reapplied.applied)
+        assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
+        assertContentEquals(zipBefore, ExtensionZip.createBytes(source))
     }
 
     @Test
-    fun `canonicalizes generated aliases and rejects an unproven generated bootstrap`() {
+    fun `reports false after provenance tampering`() {
         val source = extension()
         applyApproved(source)
-        val firstManifest = manifest(source)
-        val blocks = firstManifest["content_scripts"] as JsonArray
-        val block = blocks[0] as JsonObject
-        val aliasedBlock = JsonObject(
-            block + (
-                "js" to JsonArray(
-                    listOf(
-                        JsonPrimitive("content.js"),
-                        JsonPrimitive("./_sixbridge/action-popup-entry-content.v1.js"),
-                        JsonPrimitive("/_sixbridge/action-popup-entry-content.v1.js"),
-                    ),
-                )
+        val adapter = ActionPopupEntryAdapter()
+
+        assertTrue(adapter.isExactlyApplied(source, manifest(source), "popup.html"))
+
+        source.resolve("_sixbridge/action-popup-entry.v2.json")
+            .writeText("""{"adapter":"foreign","version":2,"popup":"popup.html"}""")
+
+        assertFalse(adapter.isExactlyApplied(source, manifest(source), "popup.html"))
+    }
+
+    @Test
+    fun `reports false after options ui tampering`() {
+        val source = extension()
+        applyApproved(source)
+        val adapter = ActionPopupEntryAdapter()
+        val appliedManifest = manifest(source)
+        val tamperedOptions = listOf(
+            JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("popup.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                    "extra" to JsonPrimitive(true),
+                ),
+            ),
+            JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("other.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                ),
+            ),
+            JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("popup.html"),
+                    "open_in_tab" to JsonPrimitive(false),
+                ),
             ),
         )
-        val aliasedManifest = JsonObject(
-            firstManifest + ("content_scripts" to JsonArray(listOf(aliasedBlock))),
+
+        tamperedOptions.forEach { options ->
+            val tampered = JsonObject(appliedManifest + ("options_ui" to options))
+            assertFalse(adapter.isExactlyApplied(source, tampered, "popup.html"), options.toString())
+        }
+    }
+
+    @Test
+    fun `does not create version one runtime assets`() {
+        val source = extension(worker = "background.js")
+        applyApproved(source)
+
+        listOf(
+            "_sixbridge/action-popup-entry-content.v1.js",
+            "_sixbridge/action-popup-entry-background.v1.js",
+            "_sixbridge-action-popup-entry-bootstrap.v1.js",
+        ).forEach { relativePath ->
+            assertFalse(Files.exists(source.resolve(relativePath)), relativePath)
+        }
+        assertEquals(
+            listOf("content.js", "second.js"),
+            (manifest(source)["content_scripts"] as JsonArray)
+                .flatMap { block ->
+                    ((block as JsonObject)["js"] as JsonArray)
+                        .map { (it as JsonPrimitive).content }
+                },
         )
-        source.resolve("manifest.json").writeText(aliasedManifest.toString())
+    }
+
+    @Test
+    fun `canonicalizes popup path for options ui and provenance`() {
+        val source = extension(popup = "/pages/../popup.html")
 
         applyApproved(source)
 
         assertEquals(
-            listOf("_sixbridge/action-popup-entry-content.v1.js", "content.js"),
-            scripts((manifest(source)["content_scripts"] as JsonArray)[0] as JsonObject),
+            JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("popup.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                ),
+            ),
+            manifest(source)["options_ui"],
         )
-
-        val tampered = extension(worker = "background.js")
-        applyApproved(tampered)
-        val manifestBefore = tampered.resolve("manifest.json").readBytes()
-        tampered.resolve("_sixbridge-action-popup-entry-bootstrap.v1.js")
-            .writeText("importScripts(\"./background.js\");")
-
-        assertFailsWith<IllegalStateException> {
-            applyApproved(tampered)
-        }
-        assertContentEquals(manifestBefore, tampered.resolve("manifest.json").readBytes())
-    }
-
-    @Test
-    fun `does not reenter generated bootstrap imports without a new decision`() {
-        listOf(
-            "./%2e%2e/background.js",
-            "./.%2e/background.js",
-            "./%2e./background.js",
-            "./%2fbackground.js",
-            "./%5cbackground.js",
-        ).forEach { unsafeImport ->
-            val source = extension(worker = "scripts/background.js")
-            val selected = approvedSelection(source)
-            applyAdapterToSource(
-                source,
-                profile,
-                ActionPopupEntryAdapter(),
-                selected,
-            )
-            val bootstrap = source.resolve(
-                "scripts/_sixbridge-action-popup-entry-bootstrap.v1.js",
-            )
-            bootstrap.writeText(
-                "importScripts(${JsonPrimitive(unsafeImport)}, " +
-                    "\"../_sixbridge/action-popup-entry-background.v1.js\");\n",
-            )
-            val manifestBefore = source.resolve("manifest.json").readBytes()
-
-            assertFailsWith<ConversionPlanningException>(unsafeImport) {
-                applyAdapterToSource(
-                    source,
-                    profile,
-                    ActionPopupEntryAdapter(),
-                    selected,
-                )
-            }
-            assertContentEquals(
-                manifestBefore,
-                source.resolve("manifest.json").readBytes(),
-                unsafeImport,
-            )
-        }
+        assertEquals(
+            """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
+            source.resolve("_sixbridge/action-popup-entry.v2.json").readText(),
+        )
     }
 
     private fun applyApproved(source: Path): AdapterDecision =
@@ -594,6 +292,7 @@ class ActionPopupEntryAdapterTest {
         val report = MobilePatternAnalyzer().analyze(source, profile)
         val decision = report.adapterDecisions
             .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
+        assertEquals(2, decision.version)
         assertEquals(AdapterDisposition.REQUIRES_APPROVAL, decision.disposition)
         return ConversionPlanner()
             .plan(report, setOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY))
@@ -604,47 +303,26 @@ class ActionPopupEntryAdapterTest {
     private fun manifest(root: Path): JsonObject =
         Json.parseToJsonElement(root.resolve("manifest.json").readText()) as JsonObject
 
-    private fun scripts(block: JsonObject): List<String> =
-        (block["js"] as JsonArray).map { (it as JsonPrimitive).content }
-
     private fun extension(
-        popup: String? = "popup.html",
-        hasContent: Boolean = true,
+        popup: String = "popup.html",
         worker: String? = null,
-        workerType: String? = null,
-        workerSource: String = "globalThis.originalWorker = true;",
     ): Path {
         val root = Files.createTempDirectory("six-action-popup-entry")
-        val popupMember = popup?.let {
-            ""","action":{"default_popup":${JsonPrimitive(it)}}"""
-        }.orEmpty()
-        val contentMember = if (hasContent) {
-            ""","content_scripts":[{"matches":["https://example.test/*"],"js":["content.js"]},{"matches":["https://second.example.test/*"],"js":["second.js"]}]"""
-        } else {
-            ""
-        }
-        val typeMember = workerType?.let { ""","type":${JsonPrimitive(it)}""" }.orEmpty()
         val backgroundMember = worker?.let {
-            ""","background":{"service_worker":${JsonPrimitive(it)}$typeMember}"""
+            ""","background":{"service_worker":${JsonPrimitive(it)}}"""
         }.orEmpty()
         root.resolve("manifest.json").writeText(
-            """{"manifest_version":3,"name":"Action fixture","version":"1","permissions":["storage"],"host_permissions":["https://example.test/*"]$popupMember$contentMember$backgroundMember}""",
+            """{"manifest_version":3,"name":"Action fixture","version":"1","permissions":["storage"],"host_permissions":["https://example.test/*"],"action":{"default_popup":${JsonPrimitive(popup)}},"content_scripts":[{"matches":["https://example.test/*"],"js":["content.js"]},{"matches":["https://second.example.test/*"],"js":["second.js"]}]$backgroundMember}""",
         )
-        if (hasContent) {
-            root.resolve("content.js").writeText("console.log('content');")
-            root.resolve("second.js").writeText("console.log('second');")
-        }
-        popup?.takeUnless { '\\' in it }?.let { path ->
-            val output = root.resolve(path)
-            Files.createDirectories(output.parent)
-            output.writeText("<p>popup</p>")
-        }
+        root.resolve("content.js").writeText("console.log('content');")
+        root.resolve("second.js").writeText("console.log('second');")
+        val popupOutput = root.resolve(popup.removePrefix("/")).normalize()
+        Files.createDirectories(popupOutput.parent)
+        popupOutput.writeText("<p>popup</p>")
         worker?.let {
             val output = root.resolve(it.removePrefix("/")).normalize()
-            if (output.startsWith(root)) {
-                Files.createDirectories(output.parent)
-                output.writeText(workerSource)
-            }
+            Files.createDirectories(output.parent)
+            output.writeText("globalThis.originalWorker = true;")
         }
         return root
     }
@@ -658,5 +336,6 @@ class ActionPopupEntryAdapterTest {
         wrapperContract = WrapperContract.complete(),
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 }

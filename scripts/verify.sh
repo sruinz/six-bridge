@@ -20,7 +20,6 @@ GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
 
 node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/minimal-mv3/content.test.mjs \
-  fixtures/desktop-mobile-golden/action-entry.test.mjs \
   fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
   fixtures/desktop-mobile-golden/storage-fallback.test.mjs
 
