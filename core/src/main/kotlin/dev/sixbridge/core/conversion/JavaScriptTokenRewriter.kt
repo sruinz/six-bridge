@@ -42,7 +42,6 @@ class JavaScriptTokenRewriter {
         val hazards = environmentHazards(
             source,
             codeOnly,
-            sourceWithoutComments,
             scan.recognizedRootStarts,
         )
         val unsafe = (scan.unsafeAccesses + hazards)
@@ -158,7 +157,6 @@ class JavaScriptTokenRewriter {
     private fun environmentHazards(
         source: String,
         codeOnly: String,
-        sourceWithoutComments: String,
         recognizedRootStarts: Set<Int>,
     ): List<UnsafeStorageAccess> = buildList {
         EVAL_IDENTIFIER.findAll(codeOnly).forEach { match ->
@@ -167,16 +165,14 @@ class JavaScriptTokenRewriter {
         WITH_STATEMENT.findAll(codeOnly).forEach { match ->
             add(unsafe(source, match.range.first, "with 실행 환경은 자동 변환할 수 없습니다."))
         }
-        GLOBAL_ROOT_ACCESS.findAll(sourceWithoutComments).forEach { match ->
-            if (codeOnly.getOrNull(match.range.first)?.isJavaIdentifierStart() == true) {
-                add(
-                    unsafe(
-                        source,
-                        match.range.first,
-                        "global root assignment 또는 접근은 자동 변환할 수 없습니다.",
-                    ),
-                )
-            }
+        GLOBAL_ROOT_IDENTIFIER.findAll(codeOnly).forEach { match ->
+            add(
+                unsafe(
+                    source,
+                    match.range.first,
+                    "global root identifier가 있어 자동 변환할 수 없습니다.",
+                ),
+            )
         }
         ROOT_IDENTIFIER.findAll(codeOnly).forEach { match ->
             val start = match.range.first
@@ -363,10 +359,7 @@ class JavaScriptTokenRewriter {
             """\b(?:chrome|browser)\b.*\bstorage\b.*\bsync\b""",
             setOf(RegexOption.DOT_MATCHES_ALL),
         )
-        val GLOBAL_ROOT_ACCESS = Regex(
-            """\b(?:globalThis|window)\s*(?:\.\s*(?:chrome|browser)\b|""" +
-                """\[\s*(["'])(?:chrome|browser)\1\s*])""",
-        )
+        val GLOBAL_ROOT_IDENTIFIER = Regex("""\b(?:globalThis|window)\b""")
         val COMPUTED_STRING = Regex("""(["'])([A-Za-z_$][\w$]*)\1""")
         val COMPUTED_TEMPLATE = Regex("""`([A-Za-z_$][\w$]*)`""")
     }

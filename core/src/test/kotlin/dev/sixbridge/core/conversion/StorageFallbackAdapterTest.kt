@@ -210,6 +210,32 @@ class StorageFallbackAdapterTest {
     }
 
     @Test
+    fun `any executable globalThis or window identifier blocks a storage closure`() {
+        listOf(
+            """globalThis[key]; chrome.storage.sync.get("a");""",
+            """globalThis['eval']; chrome.storage.sync.get("a");""",
+            """window.location; browser.storage.sync.get("a");""",
+        ).forEach { source ->
+            val result = JavaScriptTokenRewriter().rewrite(source)
+
+            assertEquals(source, result.source)
+            assertTrue(
+                result.unsafeAccesses.any { "global root" in it.detail },
+                "$source: ${result.unsafeAccesses}",
+            )
+        }
+
+        val literals = """
+            const first = "globalThis";
+            // window
+            chrome.storage.sync.get("a");
+        """.trimIndent()
+        val safe = JavaScriptTokenRewriter().rewrite(literals)
+        assertTrue(safe.unsafeAccesses.isEmpty(), safe.unsafeAccesses.toString())
+        assertTrue("storage.local" in safe.source)
+    }
+
+    @Test
     fun `allows property names that do not bind chrome or browser`() {
         val samples = listOf(
             """
@@ -299,7 +325,7 @@ class StorageFallbackAdapterTest {
     }
 
     @Test
-    fun `rewrites only reachable scripts in working snapshot and is byte idempotent`() {
+    fun `rewrites only reachable scripts from an exact immutable original`() {
         val source = extension(
             content = "chrome.storage.sync.get('content');\r\n",
             background = """
@@ -326,9 +352,11 @@ class StorageFallbackAdapterTest {
                 .selectedAdapters
                 .single { it.id == MobilePatternAnalyzer.STORAGE_FALLBACK }
 
-            val applied = workspace.transform(snapshot, fallbackProfile) { context ->
-                StorageFallbackAdapter().apply(context, selected)
-            }
+            val applied = workspace.transform(
+                snapshot,
+                fallbackProfile,
+                conversionPlanOf(selected),
+            ).single()
 
             assertTrue(applied.applied)
             assertTrue(
@@ -353,20 +381,11 @@ class StorageFallbackAdapterTest {
                 snapshot.originalRoot.resolve("background.js").readBytes(),
             )
 
-            val beforeReapply = treeBytes(snapshot.workingRoot)
-            val reapplied = workspace.transform(snapshot, fallbackProfile) { context ->
-                StorageFallbackAdapter().apply(context, selected)
-            }
-
-            assertTrue(reapplied.applied)
-            assertTrue(reapplied.changes.isEmpty())
-            assertEquals(applied.remainingLimitations, reapplied.remainingLimitations)
             assertTrue(
                 applied.remainingLimitations.any {
                     "기존 storage.sync 데이터" in it && "이관" in it
                 },
             )
-            assertEquals(beforeReapply, treeBytes(snapshot.workingRoot))
         }
     }
 
@@ -381,9 +400,11 @@ class StorageFallbackAdapterTest {
             val before = treeBytes(working)
 
             assertFailsWith<IllegalStateException> {
-                workspace.transform(snapshot, fallbackProfile) { context ->
-                    StorageFallbackAdapter().apply(context, selected)
-                }
+                workspace.transform(
+                    snapshot,
+                    fallbackProfile,
+                    conversionPlanOf(selected),
+                )
             }
 
             assertEquals(before, treeBytes(working))
@@ -403,9 +424,11 @@ class StorageFallbackAdapterTest {
             val before = treeBytes(working)
 
             assertFailsWith<IllegalStateException> {
-                workspace.transform(snapshot, fallbackProfile) { context ->
-                    StorageFallbackAdapter().apply(context, selected)
-                }
+                workspace.transform(
+                    snapshot,
+                    fallbackProfile,
+                    conversionPlanOf(selected),
+                )
             }
 
             assertEquals(before, treeBytes(working))
@@ -429,9 +452,11 @@ class StorageFallbackAdapterTest {
             if (!symlinkCreated) return
 
             assertFailsWith<ConversionExecutionException> {
-                workspace.transform(snapshot, fallbackProfile) { context ->
-                    StorageFallbackAdapter().apply(context, selected)
-                }
+                workspace.transform(
+                    snapshot,
+                    fallbackProfile,
+                    conversionPlanOf(selected),
+                )
             }
             assertEquals("chrome.storage.sync.get('outside');", outside.readText())
         }
@@ -457,32 +482,15 @@ class StorageFallbackAdapterTest {
             if (!linked) return
 
             assertFailsWith<IllegalStateException> {
-                workspace.transform(snapshot, fallbackProfile) { context ->
-                    StorageFallbackAdapter().apply(context, selected)
-                }
+                workspace.transform(
+                    snapshot,
+                    fallbackProfile,
+                    conversionPlanOf(selected),
+                )
             }
 
             assertEquals("unchanged", outside.resolve("sentinel.txt").readText())
             assertFalse(Files.exists(outside.resolve("content.js")))
-        }
-    }
-
-    @Test
-    fun `requires an active same-process conversion context`() {
-        val source = extension("chrome.storage.sync.get('a');")
-        ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
-            val selected = selected(snapshot.originalRoot)
-            lateinit var expired: AdapterExecutionContext
-            workspace.transform(snapshot, fallbackProfile) { context ->
-                expired = context
-            }
-
-            val error = assertFailsWith<IllegalStateException> {
-                StorageFallbackAdapter().apply(expired, selected)
-            }
-
-            assertTrue("활성" in requireNotNull(error.message))
         }
     }
 
@@ -513,9 +521,11 @@ class StorageFallbackAdapterTest {
                 val before = treeBytes(working)
 
                 assertFailsWith<IllegalStateException> {
-                    workspace.transform(snapshot, fallbackProfile) { context ->
-                        StorageFallbackAdapter().apply(context, selected)
-                    }
+                    workspace.transform(
+                        snapshot,
+                        fallbackProfile,
+                        conversionPlanOf(selected),
+                    )
                 }
 
                 assertEquals(before, treeBytes(working))
@@ -553,15 +563,17 @@ class StorageFallbackAdapterTest {
             ).selectedAdapters.single()
 
             assertFailsWith<IllegalStateException> {
-                workspace.transform(snapshot, fallbackProfile) { context ->
-                    StorageFallbackAdapter().apply(context, selected)
-                }
+                workspace.transform(
+                    snapshot,
+                    fallbackProfile,
+                    conversionPlanOf(selected),
+                )
             }
         }
     }
 
     @Test
-    fun `does not accept another adapter selection capability`() {
+    fun `registry routes another adapter selection without invoking storage`() {
         val source = extension(
             content = """
                 document.addEventListener("mouseup", (event) => use(getSelection()));
@@ -576,13 +588,24 @@ class StorageFallbackAdapterTest {
         }
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
-            val before = treeBytes(snapshot.workingRoot)
-            val result = workspace.transform(snapshot, fallbackProfile) { context ->
-                StorageFallbackAdapter().apply(context, selection)
-            }
+            val result = workspace.transform(
+                snapshot,
+                fallbackProfile,
+                conversionPlanOf(selection),
+            ).single()
 
-            assertFalse(result.applied)
-            assertEquals(before, treeBytes(snapshot.workingRoot))
+            assertTrue(result.applied)
+            assertTrue(
+                Files.exists(
+                    snapshot.workingRoot.resolve(
+                        "_sixbridge/desktop-selection-event-bridge.v1.js",
+                    ),
+                ),
+            )
+            assertTrue(
+                "chrome.storage.sync" in
+                    snapshot.workingRoot.resolve("content.js").readText(),
+            )
         }
     }
 

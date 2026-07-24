@@ -26,16 +26,12 @@ class ConversionCompositionTest {
     )
 
     @Test
-    fun `applies action selection and storage in planner order in one transaction`() {
+    fun `executes storage first but returns decisions in planner order`() {
         val source = extension()
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
             val plan = plan(snapshot.originalRoot)
-            val applied = workspace.transform(snapshot, profile) { context ->
-                plan.selectedAdapters.map { selected ->
-                    adapters.getValue(selected.id).apply(context, selected)
-                }
-            }
+            val applied = workspace.transform(snapshot, profile, plan)
 
             assertEquals(
                 listOf(
@@ -57,7 +53,7 @@ class ConversionCompositionTest {
     }
 
     @Test
-    fun `rolls back earlier adapters when storage target is changed inside transaction`() {
+    fun `rolls back every adapter when a later adapter fails`() {
         val source = extension()
         ConversionWorkspace().use { workspace ->
             val snapshot = workspace.snapshot(source)
@@ -68,15 +64,13 @@ class ConversionCompositionTest {
             )
 
             assertFailsWith<ConversionExecutionException> {
-                workspace.transform(snapshot, profile) { context ->
-                    plan.selectedAdapters.forEach { selected ->
-                        if (selected.id == MobilePatternAnalyzer.STORAGE_FALLBACK) {
-                            context.stagedRoot.resolve("content.js")
-                                .writeText("chrome.storage.sync.get('tampered');")
-                        }
-                        adapters.getValue(selected.id).apply(context, selected)
-                    }
-                }
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = plan,
+                    failAfterAdapterId =
+                        MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
+                )
             }
 
             assertTrue(
@@ -99,11 +93,7 @@ class ConversionCompositionTest {
             val differentProfile = profile.copy(versionCode = profile.versionCode + 1)
 
             assertFailsWith<ConversionExecutionException> {
-                workspace.transform(snapshot, differentProfile) { context ->
-                    plan.selectedAdapters.forEach { selected ->
-                        adapters.getValue(selected.id).apply(context, selected)
-                    }
-                }
+                workspace.transform(snapshot, differentProfile, plan)
             }
         }
     }
@@ -143,13 +133,4 @@ class ConversionCompositionTest {
                 """.trimIndent(),
             )
         }
-
-    private companion object {
-        val adapters: Map<String, MobileAdapter> = mapOf(
-            MobilePatternAnalyzer.ACTION_POPUP_ENTRY to ActionPopupEntryAdapter(),
-            MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE to
-                DesktopSelectionEventBridge(),
-            MobilePatternAnalyzer.STORAGE_FALLBACK to StorageFallbackAdapter(),
-        )
-    }
 }

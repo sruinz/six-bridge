@@ -13,7 +13,7 @@ import java.nio.file.Path
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.io.path.readText
 
-class ActionPopupEntryAdapter : MobileAdapter {
+internal class ActionPopupEntryAdapter : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.ACTION_POPUP_ENTRY
     override val version: Int = 1
 
@@ -21,7 +21,7 @@ class ActionPopupEntryAdapter : MobileAdapter {
         context: AdapterExecutionContext,
         selected: SelectedAdapter,
     ): AdapterDecision {
-        val workingRoot = context.requireActive().stagedRoot
+        val workingRoot = context.stagedRoot
         val decision = selected.toDecision()
         if (decision.id != id || decision.version != version ||
             decision.disposition != AdapterDisposition.REQUIRES_APPROVAL

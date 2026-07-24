@@ -31,6 +31,7 @@ class ConversionWorkspace : AutoCloseable {
                 sourceRoot = source,
                 includeProjectMarker = true,
             )
+            val sourceTree = WorkspaceTreeDigest.capture(source)
             require(
                 sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
                     source,
@@ -39,14 +40,27 @@ class ConversionWorkspace : AutoCloseable {
             ) {
                 "snapshot 중 source project identity marker가 변경되었습니다."
             }
-            val original = ExtensionZip.extract(
-                sourceZip,
+            val original = NativeWorkspaceTree.copy(
+                source,
                 snapshotRoot.resolve("original"),
             )
-            val working = ExtensionZip.extract(
-                sourceZip,
+            val working = NativeWorkspaceTree.copy(
+                source,
                 snapshotRoot.resolve("working"),
             )
+            check(sourceTree == WorkspaceTreeDigest.capture(source)) {
+                "snapshot 중 source native tree가 변경되었습니다."
+            }
+            check(
+                sourceZip.contentEquals(
+                    ExtensionZip.createBytes(
+                        sourceRoot = source,
+                        includeProjectMarker = true,
+                    ),
+                ),
+            ) {
+                "snapshot 중 source bundle tree가 변경되었습니다."
+            }
             ConversionWorkspaceOwnership.register(
                 originalRoot = original,
                 workingRoot = working,
@@ -68,41 +82,53 @@ class ConversionWorkspace : AutoCloseable {
         }
     }
 
-    fun <T> transform(
+    fun transform(
         snapshot: ExtensionSnapshot,
         profile: BrowserProfile,
-        transform: (AdapterExecutionContext) -> T,
-    ): T = transformWith(
+        plan: ConversionPlan,
+    ): List<AdapterDecision> = transformWith(
         snapshot,
         profile,
+        plan,
         ConversionWorkspaceTransaction(),
-        transform,
+        MobileAdapterRegistry.DEFAULT,
     )
 
-    internal fun <T> transformForTesting(
+    internal fun transformForTesting(
         snapshot: ExtensionSnapshot,
         profile: BrowserProfile,
+        plan: ConversionPlan,
         moveDirectory: (Path, Path) -> Unit = { from, to ->
             Files.move(from, to, ATOMIC_MOVE)
         },
+        mutateStage: (Path) -> Unit = {},
         beforePublish: () -> Unit = {},
-        transform: (AdapterExecutionContext) -> T,
-    ): T = transformWith(
+        afterBackupMove: (Path) -> Unit = {},
+        afterStagePublish: (Path) -> Unit = {},
+        beforeOwnershipUpdate: (Path) -> Unit = {},
+        failAfterAdapterId: String? = null,
+    ): List<AdapterDecision> = transformWith(
         snapshot,
         profile,
+        plan,
         ConversionWorkspaceTransaction(
             moveDirectory = moveDirectory,
+            beforeExecution = mutateStage,
             beforePublish = beforePublish,
+            afterBackupMove = afterBackupMove,
+            afterStagePublish = afterStagePublish,
+            beforeOwnershipUpdate = beforeOwnershipUpdate,
         ),
-        transform,
+        MobileAdapterRegistry.forTesting(failAfterAdapterId),
     )
 
-    private fun <T> transformWith(
+    private fun transformWith(
         snapshot: ExtensionSnapshot,
         profile: BrowserProfile,
+        plan: ConversionPlan,
         transaction: ConversionWorkspaceTransaction,
-        transform: (AdapterExecutionContext) -> T,
-    ): T {
+        registry: MobileAdapterRegistry,
+    ): List<AdapterDecision> {
         check(!closed) { "이미 정리된 conversion workspace입니다." }
         check(ownedSnapshots.containsKey(snapshot)) {
             "이 ConversionWorkspace가 발급한 snapshot이 아닙니다."
@@ -113,7 +139,8 @@ class ConversionWorkspace : AutoCloseable {
                 originalRoot = snapshot.originalRoot,
                 workingRoot = snapshot.workingRoot,
                 profile = profile,
-                transform = transform,
+                selectedAdapters = plan.selectedAdapters,
+                registry = registry,
             )
         } catch (error: Error) {
             throw error

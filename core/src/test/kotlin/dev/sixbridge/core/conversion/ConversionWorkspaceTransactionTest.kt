@@ -20,14 +20,18 @@ import kotlin.test.assertTrue
 class ConversionWorkspaceTransactionTest {
     @Test
     fun `publishes only a fully transformed staged tree`() {
-        val source = extension()
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
 
-            workspace.transform(snapshot, profile) { context ->
-                context.stagedRoot.resolve("one.js").writeText("changed-one")
-                context.stagedRoot.resolve("two.js").writeText("changed-two")
-            }
+            workspace.transformForTesting(
+                snapshot = snapshot,
+                profile = profile,
+                plan = emptyPlan,
+                mutateStage = { stage ->
+                    stage.resolve("one.js").writeText("changed-one")
+                    stage.resolve("two.js").writeText("changed-two")
+                },
+            )
 
             assertEquals("changed-one", snapshot.workingRoot.resolve("one.js").readText())
             assertEquals("changed-two", snapshot.workingRoot.resolve("two.js").readText())
@@ -37,31 +41,34 @@ class ConversionWorkspaceTransactionTest {
     }
 
     @Test
-    fun `transform failure leaves the published tree byte unchanged`() {
-        val source = extension()
+    fun `transform failure leaves the published tree unchanged`() {
         ConversionWorkspace().use { workspace ->
-            val working = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
 
             assertFailsWith<ConversionExecutionException> {
-                workspace.transform(working, profile) { context ->
-                    context.stagedRoot.resolve("one.js").writeText("partial")
-                    throw IllegalStateException("transform failed")
-                }
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = { stage ->
+                        stage.resolve("one.js").writeText("partial")
+                        throw IllegalStateException("transform failed")
+                    },
+                )
             }
 
-            assertEquals("one", working.workingRoot.resolve("one.js").readText())
-            ConversionWorkspaceOwnership.requireUsable(working.workingRoot)
+            assertEquals("one", snapshot.workingRoot.resolve("one.js").readText())
+            ConversionWorkspaceOwnership.requireUsable(snapshot.workingRoot)
         }
     }
 
     @Test
     fun `no-op transform preserves the working root identity`() {
-        val source = extension()
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
             val before = fileKey(snapshot.workingRoot)
 
-            workspace.transform(snapshot, profile) { "no-op" }
+            workspace.transform(snapshot, profile, emptyPlan)
 
             assertEquals(before, fileKey(snapshot.workingRoot))
         }
@@ -69,9 +76,8 @@ class ConversionWorkspaceTransactionTest {
 
     @Test
     fun `concurrent transforms for one root are serialized`() {
-        val source = extension()
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
             val firstEntered = CountDownLatch(1)
             val releaseFirst = CountDownLatch(1)
             val secondAttempting = CountDownLatch(1)
@@ -79,17 +85,25 @@ class ConversionWorkspaceTransactionTest {
             val pool = Executors.newFixedThreadPool(2)
             try {
                 val first = pool.submit<Unit> {
-                    workspace.transform(snapshot, profile) {
-                        firstEntered.countDown()
-                        releaseFirst.await()
-                    }
+                    workspace.transformForTesting(
+                        snapshot,
+                        profile,
+                        emptyPlan,
+                        beforePublish = {
+                            firstEntered.countDown()
+                            releaseFirst.await()
+                        },
+                    )
                 }
                 assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
                 val second = pool.submit<Unit> {
                     secondAttempting.countDown()
-                    workspace.transform(snapshot, profile) {
-                        secondEntered.countDown()
-                    }
+                    workspace.transformForTesting(
+                        snapshot,
+                        profile,
+                        emptyPlan,
+                        beforePublish = { secondEntered.countDown() },
+                    )
                 }
                 assertTrue(secondAttempting.await(5, TimeUnit.SECONDS))
                 assertFalse(secondEntered.await(200, TimeUnit.MILLISECONDS))
@@ -107,20 +121,21 @@ class ConversionWorkspaceTransactionTest {
 
     @Test
     fun `root mutation before publish prevents staged output publication`() {
-        val source = extension()
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
 
             assertFailsWith<ConversionExecutionException> {
                 workspace.transformForTesting(
                     snapshot = snapshot,
                     profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = {
+                        it.resolve("one.js").writeText("staged")
+                    },
                     beforePublish = {
                         snapshot.workingRoot.resolve("one.js").writeText("raced")
                     },
-                ) { context ->
-                    context.stagedRoot.resolve("one.js").writeText("staged")
-                }
+                )
             }
 
             assertEquals("raced", snapshot.workingRoot.resolve("one.js").readText())
@@ -128,23 +143,24 @@ class ConversionWorkspaceTransactionTest {
     }
 
     @Test
-    fun `root mutation in an extension zip excluded directory is still detected`() {
-        val source = extension()
+    fun `root mutation in an extension zip excluded directory is detected`() {
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
 
             assertFailsWith<ConversionExecutionException> {
                 workspace.transformForTesting(
                     snapshot = snapshot,
                     profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = {
+                        it.resolve("one.js").writeText("staged")
+                    },
                     beforePublish = {
                         val raced = snapshot.workingRoot.resolve("node_modules")
                         Files.createDirectory(raced)
                         raced.resolve("race.js").writeText("external")
                     },
-                ) { context ->
-                    context.stagedRoot.resolve("one.js").writeText("staged")
-                }
+                )
             }
 
             assertEquals(
@@ -156,16 +172,97 @@ class ConversionWorkspaceTransactionTest {
     }
 
     @Test
-    fun `failed publish and failed restore persist poison state`() {
-        val source = extension()
+    fun `backup mutation after root move is restored and not published`() {
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
+            val snapshot = workspace.snapshot(extension())
+
+            assertFailsWith<ConversionExecutionException> {
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = {
+                        it.resolve("one.js").writeText("staged")
+                    },
+                    afterBackupMove = { backup ->
+                        backup.resolve("one.js").writeText("raced-backup")
+                    },
+                )
+            }
+
+            assertEquals("raced-backup", snapshot.workingRoot.resolve("one.js").readText())
+            assertFalse(snapshot.workingRoot.resolve("one.js").readText() == "staged")
+        }
+    }
+
+    @Test
+    fun `published validation failure restores the exact previous tree`() {
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(extension())
+            val before = WorkspaceTreeDigest.contentSha256(snapshot.workingRoot)
+
+            assertFailsWith<ConversionExecutionException> {
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = {
+                        it.resolve("one.js").writeText("staged")
+                    },
+                    afterStagePublish = { published ->
+                        published.resolve("one.js").writeText("raced-published")
+                    },
+                )
+            }
+
+            assertEquals(before, WorkspaceTreeDigest.contentSha256(snapshot.workingRoot))
+            assertEquals("one", snapshot.workingRoot.resolve("one.js").readText())
+            ConversionWorkspaceOwnership.requireUsable(snapshot.workingRoot)
+        }
+    }
+
+    @Test
+    fun `ownership update race restores the previous usable tree`() {
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(extension())
+            val before = WorkspaceTreeDigest.provenanceSha256(
+                snapshot.workingRoot,
+            )
+
+            assertFailsWith<ConversionExecutionException> {
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = {
+                        it.resolve("one.js").writeText("staged")
+                    },
+                    beforeOwnershipUpdate = { published ->
+                        published.resolve("one.js").writeText("late-race")
+                    },
+                )
+            }
+
+            assertEquals(
+                before,
+                WorkspaceTreeDigest.provenanceSha256(snapshot.workingRoot),
+            )
+            assertEquals("one", snapshot.workingRoot.resolve("one.js").readText())
+            ConversionWorkspaceOwnership.requireUsable(snapshot.workingRoot)
+        }
+    }
+
+    @Test
+    fun `failed publish and failed restore persist poison state`() {
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(extension())
             var moves = 0
 
             assertFailsWith<ConversionExecutionException> {
                 workspace.transformForTesting(
                     snapshot = snapshot,
                     profile = profile,
+                    plan = emptyPlan,
                     moveDirectory = { from, to ->
                         moves++
                         when (moves) {
@@ -173,9 +270,10 @@ class ConversionWorkspaceTransactionTest {
                             else -> throw IllegalStateException("injected move failure")
                         }
                     },
-                ) { context ->
-                    context.stagedRoot.resolve("one.js").writeText("complete-stage")
-                }
+                    mutateStage = {
+                        it.resolve("one.js").writeText("complete-stage")
+                    },
+                )
             }
 
             assertFalse(Files.exists(snapshot.workingRoot))
@@ -193,36 +291,48 @@ class ConversionWorkspaceTransactionTest {
     }
 
     @Test
-    fun `execution context is active only inside its workspace transaction`() {
-        val source = extension()
+    fun `poison persistence failure remains in memory and exposes a fixed error`() {
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
-            lateinit var captured: AdapterExecutionContext
+            val snapshot = workspace.snapshot(extension())
 
-            workspace.transform(snapshot, profile) { context ->
-                captured = context
-                context.requireActive()
+            val error = assertFailsWith<WorkspacePoisonPersistenceException> {
+                ConversionWorkspaceOwnership.poisonForTesting(
+                    snapshot.workingRoot,
+                ) { _, _ ->
+                    throw IllegalStateException(
+                        "${snapshot.workingRoot}/secret-source",
+                    )
+                }
             }
 
+            assertEquals(
+                "conversion workspace poison 상태를 디스크에 기록하지 못했습니다.",
+                error.message,
+            )
+            assertEquals(null, error.cause)
             assertFailsWith<IllegalStateException> {
-                captured.requireActive()
+                ConversionWorkspaceOwnership.requireUsable(snapshot.workingRoot)
             }
         }
     }
 
     @Test
-    fun `public conversion exception does not expose staged path or source text`() {
-        val source = extension()
+    fun `public conversion exception exposes neither staged path nor source text`() {
         ConversionWorkspace().use { workspace ->
-            val snapshot = workspace.snapshot(source)
-            var stagedPath = ""
+            val snapshot = workspace.snapshot(extension())
             val secretSource = "chrome.storage.sync.get('secret-source')"
+            var stagedPath = ""
 
             val error = assertFailsWith<ConversionExecutionException> {
-                workspace.transform(snapshot, profile) { context ->
-                    stagedPath = context.stagedRoot.toString()
-                    throw IllegalStateException("$stagedPath $secretSource")
-                }
+                workspace.transformForTesting(
+                    snapshot = snapshot,
+                    profile = profile,
+                    plan = emptyPlan,
+                    mutateStage = { stage ->
+                        stagedPath = stage.toString()
+                        throw IllegalStateException("$stagedPath $secretSource")
+                    },
+                )
             }
 
             assertTrue(stagedPath.isNotBlank())
@@ -249,6 +359,7 @@ class ConversionWorkspaceTransactionTest {
         ).fileKey()?.toString()
 
     private companion object {
+        val emptyPlan = conversionPlanOf()
         val profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",
             versionName = "30.0.2.61",

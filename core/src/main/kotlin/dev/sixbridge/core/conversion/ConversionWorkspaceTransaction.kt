@@ -1,12 +1,15 @@
 package dev.sixbridge.core.conversion
 
-import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.CREATE_NEW
+import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
@@ -14,6 +17,7 @@ import java.nio.file.attribute.PosixFilePermission
 import java.util.Comparator
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -88,27 +92,17 @@ internal object ConversionWorkspaceOwnership {
     ): CapturedTree {
         val key = key(root)
         verifyLocked(key, record, verifyTree = false)
-        val treeSha256 = WorkspaceTreeDigest.sha256(key)
-        check(treeSha256 == record.workingTreeSha256) {
+        val state = WorkspaceTreeDigest.capture(key)
+        check(state.identitySha256 == record.workingTreeSha256) {
             "conversion workspace tree가 등록된 상태와 다릅니다."
         }
-        val contentSha256 = WorkspaceTreeDigest.contentSha256(key)
-        val bytes = ExtensionZip.createBytes(
-            sourceRoot = key,
-            includeProjectMarker = true,
-        )
         check(
-            WorkspaceTreeDigest.sha256(key) == treeSha256 &&
-                WorkspaceTreeDigest.contentSha256(key) == contentSha256
+            WorkspaceTreeDigest.capture(key) == state
         ) {
             "conversion workspace tree가 snapshot 중 변경되었습니다."
         }
         verifyLocked(key, record, verifyTree = false)
-        return CapturedTree(
-            zipBytes = bytes,
-            treeSha256 = treeSha256,
-            contentSha256 = contentSha256,
-        )
+        return CapturedTree(state)
     }
 
     fun verifyOriginalLocked(record: OwnershipRecord) {
@@ -133,14 +127,26 @@ internal object ConversionWorkspaceOwnership {
         check(Files.isDirectory(key, NOFOLLOW_LINKS) && !Files.isSymbolicLink(key)) {
             "published workspace root를 확인할 수 없습니다."
         }
-        record.workingFileKey = requireFileKey(key, "published working root")
-        record.workingTreeSha256 = publishedTreeSha256
-        verifyLocked(key, record, verifyTree = true)
+        val previousFileKey = record.workingFileKey
+        val previousTreeSha256 = record.workingTreeSha256
+        try {
+            record.workingFileKey = requireFileKey(key, "published working root")
+            record.workingTreeSha256 = publishedTreeSha256
+            verifyLocked(key, record, verifyTree = true)
+        } catch (error: Throwable) {
+            record.workingFileKey = previousFileKey
+            record.workingTreeSha256 = previousTreeSha256
+            throw error
+        }
     }
 
-    fun poison(root: Path, record: OwnershipRecord) {
+    fun poison(
+        root: Path,
+        record: OwnershipRecord,
+        persistMarker: (Path, String) -> Unit = ::persistPoisonMarker,
+    ) {
         record.poisoned = true
-        runCatching {
+        try {
             val key = key(root)
             verifyParent(key, record)
             val marker = markerPath(key)
@@ -148,13 +154,26 @@ internal object ConversionWorkspaceOwnership {
                 Files.isRegularFile(marker, NOFOLLOW_LINKS) &&
                     !Files.isSymbolicLink(marker),
             )
-            Files.writeString(
+            persistMarker(
                 marker,
                 markerContent(POISONED, record.token),
-                TRUNCATE_EXISTING,
-                WRITE,
-                NOFOLLOW_LINKS,
             )
+            WorkspacePermissionPolicy.requirePrivate(
+                marker,
+                record.freshWorkspaceRoot,
+            )
+        } catch (_: Throwable) {
+            throw WorkspacePoisonPersistenceException()
+        }
+    }
+
+    internal fun poisonForTesting(
+        root: Path,
+        persistMarker: (Path, String) -> Unit,
+    ) {
+        val record = record(root)
+        record.lock.withLock {
+            poison(root, record, persistMarker)
         }
     }
 
@@ -240,6 +259,51 @@ internal object ConversionWorkspaceOwnership {
         }
     }
 
+    private fun persistPoisonMarker(marker: Path, content: String) {
+        val parent = requireNotNull(marker.parent)
+        val temporary = Files.createTempFile(
+            parent,
+            ".${marker.fileName}.",
+            ".tmp",
+        )
+        try {
+            if (Files.getFileAttributeView(
+                    temporary,
+                    java.nio.file.attribute.PosixFileAttributeView::class.java,
+                    NOFOLLOW_LINKS,
+                ) != null
+            ) {
+                Files.setPosixFilePermissions(
+                    temporary,
+                    setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                    ),
+                )
+            }
+            FileChannel.open(
+                temporary,
+                WRITE,
+                TRUNCATE_EXISTING,
+            ).use { channel ->
+                val bytes = ByteBuffer.wrap(content.toByteArray(Charsets.UTF_8))
+                while (bytes.hasRemaining()) channel.write(bytes)
+                channel.force(true)
+            }
+            Files.move(
+                temporary,
+                marker,
+                ATOMIC_MOVE,
+                REPLACE_EXISTING,
+            )
+            FileChannel.open(parent, READ).use { channel ->
+                channel.force(true)
+            }
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
     private fun markerContent(state: String, token: String): String =
         "$state\n$token\n"
 
@@ -273,24 +337,32 @@ internal object ConversionWorkspaceOwnership {
     )
 
     internal data class CapturedTree(
-        val zipBytes: ByteArray,
-        val treeSha256: String,
-        val contentSha256: String,
+        val state: WorkspaceTreeDigest.State,
     )
 }
+
+internal class WorkspacePoisonPersistenceException :
+    IllegalStateException(
+        "conversion workspace poison 상태를 디스크에 기록하지 못했습니다.",
+    )
 
 internal class ConversionWorkspaceTransaction(
     private val moveDirectory: (Path, Path) -> Unit = { from, to ->
         Files.move(from, to, ATOMIC_MOVE)
     },
+    private val beforeExecution: (Path) -> Unit = {},
     private val beforePublish: () -> Unit = {},
+    private val afterBackupMove: (Path) -> Unit = {},
+    private val afterStagePublish: (Path) -> Unit = {},
+    private val beforeOwnershipUpdate: (Path) -> Unit = {},
 ) {
-    fun <T> run(
+    fun run(
         originalRoot: Path,
         workingRoot: Path,
         profile: BrowserProfile,
-        transform: (AdapterExecutionContext) -> T,
-    ): T {
+        selectedAdapters: List<SelectedAdapter>,
+        registry: MobileAdapterRegistry,
+    ): List<AdapterDecision> {
         val root = workingRoot.toAbsolutePath().normalize()
         val record = ConversionWorkspaceOwnership.record(root)
         return record.lock.withLock {
@@ -304,7 +376,8 @@ internal class ConversionWorkspaceTransaction(
                     root,
                     profile,
                     record,
-                    transform,
+                    selectedAdapters,
+                    registry,
                 )
             } finally {
                 record.active = false
@@ -312,13 +385,14 @@ internal class ConversionWorkspaceTransaction(
         }
     }
 
-    private fun <T> runLocked(
+    private fun runLocked(
         originalRoot: Path,
         root: Path,
         profile: BrowserProfile,
         record: ConversionWorkspaceOwnership.OwnershipRecord,
-        transform: (AdapterExecutionContext) -> T,
-    ): T {
+        selectedAdapters: List<SelectedAdapter>,
+        registry: MobileAdapterRegistry,
+    ): List<AdapterDecision> {
         check(originalRoot == record.originalRoot) {
             "등록된 immutable original root와 다릅니다."
         }
@@ -336,16 +410,17 @@ internal class ConversionWorkspaceTransaction(
         )
         var stagedRoot: Path? = null
         try {
-            stagedRoot = ExtensionZip.extract(sourceTree.zipBytes, stageDestination)
-            val context = ActiveAdapterExecutionContext.create(
+            stagedRoot = NativeWorkspaceTree.copy(root, stageDestination)
+            beforeExecution(stagedRoot)
+            TransactionContext.activate(
                 originalRoot = originalRoot,
                 stagedRoot = stagedRoot,
                 profile = profile,
             )
             val result = try {
-                transform(context)
+                registry.apply(TransactionContext, selectedAdapters)
             } finally {
-                context.deactivate()
+                TransactionContext.deactivate()
             }
             val stagedTree = validateCompleteTree(stagedRoot)
             beforePublish()
@@ -355,40 +430,82 @@ internal class ConversionWorkspaceTransaction(
                     record,
                 )
             check(
-                sourceTree.treeSha256 == latestWorkingTree.treeSha256 &&
-                    sourceTree.contentSha256 == latestWorkingTree.contentSha256 &&
-                    sourceTree.zipBytes.contentEquals(latestWorkingTree.zipBytes)
+                sourceTree.state == latestWorkingTree.state
             ) {
                 "conversion workspace가 transaction 실행 중 변경되었습니다."
             }
             if (
-                sourceTree.contentSha256 == stagedTree.contentSha256 &&
-                sourceTree.zipBytes.contentEquals(stagedTree.zipBytes)
+                sourceTree.state.provenanceSha256 ==
+                    stagedTree.state.provenanceSha256
             ) {
                 return result
             }
 
+            check(validateCompleteTree(stagedRoot).state == stagedTree.state) {
+                "staged conversion tree가 publish 직전에 변경되었습니다."
+            }
             moveDirectory(root, backup)
             try {
+                afterBackupMove(backup)
+                check(
+                    WorkspaceTreeDigest.capture(backup) == sourceTree.state
+                ) {
+                    "backup workspace가 root move 직후 변경되었습니다."
+                }
+                check(validateCompleteTree(stagedRoot).state == stagedTree.state) {
+                    "staged conversion tree가 root move 후 변경되었습니다."
+                }
                 moveDirectory(stagedRoot, root)
                 stagedRoot = null
-            } catch (publishError: Throwable) {
+            } catch (prePublishError: Throwable) {
                 try {
-                    moveDirectory(backup, root)
+                    if (!Files.exists(root, NOFOLLOW_LINKS) &&
+                        Files.exists(backup, NOFOLLOW_LINKS)
+                    ) {
+                        moveDirectory(backup, root)
+                    }
+                    check(
+                        WorkspaceTreeDigest.capture(root) == sourceTree.state
+                    ) {
+                        "backup restore 후 원래 workspace와 다릅니다."
+                    }
                 } catch (restoreError: Throwable) {
-                    publishError.addSuppressed(restoreError)
-                    ConversionWorkspaceOwnership.poison(root, record)
+                    prePublishError.addSuppressed(restoreError)
+                    try {
+                        ConversionWorkspaceOwnership.poison(root, record)
+                    } catch (poisonError: WorkspacePoisonPersistenceException) {
+                        poisonError.addSuppressed(prePublishError)
+                        throw poisonError
+                    }
                 }
-                throw publishError
+                throw prePublishError
             }
             try {
+                afterStagePublish(root)
+                check(
+                    validateCompleteTree(root).state == stagedTree.state
+                ) {
+                    "published workspace가 검증된 stage와 다릅니다."
+                }
+                check(
+                    WorkspaceTreeDigest.capture(backup) == sourceTree.state
+                ) {
+                    "backup workspace가 publish 중 변경되었습니다."
+                }
+                beforeOwnershipUpdate(root)
                 ConversionWorkspaceOwnership.updatePublishedLocked(
                     root,
                     record,
-                    stagedTree.treeSha256,
+                    stagedTree.state.identitySha256,
                 )
             } catch (validationError: Throwable) {
-                ConversionWorkspaceOwnership.poison(root, record)
+                restorePublishedFailure(
+                    root = root,
+                    backup = backup,
+                    expected = sourceTree.state,
+                    record = record,
+                    failure = validationError,
+                )
                 throw validationError
             }
             runCatching { deleteTree(backup) }
@@ -406,39 +523,41 @@ internal class ConversionWorkspaceTransaction(
         ) {
             "완성된 staged conversion tree를 검증할 수 없습니다."
         }
-        val treeSha256 = WorkspaceTreeDigest.sha256(root)
-        val contentSha256 = WorkspaceTreeDigest.contentSha256(root)
-        val zipBytes = ExtensionZip.createBytes(
-            sourceRoot = root,
-            includeProjectMarker = true,
-        )
-        check(
-            WorkspaceTreeDigest.sha256(root) == treeSha256 &&
-                WorkspaceTreeDigest.contentSha256(root) == contentSha256
-        ) {
-            "staged conversion tree가 snapshot 중 변경되었습니다."
+        val state = WorkspaceTreeDigest.capture(root)
+        check(WorkspaceTreeDigest.capture(root) == state) {
+            "staged conversion tree가 검증 중 변경되었습니다."
         }
-        val validationDestination = requireNotNull(root.parent).resolve(
-            ".sixbridge-validate-${UUID.randomUUID()}",
+        return ValidatedTree(state)
+    }
+
+    private fun restorePublishedFailure(
+        root: Path,
+        backup: Path,
+        expected: WorkspaceTreeDigest.State,
+        record: ConversionWorkspaceOwnership.OwnershipRecord,
+        failure: Throwable,
+    ) {
+        val quarantine = requireNotNull(root.parent).resolve(
+            ".sixbridge-quarantine-${UUID.randomUUID()}",
         )
         try {
-            val validationRoot = ExtensionZip.extract(
-                zipBytes,
-                validationDestination,
-            )
-            check(
-                WorkspaceTreeDigest.contentSha256(validationRoot) == contentSha256
-            ) {
-                "staged conversion tree에 bundle에 포함되지 않는 항목이 있습니다."
+            if (Files.exists(root, NOFOLLOW_LINKS)) {
+                moveDirectory(root, quarantine)
             }
-        } finally {
-            deleteTree(validationDestination)
+            moveDirectory(backup, root)
+            check(WorkspaceTreeDigest.capture(root) == expected) {
+                "publish 실패 후 복구된 workspace가 이전 tree와 다릅니다."
+            }
+            deleteTree(quarantine)
+        } catch (restoreError: Throwable) {
+            failure.addSuppressed(restoreError)
+            try {
+                ConversionWorkspaceOwnership.poison(root, record)
+            } catch (poisonError: WorkspacePoisonPersistenceException) {
+                poisonError.addSuppressed(failure)
+                throw poisonError
+            }
         }
-        return ValidatedTree(
-            zipBytes = zipBytes,
-            treeSha256 = treeSha256,
-            contentSha256 = contentSha256,
-        )
     }
 
     private fun deleteTree(path: Path) {
@@ -449,8 +568,76 @@ internal class ConversionWorkspaceTransaction(
     }
 
     private data class ValidatedTree(
-        val zipBytes: ByteArray,
-        val treeSha256: String,
-        val contentSha256: String,
+        val state: WorkspaceTreeDigest.State,
     )
+
+    private object TransactionContext : AdapterExecutionContext {
+        private val current = ThreadLocal<State?>()
+
+        override val originalRoot: Path
+            get() = checked(State::originalRoot)
+
+        override val stagedRoot: Path
+            get() = checked(State::stagedRoot)
+
+        override val profile: BrowserProfile
+            get() = checked(State::profile)
+
+        override fun requireExactOriginalTree() {
+            checked { state ->
+                check(
+                    WorkspaceTreeDigest.provenanceSha256(state.originalRoot) ==
+                        WorkspaceTreeDigest.provenanceSha256(state.stagedRoot),
+                ) {
+                    "storage adapter는 immutable original과 같은 stage에서만 실행됩니다."
+                }
+            }
+        }
+
+        @JvmSynthetic
+        fun activate(
+            originalRoot: Path,
+            stagedRoot: Path,
+            profile: BrowserProfile,
+        ) {
+            check(current.get() == null) {
+                "adapter execution context가 이미 활성 상태입니다."
+            }
+            current.set(
+                State(
+                    active = AtomicBoolean(true),
+                    originalRoot = originalRoot,
+                    stagedRoot = stagedRoot,
+                    profile = profile,
+                ),
+            )
+        }
+
+        @JvmSynthetic
+        fun deactivate() {
+            val state = requireNotNull(current.get()) {
+                "adapter execution context가 활성 상태가 아닙니다."
+            }
+            check(state.active.compareAndSet(true, false)) {
+                "adapter execution context가 이미 비활성 상태입니다."
+            }
+            current.remove()
+        }
+
+        private inline fun <T> checked(block: (State) -> T): T {
+            val state = current.get()
+            check(state != null && state.active.get()) {
+                "adapter execution context가 활성 상태가 아닙니다."
+            }
+            return block(state)
+        }
+
+        private data class State(
+            val active: AtomicBoolean,
+            val originalRoot: Path,
+            val stagedRoot: Path,
+            val profile: BrowserProfile,
+        )
+    }
+
 }

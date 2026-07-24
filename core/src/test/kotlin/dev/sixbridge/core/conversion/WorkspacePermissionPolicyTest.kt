@@ -12,7 +12,16 @@ class WorkspacePermissionPolicyTest {
                 posixAvailable = false,
                 aclOwnerOnly = false,
                 runtimeName = "Android Runtime",
-                insideFreshWorkspaceRoot = true,
+                androidPrivatePathVerified = true,
+            ),
+        )
+        assertEquals(
+            WorkspacePermissionMode.UNSUPPORTED,
+            WorkspacePermissionPolicy.selectMode(
+                posixAvailable = false,
+                aclOwnerOnly = false,
+                runtimeName = "Android Runtime",
+                androidPrivatePathVerified = false,
             ),
         )
     }
@@ -25,7 +34,7 @@ class WorkspacePermissionPolicyTest {
                 posixAvailable = false,
                 aclOwnerOnly = false,
                 runtimeName = "OpenJDK Runtime Environment",
-                insideFreshWorkspaceRoot = true,
+                androidPrivatePathVerified = false,
             ),
         )
     }
@@ -38,7 +47,7 @@ class WorkspacePermissionPolicyTest {
                 posixAvailable = true,
                 aclOwnerOnly = false,
                 runtimeName = "OpenJDK Runtime Environment",
-                insideFreshWorkspaceRoot = true,
+                androidPrivatePathVerified = false,
             ),
         )
         assertEquals(
@@ -47,7 +56,7 @@ class WorkspacePermissionPolicyTest {
                 posixAvailable = false,
                 aclOwnerOnly = true,
                 runtimeName = "OpenJDK Runtime Environment",
-                insideFreshWorkspaceRoot = true,
+                androidPrivatePathVerified = false,
             ),
         )
     }

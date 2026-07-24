@@ -8,7 +8,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 
-class StorageFallbackAdapter : MobileAdapter {
+internal class StorageFallbackAdapter : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.STORAGE_FALLBACK
     override val version: Int = 1
 
@@ -16,7 +16,8 @@ class StorageFallbackAdapter : MobileAdapter {
         context: AdapterExecutionContext,
         selected: SelectedAdapter,
     ): AdapterDecision {
-        val activeContext = context.requireActive()
+        context.requireExactOriginalTree()
+        val activeContext = context
         val decision = selected.toDecision()
         if (decision.id != id ||
             decision.version != version ||
@@ -44,7 +45,7 @@ class StorageFallbackAdapter : MobileAdapter {
     }
 
     private fun applyToStagedTree(
-        context: ActiveAdapterExecutionContext,
+        context: AdapterExecutionContext,
         decision: AdapterDecision,
         capability: StorageFallbackCapability,
     ): AdapterDecision {

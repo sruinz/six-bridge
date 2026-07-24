@@ -35,9 +35,11 @@ class DesktopSelectionEventBridgeTest {
             val snapshot = workspace.snapshot(source)
             val working = snapshot.workingRoot
             val selection = automaticSelection(working)
-            val applied = workspace.transform(snapshot, profile) { context ->
-                DesktopSelectionEventBridge().apply(context, selection)
-            }
+            val applied = workspace.transform(
+                snapshot,
+                profile,
+                conversionPlanOf(selection),
+            ).single()
 
             assertTrue(applied.applied)
             val manifest = Json.parseToJsonElement(working.resolve("manifest.json").readText()) as JsonObject

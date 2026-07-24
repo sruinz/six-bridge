@@ -10,7 +10,7 @@ import java.nio.file.Path
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.io.path.readText
 
-class DesktopSelectionEventBridge : MobileAdapter {
+internal class DesktopSelectionEventBridge : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE
     override val version: Int = 1
 
@@ -18,7 +18,7 @@ class DesktopSelectionEventBridge : MobileAdapter {
         context: AdapterExecutionContext,
         selected: SelectedAdapter,
     ): AdapterDecision {
-        val workingRoot = context.requireActive().stagedRoot
+        val workingRoot = context.stagedRoot
         val decision = selected.toDecision()
         if (decision.id != id || decision.version != version ||
             decision.disposition != AdapterDisposition.AUTOMATIC

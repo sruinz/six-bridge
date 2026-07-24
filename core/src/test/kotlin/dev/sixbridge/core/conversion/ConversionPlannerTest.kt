@@ -39,17 +39,23 @@ class ConversionPlannerTest {
     }
 
     @Test
-    fun `mobile adapters require an active execution context and planner capability`() {
-        val applyParameters = MobileAdapter::class.java.methods
-            .single { it.name == "apply" }
-            .parameterTypes
+    fun `workspace transform exposes plan input and no callback or path`() {
+        val transform = ConversionWorkspace::class.java.methods
+            .single { it.name == "transform" }
 
         assertEquals(
             listOf(
-                AdapterExecutionContext::class.java,
-                SelectedAdapter::class.java,
+                ExtensionSnapshot::class.java,
+                dev.sixbridge.core.profile.BrowserProfile::class.java,
+                ConversionPlan::class.java,
             ),
-            applyParameters.toList(),
+            transform.parameterTypes.toList(),
+        )
+        assertFalse(
+            transform.parameterTypes.any {
+                java.nio.file.Path::class.java.isAssignableFrom(it) ||
+                    it.name.startsWith("kotlin.jvm.functions.Function")
+            },
         )
     }
 
@@ -60,6 +66,7 @@ class ConversionPlannerTest {
             "ImplementSelectedAdapter.java",
             "ConstructPlannerImplementation.java",
             "ConstructAdapterExecutionContext.java",
+            "ActivateTransactionContext.java",
             "ConstructExtensionSnapshot.java",
         ).forEach { fixture ->
             val source = requireNotNull(
@@ -89,7 +96,7 @@ class ConversionPlannerTest {
                 )
             } else if (
                 fixture == "ConstructPlannerImplementation.java" ||
-                fixture == "ConstructAdapterExecutionContext.java" ||
+                fixture == "ActivateTransactionContext.java" ||
                 fixture == "ConstructExtensionSnapshot.java"
             ) {
                 assertTrue("private access" in diagnostics, diagnostics)
@@ -108,6 +115,7 @@ class ConversionPlannerTest {
         val process = ProcessBuilder(
             javap.toString(),
             "-p",
+            "-v",
             "-classpath",
             System.getProperty("java.class.path"),
             SelectedAdapter::class.java.name,
@@ -121,6 +129,42 @@ class ConversionPlannerTest {
         )
         assertFalse("SelectedAdapter(" in output, output)
         assertFalse("AdapterDecision" in output, output)
+    }
+
+    @Test
+    fun `execution context implementation is private and has no callable factory`() {
+        val javap = Path.of(System.getProperty("java.home"), "bin", "javap")
+        val process = ProcessBuilder(
+            javap.toString(),
+            "-p",
+            "-v",
+            "-classpath",
+            System.getProperty("java.class.path"),
+            "dev.sixbridge.core.conversion.ConversionWorkspaceTransaction" +
+                "\$TransactionContext",
+        ).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+
+        assertEquals(0, process.waitFor(), output)
+        assertTrue(
+            "private dev.sixbridge.core.conversion." +
+                "ConversionWorkspaceTransaction\$TransactionContext();" in output,
+            output,
+        )
+        assertTrue(
+            "java/util/concurrent/atomic/AtomicBoolean" in output,
+            output,
+        )
+        val activateBlock = output
+            .substringAfter("public final void activate")
+            .substringBefore("public final void deactivate")
+        val deactivateBlock = output
+            .substringAfter("public final void deactivate")
+            .substringBefore("private final")
+        assertTrue("ACC_SYNTHETIC" in activateBlock, activateBlock)
+        assertTrue("ACC_SYNTHETIC" in deactivateBlock, deactivateBlock)
+        assertFalse("Companion" in output, output)
+        assertFalse("create(" in output, output)
     }
 
     @Test

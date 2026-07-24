@@ -38,10 +38,33 @@ internal object WorkspacePermissionPolicy {
             posixAvailable = posixAvailable,
             aclOwnerOnly = aclOwnerOnly,
             runtimeName = System.getProperty("java.runtime.name").orEmpty(),
-            insideFreshWorkspaceRoot = normalizedPath.startsWith(normalizedRoot),
+            androidPrivatePathVerified =
+                normalizedPath.startsWith(normalizedRoot) &&
+                    isConfiguredAndroidPrivatePath(normalizedRoot),
         )
         check(mode != WorkspacePermissionMode.UNSUPPORTED) {
             "workspace filesystem의 owner-only 경계를 확인할 수 없습니다."
+        }
+    }
+
+    fun requireMetadataSupport(path: Path) {
+        val posixAvailable = Files.getFileAttributeView(
+            path,
+            PosixFileAttributeView::class.java,
+            NOFOLLOW_LINKS,
+        ) != null
+        val aclOwnerOnly = if (posixAvailable) false else ownerOnlyAcl(path)
+        val mode = selectMode(
+            posixAvailable = posixAvailable,
+            aclOwnerOnly = aclOwnerOnly,
+            runtimeName = System.getProperty("java.runtime.name").orEmpty(),
+            androidPrivatePathVerified =
+                isConfiguredAndroidPrivatePath(
+                    path.toAbsolutePath().normalize(),
+                ),
+        )
+        check(mode != WorkspacePermissionMode.UNSUPPORTED) {
+            "workspace metadata를 검증할 수 없는 filesystem입니다."
         }
     }
 
@@ -49,13 +72,25 @@ internal object WorkspacePermissionPolicy {
         posixAvailable: Boolean,
         aclOwnerOnly: Boolean,
         runtimeName: String,
-        insideFreshWorkspaceRoot: Boolean,
+        androidPrivatePathVerified: Boolean,
     ): WorkspacePermissionMode = when {
         posixAvailable -> WorkspacePermissionMode.POSIX_OWNER_ONLY
         aclOwnerOnly -> WorkspacePermissionMode.ACL_OWNER_ONLY
         runtimeName.contains("Android", ignoreCase = true) &&
-            insideFreshWorkspaceRoot -> WorkspacePermissionMode.ANDROID_APP_PRIVATE
+            androidPrivatePathVerified -> WorkspacePermissionMode.ANDROID_APP_PRIVATE
         else -> WorkspacePermissionMode.UNSUPPORTED
+    }
+
+    private fun isConfiguredAndroidPrivatePath(path: Path): Boolean {
+        val configured = System.getProperty(
+            "sixbridge.android.app-private-root",
+        )?.takeIf(String::isNotBlank) ?: return false
+        val root = runCatching {
+            Path.of(configured).toAbsolutePath().normalize()
+        }.getOrNull() ?: return false
+        return Files.isDirectory(root, NOFOLLOW_LINKS) &&
+            !Files.isSymbolicLink(root) &&
+            path.startsWith(root)
     }
 
     private fun requireOwnerOnly(permissions: Set<PosixFilePermission>) {
