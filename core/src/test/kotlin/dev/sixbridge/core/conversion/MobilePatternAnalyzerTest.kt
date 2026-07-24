@@ -101,7 +101,6 @@ class MobilePatternAnalyzerTest {
     fun `marks selection bridge unavailable for trusted and mouse state dependencies`() {
         val sensitiveMembers = listOf(
             "isTrusted",
-            "button",
             "buttons",
             "movementX",
             "movementY",
@@ -125,6 +124,46 @@ class MobilePatternAnalyzerTest {
             assertEquals(2, decision.evidence.single().line)
             assertTrue(member in decision.evidence.single().detail)
         }
+    }
+
+    @Test
+    fun `marks selection bridge unavailable for callback event button access`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                document.addEventListener("mouseup", (event) => {
+                  if (event.button !== 0) return;
+                  use(getSelection());
+                });
+            """.trimIndent(),
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertEquals(2, decision.evidence.single().line)
+        assertTrue("button" in decision.evidence.single().detail)
+    }
+
+    @Test
+    fun `does not bind unrelated toolbar button member to selection event`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                document.addEventListener("mouseup", (event) => {
+                  toolbar.button.disabled = true;
+                  use(getSelection());
+                });
+            """.trimIndent(),
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.AUTOMATIC, decision.disposition)
     }
 
     @Test
@@ -277,6 +316,47 @@ class MobilePatternAnalyzerTest {
         assertFalse(report.issues.any { it.code == "storage_area_unknown" })
     }
 
+    @Test
+    fun `ignores storage pattern regex after a completed block`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "if (ready) {} /chrome.storage.sync/.test(value);",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNull(report.decision("storage-fallback"))
+        assertTrue(report.usedApis.isEmpty())
+    }
+
+    @Test
+    fun `ignores storage pattern regex after a function declaration`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                "function validate() {} /browser.storage.sync/.test(value);",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNull(report.decision("storage-fallback"))
+        assertTrue(report.usedApis.isEmpty())
+    }
+
+    @Test
+    fun `keeps division after a function expression as executable code`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                "const ratio = function value() {} / chrome.storage.sync.value;",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNotNull(report.decision("storage-fallback"))
+        assertEquals(setOf("storage"), report.usedApis)
+    }
+
     private fun extension(
         name: String = "Synthetic extension",
         key: String? = null,
@@ -319,4 +399,9 @@ class MobilePatternAnalyzerTest {
 
     private val selectionSource =
         """document.addEventListener("mouseup", () => use(getSelection()));"""
+
+    private val fallbackProfile = profile.copy(
+        supportedFeatures = setOf("storage.local"),
+        unavailableFeatures = setOf("storage.sync"),
+    )
 }

@@ -78,15 +78,9 @@ class MobilePatternAnalyzer(
         }
         if (handlesMobileInput) return null
 
-        val unsafeEvidence = scripts.firstNotNullOfOrNull { script ->
-            val match = SENSITIVE_MOUSE_STATE.find(codeOnly(script.source))
-                ?: return@firstNotNullOfOrNull null
-            evidence(
-                script,
-                match.range.first,
-                "${match.groupValues[1]} mouse event 상태 의존",
-            )
-        }
+        val unsafeEvidence = scripts.firstNotNullOfOrNull(
+            ::sensitiveMouseEventEvidence,
+        )
         val unavailable = unsafeEvidence != null
         return AdapterDecision(
             id = DESKTOP_SELECTION_EVENT_BRIDGE,
@@ -206,6 +200,155 @@ class MobilePatternAnalyzer(
         return evidence(script, offset, detail)
     }
 
+    private fun sensitiveMouseEventEvidence(
+        script: RuntimeResourceIndex.RuntimeScript,
+    ): SourceEvidence? {
+        val sourceWithoutComments = JavaScriptLexicalMask.mask(
+            script.source,
+            maskLiterals = false,
+        )
+        val codeOnly = codeOnly(script.source)
+        MOUSEUP_LISTENER.findAll(sourceWithoutComments)
+            .filter {
+                codeOnly.getOrNull(it.range.first)?.isJavaIdentifierStart() == true
+            }
+            .forEach { listener ->
+                val callback = readCallbackBody(
+                    codeOnly,
+                    listener.range.last + 1,
+                ) ?: return@forEach
+                val member = eventMemberRegex(callback.parameter)
+                    .find(codeOnly, callback.bodyStart)
+                    ?.takeIf { it.range.first < callback.bodyEnd }
+                    ?: return@forEach
+                return evidence(
+                    script,
+                    member.range.first,
+                    "${member.groupValues[1]} mouse event 상태 의존",
+                )
+            }
+        return null
+    }
+
+    private fun readCallbackBody(
+        codeOnly: String,
+        listenerEnd: Int,
+    ): CallbackBody? {
+        var cursor = skipWhitespace(codeOnly, listenerEnd)
+        if (codeOnly.getOrNull(cursor) != ',') return null
+        cursor = skipWhitespace(codeOnly, cursor + 1)
+        return if (codeOnly.startsWith("function", cursor) &&
+            !codeOnly.getOrNull(cursor + "function".length)
+                .let { it?.isJavaIdentifierPart() == true }
+        ) {
+            readFunctionCallback(codeOnly, cursor + "function".length)
+        } else {
+            readArrowCallback(codeOnly, cursor)
+        }
+    }
+
+    private fun readFunctionCallback(
+        codeOnly: String,
+        start: Int,
+    ): CallbackBody? {
+        var cursor = skipWhitespace(codeOnly, start)
+        if (codeOnly.getOrNull(cursor)?.isJavaIdentifierStart() == true) {
+            cursor = readIdentifierEnd(codeOnly, cursor)
+            cursor = skipWhitespace(codeOnly, cursor)
+        }
+        if (codeOnly.getOrNull(cursor) != '(') return null
+        val parametersEnd = matchingDelimiter(codeOnly, cursor, '(', ')') ?: return null
+        val parameter = singleParameter(
+            codeOnly.substring(cursor + 1, parametersEnd),
+        ) ?: return null
+        cursor = skipWhitespace(codeOnly, parametersEnd + 1)
+        return bracedCallbackBody(codeOnly, cursor, parameter)
+    }
+
+    private fun readArrowCallback(
+        codeOnly: String,
+        start: Int,
+    ): CallbackBody? {
+        var cursor = start
+        val parameter = if (codeOnly.getOrNull(cursor) == '(') {
+            val parametersEnd = matchingDelimiter(codeOnly, cursor, '(', ')')
+                ?: return null
+            val value = singleParameter(
+                codeOnly.substring(cursor + 1, parametersEnd),
+            ) ?: return null
+            cursor = skipWhitespace(codeOnly, parametersEnd + 1)
+            value
+        } else {
+            if (codeOnly.getOrNull(cursor)?.isJavaIdentifierStart() != true) return null
+            val parameterEnd = readIdentifierEnd(codeOnly, cursor)
+            val value = codeOnly.substring(cursor, parameterEnd)
+            cursor = skipWhitespace(codeOnly, parameterEnd)
+            value
+        }
+        if (!codeOnly.startsWith("=>", cursor)) return null
+        cursor = skipWhitespace(codeOnly, cursor + 2)
+        if (codeOnly.getOrNull(cursor) == '{') {
+            return bracedCallbackBody(codeOnly, cursor, parameter)
+        }
+        val bodyEnd = sequenceOf(
+            codeOnly.indexOf('\n', cursor),
+            codeOnly.indexOf(';', cursor),
+        ).filter { it >= 0 }.minOrNull() ?: codeOnly.length
+        return CallbackBody(parameter, cursor, bodyEnd)
+    }
+
+    private fun bracedCallbackBody(
+        codeOnly: String,
+        openingBrace: Int,
+        parameter: String,
+    ): CallbackBody? {
+        if (codeOnly.getOrNull(openingBrace) != '{') return null
+        val closingBrace = matchingDelimiter(
+            codeOnly,
+            openingBrace,
+            '{',
+            '}',
+        ) ?: return null
+        return CallbackBody(parameter, openingBrace + 1, closingBrace)
+    }
+
+    private fun matchingDelimiter(
+        source: String,
+        start: Int,
+        opening: Char,
+        closing: Char,
+    ): Int? {
+        var depth = 0
+        for (index in start until source.length) {
+            when (source[index]) {
+                opening -> depth++
+                closing -> {
+                    depth--
+                    if (depth == 0) return index
+                }
+            }
+        }
+        return null
+    }
+
+    private fun singleParameter(source: String): String? =
+        source.trim()
+            .removeSuffix(",")
+            .trim()
+            .takeIf { IDENTIFIER.matches(it) }
+
+    private fun readIdentifierEnd(source: String, start: Int): Int {
+        var cursor = start + 1
+        while (source.getOrNull(cursor)?.isJavaIdentifierPart() == true) cursor++
+        return cursor
+    }
+
+    private fun skipWhitespace(source: String, start: Int): Int {
+        var cursor = start
+        while (source.getOrNull(cursor)?.isWhitespace() == true) cursor++
+        return cursor
+    }
+
     private fun eventInCode(source: String, event: Regex): Int? {
         val sourceWithoutComments = JavaScriptLexicalMask.mask(
             source,
@@ -266,17 +409,23 @@ class MobilePatternAnalyzer(
         val unknown: Boolean = false,
     )
 
+    private data class CallbackBody(
+        val parameter: String,
+        val bodyStart: Int,
+        val bodyEnd: Int,
+    )
+
     companion object {
         const val DESKTOP_SELECTION_EVENT_BRIDGE =
             "desktop-selection-event-bridge"
         const val ACTION_POPUP_ENTRY = "action-popup-entry"
         const val STORAGE_FALLBACK = "storage-fallback"
 
-        val ADAPTER_IDS = sortedSetOf(
+        val ADAPTER_IDS: Set<String> = listOf(
             ACTION_POPUP_ENTRY,
             DESKTOP_SELECTION_EVENT_BRIDGE,
             STORAGE_FALLBACK,
-        )
+        ).sorted().toSet()
 
         private const val ACTION_POPUP_USER_ACCESSIBLE =
             "action.popup.user-accessible"
@@ -288,9 +437,7 @@ class MobilePatternAnalyzer(
         private val TOUCHEND_LISTENER = eventListenerRegex("touchend")
         private val SELECTIONCHANGE_LISTENER = eventListenerRegex("selectionchange")
         private val GET_SELECTION = Regex("""\bgetSelection\s*\(""")
-        private val SENSITIVE_MOUSE_STATE = Regex(
-            """\.\s*(isTrusted|button|buttons|movementX|movementY)\b""",
-        )
+        private val IDENTIFIER = Regex("""[A-Za-z_$][\w$]*""")
         private val STORAGE_SYNC = Regex(
             """\b(?:chrome|browser)\s*\.\s*storage\s*\.\s*sync\b""",
         )
@@ -299,6 +446,11 @@ class MobilePatternAnalyzer(
         private fun eventListenerRegex(eventName: String) = Regex(
             """\b(?:document|window)\s*\.\s*addEventListener\s*""" +
                 """\(\s*(["'])${Regex.escape(eventName)}\1""",
+        )
+
+        private fun eventMemberRegex(parameter: String) = Regex(
+            """\b${Regex.escape(parameter)}\s*\.\s*""" +
+                """(isTrusted|button|buttons|movementX|movementY)\b""",
         )
     }
 }
