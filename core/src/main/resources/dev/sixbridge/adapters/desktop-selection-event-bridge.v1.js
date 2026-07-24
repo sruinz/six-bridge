@@ -1,47 +1,59 @@
 (() => {
   const syntheticEvents = new WeakSet();
+  const nodeIds = new WeakMap();
+  let nextNodeId = 1;
+  let gesture = 0;
+  let deliveredGesture = -1;
+  let actualMouseup;
   let lastPoint;
-  let lastActual;
-  let lastDelivered;
-  let pending = false;
+  let generation = 0;
+  let scheduled = false;
+  let dispatching = false;
+
+  const fingerprint = (value) => {
+    let result = value.length;
+    for (let index = 0; index < value.length; index += 1) {
+      result = ((result * 31) + value.charCodeAt(index)) | 0;
+    }
+    return result;
+  };
+
+  const nodeId = (node) => {
+    let id = nodeIds.get(node);
+    if (!id) {
+      id = nextNodeId;
+      nextNodeId += 1;
+      nodeIds.set(node, id);
+    }
+    return id;
+  };
 
   const selectionSnapshot = () => {
     const selection = document.getSelection();
-    const text = selection?.toString();
-    if (!text || selection.rangeCount !== 1) return null;
+    if (!selection || selection.rangeCount !== 1) return null;
+    const value = selection.toString();
+    if (!value) return null;
     const range = selection.getRangeAt(0);
     if (!range?.startContainer?.isConnected || !range.endContainer?.isConnected) return null;
-    return { text, fingerprint: fingerprint(text), range };
-  };
-
-  const fingerprint = (text) => {
-    let value = text.length;
-    for (let index = 0; index < text.length; index += 1) {
-      value = ((value * 31) + text.charCodeAt(index)) | 0;
-    }
-    return value;
+    const rect = range.getBoundingClientRect();
+    return {
+      fingerprint: fingerprint(value),
+      startNode: nodeId(range.startContainer),
+      startOffset: range.startOffset,
+      endNode: nodeId(range.endContainer),
+      endOffset: range.endOffset,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
   };
 
   const sameSelection = (first, second) =>
     first && second &&
-    first.text === second.text &&
-    first.range.startContainer === second.range.startContainer &&
-    first.range.startOffset === second.range.startOffset &&
-    first.range.endContainer === second.range.endContainer &&
-    first.range.endOffset === second.range.endOffset;
-
-  const rememberedSelection = (snapshot) => snapshot && ({
-    fingerprint: snapshot.fingerprint,
-    range: snapshot.range,
-  });
-
-  const sameRememberedSelection = (remembered, snapshot) =>
-    remembered && snapshot &&
-    remembered.fingerprint === snapshot.fingerprint &&
-    remembered.range.startContainer === snapshot.range.startContainer &&
-    remembered.range.startOffset === snapshot.range.startOffset &&
-    remembered.range.endContainer === snapshot.range.endContainer &&
-    remembered.range.endOffset === snapshot.range.endOffset;
+    first.fingerprint === second.fingerprint &&
+    first.startNode === second.startNode &&
+    first.startOffset === second.startOffset &&
+    first.endNode === second.endNode &&
+    first.endOffset === second.endOffset;
 
   const rememberPoint = (event) => {
     if (Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) {
@@ -49,26 +61,33 @@
     }
   };
 
-  const pointFor = (range) => {
-    if (lastPoint) return lastPoint;
-    const rect = range.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  const beginGesture = () => {
+    gesture += 1;
+    actualMouseup = undefined;
+    lastPoint = undefined;
+    generation += 1;
   };
 
-  const scheduleDelivery = () => {
-    if (pending) return;
-    pending = true;
+  const queueStableCheck = () => {
+    if (scheduled || dispatching || deliveredGesture === gesture) return;
+    scheduled = true;
+    const queuedGesture = gesture;
     requestAnimationFrame(() => {
       const first = selectionSnapshot();
+      const firstGeneration = generation;
       requestAnimationFrame(() => {
-        pending = false;
+        scheduled = false;
         const second = selectionSnapshot();
-        if (!sameSelection(first, second) ||
-            sameRememberedSelection(lastActual, second) ||
-            sameRememberedSelection(lastDelivered, second)) {
+        if (queuedGesture !== gesture || firstGeneration !== generation) {
+          queueStableCheck();
           return;
         }
-        const point = pointFor(second.range);
+        if (!first || !second || !sameSelection(first, second) ||
+            (actualMouseup?.gesture === gesture && sameSelection(actualMouseup.selection, second)) ||
+            deliveredGesture === gesture) {
+          return;
+        }
+        const point = lastPoint ?? { x: second.x, y: second.y };
         const event = new MouseEvent("mouseup", {
           bubbles: true,
           cancelable: true,
@@ -76,27 +95,48 @@
           clientX: point.x,
           clientY: point.y,
         });
+        deliveredGesture = gesture;
+        dispatching = true;
         syntheticEvents.add(event);
-        lastDelivered = rememberedSelection(second);
         document.dispatchEvent(event);
+        dispatching = false;
       });
     });
   };
 
+  const selectionSignal = () => {
+    if (!selectionSnapshot()) {
+      beginGesture();
+      return;
+    }
+    generation += 1;
+    queueStableCheck();
+  };
+
+  document.addEventListener("pointerdown", (event) => {
+    beginGesture();
+    rememberPoint(event);
+  }, true);
+  document.addEventListener("touchstart", (event) => {
+    beginGesture();
+    rememberPoint(event.changedTouches?.[0] ?? {});
+  }, true);
   document.addEventListener("pointerup", (event) => {
     rememberPoint(event);
-    scheduleDelivery();
+    selectionSignal();
   }, true);
   document.addEventListener("touchend", (event) => {
     rememberPoint(event.changedTouches?.[0] ?? {});
-    scheduleDelivery();
+    selectionSignal();
   }, true);
-  document.addEventListener("selectionchange", scheduleDelivery, true);
+  document.addEventListener("selectionchange", selectionSignal, true);
   document.addEventListener("mouseup", (event) => {
-    if (syntheticEvents.has(event)) return;
-    if (event.isTrusted) {
-      lastActual = rememberedSelection(selectionSnapshot());
-      lastDelivered = lastActual;
+    if (syntheticEvents.has(event) || !event.isTrusted) return;
+    const selection = selectionSnapshot();
+    if (!selection) {
+      beginGesture();
+      return;
     }
+    actualMouseup = { gesture, selection };
   }, true);
 })();

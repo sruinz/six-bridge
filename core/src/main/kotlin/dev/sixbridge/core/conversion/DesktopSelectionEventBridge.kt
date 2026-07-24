@@ -1,5 +1,6 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.compat.RuntimeResourceIndex
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -21,45 +22,55 @@ class DesktopSelectionEventBridge : MobileAdapter {
         val manifest = runCatching {
             kotlinx.serialization.json.Json.parseToJsonElement(manifestPath.readText()) as? JsonObject
         }.getOrNull() ?: return decision
-        val evidencePaths = decision.evidence.mapTo(sortedSetOf()) { it.relativePath }
         val contentScripts = manifest[CONTENT_SCRIPTS] as? JsonArray ?: return decision
+        val index = RuntimeResourceIndex.create(workingRoot, manifest)
+        val targetEntryIndexes = decision.evidence
+            .flatMapTo(sortedSetOf()) { evidence ->
+                index.contentScriptEntryIndexesByRelativePath[evidence.relativePath].orEmpty()
+            }
+        if (targetEntryIndexes.isEmpty()) return decision
+        val assetBytes = adapterBytes()
+        ensureNoAssetConflict(workingRoot, assetBytes)
         var changed = false
-        val updatedContentScripts = JsonArray(contentScripts.map { entry ->
-            val block = entry as? JsonObject ?: return@map entry
-            val scripts = block[SCRIPTS] as? JsonArray ?: return@map entry
-            val scriptPaths = scripts.mapNotNull {
-                (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
-            }
-            if (scriptPaths.none(evidencePaths::contains)) return@map entry
-            if (ASSET_RELATIVE_PATH in scriptPaths) return@map entry
+        val updatedContentScripts = JsonArray(contentScripts.mapIndexed { entryIndex, entry ->
+            val block = entry as? JsonObject ?: return@mapIndexed entry
+            val scripts = block[SCRIPTS] as? JsonArray ?: return@mapIndexed entry
+            if (entryIndex !in targetEntryIndexes) return@mapIndexed entry
+            val canonicalScripts = JsonArray(
+                listOf(JsonPrimitive(ASSET_RELATIVE_PATH)) + scripts.filterNot {
+                    (it as? JsonPrimitive)?.content == ASSET_RELATIVE_PATH
+                },
+            )
+            if (scripts == canonicalScripts) return@mapIndexed entry
             changed = true
-            JsonObject(block + (SCRIPTS to JsonArray(listOf(JsonPrimitive(ASSET_RELATIVE_PATH)) + scripts)))
+            JsonObject(block + (SCRIPTS to canonicalScripts))
         })
-        if (!changed) {
-            val alreadyApplied = contentScripts.any { block ->
-                val scripts = (block as? JsonObject)?.get(SCRIPTS) as? JsonArray
-                val scriptPaths = scripts?.mapNotNull {
-                    (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
-                }.orEmpty()
-                ASSET_RELATIVE_PATH in scriptPaths && scriptPaths.any(evidencePaths::contains)
-            }
-            if (alreadyApplied) installAsset(workingRoot)
-            return decision.copy(applied = alreadyApplied)
+        if (changed) {
+            val updatedManifest = JsonObject(manifest + (CONTENT_SCRIPTS to updatedContentScripts))
+            Files.writeString(manifestPath, updatedManifest.toString())
         }
-        val updatedManifest = JsonObject(manifest + (CONTENT_SCRIPTS to updatedContentScripts))
-        Files.writeString(manifestPath, updatedManifest.toString())
-        installAsset(workingRoot)
+        installAsset(workingRoot, assetBytes)
         return decision.copy(applied = true)
     }
 
-    private fun installAsset(workingRoot: Path) {
-        val destination = workingRoot.resolve(ASSET_RELATIVE_PATH)
-        val source = javaClass.classLoader.getResourceAsStream(ASSET_RESOURCE_PATH)
+    private fun adapterBytes(): ByteArray =
+        javaClass.classLoader.getResourceAsStream(ASSET_RESOURCE_PATH)
             ?.use { it.readBytes() }
             ?: error("adapter resource를 찾지 못했습니다: $ASSET_RESOURCE_PATH")
-        if (Files.isRegularFile(destination) && Files.readAllBytes(destination).contentEquals(source)) {
-            return
+
+    private fun ensureNoAssetConflict(workingRoot: Path, source: ByteArray) {
+        val destination = workingRoot.resolve(ASSET_RELATIVE_PATH)
+        if (!Files.exists(destination)) return
+        if (!Files.isRegularFile(destination) ||
+            !Files.readAllBytes(destination).contentEquals(source)
+        ) {
+            throw IllegalStateException("기존 adapter asset과 bytes가 다릅니다: $ASSET_RELATIVE_PATH")
         }
+    }
+
+    private fun installAsset(workingRoot: Path, source: ByteArray) {
+        val destination = workingRoot.resolve(ASSET_RELATIVE_PATH)
+        if (Files.exists(destination)) return
         Files.createDirectories(destination.parent)
         Files.write(destination, source)
     }

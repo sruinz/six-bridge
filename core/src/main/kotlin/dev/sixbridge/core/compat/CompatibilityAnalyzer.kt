@@ -368,7 +368,7 @@ class CompatibilityAnalyzer(
                 ?.takeIf { it.isString }
                 ?.content
             val target = resource?.takeIf(::isSafeResourcePath)
-                ?.let { normalizedRoot.resolve(it).normalize() }
+                ?.let { normalizedRoot.resolve(it.removePrefix("/")).normalize() }
             val insideRealRoot = target?.takeIf { it.isRegularFile() }?.let {
                 runCatching { it.toRealPath().startsWith(realRoot) }.getOrDefault(false)
             } ?: false
@@ -389,9 +389,11 @@ class CompatibilityAnalyzer(
 
     private fun isSafeResourcePath(value: String): Boolean =
         value.isNotBlank() &&
-            !value.startsWith("/") &&
+            !value.startsWith("//") &&
             '\\' !in value &&
-            ':' !in value
+            ':' !in value &&
+            '?' !in value &&
+            '#' !in value
 
     private fun MatchResult.startsInCode(codeOnly: String): Boolean =
         codeOnly.getOrNull(range.first)?.isJavaIdentifierStart() == true

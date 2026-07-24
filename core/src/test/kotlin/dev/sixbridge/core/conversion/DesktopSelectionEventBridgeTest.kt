@@ -12,9 +12,11 @@ import java.nio.file.Path
 import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
+import kotlin.io.path.writeBytes
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -125,6 +127,98 @@ class DesktopSelectionEventBridgeTest {
         assertFalse(Files.exists(mobileAware.resolve("_sixbridge")))
     }
 
+    @Test
+    fun `injects into the manifest block that reaches direct or transitive evidence`() {
+        val cases = listOf(
+            listOf("./content.js") to mapOf(
+                "content.js" to "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+            ),
+            listOf("/content.js") to mapOf(
+                "content.js" to "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+            ),
+            listOf("bootstrap.js") to mapOf(
+                "bootstrap.js" to "import \"./listener.js\";",
+                "listener.js" to "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+            ),
+        )
+        cases.forEach { (scripts, files) ->
+            val source = extensionWithBlocks(
+                blocks = listOf(scripts, listOf("unrelated.js")),
+                files = files + ("unrelated.js" to "document.addEventListener('click', () => {});"),
+            )
+            val report = MobilePatternAnalyzer().analyze(source, profile)
+            val decision = report
+                .adapterDecisions.singleOrNull()
+            assertNotNull(decision, "$scripts ${report.status} ${report.issues}")
+            val applied = DesktopSelectionEventBridge().apply(source, decision)
+            val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
+
+            assertTrue(applied.applied)
+            assertEquals(
+                listOf("_sixbridge/desktop-selection-event-bridge.v1.js") + scripts,
+                scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
+            )
+            assertEquals(
+                listOf("unrelated.js"),
+                scriptPaths((manifest["content_scripts"] as JsonArray)[1] as JsonObject),
+            )
+        }
+    }
+
+    @Test
+    fun `canonicalizes generated shim placement and duplicates in the target block`() {
+        val source = extension(
+            content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+        )
+        val decision = automaticDecision(source)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
+              {"matches":["<all_urls>"],"js":["content.js","_sixbridge/desktop-selection-event-bridge.v1.js","content.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
+              {"matches":["<all_urls>"],"js":["unrelated.js"]}
+            ]}""",
+        )
+        val asset = source.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        Files.createDirectories(asset.parent)
+        asset.writeBytes(
+            requireNotNull(
+                javaClass.classLoader.getResourceAsStream(
+                    "dev/sixbridge/adapters/desktop-selection-event-bridge.v1.js",
+                ),
+            ).readBytes(),
+        )
+
+        DesktopSelectionEventBridge().apply(source, decision)
+
+        val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
+        assertEquals(
+            listOf(
+                "_sixbridge/desktop-selection-event-bridge.v1.js",
+                "content.js",
+                "content.js",
+            ),
+            scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
+        )
+    }
+
+    @Test
+    fun `rejects a conflicting generated asset without changing manifest or asset`() {
+        val source = extension(
+            content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+        )
+        val manifestBefore = source.resolve("manifest.json").readBytes()
+        val asset = source.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        Files.createDirectories(asset.parent)
+        asset.writeText("different adapter bytes")
+        val assetBefore = asset.readBytes()
+
+        assertFailsWith<IllegalStateException> {
+            DesktopSelectionEventBridge().apply(source, automaticDecision(source))
+        }
+
+        assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
+        assertContentEquals(assetBefore, asset.readBytes())
+    }
+
     private fun automaticDecision(source: Path): AdapterDecision {
         val decision = MobilePatternAnalyzer().analyze(source, profile)
             .adapterDecisions.singleOrNull()
@@ -154,6 +248,25 @@ class DesktopSelectionEventBridgeTest {
         )
         root.resolve(contentName).writeText(content)
         root.resolve("unrelated.js").writeText("document.addEventListener('click', () => {});")
+        return root
+    }
+
+    private fun extensionWithBlocks(
+        blocks: List<List<String>>,
+        files: Map<String, String>,
+    ): Path {
+        val root = Files.createTempDirectory("six-selection-bridge-provenance")
+        val contentScripts = blocks.joinToString(",") { scripts ->
+            """{"matches":["<all_urls>"],"js":[${scripts.joinToString(",") { "\"$it\"" }}]}"""
+        }
+        root.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[$contentScripts]}""",
+        )
+        files.forEach { (path, source) ->
+            val output = root.resolve(path)
+            Files.createDirectories(output.parent)
+            output.writeText(source)
+        }
         return root
     }
 

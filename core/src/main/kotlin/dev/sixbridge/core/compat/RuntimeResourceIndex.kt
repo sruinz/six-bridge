@@ -12,6 +12,7 @@ import kotlin.io.path.readText
 class RuntimeResourceIndex private constructor(
     val resources: Set<Path>,
     val contentScriptResources: Set<Path>,
+    val contentScriptEntryIndexesByRelativePath: Map<String, Set<Int>>,
     val scripts: List<RuntimeScript>,
     val unresolvedDependency: Boolean,
 ) {
@@ -36,15 +37,22 @@ class RuntimeResourceIndex private constructor(
                 ?: return RuntimeResourceIndex(
                     resources = emptySet(),
                     contentScriptResources = emptySet(),
+                    contentScriptEntryIndexesByRelativePath = emptyMap(),
                     scripts = emptyList(),
                     unresolvedDependency = true,
                 )
             val rolesByResource = linkedMapOf<Path, MutableSet<ResourceRole>>()
+            val contentScriptEntriesByResource = linkedMapOf<Path, MutableSet<Int>>()
             val pending = mutableListOf<Path>()
             var pendingIndex = 0
             var unresolvedDependency = false
 
-            fun enqueue(base: Path, resource: String, roles: Set<ResourceRole>) {
+            fun enqueue(
+                base: Path,
+                resource: String,
+                roles: Set<ResourceRole>,
+                contentScriptEntryIndexes: Set<Int> = emptySet(),
+            ) {
                 val path = resolveLocalRuntimeResource(
                     normalizedRoot,
                     realRoot,
@@ -55,7 +63,11 @@ class RuntimeResourceIndex private constructor(
                     pending.add(path)
                     mutableSetOf()
                 }
-                if (existingRoles.addAll(roles) && path !in pending.drop(pendingIndex)) {
+                val rolesChanged = existingRoles.addAll(roles)
+                val entriesChanged = contentScriptEntriesByResource
+                    .getOrPut(path, ::linkedSetOf)
+                    .addAll(contentScriptEntryIndexes)
+                if ((rolesChanged || entriesChanged) && path !in pending.drop(pendingIndex)) {
                     pending.add(path)
                 }
             }
@@ -68,14 +80,15 @@ class RuntimeResourceIndex private constructor(
                         it,
                         setOf(ResourceRole.BACKGROUND),
                     )
-                }
-            (manifest["content_scripts"] as? JsonArray)?.forEach { item ->
-                val script = item as? JsonObject ?: return@forEach
+            }
+            (manifest["content_scripts"] as? JsonArray)?.forEachIndexed { index, item ->
+                val script = item as? JsonObject ?: return@forEachIndexed
                 readStringSet(script["js"]).forEach {
                     enqueue(
                         normalizedRoot,
                         it,
                         setOf(ResourceRole.CONTENT_SCRIPT),
+                        setOf(index),
                     )
                 }
             }
@@ -143,7 +156,12 @@ class RuntimeResourceIndex private constructor(
                 }
                 if (dependencyScan.unresolvedDependency) unresolvedDependency = true
                 dependencyScan.dependencies.forEach {
-                    enqueue(resource.parent, it, roles)
+                    enqueue(
+                        resource.parent,
+                        it,
+                        roles,
+                        contentScriptEntriesByResource[resource].orEmpty().toSet(),
+                    )
                 }
             }
 
@@ -182,6 +200,12 @@ class RuntimeResourceIndex private constructor(
                 contentScriptResources = rolesByResource
                     .filterValues { ResourceRole.CONTENT_SCRIPT in it }
                     .keys,
+                contentScriptEntryIndexesByRelativePath = contentScriptEntriesByResource
+                    .filterValues { it.isNotEmpty() }
+                    .entries
+                    .associate { (path, entries) ->
+                        relativePath(normalizedRoot, path) to entries.toSortedSet()
+                    },
                 scripts = scripts,
                 unresolvedDependency = unresolvedDependency,
             )
