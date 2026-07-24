@@ -252,6 +252,52 @@ class ConversionPipelineTest {
     }
 
     @Test
+    fun `external CRX rejects a manifest key that differs from verified proof key`() {
+        val source = plainSource("six-pipeline-external-key-mismatch")
+        val manifestKey = keyPair().public.encoded
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1","key":""" +
+                """"${Base64.getEncoder().encodeToString(manifestKey)}"}""",
+        )
+        val packed = packSignedZip(ExtensionZip.createBytes(source), keyPair())
+        val resolved = ResolvedExtensionInput(
+            ExtensionInputKind.CRX3,
+            "external-key-mismatch.crx",
+            source,
+            crxBytes = packed.bytes,
+            expectedExtensionId = packed.extensionId,
+        )
+
+        assertFailsWith<CrxSourceBindingException> {
+            ConversionPipeline(Files.createTempDirectory("six-key-mismatch-local")).use {
+                it.analyze(resolved, profile())
+            }
+        }
+    }
+
+    @Test
+    fun `external CRX rejects malformed manifest key as binding failure`() {
+        val source = plainSource("six-pipeline-external-key-malformed")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1","key":"%%%"}""",
+        )
+        val packed = packSignedZip(ExtensionZip.createBytes(source), keyPair())
+        val resolved = ResolvedExtensionInput(
+            ExtensionInputKind.CRX3,
+            "external-key-malformed.crx",
+            source,
+            crxBytes = packed.bytes,
+            expectedExtensionId = packed.extensionId,
+        )
+
+        assertFailsWith<CrxSourceBindingException> {
+            ConversionPipeline(Files.createTempDirectory("six-key-malformed-local")).use {
+                it.prepare(resolved, profile(), emptyList())
+            }
+        }
+    }
+
+    @Test
     fun `pipeline result reports and nested collections are deeply immutable`() {
         val result = ConversionPipeline(
             Files.createTempDirectory("six-pipeline-immutable-local"),
@@ -458,6 +504,19 @@ class ConversionPipelineTest {
     private fun keyPair() = KeyPairGenerator.getInstance("RSA")
         .apply { initialize(2048) }
         .generateKeyPair()
+
+    private fun packSignedZip(
+        zipBytes: ByteArray,
+        keyPair: java.security.KeyPair,
+    ): dev.sixbridge.core.crx.PackedCrx {
+        val packZip = Crx3::class.java.getDeclaredMethod(
+            "packZip",
+            ByteArray::class.java,
+            java.security.KeyPair::class.java,
+        ).apply { isAccessible = true }
+        return packZip.invoke(Crx3, zipBytes, keyPair)
+            as dev.sixbridge.core.crx.PackedCrx
+    }
 
     private fun profile() = BrowserProfile(
         browserPackage = "com.sec.android.app.sbrowser",

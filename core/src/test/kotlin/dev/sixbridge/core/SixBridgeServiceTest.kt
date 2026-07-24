@@ -468,7 +468,7 @@ class SixBridgeServiceTest {
             .apply { initialize(2048) }
             .generateKeyPair()
         val extensionId = Crx3.extensionId(key.public.encoded)
-        ExtensionKeyManager.create(
+        ExtensionKeyManager(
             trustedRoot = workspace,
             keyRoot = workspace.resolve(".local/keystore/crx"),
         )

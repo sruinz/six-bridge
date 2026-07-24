@@ -453,6 +453,19 @@ object ExtensionZip {
     ): ByteArray {
         val json = Json
         val manifest = json.parseToJsonElement(manifestBytes.decodeToString()) as JsonObject
+        manifest["key"]?.let { existing ->
+            val encoded = (existing as? JsonPrimitive)
+                ?.takeIf(JsonPrimitive::isString)
+                ?.content
+                ?: throw IllegalArgumentException("manifest key는 Base64 문자열이어야 합니다.")
+            val decoded = Base64.getDecoder().decode(encoded)
+            require(Base64.getEncoder().encodeToString(decoded) == encoded) {
+                "manifest key는 canonical Base64여야 합니다."
+            }
+            require(decoded.contentEquals(publicKey)) {
+                "manifest key가 검증된 CRX proof 공개 키와 다릅니다."
+            }
+        }
         val withKey = JsonObject(
             manifest + ("key" to JsonPrimitive(Base64.getEncoder().encodeToString(publicKey))),
         )

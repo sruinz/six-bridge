@@ -50,7 +50,7 @@ class Crx3Test {
     @Test
     fun `the persisted extension key keeps the CRX id stable`() {
         val keyRoot = Files.createTempDirectory("six-crx-keys")
-        val manager = ExtensionKeyManager(keyRoot)
+        val manager = ExtensionKeyManager(requireNotNull(keyRoot.parent), keyRoot)
 
         val first = manager.getOrCreate("smart-context-menu")
         val second = manager.getOrCreate("smart-context-menu")

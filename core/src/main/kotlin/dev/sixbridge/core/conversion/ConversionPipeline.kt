@@ -293,7 +293,7 @@ class ConversionPipeline private constructor(
             throw CrxSourceBindingException()
         }
         val publicKey = parsed.publicKey
-        val canonical =
+        val canonical = try {
             StableExtensionAnalysis.fromArchive(parsed.zipBytes).use { stable ->
                 ExtensionZip.createCanonicalManifestBytes(
                     stable.root,
@@ -301,14 +301,21 @@ class ConversionPipeline private constructor(
                     includeProjectMarker = true,
                 )
             }
+        } catch (_: IllegalArgumentException) {
+            throw CrxSourceBindingException()
+        }
         if (Crx3.extensionId(publicKey) != parsed.extensionId) {
             throw CrxSourceBindingException()
         }
-        val expected = ExtensionZip.createCanonicalManifestBytes(
-            snapshot.originalRoot,
-            publicKey,
-            includeProjectMarker = true,
-        )
+        val expected = try {
+            ExtensionZip.createCanonicalManifestBytes(
+                snapshot.originalRoot,
+                publicKey,
+                includeProjectMarker = true,
+            )
+        } catch (_: IllegalArgumentException) {
+            throw CrxSourceBindingException()
+        }
         if (!canonical.contentEquals(expected)) {
             throw CrxSourceBindingException()
         }
@@ -459,7 +466,7 @@ internal class CrxIdentityPolicy private constructor(
                 originalParsed.extensionId,
                 profileMajorVersion,
             )
-            val keyManager = ExtensionKeyManager.create(
+            val keyManager = ExtensionKeyManager(
                 requireNotNull(localRoot.parent),
                 localRoot.resolve("keystore/crx"),
             )
@@ -480,7 +487,7 @@ internal class CrxIdentityPolicy private constructor(
             )
         }
 
-        val keyManager = ExtensionKeyManager.create(
+        val keyManager = ExtensionKeyManager(
             requireNotNull(localRoot.parent),
             localRoot.resolve("keystore/crx"),
         )

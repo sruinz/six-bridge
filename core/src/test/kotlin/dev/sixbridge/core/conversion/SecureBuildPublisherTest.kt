@@ -3,6 +3,10 @@ package dev.sixbridge.core.conversion
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
@@ -14,6 +18,245 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SecureBuildPublisherTest {
+    @Test
+    fun `same output parent publications are serialized for the whole transaction`() {
+        val parent = Files.createTempDirectory("six-publish-concurrent")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val failures = Collections.synchronizedList(mutableListOf<Throwable>())
+
+        val first = thread {
+            runCatching {
+                BuildPublicationFaultInjection.pauseAfterStagedJournal({
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS))
+                }) {
+                    SecureBuildPublisher.publish(mapOf(output to "first".toByteArray()))
+                }
+            }.exceptionOrNull()?.let(failures::add)
+        }
+        assertTrue(entered.await(10, TimeUnit.SECONDS))
+        val second = thread {
+            runCatching {
+                SecureBuildPublisher.publish(mapOf(output to "second".toByteArray()))
+            }.exceptionOrNull()?.let(failures::add)
+        }
+        Thread.sleep(100)
+        release.countDown()
+        first.join(10_000)
+        second.join(10_000)
+
+        assertTrue(failures.isEmpty(), failures.joinToString())
+        assertEquals("second", Files.readString(output))
+    }
+
+    @Test
+    fun `publisher waits for an operating system lock held by another process`() {
+        val parent = Files.createTempDirectory("six-publish-process-lock")
+        val output = parent.resolve("extension.crx")
+        SecureBuildPublisher.recoverPending(listOf(output), null)
+        val probeRoot = Files.createTempDirectory("six-publish-lock-probe")
+        val source = probeRoot.resolve("LockProbe.java")
+        source.writeText(
+            """
+            import java.nio.channels.FileChannel;
+            import java.nio.file.*;
+            import static java.nio.file.StandardOpenOption.WRITE;
+            public class LockProbe {
+              public static void main(String[] args) throws Exception {
+                Path lock = Path.of(args[0]);
+                Path ready = Path.of(args[1]);
+                Path release = Path.of(args[2]);
+                try (FileChannel channel = FileChannel.open(lock, WRITE);
+                     var ignored = channel.lock()) {
+                  Files.writeString(ready, "ready");
+                  while (!Files.exists(release)) Thread.sleep(10);
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+        val javaHome = Path.of(System.getProperty("java.home"))
+        assertEquals(
+            0,
+            ProcessBuilder(javaHome.resolve("bin/javac").toString(), source.toString())
+                .inheritIO()
+                .start()
+                .waitFor(),
+        )
+        val ready = probeRoot.resolve("ready")
+        val release = probeRoot.resolve("release")
+        val process = ProcessBuilder(
+            javaHome.resolve("bin/java").toString(),
+            "-cp",
+            probeRoot.toString(),
+            "LockProbe",
+            parent.resolve(".sixbridge-build-publisher.lock").toString(),
+            ready.toString(),
+            release.toString(),
+        ).inheritIO().start()
+        repeat(200) {
+            if (Files.exists(ready)) return@repeat
+            Thread.sleep(10)
+        }
+        assertTrue(Files.exists(ready))
+        val publisher = thread {
+            SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+        }
+        Thread.sleep(100)
+        assertTrue(publisher.isAlive)
+        Files.writeString(release, "release")
+        assertEquals(0, process.waitFor())
+        publisher.join(10_000)
+        assertEquals("new", Files.readString(output))
+    }
+
+    @Test
+    fun `publisher lock permissions and hard links fail closed`() {
+        listOf("permissions", "hardlink").forEach { mode ->
+            val parent = Files.createTempDirectory("six-publish-lock-$mode")
+            val lock = parent.resolve(".sixbridge-build-publisher.lock")
+            Files.writeString(lock, "lock")
+            Files.setPosixFilePermissions(
+                lock,
+                setOf(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE,
+                ),
+            )
+            if (mode == "permissions") {
+                Files.setPosixFilePermissions(
+                    lock,
+                    setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                        PosixFilePermission.GROUP_READ,
+                    ),
+                )
+            } else {
+                Files.createLink(parent.resolve("lock-hardlink"), lock)
+            }
+            val output = parent.resolve("extension.crx")
+
+            assertFails {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+            assertFalse(Files.exists(output))
+        }
+    }
+
+    @Test
+    fun `publication lock rejects output parent replacement`() {
+        val parent = Files.createTempDirectory("six-publish-lock-root")
+        val moved = parent.resolveSibling("${parent.fileName}-moved")
+        val output = parent.resolve("extension.crx")
+
+        assertFails {
+            BuildPublicationFaultInjection.replaceParentAfterLock({
+                Files.move(parent, moved)
+                Files.createDirectory(parent)
+            }) {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+
+        assertTrue(parent.listDirectoryEntries().isEmpty())
+        assertTrue(moved.listDirectoryEntries().all {
+            it.fileName.toString() == ".sixbridge-build-publisher.lock"
+        })
+    }
+
+    @Test
+    fun `rollback failure preserves journal and backup for next old-all recovery`() {
+        val outputParent = Files.createTempDirectory("six-publish-rollback-preserve")
+        val output = outputParent.resolve("extension.crx")
+        Files.writeString(output, "old-output")
+        val localParent = Files.createTempDirectory("six-publish-rollback-preserve-local")
+        val destination = localParent.resolve("extension-id")
+        Files.createDirectory(destination)
+        destination.resolve("manifest.json").writeText("old-source")
+        val source = Files.createTempDirectory("six-publish-rollback-preserve-source")
+        source.resolve("manifest.json").writeText("new-source")
+        val local = LocalSourcePublication(source, destination)
+
+        assertFails {
+            BuildPublicationFaultInjection.failOutputRollback {
+                BuildPublicationFaultInjection.failAfterLocalPublish {
+                    SecureBuildPublisher.publish(
+                        mapOf(output to "new-output".toByteArray()),
+                        local,
+                    )
+                }
+            }
+        }
+        assertTrue(Files.exists(outputParent.resolve(".sixbridge-publish-journal.v1")))
+
+        SecureBuildPublisher.recoverPending(listOf(output), local)
+        assertEquals("old-output", Files.readString(output))
+        assertEquals("old-source", destination.resolve("manifest.json").readText())
+        assertNoTransactionDebris(outputParent)
+        assertNoTransactionDebris(localParent)
+    }
+
+    @Test
+    fun `rename phases fsync every affected output stage and local parent`() {
+        val outputParent = Files.createTempDirectory("six-publish-fsync-output")
+        val output = outputParent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        val localParent = Files.createTempDirectory("six-publish-fsync-local")
+        val destination = localParent.resolve("extension-id")
+        Files.createDirectory(destination)
+        destination.resolve("manifest.json").writeText("old")
+        val source = Files.createTempDirectory("six-publish-fsync-source")
+        source.resolve("manifest.json").writeText("new")
+        val observed = Collections.synchronizedList(mutableListOf<Path>())
+
+        BuildPublicationFaultInjection.observeDirectoryFsync(observed::add) {
+            SecureBuildPublisher.publish(
+                mapOf(output to "new".toByteArray()),
+                LocalSourcePublication(source, destination),
+            )
+        }
+
+        assertTrue(outputParent in observed)
+        assertTrue(localParent in observed)
+        assertTrue(observed.any {
+            it.parent == outputParent &&
+                it.fileName.toString().startsWith(".sixbridge-publish-")
+        })
+    }
+
+    @Test
+    fun `directory fsync failure propagates and restores old-all`() {
+        val parent = Files.createTempDirectory("six-publish-fsync-failure")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+
+        var stageFsyncs = 0
+        assertFails {
+            BuildPublicationFaultInjection.failDirectoryFsyncWhen(
+                predicate = { path ->
+                    if (path.parent == parent &&
+                        path.fileName.toString().startsWith(".sixbridge-publish-")
+                    ) {
+                        stageFsyncs += 1
+                    }
+                    stageFsyncs == 2
+                },
+                block = {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                },
+            )
+        }
+
+        assertEquals(2, stageFsyncs)
+        assertEquals("old", Files.readString(output))
+        SecureBuildPublisher.recoverPending(listOf(output), null)
+        assertEquals("old", Files.readString(output))
+    }
+
     @Test
     fun `recovery removes an owner-only orphan journal temp without a journal`() {
         val outputParent = Files.createTempDirectory("six-publish-journal-orphan")
@@ -114,7 +357,7 @@ class SecureBuildPublisherTest {
         val outputParent = Files.createTempDirectory("six-publish-local-output")
         val output = outputParent.resolve("extension.crx")
 
-        assertFails {
+        val failure = assertFails {
             SecureBuildPublisher.publish(
                 mapOf(output to byteArrayOf(1)),
                 LocalSourcePublication(
@@ -124,9 +367,14 @@ class SecureBuildPublisherTest {
                 ),
             )
         }
+        assertTrue(
+            failure.suppressed.isEmpty(),
+            failure.suppressed.joinToString { it.stackTraceToString() },
+        )
 
         assertTrue(outside.listDirectoryEntries().isEmpty())
         assertFalse(Files.exists(output))
+        SecureBuildPublisher.recoverPending(listOf(output), null)
         assertNoTransactionDebris(outputParent)
     }
 
@@ -154,6 +402,100 @@ class SecureBuildPublisherTest {
         }
         assertEquals("outside", Files.readString(outside))
         assertTrue(Files.isSymbolicLink(output))
+    }
+
+    @Test
+    fun `journal recovery rejects a same-bytes replacement inode`() {
+        val parent = Files.createTempDirectory("six-publish-journal-inode")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        val outputs = mapOf(output to "new".toByteArray())
+
+        assertFails {
+            BuildPublicationFaultInjection.forceTermination(
+                BuildCrashPoint.AFTER_PARTIAL_OUTPUT,
+            ) {
+                SecureBuildPublisher.publish(outputs)
+            }
+        }
+        val bytes = Files.readAllBytes(output)
+        Files.delete(output)
+        Files.write(output, bytes)
+
+        assertFails {
+            SecureBuildPublisher.recoverPending(outputs.keys, null)
+        }
+        assertEquals("new", Files.readString(output))
+    }
+
+    @Test
+    fun `next build recovers a pending transaction before accepting different names`() {
+        val parent = Files.createTempDirectory("six-publish-different-request")
+        val oldOutput = parent.resolve("extension-a.crx")
+        Files.writeString(oldOutput, "old-a")
+
+        assertFails {
+            BuildPublicationFaultInjection.forceTermination(
+                BuildCrashPoint.AFTER_PARTIAL_OUTPUT,
+            ) {
+                SecureBuildPublisher.publish(mapOf(oldOutput to "new-a".toByteArray()))
+            }
+        }
+        val nextOutput = parent.resolve("extension-b.crx")
+        SecureBuildPublisher.publish(mapOf(nextOutput to "new-b".toByteArray()))
+
+        assertEquals("old-a", Files.readString(oldOutput))
+        assertEquals("new-b", Files.readString(nextOutput))
+        assertNoTransactionDebris(parent)
+    }
+
+    @Test
+    fun `intent journal recovers a crash after stage creation before staged journal`() {
+        val parent = Files.createTempDirectory("six-publish-intent-stage")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+
+        assertFails {
+            BuildPublicationFaultInjection.forceAfterStageBeforeStagedJournal {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        assertTrue(Files.exists(parent.resolve(".sixbridge-publish-journal.v1")))
+
+        SecureBuildPublisher.recoverPending(listOf(output), null)
+        assertEquals("old", Files.readString(output))
+        assertNoTransactionDebris(parent)
+    }
+
+    @Test
+    fun `intent journal recovers a crash before any stage is created`() {
+        val parent = Files.createTempDirectory("six-publish-intent-only")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+
+        assertFails {
+            BuildPublicationFaultInjection.forceAfterIntentBeforeStage {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        SecureBuildPublisher.recoverPending(listOf(output), null)
+
+        assertEquals("old", Files.readString(output))
+        assertNoTransactionDebris(parent)
+    }
+
+    @Test
+    fun `orphan recovery never deletes an arbitrary same-prefix user directory`() {
+        val parent = Files.createTempDirectory("six-publish-user-prefix")
+        val userDirectory = parent.resolve(".sixbridge-publish-user-owned")
+        Files.createDirectory(userDirectory)
+        userDirectory.resolve("keep.txt").writeText("keep")
+
+        SecureBuildPublisher.publish(
+            mapOf(parent.resolve("extension.crx") to "new".toByteArray()),
+        )
+
+        assertEquals("keep", userDirectory.resolve("keep.txt").readText())
     }
 
     @Test
@@ -279,14 +621,16 @@ class SecureBuildPublisherTest {
     }
 
     private fun assertNoTransactionDebris(parent: Path) {
+        val entries = parent.listDirectoryEntries()
         assertTrue(
-            parent.listDirectoryEntries().none {
+            entries.none {
                 val name = it.fileName.toString()
                 name.startsWith(".sixbridge-publish-") ||
                 name.startsWith(".sixbridge-local-stage-") ||
                     name.startsWith(".sixbridge-local-backup-") ||
                     name.startsWith(".sixbridge-publish-journal")
             },
+            entries.joinToString { it.fileName.toString() },
         )
     }
 }

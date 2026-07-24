@@ -29,15 +29,10 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.jvm.JvmSynthetic
 
-class ExtensionKeyManager private constructor(
-    keyRoot: Path,
+class ExtensionKeyManager(
     trustedRoot: Path,
+    keyRoot: Path,
 ) {
-    constructor(keyRoot: Path) : this(
-        keyRoot,
-        requireNotNull(keyRoot.toAbsolutePath().normalize().parent),
-    )
-
     private val keyRoot = keyRoot.toAbsolutePath().normalize()
     private val trustedRoot = trustedRoot.toAbsolutePath().normalize()
     private val activeGuard = ThreadLocal<RootGuard?>()
@@ -565,12 +560,6 @@ class ExtensionKeyManager private constructor(
     )
 
     companion object {
-        @JvmSynthetic
-        internal fun create(
-            trustedRoot: Path,
-            keyRoot: Path,
-        ): ExtensionKeyManager = ExtensionKeyManager(keyRoot, trustedRoot)
-
         fun storeConversionIdentity(
             originalExtensionId: String,
             profileMajorVersion: Int,

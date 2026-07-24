@@ -21,6 +21,9 @@ import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.jvm.JvmSynthetic
 
 internal data class LocalSourcePublication(
@@ -86,16 +89,31 @@ internal object SecureBuildPublisher {
             .singleOrNull()
             ?: throw IllegalArgumentException("모든 출력은 같은 디렉터리에 있어야 합니다.")
         Files.createDirectories(parent)
-        recoverPending(
-            normalized.map { it.first },
-            localSource,
-        )
+        withPublicationLock(parent) {
+            recoverPendingLocked(parent)
         val outputTransaction = OutputTransaction(parent, normalized)
         val localTransaction = localSource?.let(::LocalSourceTransaction)
         val journal = PublicationJournal(parent)
         try {
+            journal.write(JournalRecord.intent(outputTransaction, localTransaction))
+            BuildPublicationFaultInjection.afterIntentBeforeStage()
             outputTransaction.stage()
+            journal.write(
+                JournalRecord.outputStageReady(
+                    outputTransaction,
+                    localTransaction,
+                ),
+            )
             localTransaction?.stage()
+            journal.write(
+                JournalRecord.create(
+                    JournalPhase.STAGES_READY,
+                    0,
+                    outputTransaction,
+                    localTransaction,
+                ),
+            )
+            BuildPublicationFaultInjection.afterStageBeforeStagedJournal()
             journal.write(
                 JournalRecord.create(
                     JournalPhase.STAGED,
@@ -104,6 +122,9 @@ internal object SecureBuildPublisher {
                     localTransaction,
                 ),
             )
+            BuildPublicationFaultInjection.afterStagedJournal()
+            outputTransaction.removeIntentMarker()
+            localTransaction?.removeIntentMarker()
             outputTransaction.publish(
                 afterBackup = {
                     journal.write(
@@ -174,22 +195,30 @@ internal object SecureBuildPublisher {
             } catch (_: Exception) {
                 outputTransaction.abandonForCrash()
                 localTransaction?.abandonForCrash()
-                return
+                return@withPublicationLock
             }
         } catch (error: Throwable) {
             if (error is ForcedBuildTermination) {
                 localTransaction?.abandonForCrash()
                 outputTransaction.abandonForCrash()
             } else {
-                localTransaction?.rollback(error)
-                outputTransaction.rollback(error)
-                runCatching { journal.delete() }.exceptionOrNull()
-                    ?.let(error::addSuppressed)
+                val localRolledBack = localTransaction?.rollback(error) ?: true
+                val outputsRolledBack = outputTransaction.rollback(error)
+                if (localRolledBack && outputsRolledBack) {
+                    outputTransaction.removeIntentMarkerIfPresent()
+                    localTransaction?.removeIntentMarkerIfPresent()
+                    runCatching { journal.delete() }.exceptionOrNull()
+                        ?.let(error::addSuppressed)
+                } else {
+                    localTransaction?.abandonForCrash()
+                    outputTransaction.abandonForCrash()
+                }
             }
             throw error
         } finally {
             localTransaction?.finish()
             outputTransaction.finish()
+        }
         }
     }
 
@@ -202,19 +231,43 @@ internal object SecureBuildPublisher {
         val normalized = outputs.map { it.toAbsolutePath().normalize() }
         val parent = normalized.map { requireNotNull(it.parent) }.distinct().single()
         if (!Files.isDirectory(parent, NOFOLLOW_LINKS)) return
+        withPublicationLock(parent) {
+            recoverPendingLocked(parent)
+        }
+    }
+
+    private fun recoverPendingLocked(parent: Path) {
         val journal = PublicationJournal(parent)
         val record = journal.read()
         if (record == null) {
             journal.delete()
             return
         }
-        record.requireMatches(normalized, localSource)
-        if (record.phase == JournalPhase.COMMIT_READY) {
+        if (record.phase == JournalPhase.INTENT) {
+            recoverIntent(record, parent)
+        } else if (record.phase == JournalPhase.OUTPUT_STAGE_READY) {
+            recoverOld(record, parent)
+        } else if (record.phase == JournalPhase.COMMIT_READY) {
             recoverCommitted(record, parent)
         } else {
             recoverOld(record, parent)
         }
+        removeIntentMarkerIfPresent(parent, UUID.fromString(record.outputIntentToken))
+        if (record.local != null) {
+            val intent = requireNotNull(record.localIntent)
+            val localParent = Path.of(intent.parent).toAbsolutePath().normalize()
+            validateTrustedLocalPath(Path.of(intent.trustedRoot), localParent)
+            removeIntentMarkerIfPresent(localParent, UUID.fromString(intent.token))
+        }
         journal.delete()
+    }
+
+    private fun recoverIntent(record: JournalRecord, outputParent: Path) {
+        deleteIntentOwnedStage(
+            outputParent,
+            record.outputStageName,
+            record.outputIntentToken,
+        )
     }
 
     private class OutputTransaction(
@@ -230,7 +283,9 @@ internal object SecureBuildPublisher {
             )
         }
         private var owner: OwnedTempDirectory? = null
-        private var stagePath: Path? = null
+        private val stagePath: Path =
+            parent.resolve(".sixbridge-publish-${UUID.randomUUID()}")
+        private val intentToken: UUID = UUID.randomUUID()
         private var stageRootKey: String? = null
         private var published = false
         private var committed = false
@@ -258,10 +313,12 @@ internal object SecureBuildPublisher {
                     }
                 }
             }
-            val path = parent.resolve(".sixbridge-publish-${UUID.randomUUID()}")
+            val path = stagePath
+            secureDirectory(parent).use { parentHandle ->
+                writeIntentMarker(parent, parentHandle, intentToken)
+            }
             val created = OwnedTempTree.createAt(path)
             owner = created
-            stagePath = path
             secureDirectory(path).use { stageHandle ->
                 validateDirectoryHandle(path, stageHandle)
                 stageRootKey = requireNotNull(
@@ -284,13 +341,14 @@ internal object SecureBuildPublisher {
                     )
                 }
             }
+            forceDirectory(path)
         }
 
         fun publish(
             afterBackup: () -> Unit,
             afterPublished: (Int) -> Unit,
         ) {
-            val path = requireNotNull(stagePath)
+            val path = stagePath
             secureDirectory(parent).use { parentHandle ->
                 secureDirectory(path).use { stageHandle ->
                     validateDirectoryHandle(parent, parentHandle)
@@ -317,6 +375,8 @@ internal object SecureBuildPublisher {
                             "출력 backup identity가 바뀌었습니다.",
                         )
                     }
+                    forceDirectory(parent)
+                    forceDirectory(path)
                     afterBackup()
                     var publishedCount = 0
                     targets.forEach { target ->
@@ -337,6 +397,8 @@ internal object SecureBuildPublisher {
                             targetState(parentHandle, target.name, target.path),
                             "published output identity가 staged output과 다릅니다.",
                         )
+                        forceDirectory(parent)
+                        forceDirectory(path)
                         publishedCount += 1
                         afterPublished(publishedCount)
                     }
@@ -345,10 +407,16 @@ internal object SecureBuildPublisher {
             }
         }
 
-        fun rollback(failure: Throwable) {
-            if (committed || owner == null) return
-            val path = requireNotNull(stagePath)
-            runCatching {
+        fun rollback(failure: Throwable): Boolean {
+            if (committed || owner == null) return true
+            if (BuildPublicationFaultInjection.shouldFailOutputRollback()) {
+                failure.addSuppressed(
+                    IllegalStateException("injected output rollback failure"),
+                )
+                return false
+            }
+            val path = stagePath
+            val rollbackFailure = runCatching {
                 secureDirectory(parent).use { parentHandle ->
                     secureDirectory(path).use { stageHandle ->
                         targets.asReversed().filter(OutputTarget::wasPublished)
@@ -378,13 +446,17 @@ internal object SecureBuildPublisher {
                         }
                     }
                 }
+                forceDirectory(parent)
+                forceDirectory(path)
                 published = false
-            }.exceptionOrNull()?.let(failure::addSuppressed)
+            }.exceptionOrNull()
+            rollbackFailure?.let(failure::addSuppressed)
+            return rollbackFailure == null
         }
 
         fun commit() {
             check(published)
-            val path = requireNotNull(stagePath)
+            val path = stagePath
             secureDirectory(path).use { stageHandle ->
                 targets.forEach { target ->
                     target.backupName?.let { backup ->
@@ -397,6 +469,7 @@ internal object SecureBuildPublisher {
             val retainedOwner = requireNotNull(owner)
             OwnedTempTree.delete(retainedOwner)
             owner = null
+            forceDirectory(parent)
         }
 
         fun finish() {
@@ -412,9 +485,19 @@ internal object SecureBuildPublisher {
         }
 
         fun journalStageName(): String =
-            requireNotNull(stagePath).fileName.toString()
+            stagePath.fileName.toString()
 
         fun journalStageRootKey(): String = requireNotNull(stageRootKey)
+
+        fun journalIntentToken(): String = intentToken.toString()
+
+        fun removeIntentMarker() {
+            removeIntentMarker(parent, intentToken)
+        }
+
+        fun removeIntentMarkerIfPresent() {
+            removeIntentMarkerIfPresent(parent, intentToken)
+        }
 
         fun journalTargets(): List<JournalOutput> = targets.map { target ->
             JournalOutput(
@@ -422,6 +505,19 @@ internal object SecureBuildPublisher {
                 oldExists = target.original != null,
                 oldSha256 = target.originalSha256,
                 newSha256 = target.newSha256,
+                oldIdentity = target.original?.identity?.encode(),
+                newIdentity = requireNotNull(target.staged).identity.encode(),
+            )
+        }
+
+        fun journalIntentTargets(): List<JournalOutput> = targets.map { target ->
+            JournalOutput(
+                name = target.name.toString(),
+                oldExists = false,
+                oldSha256 = null,
+                newSha256 = target.newSha256,
+                oldIdentity = null,
+                newIdentity = null,
             )
         }
     }
@@ -437,6 +533,7 @@ internal object SecureBuildPublisher {
         private val stageOriginal = parent.resolve(
             ".sixbridge-local-stage-${UUID.randomUUID()}",
         )
+        private val intentToken: UUID = UUID.randomUUID()
         private val backupName = singleName(
             ".sixbridge-local-backup-${UUID.randomUUID()}",
         )
@@ -468,9 +565,18 @@ internal object SecureBuildPublisher {
                     originalRootIdentity = requireNotNull(attributes.fileKey())
                 }
             }
+            secureDirectory(parent).use { parentHandle ->
+                writeIntentMarker(parent, parentHandle, intentToken)
+            }
             val created = OwnedTempTree.createAt(stageOriginal)
             owner = created
             NativeWorkspaceTree.copyInto(source, stageOriginal)
+            check(WorkspaceTreeDigest.capture(stageOriginal).provenanceSha256 ==
+                requireNotNull(sourceState).provenanceSha256
+            ) {
+                "local source stage가 원본과 다릅니다."
+            }
+            forceDirectory(stageOriginal)
             stageRootKey = requireNotNull(
                 Files.readAttributes(
                     stageOriginal,
@@ -478,11 +584,6 @@ internal object SecureBuildPublisher {
                     NOFOLLOW_LINKS,
                 ).fileKey(),
             ).toString()
-            check(WorkspaceTreeDigest.capture(stageOriginal).provenanceSha256 ==
-                requireNotNull(sourceState).provenanceSha256
-            ) {
-                "local source stage가 원본과 다릅니다."
-            }
         }
 
         fun publish() {
@@ -502,6 +603,7 @@ internal object SecureBuildPublisher {
                     }
                     parentHandle.move(destinationName, parentHandle, backupName)
                     backupExists = true
+                    forceDirectory(parent)
                     val backupPath = parent.resolve(backupName.toString())
                     check(
                         WorkspaceTreeDigest.capture(backupPath) == originalState,
@@ -515,6 +617,7 @@ internal object SecureBuildPublisher {
                 }
             }
             PendingTempCleanup.move(stageOriginal, destination)
+            forceDirectory(parent)
             published = true
             validateTreeNoLinks(destination)
             check(
@@ -525,9 +628,9 @@ internal object SecureBuildPublisher {
             }
         }
 
-        fun rollback(failure: Throwable) {
-            if (committed || owner == null) return
-            runCatching {
+        fun rollback(failure: Throwable): Boolean {
+            if (committed || owner == null) return true
+            val rollbackFailure = runCatching {
                 if (published) {
                     PendingTempCleanup.move(destination, stageOriginal)
                     published = false
@@ -542,7 +645,10 @@ internal object SecureBuildPublisher {
                         "local source rollback 결과가 원본과 다릅니다."
                     }
                 }
-            }.exceptionOrNull()?.let(failure::addSuppressed)
+                forceDirectory(parent)
+            }.exceptionOrNull()
+            rollbackFailure?.let(failure::addSuppressed)
+            return rollbackFailure == null
         }
 
         fun commit() {
@@ -552,6 +658,7 @@ internal object SecureBuildPublisher {
                     deleteTree(parentHandle, backupName)
                 }
                 backupExists = false
+                forceDirectory(parent)
             }
             val retainedOwner = requireNotNull(owner)
             OwnedTempTree.abandonNoDelete(
@@ -588,6 +695,21 @@ internal object SecureBuildPublisher {
             stageRootKey = requireNotNull(stageRootKey),
             oldRootKey = originalRootIdentity?.toString(),
         )
+
+        fun journalIntent(): JournalLocalIntent = JournalLocalIntent(
+            trustedRoot = trustedRoot.toString(),
+            parent = parent.toString(),
+            stageName = stageOriginal.fileName.toString(),
+            token = intentToken.toString(),
+        )
+
+        fun removeIntentMarker() {
+            removeIntentMarker(parent, intentToken)
+        }
+
+        fun removeIntentMarkerIfPresent() {
+            removeIntentMarkerIfPresent(parent, intentToken)
+        }
     }
 
     private fun recoverOld(record: JournalRecord, outputParent: Path) {
@@ -601,7 +723,8 @@ internal object SecureBuildPublisher {
                 require(
                     stageAttributes.isDirectory &&
                         !stageAttributes.isSymbolicLink &&
-                        stageAttributes.fileKey().toString() == record.outputStageRootKey,
+                        stageAttributes.fileKey().toString() ==
+                        requireNotNull(record.outputStageRootKey),
                 ) {
                     "journal output stage identity가 변경되었습니다."
                 }
@@ -609,28 +732,36 @@ internal object SecureBuildPublisher {
                     record.outputs.forEachIndexed { index, output ->
                         val targetName = singleName(output.name)
                         val backupName = singleName("backup-$index")
-                        val targetSha = sha256OrNull(
+                        val targetProof = fileProofOrNull(
                             outputHandle,
                             targetName,
                             outputParent.resolve(output.name),
                         )
-                        val backupSha = sha256OrNull(
+                        val backupProof = fileProofOrNull(
                             stageHandle,
                             backupName,
                             stagePath.resolve(backupName.toString()),
                         )
-                        if (targetSha == output.newSha256) {
+                        if (targetProof?.sha256 == output.newSha256) {
+                            require(targetProof.identity == output.newIdentity) {
+                                "journal published output identity가 변경되었습니다."
+                            }
                             outputHandle.deleteFile(targetName)
-                        } else if (targetSha != null &&
-                            !(output.oldExists && targetSha == output.oldSha256)
+                        } else if (targetProof != null &&
+                            !(output.oldExists &&
+                                targetProof.sha256 == output.oldSha256 &&
+                                targetProof.identity == output.oldIdentity)
                         ) {
                             throw IllegalStateException(
                                 "journal recovery 대상 output이 외부에서 변경되었습니다.",
                             )
                         }
                         if (output.oldExists) {
-                            if (backupSha != null) {
-                                require(backupSha == output.oldSha256) {
+                            if (backupProof != null) {
+                                require(
+                                    backupProof.sha256 == output.oldSha256 &&
+                                        backupProof.identity == output.oldIdentity,
+                                ) {
                                     "journal output backup이 변경되었습니다."
                                 }
                                 require(attributesOrNull(outputHandle, targetName) == null) {
@@ -639,11 +770,14 @@ internal object SecureBuildPublisher {
                                 stageHandle.move(backupName, outputHandle, targetName)
                             } else {
                                 require(
-                                    sha256OrNull(
+                                    fileProofOrNull(
                                         outputHandle,
                                         targetName,
                                         outputParent.resolve(output.name),
-                                    ) == output.oldSha256,
+                                    ) == FileProof(
+                                        requireNotNull(output.oldSha256),
+                                        requireNotNull(output.oldIdentity),
+                                    ),
                                 ) {
                                     "journal output 원본 또는 backup이 없습니다."
                                 }
@@ -660,14 +794,18 @@ internal object SecureBuildPublisher {
                 }
             } else {
                 record.outputs.forEach { output ->
-                    val sha = sha256OrNull(
+                    val proof = fileProofOrNull(
                         outputHandle,
                         singleName(output.name),
                         outputParent.resolve(output.name),
                     )
                     require(
-                        (output.oldExists && sha == output.oldSha256) ||
-                            (!output.oldExists && sha == null),
+                        (output.oldExists &&
+                            proof == FileProof(
+                                requireNotNull(output.oldSha256),
+                                requireNotNull(output.oldIdentity),
+                            )) ||
+                            (!output.oldExists && proof == null),
                     ) {
                         "journal stage 없이 output 원본 상태를 확인할 수 없습니다."
                     }
@@ -675,17 +813,21 @@ internal object SecureBuildPublisher {
             }
         }
         record.local?.let(::recoverLocalOld)
+        forceDirectory(outputParent)
     }
 
     private fun recoverCommitted(record: JournalRecord, outputParent: Path) {
         secureDirectory(outputParent).use { outputHandle ->
             record.outputs.forEach { output ->
                 require(
-                    sha256OrNull(
+                    fileProofOrNull(
                         outputHandle,
                         singleName(output.name),
                         outputParent.resolve(output.name),
-                    ) == output.newSha256,
+                    ) == FileProof(
+                        output.newSha256,
+                        requireNotNull(output.newIdentity),
+                    ),
                 ) {
                     "commit-ready journal의 published output이 변경되었습니다."
                 }
@@ -695,7 +837,8 @@ internal object SecureBuildPublisher {
                 require(
                     attributes.isDirectory &&
                         !attributes.isSymbolicLink &&
-                        attributes.fileKey().toString() == record.outputStageRootKey,
+                        attributes.fileKey().toString() ==
+                        requireNotNull(record.outputStageRootKey),
                 ) {
                     "commit-ready output stage identity가 변경되었습니다."
                 }
@@ -703,6 +846,7 @@ internal object SecureBuildPublisher {
             }
         }
         record.local?.let(::recoverLocalCommitted)
+        forceDirectory(outputParent)
     }
 
     private fun recoverLocalOld(local: JournalLocal) {
@@ -767,6 +911,7 @@ internal object SecureBuildPublisher {
             } else {
                 require(attributesOrNull(handle, destination) == null)
             }
+            forceDirectory(parent)
         }
     }
 
@@ -798,6 +943,7 @@ internal object SecureBuildPublisher {
                     deleteTree(handle, name)
                 }
             }
+            forceDirectory(parent)
         }
     }
 
@@ -806,6 +952,15 @@ internal object SecureBuildPublisher {
         val oldExists: Boolean,
         val oldSha256: String?,
         val newSha256: String,
+        val oldIdentity: String?,
+        val newIdentity: String?,
+    )
+
+    private data class JournalLocalIntent(
+        val trustedRoot: String,
+        val parent: String,
+        val stageName: String,
+        val token: String,
     )
 
     private data class JournalLocal(
@@ -822,6 +977,9 @@ internal object SecureBuildPublisher {
     )
 
     private enum class JournalPhase {
+        INTENT,
+        OUTPUT_STAGE_READY,
+        STAGES_READY,
         STAGED,
         OUTPUT_BACKED_UP,
         OUTPUT_PARTIAL,
@@ -834,35 +992,41 @@ internal object SecureBuildPublisher {
         val phase: JournalPhase,
         val publishedCount: Int,
         val outputStageName: String,
-        val outputStageRootKey: String,
+        val outputStageRootKey: String?,
+        val outputIntentToken: String,
         val outputs: List<JournalOutput>,
         val local: JournalLocal?,
+        val localIntent: JournalLocalIntent?,
     ) {
-        fun requireMatches(
-            outputPaths: List<Path>,
-            localRequest: LocalSourcePublication?,
-        ) {
-            require(
-                outputs.map { it.name } ==
-                    outputPaths.map { it.fileName.toString() },
-            ) {
-                "pending publish journal과 요청 output 집합이 다릅니다."
-            }
-            if (local == null) {
-                require(localRequest == null)
-            } else {
-                requireNotNull(localRequest)
-                val destination = localRequest.destination.toAbsolutePath().normalize()
-                require(
-                    destination.parent.toString() == local.parent &&
-                        destination.fileName.toString() == local.destinationName,
-                ) {
-                    "pending publish journal과 local source 대상이 다릅니다."
-                }
-            }
-        }
-
         companion object {
+            fun intent(
+                output: OutputTransaction,
+                local: LocalSourceTransaction?,
+            ): JournalRecord = JournalRecord(
+                phase = JournalPhase.INTENT,
+                publishedCount = 0,
+                outputStageName = output.journalStageName(),
+                outputStageRootKey = null,
+                outputIntentToken = output.journalIntentToken(),
+                outputs = output.journalIntentTargets(),
+                local = null,
+                localIntent = local?.journalIntent(),
+            )
+
+            fun outputStageReady(
+                output: OutputTransaction,
+                local: LocalSourceTransaction?,
+            ): JournalRecord = JournalRecord(
+                phase = JournalPhase.OUTPUT_STAGE_READY,
+                publishedCount = 0,
+                outputStageName = output.journalStageName(),
+                outputStageRootKey = output.journalStageRootKey(),
+                outputIntentToken = output.journalIntentToken(),
+                outputs = output.journalTargets(),
+                local = null,
+                localIntent = local?.journalIntent(),
+            )
+
             fun create(
                 phase: JournalPhase,
                 publishedCount: Int,
@@ -873,8 +1037,10 @@ internal object SecureBuildPublisher {
                 publishedCount,
                 output.journalStageName(),
                 output.journalStageRootKey(),
+                output.journalIntentToken(),
                 output.journalTargets(),
                 local?.journalLocal(),
+                local?.journalIntent(),
             )
         }
     }
@@ -996,7 +1162,8 @@ internal object SecureBuildPublisher {
                     record.phase.name,
                     record.publishedCount.toString(),
                     encodeField(record.outputStageName),
-                    encodeField(record.outputStageRootKey),
+                    encodeNullable(record.outputStageRootKey),
+                    encodeField(record.outputIntentToken),
                 ).joinToString("|"),
             )
             record.outputs.forEach { output ->
@@ -1007,6 +1174,19 @@ internal object SecureBuildPublisher {
                         output.oldExists.toString(),
                         encodeNullable(output.oldSha256),
                         output.newSha256,
+                        encodeNullable(output.oldIdentity),
+                        encodeNullable(output.newIdentity),
+                    ).joinToString("|"),
+                )
+            }
+            record.localIntent?.let { intent ->
+                appendLine(
+                    listOf(
+                        "T",
+                        encodeField(intent.trustedRoot),
+                        encodeField(intent.parent),
+                        encodeField(intent.stageName),
+                        encodeField(intent.token),
                     ).joinToString("|"),
                 )
             }
@@ -1033,17 +1213,31 @@ internal object SecureBuildPublisher {
             val lines = text.lineSequence().filter(String::isNotEmpty).toList()
             require(lines.firstOrNull() == "SIXBRIDGE-PUBLISH-JOURNAL-V1")
             val header = lines.getOrNull(1)?.split('|') ?: error("journal header 없음")
-            require(header.size == 5 && header[0] == "H")
+            require(header.size == 6 && header[0] == "H")
             val outputs = lines.drop(2).filter { it.startsWith("O|") }.map { line ->
                 val fields = line.split('|')
-                require(fields.size == 5)
+                require(fields.size == 7)
                 JournalOutput(
                     decodeField(fields[1]),
                     fields[2].toBooleanStrict(),
                     decodeNullable(fields[3]),
                     fields[4],
+                    decodeNullable(fields[5]),
+                    decodeNullable(fields[6]),
                 )
             }
+            val localIntent = lines.drop(2)
+                .singleOrNull { it.startsWith("T|") }
+                ?.let { line ->
+                    val fields = line.split('|')
+                    require(fields.size == 5)
+                    JournalLocalIntent(
+                        trustedRoot = decodeField(fields[1]),
+                        parent = decodeField(fields[2]),
+                        stageName = decodeField(fields[3]),
+                        token = decodeField(fields[4]),
+                    )
+                }
             val local = lines.drop(2).singleOrNull { it.startsWith("L|") }?.let { line ->
                 val fields = line.split('|')
                 require(fields.size == 11)
@@ -1064,9 +1258,11 @@ internal object SecureBuildPublisher {
                 phase = JournalPhase.valueOf(header[1]),
                 publishedCount = header[2].toInt(),
                 outputStageName = decodeField(header[3]),
-                outputStageRootKey = decodeField(header[4]),
+                outputStageRootKey = decodeNullable(header[4]),
+                outputIntentToken = decodeField(header[5]),
                 outputs = outputs,
                 local = local,
+                localIntent = localIntent,
             )
         }
 
@@ -1099,11 +1295,18 @@ internal object SecureBuildPublisher {
     )
 
     private data class FileState(
-        val fileKey: Any,
+        val identity: StableFileIdentity,
         val size: Long,
         val modified: java.nio.file.attribute.FileTime,
         val links: Long,
     )
+
+    private data class StableFileIdentity(
+        val device: Long,
+        val inode: Long,
+    ) {
+        fun encode(): String = "$device:$inode"
+    }
 
     private fun targetState(
         directory: SecureDirectoryStream<Path>,
@@ -1117,7 +1320,7 @@ internal object SecureBuildPublisher {
             "출력 경로의 hard link는 허용되지 않습니다: $absolute"
         }
         return FileState(
-            fileKey = requireNotNull(attributes.fileKey()),
+            identity = stableFileIdentity(absolute, requireNotNull(attributes.fileKey())),
             size = attributes.size(),
             modified = attributes.lastModifiedTime(),
             links = links,
@@ -1180,6 +1383,101 @@ internal object SecureBuildPublisher {
         return stream
     }
 
+    private fun <T> withPublicationLock(
+        parent: Path,
+        block: () -> T,
+    ): T {
+        val normalized = parent.toAbsolutePath().normalize()
+        val processLock = PUBLICATION_LOCKS.computeIfAbsent(normalized) {
+            ReentrantLock()
+        }
+        return processLock.withLock {
+            secureDirectory(normalized).use { handle ->
+                validateDirectoryHandle(normalized, handle)
+                val lockName = singleName(PUBLICATION_LOCK_FILE)
+                if (attributesOrNull(handle, lockName) == null) {
+                    try {
+                        handle.newByteChannel(
+                            lockName,
+                            setOf(CREATE_NEW, WRITE, NOFOLLOW_LINKS),
+                        ).use { channel ->
+                            (channel as? FileChannel)?.force(true)
+                                ?: throw IllegalStateException(
+                                    "publisher lock 파일을 fsync할 수 없습니다.",
+                                )
+                        }
+                        val view = requireNotNull(
+                            handle.getFileAttributeView(
+                                lockName,
+                                PosixFileAttributeView::class.java,
+                                NOFOLLOW_LINKS,
+                            ),
+                        )
+                        view.setPermissions(JOURNAL_PERMISSIONS)
+                        forceDirectory(normalized)
+                    } catch (_: java.nio.file.FileAlreadyExistsException) {
+                        // 다른 프로세스가 먼저 생성했으므로 아래에서 검증한다.
+                    }
+                }
+                val attributes = requireNotNull(attributesOrNull(handle, lockName))
+                require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+                    "publisher lock은 일반 파일이어야 합니다."
+                }
+                require(strictUnixLinks(normalized.resolve(PUBLICATION_LOCK_FILE)) == 1L) {
+                    "publisher lock hard link는 허용되지 않습니다."
+                }
+                val permissions = requireNotNull(
+                    handle.getFileAttributeView(
+                        lockName,
+                        PosixFileAttributeView::class.java,
+                        NOFOLLOW_LINKS,
+                    ),
+                ).readAttributes().permissions()
+                require(permissions == JOURNAL_PERMISSIONS) {
+                    "publisher lock은 owner-only여야 합니다."
+                }
+                val lockFileKey = requireNotNull(attributes.fileKey())
+                val rootFileKey = requireNotNull(
+                    handle.getFileAttributeView(BasicFileAttributeView::class.java)
+                        ?.readAttributes()
+                        ?.fileKey(),
+                )
+                val channel = handle.newByteChannel(
+                    lockName,
+                    setOf(WRITE, NOFOLLOW_LINKS),
+                ) as? FileChannel ?: throw IllegalStateException(
+                    "publisher lock을 FileChannel로 열 수 없습니다.",
+                )
+                channel.use {
+                    it.lock().use {
+                        activePublicationRoot.set(
+                            PublicationRootGuard(normalized, rootFileKey),
+                        )
+                        try {
+                            BuildPublicationFaultInjection.afterPublicationLock()
+                            validateDirectoryHandle(normalized, handle)
+                            require(
+                                attributesOrNull(handle, lockName)?.fileKey() == lockFileKey,
+                            ) {
+                                "publisher lock identity가 변경되었습니다."
+                            }
+                            block().also {
+                                validateDirectoryHandle(normalized, handle)
+                                require(
+                                    attributesOrNull(handle, lockName)?.fileKey() == lockFileKey,
+                                ) {
+                                    "publisher lock identity가 변경되었습니다."
+                                }
+                            }
+                        } finally {
+                            activePublicationRoot.remove()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun validateDirectoryHandle(
         path: Path,
         handle: SecureDirectoryStream<Path>,
@@ -1192,6 +1490,15 @@ internal object SecureBuildPublisher {
         val anchored = requireNotNull(
             handle.getFileAttributeView(BasicFileAttributeView::class.java),
         ).readAttributes()
+        activePublicationRoot.get()?.takeIf {
+            path.toAbsolutePath().normalize() == it.path
+        }?.let { guard ->
+            require(absolute.fileKey() == guard.fileKey &&
+                anchored.fileKey() == guard.fileKey
+            ) {
+                "publisher output parent identity가 transaction 중 변경되었습니다."
+            }
+        }
         require(
             absolute.isDirectory &&
                 !absolute.isSymbolicLink &&
@@ -1247,6 +1554,104 @@ internal object SecureBuildPublisher {
         }
     }
 
+    private fun writeIntentMarker(
+        parentPath: Path,
+        parentHandle: SecureDirectoryStream<Path>,
+        token: UUID,
+    ) {
+        val name = singleName(".sixbridge-publish-intent-$token")
+        val bytes = token.toString().toByteArray(Charsets.US_ASCII)
+        parentHandle.newByteChannel(
+            name,
+            setOf(CREATE_NEW, WRITE, NOFOLLOW_LINKS),
+        ).use { channel ->
+            val buffer = ByteBuffer.wrap(bytes)
+            while (buffer.hasRemaining()) channel.write(buffer)
+            (channel as? FileChannel)?.force(true)
+                ?: throw IllegalStateException("publish intent marker를 fsync할 수 없습니다.")
+        }
+        val view = requireNotNull(
+            parentHandle.getFileAttributeView(
+                name,
+                PosixFileAttributeView::class.java,
+                NOFOLLOW_LINKS,
+            ),
+        )
+        view.setPermissions(JOURNAL_PERMISSIONS)
+        require(view.readAttributes().permissions() == JOURNAL_PERMISSIONS)
+        require(strictUnixLinks(parentPath.resolve(name.toString())) == 1L)
+        forceDirectory(parentPath)
+    }
+
+    private fun deleteIntentOwnedStage(
+        parent: Path,
+        stageNameValue: String,
+        tokenValue: String,
+    ) {
+        val stageName = singleName(stageNameValue)
+        val token = UUID.fromString(tokenValue)
+        val markerName = singleName(".sixbridge-publish-intent-$token")
+        secureDirectory(parent).use { parentHandle ->
+            val stageAttributes = attributesOrNull(parentHandle, stageName)
+            val markerAttributes = attributesOrNull(parentHandle, markerName)
+            if (stageAttributes != null) {
+                require(stageAttributes.isDirectory && !stageAttributes.isSymbolicLink) {
+                    "intent stage는 일반 디렉터리여야 합니다."
+                }
+                requireNotNull(markerAttributes) {
+                    "intent stage owner marker가 없습니다."
+                }
+            }
+            if (markerAttributes != null) {
+                require(markerAttributes.isRegularFile && !markerAttributes.isSymbolicLink)
+                require(strictUnixLinks(parent.resolve(markerName.toString())) == 1L)
+                val permissions = requireNotNull(
+                    parentHandle.getFileAttributeView(
+                        markerName,
+                        PosixFileAttributeView::class.java,
+                        NOFOLLOW_LINKS,
+                    ),
+                ).readAttributes().permissions()
+                require(permissions == JOURNAL_PERMISSIONS)
+                val marker = parentHandle.newByteChannel(
+                    markerName,
+                    setOf(READ, NOFOLLOW_LINKS),
+                ).use { it.readAllBytes() }.toString(Charsets.US_ASCII)
+                require(marker == token.toString()) {
+                    "intent stage owner marker가 journal과 다릅니다."
+                }
+            }
+            if (stageAttributes != null) deleteTree(parentHandle, stageName)
+            if (markerAttributes != null) parentHandle.deleteFile(markerName)
+            forceDirectory(parent)
+        }
+    }
+
+    private fun removeIntentMarker(
+        parentPath: Path,
+        token: UUID,
+    ) {
+        secureDirectory(parentPath).use { handle ->
+            val name = singleName(".sixbridge-publish-intent-$token")
+            val attributes = requireNotNull(attributesOrNull(handle, name))
+            require(attributes.isRegularFile && !attributes.isSymbolicLink)
+            require(strictUnixLinks(parentPath.resolve(name.toString())) == 1L)
+            handle.deleteFile(name)
+            forceDirectory(parentPath)
+        }
+    }
+
+    private fun removeIntentMarkerIfPresent(
+        parentPath: Path,
+        token: UUID,
+    ) {
+        secureDirectory(parentPath).use { handle ->
+            val name = singleName(".sixbridge-publish-intent-$token")
+            if (attributesOrNull(handle, name) == null) return
+        }
+        removeIntentMarker(parentPath, token)
+    }
+
     private fun deleteTree(
         parent: SecureDirectoryStream<Path>,
         name: Path,
@@ -1283,28 +1688,78 @@ internal object SecureBuildPublisher {
     private fun strictUnixLinks(path: Path): Long =
         (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number).toLong()
 
+    private fun stableFileIdentity(
+        path: Path,
+        expectedFileKey: Any,
+    ): StableFileIdentity {
+        val unix = Files.readAttributes(
+            path,
+            "unix:dev,ino",
+            NOFOLLOW_LINKS,
+        )
+        val identity = StableFileIdentity(
+            device = (unix["dev"] as? Number)?.toLong()
+                ?: throw IllegalStateException("output device identity를 읽을 수 없습니다."),
+            inode = (unix["ino"] as? Number)?.toLong()
+                ?: throw IllegalStateException("output inode identity를 읽을 수 없습니다."),
+        )
+        val after = Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(after.fileKey() == expectedFileKey) {
+            "output identity가 조회 중 변경되었습니다."
+        }
+        return identity
+    }
+
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
-    private fun sha256OrNull(
+    private data class FileProof(
+        val sha256: String,
+        val identity: String,
+    )
+
+    private fun fileProofOrNull(
         handle: SecureDirectoryStream<Path>,
         name: Path,
         absolute: Path,
-    ): String? {
+    ): FileProof? {
         val state = targetState(handle, name, absolute) ?: return null
         require(state.links == 1L) {
             "journal recovery 파일의 hard link는 허용되지 않습니다."
         }
-        return sha256(
+        val digest = sha256(
             handle.newByteChannel(name, setOf(READ, NOFOLLOW_LINKS)).use {
                 it.readAllBytes()
             },
         )
+        requireSameState(
+            state,
+            targetState(handle, name, absolute),
+            "journal recovery 파일이 읽는 동안 변경되었습니다.",
+        )
+        return FileProof(digest, state.identity.encode())
     }
 
     private fun forceDirectory(path: Path) {
+        BuildPublicationFaultInjection.beforeDirectoryFsync(path)
+        activePublicationRoot.get()?.takeIf {
+            path.toAbsolutePath().normalize() == it.path
+        }?.let { guard ->
+            val attributes = Files.readAttributes(
+                path,
+                BasicFileAttributes::class.java,
+                NOFOLLOW_LINKS,
+            )
+            require(attributes.fileKey() == guard.fileKey) {
+                "publisher output parent identity가 fsync 전에 변경되었습니다."
+            }
+        }
         FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
     }
 
@@ -1351,6 +1806,13 @@ internal object SecureBuildPublisher {
         PosixFilePermission.OWNER_READ,
         PosixFilePermission.OWNER_WRITE,
     )
+    private val PUBLICATION_LOCKS = ConcurrentHashMap<Path, ReentrantLock>()
+    private val activePublicationRoot = ThreadLocal<PublicationRootGuard?>()
+    private data class PublicationRootGuard(
+        val path: Path,
+        val fileKey: Any,
+    )
+    private const val PUBLICATION_LOCK_FILE = ".sixbridge-build-publisher.lock"
     private const val JOURNAL_FILE = ".sixbridge-publish-journal.v1"
     private const val MAX_EXISTING_OUTPUT_BYTES = 512L * 1024 * 1024
 }
@@ -1363,6 +1825,14 @@ internal object BuildPublicationFaultInjection {
     private val afterLocal = ThreadLocal<(() -> Unit)?>()
     private val crashPoint = ThreadLocal<BuildCrashPoint?>()
     private val failCleanup = ThreadLocal<Boolean?>()
+    private val afterStaged = ThreadLocal<(() -> Unit)?>()
+    private val afterLock = ThreadLocal<(() -> Unit)?>()
+    private val failRollback = ThreadLocal<Boolean?>()
+    private val directoryFsyncObserver = ThreadLocal<((Path) -> Unit)?>()
+    private val directoryFsyncFailurePredicate =
+        ThreadLocal<((Path) -> Boolean)?>()
+    private val failBeforeStaged = ThreadLocal<Boolean?>()
+    private val failAfterIntent = ThreadLocal<Boolean?>()
 
     @JvmSynthetic
     fun <T> beforeOutputPublish(
@@ -1399,6 +1869,127 @@ internal object BuildPublicationFaultInjection {
     @JvmSynthetic
     fun afterLocalPublish() {
         afterLocal.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> pauseAfterStagedJournal(
+        action: () -> Unit,
+        block: () -> T,
+    ): T {
+        check(afterStaged.get() == null)
+        afterStaged.set(action)
+        return try {
+            block()
+        } finally {
+            afterStaged.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun afterStagedJournal() {
+        afterStaged.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> replaceParentAfterLock(
+        action: () -> Unit,
+        block: () -> T,
+    ): T {
+        check(afterLock.get() == null)
+        afterLock.set(action)
+        return try {
+            block()
+        } finally {
+            afterLock.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun afterPublicationLock() {
+        afterLock.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> failOutputRollback(block: () -> T): T {
+        check(failRollback.get() == null)
+        failRollback.set(true)
+        return try {
+            block()
+        } finally {
+            failRollback.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun shouldFailOutputRollback(): Boolean = failRollback.get() == true
+
+    @JvmSynthetic
+    fun <T> observeDirectoryFsync(
+        observer: (Path) -> Unit,
+        block: () -> T,
+    ): T {
+        check(directoryFsyncObserver.get() == null)
+        directoryFsyncObserver.set(observer)
+        return try {
+            block()
+        } finally {
+            directoryFsyncObserver.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun <T> failDirectoryFsyncWhen(
+        predicate: (Path) -> Boolean,
+        block: () -> T,
+    ): T {
+        check(directoryFsyncFailurePredicate.get() == null)
+        directoryFsyncFailurePredicate.set(predicate)
+        return try {
+            block()
+        } finally {
+            directoryFsyncFailurePredicate.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun beforeDirectoryFsync(path: Path) {
+        directoryFsyncObserver.get()?.invoke(path)
+        if (directoryFsyncFailurePredicate.get()?.invoke(path) == true) {
+            directoryFsyncFailurePredicate.remove()
+            throw IllegalStateException("injected publisher directory fsync failure")
+        }
+    }
+
+    @JvmSynthetic
+    fun <T> forceAfterStageBeforeStagedJournal(block: () -> T): T {
+        check(failBeforeStaged.get() == null)
+        failBeforeStaged.set(true)
+        return try {
+            block()
+        } finally {
+            failBeforeStaged.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun afterStageBeforeStagedJournal() {
+        if (failBeforeStaged.get() == true) throw ForcedBuildTermination()
+    }
+
+    @JvmSynthetic
+    fun <T> forceAfterIntentBeforeStage(block: () -> T): T {
+        check(failAfterIntent.get() == null)
+        failAfterIntent.set(true)
+        return try {
+            block()
+        } finally {
+            failAfterIntent.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun afterIntentBeforeStage() {
+        if (failAfterIntent.get() == true) throw ForcedBuildTermination()
     }
 
     @JvmSynthetic

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.crx
 
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.concurrent.Callable
@@ -16,6 +17,21 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class ExtensionKeyManagerSecurityTest {
+    private fun manager(root: Path): ExtensionKeyManager =
+        ExtensionKeyManager(requireNotNull(root.parent), root)
+
+    @Test
+    fun `public API requires an explicit trusted root and key root`() {
+        val publicConstructors = ExtensionKeyManager::class.java.constructors.toList()
+
+        assertTrue(publicConstructors.none { it.parameterCount == 1 })
+        assertTrue(
+            publicConstructors.any { constructor ->
+                constructor.parameterTypes.toList() == listOf(Path::class.java, Path::class.java)
+            },
+        )
+    }
+
     @Test
     fun `trusted root symlink ancestor is rejected`() {
         val trustedParent = Files.createTempDirectory("six-key-trusted-parent")
@@ -24,7 +40,7 @@ class ExtensionKeyManagerSecurityTest {
         Files.createSymbolicLink(linkedLocal, outside)
 
         assertFails {
-            ExtensionKeyManager.create(
+            ExtensionKeyManager(
                 trustedRoot = trustedParent,
                 keyRoot = linkedLocal.resolve("keystore/crx"),
             ).getOrCreate("project-${"e".repeat(32)}")
@@ -45,7 +61,7 @@ class ExtensionKeyManagerSecurityTest {
                     Files.createDirectory(root)
                 },
                 block = {
-                    ExtensionKeyManager(root)
+                    manager(root)
                         .getOrCreate("project-${"f".repeat(32)}")
                 },
             )
@@ -61,7 +77,7 @@ class ExtensionKeyManagerSecurityTest {
     fun `directory fsync failure never commits metadata and recovers incomplete pair`() {
         val root = Files.createTempDirectory("six-key-fsync")
         val identity = "project-${"1".repeat(32)}"
-        val manager = ExtensionKeyManager(root)
+        val manager = manager(root)
 
         assertFails {
             ExtensionKeyManagerFaultInjection.failNextDirectoryFsync {
@@ -81,7 +97,7 @@ class ExtensionKeyManagerSecurityTest {
     fun `committed metadata with a missing pair is corruption not normal recovery`() {
         val root = Files.createTempDirectory("six-key-committed-missing")
         val identity = "project-${"2".repeat(32)}"
-        val manager = ExtensionKeyManager(root)
+        val manager = manager(root)
         manager.getOrCreate(identity)
         Files.delete(root.listDirectoryEntries("*.pub").single())
 
@@ -97,7 +113,7 @@ class ExtensionKeyManagerSecurityTest {
 
         assertFails {
             ExtensionKeyManagerFaultInjection.failUnixLinkCount {
-                ExtensionKeyManager(root)
+                manager(root)
                     .getOrCreate("project-${"3".repeat(32)}")
             }
         }
@@ -107,7 +123,7 @@ class ExtensionKeyManagerSecurityTest {
     @Test
     fun `identities that collided under the legacy safe name get distinct canonical keys`() {
         val root = Files.createTempDirectory("six-key-collision")
-        val manager = ExtensionKeyManager(root)
+        val manager = manager(root)
 
         val colon = manager.getOrCreate("store:abc:profile-30")
         val dash = manager.getOrCreate("store-abc-profile-30")
@@ -134,7 +150,7 @@ class ExtensionKeyManagerSecurityTest {
         Files.createSymbolicLink(root.resolve("$base.pk8"), outside)
 
         assertFails {
-            ExtensionKeyManager(root).getOrCreate(identity)
+            manager(root).getOrCreate(identity)
         }
         assertEquals("outside", Files.readString(outside))
     }
@@ -148,7 +164,7 @@ class ExtensionKeyManagerSecurityTest {
             (1..16).map {
                 pool.submit(
                     Callable {
-                        ExtensionKeyManager(root).getOrCreate(identity)
+                        manager(root).getOrCreate(identity)
                     },
                 )
             }
@@ -170,7 +186,7 @@ class ExtensionKeyManagerSecurityTest {
     fun `incomplete pair left before identity commit is recovered`() {
         val root = Files.createTempDirectory("six-key-recovery")
         val identity = "project-${"c".repeat(32)}"
-        val manager = ExtensionKeyManager(root)
+        val manager = manager(root)
 
         assertFails {
             ExtensionKeyManagerFaultInjection.failAfterPairPublish {
@@ -196,8 +212,8 @@ class ExtensionKeyManagerSecurityTest {
         val oldManager = LegacyKeyWriter(root)
         val legacy = oldManager.write(legacyIdentity)
 
-        val migrated = ExtensionKeyManager(root).getOrCreate(legacyIdentity)
-        val colliding = ExtensionKeyManager(root).getOrCreate(
+        val migrated = manager(root).getOrCreate(legacyIdentity)
+        val colliding = manager(root).getOrCreate(
             legacyIdentity.replace("manifest-", "manifest:"),
         )
 
@@ -220,7 +236,10 @@ class ExtensionKeyManagerSecurityTest {
     ) {
         fun write(identity: String): java.security.KeyPair {
             val staging = Files.createTempDirectory("six-key-legacy-staging")
-            val generated = ExtensionKeyManager(staging).getOrCreate("seed")
+            val generated = ExtensionKeyManager(
+                requireNotNull(staging.parent),
+                staging,
+            ).getOrCreate("seed")
             Files.copy(
                 staging.listDirectoryEntries("*.pk8").single(),
                 root.resolve("$identity.pk8"),
