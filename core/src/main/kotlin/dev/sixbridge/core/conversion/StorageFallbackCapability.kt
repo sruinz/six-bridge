@@ -1,6 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.RuntimeResourceIndex
+import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
@@ -10,12 +11,14 @@ import java.security.MessageDigest
 internal data class StorageFallbackCapability(
     val sourceClosureSha256: String,
     val convertedClosureSha256: String,
+    val profileSha256: String,
 ) {
     fun evidence(): SourceEvidence = SourceEvidence(
         relativePath = EVIDENCE_PATH,
         line = null,
         detail = "schema=1; source-closure-sha256=$sourceClosureSha256; " +
             "converted-closure-sha256=$convertedClosureSha256; " +
+            "profile-sha256=$profileSha256; " +
             "storage.local=supported; storage.sync=unavailable",
     )
 
@@ -26,6 +29,7 @@ internal data class StorageFallbackCapability(
             root: Path,
             index: RuntimeResourceIndex,
             convertedSources: Map<String, String>,
+            profile: BrowserProfile,
         ): StorageFallbackCapability = StorageFallbackCapability(
             sourceClosureSha256 = closureSha256(root, index, emptyMap()),
             convertedClosureSha256 = closureSha256(
@@ -33,6 +37,7 @@ internal data class StorageFallbackCapability(
                 index,
                 convertedSources.mapValues { (_, source) -> source.toByteArray(UTF_8) },
             ),
+            profileSha256 = BrowserProfileDigest.sha256(profile),
         )
 
         fun currentClosureSha256(
@@ -46,6 +51,7 @@ internal data class StorageFallbackCapability(
             return StorageFallbackCapability(
                 sourceClosureSha256 = match.groupValues[1],
                 convertedClosureSha256 = match.groupValues[2],
+                profileSha256 = match.groupValues[3],
             )
         }
 
@@ -109,6 +115,7 @@ internal data class StorageFallbackCapability(
         private val DETAIL = Regex(
             """schema=1; source-closure-sha256=([0-9a-f]{64}); """ +
                 """converted-closure-sha256=([0-9a-f]{64}); """ +
+                """profile-sha256=([0-9a-f]{64}); """ +
                 """storage\.local=supported; storage\.sync=unavailable""",
         )
     }

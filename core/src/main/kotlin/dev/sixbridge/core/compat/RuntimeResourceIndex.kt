@@ -4,10 +4,10 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
-import kotlin.io.path.readText
 
 class RuntimeResourceIndex private constructor(
     val resources: Set<Path>,
@@ -38,7 +38,20 @@ class RuntimeResourceIndex private constructor(
     )
 
     companion object {
-        fun create(root: Path, manifest: JsonObject): RuntimeResourceIndex {
+        fun create(root: Path, manifest: JsonObject): RuntimeResourceIndex =
+            create(root, manifest, Files::readString)
+
+        internal fun createForTesting(
+            root: Path,
+            manifest: JsonObject,
+            readSource: (Path) -> String,
+        ): RuntimeResourceIndex = create(root, manifest, readSource)
+
+        private fun create(
+            root: Path,
+            manifest: JsonObject,
+            readSource: (Path) -> String,
+        ): RuntimeResourceIndex {
             val normalizedRoot = root.toAbsolutePath().normalize()
             val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
                 ?: return RuntimeResourceIndex(
@@ -54,6 +67,7 @@ class RuntimeResourceIndex private constructor(
             val contentScriptEntriesByResource = linkedMapOf<Path, MutableSet<Int>>()
             val pending = mutableListOf<Path>()
             val dependencyEdges = linkedSetOf<RuntimeDependencyEdge>()
+            val sourceByResource = linkedMapOf<Path, String>()
             var pendingIndex = 0
             var unresolvedDependency = false
 
@@ -135,7 +149,12 @@ class RuntimeResourceIndex private constructor(
             while (pendingIndex < pending.size) {
                 val resource = pending[pendingIndex++]
                 val roles = rolesByResource.getValue(resource).toSet()
-                val source = runCatching { resource.readText() }.getOrDefault("")
+                val source = runCatching { readSource(resource) }
+                    .getOrElse {
+                        unresolvedDependency = true
+                        ""
+                    }
+                sourceByResource[resource] = source
                 val dependencyScan = when (resource.extension.lowercase()) {
                     "html" -> {
                         val htmlScan = RuntimeSourceScanner.scanHtmlScripts(source)
@@ -188,7 +207,7 @@ class RuntimeResourceIndex private constructor(
             val scripts = rolesByResource.entries
                 .sortedBy { (path, _) -> relativePath(normalizedRoot, path) }
                 .flatMap { (path, roles) ->
-                    val source = runCatching { path.readText() }.getOrDefault("")
+                    val source = sourceByResource[path].orEmpty()
                     when (path.extension.lowercase()) {
                         "js", "mjs", "cjs" -> listOf(
                             RuntimeScript(

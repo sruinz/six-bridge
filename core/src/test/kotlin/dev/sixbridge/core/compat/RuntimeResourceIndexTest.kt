@@ -73,6 +73,27 @@ class RuntimeResourceIndexTest {
         )
     }
 
+    @Test
+    fun `marks runtime closure unresolved when a declared resource read fails`() {
+        val root = workerExtension(
+            """importScripts("./helper.js");""",
+        )
+        root.resolve("helper.js").writeText("console.log('helper');")
+
+        val index = RuntimeResourceIndex.createForTesting(
+            root = root,
+            manifest = manifest("""{"service_worker":"background.js"}"""),
+            readSource = { path ->
+                if (path.fileName.toString() == "helper.js") {
+                    throw java.io.IOException("injected read failure")
+                }
+                java.nio.file.Files.readString(path)
+            },
+        )
+
+        assertTrue(index.unresolvedDependency)
+    }
+
     private fun workerExtension(source: String): Path =
         Files.createTempDirectory("sixbridge-index-").also { root ->
             root.resolve("background.js").writeText(source)

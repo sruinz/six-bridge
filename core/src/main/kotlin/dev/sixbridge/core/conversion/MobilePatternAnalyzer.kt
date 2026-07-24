@@ -173,13 +173,21 @@ class MobilePatternAnalyzer(
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
         val convertedSources = mutableMapOf<String, String>()
-        index.scripts.forEach { script ->
+        val inspected = index.scripts.map { script ->
+            script to rewriter.inspect(script.source)
+        }
+        if (inspected.none { (_, inspection) -> inspection.storageIntent }) {
+            return StorageDecision()
+        }
+        inspected.forEach { (script, inspection) ->
             val rewrite = rewriter.rewrite(script.source)
             if (isStandaloneJavaScript(script.relativePath)) {
-                if (rewrite.replacements.isNotEmpty()) {
+                if (inspection.unsafeAccesses.isEmpty() &&
+                    rewrite.replacements.isNotEmpty()
+                ) {
                     convertedSources[script.relativePath] = rewrite.source
                 }
-                safeEvidence += rewrite.replacements.map { access ->
+                safeEvidence += inspection.syncAccesses.map { access ->
                     SourceEvidence(
                         relativePath = script.relativePath,
                         line = script.lineOffset + access.line,
@@ -191,7 +199,7 @@ class MobilePatternAnalyzer(
                     )
                 }
             } else {
-                unsafeEvidence += rewrite.replacements.map { access ->
+                unsafeEvidence += inspection.syncAccesses.map { access ->
                     SourceEvidence(
                         relativePath = script.relativePath,
                         line = script.lineOffset + access.line,
@@ -199,16 +207,13 @@ class MobilePatternAnalyzer(
                     )
                 }
             }
-            unsafeEvidence += rewrite.unsafeAccesses.map { access ->
+            unsafeEvidence += inspection.unsafeAccesses.map { access ->
                 SourceEvidence(
                     relativePath = script.relativePath,
                     line = script.lineOffset + access.line,
                     detail = access.detail,
                 )
             }
-        }
-        if (safeEvidence.isEmpty() && unsafeEvidence.isEmpty()) {
-            return StorageDecision()
         }
         if (STORAGE_SYNC_FEATURE in profile.supportedFeatures) {
             return StorageDecision()
@@ -267,6 +272,7 @@ class MobilePatternAnalyzer(
             extensionRoot,
             index,
             convertedSources,
+            profile,
         )
         return StorageDecision(
             decision = AdapterDecision(

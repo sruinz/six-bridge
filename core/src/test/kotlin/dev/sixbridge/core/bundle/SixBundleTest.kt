@@ -132,6 +132,7 @@ class SixBundleTest {
         val capability =
             "schema=1; source-closure-sha256=${"c".repeat(64)}; " +
                 "converted-closure-sha256=${"d".repeat(64)}; " +
+                "profile-sha256=${"e".repeat(64)}; " +
                 "storage.local=supported; storage.sync=unavailable"
         val compatibility = CompatibilityReport(
             status = CompatibilityStatus.COMPATIBLE,

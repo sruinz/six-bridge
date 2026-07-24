@@ -39,13 +39,18 @@ class ConversionPlannerTest {
     }
 
     @Test
-    fun `mobile adapters accept only planner selected capabilities`() {
-        val applyParameter = MobileAdapter::class.java.methods
+    fun `mobile adapters require an active execution context and planner capability`() {
+        val applyParameters = MobileAdapter::class.java.methods
             .single { it.name == "apply" }
             .parameterTypes
-            .last()
 
-        assertEquals(SelectedAdapter::class.java, applyParameter)
+        assertEquals(
+            listOf(
+                AdapterExecutionContext::class.java,
+                SelectedAdapter::class.java,
+            ),
+            applyParameters.toList(),
+        )
     }
 
     @Test
@@ -54,6 +59,8 @@ class ConversionPlannerTest {
             "ConstructSelectedAdapter.java",
             "ImplementSelectedAdapter.java",
             "ConstructPlannerImplementation.java",
+            "ConstructAdapterExecutionContext.java",
+            "ConstructExtensionSnapshot.java",
         ).forEach { fixture ->
             val source = requireNotNull(
                 javaClass.classLoader.getResource(
@@ -80,7 +87,11 @@ class ConversionPlannerTest {
                     "abstract" in diagnostics && "instantiated" in diagnostics,
                     diagnostics,
                 )
-            } else if (fixture == "ConstructPlannerImplementation.java") {
+            } else if (
+                fixture == "ConstructPlannerImplementation.java" ||
+                fixture == "ConstructAdapterExecutionContext.java" ||
+                fixture == "ConstructExtensionSnapshot.java"
+            ) {
                 assertTrue("private access" in diagnostics, diagnostics)
             } else {
                 assertTrue(

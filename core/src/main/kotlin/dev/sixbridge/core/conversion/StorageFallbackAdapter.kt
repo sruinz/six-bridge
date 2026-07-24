@@ -13,9 +13,10 @@ class StorageFallbackAdapter : MobileAdapter {
     override val version: Int = 1
 
     override fun apply(
-        workingRoot: Path,
+        context: AdapterExecutionContext,
         selected: SelectedAdapter,
     ): AdapterDecision {
+        val activeContext = context.requireActive()
         val decision = selected.toDecision()
         if (decision.id != id ||
             decision.version != version ||
@@ -33,147 +34,231 @@ class StorageFallbackAdapter : MobileAdapter {
             ?: throw IllegalStateException(
                 "storage fallback closure 또는 feature proof가 올바르지 않습니다.",
             )
-        return ConversionWorkspaceTransaction().run(workingRoot) { stagedRoot ->
-            applyToStagedTree(stagedRoot, decision, capability)
+        check(
+            capability.profileSha256 ==
+                BrowserProfileDigest.sha256(activeContext.profile),
+        ) {
+            "승인된 browser profile과 현재 실행 profile이 다릅니다."
         }
+        return applyToStagedTree(activeContext, decision, capability)
     }
 
     private fun applyToStagedTree(
-        stagedRoot: Path,
+        context: ActiveAdapterExecutionContext,
         decision: AdapterDecision,
         capability: StorageFallbackCapability,
     ): AdapterDecision {
-        val root = verifiedRoot(stagedRoot)
-        val manifest = manifest(root)
-        val index = RuntimeResourceIndex.create(root, manifest)
-        if (index.unresolvedDependency) {
-            throw IllegalStateException("runtime dependency를 완전히 해석할 수 없습니다.")
+        val originalRoot = verifiedRoot(context.originalRoot)
+        val stagedRoot = verifiedRoot(context.stagedRoot)
+        val originalIndex = runtimeIndex(originalRoot)
+        check(
+            StorageFallbackCapability.currentClosureSha256(
+                originalRoot,
+                originalIndex,
+            ) == capability.sourceClosureSha256,
+        ) {
+            "승인된 immutable original runtime closure와 다릅니다."
         }
-        val currentClosure = StorageFallbackCapability.currentClosureSha256(
-            root,
-            index,
-        )
-        val sourceState = when (currentClosure) {
-            capability.sourceClosureSha256 -> true
-            capability.convertedClosureSha256 -> false
-            else -> throw IllegalStateException(
-                "승인된 manifest 또는 runtime closure가 현재 staged tree와 다릅니다.",
-            )
-        }
-
-        val rewriter = JavaScriptTokenRewriter()
-        val files = index.scripts
-            .groupBy(RuntimeResourceIndex.RuntimeScript::relativePath)
-            .toSortedMap()
-            .map { (relativePath, scripts) ->
-                if (!isStandaloneJavaScript(relativePath) ||
-                    scripts.any { it.lineOffset != 0 }
-                ) {
-                    throw IllegalStateException(
-                        "인라인 runtime script는 storage fallback으로 변환할 수 없습니다: " +
-                            relativePath,
-                    )
-                }
-                val target = verifiedFile(root, relativePath)
-                val bytes = Files.readAllBytes(target)
-                val source = bytes.toString(UTF_8)
-                if (scripts.any { it.source != source }) {
-                    throw IllegalStateException(
-                        "runtime 색인 후 파일이 변경되었습니다: $relativePath",
-                    )
-                }
-                val result = rewriter.rewrite(source)
-                if (result.unsafeAccesses.isNotEmpty()) {
-                    throw IllegalStateException(
-                        "승인 후 안전하지 않은 storage 접근이 발견되었습니다: $relativePath",
-                    )
-                }
-                RewriteFile(relativePath, target, source, result)
-            }
-
         val tokenEvidence = decision.evidence
             .filter { it.relativePath != StorageFallbackCapability.EVIDENCE_PATH }
             .distinct()
             .sortedWith(EVIDENCE_ORDER)
-        if (!sourceState) {
-            verifyReapplication(tokenEvidence, files)
-            return decision.copy(applied = true, changes = emptyList())
+        val plans = targetPlans(
+            originalRoot,
+            originalIndex,
+            stagedRoot,
+            tokenEvidence,
+        )
+        val expectedCapability = StorageFallbackCapability.create(
+            root = originalRoot,
+            index = originalIndex,
+            convertedSources = plans.associate {
+                it.relativePath to it.convertedSource
+            },
+            profile = context.profile,
+        )
+        check(expectedCapability == capability) {
+            "승인된 storage target 또는 profile provenance가 다릅니다."
+        }
+        verifyOriginalRuntimeResources(
+            originalRoot,
+            stagedRoot,
+            originalIndex,
+            plans,
+        )
+        val stagedIndex = runtimeIndex(stagedRoot)
+        val stagedScriptPaths = stagedIndex.scripts
+            .mapTo(mutableSetOf()) { it.relativePath }
+        check(plans.all { it.relativePath in stagedScriptPaths }) {
+            "승인된 storage target이 현재 staged runtime closure에 없습니다."
         }
 
-        val currentEvidence = files.flatMap { file ->
-            file.result.replacements.map { access ->
+        val states = plans.mapTo(mutableSetOf()) { plan ->
+            when (plan.currentSource) {
+                plan.originalSource -> TargetState.SOURCE
+                plan.convertedSource -> TargetState.CONVERTED
+                else -> throw IllegalStateException(
+                    "승인된 storage target bytes가 현재 staged tree와 다릅니다.",
+                )
+            }
+        }
+        check(states.size == 1) {
+            "storage target 일부만 변환된 상태는 허용하지 않습니다."
+        }
+        return if (states.single() == TargetState.CONVERTED) {
+            verifyConvertedTargets(plans, tokenEvidence)
+            decision.copy(applied = true, changes = emptyList())
+        } else {
+            plans.forEach { plan ->
+                Files.writeString(
+                    plan.stagedPath,
+                    plan.convertedSource,
+                    UTF_8,
+                )
+                check(Files.readString(plan.stagedPath, UTF_8) == plan.convertedSource) {
+                    "storage target 변환 결과 검증에 실패했습니다."
+                }
+            }
+            decision.copy(
+                applied = true,
+                changes = plans.flatMap { plan ->
+                    plan.replacements.map { access ->
+                        "${plan.relativePath}:${access.line} storage.sync → storage.local"
+                    }
+                }.distinct().sorted(),
+            )
+        }
+    }
+
+    private fun targetPlans(
+        originalRoot: Path,
+        originalIndex: RuntimeResourceIndex,
+        stagedRoot: Path,
+        expectedEvidence: List<SourceEvidence>,
+    ): List<TargetPlan> {
+        check(expectedEvidence.isNotEmpty()) {
+            "승인된 storage token 근거가 없습니다."
+        }
+        val evidencePaths = expectedEvidence.mapTo(sortedSetOf()) {
+            it.relativePath
+        }
+        val scriptsByPath = originalIndex.scripts
+            .groupBy(RuntimeResourceIndex.RuntimeScript::relativePath)
+        val rewriter = JavaScriptTokenRewriter()
+        val plans = evidencePaths.map { relativePath ->
+            val scripts = scriptsByPath[relativePath]
+                ?: throw IllegalStateException(
+                    "승인된 storage target을 immutable closure에서 찾을 수 없습니다.",
+                )
+            check(
+                isStandaloneJavaScript(relativePath) &&
+                    scripts.all { it.lineOffset == 0 },
+            ) {
+                "인라인 runtime script는 storage fallback으로 변환할 수 없습니다."
+            }
+            val originalPath = verifiedFile(originalRoot, relativePath)
+            val originalSource = Files.readString(originalPath, UTF_8)
+            check(scripts.all { it.source == originalSource }) {
+                "immutable runtime 색인과 target bytes가 다릅니다."
+            }
+            val inspection = rewriter.inspect(originalSource)
+            check(inspection.unsafeAccesses.isEmpty()) {
+                "immutable storage target에 안전하지 않은 실행 환경이 있습니다."
+            }
+            val rewrite = rewriter.rewrite(originalSource)
+            check(rewrite.replacements.isNotEmpty()) {
+                "immutable storage target에서 변환 token을 찾지 못했습니다."
+            }
+            TargetPlan(
+                relativePath = relativePath,
+                originalSource = originalSource,
+                convertedSource = rewrite.source,
+                currentSource = Files.readString(
+                    verifiedFile(stagedRoot, relativePath),
+                    UTF_8,
+                ),
+                stagedPath = verifiedFile(stagedRoot, relativePath),
+                replacements = rewrite.replacements,
+            )
+        }
+        val currentEvidence = plans.flatMap { plan ->
+            plan.replacements.map { access ->
                 SourceEvidence(
-                    relativePath = file.relativePath,
+                    relativePath = plan.relativePath,
                     line = access.line,
                     detail = StorageFallbackEvidence.detail(
                         access.root,
-                        file.source,
-                        file.result.source,
+                        plan.originalSource,
+                        plan.convertedSource,
                     ),
                 )
             }
         }.distinct().sortedWith(EVIDENCE_ORDER)
-        if (currentEvidence != tokenEvidence || currentEvidence.isEmpty()) {
-            throw IllegalStateException("승인된 storage token 근거와 현재 source가 다릅니다.")
+        check(currentEvidence == expectedEvidence) {
+            "승인된 storage token 근거와 immutable original source가 다릅니다."
         }
-
-        val convertedSources = files
-            .filter { it.result.replacements.isNotEmpty() }
-            .associate { it.relativePath to it.result.source }
-        val expected = StorageFallbackCapability.create(
-            root,
-            index,
-            convertedSources,
-        )
-        if (expected != capability) {
-            throw IllegalStateException("승인된 storage closure 변환 결과와 현재 계획이 다릅니다.")
-        }
-        files.filter { it.result.source != it.source }.forEach { file ->
-            Files.writeString(file.path, file.result.source, UTF_8)
-        }
-        val convertedManifest = manifest(root)
-        val convertedIndex = RuntimeResourceIndex.create(root, convertedManifest)
-        if (convertedIndex.unresolvedDependency ||
-            StorageFallbackCapability.currentClosureSha256(
-                root,
-                convertedIndex,
-            ) != capability.convertedClosureSha256
-        ) {
-            throw IllegalStateException("완성된 storage fallback closure 검증에 실패했습니다.")
-        }
-        return decision.copy(
-            applied = true,
-            changes = files.flatMap { file ->
-                file.result.replacements.map { access ->
-                    "${file.relativePath}:${access.line} storage.sync → storage.local"
-                }
-            }.distinct().sorted(),
-        )
+        return plans
     }
 
-    private fun verifyReapplication(
-        expectedEvidence: List<SourceEvidence>,
-        files: List<RewriteFile>,
+    private fun verifyOriginalRuntimeResources(
+        originalRoot: Path,
+        stagedRoot: Path,
+        originalIndex: RuntimeResourceIndex,
+        plans: List<TargetPlan>,
     ) {
-        val filesByPath = files.associateBy(RewriteFile::relativePath)
-        val localKeys = files.flatMap { file ->
-            file.result.localAccesses.map { access ->
-                EvidenceKey(file.relativePath, access.line, access.root)
+        val plansByPath = plans.associateBy(TargetPlan::relativePath)
+        originalIndex.resources.forEach { originalPath ->
+            val relativePath = relativePath(originalRoot, originalPath)
+            val originalBytes = Files.readAllBytes(
+                verifiedFile(originalRoot, relativePath),
+            )
+            val stagedBytes = Files.readAllBytes(
+                verifiedFile(stagedRoot, relativePath),
+            )
+            val target = plansByPath[relativePath]
+            if (target == null) {
+                check(originalBytes.contentEquals(stagedBytes)) {
+                    "원본 runtime resource bytes가 staged tree에서 변경되었습니다."
+                }
+            } else {
+                val sourceBytes = target.originalSource.toByteArray(UTF_8)
+                val convertedBytes = target.convertedSource.toByteArray(UTF_8)
+                check(
+                    stagedBytes.contentEquals(sourceBytes) ||
+                        stagedBytes.contentEquals(convertedBytes),
+                ) {
+                    "원본 storage target bytes가 staged tree에서 변경되었습니다."
+                }
             }
+        }
+    }
+
+    private fun verifyConvertedTargets(
+        plans: List<TargetPlan>,
+        expectedEvidence: List<SourceEvidence>,
+    ) {
+        val localKeys = plans.flatMap { plan ->
+            JavaScriptTokenRewriter().inspect(plan.currentSource)
+                .localAccesses
+                .map { access ->
+                    EvidenceKey(plan.relativePath, access.line, access.root)
+                }
         }.toSet()
         val expectedKeys = expectedEvidence.map { evidence ->
             val parsed = StorageFallbackEvidence.parse(evidence.detail)
                 ?: throw IllegalStateException(
                     "승인된 storage token 근거 형식을 확인할 수 없습니다.",
                 )
-            val file = filesByPath[evidence.relativePath]
-                ?: throw IllegalStateException(
-                    "승인된 storage 파일을 runtime closure에서 찾을 수 없습니다.",
-                )
-            if (StorageFallbackEvidence.sha256(file.source) != parsed.convertedSha256) {
-                throw IllegalStateException(
-                    "승인 후 storage 변환 파일이 변경되었습니다: ${evidence.relativePath}",
-                )
+            val plan = plans.singleOrNull {
+                it.relativePath == evidence.relativePath
+            } ?: throw IllegalStateException(
+                "승인된 storage target plan을 찾을 수 없습니다.",
+            )
+            check(
+                StorageFallbackEvidence.sha256(plan.currentSource) ==
+                    parsed.convertedSha256,
+            ) {
+                "승인 후 storage 변환 target이 변경되었습니다."
             }
             EvidenceKey(
                 relativePath = evidence.relativePath,
@@ -183,9 +268,17 @@ class StorageFallbackAdapter : MobileAdapter {
                 root = parsed.root,
             )
         }.toSet()
-        if (expectedKeys.isEmpty() || !localKeys.containsAll(expectedKeys)) {
-            throw IllegalStateException("승인된 storage 변환 결과를 현재 closure에서 확인할 수 없습니다.")
+        check(expectedKeys.isNotEmpty() && localKeys.containsAll(expectedKeys)) {
+            "승인된 storage 변환 결과를 현재 target에서 확인할 수 없습니다."
         }
+    }
+
+    private fun runtimeIndex(root: Path): RuntimeResourceIndex {
+        val index = RuntimeResourceIndex.create(root, manifest(root))
+        check(!index.unresolvedDependency) {
+            "runtime dependency를 완전히 해석할 수 없습니다."
+        }
+        return index
     }
 
     private fun manifest(root: Path): JsonObject {
@@ -195,57 +288,63 @@ class StorageFallbackAdapter : MobileAdapter {
         }.getOrNull() ?: throw IllegalStateException("manifest.json을 해석할 수 없습니다.")
     }
 
-    private fun verifiedRoot(stagedRoot: Path): Path {
-        val root = stagedRoot.toAbsolutePath().normalize()
-        if (!Files.isDirectory(root, NOFOLLOW_LINKS) ||
-            Files.isSymbolicLink(root)
-        ) {
-            throw IllegalStateException("staged working root 경계를 확인할 수 없습니다.")
+    private fun verifiedRoot(path: Path): Path {
+        val root = path.toAbsolutePath().normalize()
+        check(Files.isDirectory(root, NOFOLLOW_LINKS) && !Files.isSymbolicLink(root)) {
+            "conversion root 경계를 확인할 수 없습니다."
         }
         return root.toRealPath()
     }
 
     private fun verifiedFile(root: Path, relativePath: String): Path {
-        if (relativePath.isBlank() ||
-            '\\' in relativePath ||
-            '%' in relativePath ||
-            ':' in relativePath ||
-            '?' in relativePath ||
-            '#' in relativePath
+        check(
+            relativePath.isNotBlank() &&
+                '\\' !in relativePath &&
+                '%' !in relativePath &&
+                ':' !in relativePath &&
+                '?' !in relativePath &&
+                '#' !in relativePath,
         ) {
-            throw IllegalStateException("runtime 경로가 안전하지 않습니다: $relativePath")
+            "runtime 경로가 안전하지 않습니다."
         }
         val relative = runCatching { Path.of(relativePath) }.getOrNull()
-            ?: throw IllegalStateException("runtime 경로를 해석할 수 없습니다: $relativePath")
-        if (relative.isAbsolute || relative.any { it.toString() == ".." }) {
-            throw IllegalStateException("runtime 경로가 root를 벗어납니다: $relativePath")
+            ?: throw IllegalStateException("runtime 경로를 해석할 수 없습니다.")
+        check(!relative.isAbsolute && relative.none { it.toString() == ".." }) {
+            "runtime 경로가 root를 벗어납니다."
         }
         var current = root
         relative.forEach { component ->
             current = current.resolve(component)
-            if (Files.isSymbolicLink(current)) {
-                throw IllegalStateException("runtime 경로에 symlink가 있습니다: $relativePath")
+            check(!Files.isSymbolicLink(current)) {
+                "runtime 경로에 symlink가 있습니다."
             }
         }
         val target = root.resolve(relative).normalize()
-        if (!target.startsWith(root) ||
-            !Files.isRegularFile(target, NOFOLLOW_LINKS) ||
-            target.toRealPath() != target
+        check(
+            target.startsWith(root) &&
+                Files.isRegularFile(target, NOFOLLOW_LINKS) &&
+                target.toRealPath() == target,
         ) {
-            throw IllegalStateException("runtime 파일을 확인할 수 없습니다: $relativePath")
+            "runtime 파일을 확인할 수 없습니다."
         }
         return target
     }
+
+    private fun relativePath(root: Path, path: Path): String =
+        root.relativize(path.toAbsolutePath().normalize())
+            .joinToString("/") { it.toString() }
 
     private fun isStandaloneJavaScript(relativePath: String): Boolean =
         relativePath.substringAfterLast('.', "").lowercase() in
             setOf("js", "mjs", "cjs")
 
-    private data class RewriteFile(
+    private data class TargetPlan(
         val relativePath: String,
-        val path: Path,
-        val source: String,
-        val result: RewriteResult,
+        val originalSource: String,
+        val convertedSource: String,
+        val currentSource: String,
+        val stagedPath: Path,
+        val replacements: List<StaticStorageAccess>,
     )
 
     private data class EvidenceKey(
@@ -253,6 +352,11 @@ class StorageFallbackAdapter : MobileAdapter {
         val line: Int,
         val root: String,
     )
+
+    private enum class TargetState {
+        SOURCE,
+        CONVERTED,
+    }
 
     private companion object {
         const val MANIFEST = "manifest.json"

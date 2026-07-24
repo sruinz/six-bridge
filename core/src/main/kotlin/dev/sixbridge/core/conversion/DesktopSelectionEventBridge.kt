@@ -14,7 +14,11 @@ class DesktopSelectionEventBridge : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE
     override val version: Int = 1
 
-    override fun apply(workingRoot: Path, selected: SelectedAdapter): AdapterDecision {
+    override fun apply(
+        context: AdapterExecutionContext,
+        selected: SelectedAdapter,
+    ): AdapterDecision {
+        val workingRoot = context.requireActive().stagedRoot
         val decision = selected.toDecision()
         if (decision.id != id || decision.version != version ||
             decision.disposition != AdapterDisposition.AUTOMATIC

@@ -38,7 +38,12 @@ class ActionPopupEntryAdapterTest {
             .plan(report, setOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY))
             .selectedAdapters
             .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
-        val applied = ActionPopupEntryAdapter().apply(source, approved)
+        val applied = applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            approved,
+        )
         val updated = manifest(source)
 
         assertTrue(applied.applied)
@@ -85,8 +90,12 @@ class ActionPopupEntryAdapterTest {
             },
         )
         assertFalse(
-            ActionPopupEntryAdapter()
-                .apply(changedAfterApproval, selectedBeforePopupRemoval)
+            applyAdapterToSource(
+                changedAfterApproval,
+                profile,
+                ActionPopupEntryAdapter(),
+                selectedBeforePopupRemoval,
+            )
                 .applied,
         )
         assertFalse(Files.exists(changedAfterApproval.resolve("_sixbridge")))
@@ -182,7 +191,12 @@ class ActionPopupEntryAdapterTest {
             .writeText("globalThis.workerUrl = self.location.href;")
 
         assertFailsWith<IllegalStateException> {
-            ActionPopupEntryAdapter().apply(changedAfterApproval, selected)
+            applyAdapterToSource(
+                changedAfterApproval,
+                profile,
+                ActionPopupEntryAdapter(),
+                selected,
+            )
         }
         assertFalse(Files.exists(changedAfterApproval.resolve("_sixbridge")))
     }
@@ -239,7 +253,12 @@ class ActionPopupEntryAdapterTest {
             """new URL("worker.js", location);""",
         )
         assertFailsWith<IllegalStateException>("changed transitive dependency") {
-            ActionPopupEntryAdapter().apply(changedTransitive, transitiveSelection)
+            applyAdapterToSource(
+                changedTransitive,
+                profile,
+                ActionPopupEntryAdapter(),
+                transitiveSelection,
+            )
         }
         assertFalse(Files.exists(changedTransitive.resolve("_sixbridge")))
 
@@ -267,8 +286,13 @@ class ActionPopupEntryAdapterTest {
             }
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            assertFailsWith<IllegalStateException>(label) {
-                ActionPopupEntryAdapter().apply(source, selected)
+            assertFailsWith<RuntimeException>(label) {
+                applyAdapterToSource(
+                    source,
+                    profile,
+                    ActionPopupEntryAdapter(),
+                    selected,
+                )
             }
             assertContentEquals(
                 manifestBefore,
@@ -289,14 +313,19 @@ class ActionPopupEntryAdapterTest {
             "globalThis.initiallySafe = true;",
         )
         val selected = approvedSelection(source)
-        ActionPopupEntryAdapter().apply(source, selected)
+        applyAdapterToSource(source, profile, ActionPopupEntryAdapter(), selected)
         val manifestBefore = source.resolve("manifest.json").readBytes()
         source.resolve("scripts/dependency.js").writeText(
             """self["location"].href;""",
         )
 
         assertFailsWith<IllegalStateException> {
-            ActionPopupEntryAdapter().apply(source, selected)
+            applyAdapterToSource(
+                source,
+                profile,
+                ActionPopupEntryAdapter(),
+                selected,
+            )
         }
         assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
     }
@@ -353,8 +382,13 @@ class ActionPopupEntryAdapterTest {
                 ).toString(),
             )
 
-            assertFailsWith<IllegalStateException>(unsafeWorker) {
-                ActionPopupEntryAdapter().apply(source, selected)
+            assertFailsWith<RuntimeException>(unsafeWorker) {
+                applyAdapterToSource(
+                    source,
+                    profile,
+                    ActionPopupEntryAdapter(),
+                    selected,
+                )
             }
             assertFalse(Files.exists(source.resolve("_sixbridge")), unsafeWorker)
         }
@@ -384,10 +418,15 @@ class ActionPopupEntryAdapterTest {
             val adapter = ActionPopupEntryAdapter()
             val selection = approvedSelection(source)
 
-            adapter.apply(source, selection)
+            applyAdapterToSource(source, profile, adapter, selection)
             val manifestBefore = source.resolve("manifest.json").readBytes()
             val zipBefore = ExtensionZip.createBytes(source)
-            val reapplied = adapter.apply(source, selection)
+            val reapplied = applyAdapterToSource(
+                source,
+                profile,
+                adapter,
+                selection,
+            )
 
             assertTrue(reapplied.applied)
             assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
@@ -475,7 +514,12 @@ class ActionPopupEntryAdapterTest {
         ).forEach { unsafeImport ->
             val source = extension(worker = "scripts/background.js")
             val selected = approvedSelection(source)
-            ActionPopupEntryAdapter().apply(source, selected)
+            applyAdapterToSource(
+                source,
+                profile,
+                ActionPopupEntryAdapter(),
+                selected,
+            )
             val bootstrap = source.resolve(
                 "scripts/_sixbridge-action-popup-entry-bootstrap.v1.js",
             )
@@ -486,7 +530,12 @@ class ActionPopupEntryAdapterTest {
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
             assertFailsWith<IllegalStateException>(unsafeImport) {
-                ActionPopupEntryAdapter().apply(source, selected)
+                applyAdapterToSource(
+                    source,
+                    profile,
+                    ActionPopupEntryAdapter(),
+                    selected,
+                )
             }
             assertContentEquals(
                 manifestBefore,
@@ -497,7 +546,12 @@ class ActionPopupEntryAdapterTest {
     }
 
     private fun applyApproved(source: Path): AdapterDecision =
-        ActionPopupEntryAdapter().apply(source, approvedSelection(source))
+        applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            approvedSelection(source),
+        )
 
     private fun approvedSelection(source: Path): SelectedAdapter {
         val report = MobilePatternAnalyzer().analyze(source, profile)
