@@ -93,6 +93,8 @@ class SixBundleTest {
             unsupportedApis = emptySet(),
             issues = emptyList(),
             conversionState = ConversionState.REQUIRES_APPROVAL,
+            sourceSha256 = "c".repeat(64),
+            browserProfileSha256 = "d".repeat(64),
             adapterDecisions = listOf(
                 AdapterDecision(
                     id = "zeta",
@@ -146,6 +148,8 @@ class SixBundleTest {
             unsupportedApis = emptySet(),
             issues = emptyList(),
             conversionState = ConversionState.AUTOMATIC,
+            sourceSha256 = "c".repeat(64),
+            browserProfileSha256 = "d".repeat(64),
             adapterDecisions = listOf(
                 AdapterDecision(
                     id = "storage-fallback",
@@ -171,6 +175,58 @@ class SixBundleTest {
         ).compatibility
 
         assertEquals(compatibility, roundtripped)
+    }
+
+    @Test
+    fun `schema v3 requires both lowercase provenance digests`() {
+        val missing = compatibilityWithProofs().copy(
+            sourceSha256 = null,
+        )
+        val uppercase = compatibilityWithProofs().copy(
+            browserProfileSha256 = "A".repeat(64),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundle.encodeCompatibility(missing)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            SixBundle.encodeCompatibility(uppercase)
+        }
+
+        val bundle = bundleWithCompatibility(compatibilityWithProofs())
+        rewrite(bundle) { name, bytes ->
+            if (name == "compatibility.json") {
+                bytes.decodeToString()
+                    .replace(
+                        "\"sourceSha256\": \"${"c".repeat(64)}\"",
+                        "\"sourceSha256\": null",
+                    )
+                    .toByteArray()
+            } else {
+                bytes
+            }
+        }
+        assertFailsWith<InvalidSixBundleException> {
+            SixBundle.read(bundle)
+        }
+    }
+
+    @Test
+    fun `schema v3 provenance cannot be downgraded to schema v2`() {
+        val bundle = bundleWithCompatibility(compatibilityWithProofs())
+        rewrite(bundle) { name, bytes ->
+            if (name == "compatibility.json") {
+                bytes.decodeToString()
+                    .replace("\"schemaVersion\": 3", "\"schemaVersion\": 2")
+                    .toByteArray()
+            } else {
+                bytes
+            }
+        }
+
+        assertFailsWith<InvalidSixBundleException> {
+            SixBundle.read(bundle)
+        }
     }
 
     @Test
@@ -282,16 +338,7 @@ class SixBundleTest {
 
     private fun validBundle(): java.nio.file.Path {
         return bundleWithCompatibility(
-            CompatibilityReport(
-                status = CompatibilityStatus.COMPATIBLE,
-                manifestVersion = 3,
-                extensionName = "Tiny",
-                extensionVersion = "1.0.0",
-                declaredPermissions = emptySet(),
-                usedApis = emptySet(),
-                unsupportedApis = emptySet(),
-                issues = emptyList(),
-            ),
+            compatibilityWithProofs(),
         )
     }
 
@@ -320,6 +367,19 @@ class SixBundleTest {
             )
         }
     }
+
+    private fun compatibilityWithProofs() = CompatibilityReport(
+        status = CompatibilityStatus.COMPATIBLE,
+        manifestVersion = 3,
+        extensionName = "Proof",
+        extensionVersion = "1",
+        declaredPermissions = emptySet(),
+        usedApis = emptySet(),
+        unsupportedApis = emptySet(),
+        issues = emptyList(),
+        sourceSha256 = "c".repeat(64),
+        browserProfileSha256 = "d".repeat(64),
+    )
 
     private fun rewrite(
         bundle: java.nio.file.Path,

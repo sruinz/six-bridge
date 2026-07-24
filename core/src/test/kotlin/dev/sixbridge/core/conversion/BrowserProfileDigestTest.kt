@@ -1,6 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.BrowserProfileDigest
 import dev.sixbridge.core.profile.WrapperContract
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -62,5 +63,38 @@ class BrowserProfileDigestTest {
         variations.forEach { changed ->
             assertNotEquals(digest, BrowserProfileDigest.sha256(changed), changed.toString())
         }
+    }
+
+    @Test
+    fun `canonical profile digest is injective for collection boundaries`() {
+        val twoValues = base.copy(
+            supportedApis = setOf("a", "b"),
+            profileDifferences = emptyList(),
+        )
+        val embeddedSeparator = base.copy(
+            supportedApis = setOf("a\u0000b"),
+            profileDifferences = emptyList(),
+        )
+        val emptySet = base.copy(
+            supportedApis = emptySet(),
+            profileDifferences = emptyList(),
+        )
+        val oneEmptyValue = base.copy(
+            supportedApis = setOf(""),
+            profileDifferences = emptyList(),
+        )
+
+        assertNotEquals(
+            twoValues.canonicalSha256(),
+            embeddedSeparator.canonicalSha256(),
+        )
+        assertNotEquals(
+            emptySet.canonicalSha256(),
+            oneEmptyValue.canonicalSha256(),
+        )
+        assertEquals(
+            BrowserProfileDigest.sha256(twoValues),
+            twoValues.canonicalSha256(),
+        )
     }
 }

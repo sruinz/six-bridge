@@ -1,5 +1,6 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.profile.BrowserProfileDigest
 import dev.sixbridge.core.compat.RuntimeResourceIndex
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.ByteBuffer

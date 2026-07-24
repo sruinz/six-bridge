@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.SourceProjectIdentityStore
+import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -31,24 +32,21 @@ class ConversionWorkspace : AutoCloseable {
     private val ownedWorkingRoots = mutableListOf<Path>()
     private val ownedSnapshots = IdentityHashMap<ExtensionSnapshot, Unit>()
     private val pendingCleanup = ConcurrentHashMap.newKeySet<Path>()
-    private var closed = false
+    private var lifecycle = Lifecycle.OPEN
 
+    @Synchronized
     fun snapshot(
         source: Path,
         requireOwnerOnlyMarker: Boolean = true,
     ): ExtensionSnapshot {
-        check(!closed) { "이미 정리된 conversion workspace입니다." }
+        requireOpen()
         val snapshotRoot = Files.createTempDirectory(root, "snapshot-")
         return try {
             val sourceProjectIdentity = SourceProjectIdentityStore.readSourceMarker(
                 source,
                 requireOwnerOnlyMarker,
             )
-            val sourceZip = ExtensionZip.createBytes(
-                sourceRoot = source,
-                includeProjectMarker = true,
-            )
-            val sourceTree = WorkspaceTreeDigest.capture(source)
+            val sourceTree = captureInitialSource(source)
             require(
                 sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
                     source,
@@ -61,27 +59,32 @@ class ConversionWorkspace : AutoCloseable {
                 source,
                 snapshotRoot.resolve("original"),
             )
-            check(sourceTree == WorkspaceTreeDigest.capture(source)) {
-                "snapshot original copy 후 source native tree가 변경되었습니다."
-            }
             requireSnapshotCopy(sourceTree, original, "original")
             val working = NativeWorkspaceTree.copy(
-                source,
+                original,
                 snapshotRoot.resolve("working"),
             )
-            check(sourceTree == WorkspaceTreeDigest.capture(source)) {
-                "snapshot 중 source native tree가 변경되었습니다."
-            }
             requireSnapshotCopy(sourceTree, working, "working")
             check(
-                sourceZip.contentEquals(
-                    ExtensionZip.createBytes(
-                        sourceRoot = source,
-                        includeProjectMarker = true,
-                    ),
+                sourceTree == WorkspaceTreeDigest.capture(source),
+            ) {
+                "snapshot 중 source native tree가 변경되었습니다."
+            }
+            val sourceZip = ExtensionZip.createBytes(
+                sourceRoot = original,
+                includeProjectMarker = true,
+            )
+            val sourceSha256 = sha256(sourceZip)
+            check(sourceTree == WorkspaceTreeDigest.capture(source)) {
+                "snapshot source bundle 생성 중 source native tree가 변경되었습니다."
+            }
+            require(
+                sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
+                    source,
+                    requireOwnerOnlyMarker,
                 ),
             ) {
-                "snapshot 중 source bundle tree가 변경되었습니다."
+                "snapshot 완료 전 source project identity marker가 변경되었습니다."
             }
             Ownership.register(
                 originalRoot = original,
@@ -91,7 +94,7 @@ class ConversionWorkspace : AutoCloseable {
             ownedWorkingRoots.add(working)
             val snapshot = ExtensionSnapshot.create(
                 sourceZip = sourceZip,
-                sourceSha256 = sha256(sourceZip),
+                sourceSha256 = sourceSha256,
                 originalRoot = original,
                 workingRoot = working,
                 sourceProjectIdentity = sourceProjectIdentity,
@@ -99,17 +102,23 @@ class ConversionWorkspace : AutoCloseable {
             ownedSnapshots[snapshot] = Unit
             snapshot
         } catch (error: Throwable) {
-            deleteTree(snapshotRoot)
+            try {
+                deleteTree(snapshotRoot)
+            } catch (_: Throwable) {
+                queueCleanup(snapshotRoot)
+                error.addSuppressed(SnapshotCleanupException())
+            }
             throw error
         }
     }
 
+    @Synchronized
     fun transform(
         snapshot: ExtensionSnapshot,
         profile: BrowserProfile,
         plan: ConversionPlan,
     ): List<AdapterDecision> {
-        check(!closed) { "이미 정리된 conversion workspace입니다." }
+        requireOpen()
         check(ownedSnapshots.containsKey(snapshot)) {
             "이 ConversionWorkspace가 발급한 snapshot이 아닙니다."
         }
@@ -129,18 +138,56 @@ class ConversionWorkspace : AutoCloseable {
         }
     }
 
+    @Synchronized
     override fun close() {
-        if (closed) return
-        closed = true
+        if (lifecycle == Lifecycle.CLOSED) return
+        lifecycle = Lifecycle.CLOSING
+        var failure: Throwable? = null
         pendingCleanup.toList().forEach { path ->
-            if (runCatching { deleteTree(path) }.isSuccess) {
+            try {
+                deleteTree(path)
                 pendingCleanup.remove(path)
+            } catch (cleanupError: Throwable) {
+                if (failure == null) {
+                    failure = cleanupError
+                } else {
+                    requireNotNull(failure).addSuppressed(cleanupError)
+                }
             }
         }
         ownedWorkingRoots.forEach(Ownership::unregister)
+        ownedWorkingRoots.clear()
         ownedSnapshots.clear()
-        deleteTree(root)
+        try {
+            deleteTree(root)
+        } catch (cleanupError: Throwable) {
+            if (failure == null) {
+                failure = cleanupError
+            } else {
+                requireNotNull(failure).addSuppressed(cleanupError)
+            }
+        }
+        if (failure == null) {
+            lifecycle = Lifecycle.CLOSED
+        } else {
+            throw requireNotNull(failure)
+        }
     }
+
+    private fun requireOpen() {
+        check(lifecycle == Lifecycle.OPEN) {
+            "이미 정리 중이거나 정리된 conversion workspace입니다."
+        }
+    }
+
+    private fun captureInitialSource(source: Path): WorkspaceTreeDigest.State =
+        try {
+            WorkspaceTreeDigest.capture(source)
+        } catch (error: IllegalStateException) {
+            throw IllegalArgumentException(
+                error.message ?: "확장 source tree를 검증할 수 없습니다.",
+            )
+        }
 
     private fun verifyPlan(
         snapshot: ExtensionSnapshot,
@@ -149,6 +196,12 @@ class ConversionWorkspace : AutoCloseable {
     ) {
         val report = plan.report
         report.validate()
+        check(
+            report.status == CompatibilityStatus.COMPATIBLE ||
+                report.status == CompatibilityStatus.PARTIAL,
+        ) {
+            "변환 가능한 compatibility status가 아닙니다."
+        }
         check(report.sourceSha256 == snapshot.sourceSha256) {
             "conversion plan source provenance가 snapshot과 다릅니다."
         }
@@ -161,8 +214,15 @@ class ConversionWorkspace : AutoCloseable {
         ) {
             "conversion plan proof가 다릅니다."
         }
-        val current = MobilePatternAnalyzer().analyze(
+        val originalArchive = ExtensionZip.createBytes(
             snapshot.originalRoot,
+            includeProjectMarker = true,
+        )
+        check(snapshot.sourceZip.contentEquals(originalArchive)) {
+            "immutable original source archive가 snapshot과 다릅니다."
+        }
+        val current = MobilePatternAnalyzer().analyzeArchive(
+            originalArchive,
             profile,
         )
         check(current == report) {
@@ -893,6 +953,17 @@ class ConversionWorkspace : AutoCloseable {
         val stagedRoot: Path,
         val profile: BrowserProfile,
     )
+
+    private enum class Lifecycle {
+        OPEN,
+        CLOSING,
+        CLOSED,
+    }
+
+    private class SnapshotCleanupException :
+        IllegalStateException(
+            "snapshot 임시 경로를 정리하지 못했습니다.",
+        )
 
     private fun deleteTree(path: Path) {
         if (!Files.exists(path, NOFOLLOW_LINKS)) return

@@ -124,8 +124,12 @@ class DesktopSelectionEventBridgeTest {
         val unavailableReport = MobilePatternAnalyzer().analyze(sensitive, profile)
         val unavailable = unavailableReport.adapterDecisions.single()
         assertEquals(AdapterDisposition.UNAVAILABLE, unavailable.disposition)
-        assertTrue(
-            ConversionPlanner().plan(unavailableReport, emptySet()).selectedAdapters.isEmpty(),
+        val planningError = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(unavailableReport, emptySet())
+        }
+        assertEquals(
+            ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
+            planningError.failure,
         )
         assertFalse(Files.exists(sensitive.resolve("_sixbridge")))
 

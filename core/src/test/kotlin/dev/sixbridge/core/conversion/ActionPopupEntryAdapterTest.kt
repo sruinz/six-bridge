@@ -115,21 +115,18 @@ class ActionPopupEntryAdapterTest {
 
         assertEquals(AdapterDisposition.UNAVAILABLE, noContentDecision.disposition)
         assertEquals(AdapterDisposition.UNAVAILABLE, noTabsDecision.disposition)
-        assertTrue(
-            ConversionPlanner().plan(
-                MobilePatternAnalyzer().analyze(noContent, profile),
-                emptySet(),
-            ).selectedAdapters.isEmpty(),
-        )
-        assertTrue(
-            ConversionPlanner().plan(
-                MobilePatternAnalyzer().analyze(
-                    noTabs,
-                    profile.copy(supportedApis = profile.supportedApis - "tabs"),
-                ),
-                emptySet(),
-            ).selectedAdapters.isEmpty(),
-        )
+        listOf(
+            MobilePatternAnalyzer().analyze(noContent, profile),
+            MobilePatternAnalyzer().analyze(
+                noTabs,
+                profile.copy(supportedApis = profile.supportedApis - "tabs"),
+            ),
+        ).forEach { report ->
+            val error = assertFailsWith<ConversionPlanningException> {
+                ConversionPlanner().plan(report, emptySet())
+            }
+            assertEquals(ConversionPlanningFailure.NO_APPLICABLE_ADAPTER, error.failure)
+        }
     }
 
     @Test
@@ -183,14 +180,20 @@ class ActionPopupEntryAdapterTest {
             .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
 
         assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
-        assertTrue(ConversionPlanner().plan(report, emptySet()).selectedAdapters.isEmpty())
+        val planningError = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(report, emptySet())
+        }
+        assertEquals(
+            ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
+            planningError.failure,
+        )
 
         val changedAfterApproval = extension(worker = "scripts/background.js")
         val selected = approvedSelection(changedAfterApproval)
         changedAfterApproval.resolve("scripts/background.js")
             .writeText("globalThis.workerUrl = self.location.href;")
 
-        assertFailsWith<IllegalStateException> {
+        assertFailsWith<ConversionPlanningException> {
             applyAdapterToSource(
                 changedAfterApproval,
                 profile,
@@ -252,7 +255,7 @@ class ActionPopupEntryAdapterTest {
         changedTransitive.resolve("dependency.js").writeText(
             """new URL("worker.js", location);""",
         )
-        assertFailsWith<IllegalStateException>("changed transitive dependency") {
+        assertFailsWith<ConversionPlanningException>("changed transitive dependency") {
             applyAdapterToSource(
                 changedTransitive,
                 profile,
@@ -286,23 +289,13 @@ class ActionPopupEntryAdapterTest {
             }
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            if (label == "new static dependency") {
-                assertFailsWith<ConversionExecutionException>(label) {
-                    applyAdapterToSource(
-                        source,
-                        profile,
-                        ActionPopupEntryAdapter(),
-                        selected,
-                    )
-                }
-            } else {
-                val reapplied = applyAdapterToSource(
+            assertFailsWith<ConversionPlanningException>(label) {
+                applyAdapterToSource(
                     source,
                     profile,
                     ActionPopupEntryAdapter(),
                     selected,
                 )
-                assertFalse(reapplied.applied, label)
             }
             assertContentEquals(
                 manifestBefore,
@@ -329,7 +322,7 @@ class ActionPopupEntryAdapterTest {
             """self["location"].href;""",
         )
 
-        assertFailsWith<IllegalStateException> {
+        assertFailsWith<ConversionPlanningException> {
             applyAdapterToSource(
                 source,
                 profile,
@@ -540,13 +533,14 @@ class ActionPopupEntryAdapterTest {
             )
             val manifestBefore = source.resolve("manifest.json").readBytes()
 
-            val reapplied = applyAdapterToSource(
-                source,
-                profile,
-                ActionPopupEntryAdapter(),
-                selected,
-            )
-            assertFalse(reapplied.applied, unsafeImport)
+            assertFailsWith<ConversionPlanningException>(unsafeImport) {
+                applyAdapterToSource(
+                    source,
+                    profile,
+                    ActionPopupEntryAdapter(),
+                    selected,
+                )
+            }
             assertContentEquals(
                 manifestBefore,
                 source.resolve("manifest.json").readBytes(),

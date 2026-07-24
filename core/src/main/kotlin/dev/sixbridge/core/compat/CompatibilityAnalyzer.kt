@@ -1,7 +1,6 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.profile.BrowserProfile
-import dev.sixbridge.core.input.ExtensionZip
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -17,27 +16,36 @@ import java.util.Base64
 import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.readText
+import kotlin.jvm.JvmSynthetic
 
 class CompatibilityAnalyzer(
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
-        profile.validate()
-        val sourceBefore = canonicalSource(extensionRoot)
-        val report = analyzeUnsealed(extensionRoot, profile)
-        val sourceAfter = canonicalSource(extensionRoot)
-        check(
-            if (sourceBefore == null) {
-                sourceAfter == null
-            } else {
-                sourceAfter != null &&
-                    sourceBefore.contentEquals(sourceAfter)
-            },
-        ) {
-            "호환성 분석 중 source provenance가 변경되었습니다."
+        val stable = StableExtensionAnalysis.captureLive(extensionRoot)
+        return try {
+            val report = analyzeStable(
+                stable.root,
+                profile,
+                stable.sourceSha256,
+            )
+            stable.verifyLiveSource()
+            report
+        } finally {
+            stable.close()
         }
+    }
+
+    @JvmSynthetic
+    internal fun analyzeStable(
+        extensionRoot: Path,
+        profile: BrowserProfile,
+        sourceSha256: String?,
+    ): CompatibilityReport {
+        profile.validate()
+        val report = analyzeUnsealed(extensionRoot, profile)
         return report.copy(
-            sourceSha256 = sourceBefore?.let(::sha256),
+            sourceSha256 = sourceSha256,
             browserProfileSha256 = profile.canonicalSha256(),
         ).also(CompatibilityReport::validate)
     }
@@ -203,19 +211,6 @@ class CompatibilityAnalyzer(
             issues,
         )
     }
-
-    private fun canonicalSource(extensionRoot: Path): ByteArray? =
-        runCatching {
-            ExtensionZip.createBytes(
-                extensionRoot,
-                includeProjectMarker = true,
-            )
-        }.getOrNull()
-
-    private fun sha256(bytes: ByteArray): String =
-        MessageDigest.getInstance("SHA-256")
-            .digest(bytes)
-            .joinToString("") { "%02x".format(it) }
 
     private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()

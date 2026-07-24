@@ -56,6 +56,7 @@ internal object WorkspaceTreeDigest {
             if (includeMetadata) {
                 digest.field(entry.lastModified)
                 digest.field(entry.owner)
+                digest.field(entry.aclOwner)
                 digest.field(entry.group)
                 digest.field(entry.permissions)
                 digest.field(entry.acl)
@@ -96,15 +97,11 @@ internal object WorkspaceTreeDigest {
             PosixFileAttributeView::class.java,
             NOFOLLOW_LINKS,
         )?.readAttributes()
-        val aclView = if (posix == null) {
-            Files.getFileAttributeView(
-                path,
-                AclFileAttributeView::class.java,
-                NOFOLLOW_LINKS,
-            )
-        } else {
-            null
-        }
+        val aclView = Files.getFileAttributeView(
+            path,
+            AclFileAttributeView::class.java,
+            NOFOLLOW_LINKS,
+        )
         WorkspacePermissionPolicy.requireMetadataSupport(path)
         val owner = posix?.owner()?.name
             ?: aclView?.owner?.name
@@ -142,6 +139,7 @@ internal object WorkspaceTreeDigest {
                 .toInstant()
                 .let { "${it.epochSecond}:${it.nano}" },
             owner = owner,
+            aclOwner = aclView?.owner?.name.orEmpty(),
             group = posix?.group()?.name.orEmpty(),
             permissions = posix?.permissions()
                 ?.map(Enum<*>::name)
@@ -182,6 +180,7 @@ internal object WorkspaceTreeDigest {
         val contentSha256: String,
         val lastModified: String,
         val owner: String,
+        val aclOwner: String,
         val group: String,
         val permissions: String,
         val acl: String,

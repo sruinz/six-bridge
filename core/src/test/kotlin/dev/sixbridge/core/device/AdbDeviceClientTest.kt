@@ -132,6 +132,8 @@ class AdbDeviceClientTest {
                     usedApis = emptySet(),
                     unsupportedApis = emptySet(),
                     issues = emptyList(),
+                    sourceSha256 = "c".repeat(64),
+                    browserProfileSha256 = "d".repeat(64),
                 ),
             )
             assertFailsWith<IllegalArgumentException> {
@@ -267,6 +269,8 @@ class AdbDeviceClientTest {
                     usedApis = emptySet(),
                     unsupportedApis = emptySet(),
                     issues = emptyList(),
+                    sourceSha256 = "c".repeat(64),
+                    browserProfileSha256 = "d".repeat(64),
                 ),
             )
         }
@@ -286,6 +290,8 @@ class AdbDeviceClientTest {
                     usedApis = emptySet(),
                     unsupportedApis = emptySet(),
                     issues = emptyList(),
+                    sourceSha256 = "c".repeat(64),
+                    browserProfileSha256 = "d".repeat(64),
                 ),
             )
         }

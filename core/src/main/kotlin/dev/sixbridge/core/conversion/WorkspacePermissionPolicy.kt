@@ -12,12 +12,14 @@ import java.nio.file.attribute.PosixFilePermission
 internal enum class WorkspacePermissionMode {
     POSIX_OWNER_ONLY,
     ACL_OWNER_ONLY,
+    POSIX_AND_ACL_OWNER_ONLY,
     UNSUPPORTED,
 }
 
 internal enum class WorkspaceMetadataMode {
     POSIX,
     ACL,
+    POSIX_AND_ACL,
     UNSUPPORTED,
 }
 
@@ -79,7 +81,9 @@ internal object WorkspacePermissionPolicy {
         aclAvailable: Boolean,
         aclOwnerOnly: Boolean,
     ): WorkspacePermissionMode = when {
-        posixAvailable && posixOwnerOnly ->
+        posixAvailable && aclAvailable && posixOwnerOnly && aclOwnerOnly ->
+            WorkspacePermissionMode.POSIX_AND_ACL_OWNER_ONLY
+        posixAvailable && !aclAvailable && posixOwnerOnly ->
             WorkspacePermissionMode.POSIX_OWNER_ONLY
         !posixAvailable && aclAvailable && aclOwnerOnly ->
             WorkspacePermissionMode.ACL_OWNER_ONLY
@@ -90,6 +94,7 @@ internal object WorkspacePermissionPolicy {
         posixAvailable: Boolean,
         aclAvailable: Boolean,
     ): WorkspaceMetadataMode = when {
+        posixAvailable && aclAvailable -> WorkspaceMetadataMode.POSIX_AND_ACL
         posixAvailable -> WorkspaceMetadataMode.POSIX
         aclAvailable -> WorkspaceMetadataMode.ACL
         else -> WorkspaceMetadataMode.UNSUPPORTED
@@ -111,6 +116,15 @@ internal object WorkspacePermissionPolicy {
 
     private fun ownerOnlyAcl(view: AclFileAttributeView): Boolean {
         val owner = runCatching { view.owner }.getOrNull() ?: return false
+        return runCatching {
+            isOwnerOnlyAcl(owner, view.acl)
+        }.getOrDefault(false)
+    }
+
+    internal fun isOwnerOnlyAcl(
+        owner: java.nio.file.attribute.UserPrincipal,
+        entries: List<java.nio.file.attribute.AclEntry>,
+    ): Boolean {
         val sensitive = setOf(
             AclEntryPermission.READ_DATA,
             AclEntryPermission.WRITE_DATA,
@@ -121,13 +135,15 @@ internal object WorkspacePermissionPolicy {
             AclEntryPermission.LIST_DIRECTORY,
             AclEntryPermission.ADD_FILE,
             AclEntryPermission.ADD_SUBDIRECTORY,
+            AclEntryPermission.WRITE_ATTRIBUTES,
+            AclEntryPermission.WRITE_NAMED_ATTRS,
+            AclEntryPermission.WRITE_ACL,
+            AclEntryPermission.WRITE_OWNER,
         )
-        return runCatching {
-            view.acl.none { entry ->
-                entry.type() == AclEntryType.ALLOW &&
-                    entry.principal() != owner &&
-                    entry.permissions().any(sensitive::contains)
-            }
-        }.getOrDefault(false)
+        return entries.none { entry ->
+            entry.type() == AclEntryType.ALLOW &&
+                entry.principal() != owner &&
+                entry.permissions().any(sensitive::contains)
+        }
     }
 }

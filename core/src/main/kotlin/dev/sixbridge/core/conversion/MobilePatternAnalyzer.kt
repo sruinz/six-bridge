@@ -6,15 +6,15 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import dev.sixbridge.core.compat.RuntimeResourceIndex
+import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.profile.BrowserProfile
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Path
-import java.security.MessageDigest
-import dev.sixbridge.core.input.ExtensionZip
 import kotlin.io.path.readText
+import kotlin.jvm.JvmSynthetic
 
 class MobilePatternAnalyzer(
     private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(),
@@ -24,11 +24,51 @@ class MobilePatternAnalyzer(
         extensionRoot: Path,
         profile: BrowserProfile,
     ): CompatibilityReport {
-        val compatibility = compatibilityAnalyzer.analyze(extensionRoot, profile)
+        val stable = StableExtensionAnalysis.captureLive(extensionRoot)
+        return try {
+            val report = analyzeStable(
+                stable.root,
+                profile,
+                stable.sourceSha256,
+            )
+            stable.verifyLiveSource()
+            report
+        } finally {
+            stable.close()
+        }
+    }
+
+    @JvmSynthetic
+    internal fun analyzeArchive(
+        sourceArchive: ByteArray,
+        profile: BrowserProfile,
+    ): CompatibilityReport {
+        val stable = StableExtensionAnalysis.fromArchive(sourceArchive)
+        return try {
+            analyzeStable(
+                stable.root,
+                profile,
+                stable.sourceSha256,
+            )
+        } finally {
+            stable.close()
+        }
+    }
+
+    private fun analyzeStable(
+        extensionRoot: Path,
+        profile: BrowserProfile,
+        sourceSha256: String?,
+    ): CompatibilityReport {
+        val compatibility = compatibilityAnalyzer.analyzeStable(
+            extensionRoot,
+            profile,
+            sourceSha256,
+        )
         if (compatibility.status == CompatibilityStatus.BLOCKED ||
             compatibility.status == CompatibilityStatus.UNKNOWN
         ) {
-            return verifySource(extensionRoot, compatibility)
+            return compatibility
         }
         val manifestPath = extensionRoot.resolve("manifest.json")
         val manifest = runCatching {
@@ -36,7 +76,7 @@ class MobilePatternAnalyzer(
         }.getOrNull() ?: return compatibility
         val index = RuntimeResourceIndex.create(extensionRoot, manifest)
         if (index.unresolvedDependency) {
-            return verifySource(extensionRoot, compatibility)
+            return compatibility
         }
 
         val decisions = mutableListOf<AdapterDecision>()
@@ -56,30 +96,11 @@ class MobilePatternAnalyzer(
         val sortedDecisions = decisions.sortedWith(
             compareBy(AdapterDecision::id, AdapterDecision::version),
         )
-        return verifySource(extensionRoot, compatibility.copy(
+        return compatibility.copy(
             issues = issues,
             conversionState = conversionState(sortedDecisions),
             adapterDecisions = sortedDecisions,
-        ))
-    }
-
-    private fun verifySource(
-        extensionRoot: Path,
-        report: CompatibilityReport,
-    ): CompatibilityReport {
-        if (report.sourceSha256 == null) return report
-        val current = MessageDigest.getInstance("SHA-256")
-            .digest(
-                ExtensionZip.createBytes(
-                    extensionRoot,
-                    includeProjectMarker = true,
-                ),
-            )
-            .joinToString("") { "%02x".format(it) }
-        check(report.sourceSha256 == current) {
-            "mobile pattern 분석 중 source provenance가 변경되었습니다."
-        }
-        return report
+        )
     }
 
     private fun selectionDecision(

@@ -124,6 +124,14 @@ object SixBundle {
 
     fun encodeCompatibility(value: CompatibilityReport): String {
         value.validate()
+        val sourceSha256 = requireNotNull(value.sourceSha256) {
+            "schema v3 compatibility에는 sourceSha256이 필요합니다."
+        }
+        val browserProfileSha256 = requireNotNull(
+            value.browserProfileSha256,
+        ) {
+            "schema v3 compatibility에는 browserProfileSha256이 필요합니다."
+        }
         return json.encodeToString(
             JsonObject.serializer(),
             JsonObject(
@@ -171,14 +179,12 @@ object SixBundle {
                     "convertedExtensionId" to (
                         value.convertedExtensionId?.let(::JsonPrimitive)
                             ?: kotlinx.serialization.json.JsonNull
-                        ),
+                    ),
                     "sourceSha256" to (
-                        value.sourceSha256?.let(::JsonPrimitive)
-                            ?: kotlinx.serialization.json.JsonNull
+                        JsonPrimitive(sourceSha256)
                         ),
                     "browserProfileSha256" to (
-                        value.browserProfileSha256?.let(::JsonPrimitive)
-                            ?: kotlinx.serialization.json.JsonNull
+                        JsonPrimitive(browserProfileSha256)
                         ),
                 ),
             ),
@@ -226,6 +232,18 @@ object SixBundle {
         val schemaVersion = objectValue.requiredInt("schemaVersion")
         require(schemaVersion in 1..COMPATIBILITY_SCHEMA_VERSION) {
             "지원하지 않는 compatibility.json schemaVersion입니다."
+        }
+        if (schemaVersion < 3) {
+            require(objectValue.optionalNullableString("sourceSha256") == null) {
+                "schema v1/v2에는 sourceSha256 proof를 넣을 수 없습니다."
+            }
+            require(
+                objectValue.optionalNullableString(
+                    "browserProfileSha256",
+                ) == null,
+            ) {
+                "schema v1/v2에는 browserProfileSha256 proof를 넣을 수 없습니다."
+            }
         }
         return CompatibilityReport(
             status = CompatibilityStatus.valueOf(
@@ -285,12 +303,12 @@ object SixBundle {
             sourceSha256 = if (schemaVersion < 3) {
                 null
             } else {
-                objectValue.nullableString("sourceSha256")
+                objectValue.requiredString("sourceSha256")
             },
             browserProfileSha256 = if (schemaVersion < 3) {
                 null
             } else {
-                objectValue.nullableString("browserProfileSha256")
+                objectValue.requiredString("browserProfileSha256")
             },
         ).also(CompatibilityReport::validate)
     }
@@ -368,6 +386,9 @@ object SixBundle {
 
     private fun JsonObject.nullableString(name: String): String? =
         getValue(name).jsonPrimitive.content.takeUnless { it == "null" }
+
+    private fun JsonObject.optionalNullableString(name: String): String? =
+        get(name)?.jsonPrimitive?.content?.takeUnless { it == "null" }
 
     private fun stringArray(values: Set<String>) =
         JsonArray(values.sorted().map(::JsonPrimitive))

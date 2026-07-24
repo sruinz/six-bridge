@@ -292,15 +292,75 @@ class ConversionPlannerTest {
     }
 
     @Test
-    fun `does not change unknown compatibility to compatible`() {
-        val report = reportWith(
-            decision("desktop-selection-event-bridge", AdapterDisposition.AUTOMATIC),
-            status = CompatibilityStatus.UNKNOWN,
+    fun `rejects blocked and unknown compatibility before planning`() {
+        listOf(
+            CompatibilityStatus.BLOCKED,
+            CompatibilityStatus.UNKNOWN,
+        ).forEach { status ->
+            val error = assertFailsWith<ConversionPlanningException> {
+                ConversionPlanner().plan(
+                    reportWith(status = status),
+                    approvedAdapterIds = emptySet(),
+                )
+            }
+
+            assertEquals(
+                ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
+                error.failure,
+            )
+            assertEquals(emptySet(), error.adapterIds)
+        }
+    }
+
+    @Test
+    fun `plan proof is injective for collection boundaries`() {
+        val twoValues = reportWith().copy(
+            declaredPermissions = setOf("a", "b"),
+        )
+        val embeddedSeparator = reportWith().copy(
+            declaredPermissions = setOf("a\u0000b"),
+        )
+        val emptyReport = reportWith().copy(
+            declaredPermissions = emptySet(),
+        )
+        val oneEmptyValue = reportWith().copy(
+            declaredPermissions = setOf(""),
         )
 
-        val plan = ConversionPlanner().plan(report, approvedAdapterIds = emptySet())
+        assertFalse(
+            ConversionPlanner().plan(twoValues, emptySet()).proofSha256 ==
+                ConversionPlanner().plan(
+                    embeddedSeparator,
+                    emptySet(),
+                ).proofSha256,
+        )
+        assertFalse(
+            ConversionPlanner().plan(emptyReport, emptySet()).proofSha256 ==
+                ConversionPlanner().plan(
+                    oneEmptyValue,
+                    emptySet(),
+                ).proofSha256,
+        )
+    }
 
-        assertEquals(CompatibilityStatus.UNKNOWN, plan.report.status)
+    @Test
+    fun `does not issue an empty plan for unavailable decisions`() {
+        val error = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(
+                reportWith(
+                    decision(
+                        "storage-fallback",
+                        AdapterDisposition.UNAVAILABLE,
+                    ),
+                ),
+                emptySet(),
+            )
+        }
+
+        assertEquals(
+            ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
+            error.failure,
+        )
     }
 
     private fun reportWith(

@@ -1,6 +1,5 @@
-package dev.sixbridge.core.conversion
+package dev.sixbridge.core.profile
 
-import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
@@ -32,17 +31,19 @@ internal object BrowserProfileDigest {
         )
         digest.field("sourceApkSha256", profile.sourceApkSha256)
         digest.field("sourceApkSignerSha256", profile.sourceApkSignerSha256)
-        profile.profileDifferences.forEachIndexed { index, value ->
-            digest.field("profileDifferences[$index]", value)
-        }
+        digest.list("profileDifferences", profile.profileDifferences)
         digest.set("supportedFeatures", profile.supportedFeatures)
         digest.set("unavailableFeatures", profile.unavailableFeatures)
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun MessageDigest.set(name: String, values: Set<String>) {
+        list(name, values.sorted())
+    }
+
+    private fun MessageDigest.list(name: String, values: List<String>) {
         field("$name.size", values.size.toString())
-        values.sorted().forEachIndexed { index, value ->
+        values.forEachIndexed { index, value ->
             field("$name[$index]", value)
         }
     }

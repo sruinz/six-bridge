@@ -1,5 +1,6 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.profile.BrowserProfileDigest
 import dev.sixbridge.core.compat.RuntimeResourceIndex
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject

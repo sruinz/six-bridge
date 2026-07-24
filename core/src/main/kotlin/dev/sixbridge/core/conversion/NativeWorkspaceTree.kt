@@ -113,7 +113,6 @@ internal object NativeWorkspaceTree {
             targetPosix.setOwner(attributes.owner())
             targetPosix.setGroup(attributes.group())
             targetPosix.setPermissions(attributes.permissions())
-            return
         }
         val sourceAcl = Files.getFileAttributeView(
             source,
@@ -131,10 +130,13 @@ internal object NativeWorkspaceTree {
             }
             targetAcl.owner = sourceAcl.owner
             targetAcl.acl = sourceAcl.acl
-            return
         }
-        WorkspacePermissionPolicy.requireMetadataSupport(source)
-        WorkspacePermissionPolicy.requireMetadataSupport(target)
+        if (sourcePosix == null && sourceAcl == null) {
+            WorkspacePermissionPolicy.requireMetadataSupport(source)
+        }
+        if (targetPosix == null && targetAcl == null) {
+            WorkspacePermissionPolicy.requireMetadataSupport(target)
+        }
     }
 
     private fun deleteTree(path: Path) {
