@@ -63,11 +63,12 @@ ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확�
 현재 PoC의 파일시스템 위협 모델은 신뢰된 단일 사용자 workspace다. 같은
 OS 계정의 다른 프로세스가 `prepare` 도중 보호 경로나 출력 경로를 동시에
 변경하는 상황은 지원하지 않으며, 공개 다중 사용자 변환 서비스의 격리
-경계로 사용해서는 안 된다. 그런 변경이 발생하면 최종 publication guard가
-게시를 거부하지만, 그 전에 만들어진 멱등적인 source identity, CRX 키,
-wrapper 키 또는 version 상태는 `.local/`에 남을 수 있다. 즉 출력 게시
-거부는 보장하지만 workspace 전체를 하나의 원자적 트랜잭션으로 취급하지
-않는다.
+경계로 사용해서는 안 된다. identity 변경은 최종 publication guard가
+거부할 수 있지만, inode·권한을 유지한 내용 변경이나 swap 후 원상 복구를
+포함한 모든 동시 변경의 탐지를 보장하지 않는다. 게시가 실패하기 전에
+생성된 source identity, CRX 키, wrapper 키가 `.local/`에 남거나 단조 증가
+version 카운터가 앞설 수 있으므로 workspace 전체를 하나의 원자적
+트랜잭션으로 취급하지 않는다.
 
 ## 확인된 삼성 래퍼 계약
 
