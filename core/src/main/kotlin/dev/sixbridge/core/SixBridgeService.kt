@@ -184,7 +184,7 @@ class SixBridgeService(
                 target,
                 payload,
                 key,
-                requireNotNull(targetGuard.publicationGuard),
+                targetGuard.publicationGuard,
             )
             verifyWrittenDraft(payload, key, draftReader(target))
             SixDraftResult(
@@ -513,7 +513,14 @@ private object ProtectedOutputPolicy {
         }.distinct().singleOrNull() ?: throw UnsafeOutputException(
             "모든 출력은 같은 디렉터리에 있어야 합니다.",
         )
-        val outputAncestorPath = nearestExistingAncestor(outputParent)
+        if (
+            !Files.isDirectory(outputParent, NOFOLLOW_LINKS) ||
+            Files.isSymbolicLink(outputParent)
+        ) {
+            throw UnsafeOutputException(
+                "출력 parent가 없습니다. 먼저 실행하세요: mkdir -p \"$outputParent\"",
+            )
+        }
         val watchedPaths = buildList {
             resolved.sourceRoot?.let(::add)
             if (
@@ -524,7 +531,7 @@ private object ProtectedOutputPolicy {
             }
             addAll(protectedInputList)
             persistentRoots.forEach { add(localRoot.resolve(it)) }
-            add(outputAncestorPath)
+            add(outputParent)
         }.map { it.toAbsolutePath().normalize() }
             .distinct()
             .filter { Files.exists(it, NOFOLLOW_LINKS) }
@@ -536,15 +543,7 @@ private object ProtectedOutputPolicy {
                 resolved = resolved,
                 protectedInputs = protectedInputList,
                 watched = watched,
-                outputAncestor = watched.single { it.path == outputAncestorPath },
-                publicationGuard = outputs.firstOrNull()?.let { output ->
-                    val parent = requireNotNull(output.toAbsolutePath().normalize().parent)
-                    if (Files.isDirectory(parent, NOFOLLOW_LINKS)) {
-                        SecureBuildPublisher.capturePublicationGuard(outputs)
-                    } else {
-                        null
-                    }
-                },
+                publicationGuard = SecureBuildPublisher.capturePublicationGuard(outputs),
             )
         }
     }
@@ -568,18 +567,10 @@ private object ProtectedOutputPolicy {
                 resolved = previous.resolved,
                 protectedInputs = previous.protectedInputs,
                 watched = previous.watched,
-                outputAncestor = previous.outputAncestor,
-                publicationGuard = if (previous.publicationGuard == null) {
-                    SecureBuildPublisher.capturePublicationGuard(
-                        outputs = outputs,
-                        expectedAncestor = previous.outputAncestor,
-                    )
-                } else {
-                    SecureBuildPublisher.capturePublicationGuard(
-                        outputs,
-                        previous.publicationGuard,
-                    )
-                },
+                publicationGuard = SecureBuildPublisher.capturePublicationGuard(
+                    outputs,
+                    previous.publicationGuard,
+                ),
             )
         }
     }
@@ -665,20 +656,6 @@ private object ProtectedOutputPolicy {
         return anchored.normalize()
     }
 
-    private fun nearestExistingAncestor(path: Path): Path {
-        var current = path.toAbsolutePath().normalize()
-        while (!Files.exists(current, NOFOLLOW_LINKS)) {
-            current = current.parent ?: throw UnsafeOutputException(
-                "출력 parent의 기존 ancestor를 찾을 수 없습니다: $path",
-            )
-        }
-        if (Files.isSymbolicLink(current)) {
-            throw UnsafeOutputException(
-                "출력 parent ancestor가 symlink입니다: $current",
-            )
-        }
-        return current
-    }
 }
 
 private class ProtectedOutputGuard(
@@ -687,13 +664,12 @@ private class ProtectedOutputGuard(
     val resolved: ResolvedExtensionInput,
     val protectedInputs: List<Path>,
     val watched: List<WorkspacePathIdentity>,
-    val outputAncestor: WorkspacePathIdentity,
-    val publicationGuard: PublicationGuard?,
+    val publicationGuard: PublicationGuard,
 ) {
     fun requireCurrent() {
         try {
             watched.forEach(WorkspacePermissionPolicy::requireSameIdentity)
-            publicationGuard?.let(SecureBuildPublisher::requirePublicationGuard)
+            SecureBuildPublisher.requirePublicationGuard(publicationGuard)
         } catch (error: UnsafeOutputException) {
             throw error
         } catch (error: Exception) {

@@ -53,6 +53,8 @@ sixbridge analyze \
 예시는 action popup을 모바일 탭 진입점으로 바꾸는 동작을 승인한다.
 
 ```sh
+mkdir -p .local/test-output
+
 sixbridge draft \
   --input fixtures/desktop-mobile-golden \
   --profile profiles/sbrowser-30.0.2.61.json \
@@ -63,6 +65,8 @@ sixbridge draft \
 개발용 CRX3, 래퍼 APK, SixBundle을 직접 만들 수도 있다.
 
 ```sh
+mkdir -p dist
+
 sixbridge build \
   --input fixtures/desktop-mobile-golden \
   --profile profiles/sbrowser-30.0.2.61.json \
@@ -75,6 +79,9 @@ sixbridge build \
 `desktop-mobile.six`를 만든다. `--output`을 생략하면 canonical 입력 문자열의
 SHA-256에서 만든 결정적 basename을 `dist/`에 사용한다. 산출물 파일명과
 무관하게 실제 extension ID는 CRX, descriptor, 래퍼 package에 유지된다.
+`draft`와 `build`는 출력 부모 폴더를 자동 생성하지 않는다. 명령 실행 전에
+위 예시처럼 `mkdir -p <출력-부모>`로 만들고, 해당 폴더의 identity와 권한을
+검증할 수 있게 해야 한다.
 
 CLI `build`의 APK 서명은 개발 검증용이다. 일반 사용자에게 설치할 최종
 래퍼 서명과 설치 승인은 Android 관리자가 담당한다. 변환 과정에서 source를

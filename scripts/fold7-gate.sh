@@ -9,6 +9,8 @@ fi
 
 serial=$1
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# 레거시 최소 기술 게이트는 최초 검증에서 확정한 extension ID를 계속 쓴다.
+# 변환된 확장의 후속 검증은 SixBundle basename을 받는 device 명령을 사용한다.
 extension_id=odgobepbaifhaibnnkpcclekeaogainb
 package_name="dev.sixbridge.ext.$extension_id"
 wrapper_apk="$project_dir/dist/$extension_id-wrapper.apk"

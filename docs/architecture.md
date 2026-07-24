@@ -37,6 +37,11 @@ identity를 검증한다. 출력 경로를 생략하면 canonical 입력 문자�
 결정적 basename을 만든다. 파일명은 extension ID가 아니며 실제 ID는 CRX,
 descriptor와 래퍼 package에 유지된다.
 
+`draft`와 `build`의 출력 부모 폴더는 명령 전에 사용자가 만들어야 한다.
+SIX Bridge는 이를 자동 생성하지 않고, 승인 검사와 persistent prepare보다
+먼저 기존 폴더의 identity·권한과 모든 target을 캡처한다. 예를 들어
+`dist/foo.six`를 만들려면 먼저 `mkdir -p dist`를 실행한다.
+
 ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확인하기 위한
 검증 경로일 뿐, 일반 사용자 흐름의 필수 구성요소가 아니다.
 
@@ -54,6 +59,15 @@ ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확�
   SixDraft 전달 서명용 Ed25519 공개 키와 개인 키를 분리해 저장한다.
 - 래퍼 패키지명은 `dev.sixbridge.ext.<extensionId>`이다. 서명된 APK 검증이
   성공한 뒤에만 `versionCode`를 확정한다.
+
+현재 PoC의 파일시스템 위협 모델은 신뢰된 단일 사용자 workspace다. 같은
+OS 계정의 다른 프로세스가 `prepare` 도중 보호 경로나 출력 경로를 동시에
+변경하는 상황은 지원하지 않으며, 공개 다중 사용자 변환 서비스의 격리
+경계로 사용해서는 안 된다. 그런 변경이 발생하면 최종 publication guard가
+게시를 거부하지만, 그 전에 만들어진 멱등적인 source identity, CRX 키,
+wrapper 키 또는 version 상태는 `.local/`에 남을 수 있다. 즉 출력 게시
+거부는 보장하지만 workspace 전체를 하나의 원자적 트랜잭션으로 취급하지
+않는다.
 
 ## 확인된 삼성 래퍼 계약
 

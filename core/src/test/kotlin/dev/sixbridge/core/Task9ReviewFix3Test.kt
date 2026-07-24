@@ -1,13 +1,12 @@
 package dev.sixbridge.core
 
-import dev.sixbridge.core.conversion.BuildPublicationFaultInjection
+import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.draft.DraftSourceStreams
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.security.MessageDigest
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
@@ -83,47 +82,84 @@ class Task9ReviewFix3Test {
     }
 
     @Test
-    fun `guarded parent creation cleans a directory created after ancestor replacement`() {
-        val workspace = Files.createTempDirectory("six-review-parent-create-race")
+    fun `build rejects a missing output parent without creating or deleting anything`() {
+        val workspace = Files.createTempDirectory("six-review-missing-parent")
         val source = source(workspace.resolve("source"))
         val anchor = workspace.resolve("anchor").also(Files::createDirectory)
         anchor.resolve("sentinel").writeText("original")
-        val moved = workspace.resolve("anchor-original")
         val output = anchor.resolve("new-parent/converted.six")
         var toolchainRequests = 0
 
-        assertFailsWith<UnsafeOutputException> {
-            BuildPublicationFaultInjection.replaceAncestorBeforeGuardedParentCreate(
-                action = {
-                    Files.move(anchor, moved, ATOMIC_MOVE)
-                    Files.createDirectory(anchor)
+        val error = assertFailsWith<UnsafeOutputException> {
+            SixBridgeService(
+                workspaceRoot = workspace,
+                toolchainProvider = {
+                    toolchainRequests += 1
+                    error("없는 output parent에서 wrapper를 빌드하면 안 됩니다.")
                 },
-            ) {
-                SixBridgeService(
-                    workspaceRoot = workspace,
-                    toolchainProvider = {
-                        toolchainRequests += 1
-                        error("교체된 ancestor 아래에서 wrapper를 빌드하면 안 됩니다.")
-                    },
-                ).build(
-                    input = source.toString(),
-                    profile = profile(),
-                    outputBundle = output,
-                )
-            }
+            ).build(
+                input = source.toString(),
+                profile = profile(),
+                outputBundle = output,
+            )
         }
 
         assertEquals(0, toolchainRequests)
-        assertEquals("original", moved.resolve("sentinel").toFile().readText())
+        assertTrue(error.message.orEmpty().contains("mkdir -p"))
+        assertEquals("original", anchor.resolve("sentinel").toFile().readText())
         assertEquals(
             listOf("sentinel"),
-            Files.list(moved).use { paths ->
+            Files.list(anchor).use { paths ->
                 paths.map { it.fileName.toString() }.sorted().toList()
             },
         )
-        assertTrue(Files.list(anchor).use { it.findAny().isEmpty })
         assertFalse(anchor.resolve("new-parent").exists())
         assertFalse(workspace.resolve(".local").exists())
+    }
+
+    @Test
+    fun `draft rejects a missing output parent before adapter approval or prepare`() {
+        val workspace = Files.createTempDirectory("six-review-draft-missing-parent")
+        val source = source(workspace.resolve("source"))
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Draft missing parent",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        val output = workspace.resolve("missing/converted.sixdraft")
+
+        val error = assertFailsWith<UnsafeOutputException> {
+            SixBridgeService(workspace).draft(
+                input = source.toString(),
+                profile = profile(),
+                outputDraft = output,
+            )
+        }
+
+        assertTrue(error.message.orEmpty().contains("mkdir -p"))
+        assertFalse(workspace.resolve("missing").exists())
+        assertFalse(workspace.resolve(".local").exists())
+    }
+
+    @Test
+    fun `publication guard recapture rejects a different target set`() {
+        val parent = Files.createTempDirectory("six-review-guard-target-set")
+        val first = parent.resolve("first.six")
+        val second = parent.resolve("second.six")
+        val guard = SecureBuildPublisher.capturePublicationGuard(listOf(first))
+
+        assertFailsWith<IllegalArgumentException> {
+            SecureBuildPublisher.capturePublicationGuard(
+                outputs = listOf(second),
+                expectedParent = guard,
+            )
+        }
     }
 
     @Test

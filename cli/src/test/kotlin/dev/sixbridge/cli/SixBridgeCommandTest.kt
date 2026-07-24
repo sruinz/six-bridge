@@ -479,6 +479,29 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `build reports a missing output parent as actionable user input`() {
+        val workspace = Files.createTempDirectory("six-cli-missing-output-parent")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val output = workspace.resolve("missing/converted.six")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "build",
+            "--input", source.toString(),
+            "--profile", writeProfile(workspace).toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(2, result.exitCode, result.error)
+        assertTrue(result.error.contains("mkdir -p"), result.error)
+        assertFalse(workspace.resolve("missing").exists())
+        assertFalse(workspace.resolve(".local").exists())
+    }
+
+    @Test
     fun `build accepts popup approval and uses the draft transformed source hash`() {
         val workspace = Files.createTempDirectory("six-cli-build-conversion")
         val profile = writeProfile(workspace)

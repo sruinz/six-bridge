@@ -127,6 +127,7 @@ class SixBridgeServiceTest {
     @Test
     fun `build publishes no artifacts when required approval is missing`() {
         val workspace = Files.createTempDirectory("six-build-no-output-workspace")
+        val outputParent = workspace.resolve("dist").also(Files::createDirectory)
         val source = source("six-build-no-output-source", "Missing approval")
         source.resolve("content.js").writeText("console.log('content');")
         source.resolve("popup.html").writeText("<p>popup</p>")
@@ -152,7 +153,9 @@ class SixBridgeServiceTest {
             service.build(source.toString(), supportedProfile())
         }
 
-        assertFalse(Files.exists(workspace.resolve("dist")))
+        assertTrue(
+            Files.list(outputParent).use { paths -> paths.findAny().isEmpty },
+        )
     }
 
     @Test
@@ -172,6 +175,7 @@ class SixBridgeServiceTest {
     @Test
     fun `build rejects a group-writable source marker before snapshot permissions are lost`() {
         val workspace = Files.createTempDirectory("six-build-marker-permission-workspace")
+        Files.createDirectory(workspace.resolve("dist"))
         val source = source("six-build-marker-permission-source", "Unsafe marker")
         val marker = source.resolve(".sixbridge-project-id")
         marker.writeText("sixbridge-project-v1:${"d".repeat(32)}")

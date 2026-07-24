@@ -22,6 +22,12 @@
 8. 삼성 인터넷을 완전히 종료·재실행한 뒤 활성 상태와 배지 실행이 유지되는지
    확인한다.
 
+`fold7-gate.sh`는 최초 런타임 기술 게이트에서 확정한 extension ID
+`odgobepbaifhaibnnkpcclekeaogainb`와 해당 고정 wrapper 파일명을 계속
+사용하는 레거시 검증 스크립트다. 변환된 확장의 후속 검증은 `build`가 만든
+SixBundle basename을 `device install`과 `device smoke`에 전달한다. 두
+경로의 파일명을 서로 바꾸지 않는다.
+
 패키지가 설치되고 `six://ex`도 해석되지만 Add-ons에 나타나지 않으면 원본
 Chrome 웹 스토어 CRX와 개발 키로 다시 패킹한 CRX를 각각 시험하고 결과를
 기록한다. 삼성 인터넷 APK는 수정하지 않으며 Android 관리자 앱 단계도
