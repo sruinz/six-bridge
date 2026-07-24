@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "extensions": [
+    {
+      "order": 1,
+      "id": "lneaoklobohnoncgckmbbjfiajgpbdde",
+      "name": "스마트 컨텍스트 메뉴",
+      "expectedStatus": "compatible",
+      "requiredScenarios": [
+        "popup",
+        "selection-context-menu",
+        "copy-and-search",
+        "settings-persistence"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "meemjdgdjhjfhcfchppfapgifiipjnlo",
+      "name": "AI 레시피 추출기",
+      "expectedStatus": "compatible",
+      "requiredScenarios": [
+        "options-persistence",
+        "selected-url",
+        "mobile-context-menu",
+        "server-request-navigation"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "fchehlladkkanoekpjffcfffpfbdaalj",
+      "name": "Video Download to NAS",
+      "expectedStatus": "compatible",
+      "requiredScenarios": [
+        "page-detection",
+        "action-ui",
+        "settings-persistence",
+        "nas-authentication-and-request"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "ommjjncpoppekodegknkannmdhoppgkj",
+      "name": "MediaNab",
+      "expectedStatus": "partial",
+      "requiredScenarios": [
+        "installation-and-enable",
+        "popup",
+        "media-detection",
+        "storage-tabs-webRequest-offscreen"
+      ],
+      "excludedFromPocPass": [
+        "downloads",
+        "nativeMessaging"
+      ]
+    }
+  ]
+}

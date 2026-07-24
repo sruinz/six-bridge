@@ -1,0 +1,254 @@
+package dev.sixbridge.cli
+
+import dev.sixbridge.core.SixBridgeService
+import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.device.AdbDeviceClient
+import dev.sixbridge.core.profile.BrowserProfileExtractor
+import dev.sixbridge.core.profile.BrowserProfileJson
+import picocli.CommandLine
+import picocli.CommandLine.Command
+import picocli.CommandLine.Option
+import picocli.CommandLine.ParentCommand
+import picocli.CommandLine.Spec
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.Callable
+import kotlin.io.path.readText
+import kotlin.io.path.writeText
+import kotlin.system.exitProcess
+
+fun main(args: Array<String>) {
+    val command = CommandLine(SixBridgeCommand())
+    command.executionExceptionHandler = CommandLine.IExecutionExceptionHandler { error, line, _ ->
+        line.err.println("오류: ${error.message}")
+        if (System.getenv("SIXBRIDGE_DEBUG") == "1") {
+            error.printStackTrace(line.err)
+        }
+        1
+    }
+    exitProcess(command.execute(*args))
+}
+
+@Command(
+    name = "sixbridge",
+    mixinStandardHelpOptions = true,
+    version = ["SIX Bridge 0.1.0-SNAPSHOT"],
+    description = ["Chrome/Edge 확장을 삼성 인터넷 개발 확장 래퍼로 변환합니다."],
+    subcommands = [
+        ProfileCommand::class,
+        AnalyzeCommand::class,
+        BuildCommand::class,
+        DeviceCommand::class,
+    ],
+)
+class SixBridgeCommand : Runnable {
+    @Option(
+        names = ["--workspace"],
+        description = ["프로젝트 루트 (기본값: 현재 디렉터리)"],
+    )
+    var workspace: Path = Path.of("").toAbsolutePath().normalize()
+
+    override fun run() {
+        CommandLine(this).usage(System.out)
+    }
+}
+
+@Command(
+    name = "profile",
+    mixinStandardHelpOptions = true,
+    description = ["삼성 브라우저 APK에서 버전·API·래퍼 계약 프로필을 추출합니다."],
+)
+class ProfileCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var root: SixBridgeCommand
+
+    @Option(names = ["--browser-apk"], required = true)
+    lateinit var browserApk: Path
+
+    @Option(names = ["--output"])
+    var output: Path? = null
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val profile = BrowserProfileExtractor().extract(browserApk)
+        val target = output ?: root.workspace.resolve(
+            "profiles/sbrowser-${profile.versionName}.json",
+        )
+        Files.createDirectories(target.toAbsolutePath().parent)
+        target.writeText(BrowserProfileJson.encode(profile))
+        spec.commandLine().out.println("profile=${target.toAbsolutePath()}")
+        spec.commandLine().out.println("support=${profile.support.name.lowercase()}")
+        spec.commandLine().out.println("apis=${profile.supportedApis.size}")
+        return 0
+    }
+}
+
+@Command(
+    name = "analyze",
+    mixinStandardHelpOptions = true,
+    description = ["확장 Manifest V3·권한·chrome.* API 호환성을 분석합니다."],
+)
+class AnalyzeCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var root: SixBridgeCommand
+
+    @Option(names = ["--input"], required = true)
+    lateinit var input: String
+
+    @Option(names = ["--profile"], required = true)
+    lateinit var profilePath: Path
+
+    @Option(names = ["--output"])
+    var output: Path? = null
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val profile = BrowserProfileJson.decode(profilePath.readText())
+        val report = SixBridgeService(root.workspace).analyze(input, profile)
+        val encoded = SixBundle.encodeCompatibility(report)
+        if (output == null) {
+            spec.commandLine().out.println(encoded)
+        } else {
+            Files.createDirectories(output!!.toAbsolutePath().parent)
+            output!!.writeText(encoded)
+            spec.commandLine().out.println("report=${output!!.toAbsolutePath()}")
+        }
+        return if (report.status == CompatibilityStatus.BLOCKED ||
+            report.status == CompatibilityStatus.UNKNOWN
+        ) {
+            2
+        } else {
+            0
+        }
+    }
+}
+
+@Command(
+    name = "build",
+    mixinStandardHelpOptions = true,
+    description = ["CRX3, 서명된 Android 래퍼 APK와 SixBundle을 생성합니다."],
+)
+class BuildCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var root: SixBridgeCommand
+
+    @Option(names = ["--input"], required = true)
+    lateinit var input: String
+
+    @Option(names = ["--profile"], required = true)
+    lateinit var profilePath: Path
+
+    @Option(names = ["--output"], description = ["출력 .six 경로"])
+    var output: Path? = null
+
+    @Option(
+        names = ["--identity"],
+        description = ["markerless 업데이트 ZIP에 사용할 source project identity"],
+    )
+    var projectIdentity: String? = null
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val profile = BrowserProfileJson.decode(profilePath.readText())
+        val result = SixBridgeService(root.workspace).build(
+            input,
+            profile,
+            output,
+            projectIdentity,
+        )
+        spec.commandLine().out.println("extensionId=${result.extensionId}")
+        spec.commandLine().out.println("compatibility=${result.compatibility.status.name.lowercase()}")
+        spec.commandLine().out.println("crx=${result.crx.toAbsolutePath()}")
+        spec.commandLine().out.println("wrapper=${result.wrapperApk.toAbsolutePath()}")
+        spec.commandLine().out.println("bundle=${result.bundle.toAbsolutePath()}")
+        return 0
+    }
+}
+
+@Command(
+    name = "device",
+    description = ["ADB로 SixBundle 래퍼를 설치하고 삼성 인터넷 인식 증거를 수집합니다."],
+    subcommands = [DeviceInstallCommand::class, DeviceSmokeCommand::class],
+)
+class DeviceCommand : Runnable {
+    @ParentCommand
+    lateinit var root: SixBridgeCommand
+
+    override fun run() {
+        CommandLine(this).usage(System.out)
+    }
+}
+
+@Command(
+    name = "install",
+    mixinStandardHelpOptions = true,
+    description = ["SixBundle의 래퍼 APK를 사용자 지정 ADB 기기에 설치·업데이트합니다."],
+)
+class DeviceInstallCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var device: DeviceCommand
+
+    @Option(names = ["--bundle"], required = true)
+    lateinit var bundle: Path
+
+    @Option(names = ["--serial"], required = true)
+    lateinit var serial: String
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val result = AdbDeviceClient().install(bundle, serial)
+        spec.commandLine().out.println("package=${result.packageName}")
+        spec.commandLine().out.println("result=${result.output}")
+        return 0
+    }
+}
+
+@Command(
+    name = "smoke",
+    mixinStandardHelpOptions = true,
+    description = ["래퍼 패키지·six://ex 인식 여부와 관련 logcat 증거를 수집합니다."],
+)
+class DeviceSmokeCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var device: DeviceCommand
+
+    @Option(names = ["--bundle"], required = true)
+    lateinit var bundle: Path
+
+    @Option(names = ["--serial"], required = true)
+    lateinit var serial: String
+
+    @Option(names = ["--evidence-dir"])
+    var evidenceDirectory: Path? = null
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val evidence = evidenceDirectory
+            ?: device.root.workspace.resolve(".local/evidence")
+        val result = AdbDeviceClient().smoke(bundle, serial, evidence)
+        spec.commandLine().out.println("installed=${result.installed}")
+        spec.commandLine().out.println("discovery=${result.discoveryActivityResolved}")
+        spec.commandLine().out.println("provider=${result.providerReadable}")
+        spec.commandLine().out.println("evidence=${result.evidenceLog.toAbsolutePath()}")
+        return if (
+            result.installed &&
+            result.discoveryActivityResolved &&
+            result.providerReadable
+        ) {
+            0
+        } else {
+            3
+        }
+    }
+}
