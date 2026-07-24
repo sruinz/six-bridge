@@ -8,6 +8,7 @@ import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.MissingAdapterApprovalException
 import dev.sixbridge.core.crx.InvalidCrxException
 import dev.sixbridge.core.device.AdbDeviceClient
+import dev.sixbridge.core.device.BuildArtifactVerifier
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.input.UnsupportedInputException
 import dev.sixbridge.core.profile.BrowserProfileExtractor
@@ -60,6 +61,7 @@ fun createCommandLine(
         AnalyzeCommand::class,
         DraftCommand::class,
         VerifyDraftCommand::class,
+        VerifyBuildCommand::class,
         BuildCommand::class,
         DeviceCommand::class,
     ],
@@ -221,6 +223,35 @@ class VerifyDraftCommand : Callable<Int> {
     override fun call(): Int {
         SixDraft.read(input)
         spec.commandLine().out.println("SixDraft verified")
+        return 0
+    }
+}
+
+@Command(
+    name = "verify-build",
+    hidden = true,
+    mixinStandardHelpOptions = true,
+    description = ["CRX, wrapper APK와 SixBundle의 결합 계약을 독립 검증합니다."],
+)
+class VerifyBuildCommand : Callable<Int> {
+    @Option(names = ["--bundle"], required = true)
+    lateinit var bundle: Path
+
+    @Option(names = ["--crx"], required = true)
+    lateinit var crx: Path
+
+    @Option(names = ["--wrapper"], required = true)
+    lateinit var wrapper: Path
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val result = BuildArtifactVerifier().verify(bundle, crx, wrapper)
+        spec.commandLine().out.println("extensionId=${result.extensionId}")
+        spec.commandLine().out.println("wrapperPackage=${result.wrapperPackage}")
+        spec.commandLine().out.println("wrapperVersionCode=${result.wrapperVersionCode}")
+        spec.commandLine().out.println("Build artifacts verified")
         return 0
     }
 }

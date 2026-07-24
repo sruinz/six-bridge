@@ -386,6 +386,38 @@ class ConversionPipelineTest {
     }
 
     @Test
+    fun `trusted action popup asset does not contaminate safe storage conversion`() {
+        val source = convertibleSource(
+            "six-pipeline-popup-storage",
+            includePopup = true,
+        )
+        source.resolve("content.js").writeText(
+            source.resolve("content.js").readText() +
+                "\nchrome.storage.sync.get(\"theme\").then(console.log);\n",
+        )
+        val fallbackProfile = profile().copy(
+            supportedFeatures = setOf("storage.local"),
+            unavailableFeatures = setOf("storage.sync"),
+        )
+
+        val result = ConversionPipeline(
+            Files.createTempDirectory("six-pipeline-popup-storage-local"),
+        ).use {
+            it.prepare(
+                resolvedSource(source),
+                fallbackProfile,
+                listOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY),
+            )
+        }
+
+        val decisions = result.compatibilityAfter.adapterDecisions.associateBy { it.id }
+        assertTrue(decisions.getValue(MobilePatternAnalyzer.ACTION_POPUP_ENTRY).applied)
+        val storage = decisions.getValue(MobilePatternAnalyzer.STORAGE_FALLBACK)
+        assertEquals(AdapterDisposition.AUTOMATIC, storage.disposition)
+        assertTrue(storage.applied)
+    }
+
+    @Test
     fun `conversion preserves an existing unselected unavailable decision`() {
         val source = convertibleSource(
             "six-pipeline-unavailable-preserved",
@@ -450,10 +482,74 @@ class ConversionPipelineTest {
         )
 
         assertFailsWith<ConversionValidationException> {
-            requireNoNewAdapterDecisions(
+            reconcileAdapterDecisions(
                 beforeDecisions = before,
                 appliedDecisions = applied,
                 rawAfterDecisions = listOf(newDecision),
+            )
+        }
+    }
+
+    @Test
+    fun `reconciliation rejects added evidence on an unselected decision`() {
+        assertFailsWith<ConversionValidationException> {
+            reconcileWithStorageEvidence(
+                listOf(
+                    SourceEvidence("content.js", 1, "원본 근거"),
+                    SourceEvidence("_sixbridge/generated.js", 2, "추가 근거"),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `reconciliation rejects removed evidence on an unselected decision`() {
+        assertFailsWith<ConversionValidationException> {
+            reconcileWithStorageEvidence(emptyList())
+        }
+    }
+
+    @Test
+    fun `reconciliation rejects changed evidence on an unselected decision`() {
+        assertFailsWith<ConversionValidationException> {
+            reconcileWithStorageEvidence(
+                listOf(SourceEvidence("content.js", 1, "변경된 근거")),
+            )
+        }
+    }
+
+    @Test
+    fun `reconciliation rejects a duplicate raw decision with the same identity`() {
+        val selected = AdapterDecision(
+            id = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.AUTOMATIC,
+            applied = true,
+            evidence = listOf(SourceEvidence("content.js", 1, "선택 근거")),
+            changes = listOf("선택 변경"),
+            remainingLimitations = emptyList(),
+        )
+        val unavailable = AdapterDecision(
+            id = MobilePatternAnalyzer.STORAGE_FALLBACK,
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.UNAVAILABLE,
+            applied = false,
+            evidence = listOf(SourceEvidence("content.js", 1, "원본 근거")),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 제한"),
+        )
+
+        assertFailsWith<ConversionValidationException> {
+            reconcileAdapterDecisions(
+                beforeDecisions = listOf(selected.copy(applied = false), unavailable),
+                appliedDecisions = listOf(selected),
+                rawAfterDecisions = listOf(
+                    selected,
+                    unavailable.copy(evidence = emptyList()),
+                    unavailable,
+                ),
             )
         }
     }
@@ -573,6 +669,40 @@ class ConversionPipelineTest {
         originalInput = source.toString(),
         sourceRoot = source,
     )
+
+    private fun reconcileWithStorageEvidence(
+        currentEvidence: List<SourceEvidence>,
+    ): List<AdapterDecision> {
+        val selected = AdapterDecision(
+            id = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.AUTOMATIC,
+            applied = false,
+            evidence = listOf(SourceEvidence("content.js", 1, "선택 근거")),
+            changes = listOf("선택 변경"),
+            remainingLimitations = emptyList(),
+        )
+        val unavailable = AdapterDecision(
+            id = MobilePatternAnalyzer.STORAGE_FALLBACK,
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.UNAVAILABLE,
+            applied = false,
+            evidence = listOf(SourceEvidence("content.js", 1, "원본 근거")),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 제한"),
+        )
+        val applied = selected.copy(applied = true)
+        return reconcileAdapterDecisions(
+            beforeDecisions = listOf(selected, unavailable),
+            appliedDecisions = listOf(applied),
+            rawAfterDecisions = listOf(
+                applied,
+                unavailable.copy(evidence = currentEvidence),
+            ),
+        )
+    }
 
     private fun keyPair() = KeyPairGenerator.getInstance("RSA")
         .apply { initialize(2048) }

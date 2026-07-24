@@ -44,6 +44,20 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `hidden build verifier remains directly invokable`() {
+        val output = StringWriter()
+        val command = CommandLine(SixBridgeCommand())
+        command.out = PrintWriter(output)
+
+        val exit = command.execute("verify-build", "--help")
+
+        assertEquals(0, exit)
+        assertTrue("--bundle" in output.toString())
+        assertTrue("--crx" in output.toString())
+        assertTrue("--wrapper" in output.toString())
+    }
+
+    @Test
     fun `profile writes a reusable browser profile`() {
         val workspace = Files.createTempDirectory("six-cli-profile")
         val apk = workspace.resolve("sbrowser-30.0.2.61-1300261502_test.apk")

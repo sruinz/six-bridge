@@ -25,4 +25,11 @@ node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/desktop-mobile-golden/storage-fallback.test.mjs
 
 bash -n scripts/fold7-gate.sh
+for shell_file in \
+  scripts/fold7-converted-extension.sh \
+  scripts/fold7-validation-lib.sh \
+  scripts/fold7-converted-extension.test.sh; do
+  bash -n "$shell_file"
+done
+bash scripts/fold7-converted-extension.test.sh
 bash scripts/verify-mobile-conversion.sh

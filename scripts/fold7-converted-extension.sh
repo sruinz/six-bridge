@@ -16,6 +16,8 @@ EOF
 }
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+# shellcheck source=fold7-validation-lib.sh
+. "$project_dir/scripts/fold7-validation-lib.sh"
 source_input='/workspace/T5다운로드/작업중/미니메뉴 확장프로그램/smart-context-menu'
 profile_input="$project_dir/profiles/sbrowser-30.0.2.61.json"
 serial=
@@ -67,6 +69,10 @@ if [ "$host_only" = true ] && [ -n "$serial" ]; then
   echo "--host-only와 --serial은 함께 사용할 수 없습니다." >&2
   exit 2
 fi
+if [ "$host_only" = false ] && [ -z "$serial" ]; then
+  echo "--host-only가 아니면 --serial 값이 필요합니다." >&2
+  exit 2
+fi
 if [ ! -d "$source_input" ]; then
   echo "확장 source 디렉터리를 찾을 수 없습니다: $source_input" >&2
   exit 2
@@ -111,11 +117,28 @@ if ! "$java_command" -version >/dev/null 2>&1; then
   exit 2
 fi
 
-evidence_dir="$project_dir/.local/evidence"
+local_dir="$project_dir/.local"
+evidence_dir="$local_dir/evidence"
 dist_dir="$project_dir/dist"
-mkdir -p "$evidence_dir" "$dist_dir"
+six_secure_directory "$local_dir" "$project_dir" || {
+  echo "안전한 .local 디렉터리를 준비할 수 없습니다." >&2
+  exit 2
+}
+six_secure_directory "$evidence_dir" "$local_dir" || {
+  echo "안전한 evidence 디렉터리를 준비할 수 없습니다." >&2
+  exit 2
+}
+six_secure_directory "$dist_dir" "$project_dir" || {
+  echo "안전한 dist 디렉터리를 준비할 수 없습니다." >&2
+  exit 2
+}
 timestamp=$(date +%Y%m%d-%H%M%S)
-evidence_log="$evidence_dir/$timestamp-smart-context-converted.log"
+run_dir=$(mktemp -d "$evidence_dir/.smart-context-run.XXXXXX")
+[ -d "$run_dir" ] && [ ! -L "$run_dir" ] || {
+  echo "안전한 evidence run 디렉터리를 만들 수 없습니다." >&2
+  exit 2
+}
+evidence_log=$(mktemp "$evidence_dir/$timestamp-smart-context-converted.log.XXXXXX")
 report="$evidence_dir/smart-context-before.json"
 first_draft="$evidence_dir/smart-context-a.sixdraft"
 second_draft="$evidence_dir/smart-context-b.sixdraft"
@@ -124,6 +147,11 @@ crx="$dist_dir/smart-context-converted.crx"
 wrapper="$dist_dir/smart-context-converted-wrapper.apk"
 descriptor="$evidence_dir/smart-context-extension.json"
 after_report="$evidence_dir/smart-context-after.json"
+report_work=$(mktemp "$evidence_dir/.smart-context-before.XXXXXX")
+first_draft_work=$(mktemp "$evidence_dir/.smart-context-a.sixdraft.XXXXXX")
+second_draft_work=$(mktemp "$evidence_dir/.smart-context-b.sixdraft.XXXXXX")
+descriptor_work=$(mktemp "$evidence_dir/.smart-context-extension.XXXXXX")
+after_report_work=$(mktemp "$evidence_dir/.smart-context-after.XXXXXX")
 
 tree_hash() {
   (
@@ -172,12 +200,12 @@ on_exit() {
   fi
   echo "evidence=$evidence_log"
   cat "$evidence_log" >&3
-  exec 3>&- 4>&-
+  exec 3>&-
   exit "$exit_code"
 }
 
 trap on_exit EXIT
-exec 3>&1 4>&2
+exec 3>&1
 exec >"$evidence_log" 2>&1
 
 echo "# SIX Bridge 스마트 컨텍스트 메뉴 변환 검증"
@@ -191,41 +219,24 @@ printf '%s\n' "sourceStatusBaseline:" "$source_status_before"
 "$cli" analyze \
   --input "$source_dir" \
   --profile "$profile" \
-  --output "$report"
-
-jq -e '
-  .status == "compatible" and .conversionState == "unavailable" and
-  ([.adapterDecisions[].id] | sort) ==
-    ["action-popup-entry", "desktop-selection-event-bridge", "storage-fallback"] and
-  any(.adapterDecisions[];
-    .id == "desktop-selection-event-bridge" and
-    .disposition == "automatic" and .applied == false) and
-  any(.adapterDecisions[];
-    .id == "action-popup-entry" and
-    .disposition == "requires-approval" and .applied == false) and
-  any(.adapterDecisions[];
-    .id == "storage-fallback" and
-    .disposition == "unavailable" and .applied == false)
-' "$report" >/dev/null
-echo "hostPatternDecision=true"
-echo "identitySpecificDecision=false"
+  --output "$report_work"
 
 "$cli" draft \
   --input "$source_dir" \
   --profile "$profile" \
   --approve-adapter action-popup-entry \
-  --output "$first_draft"
+  --output "$first_draft_work"
 
 "$cli" draft \
   --input "$source_dir" \
   --profile "$profile" \
   --approve-adapter action-popup-entry \
-  --output "$second_draft"
+  --output "$second_draft_work"
 
-"$cli" verify-draft --input "$first_draft"
-"$cli" verify-draft --input "$second_draft"
-first_hash=$(shasum -a 256 "$first_draft" | awk '{print $1}')
-second_hash=$(shasum -a 256 "$second_draft" | awk '{print $1}')
+"$cli" verify-draft --input "$first_draft_work"
+"$cli" verify-draft --input "$second_draft_work"
+first_hash=$(shasum -a 256 "$first_draft_work" | awk '{print $1}')
+second_hash=$(shasum -a 256 "$second_draft_work" | awk '{print $1}')
 echo "draftSha256A=$first_hash"
 echo "draftSha256B=$second_hash"
 if [ "$first_hash" != "$second_hash" ]; then
@@ -251,87 +262,36 @@ done
   exit 3
 }
 
-bundle_entries=$(zipinfo -1 "$bundle" | LC_ALL=C sort)
-expected_entries=$(printf '%s\n' compatibility.json extension.json wrapper.apk)
-if [ "$bundle_entries" != "$expected_entries" ]; then
-  echo "SixBundle 항목 계약이 일치하지 않습니다." >&2
+unzip -p "$bundle" extension.json >"$descriptor_work"
+unzip -p "$bundle" compatibility.json >"$after_report_work"
+six_assert_conversion_reports "$report_work" "$after_report_work" || {
+  echo "변환 전후 compatibility 보고서 계약이 일치하지 않습니다." >&2
   exit 3
-fi
-unzip -p "$bundle" extension.json >"$descriptor"
-unzip -p "$bundle" compatibility.json >"$after_report"
-jq -e '
-  .status == "compatible" and .conversionState == "converted" and
-  any(.adapterDecisions[];
-    .id == "desktop-selection-event-bridge" and
-    .disposition == "automatic" and .applied == true) and
-  any(.adapterDecisions[];
-    .id == "action-popup-entry" and
-    .disposition == "requires-approval" and .applied == true) and
-  any(.adapterDecisions[];
-    .id == "storage-fallback" and
-    .disposition == "unavailable" and .applied == false)
-' "$after_report" >/dev/null
+}
+"$cli" verify-build \
+  --bundle "$bundle" \
+  --crx "$crx" \
+  --wrapper "$wrapper"
 
 crx_hash=$(shasum -a 256 "$crx" | awk '{print $1}')
 wrapper_hash=$(shasum -a 256 "$wrapper" | awk '{print $1}')
-bundle_wrapper_hash=$(unzip -p "$bundle" wrapper.apk | shasum -a 256 | awk '{print $1}')
-if [ "$wrapper_hash" != "$bundle_wrapper_hash" ] ||
-  [ "$crx_hash" != "$(jq -er '.crxSha256' "$descriptor")" ] ||
-  [ "$wrapper_hash" != "$(jq -er '.wrapperSha256' "$descriptor")" ]; then
-  echo "SixBundle descriptor와 외부 산출물 hash가 일치하지 않습니다." >&2
-  exit 3
-fi
-if ! zipinfo -1 "$wrapper" | grep -Fx 'assets/extension.crx' >/dev/null; then
-  echo "wrapper APK에 embedded CRX가 없습니다." >&2
-  exit 3
-fi
-embedded_crx_hash=$(unzip -p "$wrapper" assets/extension.crx |
-  shasum -a 256 | awk '{print $1}')
-if [ "$crx_hash" != "$embedded_crx_hash" ]; then
-  echo "wrapper APK의 embedded CRX가 외부 CRX와 다릅니다." >&2
-  exit 3
-fi
-
-sdk_root=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}}
-build_tools=$(find "$sdk_root/build-tools" -mindepth 1 -maxdepth 1 -type d |
-  LC_ALL=C sort | tail -n 1)
-aapt2="$build_tools/aapt2"
-apksigner="$build_tools/apksigner"
-zipalign="$build_tools/zipalign"
-for android_tool in "$aapt2" "$apksigner" "$zipalign"; do
-  [ -x "$android_tool" ] || {
-    echo "Android build-tool을 찾을 수 없습니다: $android_tool" >&2
-    exit 2
-  }
-done
-
-"$apksigner" verify --verbose --print-certs "$wrapper"
-"$zipalign" -c -P 16 4 "$wrapper"
-badging=$("$aapt2" dump badging "$wrapper")
-manifest=$("$aapt2" dump xmltree "$wrapper" --file AndroidManifest.xml)
-wrapper_package=$(jq -er '.wrapperPackage' "$descriptor")
-for contract_marker in \
-  "$wrapper_package" \
-  'extension-id' \
-  'dev.sixbridge.runtime.SixDiscoveryActivity' \
-  'six' \
-  'ex' \
-  "$wrapper_package.contentprovider"; do
-  if ! printf '%s\n%s\n' "$badging" "$manifest" |
-    grep -F "$contract_marker" >/dev/null; then
-    echo "wrapper manifest 계약 표식을 찾을 수 없습니다: $contract_marker" >&2
-    exit 3
-  fi
-done
+wrapper_package=$(jq -er '.wrapperPackage' "$descriptor_work")
 echo "hostContract=true"
 echo "crxSha256=$crx_hash"
 echo "wrapperSha256=$wrapper_hash"
 echo "bundleSha256=$(shasum -a 256 "$bundle" | awk '{print $1}')"
-echo "extensionId=$(jq -er '.extensionId' "$descriptor")"
+echo "extensionId=$(jq -er '.extensionId' "$descriptor_work")"
 echo "wrapperPackage=$wrapper_package"
-echo "wrapperVersionCode=$(jq -er '.wrapperVersionCode' "$descriptor")"
+echo "wrapperVersionCode=$(jq -er '.wrapperVersionCode' "$descriptor_work")"
+echo "patternDecisionChecked=true"
 
-if [ "$host_only" = true ] || [ -z "$serial" ]; then
+six_atomic_publish "$report_work" "$report" "$evidence_dir"
+six_atomic_publish "$first_draft_work" "$first_draft" "$evidence_dir"
+six_atomic_publish "$second_draft_work" "$second_draft" "$evidence_dir"
+six_atomic_publish "$descriptor_work" "$descriptor" "$evidence_dir"
+six_atomic_publish "$after_report_work" "$after_report" "$evidence_dir"
+
+if [ "$host_only" = true ]; then
   echo "deviceChecks=skipped"
   echo "runtimeResult=수동 검증 보류"
   exit 0
@@ -353,28 +313,42 @@ if ! printf '%s\n' "$devices" |
   exit 3
 fi
 
-browser_dump=$(adb -s "$serial" shell dumpsys package com.sec.android.app.sbrowser)
-browser_version=$(printf '%s\n' "$browser_dump" |
-  sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)
-browser_version_code=$(printf '%s\n' "$browser_dump" |
-  sed -n 's/^[[:space:]]*versionCode=\([0-9]*\).*/\1/p' | head -n 1)
-profile_version=$(jq -er '.versionName' "$profile")
+browser_dump_file="$run_dir/browser-dumpsys.txt"
+adb -s "$serial" shell dumpsys package com.sec.android.app.sbrowser \
+  >"$browser_dump_file"
+browser_binding=$(six_browser_binding "$browser_dump_file") || {
+  echo "설치된 삼성 인터넷의 package/version 정보를 정확히 읽을 수 없습니다." >&2
+  exit 3
+}
+profile_binding=$(six_profile_binding "$profile") || {
+  echo "profile의 package/version 계약이 올바르지 않습니다." >&2
+  exit 3
+}
+IFS=$'\t' read -r browser_package browser_version browser_version_code \
+  <<<"$browser_binding"
+IFS=$'\t' read -r profile_package profile_version profile_version_code \
+  <<<"$profile_binding"
+echo "browserPackage=$browser_package"
 echo "browserVersion=$browser_version"
 echo "browserVersionCode=$browser_version_code"
+echo "profilePackage=$profile_package"
 echo "profileVersion=$profile_version"
-if [ "$browser_version" = "$profile_version" ]; then
+echo "profileVersionCode=$profile_version_code"
+if six_profile_matches "$browser_dump_file" "$profile"; then
   echo "profileMatch=true"
+  profile_match=true
 else
   echo "profileMatch=false"
+  profile_match=false
 fi
 
 "$cli" device install --bundle "$bundle" --serial "$serial"
 "$cli" device smoke \
   --bundle "$bundle" \
   --serial "$serial" \
-  --evidence-dir "$evidence_dir"
+  --evidence-dir "$run_dir"
 echo "deviceChecks=passed"
-if [ "$browser_version" = "$profile_version" ]; then
+if [ "$profile_match" = true ]; then
   echo "runtimeResult=사용자 수동 확인 필요"
 else
   echo "runtimeResult=브라우저/profile 불일치로 최종 합격 보류"

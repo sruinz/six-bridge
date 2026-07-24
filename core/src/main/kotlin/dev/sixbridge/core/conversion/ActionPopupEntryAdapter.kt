@@ -150,6 +150,21 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         true
     }.getOrDefault(false)
 
+    @JvmSynthetic
+    internal fun trustedStorageAnalysisExclusions(
+        workingRoot: Path,
+        manifest: JsonObject,
+    ): Set<String> {
+        val popupPath = (manifest[ACTION] as? JsonObject)
+            ?.stringOrNull(DEFAULT_POPUP)
+            ?: return emptySet()
+        return if (isExactlyApplied(workingRoot, manifest, popupPath)) {
+            setOf(CONTENT_RELATIVE_PATH)
+        } else {
+            emptySet()
+        }
+    }
+
     private fun hasExactBytes(path: Path, expected: ByteArray): Boolean =
         Files.isRegularFile(path, NOFOLLOW_LINKS) &&
             Files.readAllBytes(path).contentEquals(expected)

@@ -120,7 +120,7 @@ Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷�
 
 ### Host-side 결과
 
-2026-07-25 03:11 KST에 실제 개발 source를 범용 변환 pipeline에 입력했다.
+2026-07-25 03:44 KST에 실제 개발 source를 범용 변환 pipeline에 입력했다.
 확장 ID·이름을 조건으로 한 별도 변환 분기는 사용하지 않았다.
 
 변환 전 decision은 다음과 같았다.
@@ -140,8 +140,14 @@ Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷�
 잘못 판정하는 pipeline 결함이 발견됐다. 회귀 테스트를 먼저 추가한 뒤,
 변환 전에도 없고 적용 proof에도 없는 decision만 새 계획으로 차단하도록
 수정했다. 기존 미선택 decision은 위험도, disposition, 적용 상태, 원본
-evidence, 변경·제한 의미를 보존하며, 실제로 새 decision이 생기는 경우의
-fail-closed 동작은 별도 테스트로 유지했다.
+evidence, 변경·제한을 객체 전체 비교로 보존한다. evidence 추가·삭제·변경,
+중복 identity, 실제 새 decision은 모두 별도 테스트로 fail-closed를
+확인했다.
+
+popup 어댑터의 정확한 bytes와 wiring이 증명된 생성 content asset만 storage
+위험 분석에서 제외했다. 이 생성 asset은 안전한 storage fallback을
+오염시키지 않지만, 같은 원본 runtime closure의 별도 `eval` 등 위험 신호는
+계속 `unavailable`로 차단한다.
 
 두 SixDraft는 strict reader 검증을 통과했고 SHA-256이 모두
 `56dc38969c43869732a82a78c640e86084c7cfa332a4c98be041e7d0e474f722`로
@@ -156,13 +162,14 @@ fail-closed 동작은 별도 테스트로 유지했다.
 |---|---|
 | 변환 extension ID | `dncifaeoabkkmddoeeccpjdkifeoemfd` |
 | wrapper package | `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` |
-| wrapper versionCode | `3` |
+| wrapper versionCode | `7` |
 | CRX SHA-256 | `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f` |
-| wrapper SHA-256 | `446960fe2d9ccac781e7a9d4cc42a1b90da81a800935a7233bcdea8fbaa43feb` |
-| SixBundle SHA-256 | `a097c8fa519d02f74b46066db435ae78b3edd0583f27e109929fcca8636b5fa4` |
+| wrapper SHA-256 | `32ca0e42d04ab1ab38cb6dbde020d6110e70f59b95be4e9462d4bfc1eb3af694` |
+| SixBundle SHA-256 | `530fd41c0413d13bb1be5cf08a15579c836f854bdf7703e917a7e610e5e10f39` |
 
-CRX3 magic, SixBundle 항목·descriptor hash, wrapper embedded CRX, APK v3
-서명, zipalign, metadata·Activity·Provider 계약을 모두 검사했다.
+공용 `verify-build`로 외부 CRX·wrapper와 SixBundle bytes, CRX ID·hash,
+wrapper package·versionCode·signer, embedded CRX, APK v3 서명, zipalign,
+metadata·Activity·Provider 구조화 manifest 계약을 모두 검사했다.
 
 실제 source repository에는 실행 전부터 다음 사용자 상태가 있었다.
 
@@ -186,8 +193,9 @@ relative-path/content tree SHA-256은 실행 전후 모두
 - ContentProvider CRX3 stream: 성공
 
 증거는
-`.local/evidence/20260725-031118-smart-context-converted.log`와
-`.local/evidence/1784916691-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에 있다.
+`.local/evidence/20260725-034404-smart-context-converted.log.YJ6n5Q`와
+`.local/evidence/.smart-context-run.STpnzC/1784918658-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
+있다.
 
 ### Runtime 보류 결과
 

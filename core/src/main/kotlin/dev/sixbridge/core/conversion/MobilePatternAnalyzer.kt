@@ -77,7 +77,7 @@ class MobilePatternAnalyzer(
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
         popupDecision(manifestPath, manifest, index, profile)?.let(decisions::add)
-        val storage = storageDecision(extensionRoot, index, profile)
+        val storage = storageDecision(extensionRoot, manifest, index, profile)
         storage.decision?.let(decisions::add)
         if (storage.unknown) {
             issues += CompatibilityIssue(
@@ -210,6 +210,7 @@ class MobilePatternAnalyzer(
 
     private fun storageDecision(
         extensionRoot: Path,
+        manifest: JsonObject,
         index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): StorageDecision {
@@ -217,9 +218,11 @@ class MobilePatternAnalyzer(
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
         val convertedSources = mutableMapOf<String, String>()
-        val inspected = index.scripts.map { script ->
-            script to rewriter.inspect(script.source)
-        }
+        val trustedExclusions = ActionPopupEntryAdapter()
+            .trustedStorageAnalysisExclusions(extensionRoot, manifest)
+        val inspected = index.scripts
+            .filterNot { it.relativePath in trustedExclusions }
+            .map { script -> script to rewriter.inspect(script.source) }
         if (inspected.none { (_, inspection) -> inspection.storageIntent }) {
             return StorageDecision()
         }

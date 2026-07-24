@@ -249,57 +249,11 @@ class ConversionPipeline private constructor(
         check(applied.all(AdapterDecision::applied)) {
             "sealed adapter application proof가 완전하지 않습니다."
         }
-        val selectedKeys = applied.mapTo(mutableSetOf()) { it.id to it.version }
-        val beforeByKey = beforeDecisions.associateBy { it.id to it.version }
-        requireNoNewAdapterDecisions(
+        val decisions = reconcileAdapterDecisions(
             beforeDecisions,
             applied,
             rawAfter.adapterDecisions,
         )
-        val reapplied = rawAfter.adapterDecisions
-            .associateBy { it.id to it.version }
-        val appliedDecisions = applied.map { decision ->
-            val current = reapplied[decision.id to decision.version]
-            if (current != null) {
-                if (!current.applied ||
-                    current.risk != decision.risk ||
-                    current.disposition != decision.disposition ||
-                    current.changes != decision.changes ||
-                    current.remainingLimitations != decision.remainingLimitations
-                ) {
-                    throw ConversionValidationException(
-                        "변환본 재분석의 adapter 근거가 원본 계획과 다릅니다: " +
-                            "${decision.id}; raw=$current; proof=$decision",
-                    )
-                }
-                current
-            } else {
-                decision
-            }
-        }
-        val preservedDecisions = (beforeByKey.keys - selectedKeys).map { key ->
-            val before = beforeByKey.getValue(key)
-            val current = reapplied[key]
-                ?: throw ConversionValidationException(
-                    "변환본 재분석에서 미선택 adapter 근거가 사라졌습니다: ${before.id}",
-                )
-            if (current.id != before.id ||
-                current.version != before.version ||
-                current.risk != before.risk ||
-                current.disposition != before.disposition ||
-                current.applied != before.applied ||
-                !current.evidence.containsAll(before.evidence) ||
-                current.changes != before.changes ||
-                current.remainingLimitations != before.remainingLimitations
-            ) {
-                throw ConversionValidationException(
-                    "변환본 재분석에서 미선택 adapter 근거가 달라졌습니다: ${before.id}",
-                )
-            }
-            before
-        }
-        val decisions = (appliedDecisions + preservedDecisions)
-            .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
         return rawAfter.copy(
             conversionState = ConversionState.CONVERTED,
             adapterDecisions = decisions,
@@ -370,13 +324,27 @@ class ConversionPipeline private constructor(
     }
 }
 
-internal fun requireNoNewAdapterDecisions(
+internal fun reconcileAdapterDecisions(
     beforeDecisions: List<AdapterDecision>,
     appliedDecisions: List<AdapterDecision>,
     rawAfterDecisions: List<AdapterDecision>,
-) {
-    val allowedKeys = (beforeDecisions + appliedDecisions)
-        .mapTo(mutableSetOf()) { it.id to it.version }
+): List<AdapterDecision> {
+    val beforeByKey = beforeDecisions.associateBy { it.id to it.version }
+    if (beforeByKey.size != beforeDecisions.size) {
+        throw ConversionValidationException(
+            "변환 전 adapter 계획에 중복 identity가 있습니다.",
+        )
+    }
+    val appliedKeys = appliedDecisions.mapTo(mutableSetOf()) { it.id to it.version }
+    if (appliedKeys.size != appliedDecisions.size ||
+        appliedDecisions.any { !it.applied } ||
+        appliedKeys.any { it !in beforeByKey }
+    ) {
+        throw ConversionValidationException(
+            "sealed adapter application proof가 변환 전 계획과 일치하지 않습니다.",
+        )
+    }
+    val allowedKeys = beforeByKey.keys + appliedKeys
     val newDecisions = rawAfterDecisions.filter {
         (it.id to it.version) !in allowedKeys
     }
@@ -386,6 +354,46 @@ internal fun requireNoNewAdapterDecisions(
                 newDecisions.map { it.id }.sorted(),
         )
     }
+    val rawByKey = rawAfterDecisions.associateBy { it.id to it.version }
+    if (rawByKey.size != rawAfterDecisions.size) {
+        throw ConversionValidationException(
+            "변환본 재분석에 중복 adapter identity가 있습니다.",
+        )
+    }
+    val verifiedApplied = appliedDecisions.map { decision ->
+        val current = rawByKey[decision.id to decision.version]
+        if (current != null) {
+            if (!current.applied ||
+                current.risk != decision.risk ||
+                current.disposition != decision.disposition ||
+                current.changes != decision.changes ||
+                current.remainingLimitations != decision.remainingLimitations
+            ) {
+                throw ConversionValidationException(
+                    "변환본 재분석의 adapter 근거가 원본 계획과 다릅니다: " +
+                        "${decision.id}; raw=$current; proof=$decision",
+                )
+            }
+            current
+        } else {
+            decision
+        }
+    }
+    val preserved = (beforeByKey.keys - appliedKeys).map { key ->
+        val before = beforeByKey.getValue(key)
+        val current = rawByKey[key]
+            ?: throw ConversionValidationException(
+                "변환본 재분석에서 미선택 adapter 근거가 사라졌습니다: ${before.id}",
+            )
+        if (current != before) {
+            throw ConversionValidationException(
+                "변환본 재분석에서 미선택 adapter 근거가 달라졌습니다: ${before.id}",
+            )
+        }
+        current
+    }
+    return (verifiedApplied + preserved)
+        .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
 }
 
 class ConversionPipelineResult private constructor(

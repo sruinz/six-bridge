@@ -20,6 +20,7 @@ import kotlin.io.path.readLines
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -179,8 +180,11 @@ class AdbDeviceClientTest {
                 packed.bytes,
                 ContractVariant.DISCOVERY_EXPORTED,
             ),
+            ContractCase("discovery-class", packed.bytes, ContractVariant.DISCOVERY_CLASS),
             ContractCase("provider-authority", packed.bytes, ContractVariant.PROVIDER_AUTHORITY),
             ContractCase("provider-exported", packed.bytes, ContractVariant.PROVIDER_EXPORTED),
+            ContractCase("provider-class", packed.bytes, ContractVariant.PROVIDER_CLASS),
+            ContractCase("v2-only-signature", packed.bytes, ContractVariant.V2_ONLY),
         )
         val fixture = adbFixture()
 
@@ -211,6 +215,62 @@ class AdbDeviceClientTest {
             }
         }
         assertFalse(Files.exists(fixture.log))
+    }
+
+    @Test
+    fun `verify build binds the external CRX wrapper and strict SixBundle`() {
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 build 계약 검증 테스트를 실행할 수 없습니다.")
+        val source = Files.createTempDirectory("six-verify-build-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Build verify","version":"1"}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA")
+                .apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val localRoot = Files.createTempDirectory("six-verify-build-local")
+        val wrapperPath = Files.createTempFile("six-verify-build", ".apk")
+        val wrapper = WrapperApkBuilder(sdk, localRoot).build(
+            WrapperBuildRequest(
+                packed.extensionId,
+                "Build verify",
+                packed.bytes,
+                wrapperPath,
+            ),
+        )
+        val descriptor = ExtensionDescriptor(
+            extensionId = packed.extensionId,
+            name = "Build verify",
+            version = "1",
+            sourceKind = "SOURCE_DIRECTORY",
+            crxSha256 = sha256(packed.bytes),
+            wrapperSha256 = sha256(wrapperPath.toFile().readBytes()),
+            wrapperPackage = wrapper.packageName,
+            wrapperVersionCode = wrapper.versionCode,
+            signerSha256 = wrapper.signerSha256,
+        )
+        val bundle = bundle(wrapperPath, descriptor)
+        val crx = Files.createTempFile("six-verify-build", ".crx")
+            .also { it.writeBytes(packed.bytes) }
+
+        val result = BuildArtifactVerifier().verify(bundle, crx, wrapperPath)
+
+        assertEquals(packed.extensionId, result.extensionId)
+        assertEquals(wrapper.packageName, result.wrapperPackage)
+
+        val wrongCrx = Files.createTempFile("six-verify-build-wrong", ".crx")
+            .also { it.writeBytes(packed.bytes + 1) }
+        assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(bundle, wrongCrx, wrapperPath)
+        }
+        val wrongWrapper = Files.createTempFile("six-verify-build-wrong", ".apk")
+            .also { it.writeBytes(wrapperPath.toFile().readBytes() + 1) }
+        assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(bundle, crx, wrongWrapper)
+        }
     }
 
     private fun adbFixture(): AdbFixture {
@@ -318,12 +378,22 @@ class AdbDeviceClientTest {
                 },
                 discoveryHost = if (variant == ContractVariant.DISCOVERY_URI) "wrong" else "ex",
                 discoveryExported = variant != ContractVariant.DISCOVERY_EXPORTED,
+                discoveryClass = if (variant == ContractVariant.DISCOVERY_CLASS) {
+                    "dev.sixbridge.runtime.WrongActivity"
+                } else {
+                    "dev.sixbridge.runtime.SixDiscoveryActivity"
+                },
                 providerAuthority = if (variant == ContractVariant.PROVIDER_AUTHORITY) {
                     "$packageName.wrong"
                 } else {
                     "$packageName.contentprovider"
                 },
                 providerExported = variant != ContractVariant.PROVIDER_EXPORTED,
+                providerClass = if (variant == ContractVariant.PROVIDER_CLASS) {
+                    "dev.sixbridge.runtime.WrongProvider"
+                } else {
+                    "dev.sixbridge.runtime.ExtensionProvider"
+                },
             ),
         )
         val base = work.resolve("base.apk")
@@ -394,6 +464,8 @@ class AdbDeviceClientTest {
                 "sixbridge",
                 "--ks-pass",
                 "file:${localRoot.resolve("keystore/wrapper.pass")}",
+                "--v3-signing-enabled",
+                (variant != ContractVariant.V2_ONLY).toString(),
                 "--out",
                 output.toString(),
                 aligned.toString(),
@@ -407,8 +479,10 @@ class AdbDeviceClientTest {
         metadataId: String,
         discoveryHost: String,
         discoveryExported: Boolean,
+        discoveryClass: String,
         providerAuthority: String,
         providerExported: Boolean,
+        providerClass: String,
     ) = """
         <?xml version="1.0" encoding="utf-8"?>
         <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -419,7 +493,7 @@ class AdbDeviceClientTest {
             <application android:label="Contract wrapper">
                 <meta-data android:name="extension-id" android:value="$metadataId" />
                 <activity
-                    android:name="dev.sixbridge.runtime.SixDiscoveryActivity"
+                    android:name="$discoveryClass"
                     android:exported="$discoveryExported">
                     <intent-filter>
                         <action android:name="android.intent.action.VIEW" />
@@ -429,7 +503,7 @@ class AdbDeviceClientTest {
                     </intent-filter>
                 </activity>
                 <provider
-                    android:name="dev.sixbridge.runtime.ExtensionProvider"
+                    android:name="$providerClass"
                     android:authorities="$providerAuthority"
                     android:exported="$providerExported" />
             </application>
@@ -457,7 +531,10 @@ class AdbDeviceClientTest {
         METADATA,
         DISCOVERY_URI,
         DISCOVERY_EXPORTED,
+        DISCOVERY_CLASS,
         PROVIDER_AUTHORITY,
         PROVIDER_EXPORTED,
+        PROVIDER_CLASS,
+        V2_ONLY,
     }
 }

@@ -59,27 +59,36 @@ Fold7 install/smoke를 연속 실행한다.
   --serial 'adb-DEVICE_SERIAL._adb-tls-connect._tcp'
 ```
 
-기기 없이 host 결과만 만들 때는 `--host-only`를 사용한다. 다른 source나
-profile은 각각 `--source`, `--profile`로 지정한다. 스크립트는 실행 전에
-`.local/evidence`와 `dist`를 만들고 다음을 검사한다.
+기기 없이 host 결과만 만들 때는 `--host-only`를 사용한다. `--host-only`가
+아니면 비어 있지 않은 `--serial`이 필수이며 둘을 함께 지정할 수 없다. 다른
+source나 profile은 각각 `--source`, `--profile`로 지정한다. 스크립트는
+실행 전에 `.local`, `.local/evidence`, `dist`가 symlink가 아닌 예상 실제
+parent의 디렉터리인지 확인하고 다음을 검사한다.
 
 - 변환 전 adapter decision
 - 같은 입력으로 만든 SixDraft 두 개의 strict 검증과 SHA-256 일치
 - `smart-context-converted.crx`,
   `smart-context-converted-wrapper.apk`,
   `smart-context-converted.six` basename 계약
-- CRX3 magic, SixBundle 항목·hash, wrapper embedded CRX
-- APK v3 서명, zipalign, metadata·Activity·Provider manifest 계약
-- 변환 후 selection·popup adapter 적용과 미적용 storage 제한 보존
+- `verify-build`를 통한 CRX3 ID·hash, SixBundle 외부 산출물 결합, wrapper
+  embedded CRX·package·versionCode·signer 검증
+- APK v3 서명, zipalign, metadata·Activity·Provider 구조화 manifest 계약
+- 변환 후 정확한 세 adapter의 version과 selection·popup 적용 상태,
+  미적용 storage decision 전체 객체 보존
+- 설치 package, `versionName`, 숫자 `versionCode`와 profile의 정확한 일치
 - 실제 source의 `git status --short`와 relative-path/content tree hash가
   실행 전후 같은지 여부
 
-2026-07-25 03:11 KST 자동 검증 증거는 다음과 같다.
+임시 보고서와 draft는 예측 불가능한 이름으로 만들고 검사가 끝난 뒤
+`evidence` 디렉터리 안에서 고정 이름으로 원자적으로 게시한다. device smoke도
+공유 evidence root가 아니라 실행마다 새로 만든 run 디렉터리를 사용한다.
+
+2026-07-25 03:44 KST 최종 자동 검증 증거는 다음과 같다.
 
 - 전체 실행:
-  `.local/evidence/20260725-031118-smart-context-converted.log`
+  `.local/evidence/20260725-034404-smart-context-converted.log.YJ6n5Q`
 - device smoke:
-  `.local/evidence/1784916691-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
+  `.local/evidence/.smart-context-run.STpnzC/1784918658-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
 - 변환 전후 report:
   `.local/evidence/smart-context-before.json`,
   `.local/evidence/smart-context-after.json`
@@ -88,9 +97,10 @@ profile은 각각 `--source`, `--profile`로 지정한다. 스크립트는 실�
   `.local/evidence/smart-context-b.sixdraft`
 
 이 실행에서 APK 설치, `six://ex` discovery, ContentProvider `Cr24` read는
-통과했다. 그러나 Fold7의 삼성 인터넷은 `30.0.0.67`
-(`versionCode 1300067502`)이고 적용 profile은 `30.0.2.61`이므로 runtime
-최종 합격으로 간주하지 않는다.
+통과했다. 최종 wrapper `versionCode`는 `7`이다. 그러나 Fold7의 삼성
+인터넷 package는 `com.sec.android.app.sbrowser`로 일치하는 반면 버전은
+`30.0.0.67` (`versionCode 1300067502`)이고 적용 profile은 `30.0.2.61`
+(`versionCode 1300261502`)이므로 runtime 최종 합격으로 간주하지 않는다.
 
 정확히 일치하는 profile을 확보한 뒤 다음 항목은 사용자가 직접 확인해야 한다.
 
