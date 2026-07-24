@@ -14,11 +14,13 @@ import kotlinx.serialization.json.long
 object BrowserProfileJson {
     private val json = Json { prettyPrint = true }
 
-    fun encode(profile: BrowserProfile): String = json.encodeToString(
-        JsonObject.serializer(),
-        JsonObject(
-            linkedMapOf(
-                "schemaVersion" to JsonPrimitive(1),
+    fun encode(profile: BrowserProfile): String {
+        profile.validate()
+        return json.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(
+                linkedMapOf(
+                    "schemaVersion" to JsonPrimitive(2),
                 "browserPackage" to JsonPrimitive(profile.browserPackage),
                 "versionName" to JsonPrimitive(profile.versionName),
                 "versionCode" to JsonPrimitive(profile.versionCode),
@@ -49,17 +51,25 @@ object BrowserProfileJson {
                 "sourceApkSignerSha256" to JsonPrimitive(
                     profile.sourceApkSignerSha256,
                 ),
-                "profileDifferences" to JsonArray(
-                    profile.profileDifferences.map(::JsonPrimitive),
+                    "profileDifferences" to JsonArray(
+                        profile.profileDifferences.map(::JsonPrimitive),
+                    ),
+                    "supportedFeatures" to JsonArray(
+                        profile.supportedFeatures.sorted().map(::JsonPrimitive),
+                    ),
+                    "unavailableFeatures" to JsonArray(
+                        profile.unavailableFeatures.sorted().map(::JsonPrimitive),
+                    ),
+                    "support" to JsonPrimitive(profile.support.name.lowercase()),
                 ),
-                "support" to JsonPrimitive(profile.support.name.lowercase()),
             ),
-        ),
-    )
+        )
+    }
 
     fun decode(value: String): BrowserProfile {
         val root = json.parseToJsonElement(value).jsonObject
-        require(root.getValue("schemaVersion").jsonPrimitive.int == 1) {
+        val schemaVersion = root.getValue("schemaVersion").jsonPrimitive.int
+        require(schemaVersion in 1..2) {
             "지원하지 않는 browser profile schemaVersion입니다."
         }
         val contract = root.getValue("wrapperContract").jsonObject
@@ -93,7 +103,17 @@ object BrowserProfileJson {
                 ?.jsonArray
                 ?.map { it.jsonPrimitive.content }
                 .orEmpty(),
-        )
+            supportedFeatures = if (schemaVersion == 1) {
+                emptySet()
+            } else {
+                root.stringSet("supportedFeatures")
+            },
+            unavailableFeatures = if (schemaVersion == 1) {
+                emptySet()
+            } else {
+                root.stringSet("unavailableFeatures")
+            },
+        ).also(BrowserProfile::validate)
     }
 
     private fun JsonObject.string(name: String): String =
@@ -101,4 +121,7 @@ object BrowserProfileJson {
 
     private fun JsonObject.boolean(name: String): Boolean =
         getValue(name).jsonPrimitive.boolean
+
+    private fun JsonObject.stringSet(name: String): Set<String> =
+        getValue(name).jsonArray.map { it.jsonPrimitive.content }.toSet()
 }

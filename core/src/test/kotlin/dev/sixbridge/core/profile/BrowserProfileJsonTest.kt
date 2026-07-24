@@ -2,6 +2,7 @@ package dev.sixbridge.core.profile
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class BrowserProfileJsonTest {
@@ -78,4 +79,34 @@ class BrowserProfileJsonTest {
         assertEquals(ProfileSupport.SUPPORTED, profile.support)
         assertTrue("\"detectedApis\"" in BrowserProfileJson.encode(profile))
     }
+
+    @Test
+    fun `profile v2 preserves verified feature evidence`() {
+        val profile = baseline().copy(
+            supportedFeatures = setOf("storage.local"),
+            unavailableFeatures = setOf("storage.sync"),
+        )
+
+        assertEquals(profile, BrowserProfileJson.decode(BrowserProfileJson.encode(profile)))
+    }
+
+    @Test
+    fun `profile rejects conflicting feature evidence`() {
+        assertFailsWith<IllegalArgumentException> {
+            baseline().copy(
+                supportedFeatures = setOf("storage.sync"),
+                unavailableFeatures = setOf("storage.sync"),
+            ).validate()
+        }
+    }
+
+    private fun baseline() = BrowserProfile(
+        browserPackage = "com.sec.android.app.sbrowser",
+        versionName = "30.0.2.61",
+        versionCode = 1_300_261_502,
+        majorVersion = 30,
+        supportedApis = setOf("storage", "tabs"),
+        wrapperContract = WrapperContract.complete(),
+        sourceApkSha256 = "abc123",
+    )
 }

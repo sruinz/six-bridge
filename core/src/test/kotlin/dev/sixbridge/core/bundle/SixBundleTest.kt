@@ -2,6 +2,11 @@ package dev.sixbridge.core.bundle
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.AdapterDecision
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.SourceEvidence
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.zip.ZipEntry
@@ -13,6 +18,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class SixBundleTest {
     @Test
@@ -40,6 +46,23 @@ class SixBundleTest {
             usedApis = setOf("storage"),
             unsupportedApis = emptySet(),
             issues = emptyList(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+            adapterDecisions = listOf(
+                AdapterDecision(
+                    id = "popup-fallback",
+                    version = 2,
+                    risk = AdapterRisk.BEHAVIOR_CHANGE,
+                    disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                    applied = false,
+                    evidence = listOf(
+                        SourceEvidence("popup.js", 4, "action popup"),
+                    ),
+                    changes = listOf("manifest.json"),
+                    remainingLimitations = listOf("popup rendering differs"),
+                ),
+            ),
+            originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
+            convertedExtensionId = "ponmlkjihgfedcbaponmlkjihgfedcba",
         )
 
         SixBundle.write(output, wrapper, descriptor, compatibility)
@@ -54,6 +77,96 @@ class SixBundleTest {
             assertNotNull(zip.getEntry("compatibility.json"))
             assertEquals(3, zip.size())
         }
+    }
+
+    @Test
+    fun `encodes conversion decisions in deterministic order`() {
+        val compatibility = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Tiny",
+            extensionVersion = "1.0.0",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+            adapterDecisions = listOf(
+                AdapterDecision(
+                    id = "zeta",
+                    version = 1,
+                    risk = AdapterRisk.SAFE,
+                    disposition = AdapterDisposition.AUTOMATIC,
+                    applied = false,
+                    evidence = listOf(
+                        SourceEvidence("z.js", 9, "second"),
+                        SourceEvidence("a.js", 2, "first"),
+                    ),
+                    changes = listOf("z.js", "a.js"),
+                    remainingLimitations = emptyList(),
+                ),
+                AdapterDecision(
+                    id = "alpha",
+                    version = 2,
+                    risk = AdapterRisk.BEHAVIOR_CHANGE,
+                    disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                    applied = false,
+                    evidence = emptyList(),
+                    changes = emptyList(),
+                    remainingLimitations = emptyList(),
+                ),
+            ),
+        )
+
+        val encoded = SixBundle.encodeCompatibility(compatibility)
+        val changesIndex = encoded.indexOf("\"changes\"")
+
+        assertTrue(encoded.indexOf("\"id\": \"alpha\"") < encoded.indexOf("\"id\": \"zeta\""))
+        assertTrue(encoded.indexOf("\"relativePath\": \"a.js\"") < encoded.indexOf("\"relativePath\": \"z.js\""))
+        assertTrue(encoded.indexOf("\"a.js\"", changesIndex) < encoded.indexOf("\"z.js\"", changesIndex))
+        assertTrue("\"conversionState\": \"requires-approval\"" in encoded)
+    }
+
+    @Test
+    fun `reads schema v1 compatibility with passthrough defaults`() {
+        val bundle = validBundle()
+        rewrite(bundle) { name, bytes ->
+            if (name == "compatibility.json") legacyCompatibilityJson().toByteArray() else bytes
+        }
+
+        val compatibility = SixBundle.read(bundle).compatibility
+
+        assertEquals(ConversionState.PASSTHROUGH, compatibility.conversionState)
+        assertEquals(emptyList(), compatibility.adapterDecisions)
+        assertEquals(null, compatibility.originalExtensionId)
+        assertEquals(null, compatibility.convertedExtensionId)
+    }
+
+    @Test
+    fun `rejects duplicate adapter decision identities`() {
+        val decision = AdapterDecision(
+            id = "popup-fallback",
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.AUTOMATIC,
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = emptyList(),
+        )
+        val compatibility = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Tiny",
+            extensionVersion = "1.0.0",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            adapterDecisions = listOf(decision, decision),
+        )
+
+        assertFailsWith<IllegalArgumentException> { compatibility.validate() }
     }
 
     @Test
@@ -171,6 +284,23 @@ class SixBundleTest {
             }
         }
     }
+
+    private fun legacyCompatibilityJson() =
+        """
+        {
+          "schemaVersion": 1,
+          "status": "compatible",
+          "manifestVersion": 3,
+          "extensionName": "Tiny",
+          "extensionVersion": "1.0.0",
+          "manifestKeyPresent": false,
+          "manifestKeyExtensionId": null,
+          "declaredPermissions": [],
+          "usedApis": [],
+          "unsupportedApis": [],
+          "issues": []
+        }
+        """.trimIndent()
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256")

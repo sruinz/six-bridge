@@ -35,6 +35,8 @@ data class BrowserProfile(
     val sourceApkSha256: String = "",
     val sourceApkSignerSha256: String = "",
     val profileDifferences: List<String> = emptyList(),
+    val supportedFeatures: Set<String> = emptySet(),
+    val unavailableFeatures: Set<String> = emptySet(),
 ) {
     val isSupportedBaseline: Boolean
         get() = majorVersion == SUPPORTED_MAJOR_VERSION &&
@@ -48,6 +50,12 @@ data class BrowserProfile(
 
     val support: ProfileSupport
         get() = if (isSupportedBaseline) ProfileSupport.SUPPORTED else ProfileSupport.UNKNOWN
+
+    fun validate() {
+        require((supportedFeatures intersect unavailableFeatures).isEmpty()) {
+            "지원 기능과 미지원 기능 증거는 겹칠 수 없습니다."
+        }
+    }
 
     companion object {
         const val SUPPORTED_MAJOR_VERSION = 30

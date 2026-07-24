@@ -3,6 +3,11 @@ package dev.sixbridge.core.bundle
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.AdapterDecision
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.SourceEvidence
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -117,11 +122,13 @@ object SixBundle {
         ),
     )
 
-    fun encodeCompatibility(value: CompatibilityReport): String = json.encodeToString(
-        JsonObject.serializer(),
-        JsonObject(
-            linkedMapOf(
-                "schemaVersion" to JsonPrimitive(1),
+    fun encodeCompatibility(value: CompatibilityReport): String {
+        value.validate()
+        return json.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(
+                linkedMapOf(
+                    "schemaVersion" to JsonPrimitive(COMPATIBILITY_SCHEMA_VERSION),
                 "status" to JsonPrimitive(value.status.name.lowercase()),
                 "manifestVersion" to (
                     value.manifestVersion?.let(::JsonPrimitive) ?: kotlinx.serialization.json.JsonNull
@@ -140,24 +147,39 @@ object SixBundle {
                 "declaredPermissions" to stringArray(value.declaredPermissions),
                 "usedApis" to stringArray(value.usedApis),
                 "unsupportedApis" to stringArray(value.unsupportedApis),
-                "issues" to JsonArray(
-                    value.issues.map { issue ->
-                        JsonObject(
-                            linkedMapOf(
-                                "code" to JsonPrimitive(issue.code),
-                                "message" to JsonPrimitive(issue.message),
-                                "blocking" to JsonPrimitive(issue.blocking),
-                            ),
-                        )
-                    },
+                    "issues" to JsonArray(
+                        value.issues.map { issue ->
+                            JsonObject(
+                                linkedMapOf(
+                                    "code" to JsonPrimitive(issue.code),
+                                    "message" to JsonPrimitive(issue.message),
+                                    "blocking" to JsonPrimitive(issue.blocking),
+                                ),
+                            )
+                        },
+                    ),
+                    "conversionState" to JsonPrimitive(value.conversionState.jsonValue()),
+                    "adapterDecisions" to JsonArray(
+                        value.adapterDecisions
+                            .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
+                            .map(::encodeAdapterDecision),
+                    ),
+                    "originalExtensionId" to (
+                        value.originalExtensionId?.let(::JsonPrimitive)
+                            ?: kotlinx.serialization.json.JsonNull
+                        ),
+                    "convertedExtensionId" to (
+                        value.convertedExtensionId?.let(::JsonPrimitive)
+                            ?: kotlinx.serialization.json.JsonNull
+                        ),
                 ),
             ),
-        ),
-    )
+        )
+    }
 
     private fun decodeExtension(value: String): ExtensionDescriptor {
         val objectValue = json.parseToJsonElement(value).jsonObject
-        require(objectValue.requiredInt("schemaVersion") == SCHEMA_VERSION) {
+        require(objectValue.requiredInt("schemaVersion") == EXTENSION_SCHEMA_VERSION) {
             "지원하지 않는 extension.json schemaVersion입니다."
         }
         val descriptor = ExtensionDescriptor(
@@ -193,7 +215,8 @@ object SixBundle {
 
     private fun decodeCompatibility(value: String): CompatibilityReport {
         val objectValue = json.parseToJsonElement(value).jsonObject
-        require(objectValue.requiredInt("schemaVersion") == SCHEMA_VERSION) {
+        val schemaVersion = objectValue.requiredInt("schemaVersion")
+        require(schemaVersion in 1..COMPATIBILITY_SCHEMA_VERSION) {
             "지원하지 않는 compatibility.json schemaVersion입니다."
         }
         return CompatibilityReport(
@@ -231,6 +254,80 @@ object SixBundle {
                     blocking = issue.getValue("blocking").jsonPrimitive.boolean,
                 )
             },
+            conversionState = if (schemaVersion == 1) {
+                ConversionState.PASSTHROUGH
+            } else {
+                conversionStateFromJson(objectValue.requiredString("conversionState"))
+            },
+            adapterDecisions = if (schemaVersion == 1) {
+                emptyList()
+            } else {
+                objectValue.getValue("adapterDecisions").jsonArray.map(::decodeAdapterDecision)
+            },
+            originalExtensionId = if (schemaVersion == 1) {
+                null
+            } else {
+                objectValue.nullableString("originalExtensionId")
+            },
+            convertedExtensionId = if (schemaVersion == 1) {
+                null
+            } else {
+                objectValue.nullableString("convertedExtensionId")
+            },
+        ).also(CompatibilityReport::validate)
+    }
+
+    private fun encodeAdapterDecision(value: AdapterDecision) = JsonObject(
+        linkedMapOf(
+            "id" to JsonPrimitive(value.id),
+            "version" to JsonPrimitive(value.version),
+            "risk" to JsonPrimitive(value.risk.jsonValue()),
+            "disposition" to JsonPrimitive(value.disposition.jsonValue()),
+            "applied" to JsonPrimitive(value.applied),
+            "evidence" to JsonArray(
+                value.evidence
+                    .sortedWith(
+                        compareBy(SourceEvidence::relativePath, SourceEvidence::line)
+                            .thenBy(SourceEvidence::detail),
+                    )
+                    .map { evidence ->
+                        JsonObject(
+                            linkedMapOf(
+                                "relativePath" to JsonPrimitive(evidence.relativePath),
+                                "line" to (
+                                    evidence.line?.let(::JsonPrimitive)
+                                        ?: kotlinx.serialization.json.JsonNull
+                                    ),
+                                "detail" to JsonPrimitive(evidence.detail),
+                            ),
+                        )
+                    },
+            ),
+            "changes" to JsonArray(value.changes.sorted().map(::JsonPrimitive)),
+            "remainingLimitations" to JsonArray(
+                value.remainingLimitations.sorted().map(::JsonPrimitive),
+            ),
+        ),
+    )
+
+    private fun decodeAdapterDecision(element: kotlinx.serialization.json.JsonElement): AdapterDecision {
+        val value = element.jsonObject
+        return AdapterDecision(
+            id = value.requiredString("id"),
+            version = value.requiredInt("version"),
+            risk = adapterRiskFromJson(value.requiredString("risk")),
+            disposition = adapterDispositionFromJson(value.requiredString("disposition")),
+            applied = value.getValue("applied").jsonPrimitive.boolean,
+            evidence = value.getValue("evidence").jsonArray.map { element ->
+                val evidence = element.jsonObject
+                SourceEvidence(
+                    relativePath = evidence.requiredString("relativePath"),
+                    line = evidence["line"]?.jsonPrimitive?.content?.toIntOrNull(),
+                    detail = evidence.requiredString("detail"),
+                )
+            },
+            changes = value.stringList("changes"),
+            remainingLimitations = value.stringList("remainingLimitations"),
         )
     }
 
@@ -247,6 +344,12 @@ object SixBundle {
 
     private fun JsonObject.stringSet(name: String): Set<String> =
         getValue(name).jsonArray.map { it.jsonPrimitive.content }.toSet()
+
+    private fun JsonObject.stringList(name: String): List<String> =
+        getValue(name).jsonArray.map { it.jsonPrimitive.content }
+
+    private fun JsonObject.nullableString(name: String): String? =
+        getValue(name).jsonPrimitive.content.takeUnless { it == "null" }
 
     private fun stringArray(values: Set<String>) =
         JsonArray(values.sorted().map(::JsonPrimitive))
@@ -281,7 +384,23 @@ object SixBundle {
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
-    private const val SCHEMA_VERSION = 1
+    private fun Enum<*>.jsonValue(): String = name.lowercase().replace('_', '-')
+
+    private inline fun <reified T> enumFromJson(value: String): T where T : Enum<T> =
+        enumValues<T>().firstOrNull { it.jsonValue() == value }
+            ?: throw IllegalArgumentException("지원하지 않는 enum 값입니다: $value")
+
+    private fun conversionStateFromJson(value: String): ConversionState =
+        enumFromJson(value)
+
+    private fun adapterRiskFromJson(value: String): AdapterRisk =
+        enumFromJson(value)
+
+    private fun adapterDispositionFromJson(value: String): AdapterDisposition =
+        enumFromJson(value)
+
+    private const val EXTENSION_SCHEMA_VERSION = 1
+    private const val COMPATIBILITY_SCHEMA_VERSION = 2
     private const val MAX_METADATA_SIZE = 1024L * 1024
     private const val MAX_WRAPPER_SIZE = 128L * 1024 * 1024
     private const val MAX_TOTAL_SIZE = MAX_WRAPPER_SIZE + (2 * MAX_METADATA_SIZE)
