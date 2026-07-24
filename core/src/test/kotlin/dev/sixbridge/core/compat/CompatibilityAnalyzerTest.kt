@@ -891,6 +891,219 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `scans dependencies imported by inline module scripts`() {
+        val source = Files.createTempDirectory("six-inline-module-dependency")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Inline module dependency",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script type="module">
+              import "./helper.test.js";
+            </script>
+            """.trimIndent(),
+        )
+        source.resolve("helper.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(setOf("webstorePrivate"), report.unsupportedApis)
+        assertTrue("webstorePrivate" in report.usedApis)
+    }
+
+    @Test
+    fun `decodes JavaScript escapes in static dependency paths`() {
+        val source = Files.createTempDirectory("six-js-escaped-dependency")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "JavaScript escaped dependency",
+              "version": "1",
+              "background": {
+                "service_worker": "worker.js",
+                "type": "module"
+              }
+            }
+            """.trimIndent(),
+        )
+        source.resolve("worker.js").writeText(
+            "import \"./helper" + "\\u002e" + "test.js\";",
+        )
+        source.resolve("helper.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(setOf("downloads"), report.unsupportedApis)
+        assertTrue("downloads" in report.usedApis)
+    }
+
+    @Test
+    fun `decodes HTML entities in script source paths`() {
+        val source = Files.createTempDirectory("six-html-entity-dependency")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "HTML entity dependency",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """<script src="helper&#46;test.js"></script>""",
+        )
+        source.resolve("helper.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(setOf("webstorePrivate"), report.unsupportedApis)
+        assertTrue("webstorePrivate" in report.usedApis)
+    }
+
+    @Test
+    fun `ignores non executable script types`() {
+        val source = Files.createTempDirectory("six-non-executable-script-types")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Non executable script types",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script type="text/x-template">
+              chrome.webstorePrivate.install();
+            </script>
+            <script type="application/json" src="ignored.test.js"></script>
+            <script type="importmap">
+              {"imports":{"chrome.webstorePrivate":"./ignored.test.js"}}
+            </script>
+            <script>chrome.storage.local.get("value");</script>
+            """.trimIndent(),
+        )
+        source.resolve("ignored.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+    }
+
+    @Test
+    fun `keeps executable script records and HTML context behavior`() {
+        val source = Files.createTempDirectory("six-executable-script-records")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Executable script records",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <!-- <script src="ignored.test.js"></script> -->
+            <script src="classic.test.js"></script>
+            <script type="text/javascript" src = legacy.test.js></script>
+            <script type="module" src="module.test.js"></script>
+            <script>chrome.storage.local.get("value");</script>
+            """.trimIndent(),
+        )
+        source.resolve("ignored.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+        source.resolve("classic.test.js").writeText(
+            "chrome.runtime.getManifest();",
+        )
+        source.resolve("legacy.test.js").writeText(
+            "chrome.tabs.query({});",
+        )
+        source.resolve("module.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(setOf("downloads"), report.unsupportedApis)
+        assertEquals(setOf("downloads", "runtime", "storage", "tabs"), report.usedApis)
+        assertTrue("webstorePrivate" !in report.usedApis)
+    }
+
+    @Test
+    fun `fails closed for undecodable static dependency paths`() {
+        val source = Files.createTempDirectory("six-undecodable-dependencies")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Undecodable dependencies",
+              "version": "1",
+              "background": {
+                "service_worker": "worker.js",
+                "type": "module"
+              },
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        val worker = source.resolve("worker.js")
+        worker.writeText(
+            "import \"./hidden" + "\\xZZ" + ".test.js\";" +
+                "chrome.storage.local.get(\"value\");",
+        )
+        val popup = source.resolve("popup.html")
+        popup.writeText("<script></script>")
+        source.resolve("hidden.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val invalidJavaScript = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, invalidJavaScript.status)
+        assertEquals(setOf("storage"), invalidJavaScript.usedApis)
+        assertTrue(invalidJavaScript.unsupportedApis.isEmpty())
+        assertTrue(invalidJavaScript.issues.any { it.code == "api_usage_dynamic" })
+
+        worker.writeText("chrome.storage.local.get(\"value\");")
+        popup.writeText("""<script src="hidden&unknown;.test.js"></script>""")
+
+        val invalidHtml = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, invalidHtml.status)
+        assertEquals(setOf("storage"), invalidHtml.usedApis)
+        assertTrue(invalidHtml.unsupportedApis.isEmpty())
+        assertTrue(invalidHtml.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
     fun `scans a large minified string without exhausting the regex stack`() {
         val source = Files.createTempDirectory("six-large-minified-string")
         source.resolve("manifest.json").writeText(

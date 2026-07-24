@@ -181,15 +181,15 @@ class CompatibilityAnalyzer(
 
     private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()
-        var dynamicUsage = false
-        val runtimeScripts = runtimeResourceClosure(root, manifest)
+        val runtimeClosure = runtimeResourceClosure(root, manifest)
+        var dynamicUsage = runtimeClosure.unresolvedDependency
         Files.walk(root).use { paths ->
             paths.filter { path ->
                 path.isRegularFile() &&
                     path.extension.lowercase() in SCRIPT_EXTENSIONS &&
                     (
                         ".test." !in path.fileName.toString().lowercase() ||
-                            path.toAbsolutePath().normalize() in runtimeScripts
+                            path.toAbsolutePath().normalize() in runtimeClosure.resources
                         )
             }.forEach { path ->
                 val source = runCatching { path.readText() }.getOrDefault("")
@@ -308,7 +308,10 @@ class CompatibilityAnalyzer(
         return ApiScan(found, dynamicUsage)
     }
 
-    private fun runtimeResourceClosure(root: Path, manifest: JsonObject): Set<Path> {
+    private fun runtimeResourceClosure(
+        root: Path,
+        manifest: JsonObject,
+    ): RuntimeResourceClosure {
         val resources = mutableSetOf<String>()
         (manifest["background"] as? JsonObject)
             ?.stringOrNull("service_worker")
@@ -327,10 +330,11 @@ class CompatibilityAnalyzer(
 
         val normalizedRoot = root.toAbsolutePath().normalize()
         val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
-            ?: return emptySet()
+            ?: return RuntimeResourceClosure(emptySet(), unresolvedDependency = true)
         val runtimeResources = mutableSetOf<Path>()
         val pending = mutableListOf<Path>()
         var pendingIndex = 0
+        var unresolvedDependency = false
 
         fun enqueue(base: Path, resource: String) {
             val path = resolveLocalRuntimeResource(
@@ -346,14 +350,36 @@ class CompatibilityAnalyzer(
         while (pendingIndex < pending.size) {
             val resource = pending[pendingIndex++]
             val source = runCatching { resource.readText() }.getOrDefault("")
-            val dependencies = when (resource.extension.lowercase()) {
-                "html" -> scanHtmlScripts(source).dependencies
+            val dependencyScan = when (resource.extension.lowercase()) {
+                "html" -> {
+                    val htmlScan = scanHtmlScripts(source)
+                    val dependencies = mutableSetOf<String>()
+                    htmlScan.records.filter { it.executable }.forEach { script ->
+                        if (script.source != null) {
+                            dependencies += script.source
+                        } else if (!script.hasSource && script.normalizedType == "module") {
+                            val body = if (script.bodyRange.isEmpty()) {
+                                ""
+                            } else {
+                                source.substring(script.bodyRange)
+                            }
+                            val inlineDependencies = javaScriptDependencies(body)
+                            dependencies += inlineDependencies.dependencies
+                            if (inlineDependencies.unresolvedDependency) {
+                                unresolvedDependency = true
+                            }
+                        }
+                    }
+                    if (htmlScan.unresolvedDependency) unresolvedDependency = true
+                    JavaScriptDependencyScan(dependencies, unresolvedDependency = false)
+                }
                 "js", "mjs", "cjs" -> javaScriptDependencies(source)
-                else -> emptySet()
+                else -> JavaScriptDependencyScan(emptySet(), unresolvedDependency = false)
             }
-            dependencies.forEach { enqueue(resource.parent, it) }
+            if (dependencyScan.unresolvedDependency) unresolvedDependency = true
+            dependencyScan.dependencies.forEach { enqueue(resource.parent, it) }
         }
-        return runtimeResources
+        return RuntimeResourceClosure(runtimeResources, unresolvedDependency)
     }
 
     private fun resolveLocalRuntimeResource(
@@ -371,11 +397,13 @@ class CompatibilityAnalyzer(
         ) {
             return null
         }
-        val target = if (resource.startsWith("/")) {
-            root.resolve(resource.removePrefix("/"))
-        } else {
-            base.resolve(resource)
-        }.toAbsolutePath().normalize()
+        val target = runCatching {
+            if (resource.startsWith("/")) {
+                root.resolve(resource.removePrefix("/"))
+            } else {
+                base.resolve(resource)
+            }.toAbsolutePath().normalize()
+        }.getOrNull() ?: return null
         if (!target.startsWith(root) || !target.isRegularFile()) return null
         val insideRealRoot = runCatching { target.toRealPath().startsWith(realRoot) }
             .getOrDefault(false)
@@ -383,10 +411,11 @@ class CompatibilityAnalyzer(
     }
 
     private fun scanHtmlScripts(source: String): HtmlScriptScan {
-        val dependencies = mutableSetOf<String>()
+        val records = mutableListOf<HtmlScriptRecord>()
         val inlineSource = source.map {
             if (it == '\r' || it == '\n') it else ' '
         }.toCharArray()
+        var unresolvedDependency = false
         var cursor = 0
         while (cursor < source.length) {
             if (source.startsWith("<!--", cursor)) {
@@ -414,16 +443,33 @@ class CompatibilityAnalyzer(
             }
 
             val openingEnd = findHtmlTagEnd(source, scriptNameEnd) ?: break
-            val scriptSource = readScriptSourceAttribute(
+            val attributes = readHtmlAttributes(
                 source,
                 scriptNameEnd,
                 openingEnd,
             )
-            scriptSource?.let(dependencies::add)
+            val decodedType = attributes["type"]?.let(::decodeHtmlAttribute)
+            val normalizedType = decodedType?.value
+                ?.trim()
+                ?.lowercase()
+            val executable = decodedType?.valid != false &&
+                isExecutableScriptType(normalizedType)
+            val hasSource = "src" in attributes
+            val decodedSource = attributes["src"]?.let(::decodeHtmlAttribute)
             val bodyStart = openingEnd + 1
             val closingStart = findClosingScriptTag(source, bodyStart)
             val bodyEnd = closingStart ?: source.length
-            if (scriptSource == null) {
+            val scriptUnresolved = decodedType?.valid == false ||
+                (executable && decodedSource?.valid == false)
+            if (scriptUnresolved) unresolvedDependency = true
+            records += HtmlScriptRecord(
+                source = decodedSource?.value,
+                hasSource = hasSource,
+                normalizedType = normalizedType,
+                bodyRange = bodyStart until bodyEnd,
+                executable = executable,
+            )
+            if (executable && !hasSource) {
                 for (index in bodyStart until bodyEnd) {
                     inlineSource[index] = source[index]
                 }
@@ -433,7 +479,11 @@ class CompatibilityAnalyzer(
             val closingEnd = findHtmlTagEnd(source, closingNameEnd) ?: break
             cursor = closingEnd + 1
         }
-        return HtmlScriptScan(dependencies, inlineSource.concatToString())
+        return HtmlScriptScan(
+            records = records,
+            inlineSource = inlineSource.concatToString(),
+            unresolvedDependency = unresolvedDependency,
+        )
     }
 
     private fun findHtmlTagEnd(source: String, start: Int): Int? {
@@ -453,11 +503,12 @@ class CompatibilityAnalyzer(
         return null
     }
 
-    private fun readScriptSourceAttribute(
+    private fun readHtmlAttributes(
         source: String,
         start: Int,
         tagEnd: Int,
-    ): String? {
+    ): Map<String, String> {
+        val attributes = linkedMapOf<String, String>()
         var cursor = start
         while (cursor < tagEnd) {
             while (cursor < tagEnd &&
@@ -500,9 +551,42 @@ class CompatibilityAnalyzer(
                     value = source.substring(valueStart, cursor)
                 }
             }
-            if (name.equals("src", ignoreCase = true)) return value.orEmpty()
+            attributes.putIfAbsent(name.lowercase(), value.orEmpty())
         }
-        return null
+        return attributes
+    }
+
+    private fun decodeHtmlAttribute(source: String): DecodedText {
+        val decoded = StringBuilder(source.length)
+        var cursor = 0
+        while (cursor < source.length) {
+            if (source[cursor] != '&') {
+                decoded.append(source[cursor++])
+                continue
+            }
+            val entityEnd = source.indexOf(';', cursor + 1)
+            if (entityEnd < 0) return DecodedText(null, valid = false)
+            val entity = source.substring(cursor + 1, entityEnd)
+            val codePoint = when {
+                entity.startsWith("#x", ignoreCase = true) ->
+                    entity.substring(2).takeIf { it.isNotEmpty() }
+                        ?.toIntOrNull(16)
+                entity.startsWith("#") ->
+                    entity.substring(1).takeIf { it.isNotEmpty() }
+                        ?.toIntOrNull(10)
+                else -> HTML_NAMED_ENTITIES[entity]
+            }
+            if (codePoint == null ||
+                !Character.isValidCodePoint(codePoint) ||
+                codePoint in 0xd800..0xdfff ||
+                codePoint == 0
+            ) {
+                return DecodedText(null, valid = false)
+            }
+            decoded.appendCodePoint(codePoint)
+            cursor = entityEnd + 1
+        }
+        return DecodedText(decoded.toString(), valid = true)
     }
 
     private fun findClosingScriptTag(source: String, start: Int): Int? {
@@ -520,10 +604,16 @@ class CompatibilityAnalyzer(
     private fun isHtmlTagNameBoundary(value: Char?): Boolean =
         value == null || value.isWhitespace() || value == '/' || value == '>'
 
-    private fun javaScriptDependencies(source: String): Set<String> {
+    private fun isExecutableScriptType(normalizedType: String?): Boolean =
+        normalizedType == null ||
+            normalizedType.isEmpty() ||
+            normalizedType == "module" ||
+            normalizedType.substringBefore(';').trim() in JAVA_SCRIPT_MIME_TYPES
+
+    private fun javaScriptDependencies(source: String): JavaScriptDependencyScan {
         val sourceWithoutComments = maskJsLiteralsAndComments(source, maskLiterals = false)
         val codeOnly = maskJsLiteralsAndComments(source, maskLiterals = true)
-        val dependencies = mutableSetOf<String>()
+        val dependencies = JavaScriptDependencyCollector()
         var cursor = 0
         while (cursor < codeOnly.length) {
             if (!codeOnly[cursor].isJavaIdentifierStart()) {
@@ -549,7 +639,10 @@ class CompatibilityAnalyzer(
                 else -> identifierEnd
             }
         }
-        return dependencies
+        return JavaScriptDependencyScan(
+            dependencies = dependencies.values,
+            unresolvedDependency = dependencies.unresolvedDependency,
+        )
     }
 
     private fun scanStaticModuleDependency(
@@ -557,7 +650,7 @@ class CompatibilityAnalyzer(
         codeOnly: String,
         start: Int,
         isImport: Boolean,
-        dependencies: MutableSet<String>,
+        dependencies: JavaScriptDependencyCollector,
     ): Int {
         var cursor = skipMaskedWhitespace(source, start)
         if (isImport &&
@@ -567,7 +660,7 @@ class CompatibilityAnalyzer(
         }
         if (isImport) {
             readJavaScriptString(source, cursor)?.let { literal ->
-                dependencies += literal.value
+                dependencies.add(literal)
                 return literal.end
             }
         } else if (source.getOrNull(cursor) != '{' && source.getOrNull(cursor) != '*') {
@@ -581,7 +674,7 @@ class CompatibilityAnalyzer(
                     val specifierStart = skipMaskedWhitespace(source, identifierEnd)
                     val literal = readJavaScriptString(source, specifierStart)
                     if (literal != null) {
-                        dependencies += literal.value
+                        dependencies.add(literal)
                         return literal.end
                     }
                 }
@@ -597,7 +690,7 @@ class CompatibilityAnalyzer(
         source: String,
         codeOnly: String,
         start: Int,
-        dependencies: MutableSet<String>,
+        dependencies: JavaScriptDependencyCollector,
     ): Int {
         var cursor = skipMaskedWhitespace(source, start)
         if (source.getOrNull(cursor) != '(') return cursor
@@ -611,7 +704,7 @@ class CompatibilityAnalyzer(
                 if (source.getOrNull(afterLiteral) == ',' ||
                     source.getOrNull(afterLiteral) == ')'
                 ) {
-                    dependencies += literal.value
+                    dependencies.add(literal)
                 }
                 cursor = afterLiteral
             }
@@ -677,19 +770,162 @@ class CompatibilityAnalyzer(
     private fun readJavaScriptString(source: String, start: Int): JavaScriptString? {
         val quote = source.getOrNull(start)
         if (quote != '\'' && quote != '"') return null
+        val decoded = StringBuilder()
+        var valid = true
         var cursor = start + 1
         while (cursor < source.length) {
-            when (source[cursor]) {
-                '\\' -> cursor += if (cursor + 1 < source.length) 2 else 1
-                quote -> return JavaScriptString(
-                    source.substring(start + 1, cursor),
-                    cursor + 1,
-                )
-                '\r', '\n' -> return null
+            val current = source[cursor]
+            when {
+                current == quote -> {
+                    val value = decoded.toString().takeIf {
+                        valid && hasValidUtf16(it)
+                    }
+                    return JavaScriptString(value, cursor + 1)
+                }
+                current == '\r' ||
+                    current == '\n' ||
+                    current == '\u2028' ||
+                    current == '\u2029' -> {
+                    return JavaScriptString(null, cursor)
+                }
+                current != '\\' -> {
+                    decoded.append(current)
+                    cursor++
+                }
+                cursor + 1 >= source.length -> {
+                    return JavaScriptString(null, source.length)
+                }
+                else -> {
+                    val escaped = source[cursor + 1]
+                    when (escaped) {
+                        '\n', '\u2028', '\u2029' -> cursor += 2
+                        '\r' -> {
+                            cursor += if (source.getOrNull(cursor + 2) == '\n') 3 else 2
+                        }
+                        '\'', '"', '\\', '/' -> {
+                            decoded.append(escaped)
+                            cursor += 2
+                        }
+                        'b' -> {
+                            decoded.append('\b')
+                            cursor += 2
+                        }
+                        'f' -> {
+                            decoded.append('\u000c')
+                            cursor += 2
+                        }
+                        'n' -> {
+                            decoded.append('\n')
+                            cursor += 2
+                        }
+                        'r' -> {
+                            decoded.append('\r')
+                            cursor += 2
+                        }
+                        't' -> {
+                            decoded.append('\t')
+                            cursor += 2
+                        }
+                        'v' -> {
+                            decoded.append('\u000b')
+                            cursor += 2
+                        }
+                        '0' -> {
+                            if (source.getOrNull(cursor + 2)?.isDigit() == true) {
+                                valid = false
+                            } else {
+                                decoded.append('\u0000')
+                            }
+                            cursor += 2
+                        }
+                        'x' -> {
+                            val digitsEnd = cursor + 4
+                            val codePoint = source.substringOrNull(cursor + 2, digitsEnd)
+                                ?.takeIf { it.all { character -> character.isHexDigit() } }
+                                ?.toIntOrNull(16)
+                            if (codePoint == null) {
+                                valid = false
+                            } else {
+                                decoded.append(codePoint.toChar())
+                                cursor = digitsEnd
+                                continue
+                            }
+                            cursor += 2
+                        }
+                        'u' -> {
+                            if (source.getOrNull(cursor + 2) == '{') {
+                                val closing = source.indexOf('}', cursor + 3)
+                                val digits = closing.takeIf { it >= 0 }
+                                    ?.let { source.substring(cursor + 3, it) }
+                                val codePoint = digits
+                                    ?.takeIf {
+                                        it.isNotEmpty() &&
+                                            it.length <= 6 &&
+                                            it.all { character -> character.isHexDigit() }
+                                    }
+                                    ?.toIntOrNull(16)
+                                    ?.takeIf(Character::isValidCodePoint)
+                                    ?.takeUnless { it in 0xd800..0xdfff }
+                                if (codePoint == null) {
+                                    valid = false
+                                } else {
+                                    decoded.appendCodePoint(codePoint)
+                                }
+                                cursor = if (closing >= 0) closing + 1 else cursor + 2
+                            } else {
+                                val digitsEnd = cursor + 6
+                                val codePoint = source.substringOrNull(cursor + 2, digitsEnd)
+                                    ?.takeIf {
+                                        it.all { character -> character.isHexDigit() }
+                                    }
+                                    ?.toIntOrNull(16)
+                                if (codePoint == null) {
+                                    valid = false
+                                    cursor += 2
+                                } else {
+                                    decoded.append(codePoint.toChar())
+                                    cursor = digitsEnd
+                                }
+                            }
+                        }
+                        else -> {
+                            if (escaped.isDigit()) {
+                                valid = false
+                            } else {
+                                decoded.append(escaped)
+                            }
+                            cursor += 2
+                        }
+                    }
+                }
+            }
+        }
+        return JavaScriptString(null, source.length)
+    }
+
+    private fun String.substringOrNull(start: Int, end: Int): String? =
+        takeIf { start >= 0 && end >= start && end <= length }
+            ?.substring(start, end)
+
+    private fun Char.isHexDigit(): Boolean =
+        this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    private fun hasValidUtf16(value: String): Boolean {
+        var cursor = 0
+        while (cursor < value.length) {
+            val current = value[cursor]
+            when {
+                Character.isHighSurrogate(current) -> {
+                    if (!Character.isLowSurrogate(value.getOrNull(cursor + 1) ?: return false)) {
+                        return false
+                    }
+                    cursor += 2
+                }
+                Character.isLowSurrogate(current) -> return false
                 else -> cursor++
             }
         }
-        return null
+        return true
     }
 
     private fun validateResources(
@@ -1098,18 +1334,96 @@ class CompatibilityAnalyzer(
         val dynamicUsage: Boolean,
     )
 
+    private data class RuntimeResourceClosure(
+        val resources: Set<Path>,
+        val unresolvedDependency: Boolean,
+    )
+
     private data class HtmlScriptScan(
-        val dependencies: Set<String>,
+        val records: List<HtmlScriptRecord>,
         val inlineSource: String,
+        val unresolvedDependency: Boolean,
+    )
+
+    private data class HtmlScriptRecord(
+        val source: String?,
+        val hasSource: Boolean,
+        val normalizedType: String?,
+        val bodyRange: IntRange,
+        val executable: Boolean,
+    )
+
+    private data class DecodedText(
+        val value: String?,
+        val valid: Boolean,
+    )
+
+    private data class JavaScriptDependencyScan(
+        val dependencies: Set<String>,
+        val unresolvedDependency: Boolean,
     )
 
     private data class JavaScriptString(
-        val value: String,
+        val value: String?,
         val end: Int,
     )
 
+    private class JavaScriptDependencyCollector {
+        val values = mutableSetOf<String>()
+        var unresolvedDependency = false
+
+        fun add(literal: JavaScriptString) {
+            val value = literal.value
+            if (value == null) {
+                unresolvedDependency = true
+            } else {
+                values += value
+            }
+        }
+    }
+
     companion object {
         private val SCRIPT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
+        private val JAVA_SCRIPT_MIME_TYPES = setOf(
+            "application/ecmascript",
+            "application/javascript",
+            "application/x-ecmascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/javascript",
+            "text/javascript1.0",
+            "text/javascript1.1",
+            "text/javascript1.2",
+            "text/javascript1.3",
+            "text/javascript1.4",
+            "text/javascript1.5",
+            "text/jscript",
+            "text/livescript",
+            "text/x-ecmascript",
+            "text/x-javascript",
+        )
+        private val HTML_NAMED_ENTITIES = mapOf(
+            "amp" to '&'.code,
+            "AMP" to '&'.code,
+            "apos" to '\''.code,
+            "quot" to '"'.code,
+            "QUOT" to '"'.code,
+            "lt" to '<'.code,
+            "LT" to '<'.code,
+            "gt" to '>'.code,
+            "GT" to '>'.code,
+            "period" to '.'.code,
+            "sol" to '/'.code,
+            "bsol" to '\\'.code,
+            "colon" to ':'.code,
+            "num" to '#'.code,
+            "quest" to '?'.code,
+            "equals" to '='.code,
+            "percnt" to '%'.code,
+            "semi" to ';'.code,
+            "lpar" to '('.code,
+            "rpar" to ')'.code,
+        )
         private val API_CALL_REGEX =
             Regex("""(?:chrome|browser)\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""")
         private val BRACKET_API_REGEX =
