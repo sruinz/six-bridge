@@ -216,7 +216,11 @@ class MobilePatternAnalyzer(
                 val callback = readCallbackBody(
                     codeOnly,
                     listener.range.last + 1,
-                ) ?: return@forEach
+                ) ?: return evidence(
+                    script,
+                    listener.range.first,
+                    "mouseup callback을 정적으로 해석할 수 없음",
+                )
                 val member = eventMemberRegex(callback.parameter)
                     .find(codeOnly, callback.bodyStart)
                     ?.takeIf { it.range.first < callback.bodyEnd }
@@ -237,14 +241,49 @@ class MobilePatternAnalyzer(
         var cursor = skipWhitespace(codeOnly, listenerEnd)
         if (codeOnly.getOrNull(cursor) != ',') return null
         cursor = skipWhitespace(codeOnly, cursor + 1)
+        if (codeOnly.startsWith("async", cursor) &&
+            codeOnly.getOrNull(cursor + "async".length)
+                ?.isJavaIdentifierPart() != true
+        ) {
+            cursor = skipWhitespace(codeOnly, cursor + "async".length)
+            return readArrowCallback(codeOnly, cursor)
+        }
         return if (codeOnly.startsWith("function", cursor) &&
             !codeOnly.getOrNull(cursor + "function".length)
                 .let { it?.isJavaIdentifierPart() == true }
         ) {
             readFunctionCallback(codeOnly, cursor + "function".length)
         } else {
-            readArrowCallback(codeOnly, cursor)
+            val identifierEnd = codeOnly.getOrNull(cursor)
+                ?.takeIf(Char::isJavaIdentifierStart)
+                ?.let { readIdentifierEnd(codeOnly, cursor) }
+            val afterIdentifier = identifierEnd?.let {
+                skipWhitespace(codeOnly, it)
+            }
+            if (identifierEnd != null &&
+                !codeOnly.startsWith("=>", afterIdentifier ?: -1)
+            ) {
+                readNamedFunctionCallback(
+                    codeOnly,
+                    codeOnly.substring(cursor, identifierEnd),
+                )
+            } else {
+                readArrowCallback(codeOnly, cursor)
+            }
         }
+    }
+
+    private fun readNamedFunctionCallback(
+        codeOnly: String,
+        name: String,
+    ): CallbackBody? {
+        val declaration = Regex(
+            """\bfunction\s+${Regex.escape(name)}\s*\(""",
+        ).find(codeOnly) ?: return null
+        return readFunctionCallback(
+            codeOnly,
+            declaration.range.first + "function".length,
+        )
     }
 
     private fun readFunctionCallback(
@@ -290,11 +329,32 @@ class MobilePatternAnalyzer(
         if (codeOnly.getOrNull(cursor) == '{') {
             return bracedCallbackBody(codeOnly, cursor, parameter)
         }
-        val bodyEnd = sequenceOf(
-            codeOnly.indexOf('\n', cursor),
-            codeOnly.indexOf(';', cursor),
-        ).filter { it >= 0 }.minOrNull() ?: codeOnly.length
+        val bodyEnd = callbackArgumentEnd(codeOnly, cursor)
         return CallbackBody(parameter, cursor, bodyEnd)
+    }
+
+    private fun callbackArgumentEnd(source: String, start: Int): Int {
+        var parentheses = 0
+        var brackets = 0
+        var braces = 0
+        for (index in start until source.length) {
+            when (source[index]) {
+                '(' -> parentheses++
+                ')' -> if (parentheses == 0 && brackets == 0 && braces == 0) {
+                    return index
+                } else if (parentheses > 0) {
+                    parentheses--
+                }
+                '[' -> brackets++
+                ']' -> if (brackets > 0) brackets--
+                '{' -> braces++
+                '}' -> if (braces > 0) braces--
+                ',' -> if (parentheses == 0 && brackets == 0 && braces == 0) {
+                    return index
+                }
+            }
+        }
+        return source.length
     }
 
     private fun bracedCallbackBody(

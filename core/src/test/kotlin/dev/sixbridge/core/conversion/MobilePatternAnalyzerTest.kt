@@ -167,6 +167,81 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
+    fun `finds mouse state access in a named function handler`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                document.addEventListener("mouseup", handleSelection);
+                function handleSelection(event) {
+                  if (event.button !== 0) return;
+                  use(getSelection());
+                }
+            """.trimIndent(),
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertEquals(3, decision.evidence.single().line)
+    }
+
+    @Test
+    fun `finds mouse state access in async arrow handlers`() {
+        listOf(
+            """async (event) => { if (event.isTrusted) use(getSelection()); }""",
+            """async event => { if (event.buttons) use(getSelection()); }""",
+        ).forEach { callback ->
+            val source = extension(
+                contentFile = "content.js",
+                contentSource =
+                    """document.addEventListener("mouseup", $callback);""",
+            )
+
+            val decision = MobilePatternAnalyzer().analyze(source, profile)
+                .decision("desktop-selection-event-bridge")
+
+            assertNotNull(decision)
+            assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        }
+    }
+
+    @Test
+    fun `expression callback excludes third argument from event member evidence`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                """document.addEventListener("mouseup", """ +
+                    """event => use(getSelection()), {capture: event.button});""",
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.AUTOMATIC, decision.disposition)
+    }
+
+    @Test
+    fun `unresolved callback expressions fail closed`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                document.addEventListener("mouseup", handlers.selection);
+                use(getSelection());
+            """.trimIndent(),
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertTrue("callback" in decision.evidence.single().detail)
+    }
+
+    @Test
     fun `requires approval for an inaccessible action popup with an existing content script`() {
         val source = extension(
             contentFile = "content.js",
@@ -355,6 +430,34 @@ class MobilePatternAnalyzerTest {
 
         assertNotNull(report.decision("storage-fallback"))
         assertEquals(setOf("storage"), report.usedApis)
+    }
+
+    @Test
+    fun `ignores storage regex after a statement block`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                "{ prepare(); } /chrome.storage.sync/.test(value);",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNull(report.decision("storage-fallback"))
+        assertTrue(report.usedApis.isEmpty())
+    }
+
+    @Test
+    fun `ignores storage regex after a class declaration`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                "class Example {} /browser.storage.sync/.test(value);",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNull(report.decision("storage-fallback"))
+        assertTrue(report.usedApis.isEmpty())
     }
 
     private fun extension(

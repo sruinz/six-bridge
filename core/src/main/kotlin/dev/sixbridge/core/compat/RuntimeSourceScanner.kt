@@ -633,8 +633,10 @@ internal object JavaScriptLexicalMask {
         var regexAllowed = true
         var pendingControlKeyword: String? = null
         var pendingFunctionBlockResult: Boolean? = null
+        var pendingClass = false
         var blockExpected = false
         var expectedBlockResult = true
+        var statementPosition = true
         val templateExpressionDepths = mutableListOf<Int>()
         val controlParentheses = mutableListOf<String?>()
         val blockBraces = mutableListOf<Boolean>()
@@ -693,17 +695,27 @@ internal object JavaScriptLexicalMask {
                             pendingFunctionBlockResult =
                                 functionDeclarationPosition(index)
                         }
-                        blockExpected = word in BLOCK_PREFIX_KEYWORDS
+                        if (word == "class") pendingClass = true
+                        blockExpected = if (pendingClass) {
+                            true
+                        } else {
+                            word in BLOCK_PREFIX_KEYWORDS
+                        }
                         if (blockExpected) expectedBlockResult = true
+                        if (!pendingClass && word !in STATEMENT_PREFIX_KEYWORDS) {
+                            statementPosition = false
+                        }
                         regexAllowed = word in REGEX_PREFIX_KEYWORDS
                         index = end
                     }
                     current.isDigit() -> {
+                        statementPosition = false
                         pendingControlKeyword = null
                         regexAllowed = false
                         index++
                     }
                     current == '\'' -> {
+                        statementPosition = false
                         pendingControlKeyword = null
                         regexAllowed = false
                         state = SINGLE_QUOTED
@@ -711,6 +723,7 @@ internal object JavaScriptLexicalMask {
                         index++
                     }
                     current == '"' -> {
+                        statementPosition = false
                         pendingControlKeyword = null
                         regexAllowed = false
                         state = DOUBLE_QUOTED
@@ -718,6 +731,7 @@ internal object JavaScriptLexicalMask {
                         index++
                     }
                     current == '`' -> {
+                        statementPosition = false
                         pendingControlKeyword = null
                         regexAllowed = false
                         state = TEMPLATE_TEXT
@@ -750,6 +764,7 @@ internal object JavaScriptLexicalMask {
                         index++
                     }
                     current == '(' -> {
+                        statementPosition = false
                         controlParentheses.add(
                             when {
                                 pendingFunctionBlockResult == true ->
@@ -780,9 +795,15 @@ internal object JavaScriptLexicalMask {
                         index++
                     }
                     current == '{' -> {
-                        blockBraces += blockExpected && expectedBlockResult
+                        blockBraces += when {
+                            pendingClass -> true
+                            blockExpected -> expectedBlockResult
+                            else -> statementPosition
+                        }
+                        pendingClass = false
                         blockExpected = false
                         expectedBlockResult = true
+                        statementPosition = true
                         pendingControlKeyword = null
                         regexAllowed = true
                         index++
@@ -795,22 +816,26 @@ internal object JavaScriptLexicalMask {
                         }
                         blockExpected = false
                         expectedBlockResult = true
+                        statementPosition = regexAllowed
                         pendingControlKeyword = null
                         index++
                     }
                     current == '[' -> {
+                        statementPosition = false
                         blockExpected = false
                         pendingControlKeyword = null
                         regexAllowed = true
                         index++
                     }
                     current == ']' || current == '.' -> {
+                        statementPosition = false
                         blockExpected = false
                         pendingControlKeyword = null
                         regexAllowed = false
                         index++
                     }
                     current == '=' && source.getOrNull(index + 1) == '>' -> {
+                        statementPosition = false
                         blockExpected = true
                         expectedBlockResult = false
                         pendingControlKeyword = null
@@ -824,6 +849,7 @@ internal object JavaScriptLexicalMask {
                         index += 2
                     }
                     current in REGEX_PREFIX_CHARS -> {
+                        statementPosition = current == ';'
                         pendingControlKeyword = null
                         regexAllowed = true
                         index++
@@ -964,6 +990,8 @@ internal object JavaScriptLexicalMask {
     private val CONTROL_PAREN_KEYWORDS =
         setOf("if", "while", "for", "with", "switch", "catch")
     private val BLOCK_PREFIX_KEYWORDS =
+        setOf("class", "do", "else", "finally", "try")
+    private val STATEMENT_PREFIX_KEYWORDS =
         setOf("class", "do", "else", "finally", "try")
     private const val FUNCTION_DECLARATION_CONTEXT = "function-declaration"
     private const val FUNCTION_EXPRESSION_CONTEXT = "function-expression"
