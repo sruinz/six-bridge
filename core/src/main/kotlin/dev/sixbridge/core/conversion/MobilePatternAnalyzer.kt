@@ -168,17 +168,74 @@ class MobilePatternAnalyzer(
         index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): StorageDecision {
-        val evidence = index.scripts.firstNotNullOfOrNull { script ->
-            val match = STORAGE_SYNC.find(codeOnly(script.source))
-                ?: return@firstNotNullOfOrNull null
-            evidence(script, match.range.first, "정적인 ${match.value} 사용")
-        } ?: return StorageDecision()
-
+        val rewriter = JavaScriptTokenRewriter()
+        val safeEvidence = mutableListOf<SourceEvidence>()
+        val unsafeEvidence = mutableListOf<SourceEvidence>()
+        index.scripts.forEach { script ->
+            val rewrite = rewriter.rewrite(script.source)
+            if (isStandaloneJavaScript(script.relativePath)) {
+                safeEvidence += rewrite.replacements.map { access ->
+                    SourceEvidence(
+                        relativePath = script.relativePath,
+                        line = script.lineOffset + access.line,
+                        detail = StorageFallbackEvidence.detail(
+                            access.root,
+                            script.source,
+                            rewrite.source,
+                        ),
+                    )
+                }
+            } else {
+                unsafeEvidence += rewrite.replacements.map { access ->
+                    SourceEvidence(
+                        relativePath = script.relativePath,
+                        line = script.lineOffset + access.line,
+                        detail = "인라인 script의 storage.sync 접근은 안전하게 치환할 수 없음",
+                    )
+                }
+            }
+            unsafeEvidence += rewrite.unsafeAccesses.map { access ->
+                SourceEvidence(
+                    relativePath = script.relativePath,
+                    line = script.lineOffset + access.line,
+                    detail = access.detail,
+                )
+            }
+        }
+        if (safeEvidence.isEmpty() && unsafeEvidence.isEmpty()) {
+            return StorageDecision()
+        }
         if (STORAGE_SYNC_FEATURE in profile.supportedFeatures) {
             return StorageDecision()
         }
         val localSupported = STORAGE_LOCAL_FEATURE in profile.supportedFeatures
         val syncUnavailable = STORAGE_SYNC_FEATURE in profile.unavailableFeatures
+        val profileEvidenceUnknown = !localSupported || !syncUnavailable
+        if (unsafeEvidence.isNotEmpty()) {
+            return StorageDecision(
+                decision = AdapterDecision(
+                    id = STORAGE_FALLBACK,
+                    version = 1,
+                    risk = AdapterRisk.SAFE,
+                    disposition = AdapterDisposition.UNAVAILABLE,
+                    applied = false,
+                    evidence = unsafeEvidence
+                        .distinct()
+                        .sortedWith(
+                            compareBy(
+                                SourceEvidence::relativePath,
+                                SourceEvidence::line,
+                                SourceEvidence::detail,
+                            ),
+                        ),
+                    changes = emptyList(),
+                    remainingLimitations = listOf(
+                        "동적 또는 계산된 storage 접근의 의미를 안전하게 보존할 수 없습니다.",
+                    ),
+                ),
+                unknown = profileEvidenceUnknown,
+            )
+        }
         if (!localSupported || !syncUnavailable) {
             val bothUnavailable =
                 STORAGE_LOCAL_FEATURE in profile.unavailableFeatures && syncUnavailable
@@ -190,7 +247,7 @@ class MobilePatternAnalyzer(
                         risk = AdapterRisk.SAFE,
                         disposition = AdapterDisposition.UNAVAILABLE,
                         applied = false,
-                        evidence = listOf(evidence),
+                        evidence = safeEvidence,
                         changes = emptyList(),
                         remainingLimitations = listOf(
                             "storage.local도 사용할 수 없어 안전한 fallback이 없습니다.",
@@ -208,12 +265,24 @@ class MobilePatternAnalyzer(
                 risk = AdapterRisk.SAFE,
                 disposition = AdapterDisposition.AUTOMATIC,
                 applied = false,
-                evidence = listOf(evidence),
+                evidence = safeEvidence
+                    .distinct()
+                    .sortedWith(
+                        compareBy(
+                            SourceEvidence::relativePath,
+                            SourceEvidence::line,
+                            SourceEvidence::detail,
+                        ),
+                    ),
                 changes = listOf("정적인 storage.sync member를 storage.local로 변경합니다."),
                 remainingLimitations = listOf("기기 간 storage 동기화가 제공되지 않습니다."),
             ),
         )
     }
+
+    private fun isStandaloneJavaScript(relativePath: String): Boolean =
+        relativePath.substringAfterLast('.', "").lowercase() in
+            setOf("js", "mjs", "cjs")
 
     private fun eventEvidence(
         script: RuntimeResourceIndex.RuntimeScript,
@@ -524,9 +593,6 @@ class MobilePatternAnalyzer(
         private val SELECTIONCHANGE_LISTENER = eventListenerRegex("selectionchange")
         private val GET_SELECTION = Regex("""\bgetSelection\s*\(""")
         private val IDENTIFIER = Regex("""[A-Za-z_$][\w$]*""")
-        private val STORAGE_SYNC = Regex(
-            """\b(?:chrome|browser)\s*\.\s*storage\s*\.\s*sync\b""",
-        )
         private val DEFAULT_POPUP = Regex(""""default_popup"\s*:""")
 
         private fun eventListenerRegex(eventName: String) = Regex(
