@@ -12,6 +12,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import kotlin.io.path.readText
 import kotlin.jvm.JvmSynthetic
@@ -59,15 +62,25 @@ class MobilePatternAnalyzer(
             profile,
             sourceSha256,
         )
-        if (compatibility.status == CompatibilityStatus.BLOCKED ||
-            compatibility.status == CompatibilityStatus.UNKNOWN
-        ) {
-            return compatibility
-        }
         val manifestPath = extensionRoot.resolve("manifest.json")
         val manifest = runCatching {
             json.parseToJsonElement(manifestPath.readText()) as? JsonObject
-        }.getOrNull() ?: return compatibility
+        }.getOrNull()
+        if (compatibility.status == CompatibilityStatus.BLOCKED ||
+            compatibility.status == CompatibilityStatus.UNKNOWN
+        ) {
+            val invalidOptionPage = manifest?.let {
+                invalidExistingOptionPageDecision(manifestPath, it, profile)
+            }
+            if (invalidOptionPage != null) {
+                return compatibility.copy(
+                    conversionState = ConversionState.UNAVAILABLE,
+                    adapterDecisions = listOf(invalidOptionPage),
+                )
+            }
+            return compatibility
+        }
+        manifest ?: return compatibility
         val index = RuntimeResourceIndex.create(extensionRoot, manifest)
         if (index.unresolvedDependency) {
             return compatibility
@@ -76,7 +89,7 @@ class MobilePatternAnalyzer(
         val decisions = mutableListOf<AdapterDecision>()
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
-        popupDecision(manifestPath, manifest, index, profile)?.let(decisions::add)
+        popupDecision(manifestPath, manifest, profile)?.let(decisions::add)
         val storage = storageDecision(extensionRoot, manifest, index, profile)
         storage.decision?.let(decisions::add)
         if (storage.unknown) {
@@ -147,46 +160,155 @@ class MobilePatternAnalyzer(
     private fun popupDecision(
         manifestPath: Path,
         manifest: JsonObject,
-        index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): AdapterDecision? {
         if (ACTION_POPUP_USER_ACCESSIBLE in profile.supportedFeatures) return null
         val popup = (manifest["action"] as? JsonObject)
             ?.stringOrNull("default_popup")
+            ?.takeIf(String::isNotBlank)
             ?: return null
-        val hasContentScript = (manifest["content_scripts"] as? JsonArray)
-            ?.mapNotNull { it as? JsonObject }
-            ?.any { readStrings(it["js"]).isNotEmpty() }
-            ?: false
-        val manifestSource = runCatching { manifestPath.readText() }.getOrDefault("")
-        val popupOffset = DEFAULT_POPUP.find(manifestSource)?.range?.first ?: 0
-        val unavailableLimitations = buildList {
-            if (!hasContentScript) {
-                add("기존 content script가 없어 host permission을 늘리지 않고 진입점을 추가할 수 없습니다.")
-            }
-            if ("tabs" !in profile.supportedApis) {
-                add("tabs namespace가 없어 popup을 extension tab으로 열 수 없습니다.")
-            }
-            if (ActionPopupEntrySafety.hasWorkerUrlDependency(index)) {
-                add("원본 service worker가 자신의 URL에 의존해 bootstrap semantics를 보존할 수 없습니다.")
+        val applied = ActionPopupEntryAdapter().isExactlyApplied(
+            manifestPath.parent,
+            manifest,
+            popup,
+        )
+        if (applied) {
+            return optionEntryDecision(
+                manifestPath = manifestPath,
+                popup = popup,
+                disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                applied = true,
+            )
+        }
+        when (
+            val existing = existingOptionPageState(
+                manifest,
+                manifestPath.parent,
+            )
+        ) {
+            ExistingOptionPage.Absent -> Unit
+            ExistingOptionPage.Valid -> return null
+            is ExistingOptionPage.Invalid -> {
+                return optionEntryDecision(
+                    manifestPath = manifestPath,
+                    popup = popup,
+                    disposition = AdapterDisposition.UNAVAILABLE,
+                    applied = false,
+                    limitations = listOf(existing.reason),
+                )
             }
         }
-        val unavailable = unavailableLimitations.isNotEmpty()
-        val applied = !unavailable &&
-            ActionPopupEntryAdapter().isExactlyApplied(
-                manifestPath.parent,
-                manifest,
-                popup,
+        if (OPTIONS_PAGE_ACCESSIBLE_FEATURE !in profile.supportedFeatures) {
+            return optionEntryDecision(
+                manifestPath = manifestPath,
+                popup = popup,
+                disposition = AdapterDisposition.UNAVAILABLE,
+                applied = false,
+                limitations = listOf(
+                    "browser profile에서 삼성 Add-ons option page 진입을 확인하지 못했습니다.",
+                ),
             )
+        }
+        return optionEntryDecision(
+            manifestPath = manifestPath,
+            popup = popup,
+            disposition = AdapterDisposition.REQUIRES_APPROVAL,
+            applied = false,
+        )
+    }
+
+    private fun invalidExistingOptionPageDecision(
+        manifestPath: Path,
+        manifest: JsonObject,
+        profile: BrowserProfile,
+    ): AdapterDecision? {
+        if (ACTION_POPUP_USER_ACCESSIBLE in profile.supportedFeatures) return null
+        val popup = (manifest["action"] as? JsonObject)
+            ?.stringOrNull("default_popup")
+            ?.takeIf(String::isNotBlank)
+            ?: return null
+        val invalid = existingOptionPageState(
+            manifest,
+            manifestPath.parent,
+        ) as? ExistingOptionPage.Invalid ?: return null
+        return optionEntryDecision(
+            manifestPath = manifestPath,
+            popup = popup,
+            disposition = AdapterDisposition.UNAVAILABLE,
+            applied = false,
+            limitations = listOf(invalid.reason),
+        )
+    }
+
+    private fun existingOptionPageState(
+        manifest: JsonObject,
+        root: Path,
+    ): ExistingOptionPage {
+        if ("options_ui" !in manifest && "options_page" !in manifest) {
+            return ExistingOptionPage.Absent
+        }
+        if ("options_ui" in manifest) {
+            val options = manifest["options_ui"] as? JsonObject
+                ?: return ExistingOptionPage.Invalid("options_ui가 객체가 아닙니다.")
+            val page = options.stringOrNull("page")
+                ?: return ExistingOptionPage.Invalid(
+                    "options_ui.page가 문자열이 아닙니다.",
+                )
+            if ("open_in_tab" in options) {
+                val openInTab = options["open_in_tab"] as? JsonPrimitive
+                if (openInTab == null ||
+                    openInTab.isString ||
+                    openInTab.booleanOrNull == null
+                ) {
+                    return ExistingOptionPage.Invalid(
+                        "options_ui.open_in_tab이 boolean이 아닙니다.",
+                    )
+                }
+            }
+            invalidOptionPageResource(root, "options_ui.page", page)?.let {
+                return ExistingOptionPage.Invalid(it)
+            }
+        }
+        if ("options_page" in manifest) {
+            val page = manifest.stringOrNull("options_page")
+                ?: return ExistingOptionPage.Invalid(
+                    "options_page가 문자열이 아닙니다.",
+                )
+            invalidOptionPageResource(root, "options_page", page)?.let {
+                return ExistingOptionPage.Invalid(it)
+            }
+        }
+        return ExistingOptionPage.Valid
+    }
+
+    private fun invalidOptionPageResource(
+        root: Path,
+        name: String,
+        value: String,
+    ): String? {
+        val path = ActionPopupEntrySafety.canonicalResourcePath(value)
+            ?: return "$name 경로가 안전한 내부 리소스가 아닙니다: $value"
+        if (!Files.isRegularFile(root.resolve(path), NOFOLLOW_LINKS)) {
+            return "$name 리소스를 확인할 수 없습니다: $value"
+        }
+        return null
+    }
+
+    private fun optionEntryDecision(
+        manifestPath: Path,
+        popup: String,
+        disposition: AdapterDisposition,
+        applied: Boolean,
+        limitations: List<String> = emptyList(),
+    ): AdapterDecision {
+        val manifestSource = runCatching { manifestPath.readText() }.getOrDefault("")
+        val popupOffset = DEFAULT_POPUP.find(manifestSource)?.range?.first ?: 0
+        val unavailable = disposition == AdapterDisposition.UNAVAILABLE
         return AdapterDecision(
             id = ACTION_POPUP_ENTRY,
-            version = 1,
+            version = 2,
             risk = AdapterRisk.BEHAVIOR_CHANGE,
-            disposition = if (unavailable) {
-                AdapterDisposition.UNAVAILABLE
-            } else {
-                AdapterDisposition.REQUIRES_APPROVAL
-            },
+            disposition = disposition,
             applied = applied,
             evidence = listOf(
                 SourceEvidence(
@@ -198,12 +320,12 @@ class MobilePatternAnalyzer(
             changes = if (unavailable) {
                 emptyList()
             } else {
-                listOf("기존 content script에 action popup 보조 진입점을 추가합니다.")
+                listOf("삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다.")
             },
             remainingLimitations = if (unavailable) {
-                unavailableLimitations
+                limitations
             } else {
-                listOf("popup이 브라우저 action UI가 아닌 별도 탭에서 열립니다.")
+                listOf("popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다.")
             },
         )
     }
@@ -218,10 +340,7 @@ class MobilePatternAnalyzer(
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
         val convertedSources = mutableMapOf<String, String>()
-        val trustedExclusions = ActionPopupEntryAdapter()
-            .trustedStorageAnalysisExclusions(extensionRoot, manifest)
         val inspected = index.scripts
-            .filterNot { it.relativePath in trustedExclusions }
             .map { script -> script to rewriter.inspect(script.source) }
         if (inspected.none { (_, inspection) -> inspection.storageIntent }) {
             return StorageDecision()
@@ -631,6 +750,12 @@ class MobilePatternAnalyzer(
         val unknown: Boolean = false,
     )
 
+    private sealed interface ExistingOptionPage {
+        data object Absent : ExistingOptionPage
+        data object Valid : ExistingOptionPage
+        data class Invalid(val reason: String) : ExistingOptionPage
+    }
+
     private data class CallbackBody(
         val parameter: String,
         val bodyStart: Int,
@@ -651,6 +776,8 @@ class MobilePatternAnalyzer(
 
         private const val ACTION_POPUP_USER_ACCESSIBLE =
             "action.popup.user-accessible"
+        private const val OPTIONS_PAGE_ACCESSIBLE_FEATURE =
+            "extension.options-page.user-accessible"
         private const val STORAGE_LOCAL_FEATURE = "storage.local"
         private const val STORAGE_SYNC_FEATURE = "storage.sync"
 

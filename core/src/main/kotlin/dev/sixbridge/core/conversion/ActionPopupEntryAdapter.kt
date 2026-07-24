@@ -6,6 +6,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -108,46 +109,20 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
     ): Boolean = runCatching {
         val canonicalPopup = ActionPopupEntrySafety.canonicalResourcePath(popupPath)
             ?: return false
-        val contentScripts = manifest[CONTENT_SCRIPTS] as? JsonArray ?: return false
-        val wiredBlocks = contentScripts.mapNotNull { it as? JsonObject }
-            .mapNotNull { it[SCRIPTS] as? JsonArray }
-            .filter { it.isNotEmpty() }
-        if (wiredBlocks.isEmpty() || wiredBlocks.any { scripts ->
-                val paths = scripts.mapNotNull {
-                    (it as? JsonPrimitive)
-                        ?.takeIf(JsonPrimitive::isString)
-                        ?.content
-                        ?.let(ActionPopupEntrySafety::canonicalResourcePath)
-                }
-                paths.count { it == CONTENT_RELATIVE_PATH } != 1
-            }
+        val options = manifest[OPTIONS_UI] as? JsonObject ?: return false
+        val openInTab = options[OPEN_IN_TAB] as? JsonPrimitive
+        if (options.keys != setOf(PAGE, OPEN_IN_TAB) ||
+            options.stringOrNull(PAGE) != canonicalPopup ||
+            openInTab == null ||
+            openInTab.isString ||
+            openInTab.booleanOrNull != true
         ) {
             return false
         }
-        if (!hasExactBytes(
-                workingRoot.resolve(CONTENT_RELATIVE_PATH),
-                resourceBytes(CONTENT_RESOURCE_PATH),
-            ) ||
-            !hasExactBytes(
-                workingRoot.resolve(BACKGROUND_RELATIVE_PATH),
-                generatedBackgroundBytes(canonicalPopup),
-            )
-        ) {
-            return false
-        }
-        val background = manifest[BACKGROUND] as? JsonObject ?: return false
-        val worker = background.stringOrNull(SERVICE_WORKER)
-            ?.let(ActionPopupEntrySafety::canonicalResourcePath)
-            ?: return false
-        if (worker == BACKGROUND_RELATIVE_PATH) return true
-        if (Path.of(worker).fileName.toString() != BOOTSTRAP_FILE_NAME) return false
-        val module = background.stringOrNull(TYPE) == MODULE
-        val bootstrapPath = workingRoot.resolve(worker)
-        if (!Files.isRegularFile(bootstrapPath, NOFOLLOW_LINKS)) return false
-        val source = Files.readString(bootstrapPath)
-        val original = verifyGeneratedBootstrap(source, module, worker)
-        verifyOriginalWorker(workingRoot, original)
-        true
+        hasExactBytes(
+            workingRoot.resolve(PROVENANCE_RELATIVE_PATH),
+            provenanceBytes(canonicalPopup),
+        )
     }.getOrDefault(false)
 
     @JvmSynthetic
@@ -168,6 +143,15 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
     private fun hasExactBytes(path: Path, expected: ByteArray): Boolean =
         Files.isRegularFile(path, NOFOLLOW_LINKS) &&
             Files.readAllBytes(path).contentEquals(expected)
+
+    private fun provenanceBytes(popup: String): ByteArray =
+        JsonObject(
+            linkedMapOf(
+                "adapter" to JsonPrimitive(id),
+                "version" to JsonPrimitive(PROVENANCE_VERSION),
+                "popup" to JsonPrimitive(popup),
+            ),
+        ).toString().toByteArray(UTF_8)
 
     private fun backgroundPlan(
         workingRoot: Path,
@@ -383,6 +367,9 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         const val MANIFEST = "manifest.json"
         const val ACTION = "action"
         const val DEFAULT_POPUP = "default_popup"
+        const val OPTIONS_UI = "options_ui"
+        const val PAGE = "page"
+        const val OPEN_IN_TAB = "open_in_tab"
         const val CONTENT_SCRIPTS = "content_scripts"
         const val SCRIPTS = "js"
         const val BACKGROUND = "background"
@@ -398,6 +385,9 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         const val CONTENT_RESOURCE_PATH = "dev/sixbridge/adapters/$CONTENT_FILE_NAME"
         const val BACKGROUND_RESOURCE_PATH = "dev/sixbridge/adapters/$BACKGROUND_FILE_NAME"
         const val POPUP_PLACEHOLDER = "__SIXBRIDGE_POPUP_PATH_JSON__"
+        const val PROVENANCE_VERSION = 2
+        const val PROVENANCE_RELATIVE_PATH =
+            "_sixbridge/action-popup-entry.v2.json"
         const val BOOTSTRAP_PROVENANCE_PREFIX =
             "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:"
         const val MODULE_TOKEN = "module"

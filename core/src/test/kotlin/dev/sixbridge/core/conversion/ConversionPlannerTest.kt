@@ -385,7 +385,7 @@ class ConversionPlannerTest {
         disposition: AdapterDisposition,
     ) = AdapterDecision(
         id = id,
-        version = 1,
+        version = if (id == "action-popup-entry") 2 else 1,
         risk = if (disposition == AdapterDisposition.REQUIRES_APPROVAL) {
             AdapterRisk.BEHAVIOR_CHANGE
         } else {

@@ -3,6 +3,11 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
@@ -267,23 +272,215 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
-    fun `requires approval for an inaccessible action popup with an existing content script`() {
+    fun `proposes option page conversion only with verified profile evidence`() {
         val source = extension(
             contentFile = "content.js",
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<script src=\"popup.js\"></script>")
-        source.resolve("popup.js").writeText("chrome.runtime.getURL('popup.html');")
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        val unsupported = profile.copy(supportedFeatures = emptySet())
+        val supported = profile.copy(
+            supportedFeatures = setOf("extension.options-page.user-accessible"),
+        )
 
-        val report = MobilePatternAnalyzer().analyze(source, profile)
+        val unavailable = MobilePatternAnalyzer().analyze(source, unsupported)
+            .decision("action-popup-entry")
+        val convertible = MobilePatternAnalyzer().analyze(source, supported)
+            .decision("action-popup-entry")
 
-        val decision = report.decision("action-popup-entry")
+        assertNotNull(unavailable)
+        assertEquals(AdapterDisposition.UNAVAILABLE, unavailable.disposition)
+        assertEquals(emptyList(), unavailable.changes)
+        assertEquals(
+            listOf("browser profile에서 삼성 Add-ons option page 진입을 확인하지 못했습니다."),
+            unavailable.remainingLimitations,
+        )
+        assertNotNull(convertible)
+        assertEquals(2, convertible.version)
+        assertEquals(AdapterRisk.BEHAVIOR_CHANGE, convertible.risk)
+        assertEquals(AdapterDisposition.REQUIRES_APPROVAL, convertible.disposition)
+        assertEquals(
+            listOf("삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다."),
+            convertible.changes,
+        )
+        assertEquals(
+            listOf("popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다."),
+            convertible.remainingLimitations,
+        )
+        assertEquals("manifest.json", convertible.evidence.single().relativePath)
+    }
+
+    @Test
+    fun `preserves existing options ui and options page without proposing conversion`() {
+        listOf<Pair<String, JsonElement>>(
+            "options_ui" to JsonObject(
+                linkedMapOf(
+                    "page" to JsonPrimitive("settings.html"),
+                    "open_in_tab" to JsonPrimitive(true),
+                ),
+            ),
+            "options_page" to JsonPrimitive("settings.html"),
+        ).forEach { (name, value) ->
+            val source = extension(
+                contentFile = "content.js",
+                contentSource = "console.log('content');",
+                popup = "popup.html",
+            )
+            source.resolve("popup.html").writeText("<p>popup</p>")
+            source.resolve("settings.html").writeText("<p>settings</p>")
+            val manifestPath = source.resolve("manifest.json")
+            val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
+            manifestPath.writeText(JsonObject(manifest + (name to value)).toString())
+
+            assertNull(
+                MobilePatternAnalyzer().analyze(
+                    source,
+                    profile.copy(
+                        supportedFeatures =
+                            setOf("extension.options-page.user-accessible"),
+                    ),
+                )
+                    .decision("action-popup-entry"),
+            )
+        }
+    }
+
+    @Test
+    fun `rejects malformed options ui without proposing a conversion`() {
+        listOf<JsonElement>(
+            JsonPrimitive("settings.html"),
+            JsonObject(emptyMap()),
+            JsonObject(mapOf("page" to JsonPrimitive(1))),
+            JsonObject(mapOf("page" to JsonPrimitive(""))),
+            JsonObject(mapOf("page" to JsonPrimitive("../settings.html"))),
+            JsonObject(mapOf("page" to JsonPrimitive("https://example.com/settings.html"))),
+            JsonObject(
+                mapOf(
+                    "page" to JsonPrimitive("settings.html"),
+                    "open_in_tab" to JsonPrimitive("true"),
+                ),
+            ),
+        ).forEach { optionsUi ->
+            val source = popupExtensionWithManifestEntry("options_ui", optionsUi)
+            source.resolve("settings.html").writeText("<p>settings</p>")
+
+            val decision = MobilePatternAnalyzer().analyze(
+                source,
+                optionsPageProfile,
+            ).decision("action-popup-entry")
+
+            assertNotNull(decision, optionsUi.toString())
+            assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+            assertFalse(decision.applied)
+            assertEquals(emptyList(), decision.changes)
+            assertTrue(decision.remainingLimitations.isNotEmpty())
+        }
+    }
+
+    @Test
+    fun `rejects malformed or missing options page resources`() {
+        listOf(
+            JsonPrimitive(true) to true,
+            JsonPrimitive("missing.html") to true,
+            JsonPrimitive("settings.html") to false,
+        ).forEach { (optionsPage, omitResource) ->
+            val source = popupExtensionWithManifestEntry("options_page", optionsPage)
+            if (!omitResource) {
+                source.resolve("settings.html").writeText("<p>settings</p>")
+            }
+
+            val decision = MobilePatternAnalyzer().analyze(
+                source,
+                optionsPageProfile,
+            ).decision("action-popup-entry")
+
+            if (omitResource) {
+                assertNotNull(decision)
+                assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+                assertFalse(decision.applied)
+                assertEquals(emptyList(), decision.changes)
+            } else {
+                assertNull(decision)
+            }
+        }
+    }
+
+    @Test
+    fun `requires approval without content script tabs or background worker`() {
+        val source = extension(
+            contentFile = "unused.js",
+            contentSource = "console.log('unused');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        val manifestPath = source.resolve("manifest.json")
+        val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
+        manifestPath.writeText(JsonObject(manifest - "content_scripts").toString())
+
+        val decision = MobilePatternAnalyzer().analyze(
+            source,
+            optionsPageProfile.copy(supportedApis = emptySet()),
+        ).decision("action-popup-entry")
+
         assertNotNull(decision)
+        assertEquals(2, decision.version)
         assertEquals(AdapterDisposition.REQUIRES_APPROVAL, decision.disposition)
-        assertEquals(AdapterRisk.BEHAVIOR_CHANGE, decision.risk)
-        assertEquals("manifest.json", decision.evidence.single().relativePath)
-        assertEquals(ConversionState.REQUIRES_APPROVAL, report.conversionState)
+    }
+
+    @Test
+    fun `reports applied only for exact options ui and provenance`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('content');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        writeOptionsUi(source, "popup.html")
+        Files.createDirectories(source.resolve("_sixbridge"))
+        source.resolve("_sixbridge/action-popup-entry.v2.json").writeText(
+            """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, optionsPageProfile)
+            .decision("action-popup-entry")
+
+        assertNotNull(decision)
+        assertEquals(2, decision.version)
+        assertEquals(AdapterDisposition.REQUIRES_APPROVAL, decision.disposition)
+        assertTrue(decision.applied)
+    }
+
+    @Test
+    fun `does not report applied for missing tampered or popup mismatched provenance`() {
+        listOf(
+            null to "popup.html",
+            """{"adapter":"action-popup-entry","version":2,"popup":"other.html"}""" to
+                "popup.html",
+            """{"adapter":"action-popup-entry","version":1,"popup":"popup.html"}""" to
+                "popup.html",
+            """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""" to
+                "other.html",
+        ).forEach { (provenance, optionsPage) ->
+            val source = extension(
+                contentFile = "content.js",
+                contentSource = "console.log('content');",
+                popup = "popup.html",
+            )
+            source.resolve("popup.html").writeText("<p>popup</p>")
+            source.resolve("other.html").writeText("<p>other</p>")
+            writeOptionsUi(source, optionsPage)
+            if (provenance != null) {
+                Files.createDirectories(source.resolve("_sixbridge"))
+                source.resolve("_sixbridge/action-popup-entry.v2.json")
+                    .writeText(provenance)
+            }
+
+            val decision = MobilePatternAnalyzer().analyze(source, optionsPageProfile)
+                .decision("action-popup-entry")
+
+            assertTrue(decision?.applied != true)
+        }
     }
 
     @Test
@@ -342,7 +539,10 @@ class MobilePatternAnalyzerTest {
         )
         source.resolve("popup.html").writeText("<p>popup</p>")
         val fallbackProfile = profile.copy(
-            supportedFeatures = setOf("storage.local"),
+            supportedFeatures = setOf(
+                "extension.options-page.user-accessible",
+                "storage.local",
+            ),
             unavailableFeatures = setOf("storage.sync"),
         )
 
@@ -375,7 +575,10 @@ class MobilePatternAnalyzerTest {
         )
         approvalAndAutomatic.resolve("popup.html").writeText("<p>popup</p>")
         val fallbackProfile = profile.copy(
-            supportedFeatures = setOf("storage.local"),
+            supportedFeatures = setOf(
+                "extension.options-page.user-accessible",
+                "storage.local",
+            ),
             unavailableFeatures = setOf("storage.sync"),
         )
         val approvalReport = MobilePatternAnalyzer().analyze(
@@ -606,6 +809,38 @@ class MobilePatternAnalyzerTest {
         return root
     }
 
+    private fun popupExtensionWithManifestEntry(
+        name: String,
+        value: JsonElement,
+    ): Path {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('content');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        val manifestPath = source.resolve("manifest.json")
+        val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
+        manifestPath.writeText(JsonObject(manifest + (name to value)).toString())
+        return source
+    }
+
+    private fun writeOptionsUi(source: Path, page: String) {
+        val manifestPath = source.resolve("manifest.json")
+        val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
+        manifestPath.writeText(
+            JsonObject(
+                manifest +
+                    ("options_ui" to JsonObject(
+                        linkedMapOf(
+                            "page" to JsonPrimitive(page),
+                            "open_in_tab" to JsonPrimitive(true),
+                        ),
+                    )),
+            ).toString(),
+        )
+    }
+
     private fun manifestKey(): String {
         val publicKey = KeyPairGenerator.getInstance("RSA")
             .apply { initialize(1024) }
@@ -623,7 +858,14 @@ class MobilePatternAnalyzerTest {
         """document.addEventListener("mouseup", () => use(getSelection()));"""
 
     private val fallbackProfile = profile.copy(
-        supportedFeatures = setOf("storage.local"),
+        supportedFeatures = setOf(
+            "extension.options-page.user-accessible",
+            "storage.local",
+        ),
         unavailableFeatures = setOf("storage.sync"),
+    )
+
+    private val optionsPageProfile = profile.copy(
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 }
