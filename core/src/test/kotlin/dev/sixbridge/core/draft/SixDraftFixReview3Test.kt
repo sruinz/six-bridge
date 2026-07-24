@@ -35,6 +35,33 @@ class SixDraftFixReview3Test {
         )
     }
 
+    @Test
+    fun `typed writer rejects lone high and low surrogates before UTF8 encoding`() {
+        listOf("\uD800", "\uDC00").forEach { loneSurrogate ->
+            val report = reportWithIssues(0).copy(
+                extensionName = "invalid-$loneSurrogate",
+            )
+
+            assertFailsWith<IllegalArgumentException> {
+                SixDraftJson.encodeCompatibility(report)
+            }
+        }
+    }
+
+    @Test
+    fun `typed writer preserves a valid surrogate pair through strict reader`() {
+        val extensionName = "Rocket-\uD83D\uDE80"
+        val report = reportWithIssues(0).copy(extensionName = extensionName)
+
+        val decoded = SixDraftJson.decodeCompatibility(
+            "compatibility.json",
+            SixDraftJson.encodeCompatibility(report),
+        )
+
+        assertEquals(extensionName, decoded.extensionName)
+        assertEquals(report, decoded)
+    }
+
     private fun reportWithIssues(count: Int): CompatibilityReport =
         CompatibilityReport(
             status = CompatibilityStatus.COMPATIBLE,

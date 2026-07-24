@@ -268,6 +268,7 @@ internal object SixDraftJson {
         name: String,
         value: JsonObject,
     ): ByteArray {
+        requireValidStrings(value, name, 0)
         val bytes = canonicalBytes(value)
         parseCanonicalObject(name, bytes)
         return bytes
