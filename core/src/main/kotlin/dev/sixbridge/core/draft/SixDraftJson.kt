@@ -28,7 +28,8 @@ import java.util.Base64
 internal object SixDraftJson {
     private val json = Json
 
-    fun encodeDraft(value: DraftMetadata): ByteArray = canonicalBytes(
+    fun encodeDraft(value: DraftMetadata): ByteArray = encodeCanonicalObject(
+        "draft.json",
         objectOf(
             "adapterVersions" to JsonObject(
                 value.adapterVersions.mapValues { JsonPrimitive(it.value) },
@@ -59,7 +60,8 @@ internal object SixDraftJson {
         )
     }
 
-    fun encodeInput(value: DraftInputMetadata): ByteArray = canonicalBytes(
+    fun encodeInput(value: DraftInputMetadata): ByteArray = encodeCanonicalObject(
+        "input.json",
         objectOf(
             "browserProfileSha256" to JsonPrimitive(value.browserProfileSha256),
             "inputKind" to JsonPrimitive(value.inputKind.jsonValue()),
@@ -85,7 +87,8 @@ internal object SixDraftJson {
         )
     }
 
-    fun encodePlan(value: DraftConversionPlan): ByteArray = canonicalBytes(
+    fun encodePlan(value: DraftConversionPlan): ByteArray = encodeCanonicalObject(
+        "conversion-plan.json",
         objectOf(
             "browserProfileSha256" to JsonPrimitive(value.browserProfileSha256),
             "planSha256" to JsonPrimitive(value.planSha256),
@@ -139,7 +142,8 @@ internal object SixDraftJson {
         requireNotNull(value.browserProfileSha256) {
             "compatibility schema 3에는 browserProfileSha256이 필요합니다."
         }
-        return canonicalBytes(
+        return encodeCanonicalObject(
+            "compatibility.json",
             objectOf(
                 "adapterDecisions" to JsonArray(
                     value.adapterDecisions.map(::encodeAdapterDecision),
@@ -207,7 +211,8 @@ internal object SixDraftJson {
     fun compatibilitySha256(value: CompatibilityReport): String =
         DraftSignature.sha256(encodeCompatibility(value))
 
-    fun encodeExpected(value: DraftExpected): ByteArray = canonicalBytes(
+    fun encodeExpected(value: DraftExpected): ByteArray = encodeCanonicalObject(
+        "expected.json",
         objectOf(
             "planSha256" to JsonPrimitive(value.planSha256),
             "reportSha256" to JsonPrimitive(value.reportSha256),
@@ -227,7 +232,8 @@ internal object SixDraftJson {
         )
     }
 
-    fun encodeSignature(value: DraftSignatureRecord): ByteArray = canonicalBytes(
+    fun encodeSignature(value: DraftSignatureRecord): ByteArray = encodeCanonicalObject(
+        DraftSignature.ENTRY_NAME,
         objectOf(
             "algorithm" to JsonPrimitive(value.algorithm),
             "keyId" to JsonPrimitive(value.keyId),
@@ -256,6 +262,15 @@ internal object SixDraftJson {
 
     fun validateCanonicalDocument(name: String, bytes: ByteArray) {
         parseCanonicalObject(name, bytes)
+    }
+
+    private fun encodeCanonicalObject(
+        name: String,
+        value: JsonObject,
+    ): ByteArray {
+        val bytes = canonicalBytes(value)
+        parseCanonicalObject(name, bytes)
+        return bytes
     }
 
     private fun encodeIssue(value: CompatibilityIssue): JsonObject = objectOf(
