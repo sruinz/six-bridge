@@ -40,6 +40,24 @@ class ExtensionZipTest {
     }
 
     @Test
+    fun `prunes excluded native subtrees before validating their entries`() {
+        val source = Files.createTempDirectory("six-pruned-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Pruned","version":"1"}""",
+        )
+        val excluded = Files.createDirectories(source.resolve(".git/objects"))
+        val outside = Files.createTempFile("six-pruned-outside", ".bin")
+        Files.createSymbolicLink(excluded.resolve("linked-object"), outside)
+
+        val archive = ExtensionZip.createBytes(source)
+        val names = ZipInputStream(archive.inputStream()).use { zip ->
+            generateSequence { zip.nextEntry }.map(ZipEntry::getName).toList()
+        }
+
+        assertEquals(listOf("manifest.json"), names)
+    }
+
+    @Test
     fun `rejects escaping case-colliding and normalized duplicate zip paths`() {
         val escaping = zipWith(
             "../manifest.json" to """{"name":"escape"}""",

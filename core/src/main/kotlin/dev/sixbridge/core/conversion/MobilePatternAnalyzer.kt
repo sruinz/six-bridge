@@ -24,8 +24,7 @@ class MobilePatternAnalyzer(
         extensionRoot: Path,
         profile: BrowserProfile,
     ): CompatibilityReport {
-        val stable = StableExtensionAnalysis.captureLive(extensionRoot)
-        return try {
+        return StableExtensionAnalysis.captureLive(extensionRoot).use { stable ->
             val report = analyzeStable(
                 stable.root,
                 profile,
@@ -33,8 +32,6 @@ class MobilePatternAnalyzer(
             )
             stable.verifyLiveSource()
             report
-        } finally {
-            stable.close()
         }
     }
 
@@ -43,15 +40,12 @@ class MobilePatternAnalyzer(
         sourceArchive: ByteArray,
         profile: BrowserProfile,
     ): CompatibilityReport {
-        val stable = StableExtensionAnalysis.fromArchive(sourceArchive)
-        return try {
+        return StableExtensionAnalysis.fromArchive(sourceArchive).use { stable ->
             analyzeStable(
                 stable.root,
                 profile,
                 stable.sourceSha256,
             )
-        } finally {
-            stable.close()
         }
     }
 

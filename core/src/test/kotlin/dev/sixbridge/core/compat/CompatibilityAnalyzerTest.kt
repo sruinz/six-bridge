@@ -8,6 +8,7 @@ import java.util.Base64
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class CompatibilityAnalyzerTest {
@@ -169,7 +170,7 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
-    fun `blocks a declared resource symlink that resolves outside the extension root`() {
+    fun `canonical archive rejects a declared resource symlink`() {
         val source = Files.createTempDirectory("six-symlink-resource")
         val outside = Files.createTempFile("six-outside-resource", ".js")
         Files.createSymbolicLink(source.resolve("background.js"), outside)
@@ -184,10 +185,9 @@ class CompatibilityAnalyzerTest {
             """.trimIndent(),
         )
 
-        val report = CompatibilityAnalyzer().analyze(source, profile)
-
-        assertEquals(CompatibilityStatus.BLOCKED, report.status)
-        assertTrue(report.issues.any { it.code == "manifest_resource_invalid" })
+        assertFailsWith<IllegalArgumentException> {
+            CompatibilityAnalyzer().analyze(source, profile)
+        }
     }
 
     @Test
@@ -854,7 +854,6 @@ class CompatibilityAnalyzerTest {
         val source = Files.createDirectory(container.resolve("extension"))
         val outside = container.resolve("outside.test.js")
         outside.writeText("chrome.webstorePrivate.install();")
-        source.resolve("link.test.js").let { Files.createSymbolicLink(it, outside) }
         source.resolve("query.test.js").writeText("chrome.downloads.download({});")
         source.resolve("fragment.test.js").writeText(
             "chrome.webstorePrivate.install();",

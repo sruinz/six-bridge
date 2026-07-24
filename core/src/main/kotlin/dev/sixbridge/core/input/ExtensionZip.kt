@@ -11,11 +11,13 @@ import java.nio.channels.Channels
 import java.nio.channels.FileChannel
 import java.nio.channels.WritableByteChannel
 import java.nio.file.FileAlreadyExistsException
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.OpenOption
 import java.nio.file.Path
 import java.nio.file.SecureDirectoryStream
+import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.text.Normalizer
@@ -225,7 +227,7 @@ object ExtensionZip {
         includeProjectMarker: Boolean,
     ): List<SourceEntry> {
         val inventory = captureInventory(sourceRoot, includeProjectMarker)
-        val files = inventory.filter { it.included }
+        val files = inventory
         require(files.size <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
         var totalSize = 0L
         files.forEach { entry ->
@@ -255,44 +257,55 @@ object ExtensionZip {
     ): List<SourceInventoryEntry> {
         val normalizedPaths = mutableMapOf<String, String>()
         val foldedPaths = mutableMapOf<String, String>()
-        val inventory = Files.walk(sourceRoot).use { stream ->
-            stream.iterator().asSequence()
-                .filter { it != sourceRoot }
-                .map { path ->
-                    val attributes = Files.readAttributes(
-                        path,
-                        BasicFileAttributes::class.java,
-                        LinkOption.NOFOLLOW_LINKS,
-                    )
-                    val relative = sourceRoot.relativize(path).invariantSeparatorsPathString
-                    val name = validateRelativePath(relative, attributes.isDirectory)
-                    registerPath(name, relative, normalizedPaths, foldedPaths)
-                    require(!attributes.isSymbolicLink &&
-                        (attributes.isDirectory || attributes.isRegularFile)
+        val inventory = mutableListOf<SourceInventoryEntry>()
+        Files.walkFileTree(
+            sourceRoot,
+            object : SimpleFileVisitor<Path>() {
+                override fun preVisitDirectory(
+                    directory: Path,
+                    attributes: BasicFileAttributes,
+                ): FileVisitResult {
+                    if (
+                        directory != sourceRoot &&
+                        isExcludedDirectory(sourceRoot.relativize(directory))
                     ) {
-                        "확장 소스에는 일반 파일과 디렉터리만 허용됩니다: $path"
+                        return FileVisitResult.SKIP_SUBTREE
                     }
-                    val included = attributes.isRegularFile &&
-                        shouldInclude(sourceRoot.relativize(path), includeProjectMarker)
-                    if (included) {
-                        require(attributes.size() <= MAX_ENTRY_SIZE) {
-                            "ZIP 개별 파일 크기가 제한을 초과합니다: $path"
-                        }
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFile(
+                    path: Path,
+                    attributes: BasicFileAttributes,
+                ): FileVisitResult {
+                    val relativePath = sourceRoot.relativize(path)
+                    if (!shouldInclude(relativePath, includeProjectMarker)) {
+                        return FileVisitResult.CONTINUE
                     }
-                    SourceInventoryEntry(
+                    val relative = relativePath.invariantSeparatorsPathString
+                    val name = validateRelativePath(relative, directory = false)
+                    registerPath(name, relative, normalizedPaths, foldedPaths)
+                    require(
+                        !attributes.isSymbolicLink &&
+                            attributes.isRegularFile,
+                    ) {
+                        "확장 소스에는 일반 파일만 허용됩니다: $path"
+                    }
+                    require(attributes.size() <= MAX_ENTRY_SIZE) {
+                        "ZIP 개별 파일 크기가 제한을 초과합니다: $path"
+                    }
+                    inventory += SourceInventoryEntry(
                         path = path,
                         name = name,
-                        directory = attributes.isDirectory,
                         size = attributes.size(),
                         modifiedMillis = attributes.lastModifiedTime().toMillis(),
                         fileKey = attributes.fileKey()?.toString(),
-                        included = included,
                     )
+                    return FileVisitResult.CONTINUE
                 }
-                .sortedBy(SourceInventoryEntry::name)
-                .toList()
-        }
-        return inventory
+            },
+        )
+        return inventory.sortedBy(SourceInventoryEntry::name)
     }
 
     private fun readSourceEntry(entry: SourceInventoryEntry): SourceEntry {
@@ -377,6 +390,9 @@ object ExtensionZip {
         }
         return relative.fileName.toString() !in EXCLUDED_FILES
     }
+
+    private fun isExcludedDirectory(relative: Path): Boolean =
+        relative.any { it.toString() in EXCLUDED_DIRECTORIES }
 
     private fun locateManifestRoot(extracted: Path): Path {
         if (Files.isRegularFile(extracted.resolve("manifest.json"), LinkOption.NOFOLLOW_LINKS)) {
@@ -626,16 +642,13 @@ object ExtensionZip {
     private data class SourceInventoryEntry(
         val path: Path,
         val name: String,
-        val directory: Boolean,
         val size: Long,
         val modifiedMillis: Long,
         val fileKey: String?,
-        val included: Boolean,
     ) {
         fun matches(attributes: BasicFileAttributes): Boolean =
             !attributes.isSymbolicLink &&
                 attributes.isRegularFile &&
-                !directory &&
                 attributes.size() == size &&
                 attributes.lastModifiedTime().toMillis() == modifiedMillis &&
                 attributes.fileKey()?.toString() == fileKey

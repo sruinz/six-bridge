@@ -150,15 +150,23 @@ internal object WorkspaceTreeDigest {
         )
     }
 
-    internal fun aclEntries(entries: List<AclEntry>): String =
-        entries.joinToString("|") { entry ->
-            listOf(
-                entry.type().name,
-                entry.principal().name,
-                entry.flags().map(Enum<*>::name).sorted().joinToString(","),
-                entry.permissions().map(Enum<*>::name).sorted().joinToString(","),
-            ).joinToString(":")
+    internal fun aclEntries(entries: List<AclEntry>): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.field(entries.size.toString())
+        entries.forEach { entry ->
+            digest.field(entry.type().name)
+            digest.field(entry.principal().name)
+            digest.enumSet(entry.flags())
+            digest.enumSet(entry.permissions())
         }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun MessageDigest.enumSet(values: Set<Enum<*>>) {
+        val sorted = values.map(Enum<*>::name).sorted()
+        field(sorted.size.toString())
+        sorted.forEach { field(it) }
+    }
 
     private fun MessageDigest.field(value: String) {
         val bytes = value.toByteArray(UTF_8)

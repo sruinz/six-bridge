@@ -601,7 +601,7 @@ class ActionPopupEntryAdapterTest {
             root.resolve("content.js").writeText("console.log('content');")
             root.resolve("second.js").writeText("console.log('second');")
         }
-        popup?.let { path ->
+        popup?.takeUnless { '\\' in it }?.let { path ->
             val output = root.resolve(path)
             Files.createDirectories(output.parent)
             output.writeText("<p>popup</p>")

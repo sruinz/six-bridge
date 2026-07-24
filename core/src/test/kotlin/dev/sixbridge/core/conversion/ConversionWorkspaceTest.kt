@@ -7,11 +7,13 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
+import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -69,7 +71,7 @@ class ConversionWorkspaceTest {
     }
 
     @Test
-    fun `public snapshot rejects live A to copied B to live A provenance`() {
+    fun `public snapshot keeps archive A roots while live source changes A to B to A`() {
         val source = source("six-cross-copy-aba")
         repeat(2_500) { index ->
             source.resolve("padding-$index.txt").writeText("padding-$index")
@@ -79,36 +81,109 @@ class ConversionWorkspaceTest {
         script.writeText("A")
         Files.setLastModifiedTime(script, fixedTime)
 
+        val rootsBefore = conversionRoots()
         val workspace = ConversionWorkspace()
+        val workspaceRoot = waitForNewConversionRoot(rootsBefore)
         val snapshotTask = FutureTask {
             workspace.snapshot(source)
         }
         val snapshotThread = Thread(snapshotTask, "snapshot-aba-victim")
         snapshotThread.start()
         try {
-            waitForFrame(
-                snapshotThread,
-                WorkspaceTreeDigest::class.java.name,
-                "capture",
-            )
+            val snapshotRoot = waitForSnapshotRoot(workspaceRoot)
+            waitForPath(snapshotRoot.resolve("original/manifest.json"))
             script.writeText("B")
             Files.setLastModifiedTime(script, fixedTime)
 
-            waitForFrame(
-                snapshotThread,
-                dev.sixbridge.core.input.ExtensionZip::class.java.name,
-                "createBytes",
+            waitForPathOrCompletion(
+                snapshotRoot.resolve("working/manifest.json"),
+                snapshotTask,
             )
             script.writeText("A")
             Files.setLastModifiedTime(script, fixedTime)
 
-            val error = assertFailsWith<ExecutionException> {
-                snapshotTask.get(10, TimeUnit.SECONDS)
-            }
-            assertTrue(error.cause is IllegalStateException)
+            val snapshot = snapshotTask.get(10, TimeUnit.SECONDS)
+            assertEquals("A", snapshot.originalRoot.resolve("zzzz-content.js").readText())
+            assertEquals("A", snapshot.workingRoot.resolve("zzzz-content.js").readText())
         } finally {
+            script.writeText("A")
+            Files.setLastModifiedTime(script, fixedTime)
             snapshotThread.join(5_000)
+            runCatching { workspace.close() }
+        }
+    }
+
+    @Test
+    fun `snapshot ignores excluded native subtrees and extracts writable roots`() {
+        val source = source("six-canonical-snapshot")
+        val script = source.resolve("content.js")
+        script.writeText("source")
+        val excluded = Files.createDirectories(source.resolve(".git/objects"))
+        val outside = Files.createTempFile("six-canonical-outside", ".bin")
+        Files.createSymbolicLink(excluded.resolve("linked-object"), outside)
+        Files.setPosixFilePermissions(
+            script,
+            setOf(PosixFilePermission.OWNER_READ),
+        )
+
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(source)
+
+            assertFalse(Files.exists(snapshot.originalRoot.resolve(".git")))
+            assertFalse(Files.exists(snapshot.workingRoot.resolve(".git")))
+            snapshot.workingRoot.resolve("content.js").writeText("working")
+            assertEquals("source", script.readText())
+            assertEquals(
+                "working",
+                snapshot.workingRoot.resolve("content.js").readText(),
+            )
+        }
+    }
+
+    @Test
+    fun `close normalizes read-only owned directories before deletion`() {
+        val source = source("six-read-only-cleanup")
+        Files.createDirectories(source.resolve("nested"))
+            .resolve("content.js")
+            .writeText("content")
+        val workspace = ConversionWorkspace()
+        val snapshot = workspace.snapshot(source)
+        val workspaceRoot = requireNotNull(requireNotNull(snapshot.originalRoot.parent).parent)
+        val readOnlyDirectories = listOf(
+            snapshot.originalRoot.resolve("nested"),
+            snapshot.workingRoot.resolve("nested"),
+        )
+        readOnlyDirectories.forEach { directory ->
+            Files.setPosixFilePermissions(
+                directory.resolve("content.js"),
+                setOf(PosixFilePermission.OWNER_READ),
+            )
+            Files.setPosixFilePermissions(
+                directory,
+                setOf(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_EXECUTE,
+                ),
+            )
+        }
+
+        try {
             workspace.close()
+            assertFalse(Files.exists(workspaceRoot))
+        } finally {
+            readOnlyDirectories.forEach { directory ->
+                runCatching {
+                    Files.setPosixFilePermissions(
+                        directory,
+                        setOf(
+                            PosixFilePermission.OWNER_READ,
+                            PosixFilePermission.OWNER_WRITE,
+                            PosixFilePermission.OWNER_EXECUTE,
+                        ),
+                    )
+                }
+            }
+            runCatching { workspace.close() }
         }
     }
 
@@ -295,6 +370,27 @@ class ConversionWorkspaceTest {
             Thread.onSpinWait()
         }
         error("snapshot root를 관찰하지 못했습니다.")
+    }
+
+    private fun waitForPath(path: Path) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            if (Files.exists(path)) return
+            Thread.onSpinWait()
+        }
+        error("snapshot 경로를 관찰하지 못했습니다: ${path.fileName}")
+    }
+
+    private fun waitForPathOrCompletion(
+        path: Path,
+        task: FutureTask<*>,
+    ) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            if (Files.exists(path) || task.isDone) return
+            Thread.onSpinWait()
+        }
+        error("snapshot 경로 또는 작업 완료를 관찰하지 못했습니다: ${path.fileName}")
     }
 
     private fun hashTree(root: Path): Map<String, String> =

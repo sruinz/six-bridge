@@ -13,6 +13,7 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class NativeWorkspaceTreeTest {
@@ -113,6 +114,22 @@ class NativeWorkspaceTreeTest {
         assertTrue(
             WorkspaceTreeDigest.aclEntries(listOf(first, second)) !=
                 WorkspaceTreeDigest.aclEntries(listOf(second, first)),
+        )
+    }
+
+    @Test
+    fun `ACL principal delimiters cannot collide with entry boundaries`() {
+        val single = listOf(
+            acl(principal("x::READ_DATA|ALLOW:y")),
+        )
+        val split = listOf(
+            acl(principal("x")),
+            acl(principal("y")),
+        )
+
+        assertNotEquals(
+            WorkspaceTreeDigest.aclEntries(single),
+            WorkspaceTreeDigest.aclEntries(split),
         )
     }
 

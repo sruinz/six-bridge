@@ -8,7 +8,6 @@ import java.nio.file.attribute.AclFileAttributeView
 import java.nio.file.attribute.BasicFileAttributeView
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
-import java.util.Comparator
 
 internal object NativeWorkspaceTree {
     fun copy(source: Path, destination: Path): Path {
@@ -140,9 +139,6 @@ internal object NativeWorkspaceTree {
     }
 
     private fun deleteTree(path: Path) {
-        if (!Files.exists(path, NOFOLLOW_LINKS)) return
-        Files.walk(path).use { paths ->
-            paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
-        }
+        OwnedTempTree.delete(path)
     }
 }

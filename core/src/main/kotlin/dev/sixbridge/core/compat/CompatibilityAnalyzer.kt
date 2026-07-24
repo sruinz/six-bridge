@@ -22,8 +22,7 @@ class CompatibilityAnalyzer(
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
-        val stable = StableExtensionAnalysis.captureLive(extensionRoot)
-        return try {
+        return StableExtensionAnalysis.captureLive(extensionRoot).use { stable ->
             val report = analyzeStable(
                 stable.root,
                 profile,
@@ -31,8 +30,6 @@ class CompatibilityAnalyzer(
             )
             stable.verifyLiveSource()
             report
-        } finally {
-            stable.close()
         }
     }
 

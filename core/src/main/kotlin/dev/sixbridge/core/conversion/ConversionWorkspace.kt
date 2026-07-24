@@ -19,7 +19,6 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
-import java.util.Comparator
 import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -46,37 +45,51 @@ class ConversionWorkspace : AutoCloseable {
                 source,
                 requireOwnerOnlyMarker,
             )
-            val sourceTree = captureInitialSource(source)
-            require(
-                sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
-                    source,
-                    requireOwnerOnlyMarker,
-                ),
-            ) {
-                "snapshot 중 source project identity marker가 변경되었습니다."
-            }
-            val original = NativeWorkspaceTree.copy(
-                source,
+            val sourceZip = ExtensionZip.createBytes(
+                sourceRoot = source,
+                includeProjectMarker = true,
+            )
+            val original = ExtensionZip.extract(
+                sourceZip,
                 snapshotRoot.resolve("original"),
             )
-            requireSnapshotCopy(sourceTree, original, "original")
             val working = NativeWorkspaceTree.copy(
                 original,
                 snapshotRoot.resolve("working"),
             )
-            requireSnapshotCopy(sourceTree, working, "working")
-            check(
-                sourceTree == WorkspaceTreeDigest.capture(source),
+            require(
+                sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
+                    original,
+                    requireOwnerOnly = false,
+                ),
             ) {
-                "snapshot 중 source native tree가 변경되었습니다."
+                "snapshot archive의 source project identity marker가 다릅니다."
             }
-            val sourceZip = ExtensionZip.createBytes(
-                sourceRoot = original,
-                includeProjectMarker = true,
-            )
-            val sourceSha256 = sha256(sourceZip)
-            check(sourceTree == WorkspaceTreeDigest.capture(source)) {
-                "snapshot source bundle 생성 중 source native tree가 변경되었습니다."
+            check(
+                sourceZip.contentEquals(
+                    ExtensionZip.createBytes(
+                        sourceRoot = original,
+                        includeProjectMarker = true,
+                    ),
+                ) &&
+                    sourceZip.contentEquals(
+                        ExtensionZip.createBytes(
+                            sourceRoot = working,
+                            includeProjectMarker = true,
+                        ),
+                    ),
+            ) {
+                "snapshot archive 추출 결과가 canonical source와 다릅니다."
+            }
+            check(
+                sourceZip.contentEquals(
+                    ExtensionZip.createBytes(
+                        sourceRoot = source,
+                        includeProjectMarker = true,
+                    ),
+                ),
+            ) {
+                "snapshot 완료 전 canonical source archive가 변경되었습니다."
             }
             require(
                 sourceProjectIdentity == SourceProjectIdentityStore.readSourceMarker(
@@ -86,6 +99,7 @@ class ConversionWorkspace : AutoCloseable {
             ) {
                 "snapshot 완료 전 source project identity marker가 변경되었습니다."
             }
+            val sourceSha256 = sha256(sourceZip)
             Ownership.register(
                 originalRoot = original,
                 workingRoot = working,
@@ -180,15 +194,6 @@ class ConversionWorkspace : AutoCloseable {
         }
     }
 
-    private fun captureInitialSource(source: Path): WorkspaceTreeDigest.State =
-        try {
-            WorkspaceTreeDigest.capture(source)
-        } catch (error: IllegalStateException) {
-            throw IllegalArgumentException(
-                error.message ?: "확장 source tree를 검증할 수 없습니다.",
-            )
-        }
-
     private fun verifyPlan(
         snapshot: ExtensionSnapshot,
         profile: BrowserProfile,
@@ -264,19 +269,6 @@ class ConversionWorkspace : AutoCloseable {
         }
         check(report.adapterDecisions.isEmpty() || selected.isNotEmpty()) {
             "adapter 결정이 있는 conversion plan은 no-op일 수 없습니다."
-        }
-    }
-
-    private fun requireSnapshotCopy(
-        expected: WorkspaceTreeDigest.State,
-        copiedRoot: Path,
-        label: String,
-    ) {
-        check(
-            expected.provenanceSha256 ==
-                WorkspaceTreeDigest.capture(copiedRoot).provenanceSha256,
-        ) {
-            "snapshot $label copy가 최초 source provenance와 다릅니다."
         }
     }
 
@@ -966,10 +958,7 @@ class ConversionWorkspace : AutoCloseable {
         )
 
     private fun deleteTree(path: Path) {
-        if (!Files.exists(path, NOFOLLOW_LINKS)) return
-        Files.walk(path).use { paths ->
-            paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
-        }
+        OwnedTempTree.delete(path)
     }
 
     private fun sha256(bytes: ByteArray): String =
