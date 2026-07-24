@@ -479,10 +479,15 @@ class CompatibilityAnalyzer(
             val closingEnd = findHtmlTagEnd(source, closingNameEnd) ?: break
             cursor = closingEnd + 1
         }
+        val hasImportMap = records.any { it.normalizedType == "importmap" }
+        val hasExecutableModule = records.any {
+            it.executable && it.normalizedType == "module"
+        }
         return HtmlScriptScan(
             records = records,
             inlineSource = inlineSource.concatToString(),
-            unresolvedDependency = unresolvedDependency,
+            unresolvedDependency = unresolvedDependency ||
+                (hasImportMap && hasExecutableModule),
         )
     }
 
@@ -579,6 +584,7 @@ class CompatibilityAnalyzer(
             if (codePoint == null ||
                 !Character.isValidCodePoint(codePoint) ||
                 codePoint in 0xd800..0xdfff ||
+                codePoint in 0x80..0x9f ||
                 codePoint == 0
             ) {
                 return DecodedText(null, valid = false)

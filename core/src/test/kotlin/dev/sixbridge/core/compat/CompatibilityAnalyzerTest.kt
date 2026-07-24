@@ -1104,6 +1104,190 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `fails closed when import map and module scripts share runtime HTML`() {
+        val source = Files.createTempDirectory("six-import-map-module")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Import map module",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script type="importmap">
+              {"imports":{"mapped":"./mapped.test.js"}}
+            </script>
+            <script type="module">
+              import "mapped";
+              chrome.storage.local.get("value");
+            </script>
+            """.trimIndent(),
+        )
+        source.resolve("mapped.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
+    fun `ignores import map without module scripts`() {
+        val source = Files.createTempDirectory("six-import-map-only")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Import map only",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script type="importmap">
+              {"imports":{"chrome.webstorePrivate":"./ignored.test.js"}}
+            </script>
+            <script>chrome.storage.local.get("value");</script>
+            """.trimIndent(),
+        )
+        source.resolve("ignored.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+    }
+
+    @Test
+    fun `keeps scripts and relative inline modules without import maps`() {
+        val source = Files.createTempDirectory("six-no-import-map")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "No import map",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script>chrome.storage.local.get("value");</script>
+            <script type="module">import "./relative.test.js";</script>
+            """.trimIndent(),
+        )
+        source.resolve("relative.test.js").writeText(
+            "chrome.tabs.query({});",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage", "tabs"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+    }
+
+    @Test
+    fun `applies runtime path boundaries after decoding`() {
+        val container = Files.createTempDirectory("six-decoded-boundaries")
+        val source = Files.createDirectory(container.resolve("extension"))
+        container.resolve("outside.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Decoded boundaries",
+              "version": "1",
+              "background": {
+                "service_worker": "worker.js",
+                "type": "module"
+              },
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("worker.js").writeText(
+            "import \".." + "\\u002f" + "outside.test.js\";\n" +
+                "import \"https" + "\\u003a" + "//example.com/remote.test.js\";\n" +
+                "import \"." + "\\u005c" + "backslash.test.js\";\n" +
+                "import \"./query.test.js" + "\\u003f" + "cache=1\";\n" +
+                "import \"./fragment.test.js" + "\\u0023" + "part\";\n" +
+                "chrome.storage.local.get(\"value\");",
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script src="..&#47;outside.test.js"></script>
+            <script src="https&#58;//example.com/remote.test.js"></script>
+            <script src=".&#92;backslash.test.js"></script>
+            <script src="./query.test.js&#63;cache=1"></script>
+            <script src="./fragment.test.js&#35;part"></script>
+            """.trimIndent(),
+        )
+        source.resolve("backslash.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+        source.resolve("query.test.js").writeText(
+            "chrome.downloads.download({});",
+        )
+        source.resolve("fragment.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+    }
+
+    @Test
+    fun `fails closed for C1 numeric HTML entities`() {
+        val source = Files.createTempDirectory("six-c1-html-entity")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "C1 HTML entity",
+              "version": "1",
+              "action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(
+            """
+            <script src="mapped&#128;.test.js"></script>
+            <script>chrome.storage.local.get("value");</script>
+            """.trimIndent(),
+        )
+        source.resolve("mapped€.test.js").writeText(
+            "chrome.webstorePrivate.install();",
+        )
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertEquals(setOf("storage"), report.usedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+        assertTrue(report.issues.any { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
     fun `scans a large minified string without exhausting the regex stack`() {
         val source = Files.createTempDirectory("six-large-minified-string")
         source.resolve("manifest.json").writeText(
