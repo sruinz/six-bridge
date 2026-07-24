@@ -131,7 +131,7 @@ internal object SixDraftJson {
     }
 
     fun encodeCompatibility(value: CompatibilityReport): ByteArray {
-        value.validate()
+        validateCompatibilitySchema(value)
         requireCanonicalAdapterDecisions(value.adapterDecisions)
         requireNotNull(value.sourceSha256) {
             "compatibility schema 3에는 sourceSha256이 필요합니다."
@@ -200,17 +200,7 @@ internal object SixDraftJson {
             sourceSha256 = value.strictSha256("sourceSha256"),
             browserProfileSha256 = value.strictSha256("browserProfileSha256"),
         )
-        report.validate()
-        require(report.manifestVersion == null || report.manifestVersion in 2..3) {
-            "manifestVersion 범위가 올바르지 않습니다."
-        }
-        listOf(
-            report.manifestKeyExtensionId,
-            report.originalExtensionId,
-            report.convertedExtensionId,
-        ).filterNotNull().forEach {
-            require(EXTENSION_ID.matches(it)) { "extension ID 형식이 올바르지 않습니다." }
-        }
+        validateCompatibilitySchema(report)
         return report
     }
 
@@ -319,6 +309,53 @@ internal object SixDraftJson {
         }
     }
 
+    private fun validateCompatibilitySchema(value: CompatibilityReport) {
+        value.validate()
+        require(value.manifestVersion == null || value.manifestVersion in 2..3) {
+            "manifestVersion 범위가 올바르지 않습니다."
+        }
+        require(value.extensionName == null || value.extensionName.isNotBlank()) {
+            "extensionName은 비어 있을 수 없습니다."
+        }
+        require(value.extensionVersion == null || value.extensionVersion.isNotBlank()) {
+            "extensionVersion은 비어 있을 수 없습니다."
+        }
+        listOf(
+            value.manifestKeyExtensionId,
+            value.originalExtensionId,
+            value.convertedExtensionId,
+        ).filterNotNull().forEach {
+            require(EXTENSION_ID.matches(it)) { "extension ID 형식이 올바르지 않습니다." }
+        }
+        require(
+            (value.declaredPermissions + value.usedApis + value.unsupportedApis)
+                .all(String::isNotBlank),
+        ) {
+            "compatibility 문자열 집합 항목은 비어 있을 수 없습니다."
+        }
+        require(value.issues.all { it.code.isNotBlank() && it.message.isNotBlank() }) {
+            "compatibility issue code와 message는 비어 있을 수 없습니다."
+        }
+        value.adapterDecisions.forEach { decision ->
+            require(ID.matches(decision.id) && decision.version > 0) {
+                "adapterDecision 식별자가 올바르지 않습니다."
+            }
+            require(decision.evidence.all {
+                it.relativePath.isNotBlank() &&
+                    it.detail.isNotBlank() &&
+                    (it.line == null || it.line > 0)
+            }) {
+                "adapterDecision evidence가 올바르지 않습니다."
+            }
+            require(
+                (decision.changes + decision.remainingLimitations)
+                    .all(String::isNotBlank),
+            ) {
+                "adapterDecision 문자열 항목은 비어 있을 수 없습니다."
+            }
+        }
+    }
+
     private fun decodeAdapterDecision(element: JsonElement): AdapterDecision {
         val value = element.jsonObject
         value.requireKeys(ADAPTER_KEYS, "adapterDecision")
@@ -383,12 +420,13 @@ internal object SixDraftJson {
             throw IllegalArgumentException("$name UTF-8이 올바르지 않습니다.", error)
         }
         requireValidUnicodeScalar(text, name)
+        scanJsonLimits(text, name)
         val element = try {
             json.parseToJsonElement(text)
         } catch (error: Exception) {
             throw IllegalArgumentException("$name JSON을 읽을 수 없습니다.", error)
         }
-        requireValidStrings(element, name)
+        requireValidStrings(element, name, 0)
         val canonical = canonicalBytes(element)
         require(bytes.contentEquals(canonical)) {
             "$name JSON은 중복 키가 없고 canonical 형식이어야 합니다."
@@ -397,15 +435,20 @@ internal object SixDraftJson {
     }
 
     private fun canonicalBytes(value: JsonElement): ByteArray =
-        json.encodeToString(JsonElement.serializer(), canonicalize(value))
+        json.encodeToString(JsonElement.serializer(), canonicalize(value, 0))
             .encodeToByteArray()
 
-    private fun canonicalize(value: JsonElement): JsonElement = when (value) {
-        is JsonObject -> JsonObject(
-            value.toSortedMap().mapValues { canonicalize(it.value) },
-        )
-        is JsonArray -> JsonArray(value.map(::canonicalize))
-        else -> value
+    private fun canonicalize(value: JsonElement, depth: Int): JsonElement {
+        require(depth <= MAX_JSON_DEPTH) {
+            "JSON depth가 제한을 초과합니다."
+        }
+        return when (value) {
+            is JsonObject -> JsonObject(
+                value.toSortedMap().mapValues { canonicalize(it.value, depth + 1) },
+            )
+            is JsonArray -> JsonArray(value.map { canonicalize(it, depth + 1) })
+            else -> value
+        }
     }
 
     private fun objectOf(vararg entries: Pair<String, JsonElement>): JsonObject =
@@ -503,15 +546,100 @@ internal object SixDraftJson {
         return decoded
     }
 
-    private fun requireValidStrings(value: JsonElement, name: String) {
+    private fun requireValidStrings(
+        value: JsonElement,
+        name: String,
+        depth: Int,
+    ) {
+        require(depth <= MAX_JSON_DEPTH) {
+            "$name JSON depth가 제한을 초과합니다."
+        }
         when (value) {
             is JsonObject -> value.forEach { (key, child) ->
                 requireValidUnicodeScalar(key, name)
-                requireValidStrings(child, name)
+                requireValidStrings(child, name, depth + 1)
             }
-            is JsonArray -> value.forEach { requireValidStrings(it, name) }
+            is JsonArray -> value.forEach {
+                requireValidStrings(it, name, depth + 1)
+            }
             is JsonPrimitive -> if (value.isString) {
                 requireValidUnicodeScalar(value.content, name)
+            }
+        }
+    }
+
+    private fun scanJsonLimits(text: String, name: String) {
+        var depth = 0
+        var tokens = 0
+        var keys = 0
+        var inString = false
+        var escaped = false
+        var inScalar = false
+        var closedString = false
+
+        fun token() {
+            tokens++
+            require(tokens <= MAX_JSON_TOKENS) {
+                "$name JSON token 수가 제한을 초과합니다."
+            }
+        }
+
+        text.forEach { char ->
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    char == '\\' -> escaped = true
+                    char == '"' -> {
+                        inString = false
+                        closedString = true
+                    }
+                }
+                return@forEach
+            }
+            when (char) {
+                '"' -> {
+                    if (!inScalar) token()
+                    inScalar = false
+                    inString = true
+                    closedString = false
+                }
+                '{', '[' -> {
+                    token()
+                    depth++
+                    require(depth <= MAX_JSON_DEPTH) {
+                        "$name JSON depth가 제한을 초과합니다."
+                    }
+                    inScalar = false
+                    closedString = false
+                }
+                '}', ']' -> {
+                    token()
+                    depth--
+                    inScalar = false
+                    closedString = false
+                }
+                ':' -> {
+                    token()
+                    if (closedString) {
+                        keys++
+                        require(keys <= MAX_JSON_KEYS) {
+                            "$name JSON key 수가 제한을 초과합니다."
+                        }
+                    }
+                    inScalar = false
+                    closedString = false
+                }
+                ',' -> {
+                    token()
+                    inScalar = false
+                    closedString = false
+                }
+                ' ', '\t', '\r', '\n' -> Unit
+                else -> {
+                    if (!inScalar) token()
+                    inScalar = true
+                    closedString = false
+                }
             }
         }
     }
@@ -575,4 +703,7 @@ internal object SixDraftJson {
         "changes", "remainingLimitations",
     )
     private val EVIDENCE_KEYS = setOf("relativePath", "line", "detail")
+    private const val MAX_JSON_DEPTH = 64
+    private const val MAX_JSON_TOKENS = 100_000
+    private const val MAX_JSON_KEYS = 20_000
 }

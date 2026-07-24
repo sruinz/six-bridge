@@ -23,13 +23,60 @@ internal enum class WorkspaceMetadataMode {
     UNSUPPORTED,
 }
 
+internal data class WorkspaceAclState(
+    val type: String,
+    val principal: String,
+    val permissions: List<String>,
+    val flags: List<String>,
+)
+
+internal data class WorkspaceAccessState(
+    val owner: String,
+    val posixPermissions: List<String>?,
+    val aclEntries: List<WorkspaceAclState>?,
+)
+
 internal object WorkspacePermissionPolicy {
     fun requirePrivate(path: Path, freshWorkspaceRoot: Path) {
+        capturePrivateState(path, freshWorkspaceRoot)
+    }
+
+    fun capturePrivateState(
+        path: Path,
+        freshWorkspaceRoot: Path,
+    ): WorkspaceAccessState {
         val normalizedRoot = freshWorkspaceRoot.toAbsolutePath().normalize()
         val normalizedPath = path.toAbsolutePath().normalize()
         check(normalizedPath.startsWith(normalizedRoot)) {
             "workspace private path가 발급된 root 밖에 있습니다."
         }
+        val capture = capture(path)
+        val mode = selectPrivateMode(
+            posixAvailable = capture.state.posixPermissions != null,
+            posixOwnerOnly = capture.posixOwnerOnly,
+            aclAvailable = capture.state.aclEntries != null,
+            aclOwnerOnly = capture.aclOwnerOnly,
+        )
+        check(mode != WorkspacePermissionMode.UNSUPPORTED) {
+            "workspace filesystem의 owner-only 경계를 확인할 수 없습니다."
+        }
+        return capture.state
+    }
+
+    fun captureState(path: Path): WorkspaceAccessState {
+        val capture = capture(path)
+        check(
+            selectMetadataMode(
+                posixAvailable = capture.state.posixPermissions != null,
+                aclAvailable = capture.state.aclEntries != null,
+            ) != WorkspaceMetadataMode.UNSUPPORTED,
+        ) {
+            "workspace metadata를 검증할 수 없는 filesystem입니다."
+        }
+        return capture.state
+    }
+
+    private fun capture(path: Path): AccessCapture {
         val posixView = Files.getFileAttributeView(
             path,
             PosixFileAttributeView::class.java,
@@ -40,19 +87,31 @@ internal object WorkspacePermissionPolicy {
             AclFileAttributeView::class.java,
             NOFOLLOW_LINKS,
         )
-        val mode = selectPrivateMode(
-            posixAvailable = posixView != null,
-            posixOwnerOnly = posixView
-                ?.readAttributes()
-                ?.permissions()
-                ?.let(::isOwnerOnly)
-                ?: false,
-            aclAvailable = aclView != null,
-            aclOwnerOnly = aclView?.let(::ownerOnlyAcl) ?: false,
+        val posixPermissions = posixView?.readAttributes()?.permissions()?.toSet()
+        val aclOwner = aclView?.owner
+        val acl = aclView?.acl?.toList()
+        return AccessCapture(
+            state = WorkspaceAccessState(
+                owner = ownerToken(path),
+                posixPermissions = posixPermissions
+                    ?.map(PosixFilePermission::name)
+                    ?.sorted(),
+                aclEntries = acl?.map { entry ->
+                    WorkspaceAclState(
+                        type = entry.type().name,
+                        principal = entry.principal().name,
+                        permissions = entry.permissions()
+                            .map(AclEntryPermission::name)
+                            .sorted(),
+                        flags = entry.flags().map { it.name }.sorted(),
+                    )
+                },
+            ),
+            posixOwnerOnly = posixPermissions?.let(::isOwnerOnly) ?: false,
+            aclOwnerOnly = aclOwner != null &&
+                acl != null &&
+                isOwnerOnlyAcl(aclOwner, acl),
         )
-        check(mode != WorkspacePermissionMode.UNSUPPORTED) {
-            "workspace filesystem의 owner-only 경계를 확인할 수 없습니다."
-        }
     }
 
     fun requireMetadataSupport(path: Path) {
@@ -114,11 +173,10 @@ internal object WorkspacePermissionPolicy {
         return permissions.none(shared::contains)
     }
 
-    private fun ownerOnlyAcl(view: AclFileAttributeView): Boolean {
-        val owner = runCatching { view.owner }.getOrNull() ?: return false
-        return runCatching {
-            isOwnerOnlyAcl(owner, view.acl)
-        }.getOrDefault(false)
+    private fun ownerToken(path: Path): String = runCatching {
+        "uid:${(Files.getAttribute(path, "unix:uid", NOFOLLOW_LINKS) as Number).toLong()}"
+    }.getOrElse {
+        "principal:${Files.getOwner(path, NOFOLLOW_LINKS).name}"
     }
 
     internal fun isOwnerOnlyAcl(
@@ -146,4 +204,10 @@ internal object WorkspacePermissionPolicy {
                 entry.permissions().any(sensitive::contains)
         }
     }
+
+    private data class AccessCapture(
+        val state: WorkspaceAccessState,
+        val posixOwnerOnly: Boolean,
+        val aclOwnerOnly: Boolean,
+    )
 }

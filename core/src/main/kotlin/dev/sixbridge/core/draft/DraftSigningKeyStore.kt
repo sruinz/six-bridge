@@ -1,5 +1,6 @@
 package dev.sixbridge.core.draft
 
+import dev.sixbridge.core.conversion.WorkspaceAccessState
 import dev.sixbridge.core.conversion.WorkspacePermissionPolicy
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -38,19 +39,22 @@ class DraftSigningKeyStore(
     private val keyRoot = keyRoot.toAbsolutePath().normalize()
     private val activeGuard = ThreadLocal<StoreGuard?>()
 
-    fun getOrCreate(): KeyPair = withStoreLock {
+    fun getOrCreate(): KeyPair = withStoreLock { freshRoot ->
         val state = existingState()
         when {
             state.all { it } -> readPair()
             state.any { it } -> throw IllegalStateException(
                 "SixDraft 전달 key 저장소가 부분 게시 또는 손상 상태입니다.",
             )
-            else -> {
+            freshRoot -> {
                 val generated = KeyPairGenerator.getInstance(ALGORITHM)
                     .generateKeyPair()
                 publish(generated)
                 generated
             }
+            else -> throw IllegalStateException(
+                "기존 SixDraft 전달 key 저장소에 완전한 key pair가 없습니다.",
+            )
         }
     }
 
@@ -144,12 +148,19 @@ class DraftSigningKeyStore(
         }
     }
 
-    private fun <T> withStoreLock(block: () -> T): T {
-        preflightWithoutMutation()
-        ensureRoot()
-        return PROCESS_LOCKS.computeIfAbsent(keyRoot) { ReentrantLock() }
+    private fun <T> withStoreLock(block: (Boolean) -> T): T =
+        PROCESS_LOCKS.computeIfAbsent(keyRoot) { ReentrantLock() }
             .withLock {
-                validateRoot()
+                require(keyRoot.startsWith(trustedRoot) && keyRoot != trustedRoot) {
+                    "SixDraft key root는 trusted root 내부여야 합니다."
+                }
+                requireDirectory(trustedRoot, "trusted root")
+                val freshRoot = !Files.exists(keyRoot, NOFOLLOW_LINKS)
+                if (freshRoot) {
+                    ensureRoot()
+                } else {
+                    validateRoot()
+                }
                 val ancestorGuards = captureAncestorGuards()
                 secureRoot().use { rootHandle ->
                     val rootState = stableDirectoryState(keyRoot)
@@ -160,7 +171,19 @@ class DraftSigningKeyStore(
                     activeGuard.set(guard)
                     try {
                         verifyGuard(guard)
-                        ensureLockFile(guard)
+                        if (freshRoot) {
+                            ensureLockFile(guard)
+                        } else {
+                            check(
+                                readAttributesOrNull(
+                                    guard.handle,
+                                    Path.of(LOCK_FILE),
+                                ) != null,
+                            ) {
+                                "기존 SixDraft 전달 key 저장소에 lock 파일이 없습니다."
+                            }
+                            requireSafeRegular(lockPath)
+                        }
                         val lockBefore = stableFileState(lockPath)
                         val channel = guard.handle.newByteChannel(
                             Path.of(LOCK_FILE),
@@ -185,7 +208,8 @@ class DraftSigningKeyStore(
                                     "SixDraft key lock identity가 lock 중 변경되었습니다."
                                 }
                                 verifyGuard(guard)
-                                block().also { verifyGuard(guard) }
+                                validateContentsAfterLock()
+                                block(freshRoot).also { verifyGuard(guard) }
                             }
                             require(stableFileState(lockPath) == lockBefore) {
                                 "SixDraft key lock identity가 사용 중 변경되었습니다."
@@ -197,15 +221,9 @@ class DraftSigningKeyStore(
                     }
                 }
             }
-    }
 
-    private fun preflightWithoutMutation() {
-        require(keyRoot.startsWith(trustedRoot) && keyRoot != trustedRoot) {
-            "SixDraft key root는 trusted root 내부여야 합니다."
-        }
-        requireDirectory(trustedRoot, "trusted root")
-        if (!Files.exists(keyRoot, NOFOLLOW_LINKS)) return
-        validateRoot()
+    private fun validateContentsAfterLock() {
+        activeGuard.get()?.let(::verifyGuard)
         val allowedNames = setOf(
             IDENTITY_FILE,
             PRIVATE_FILE,
@@ -218,18 +236,7 @@ class DraftSigningKeyStore(
                 "SixDraft 전달 key 저장소에 알 수 없는 기존 항목이 있습니다."
             }
         }
-        val state = existingState()
-        check(state.all { it } || state.none { it }) {
-            "SixDraft 전달 key 저장소가 부분 게시 또는 손상 상태입니다."
-        }
-        if (state.all { it }) {
-            requireSafeRegularWithoutGuard(identityPath)
-            requireSafeRegularWithoutGuard(privatePath)
-            requireSafeRegularWithoutGuard(publicPath)
-        }
-        if (Files.exists(lockPath, NOFOLLOW_LINKS)) {
-            requireSafeRegularWithoutGuard(lockPath)
-        }
+        activeGuard.get()?.let(::verifyGuard)
     }
 
     private fun ensureRoot() {
@@ -393,32 +400,6 @@ class DraftSigningKeyStore(
         activeGuard.get()?.let(::verifyGuard)
     }
 
-    private fun requireSafeRegularWithoutGuard(path: Path) {
-        val attributes = Files.readAttributes(
-            path,
-            BasicFileAttributes::class.java,
-            NOFOLLOW_LINKS,
-        )
-        require(
-            attributes.isRegularFile &&
-                !attributes.isSymbolicLink &&
-                attributes.fileKey() != null,
-        ) {
-            "SixDraft key 파일은 identity가 확인되는 일반 파일이어야 합니다: $path"
-        }
-        require(Files.getPosixFilePermissions(path, NOFOLLOW_LINKS) == FILE_PERMISSIONS) {
-            "SixDraft key 파일은 owner-only 권한이어야 합니다: $path"
-        }
-        require(
-            (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number)
-                .toLong() == 1L,
-        ) {
-            "SixDraft key 파일 hardlink는 허용되지 않습니다: $path"
-        }
-        requireSameOwner(path)
-        WorkspacePermissionPolicy.requirePrivate(path, trustedRoot)
-    }
-
     private fun readStable(path: Path): ByteArray {
         requireSafeRegular(path)
         val guard = requireNotNull(activeGuard.get())
@@ -530,8 +511,7 @@ class DraftSigningKeyStore(
             },
             size = attributes.size(),
             modified = attributes.lastModifiedTime().toMillis(),
-            permissions = Files.getPosixFilePermissions(path, NOFOLLOW_LINKS),
-            owner = ownerToken(path),
+            access = WorkspacePermissionPolicy.capturePrivateState(path, trustedRoot),
             device = (Files.getAttribute(path, "unix:dev", NOFOLLOW_LINKS) as Number)
                 .toLong(),
             inode = (Files.getAttribute(path, "unix:ino", NOFOLLOW_LINKS) as Number)
@@ -554,8 +534,7 @@ class DraftSigningKeyStore(
             fileKey = requireNotNull(attributes.fileKey()) {
                 "SixDraft key directory identity를 확인할 수 없습니다."
             },
-            permissions = Files.getPosixFilePermissions(path, NOFOLLOW_LINKS),
-            owner = ownerToken(path),
+            access = WorkspacePermissionPolicy.capturePrivateState(path, trustedRoot),
             device = (Files.getAttribute(path, "unix:dev", NOFOLLOW_LINKS) as Number)
                 .toLong(),
             inode = (Files.getAttribute(path, "unix:ino", NOFOLLOW_LINKS) as Number)
@@ -668,8 +647,7 @@ class DraftSigningKeyStore(
         val fileKey: Any,
         val size: Long,
         val modified: Long,
-        val permissions: Set<PosixFilePermission>,
-        val owner: String,
+        val access: WorkspaceAccessState,
         val device: Long,
         val inode: Long,
         val links: Long,
@@ -677,8 +655,7 @@ class DraftSigningKeyStore(
 
     private data class StableDirectoryState(
         val fileKey: Any,
-        val permissions: Set<PosixFilePermission>,
-        val owner: String,
+        val access: WorkspaceAccessState,
         val device: Long,
         val inode: Long,
     )

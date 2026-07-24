@@ -1,12 +1,13 @@
 package dev.sixbridge.core.draft
 
 import dev.sixbridge.core.conversion.SecureBuildPublisher
+import dev.sixbridge.core.conversion.WorkspaceAccessState
+import dev.sixbridge.core.conversion.WorkspacePermissionPolicy
 import dev.sixbridge.core.conversion.deepImmutableCopy
-import java.io.ByteArrayOutputStream
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.DigestOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
@@ -16,6 +17,7 @@ import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.attribute.BasicFileAttributes
+import java.security.DigestOutputStream
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.util.Collections
@@ -246,9 +248,32 @@ class SixDraftPayload private constructor(
             require(after.conversionState == expectedState) {
                 "변환 후 conversionState가 계획과 일치하지 않습니다."
             }
+            val actualSourceSha256 = actualSourceSha256(sourceKind, source)
             if (selected.isEmpty()) {
+                require(
+                    before.sourceSha256 == actualSourceSha256 &&
+                        after.sourceSha256 == before.sourceSha256,
+                ) {
+                    "passthrough 전후 보고서는 동일한 실제 source를 가리켜야 합니다."
+                }
+                require(
+                    before.conversionState ==
+                        dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH &&
+                        before.convertedExtensionId == null,
+                ) {
+                    "passthrough 변환 전 보고서는 미변환 상태여야 합니다."
+                }
+                require(after.extensionVersion == input.originalExtensionVersion) {
+                    "passthrough 결과 version이 원본과 일치하지 않습니다."
+                }
                 require(after.convertedExtensionId == input.originalExtensionId) {
                     "passthrough 결과 extension ID가 원본과 일치하지 않습니다."
+                }
+                val expectedAfter = before.copy(
+                    convertedExtensionId = input.originalExtensionId,
+                )
+                require(expectedAfter == after) {
+                    "passthrough 전후 보고서의 분석 의미가 일치하지 않습니다."
                 }
             } else {
                 require(after.convertedExtensionId != null) {
@@ -265,14 +290,18 @@ class SixDraftPayload private constructor(
                     "source.crx는 CRX passthrough에만 사용할 수 있습니다."
                 }
             }
-            val actualSourceSha256 = if (sourceKind == DraftSourceKind.CRX) {
-                dev.sixbridge.core.crx.Crx3.verifiedPayloadSha256(source)
-            } else {
-                DraftSignature.sha256(source)
-            }
             require(after.sourceSha256 == actualSourceSha256) {
                 "변환 후 보고서 source가 실제 source entry와 일치하지 않습니다."
             }
+        }
+
+        private fun actualSourceSha256(
+            sourceKind: DraftSourceKind,
+            source: ByteArray,
+        ): String = if (sourceKind == DraftSourceKind.CRX) {
+            dev.sixbridge.core.crx.Crx3.verifiedPayloadSha256(source)
+        } else {
+            DraftSignature.sha256(source)
         }
     }
 }
@@ -344,14 +373,20 @@ object SixDraft {
             require(before.size <= Int.MAX_VALUE) {
                 "SixDraft archive를 메모리에서 검증할 수 없습니다."
             }
+            val firstDigest = MessageDigest.getInstance("SHA-256")
             val bytes = FileChannel.open(absolute, READ, NOFOLLOW_LINKS).use { channel ->
                 require(pathState(absolute) == before && channel.size() == before.size) {
                     "SixDraft 파일이 읽기 전에 변경되었습니다."
                 }
                 val buffer = ByteBuffer.allocate(before.size.toInt())
                 while (buffer.hasRemaining()) {
-                    require(channel.read(buffer) >= 0) {
+                    val start = buffer.position()
+                    val count = channel.read(buffer)
+                    require(count >= 0) {
                         "SixDraft 파일을 완전히 읽지 못했습니다."
+                    }
+                    if (count > 0) {
+                        firstDigest.update(buffer.array(), start, count)
                     }
                 }
                 require(channel.read(ByteBuffer.allocate(1)) < 0) {
@@ -365,6 +400,7 @@ object SixDraft {
             require(pathState(absolute) == before) {
                 "SixDraft 파일이 읽는 동안 변경되었습니다."
             }
+            verifyStablePathHash(absolute, before, firstDigest.digest())
             readVerified(bytes)
         }
 
@@ -439,7 +475,48 @@ object SixDraft {
             links = links,
             size = attributes.size(),
             modified = attributes.lastModifiedTime().toMillis(),
+            access = WorkspacePermissionPolicy.captureState(path),
         )
+    }
+
+    private fun verifyStablePathHash(
+        path: Path,
+        expected: DraftPathState,
+        firstHash: ByteArray,
+    ) {
+        require(pathState(path) == expected) {
+            "SixDraft 파일이 두 번째 읽기 전에 변경되었습니다."
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+            require(pathState(path) == expected && channel.size() == expected.size) {
+                "SixDraft 파일이 두 번째 open 중 변경되었습니다."
+            }
+            val buffer = ByteBuffer.allocate(64 * 1024)
+            var total = 0L
+            while (true) {
+                buffer.clear()
+                val count = channel.read(buffer)
+                if (count < 0) break
+                require(count > 0) {
+                    "SixDraft 파일의 두 번째 읽기가 진행되지 않습니다."
+                }
+                total += count
+                require(total <= expected.size && total <= MAX_ARCHIVE_SIZE) {
+                    "SixDraft 파일이 두 번째 읽기 중 커졌습니다."
+                }
+                digest.update(buffer.array(), 0, count)
+            }
+            require(total == expected.size && pathState(path) == expected) {
+                "SixDraft 파일이 두 번째 읽기 중 변경되었습니다."
+            }
+        }
+        require(pathState(path) == expected) {
+            "SixDraft 파일이 두 번째 읽기 후 변경되었습니다."
+        }
+        require(firstHash.contentEquals(digest.digest())) {
+            "SixDraft 파일이 경로 재검증 중 교체되었습니다."
+        }
     }
 
     private fun signedEntries(
@@ -560,6 +637,7 @@ object SixDraft {
         val links: Long,
         val size: Long,
         val modified: Long,
+        val access: WorkspaceAccessState,
     )
 
     private class VerifiedImpl(
@@ -651,7 +729,13 @@ private object StrictDraftArchive {
         var total = 0L
         val result = linkedMapOf<String, ByteArray>()
         verified.forEach { entry ->
-            val maximum = if (entry.name == "source.zip" || entry.name == "source.crx") {
+            val isSource = entry.name == "source.zip" || entry.name == "source.crx"
+            if (isSource) {
+                require(entry.method == ZipEntry.STORED) {
+                    "SixDraft source entry는 STORED method여야 합니다: ${entry.name}"
+                }
+            }
+            val maximum = if (isSource) {
                 SixDraft.MAX_SOURCE_SIZE
             } else {
                 SixDraft.MAX_METADATA_SIZE
