@@ -21,6 +21,7 @@ import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
@@ -41,6 +42,7 @@ internal enum class BuildCrashPoint {
 }
 
 internal enum class LocalStageCrashPoint {
+    AFTER_INTENT_MARKER_BEFORE_JOURNAL,
     AFTER_DIRECTORY_CREATE,
     AFTER_OWNER_MARKER,
     AFTER_CREATED_JOURNAL,
@@ -51,6 +53,7 @@ internal enum class LocalStageCrashPoint {
 }
 
 internal enum class OutputStageCrashPoint {
+    AFTER_INTENT_MARKER_BEFORE_JOURNAL,
     AFTER_DIRECTORY_CREATE,
     AFTER_OWNER_MARKER,
 }
@@ -116,30 +119,50 @@ internal object SecureBuildPublisher {
         try {
             journal.write(JournalRecord.intent(outputTransaction, localTransaction))
             BuildPublicationFaultInjection.afterIntentBeforeStage()
-            outputTransaction.stage {
-                journal.write(
-                    JournalRecord.outputStageCreated(
-                        outputTransaction,
-                        localTransaction,
-                    ),
-                )
-            }
+            outputTransaction.stage(
+                afterIntentReady = {
+                    journal.write(
+                        JournalRecord.outputIntentReady(
+                            outputTransaction,
+                            localTransaction,
+                        ),
+                    )
+                },
+                afterCreated = {
+                    journal.write(
+                        JournalRecord.outputStageCreated(
+                            outputTransaction,
+                            localTransaction,
+                        ),
+                    )
+                },
+            )
             journal.write(
                 JournalRecord.outputStageReady(
                     outputTransaction,
                     localTransaction,
                 ),
             )
-            localTransaction?.stage {
-                journal.write(
-                    JournalRecord.create(
-                        JournalPhase.LOCAL_STAGE_CREATED,
-                        0,
-                        outputTransaction,
-                        localTransaction,
-                    ),
-                )
-            }
+            localTransaction?.stage(
+                afterIntentReady = {
+                    journal.write(
+                        JournalRecord.localIntentReady(
+                            outputTransaction,
+                            localTransaction,
+                        ),
+                    )
+                },
+                afterCreated = {
+                    journal.write(
+                        JournalRecord.create(
+                            JournalPhase.LOCAL_STAGE_CREATED,
+                            0,
+                            outputTransaction,
+                            localTransaction,
+                        ),
+                    )
+                },
+            )
             journal.write(
                 JournalRecord.create(
                     JournalPhase.STAGES_READY,
@@ -159,7 +182,25 @@ internal object SecureBuildPublisher {
             )
             BuildPublicationFaultInjection.afterStagedJournal()
             outputTransaction.removeIntentMarker()
+            journal.write(
+                JournalRecord.create(
+                    JournalPhase.STAGED,
+                    0,
+                    outputTransaction,
+                    localTransaction,
+                ),
+            )
             localTransaction?.removeIntentMarker()
+            if (localTransaction != null) {
+                journal.write(
+                    JournalRecord.create(
+                        JournalPhase.STAGED,
+                        0,
+                        outputTransaction,
+                        localTransaction,
+                    ),
+                )
+            }
             outputTransaction.publish(
                 afterBackup = {
                     journal.write(
@@ -280,12 +321,18 @@ internal object SecureBuildPublisher {
         }
         when (record.phase) {
             JournalPhase.INTENT,
+            JournalPhase.OUTPUT_INTENT_READY,
             JournalPhase.OUTPUT_STAGE_CREATED,
             -> recoverIntent(record, parent)
 
             JournalPhase.OUTPUT_STAGE_READY -> {
                 recoverOld(record, parent)
                 recoverLocalIntent(record.localIntent, null)
+            }
+
+            JournalPhase.LOCAL_INTENT_READY -> {
+                recoverOld(record.copy(local = null), parent)
+                recoverLocalIntent(requireNotNull(record.localIntent), null)
             }
 
             JournalPhase.LOCAL_STAGE_CREATED -> {
@@ -299,12 +346,22 @@ internal object SecureBuildPublisher {
             JournalPhase.COMMIT_READY -> recoverCommitted(record, parent)
             else -> recoverOld(record, parent)
         }
-        removeIntentMarkerIfPresent(parent, UUID.fromString(record.outputIntentToken))
+        recoverIntentMarker(
+            parent,
+            record.outputIntentToken,
+            record.outputMarkerIdentity,
+            record.outputMarkerRemoved,
+        )
         if (record.localIntent != null) {
             val intent = record.localIntent
             val localParent = Path.of(intent.parent).toAbsolutePath().normalize()
             validateTrustedLocalPath(Path.of(intent.trustedRoot), localParent)
-            removeIntentMarkerIfPresent(localParent, UUID.fromString(intent.token))
+            recoverIntentMarker(
+                localParent,
+                intent.token,
+                intent.markerIdentity,
+                intent.markerRemoved,
+            )
         }
         journal.delete()
     }
@@ -333,6 +390,30 @@ internal object SecureBuildPublisher {
         )
     }
 
+    private fun recoverIntentMarker(
+        parent: Path,
+        tokenValue: String,
+        identityValue: String?,
+        removed: Boolean,
+    ) {
+        if (removed) return
+        val token = strictUuid(tokenValue)
+        if (identityValue == null) {
+            secureDirectory(parent).use { handle ->
+                val name = singleName(".sixbridge-publish-intent-$token")
+                require(attributesOrNull(handle, name) == null) {
+                    "identity가 기록되지 않은 intent marker는 삭제할 수 없습니다."
+                }
+            }
+            return
+        }
+        removeIntentMarkerIfPresent(
+            parent,
+            token,
+            decodeStableIdentity(identityValue),
+        )
+    }
+
     private class OutputTransaction(
         private val parent: Path,
         outputs: List<Pair<Path, ByteArray>>,
@@ -350,6 +431,7 @@ internal object SecureBuildPublisher {
             parent.resolve(".sixbridge-publish-${UUID.randomUUID()}")
         private val intentToken: UUID = UUID.randomUUID()
         private var intentMarkerIdentity: StableFileIdentity? = null
+        private var intentMarkerRemoved = false
         private var intentMarkerOwnershipUncertain = false
         private var stageRootKey: String? = null
         private var stageIdentity: StableFileIdentity? = null
@@ -358,7 +440,10 @@ internal object SecureBuildPublisher {
         val targetCount: Int
             get() = targets.size
 
-        fun stage(afterCreated: () -> Unit) {
+        fun stage(
+            afterIntentReady: () -> Unit,
+            afterCreated: () -> Unit,
+        ) {
             secureDirectory(parent).use { parentHandle ->
                 validateDirectoryHandle(parent, parentHandle)
                 targets.forEach { target ->
@@ -392,6 +477,10 @@ internal object SecureBuildPublisher {
                     throw failure
                 }
             }
+            BuildPublicationFaultInjection.crashOutputStageAt(
+                OutputStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL,
+            )
+            afterIntentReady()
             val created = OwnedTempTree.createAt(path)
             owner = created
             BuildPublicationFaultInjection.crashOutputStageAt(
@@ -596,19 +685,24 @@ internal object SecureBuildPublisher {
 
         fun journalIntentToken(): String = intentToken.toString()
 
+        fun journalIntentMarkerIdentity(): String? =
+            intentMarkerIdentity?.encode()
+
+        fun journalIntentMarkerRemoved(): Boolean = intentMarkerRemoved
+
         fun removeIntentMarker() {
             removeIntentMarker(
                 parent,
                 intentToken,
                 requireNotNull(intentMarkerIdentity),
             )
-            intentMarkerIdentity = null
+            intentMarkerRemoved = true
         }
 
         fun removeIntentMarkerIfPresent() {
-            intentMarkerIdentity?.let { expected ->
+            if (!intentMarkerRemoved) intentMarkerIdentity?.let { expected ->
                 removeIntentMarkerIfPresent(parent, intentToken, expected)
-                intentMarkerIdentity = null
+                intentMarkerRemoved = true
             }
         }
 
@@ -661,9 +755,13 @@ internal object SecureBuildPublisher {
         private var stageIdentity: StableFileIdentity? = null
         private var durabilityFailed = false
         private var intentMarkerIdentity: StableFileIdentity? = null
+        private var intentMarkerRemoved = false
         private var intentMarkerOwnershipUncertain = false
 
-        fun stage(afterCreated: () -> Unit) {
+        fun stage(
+            afterIntentReady: () -> Unit,
+            afterCreated: () -> Unit,
+        ) {
             require(source != destination) {
                 "local source와 저장 대상이 같을 수 없습니다."
             }
@@ -694,6 +792,10 @@ internal object SecureBuildPublisher {
                     throw failure
                 }
             }
+            BuildPublicationFaultInjection.crashLocalStageAt(
+                LocalStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL,
+            )
+            afterIntentReady()
             val created = OwnedTempTree.createAt(stageOriginal)
             owner = created
             BuildPublicationFaultInjection.crashLocalStageAt(
@@ -884,6 +986,8 @@ internal object SecureBuildPublisher {
             parent = parent.toString(),
             stageName = stageOriginal.fileName.toString(),
             token = intentToken.toString(),
+            markerIdentity = intentMarkerIdentity?.encode(),
+            markerRemoved = intentMarkerRemoved,
         )
 
         fun removeIntentMarker() {
@@ -892,13 +996,13 @@ internal object SecureBuildPublisher {
                 intentToken,
                 requireNotNull(intentMarkerIdentity),
             )
-            intentMarkerIdentity = null
+            intentMarkerRemoved = true
         }
 
         fun removeIntentMarkerIfPresent() {
-            intentMarkerIdentity?.let { expected ->
+            if (!intentMarkerRemoved) intentMarkerIdentity?.let { expected ->
                 removeIntentMarkerIfPresent(parent, intentToken, expected)
-                intentMarkerIdentity = null
+                intentMarkerRemoved = true
             }
         }
     }
@@ -1185,6 +1289,8 @@ internal object SecureBuildPublisher {
         val parent: String,
         val stageName: String,
         val token: String,
+        val markerIdentity: String?,
+        val markerRemoved: Boolean,
     )
 
     private data class JournalLocal(
@@ -1203,8 +1309,10 @@ internal object SecureBuildPublisher {
 
     private enum class JournalPhase {
         INTENT,
+        OUTPUT_INTENT_READY,
         OUTPUT_STAGE_CREATED,
         OUTPUT_STAGE_READY,
+        LOCAL_INTENT_READY,
         LOCAL_STAGE_CREATED,
         STAGES_READY,
         STAGED,
@@ -1222,6 +1330,8 @@ internal object SecureBuildPublisher {
         val outputStageRootKey: String?,
         val outputStageIdentity: String?,
         val outputIntentToken: String,
+        val outputMarkerIdentity: String?,
+        val outputMarkerRemoved: Boolean,
         val outputs: List<JournalOutput>,
         val local: JournalLocal?,
         val localIntent: JournalLocalIntent?,
@@ -1237,6 +1347,25 @@ internal object SecureBuildPublisher {
                 outputStageRootKey = null,
                 outputStageIdentity = null,
                 outputIntentToken = output.journalIntentToken(),
+                outputMarkerIdentity = output.journalIntentMarkerIdentity(),
+                outputMarkerRemoved = output.journalIntentMarkerRemoved(),
+                outputs = output.journalIntentTargets(),
+                local = null,
+                localIntent = local?.journalIntent(),
+            )
+
+            fun outputIntentReady(
+                output: OutputTransaction,
+                local: LocalSourceTransaction?,
+            ): JournalRecord = JournalRecord(
+                phase = JournalPhase.OUTPUT_INTENT_READY,
+                publishedCount = 0,
+                outputStageName = output.journalStageName(),
+                outputStageRootKey = null,
+                outputStageIdentity = null,
+                outputIntentToken = output.journalIntentToken(),
+                outputMarkerIdentity = output.journalIntentMarkerIdentity(),
+                outputMarkerRemoved = output.journalIntentMarkerRemoved(),
                 outputs = output.journalIntentTargets(),
                 local = null,
                 localIntent = local?.journalIntent(),
@@ -1252,6 +1381,8 @@ internal object SecureBuildPublisher {
                 outputStageRootKey = output.journalStageRootKey(),
                 outputStageIdentity = output.journalStageIdentity(),
                 outputIntentToken = output.journalIntentToken(),
+                outputMarkerIdentity = output.journalIntentMarkerIdentity(),
+                outputMarkerRemoved = output.journalIntentMarkerRemoved(),
                 outputs = output.journalIntentTargets(),
                 local = null,
                 localIntent = local?.journalIntent(),
@@ -1267,9 +1398,28 @@ internal object SecureBuildPublisher {
                 outputStageRootKey = output.journalStageRootKey(),
                 outputStageIdentity = output.journalStageIdentity(),
                 outputIntentToken = output.journalIntentToken(),
+                outputMarkerIdentity = output.journalIntentMarkerIdentity(),
+                outputMarkerRemoved = output.journalIntentMarkerRemoved(),
                 outputs = output.journalTargets(),
                 local = null,
                 localIntent = local?.journalIntent(),
+            )
+
+            fun localIntentReady(
+                output: OutputTransaction,
+                local: LocalSourceTransaction,
+            ): JournalRecord = JournalRecord(
+                phase = JournalPhase.LOCAL_INTENT_READY,
+                publishedCount = 0,
+                outputStageName = output.journalStageName(),
+                outputStageRootKey = output.journalStageRootKey(),
+                outputStageIdentity = output.journalStageIdentity(),
+                outputIntentToken = output.journalIntentToken(),
+                outputMarkerIdentity = output.journalIntentMarkerIdentity(),
+                outputMarkerRemoved = output.journalIntentMarkerRemoved(),
+                outputs = output.journalTargets(),
+                local = null,
+                localIntent = local.journalIntent(),
             )
 
             fun create(
@@ -1284,6 +1434,8 @@ internal object SecureBuildPublisher {
                 output.journalStageRootKey(),
                 output.journalStageIdentity(),
                 output.journalIntentToken(),
+                output.journalIntentMarkerIdentity(),
+                output.journalIntentMarkerRemoved(),
                 output.journalTargets(),
                 local?.journalLocal(),
                 local?.journalIntent(),
@@ -1405,7 +1557,7 @@ internal object SecureBuildPublisher {
         private fun encode(record: JournalRecord): String {
             validateRecord(record)
             val payloadLines = buildList {
-                add("SIXBRIDGE-PUBLISH-JOURNAL-V2")
+                add("SIXBRIDGE-PUBLISH-JOURNAL-V3")
                 add(
                     listOf(
                         "H",
@@ -1414,6 +1566,8 @@ internal object SecureBuildPublisher {
                         encodeField(record.outputStageName),
                         encodeNullable(record.outputStageRootKey),
                         encodeNullable(record.outputStageIdentity),
+                        encodeNullable(record.outputMarkerIdentity),
+                        record.outputMarkerRemoved.toString(),
                         encodeField(record.outputIntentToken),
                     ).joinToString("|"),
                 )
@@ -1438,6 +1592,8 @@ internal object SecureBuildPublisher {
                             encodeField(intent.parent),
                             encodeField(intent.stageName),
                             encodeField(intent.token),
+                            encodeNullable(intent.markerIdentity),
+                            intent.markerRemoved.toString(),
                         ).joinToString("|"),
                     )
                 }
@@ -1462,7 +1618,7 @@ internal object SecureBuildPublisher {
             }
             val metadataPrefix = listOf(
                 "M",
-                "2",
+                "3",
                 record.outputs.size.toString(),
                 (record.localIntent != null).toString(),
                 (record.local != null).toString(),
@@ -1484,10 +1640,10 @@ internal object SecureBuildPublisher {
             require(text.endsWith('\n')) { "journal은 완전한 줄바꿈으로 끝나야 합니다." }
             val lines = text.dropLast(1).split('\n')
             require(lines.none(String::isEmpty))
-            require(lines.firstOrNull() == "SIXBRIDGE-PUBLISH-JOURNAL-V2")
+            require(lines.firstOrNull() == "SIXBRIDGE-PUBLISH-JOURNAL-V3")
             val metadata = lines.getOrNull(1)?.split('|')
                 ?: error("journal metadata 없음")
-            require(metadata.size == 6 && metadata[0] == "M" && metadata[1] == "2")
+            require(metadata.size == 6 && metadata[0] == "M" && metadata[1] == "3")
             val outputCount = metadata[2].toInt()
             require(outputCount > 0)
             val localIntentPresent = metadata[3].toBooleanStrict()
@@ -1505,7 +1661,7 @@ internal object SecureBuildPublisher {
                 "journal checksum이 일치하지 않습니다."
             }
             val header = lines.getOrNull(2)?.split('|') ?: error("journal header 없음")
-            require(header.size == 7 && header[0] == "H")
+            require(header.size == 9 && header[0] == "H")
             val body = lines.drop(3)
             require(body.none { !it.startsWith("O|") &&
                 !it.startsWith("T|") &&
@@ -1541,12 +1697,14 @@ internal object SecureBuildPublisher {
                 .singleOrNull { it.startsWith("T|") }
                 ?.let { line ->
                     val fields = line.split('|')
-                    require(fields.size == 5)
+                    require(fields.size == 7)
                     JournalLocalIntent(
                         trustedRoot = decodeField(fields[1]),
                         parent = decodeField(fields[2]),
                         stageName = decodeField(fields[3]),
                         token = decodeField(fields[4]),
+                        markerIdentity = decodeNullable(fields[5]),
+                        markerRemoved = fields[6].toBooleanStrict(),
                     )
                 }
             val local = tail.singleOrNull { it.startsWith("L|") }?.let { line ->
@@ -1574,7 +1732,9 @@ internal object SecureBuildPublisher {
                 outputStageName = decodeField(header[3]),
                 outputStageRootKey = decodeNullable(header[4]),
                 outputStageIdentity = decodeNullable(header[5]),
-                outputIntentToken = decodeField(header[6]),
+                outputMarkerIdentity = decodeNullable(header[6]),
+                outputMarkerRemoved = header[7].toBooleanStrict(),
+                outputIntentToken = decodeField(header[8]),
                 outputs = outputs,
                 local = local,
                 localIntent = localIntent,
@@ -1607,6 +1767,37 @@ internal object SecureBuildPublisher {
             singleName(record.outputStageName)
             require(OUTPUT_STAGE_PATTERN.matches(record.outputStageName))
             strictUuid(record.outputIntentToken)
+            record.outputMarkerIdentity?.let(::decodeStableIdentity)
+            require(!record.outputMarkerRemoved ||
+                record.outputMarkerIdentity != null
+            )
+            if (record.phase == JournalPhase.INTENT) {
+                require(
+                    record.outputMarkerIdentity == null &&
+                        !record.outputMarkerRemoved,
+                )
+            } else {
+                require(record.outputMarkerIdentity != null)
+            }
+            val markerRemovalAllowed = record.phase in setOf(
+                JournalPhase.STAGED,
+                JournalPhase.OUTPUT_BACKED_UP,
+                JournalPhase.OUTPUT_PARTIAL,
+                JournalPhase.OUTPUTS_PUBLISHED,
+                JournalPhase.LOCAL_PUBLISHED,
+                JournalPhase.COMMIT_READY,
+            )
+            require(!record.outputMarkerRemoved || markerRemovalAllowed)
+            if (record.phase in setOf(
+                    JournalPhase.OUTPUT_BACKED_UP,
+                    JournalPhase.OUTPUT_PARTIAL,
+                    JournalPhase.OUTPUTS_PUBLISHED,
+                    JournalPhase.LOCAL_PUBLISHED,
+                    JournalPhase.COMMIT_READY,
+                )
+            ) {
+                require(record.outputMarkerRemoved)
+            }
             record.outputs.forEach { output ->
                 singleName(output.name)
                 require(output.newSha256.matches(SHA256_PATTERN))
@@ -1618,9 +1809,14 @@ internal object SecureBuildPublisher {
             }
             val earlyOutput = record.phase in setOf(
                 JournalPhase.INTENT,
+                JournalPhase.OUTPUT_INTENT_READY,
                 JournalPhase.OUTPUT_STAGE_CREATED,
             )
-            if (record.phase == JournalPhase.INTENT) {
+            if (record.phase in setOf(
+                    JournalPhase.INTENT,
+                    JournalPhase.OUTPUT_INTENT_READY,
+                )
+            ) {
                 require(record.outputStageRootKey == null)
                 require(record.outputStageIdentity == null)
             } else {
@@ -1650,10 +1846,39 @@ internal object SecureBuildPublisher {
                 require(LOCAL_STAGE_PATTERN.matches(intent.stageName))
                 singleName(intent.stageName)
                 strictUuid(intent.token)
+                intent.markerIdentity?.let(::decodeStableIdentity)
+                require(!intent.markerRemoved || intent.markerIdentity != null)
                 val parent = canonicalAbsolutePath(intent.parent)
                 val trustedRoot = canonicalAbsolutePath(intent.trustedRoot)
                 require(parent.startsWith(trustedRoot)) {
                     "local intent parent는 trusted root 내부여야 합니다."
+                }
+                val localMarkerReady = record.phase in setOf(
+                    JournalPhase.LOCAL_INTENT_READY,
+                    JournalPhase.LOCAL_STAGE_CREATED,
+                    JournalPhase.STAGES_READY,
+                    JournalPhase.STAGED,
+                    JournalPhase.OUTPUT_BACKED_UP,
+                    JournalPhase.OUTPUT_PARTIAL,
+                    JournalPhase.OUTPUTS_PUBLISHED,
+                    JournalPhase.LOCAL_PUBLISHED,
+                    JournalPhase.COMMIT_READY,
+                )
+                if (localMarkerReady) {
+                    require(intent.markerIdentity != null)
+                } else {
+                    require(intent.markerIdentity == null && !intent.markerRemoved)
+                }
+                require(!intent.markerRemoved || markerRemovalAllowed)
+                if (record.phase in setOf(
+                        JournalPhase.OUTPUT_BACKED_UP,
+                        JournalPhase.OUTPUT_PARTIAL,
+                        JournalPhase.OUTPUTS_PUBLISHED,
+                        JournalPhase.LOCAL_PUBLISHED,
+                        JournalPhase.COMMIT_READY,
+                    )
+                ) {
+                    require(intent.markerRemoved)
                 }
             }
             record.local?.let { local ->
@@ -1675,9 +1900,14 @@ internal object SecureBuildPublisher {
             }
             when (record.phase) {
                 JournalPhase.INTENT,
+                JournalPhase.OUTPUT_INTENT_READY,
                 JournalPhase.OUTPUT_STAGE_CREATED,
                 JournalPhase.OUTPUT_STAGE_READY,
                 -> require(record.local == null)
+
+                JournalPhase.LOCAL_INTENT_READY -> {
+                    require(record.localIntent != null && record.local == null)
+                }
 
                 JournalPhase.LOCAL_STAGE_CREATED -> {
                     require(record.localIntent != null && record.local != null)
@@ -2155,17 +2385,8 @@ internal object SecureBuildPublisher {
     ) {
         val stageName = singleName(stageNameValue)
         val token = UUID.fromString(tokenValue)
-        val markerName = singleName(".sixbridge-publish-intent-$token")
         secureDirectory(parent).use { parentHandle ->
             val stageAttributes = attributesOrNull(parentHandle, stageName)
-            val markerAttributes = attributesOrNull(parentHandle, markerName)
-            require(
-                stageAttributes != null ||
-                    markerAttributes == null ||
-                    expectedIdentityValue != null,
-            ) {
-                "stage 없는 INTENT marker는 소유권을 증명할 수 없습니다."
-            }
             if (stageAttributes != null) {
                 require(stageAttributes.isDirectory && !stageAttributes.isSymbolicLink) {
                     "intent stage는 일반 디렉터리여야 합니다."
@@ -2191,15 +2412,8 @@ internal object SecureBuildPublisher {
                     }
                 }
             }
-            if (markerAttributes != null) {
-                readIntentMarkerIdentity(parent, parentHandle, token)
-            }
             if (stageAttributes != null) deleteTree(parentHandle, stageName)
-            if (markerAttributes != null) {
-                deleteVerifiedIntentMarker(parent, parentHandle, token, null)
-            }
             require(attributesOrNull(parentHandle, stageName) == null)
-            require(attributesOrNull(parentHandle, markerName) == null)
             forceDirectory(parent)
         }
     }
@@ -2220,7 +2434,7 @@ internal object SecureBuildPublisher {
     private fun removeIntentMarker(
         parentPath: Path,
         token: UUID,
-        expectedIdentity: StableFileIdentity?,
+        expectedIdentity: StableFileIdentity,
     ) {
         secureDirectory(parentPath).use { handle ->
             require(
@@ -2239,7 +2453,7 @@ internal object SecureBuildPublisher {
     private fun removeIntentMarkerIfPresent(
         parentPath: Path,
         token: UUID,
-        expectedIdentity: StableFileIdentity? = null,
+        expectedIdentity: StableFileIdentity,
     ) {
         secureDirectory(parentPath).use { handle ->
             deleteVerifiedIntentMarker(
@@ -2255,15 +2469,13 @@ internal object SecureBuildPublisher {
         parentPath: Path,
         parentHandle: SecureDirectoryStream<Path>,
         token: UUID,
-        expectedIdentity: StableFileIdentity?,
+        expectedIdentity: StableFileIdentity,
     ): Boolean {
         val name = singleName(".sixbridge-publish-intent-$token")
         if (attributesOrNull(parentHandle, name) == null) return false
         val identity = readIntentMarkerIdentity(parentPath, parentHandle, token)
-        expectedIdentity?.let {
-            require(identity == it) {
-                "publish intent marker identity가 생성 증거와 다릅니다."
-            }
+        require(identity == expectedIdentity) {
+            "publish intent marker identity가 생성 증거와 다릅니다."
         }
         require(
             readIntentMarkerIdentity(parentPath, parentHandle, token) == identity,
@@ -2480,7 +2692,7 @@ internal object SecureBuildPublisher {
         val name = requireNotNull(path.fileName) {
             "output은 파일명을 가져야 합니다."
         }.toString()
-        require(!name.startsWith(INTERNAL_NAMESPACE_PREFIX)) {
+        require(!name.lowercase(Locale.ROOT).startsWith(INTERNAL_NAMESPACE_PREFIX)) {
             "output은 SIX Bridge 내부 namespace를 사용할 수 없습니다: $name"
         }
     }

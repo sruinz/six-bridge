@@ -40,14 +40,14 @@ class SixBridgeServiceTest {
         val source = source("six-service-reserved-source", "Reserved output")
         val service = SixBridgeService(workspace) { toolchain }
         val reservedNames = listOf(
-            ".sixbridge-build-publisher.lock",
-            ".sixbridge-publish-journal.v1",
-            ".sixbridge-publish-journal.tmp-${UUID.randomUUID()}",
-            ".sixbridge-publish-${UUID.randomUUID()}",
-            ".sixbridge-publish-intent-${UUID.randomUUID()}",
-            ".sixbridge-local-stage-${UUID.randomUUID()}",
-            ".sixbridge-local-backup-${UUID.randomUUID()}",
-            ".sixbridge-stage-owner-${UUID.randomUUID()}",
+            ".SIXBRIDGE-build-publisher.lock",
+            ".SixBridge-publish-journal.v1",
+            ".SIXbridge-publish-journal.tmp-${UUID.randomUUID()}",
+            ".sixBRIDGE-publish-${UUID.randomUUID()}",
+            ".SIXBRIDGE-publish-intent-${UUID.randomUUID()}",
+            ".SixBridge-local-stage-${UUID.randomUUID()}",
+            ".SIXbridge-local-backup-${UUID.randomUUID()}",
+            ".sixBRIDGE-stage-owner-${UUID.randomUUID()}",
         )
 
         reservedNames.forEachIndexed { index, name ->

@@ -24,15 +24,15 @@ class SecureBuildPublisherTest {
     fun `reserved internal output names are rejected before creating the parent`() {
         val root = Files.createTempDirectory("six-reserved-output-root")
         val reservedNames = listOf(
-            ".sixbridge-build-publisher.lock",
-            ".sixbridge-publish-journal.v1",
-            ".sixbridge-publish-journal.tmp-${java.util.UUID.randomUUID()}",
-            ".sixbridge-publish-${java.util.UUID.randomUUID()}",
-            ".sixbridge-publish-intent-${java.util.UUID.randomUUID()}",
-            ".sixbridge-local-stage-${java.util.UUID.randomUUID()}",
-            ".sixbridge-local-backup-${java.util.UUID.randomUUID()}",
-            ".sixbridge-stage-owner-${java.util.UUID.randomUUID()}",
-            ".sixbridge-future-internal",
+            ".SIXBRIDGE-build-publisher.lock",
+            ".SixBridge-publish-journal.v1",
+            ".SIXbridge-publish-journal.tmp-${java.util.UUID.randomUUID()}",
+            ".sixBRIDGE-publish-${java.util.UUID.randomUUID()}",
+            ".SIXBRIDGE-publish-intent-${java.util.UUID.randomUUID()}",
+            ".SixBridge-local-stage-${java.util.UUID.randomUUID()}",
+            ".SIXbridge-local-backup-${java.util.UUID.randomUUID()}",
+            ".sixBRIDGE-stage-owner-${java.util.UUID.randomUUID()}",
+            ".SIXBRIDGE-future-internal",
         )
 
         reservedNames.forEach { name ->
@@ -583,8 +583,7 @@ class SecureBuildPublisherTest {
                 }
             }
             val journal = parent.resolve(".sixbridge-publish-journal.v1")
-            val header = journal.readText().lineSequence().drop(2).first().split('|')
-            val token = String(Base64.getUrlDecoder().decode(header[6]))
+            val token = journalOutputIntentToken(journal)
             val marker = parent.resolve(".sixbridge-publish-intent-$token")
             val bytes = if (mode == "token") {
                 "00000000-0000-4000-8000-000000000000".toByteArray()
@@ -620,6 +619,148 @@ class SecureBuildPublisherTest {
     }
 
     @Test
+    fun `crash between marker fsync and identity journal preserves the orphan`() {
+        val parent = Files.createTempDirectory("six-marker-before-identity-journal")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+
+        assertFails {
+            BuildPublicationFaultInjection.forceOutputStageCrash(
+                OutputStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL,
+            ) {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        val journal = parent.resolve(".sixbridge-publish-journal.v1")
+        val journalLines = journal.readText().lineSequence().toList()
+        assertEquals("SIXBRIDGE-PUBLISH-JOURNAL-V3", journalLines[0])
+        assertEquals("3", journalLines[1].split('|')[1])
+        val marker = parent.resolve(
+            ".sixbridge-publish-intent-${journalOutputIntentToken(journal)}",
+        )
+        val markerBytes = Files.readAllBytes(marker)
+        val markerIdentity = fileIdentity(marker)
+
+        assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+        assertContentEquals(markerBytes, Files.readAllBytes(marker))
+        assertEquals(markerIdentity, fileIdentity(marker))
+        assertTrue(Files.exists(journal))
+        assertEquals("old", Files.readString(output))
+    }
+
+    @Test
+    fun `local crash between marker fsync and identity journal preserves the orphan`() {
+        val outputParent = Files.createTempDirectory("six-local-marker-output")
+        val output = outputParent.resolve("extension.crx")
+        Files.writeString(output, "old-output")
+        val localParent = Files.createTempDirectory("six-local-marker-parent")
+        val destination = localParent.resolve("extension-id")
+        val source = Files.createTempDirectory("six-local-marker-source")
+        source.resolve("manifest.json").writeText("new-source")
+        val local = LocalSourcePublication(source, destination)
+
+        assertFails {
+            BuildPublicationFaultInjection.forceLocalStageCrash(
+                LocalStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL,
+            ) {
+                SecureBuildPublisher.publish(
+                    mapOf(output to "new-output".toByteArray()),
+                    local,
+                )
+            }
+        }
+        val journal = outputParent.resolve(".sixbridge-publish-journal.v1")
+        val intentLine = journal.readText().lineSequence()
+            .first { it.startsWith("T|") }
+            .split('|')
+        val token = String(Base64.getUrlDecoder().decode(intentLine[4]))
+        val marker = localParent.resolve(".sixbridge-publish-intent-$token")
+        val markerBytes = Files.readAllBytes(marker)
+        val markerIdentity = fileIdentity(marker)
+
+        assertFails { SecureBuildPublisher.recoverPending(listOf(output), local) }
+        assertContentEquals(markerBytes, Files.readAllBytes(marker))
+        assertEquals(markerIdentity, fileIdentity(marker))
+        assertTrue(Files.exists(journal))
+        assertEquals("old-output", Files.readString(output))
+        assertFalse(Files.exists(destination))
+    }
+
+    @Test
+    fun `journaled marker identity rejects a same-token replacement inode`() {
+        val parent = Files.createTempDirectory("six-marker-replaced-inode")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        assertFails {
+            BuildPublicationFaultInjection.forceOutputStageCrash(
+                OutputStageCrashPoint.AFTER_OWNER_MARKER,
+            ) {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        val journal = parent.resolve(".sixbridge-publish-journal.v1")
+        val token = journalOutputIntentToken(journal)
+        val marker = parent.resolve(".sixbridge-publish-intent-$token")
+        val originalIdentity = fileIdentity(marker)
+        val replacement = parent.resolve(".replacement-${java.util.UUID.randomUUID()}")
+        Files.writeString(replacement, token)
+        Files.setPosixFilePermissions(
+            replacement,
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+            ),
+        )
+        Files.move(
+            replacement,
+            marker,
+            java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+        )
+        val replacementIdentity = fileIdentity(marker)
+        assertTrue(replacementIdentity != originalIdentity)
+
+        assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+        assertEquals(replacementIdentity, fileIdentity(marker))
+        assertEquals(token, Files.readString(marker))
+        assertTrue(Files.exists(journal))
+    }
+
+    @Test
+    fun `markerRemoved journal never touches a later same-name competitor`() {
+        val parent = Files.createTempDirectory("six-marker-removed-competitor")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        assertFails {
+            BuildPublicationFaultInjection.forceTermination(
+                BuildCrashPoint.AFTER_OUTPUT_BACKUP,
+            ) {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        val journal = parent.resolve(".sixbridge-publish-journal.v1")
+        val token = journalOutputIntentToken(journal)
+        val marker = parent.resolve(".sixbridge-publish-intent-$token")
+        assertFalse(Files.exists(marker))
+        Files.writeString(marker, token)
+        Files.setPosixFilePermissions(
+            marker,
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+            ),
+        )
+        val competitorIdentity = fileIdentity(marker)
+
+        SecureBuildPublisher.recoverPending(listOf(output), null)
+
+        assertEquals(competitorIdentity, fileIdentity(marker))
+        assertEquals(token, Files.readString(marker))
+        assertFalse(Files.exists(journal))
+        assertEquals("old", Files.readString(output))
+    }
+
+    @Test
     fun `intent marker evidence allows verified cleanup after its parent fsync fails`() {
         val parent = Files.createTempDirectory("six-intent-marker-fsync")
         val output = parent.resolve("extension.crx")
@@ -650,7 +791,11 @@ class SecureBuildPublisherTest {
 
     @Test
     fun `output stage recovery requires an internal token before identity is journaled`() {
-        OutputStageCrashPoint.entries.forEach { point ->
+        OutputStageCrashPoint.entries
+            .filterNot {
+                it == OutputStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL
+            }
+            .forEach { point ->
             val parent = Files.createTempDirectory("six-output-stage-owner")
             val output = parent.resolve("extension.crx")
             Files.writeString(output, "old")
@@ -681,7 +826,11 @@ class SecureBuildPublisherTest {
 
     @Test
     fun `local stage creation crashes recover only proven owned directories`() {
-        LocalStageCrashPoint.entries.forEach { point ->
+        LocalStageCrashPoint.entries
+            .filterNot {
+                it == LocalStageCrashPoint.AFTER_INTENT_MARKER_BEFORE_JOURNAL
+            }
+            .forEach { point ->
             val outputParent = Files.createTempDirectory("six-local-stage-output")
             val output = outputParent.resolve("extension.crx")
             Files.writeString(output, "old-output")
@@ -808,6 +957,17 @@ class SecureBuildPublisherTest {
                 val fields = lines[outputIndex].split('|').toMutableList()
                 fields[4] = "z".repeat(64)
                 lines[outputIndex] = fields.joinToString("|")
+            },
+            { lines ->
+                lines.removeAt(lines.indexOfFirst { it.startsWith("L|") })
+                lines.removeAt(lines.indexOfFirst { it.startsWith("T|") })
+                val metadata = lines[1].split('|').toMutableList()
+                metadata[3] = "false"
+                metadata[4] = "false"
+                lines[1] = metadata.joinToString("|")
+                val header = lines[2].split('|').toMutableList()
+                header[1] = "LOCAL_INTENT_READY"
+                lines[2] = header.joinToString("|")
             },
         )
         mutations.forEachIndexed { index, mutation ->
@@ -1136,5 +1296,16 @@ class SecureBuildPublisherTest {
         Files.walk(root).use { paths ->
             paths.sorted(Comparator.reverseOrder()).forEach(Files::delete)
         }
+    }
+
+    private fun journalOutputIntentToken(journal: Path): String {
+        val header = journal.readText().lineSequence().drop(2).first().split('|')
+        return String(Base64.getUrlDecoder().decode(header.last()))
+    }
+
+    private fun fileIdentity(path: Path): Pair<Long, Long> {
+        val attributes = Files.readAttributes(path, "unix:dev,ino")
+        return (attributes.getValue("dev") as Number).toLong() to
+            (attributes.getValue("ino") as Number).toLong()
     }
 }
