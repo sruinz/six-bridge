@@ -150,4 +150,174 @@ for mutation in extra popup_version popup_evidence popup_risk popup_change popup
   fi
 done
 
+fixture_project="$fixture/project"
+fixture_source="$fixture/source"
+fixture_profile="$fixture_project/profiles/sbrowser-30.0.0.67.json"
+fixture_cli="$fixture_project/cli/build/install/sixbridge/bin/sixbridge"
+mkdir -p \
+  "$fixture_project/scripts" \
+  "$(dirname -- "$fixture_profile")" \
+  "$(dirname -- "$fixture_cli")" \
+  "$fixture_source"
+fixture_profile_dir=$(CDPATH= cd -- "$(dirname -- "$fixture_profile")" && pwd -P)
+fixture_profile_real="$fixture_profile_dir/$(basename -- "$fixture_profile")"
+cp "$script" "$fixture_project/scripts/fold7-converted-extension.sh"
+cp "$library" "$fixture_project/scripts/fold7-validation-lib.sh"
+jq '
+  .versionName = "30.0.0.67" |
+  .versionCode = 1300067502
+' "$profile" >"$fixture_profile"
+git -C "$fixture_source" init -q
+printf 'fixture source\n' >"$fixture_source/source.txt"
+
+fixture_bundle="$fixture/bundle.six"
+fixture_crx="$fixture/extension.crx"
+fixture_wrapper="$fixture/wrapper.apk"
+fixture_bundle_dir="$fixture/bundle"
+mkdir "$fixture_bundle_dir"
+cat >"$fixture_bundle_dir/extension.json" <<'EOF'
+{
+  "extensionId": "dncifaeoabkkmddoeeccpjdkifeoemfd",
+  "wrapperPackage": "dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd",
+  "wrapperVersionCode": 10
+}
+EOF
+cp "$after" "$fixture_bundle_dir/compatibility.json"
+(
+  cd "$fixture_bundle_dir"
+  zip -q -X "$fixture_bundle" extension.json compatibility.json
+)
+printf 'Cr24fixture\n' >"$fixture_crx"
+printf 'fixture wrapper\n' >"$fixture_wrapper"
+
+cat >"$fixture_cli" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+command_name=$1
+shift
+output=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output=$2
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+case "$command_name" in
+  analyze)
+    cp "$SIX_TEST_BEFORE" "$output"
+    ;;
+  draft)
+    cp "$SIX_TEST_DRAFT" "$output"
+    ;;
+  verify-draft|verify-build)
+    ;;
+  build)
+    cp "$SIX_TEST_BUNDLE" "$output"
+    artifact_dir=$(dirname -- "$output")
+    cp "$SIX_TEST_CRX" "$artifact_dir/smart-context-converted.crx"
+    cp "$SIX_TEST_WRAPPER" \
+      "$artifact_dir/smart-context-converted-wrapper.apk"
+    ;;
+  *)
+    echo "예상하지 않은 fixture command입니다: $command_name" >&2
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "$fixture_cli"
+
+run_option_entry_fixture() {
+  variant=$1
+  expected=$2
+  profile_mode=$3
+  source_root="$fixture/transformed-$variant"
+  source_zip="$fixture/transformed-$variant.zip"
+  draft_zip="$fixture/draft-$variant.sixdraft"
+  output_file="$fixture/output-$variant.txt"
+  mkdir "$source_root"
+  case "$variant" in
+    missing_options_ui)
+      printf '{"manifest_version":3}\n' >"$source_root/manifest.json"
+      mkdir "$source_root/_sixbridge"
+      printf 'provenance\n' \
+        >"$source_root/_sixbridge/action-popup-entry.v2.json"
+      ;;
+    *)
+      printf '%s\n' \
+        '{"manifest_version":3,"options_ui":{"page":"popup.html","open_in_tab":true}}' \
+        >"$source_root/manifest.json"
+      if [ "$variant" != missing_provenance ]; then
+        mkdir "$source_root/_sixbridge"
+        printf 'provenance\n' \
+          >"$source_root/_sixbridge/action-popup-entry.v2.json"
+      fi
+      ;;
+  esac
+  case "$variant" in
+    legacy_content)
+      printf 'legacy\n' >"$source_root/action-popup-entry-content.v1.js"
+      ;;
+    legacy_background)
+      printf 'legacy\n' >"$source_root/action-popup-entry-background.v1.js"
+      ;;
+    legacy_bootstrap)
+      printf 'legacy\n' \
+        >"$source_root/_sixbridge-action-popup-entry-bootstrap.v1.js"
+      ;;
+  esac
+  (
+    cd "$source_root"
+    zip -q -X -r "$source_zip" .
+  )
+  draft_root="$fixture/draft-root-$variant"
+  mkdir "$draft_root"
+  cp "$source_zip" "$draft_root/source.zip"
+  (
+    cd "$draft_root"
+    zip -q -X "$draft_zip" source.zip
+  )
+
+  set -- --host-only --source "$fixture_source"
+  if [ "$profile_mode" = explicit ]; then
+    set -- "$@" --profile "$fixture_profile"
+  fi
+  set +e
+  SIX_TEST_BEFORE="$before" \
+    SIX_TEST_DRAFT="$draft_zip" \
+    SIX_TEST_BUNDLE="$fixture_bundle" \
+    SIX_TEST_CRX="$fixture_crx" \
+    SIX_TEST_WRAPPER="$fixture_wrapper" \
+    "$fixture_project/scripts/fold7-converted-extension.sh" "$@" \
+    >"$output_file" 2>&1
+  actual=$?
+  set -e
+  if [ "$actual" -ne "$expected" ]; then
+    cat "$output_file" >&2
+    echo "$variant fixture 예상 exit=$expected, 실제 exit=$actual" >&2
+    exit 1
+  fi
+  if [ "$expected" -eq 0 ]; then
+    grep -Fx 'optionsEntryContract=true' "$output_file" >/dev/null
+    grep -Fx 'persistentActionButtonAbsent=true' "$output_file" >/dev/null
+  fi
+}
+
+for mutation in \
+  missing_options_ui \
+  missing_provenance \
+  legacy_content \
+  legacy_background \
+  legacy_bootstrap; do
+  run_option_entry_fixture "$mutation" 3 explicit
+done
+run_option_entry_fixture valid 0 default
+grep -Fx "profile=$fixture_profile_real" "$fixture/output-valid.txt" >/dev/null
+
 echo "fold7 converted extension shell tests passed"

@@ -19,7 +19,7 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 # shellcheck source=fold7-validation-lib.sh
 . "$project_dir/scripts/fold7-validation-lib.sh"
 source_input='/workspace/T5다운로드/작업중/미니메뉴 확장프로그램/smart-context-menu'
-profile_input="$project_dir/profiles/sbrowser-30.0.2.61.json"
+profile_input="$project_dir/profiles/sbrowser-30.0.0.67.json"
 serial=
 host_only=false
 
@@ -234,6 +234,31 @@ printf '%s\n' "sourceStatusBaseline:" "$source_status_before"
   --output "$second_draft_work"
 
 "$cli" verify-draft --input "$first_draft_work"
+transformed_source_zip="$run_dir/transformed-source.zip"
+unzip -p "$first_draft_work" source.zip >"$transformed_source_zip" || {
+  echo "SixDraft에서 transformed source ZIP을 읽을 수 없습니다." >&2
+  exit 3
+}
+if ! unzip -p "$transformed_source_zip" manifest.json |
+  jq -e '
+    .options_ui.page == "popup.html" and
+    .options_ui.open_in_tab == true
+  ' >/dev/null; then
+  echo "transformed manifest의 options_ui 계약이 올바르지 않습니다." >&2
+  exit 3
+fi
+zipinfo -1 "$transformed_source_zip" |
+  grep -Fx '_sixbridge/action-popup-entry.v2.json' >/dev/null || {
+  echo "action popup option entry provenance를 찾을 수 없습니다." >&2
+  exit 3
+}
+if zipinfo -1 "$transformed_source_zip" |
+  grep -E 'action-popup-entry-(content|background)\.v1\.js|_sixbridge-action-popup-entry-bootstrap\.v1\.js' >/dev/null; then
+  echo "version 1 action popup runtime asset이 남아 있습니다." >&2
+  exit 3
+fi
+echo "optionsEntryContract=true"
+echo "persistentActionButtonAbsent=true"
 "$cli" verify-draft --input "$second_draft_work"
 first_hash=$(shasum -a 256 "$first_draft_work" | awk '{print $1}')
 second_hash=$(shasum -a 256 "$second_draft_work" | awk '{print $1}')
@@ -347,6 +372,9 @@ fi
   --bundle "$bundle" \
   --serial "$serial" \
   --evidence-dir "$run_dir"
+echo "installSuccess=true"
+echo "discoverySuccess=true"
+echo "providerReadSuccess=true"
 echo "deviceChecks=passed"
 if [ "$profile_match" = true ]; then
   echo "runtimeResult=사용자 수동 확인 필요"
