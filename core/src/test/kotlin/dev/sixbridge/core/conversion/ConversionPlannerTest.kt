@@ -2,10 +2,15 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import javax.tools.ToolProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class ConversionPlannerTest {
     @Test
@@ -41,6 +46,70 @@ class ConversionPlannerTest {
             .last()
 
         assertEquals(SelectedAdapter::class.java, applyParameter)
+    }
+
+    @Test
+    fun `external Java cannot construct or implement a selected capability`() {
+        listOf(
+            "ConstructSelectedAdapter.java",
+            "ImplementSelectedAdapter.java",
+            "ConstructPlannerImplementation.java",
+        ).forEach { fixture ->
+            val source = requireNotNull(
+                javaClass.classLoader.getResource(
+                    "dev/sixbridge/core/conversion/$fixture",
+                ),
+            )
+            val output = ByteArrayOutputStream()
+            val destination = Files.createTempDirectory("six-selected-capability-javac")
+            val exit = ToolProvider.getSystemJavaCompiler().run(
+                null,
+                output,
+                output,
+                "-classpath",
+                System.getProperty("java.class.path"),
+                "-d",
+                destination.toString(),
+                Path.of(source.toURI()).toString(),
+            )
+
+            assertTrue(exit != 0, "$fixture unexpectedly compiled")
+            val diagnostics = output.toString()
+            if (fixture == "ConstructSelectedAdapter.java") {
+                assertTrue(
+                    "abstract" in diagnostics && "instantiated" in diagnostics,
+                    diagnostics,
+                )
+            } else if (fixture == "ConstructPlannerImplementation.java") {
+                assertTrue("private access" in diagnostics, diagnostics)
+            } else {
+                assertTrue(
+                    "sealed" in diagnostics && "not allowed" in diagnostics,
+                    diagnostics,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `selected capability exposes no public raw decision constructor in JVM bytecode`() {
+        val javap = Path.of(System.getProperty("java.home"), "bin", "javap")
+        val process = ProcessBuilder(
+            javap.toString(),
+            "-p",
+            "-classpath",
+            System.getProperty("java.class.path"),
+            SelectedAdapter::class.java.name,
+        ).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+
+        assertEquals(0, process.waitFor(), output)
+        assertTrue(
+            "interface dev.sixbridge.core.conversion.SelectedAdapter" in output,
+            output,
+        )
+        assertFalse("SelectedAdapter(" in output, output)
+        assertFalse("AdapterDecision" in output, output)
     }
 
     @Test

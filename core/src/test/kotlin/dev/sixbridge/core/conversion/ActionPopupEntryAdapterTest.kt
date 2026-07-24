@@ -188,6 +188,120 @@ class ActionPopupEntryAdapterTest {
     }
 
     @Test
+    fun `conservatively detects worker URL access but ignores comments and plain strings`() {
+        listOf(
+            """new URL("worker.js", location);""",
+            "void location;",
+            """self["location"].href;""",
+            "self?.location.href;",
+            """new URL("worker.js", import.meta["url"]);""",
+        ).forEach { workerSource ->
+            val source = extension(
+                worker = "background.js",
+                workerType = "module",
+                workerSource = workerSource,
+            )
+            val decision = MobilePatternAnalyzer().analyze(source, profile)
+                .adapterDecisions
+                .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
+
+            assertEquals(
+                AdapterDisposition.UNAVAILABLE,
+                decision.disposition,
+                workerSource,
+            )
+        }
+
+        val lexicalOnly = extension(
+            worker = "background.js",
+            workerSource = """
+                // location and import.meta are documentation words.
+                const text = "location import.meta";
+            """.trimIndent(),
+        )
+        val lexicalDecision = MobilePatternAnalyzer().analyze(lexicalOnly, profile)
+            .adapterDecisions
+            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
+        assertEquals(AdapterDisposition.REQUIRES_APPROVAL, lexicalDecision.disposition)
+    }
+
+    @Test
+    fun `apply rechecks unresolved and transitive background dependencies after approval`() {
+        val changedTransitive = extension(
+            worker = "background.js",
+            workerSource = """importScripts("./dependency.js");""",
+        )
+        changedTransitive.resolve("dependency.js").writeText(
+            "globalThis.initiallySafe = true;",
+        )
+        val transitiveSelection = approvedSelection(changedTransitive)
+        changedTransitive.resolve("dependency.js").writeText(
+            """new URL("worker.js", location);""",
+        )
+        assertFailsWith<IllegalStateException>("changed transitive dependency") {
+            ActionPopupEntryAdapter().apply(changedTransitive, transitiveSelection)
+        }
+        assertFalse(Files.exists(changedTransitive.resolve("_sixbridge")))
+
+        val cases = listOf(
+            Triple(
+                "new static dependency",
+                """importScripts("./dependency.js");""",
+                """self["location"].href;""",
+            ),
+            Triple(
+                "unresolved dependency",
+                "importScripts(nextScript);",
+                "",
+            ),
+        )
+        cases.forEach { (label, changedWorker, changedDependency) ->
+            val source = extension(
+                worker = "background.js",
+                workerSource = "globalThis.initiallySafe = true;",
+            )
+            val selected = approvedSelection(source)
+            source.resolve("background.js").writeText(changedWorker)
+            if (changedDependency.isNotEmpty()) {
+                source.resolve("dependency.js").writeText(changedDependency)
+            }
+            val manifestBefore = source.resolve("manifest.json").readBytes()
+
+            assertFailsWith<IllegalStateException>(label) {
+                ActionPopupEntryAdapter().apply(source, selected)
+            }
+            assertContentEquals(
+                manifestBefore,
+                source.resolve("manifest.json").readBytes(),
+                label,
+            )
+            assertFalse(Files.exists(source.resolve("_sixbridge")), label)
+        }
+    }
+
+    @Test
+    fun `generated bootstrap reapply rechecks transitive background dependencies`() {
+        val source = extension(
+            worker = "scripts/background.js",
+            workerSource = """importScripts("./dependency.js");""",
+        )
+        source.resolve("scripts/dependency.js").writeText(
+            "globalThis.initiallySafe = true;",
+        )
+        val selected = approvedSelection(source)
+        ActionPopupEntryAdapter().apply(source, selected)
+        val manifestBefore = source.resolve("manifest.json").readBytes()
+        source.resolve("scripts/dependency.js").writeText(
+            """self["location"].href;""",
+        )
+
+        assertFailsWith<IllegalStateException> {
+            ActionPopupEntryAdapter().apply(source, selected)
+        }
+        assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
+    }
+
+    @Test
     fun `rejects encoded and URL-like popup and worker paths`() {
         val unsafeSegments = listOf(
             "%2e%2e/popup.html",

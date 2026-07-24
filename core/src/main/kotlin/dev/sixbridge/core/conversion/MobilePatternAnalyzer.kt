@@ -129,11 +129,7 @@ class MobilePatternAnalyzer(
             if ("tabs" !in profile.supportedApis) {
                 add("tabs namespace가 없어 popup을 extension tab으로 열 수 없습니다.")
             }
-            if (index.scripts.any {
-                    RuntimeResourceIndex.ResourceRole.BACKGROUND in it.roles &&
-                        ActionPopupEntrySafety.usesWorkerUrl(it.source)
-                }
-            ) {
+            if (ActionPopupEntrySafety.hasWorkerUrlDependency(index)) {
                 add("원본 service worker가 자신의 URL에 의존해 bootstrap semantics를 보존할 수 없습니다.")
             }
         }

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
+import dev.sixbridge.core.compat.RuntimeResourceIndex
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -17,7 +18,7 @@ class ActionPopupEntryAdapter : MobileAdapter {
     override val version: Int = 1
 
     override fun apply(workingRoot: Path, selected: SelectedAdapter): AdapterDecision {
-        val decision = selected.decision
+        val decision = selected.toDecision()
         if (decision.id != id || decision.version != version ||
             decision.disposition != AdapterDisposition.REQUIRES_APPROVAL
         ) {
@@ -27,6 +28,15 @@ class ActionPopupEntryAdapter : MobileAdapter {
         val manifest = runCatching {
             Json.parseToJsonElement(manifestPath.readText()) as? JsonObject
         }.getOrNull() ?: return decision
+        val runtimeIndex = RuntimeResourceIndex.create(workingRoot, manifest)
+        if (runtimeIndex.unresolvedDependency) {
+            throw IllegalStateException("background runtime dependency를 완전히 해석할 수 없습니다.")
+        }
+        if (ActionPopupEntrySafety.hasWorkerUrlDependency(runtimeIndex)) {
+            throw IllegalStateException(
+                "background runtime closure가 worker URL에 의존해 bootstrap semantics를 보존할 수 없습니다.",
+            )
+        }
         val popupPath = (manifest[ACTION] as? JsonObject)
             ?.stringOrNull(DEFAULT_POPUP)
             ?.takeIf { it.isNotBlank() }
@@ -126,12 +136,7 @@ class ActionPopupEntryAdapter : MobileAdapter {
     }
 
     private fun verifyOriginalWorker(workingRoot: Path, relativePath: String) {
-        val worker = verifyResource(workingRoot, relativePath, "원본 service worker")
-        if (ActionPopupEntrySafety.usesWorkerUrl(Files.readString(worker))) {
-            throw IllegalStateException(
-                "원본 service worker가 자신의 URL에 의존해 bootstrap semantics를 보존할 수 없습니다.",
-            )
-        }
+        verifyResource(workingRoot, relativePath, "원본 service worker")
     }
 
     private fun verifyResource(
@@ -354,16 +359,25 @@ class ActionPopupEntryAdapter : MobileAdapter {
 }
 
 internal object ActionPopupEntrySafety {
-    private val WORKER_URL = Regex(
-        """\b(?:self|globalThis)\s*\.\s*location\b|""" +
-            """\bimport\s*\.\s*meta\s*\.\s*url\b|""" +
-            """\blocation\s*\.\s*(?:href|origin|pathname|protocol|host|hostname|port|search|hash)\b""",
-    )
+    private val LOCATION_IDENTIFIER = Regex("""\blocation\b""")
+    private val IMPORT_META = Regex("""\bimport\s*\.\s*meta\b""")
+    private val LOCATION_PROPERTY = Regex("""\[\s*(["'])location\1\s*]""")
 
-    fun usesWorkerUrl(source: String): Boolean =
-        WORKER_URL.containsMatchIn(
-            JavaScriptLexicalMask.mask(source, maskLiterals = true),
-        )
+    fun hasWorkerUrlDependency(index: RuntimeResourceIndex): Boolean =
+        index.scripts.any {
+            RuntimeResourceIndex.ResourceRole.BACKGROUND in it.roles &&
+                usesWorkerUrl(it.source)
+        }
+
+    private fun usesWorkerUrl(source: String): Boolean {
+        val commentsMasked = JavaScriptLexicalMask.mask(source, maskLiterals = false)
+        val codeOnly = JavaScriptLexicalMask.mask(source, maskLiterals = true)
+        return LOCATION_IDENTIFIER.containsMatchIn(codeOnly) ||
+            IMPORT_META.containsMatchIn(codeOnly) ||
+            LOCATION_PROPERTY.findAll(commentsMasked).any {
+                codeOnly.getOrNull(it.range.first) == '['
+            }
+    }
 
     fun canonicalResourcePath(value: String): String? {
         if (!isSafeUrlPath(value)) return null

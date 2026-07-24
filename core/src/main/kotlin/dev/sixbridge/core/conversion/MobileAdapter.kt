@@ -9,15 +9,24 @@ interface MobileAdapter {
     fun apply(workingRoot: Path, selected: SelectedAdapter): AdapterDecision
 }
 
-class SelectedAdapter internal constructor(
-    internal val decision: AdapterDecision,
-) {
-    val id: String get() = decision.id
-    val version: Int get() = decision.version
-    val risk: AdapterRisk get() = decision.risk
-    val disposition: AdapterDisposition get() = decision.disposition
-    val applied: Boolean get() = decision.applied
-    val evidence: List<SourceEvidence> get() = decision.evidence
-    val changes: List<String> get() = decision.changes
-    val remainingLimitations: List<String> get() = decision.remainingLimitations
+sealed interface SelectedAdapter {
+    val id: String
+    val version: Int
+    val risk: AdapterRisk
+    val disposition: AdapterDisposition
+    val applied: Boolean
+    val evidence: List<SourceEvidence>
+    val changes: List<String>
+    val remainingLimitations: List<String>
 }
+
+internal fun SelectedAdapter.toDecision(): AdapterDecision = AdapterDecision(
+    id = id,
+    version = version,
+    risk = risk,
+    disposition = disposition,
+    applied = applied,
+    evidence = evidence,
+    changes = changes,
+    remainingLimitations = remainingLimitations,
+)

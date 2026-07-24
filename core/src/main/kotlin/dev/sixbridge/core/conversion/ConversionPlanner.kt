@@ -45,11 +45,25 @@ class ConversionPlanner(
                         )
             }
             .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
-            .map(::SelectedAdapter)
+            .map(::PlannedAdapter)
         return ConversionPlan(
             report = report,
             selectedAdapters = selected,
         )
+    }
+
+    private class PlannedAdapter(
+        decision: AdapterDecision,
+    ) : SelectedAdapter {
+        override val id: String = decision.id
+        override val version: Int = decision.version
+        override val risk: AdapterRisk = decision.risk
+        override val disposition: AdapterDisposition = decision.disposition
+        override val applied: Boolean = decision.applied
+        override val evidence: List<SourceEvidence> = decision.evidence
+        override val changes: List<String> = decision.changes
+        override val remainingLimitations: List<String> =
+            decision.remainingLimitations
     }
 }
 
