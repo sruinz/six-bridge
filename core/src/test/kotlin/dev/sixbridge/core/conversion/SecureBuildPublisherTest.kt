@@ -4,6 +4,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -19,6 +20,32 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SecureBuildPublisherTest {
+    @Test
+    fun `reserved internal output names are rejected before creating the parent`() {
+        val root = Files.createTempDirectory("six-reserved-output-root")
+        val reservedNames = listOf(
+            ".sixbridge-build-publisher.lock",
+            ".sixbridge-publish-journal.v1",
+            ".sixbridge-publish-journal.tmp-${java.util.UUID.randomUUID()}",
+            ".sixbridge-publish-${java.util.UUID.randomUUID()}",
+            ".sixbridge-publish-intent-${java.util.UUID.randomUUID()}",
+            ".sixbridge-local-stage-${java.util.UUID.randomUUID()}",
+            ".sixbridge-local-backup-${java.util.UUID.randomUUID()}",
+            ".sixbridge-stage-owner-${java.util.UUID.randomUUID()}",
+            ".sixbridge-future-internal",
+        )
+
+        reservedNames.forEach { name ->
+            val parent = root.resolve(name.removePrefix("."))
+            assertFails {
+                SecureBuildPublisher.publish(
+                    mapOf(parent.resolve(name) to "reserved".toByteArray()),
+                )
+            }
+            assertFalse(Files.exists(parent), name)
+        }
+    }
+
     @Test
     fun `same output parent publications are serialized for the whole transaction`() {
         val parent = Files.createTempDirectory("six-publish-concurrent")
@@ -483,6 +510,142 @@ class SecureBuildPublisherTest {
 
         assertEquals("old", Files.readString(output))
         assertNoTransactionDebris(parent)
+    }
+
+    @Test
+    fun `a competitor that wins the exact intent marker name is never deleted`() {
+        val parent = Files.createTempDirectory("six-intent-marker-competitor")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        var competitor: Path? = null
+        var competitorIdentity: Any? = null
+        var competitorBytes: ByteArray? = null
+
+        assertFails {
+            BuildPublicationFaultInjection.beforeIntentMarkerCreate(
+                action = { markerParent, token ->
+                    val marker = markerParent.resolve(".sixbridge-publish-intent-$token")
+                    val bytes = token.toString().toByteArray()
+                    Files.write(marker, bytes)
+                    Files.setPosixFilePermissions(
+                        marker,
+                        setOf(
+                            PosixFilePermission.OWNER_READ,
+                            PosixFilePermission.OWNER_WRITE,
+                        ),
+                    )
+                    competitor = marker
+                    competitorBytes = bytes
+                    competitorIdentity = Files.readAttributes(
+                        marker,
+                        java.nio.file.attribute.BasicFileAttributes::class.java,
+                    ).fileKey()
+                },
+                block = {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                },
+            )
+        }
+
+        val marker = requireNotNull(competitor)
+        assertContentEquals(requireNotNull(competitorBytes), Files.readAllBytes(marker))
+        assertEquals(
+            competitorIdentity,
+            Files.readAttributes(
+                marker,
+                java.nio.file.attribute.BasicFileAttributes::class.java,
+            ).fileKey(),
+        )
+        assertTrue(Files.exists(parent.resolve(".sixbridge-publish-journal.v1")))
+        assertEquals("old", Files.readString(output))
+
+        assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+        assertContentEquals(requireNotNull(competitorBytes), Files.readAllBytes(marker))
+        assertEquals(
+            competitorIdentity,
+            Files.readAttributes(
+                marker,
+                java.nio.file.attribute.BasicFileAttributes::class.java,
+            ).fileKey(),
+        )
+        assertTrue(Files.exists(parent.resolve(".sixbridge-publish-journal.v1")))
+    }
+
+    @Test
+    fun `recovery preserves intent markers with wrong token or permissions`() {
+        listOf("token", "permissions").forEach { mode ->
+            val parent = Files.createTempDirectory("six-intent-marker-invalid-$mode")
+            val output = parent.resolve("extension.crx")
+            Files.writeString(output, "old")
+            assertFails {
+                BuildPublicationFaultInjection.forceAfterIntentBeforeStage {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                }
+            }
+            val journal = parent.resolve(".sixbridge-publish-journal.v1")
+            val header = journal.readText().lineSequence().drop(2).first().split('|')
+            val token = String(Base64.getUrlDecoder().decode(header[6]))
+            val marker = parent.resolve(".sixbridge-publish-intent-$token")
+            val bytes = if (mode == "token") {
+                "00000000-0000-4000-8000-000000000000".toByteArray()
+            } else {
+                token.toByteArray()
+            }
+            Files.write(marker, bytes)
+            Files.setPosixFilePermissions(
+                marker,
+                buildSet {
+                    add(PosixFilePermission.OWNER_READ)
+                    add(PosixFilePermission.OWNER_WRITE)
+                    if (mode == "permissions") add(PosixFilePermission.GROUP_READ)
+                },
+            )
+            val identity = Files.readAttributes(
+                marker,
+                java.nio.file.attribute.BasicFileAttributes::class.java,
+            ).fileKey()
+
+            assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+            assertContentEquals(bytes, Files.readAllBytes(marker))
+            assertEquals(
+                identity,
+                Files.readAttributes(
+                    marker,
+                    java.nio.file.attribute.BasicFileAttributes::class.java,
+                ).fileKey(),
+            )
+            assertTrue(Files.exists(journal))
+            assertEquals("old", Files.readString(output))
+        }
+    }
+
+    @Test
+    fun `intent marker evidence allows verified cleanup after its parent fsync fails`() {
+        val parent = Files.createTempDirectory("six-intent-marker-fsync")
+        val output = parent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        var parentFsyncs = 0
+
+        assertFails {
+            BuildPublicationFaultInjection.failDirectoryFsyncWhen(
+                predicate = { path ->
+                    if (path == parent) parentFsyncs += 1
+                    path == parent && parentFsyncs == 3
+                },
+                block = {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                },
+            )
+        }
+
+        assertEquals(3, parentFsyncs)
+        assertEquals("old", Files.readString(output))
+        assertFalse(Files.exists(parent.resolve(".sixbridge-publish-journal.v1")))
+        assertTrue(
+            parent.listDirectoryEntries().none {
+                it.fileName.toString().startsWith(".sixbridge-publish-intent-")
+            },
+        )
     }
 
     @Test

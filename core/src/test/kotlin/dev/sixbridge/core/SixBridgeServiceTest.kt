@@ -9,6 +9,7 @@ import dev.sixbridge.core.input.ResolvedExtensionInput
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import dev.sixbridge.core.wrapper.AndroidToolchain
 import java.lang.reflect.InvocationTargetException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -30,6 +31,63 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
+    @Test
+    fun `build preserves output directories for every reserved internal bundle name`() {
+        val toolchain = requireNotNull(AndroidToolchain.locateOrNull()) {
+            "Android SDK 도구가 없어 공개 build 예약 이름 검증을 실행할 수 없습니다."
+        }
+        val workspace = Files.createTempDirectory("six-service-reserved-workspace")
+        val source = source("six-service-reserved-source", "Reserved output")
+        val service = SixBridgeService(workspace) { toolchain }
+        val reservedNames = listOf(
+            ".sixbridge-build-publisher.lock",
+            ".sixbridge-publish-journal.v1",
+            ".sixbridge-publish-journal.tmp-${UUID.randomUUID()}",
+            ".sixbridge-publish-${UUID.randomUUID()}",
+            ".sixbridge-publish-intent-${UUID.randomUUID()}",
+            ".sixbridge-local-stage-${UUID.randomUUID()}",
+            ".sixbridge-local-backup-${UUID.randomUUID()}",
+            ".sixbridge-stage-owner-${UUID.randomUUID()}",
+        )
+
+        reservedNames.forEachIndexed { index, name ->
+            val outputDirectory = Files.createTempDirectory(
+                "six-service-reserved-output-$index",
+            )
+            val reserved = outputDirectory.resolve(name)
+            val sentinel = Files.createDirectories(outputDirectory.resolve("user-directory"))
+                .resolve("keep.txt")
+            val reservedBytes = "reserved-$index".toByteArray()
+            Files.write(reserved, reservedBytes)
+            sentinel.writeText("keep")
+            val reservedIdentity = fileIdentity(reserved)
+            val directoryIdentity = fileIdentity(outputDirectory)
+            val beforeNames = Files.list(outputDirectory).use { paths ->
+                paths.map { it.fileName.toString() }.sorted().toList()
+            }
+
+            assertFailsWith<IllegalArgumentException>(name) {
+                service.build(
+                    input = source.toString(),
+                    profile = supportedProfile(),
+                    outputBundle = reserved,
+                )
+            }
+
+            assertContentEquals(reservedBytes, Files.readAllBytes(reserved), name)
+            assertEquals(reservedIdentity, fileIdentity(reserved), name)
+            assertEquals(directoryIdentity, fileIdentity(outputDirectory), name)
+            assertEquals("keep", Files.readString(sentinel), name)
+            assertEquals(
+                beforeNames,
+                Files.list(outputDirectory).use { paths ->
+                    paths.map { it.fileName.toString() }.sorted().toList()
+                },
+                name,
+            )
+        }
+    }
+
     @Test
     fun `analyze delegates to mobile conversion analysis`() {
         val workspace = Files.createTempDirectory("six-analyze-pipeline-workspace")
@@ -594,5 +652,11 @@ class SixBridgeServiceTest {
         return Files.readString(
             workspace.resolve(".local/source-identities/paths/$key.txt"),
         ).trim()
+    }
+
+    private fun fileIdentity(path: java.nio.file.Path): Pair<Long, Long> {
+        val attributes = Files.readAttributes(path, "unix:dev,ino")
+        return (attributes.getValue("dev") as Number).toLong() to
+            (attributes.getValue("ino") as Number).toLong()
     }
 }

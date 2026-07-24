@@ -101,6 +101,9 @@ internal object SecureBuildPublisher {
         require(normalized.map(Pair<Path, ByteArray>::first).toSet().size == normalized.size) {
             "정규화된 출력 경로가 서로 겹칩니다."
         }
+        normalized.forEach { (path, _) ->
+            requireAllowedOutputName(path)
+        }
         val parent = normalized.map { requireNotNull(it.first.parent) }.distinct()
             .singleOrNull()
             ?: throw IllegalArgumentException("모든 출력은 같은 디렉터리에 있어야 합니다.")
@@ -346,6 +349,8 @@ internal object SecureBuildPublisher {
         private val stagePath: Path =
             parent.resolve(".sixbridge-publish-${UUID.randomUUID()}")
         private val intentToken: UUID = UUID.randomUUID()
+        private var intentMarkerIdentity: StableFileIdentity? = null
+        private var intentMarkerOwnershipUncertain = false
         private var stageRootKey: String? = null
         private var stageIdentity: StableFileIdentity? = null
         private var published = false
@@ -376,7 +381,16 @@ internal object SecureBuildPublisher {
             }
             val path = stagePath
             secureDirectory(parent).use { parentHandle ->
-                writeIntentMarker(parent, parentHandle, intentToken)
+                try {
+                    writeIntentMarker(parent, parentHandle, intentToken) {
+                        intentMarkerIdentity = it
+                    }
+                } catch (failure: Throwable) {
+                    if (intentMarkerIdentity == null) {
+                        intentMarkerOwnershipUncertain = true
+                    }
+                    throw failure
+                }
             }
             val created = OwnedTempTree.createAt(path)
             owner = created
@@ -488,6 +502,14 @@ internal object SecureBuildPublisher {
         }
 
         fun rollback(failure: Throwable): Boolean {
+            if (intentMarkerOwnershipUncertain) {
+                failure.addSuppressed(
+                    IllegalStateException(
+                        "output intent marker 소유권을 증명할 수 없어 journal을 보존합니다.",
+                    ),
+                )
+                return false
+            }
             if (committed || owner == null) return true
             if (BuildPublicationFaultInjection.shouldFailOutputRollback()) {
                 failure.addSuppressed(
@@ -575,11 +597,19 @@ internal object SecureBuildPublisher {
         fun journalIntentToken(): String = intentToken.toString()
 
         fun removeIntentMarker() {
-            removeIntentMarker(parent, intentToken)
+            removeIntentMarker(
+                parent,
+                intentToken,
+                requireNotNull(intentMarkerIdentity),
+            )
+            intentMarkerIdentity = null
         }
 
         fun removeIntentMarkerIfPresent() {
-            removeIntentMarkerIfPresent(parent, intentToken)
+            intentMarkerIdentity?.let { expected ->
+                removeIntentMarkerIfPresent(parent, intentToken, expected)
+                intentMarkerIdentity = null
+            }
         }
 
         fun journalTargets(): List<JournalOutput> = targets.map { target ->
@@ -630,7 +660,8 @@ internal object SecureBuildPublisher {
         private var stageRootKey: String? = null
         private var stageIdentity: StableFileIdentity? = null
         private var durabilityFailed = false
-        private var intentMarkerCreated = false
+        private var intentMarkerIdentity: StableFileIdentity? = null
+        private var intentMarkerOwnershipUncertain = false
 
         fun stage(afterCreated: () -> Unit) {
             require(source != destination) {
@@ -652,9 +683,17 @@ internal object SecureBuildPublisher {
                 }
             }
             secureDirectory(parent).use { parentHandle ->
-                writeIntentMarker(parent, parentHandle, intentToken)
+                try {
+                    writeIntentMarker(parent, parentHandle, intentToken) {
+                        intentMarkerIdentity = it
+                    }
+                } catch (failure: Throwable) {
+                    if (intentMarkerIdentity == null) {
+                        intentMarkerOwnershipUncertain = true
+                    }
+                    throw failure
+                }
             }
-            intentMarkerCreated = true
             val created = OwnedTempTree.createAt(stageOriginal)
             owner = created
             BuildPublicationFaultInjection.crashLocalStageAt(
@@ -756,6 +795,14 @@ internal object SecureBuildPublisher {
         }
 
         fun rollback(failure: Throwable): Boolean {
+            if (intentMarkerOwnershipUncertain) {
+                failure.addSuppressed(
+                    IllegalStateException(
+                        "local intent marker 소유권을 증명할 수 없어 journal을 보존합니다.",
+                    ),
+                )
+                return false
+            }
             if (committed || owner == null) return true
             if (durabilityFailed) {
                 failure.addSuppressed(
@@ -840,14 +887,18 @@ internal object SecureBuildPublisher {
         )
 
         fun removeIntentMarker() {
-            removeIntentMarker(parent, intentToken)
-            intentMarkerCreated = false
+            removeIntentMarker(
+                parent,
+                intentToken,
+                requireNotNull(intentMarkerIdentity),
+            )
+            intentMarkerIdentity = null
         }
 
         fun removeIntentMarkerIfPresent() {
-            if (intentMarkerCreated) {
-                removeIntentMarkerIfPresent(parent, intentToken)
-                intentMarkerCreated = false
+            intentMarkerIdentity?.let { expected ->
+                removeIntentMarkerIfPresent(parent, intentToken, expected)
+                intentMarkerIdentity = null
             }
         }
     }
@@ -2060,7 +2111,9 @@ internal object SecureBuildPublisher {
         parentPath: Path,
         parentHandle: SecureDirectoryStream<Path>,
         token: UUID,
+        ownershipRecorded: (StableFileIdentity) -> Unit,
     ) {
+        BuildPublicationFaultInjection.beforeIntentMarkerCreate(parentPath, token)
         val name = singleName(".sixbridge-publish-intent-$token")
         val bytes = token.toString().toByteArray(Charsets.US_ASCII)
         parentHandle.newByteChannel(
@@ -2080,9 +2133,18 @@ internal object SecureBuildPublisher {
             ),
         )
         view.setPermissions(JOURNAL_PERMISSIONS)
-        require(view.readAttributes().permissions() == JOURNAL_PERMISSIONS)
-        require(strictUnixLinks(parentPath.resolve(name.toString())) == 1L)
+        val identity = readIntentMarkerIdentity(
+            parentPath,
+            parentHandle,
+            token,
+        )
+        ownershipRecorded(identity)
         forceDirectory(parentPath)
+        require(
+            readIntentMarkerIdentity(parentPath, parentHandle, token) == identity,
+        ) {
+            "publish intent marker가 directory fsync 중 교체되었습니다."
+        }
     }
 
     private fun deleteIntentOwnedStage(
@@ -2097,6 +2159,13 @@ internal object SecureBuildPublisher {
         secureDirectory(parent).use { parentHandle ->
             val stageAttributes = attributesOrNull(parentHandle, stageName)
             val markerAttributes = attributesOrNull(parentHandle, markerName)
+            require(
+                stageAttributes != null ||
+                    markerAttributes == null ||
+                    expectedIdentityValue != null,
+            ) {
+                "stage 없는 INTENT marker는 소유권을 증명할 수 없습니다."
+            }
             if (stageAttributes != null) {
                 require(stageAttributes.isDirectory && !stageAttributes.isSymbolicLink) {
                     "intent stage는 일반 디렉터리여야 합니다."
@@ -2123,26 +2192,12 @@ internal object SecureBuildPublisher {
                 }
             }
             if (markerAttributes != null) {
-                require(markerAttributes.isRegularFile && !markerAttributes.isSymbolicLink)
-                require(strictUnixLinks(parent.resolve(markerName.toString())) == 1L)
-                val permissions = requireNotNull(
-                    parentHandle.getFileAttributeView(
-                        markerName,
-                        PosixFileAttributeView::class.java,
-                        NOFOLLOW_LINKS,
-                    ),
-                ).readAttributes().permissions()
-                require(permissions == JOURNAL_PERMISSIONS)
-                val marker = parentHandle.newByteChannel(
-                    markerName,
-                    setOf(READ, NOFOLLOW_LINKS),
-                ).use { it.readAllBytes() }.toString(Charsets.US_ASCII)
-                require(marker == token.toString()) {
-                    "intent stage owner marker가 journal과 다릅니다."
-                }
+                readIntentMarkerIdentity(parent, parentHandle, token)
             }
             if (stageAttributes != null) deleteTree(parentHandle, stageName)
-            if (markerAttributes != null) parentHandle.deleteFile(markerName)
+            if (markerAttributes != null) {
+                deleteVerifiedIntentMarker(parent, parentHandle, token, null)
+            }
             require(attributesOrNull(parentHandle, stageName) == null)
             require(attributesOrNull(parentHandle, markerName) == null)
             forceDirectory(parent)
@@ -2165,26 +2220,117 @@ internal object SecureBuildPublisher {
     private fun removeIntentMarker(
         parentPath: Path,
         token: UUID,
+        expectedIdentity: StableFileIdentity?,
     ) {
         secureDirectory(parentPath).use { handle ->
-            val name = singleName(".sixbridge-publish-intent-$token")
-            val attributes = requireNotNull(attributesOrNull(handle, name))
-            require(attributes.isRegularFile && !attributes.isSymbolicLink)
-            require(strictUnixLinks(parentPath.resolve(name.toString())) == 1L)
-            handle.deleteFile(name)
-            forceDirectory(parentPath)
+            require(
+                deleteVerifiedIntentMarker(
+                    parentPath,
+                    handle,
+                    token,
+                    expectedIdentity,
+                ),
+            ) {
+                "publish intent marker가 없습니다."
+            }
         }
     }
 
     private fun removeIntentMarkerIfPresent(
         parentPath: Path,
         token: UUID,
+        expectedIdentity: StableFileIdentity? = null,
     ) {
         secureDirectory(parentPath).use { handle ->
-            val name = singleName(".sixbridge-publish-intent-$token")
-            if (attributesOrNull(handle, name) == null) return
+            deleteVerifiedIntentMarker(
+                parentPath,
+                handle,
+                token,
+                expectedIdentity,
+            )
         }
-        removeIntentMarker(parentPath, token)
+    }
+
+    private fun deleteVerifiedIntentMarker(
+        parentPath: Path,
+        parentHandle: SecureDirectoryStream<Path>,
+        token: UUID,
+        expectedIdentity: StableFileIdentity?,
+    ): Boolean {
+        val name = singleName(".sixbridge-publish-intent-$token")
+        if (attributesOrNull(parentHandle, name) == null) return false
+        val identity = readIntentMarkerIdentity(parentPath, parentHandle, token)
+        expectedIdentity?.let {
+            require(identity == it) {
+                "publish intent marker identity가 생성 증거와 다릅니다."
+            }
+        }
+        require(
+            readIntentMarkerIdentity(parentPath, parentHandle, token) == identity,
+        ) {
+            "publish intent marker가 삭제 검증 중 교체되었습니다."
+        }
+        parentHandle.deleteFile(name)
+        require(attributesOrNull(parentHandle, name) == null)
+        forceDirectory(parentPath)
+        return true
+    }
+
+    private fun readIntentMarkerIdentity(
+        parentPath: Path,
+        parentHandle: SecureDirectoryStream<Path>,
+        token: UUID,
+    ): StableFileIdentity {
+        val name = singleName(".sixbridge-publish-intent-$token")
+        val absolute = parentPath.resolve(name.toString())
+        val before = requireNotNull(attributesOrNull(parentHandle, name))
+        require(before.isRegularFile && !before.isSymbolicLink) {
+            "publish intent marker는 일반 파일이어야 합니다."
+        }
+        require(strictUnixLinks(absolute) == 1L) {
+            "publish intent marker hard link는 허용되지 않습니다."
+        }
+        val permissions = requireNotNull(
+            parentHandle.getFileAttributeView(
+                name,
+                PosixFileAttributeView::class.java,
+                NOFOLLOW_LINKS,
+            ),
+        ).readAttributes().permissions()
+        require(permissions == JOURNAL_PERMISSIONS) {
+            "publish intent marker는 owner-only여야 합니다."
+        }
+        val identity = stableFileIdentity(
+            absolute,
+            requireNotNull(before.fileKey()),
+        )
+        val bytes = parentHandle.newByteChannel(
+            name,
+            setOf(READ, NOFOLLOW_LINKS),
+        ).use { it.readAllBytes() }
+        require(bytes.contentEquals(token.toString().toByteArray(Charsets.US_ASCII))) {
+            "publish intent marker token이 journal과 다릅니다."
+        }
+        val after = requireNotNull(attributesOrNull(parentHandle, name))
+        require(
+            after.isRegularFile &&
+                !after.isSymbolicLink &&
+                strictUnixLinks(absolute) == 1L &&
+                requireNotNull(
+                    parentHandle.getFileAttributeView(
+                        name,
+                        PosixFileAttributeView::class.java,
+                        NOFOLLOW_LINKS,
+                    ),
+                ).readAttributes().permissions() == JOURNAL_PERMISSIONS &&
+                stableFileIdentity(
+                    absolute,
+                    requireNotNull(after.fileKey()),
+                ) == identity,
+        ) {
+            "publish intent marker가 읽는 동안 변경되었습니다."
+        }
+        return identity
     }
 
     private fun deleteTree(
@@ -2330,6 +2476,15 @@ internal object SecureBuildPublisher {
         }
     }
 
+    private fun requireAllowedOutputName(path: Path) {
+        val name = requireNotNull(path.fileName) {
+            "output은 파일명을 가져야 합니다."
+        }.toString()
+        require(!name.startsWith(INTERNAL_NAMESPACE_PREFIX)) {
+            "output은 SIX Bridge 내부 namespace를 사용할 수 없습니다: $name"
+        }
+    }
+
     private fun singleName(value: String): Path =
         Path.of(value).also { name ->
             require(name.nameCount == 1 && name.toString() !in setOf(".", "..")) {
@@ -2350,6 +2505,7 @@ internal object SecureBuildPublisher {
     private const val PUBLICATION_LOCK_FILE = ".sixbridge-build-publisher.lock"
     private const val JOURNAL_FILE = ".sixbridge-publish-journal.v1"
     private const val MAX_EXISTING_OUTPUT_BYTES = 512L * 1024 * 1024
+    private const val INTERNAL_NAMESPACE_PREFIX = ".sixbridge-"
     private val SHA256_PATTERN = Regex("[0-9a-f]{64}")
     private val STABLE_IDENTITY_PATTERN = Regex("[1-9][0-9]*:[1-9][0-9]*")
     private val OUTPUT_STAGE_PATTERN = Regex(
@@ -2384,6 +2540,8 @@ internal object BuildPublicationFaultInjection {
     private val failAfterIntent = ThreadLocal<Boolean?>()
     private val localStageCrashPoint = ThreadLocal<LocalStageCrashPoint?>()
     private val outputStageCrashPoint = ThreadLocal<OutputStageCrashPoint?>()
+    private val beforeIntentMarker =
+        ThreadLocal<((Path, UUID) -> Unit)?>()
 
     @JvmSynthetic
     fun <T> beforeOutputPublish(
@@ -2584,6 +2742,25 @@ internal object BuildPublicationFaultInjection {
     @JvmSynthetic
     fun crashOutputStageAt(point: OutputStageCrashPoint) {
         if (outputStageCrashPoint.get() == point) throw ForcedBuildTermination()
+    }
+
+    @JvmSynthetic
+    fun <T> beforeIntentMarkerCreate(
+        action: (Path, UUID) -> Unit,
+        block: () -> T,
+    ): T {
+        check(beforeIntentMarker.get() == null)
+        beforeIntentMarker.set(action)
+        return try {
+            block()
+        } finally {
+            beforeIntentMarker.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun beforeIntentMarkerCreate(parent: Path, token: UUID) {
+        beforeIntentMarker.get()?.invoke(parent, token)
     }
 
     @JvmSynthetic
