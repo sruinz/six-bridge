@@ -324,11 +324,8 @@ internal object DraftSourceStreams {
                 val leftBuffer = ByteArray(BUFFER_SIZE)
                 val rightBuffer = ByteArray(BUFFER_SIZE)
                 while (true) {
-                    val leftCount = left.read(leftBuffer)
-                    val rightCount = right.read(rightBuffer)
-                    require(leftCount != 0 && rightCount != 0) {
-                        "SixDraft source stream 읽기가 진행되지 않습니다."
-                    }
+                    val leftCount = fill(left, leftBuffer)
+                    val rightCount = fill(right, rightBuffer)
                     if (leftCount != rightCount) return@use false
                     if (leftCount < 0) return@use true
                     if (!leftBuffer.contentEquals(
@@ -344,6 +341,19 @@ internal object DraftSourceStreams {
                 false
             }
         }
+
+    private fun fill(input: InputStream, buffer: ByteArray): Int {
+        var total = 0
+        while (total < buffer.size) {
+            val count = input.read(buffer, total, buffer.size - total)
+            require(count != 0) {
+                "SixDraft source stream 읽기가 진행되지 않습니다."
+            }
+            if (count < 0) break
+            total += count
+        }
+        return if (total == 0) -1 else total
+    }
 
     private fun ByteArray.contentEquals(
         other: ByteArray,

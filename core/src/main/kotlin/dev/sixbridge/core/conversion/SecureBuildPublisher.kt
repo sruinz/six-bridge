@@ -119,32 +119,46 @@ internal object SecureBuildPublisher {
     internal fun capturePublicationGuard(
         outputs: Collection<Path>,
         expectedParent: PublicationGuard? = null,
+        expectedAncestor: WorkspacePathIdentity? = null,
     ): PublicationGuard {
         require(outputs.isNotEmpty()) {
             "publication guard를 만들 출력이 없습니다."
         }
         val normalized = outputs.map { it.toAbsolutePath().normalize() }
+        normalized.forEach(::requireAllowedOutputName)
         val parent = normalized.map { requireNotNull(it.parent) }.distinct()
             .singleOrNull()
             ?: throw IllegalArgumentException("모든 출력은 같은 디렉터리에 있어야 합니다.")
-        if (expectedParent == null) {
-            Files.createDirectories(parent)
+        val createdParent = if (expectedParent == null) {
+            createPublicationParent(parent, expectedAncestor)
         } else {
             requirePublicationGuard(expectedParent, parent, expectedParent.targets.map {
                 it.path
             })
+            null
         }
-        val parentIdentity = expectedParent?.parentIdentity
-            ?: WorkspacePermissionPolicy.captureIdentity(parent)
-        return PublicationGuard(
-            parentIdentity = parentIdentity,
-            targets = normalized.map { target ->
-                PublicationTargetGuard(
-                    path = target,
-                    identity = capturePublicationTarget(target),
-                )
-            },
-        )
+        return try {
+            val parentIdentity = expectedParent?.parentIdentity
+                ?: WorkspacePermissionPolicy.captureIdentity(parent)
+            PublicationGuard(
+                parentIdentity = parentIdentity,
+                targets = normalized.map { target ->
+                    PublicationTargetGuard(
+                        path = target,
+                        identity = capturePublicationTarget(target),
+                    )
+                },
+            ).also {
+                createdParent?.let(OwnedTempTree::abandonNoDelete)
+            }
+        } catch (error: Throwable) {
+            createdParent?.let { owner ->
+                runCatching { OwnedTempTree.delete(owner) }
+                    .exceptionOrNull()
+                    ?.let(error::addSuppressed)
+            }
+            throw error
+        }
     }
 
     @JvmSynthetic
@@ -2755,6 +2769,57 @@ internal object SecureBuildPublisher {
     private fun strictUnixLinks(path: Path): Long =
         (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number).toLong()
 
+    private fun createPublicationParent(
+        parent: Path,
+        expectedAncestor: WorkspacePathIdentity?,
+    ): OwnedTempDirectory? {
+        if (Files.isDirectory(parent, NOFOLLOW_LINKS)) {
+            expectedAncestor?.let(WorkspacePermissionPolicy::requireSameIdentity)
+            return null
+        }
+        val ancestor = requireNotNull(expectedAncestor) {
+            "존재하지 않는 publication parent에는 ancestor identity가 필요합니다."
+        }
+        val normalized = parent.toAbsolutePath().normalize()
+        require(normalized.startsWith(ancestor.path) && normalized != ancestor.path) {
+            "publication parent가 검증된 ancestor 아래에 있지 않습니다."
+        }
+        WorkspacePermissionPolicy.requireSameIdentity(ancestor)
+        val names = ancestor.path.relativize(normalized).map { singleName(it.toString()) }
+        require(names.isNotEmpty()) {
+            "생성할 publication parent 구성요소가 없습니다."
+        }
+        BuildPublicationFaultInjection.beforeGuardedParentCreate()
+        var root: OwnedTempDirectory? = null
+        return try {
+            var current = OwnedTempTree.createAt(
+                ancestor.path.resolve(names.first().toString()),
+            ).also { root = it }
+            WorkspacePermissionPolicy.requireSameIdentity(ancestor)
+            names.drop(1).forEach { name ->
+                current = OwnedTempTree.createNamed(current, name.toString())
+                WorkspacePermissionPolicy.requireSameIdentity(ancestor)
+            }
+            check(current.rootPath == normalized) {
+                "guarded publication parent 경로가 예상과 다릅니다."
+            }
+            require(
+                Files.isDirectory(normalized, NOFOLLOW_LINKS) &&
+                    !Files.isSymbolicLink(normalized),
+            ) {
+                "guarded publication parent를 확인할 수 없습니다."
+            }
+            requireNotNull(root)
+        } catch (error: Throwable) {
+            root?.let { owner ->
+                runCatching { OwnedTempTree.delete(owner) }
+                    .exceptionOrNull()
+                    ?.let(error::addSuppressed)
+            }
+            throw error
+        }
+    }
+
     private fun capturePublicationTarget(path: Path): WorkspacePathIdentity? {
         if (!Files.exists(path, NOFOLLOW_LINKS)) return null
         val attributes = Files.readAttributes(
@@ -2999,6 +3064,7 @@ internal object BuildPublicationFaultInjection {
     private val outputStageCrashPoint = ThreadLocal<OutputStageCrashPoint?>()
     private val beforeIntentMarker =
         ThreadLocal<((Path, UUID) -> Unit)?>()
+    private val beforeGuardedParentCreate = ThreadLocal<(() -> Unit)?>()
 
     @JvmSynthetic
     fun <T> beforeOutputPublish(
@@ -3073,6 +3139,25 @@ internal object BuildPublicationFaultInjection {
     @JvmSynthetic
     fun afterPublicationLock() {
         afterLock.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> replaceAncestorBeforeGuardedParentCreate(
+        action: () -> Unit,
+        block: () -> T,
+    ): T {
+        check(beforeGuardedParentCreate.get() == null)
+        beforeGuardedParentCreate.set(action)
+        return try {
+            block()
+        } finally {
+            beforeGuardedParentCreate.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun beforeGuardedParentCreate() {
+        beforeGuardedParentCreate.get()?.invoke()
     }
 
     @JvmSynthetic

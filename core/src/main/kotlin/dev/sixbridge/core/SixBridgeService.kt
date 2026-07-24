@@ -4,6 +4,7 @@ import dev.sixbridge.core.bundle.ExtensionDescriptor
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.ConversionPipeline
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.CrxIdentityPolicy
@@ -31,6 +32,7 @@ import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
 import java.io.InputStream
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
@@ -98,7 +100,7 @@ class SixBridgeService(
         )
         outputGuardHook()
         outputGuard.requireCurrent()
-        preflightAnalyze(resolved, profile)
+        preflightAnalyze(resolved, profile, approvedAdapterIds)
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
@@ -209,45 +211,31 @@ class SixBridgeService(
     ): SixBuildResult {
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
         validateProjectIdentity(projectIdentity)
-        val requestedBundle = outputBundle?.toAbsolutePath()?.normalize()
-            ?: workspaceRoot.resolve("dist/pending.six").toAbsolutePath().normalize()
+        val outputs = buildOutputPaths(input, outputBundle)
         val outputGuard = ProtectedOutputPolicy.capture(
             workspaceRoot = workspaceRoot,
             localRoot = localRoot,
             resolved = resolved,
-            outputs = listOf(requestedBundle),
+            outputs = outputs.all,
             protectedInputs = protectedInputs,
         )
         outputGuardHook()
         outputGuard.requireCurrent()
-        preflightAnalyze(resolved, profile)
+        preflightAnalyze(resolved, profile, approvedAdapterIds)
         outputGuard.requireCurrent()
+        val targetGuard = outputGuard.captureTargets(outputs.all)
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
-            outputGuard.requireCurrent()
+            targetGuard.requireCurrent()
             val prepared = pipeline.prepare(
                 resolved,
                 profile,
                 approvedAdapterIds,
             )
-            outputGuard.requireCurrent()
+            targetGuard.requireCurrent()
             val compatibility = prepared.compatibilityAfter
-            val outputDirectory = (outputBundle?.toAbsolutePath()?.parent
-                ?: workspaceRoot.resolve("dist"))
-            val crxOutput = outputDirectory.resolve("${prepared.extensionId}.crx")
-            val wrapperOutput = outputDirectory.resolve("${prepared.extensionId}-wrapper.apk")
-            val bundleOutput = outputBundle?.toAbsolutePath()
-                ?: outputDirectory.resolve("${prepared.extensionId}.six")
-            val targets = listOf(crxOutput, wrapperOutput, bundleOutput)
-                .map(Path::toAbsolutePath)
-            require(targets.toSet().size == targets.size) {
-                "CRX, wrapper APK와 SixBundle 출력 경로가 서로 달라야 합니다."
-            }
-            val targetGuard = outputGuard.captureTargets(
-                outputs = targets,
-            )
             val wrapperDraft = prepared.artifactDirectory.resolve("wrapper.apk")
             targetGuard.requireCurrent()
-            SecureBuildPublisher.copyExistingOutput(wrapperOutput, wrapperDraft)
+            SecureBuildPublisher.copyExistingOutput(outputs.wrapperApk, wrapperDraft)
             val wrapper = WrapperApkBuilder(toolchainProvider(), localRoot).build(
                 WrapperBuildRequest(
                     extensionId = prepared.extensionId,
@@ -273,9 +261,9 @@ class SixBridgeService(
             targetGuard.requireCurrent()
             SecureBuildPublisher.publish(
                 outputs = linkedMapOf(
-                    crxOutput to prepared.crxBytes,
-                    wrapperOutput to Files.readAllBytes(wrapperDraft),
-                    bundleOutput to Files.readAllBytes(bundleDraft),
+                    outputs.crx to prepared.crxBytes,
+                    outputs.wrapperApk to Files.readAllBytes(wrapperDraft),
+                    outputs.bundle to Files.readAllBytes(bundleDraft),
                 ),
                 localSource = if (
                     resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY ||
@@ -294,9 +282,9 @@ class SixBridgeService(
             )
             SixBuildResult(
                 extensionId = prepared.extensionId,
-                crx = crxOutput,
-                wrapperApk = wrapperOutput,
-                bundle = bundleOutput,
+                crx = outputs.crx,
+                wrapperApk = outputs.wrapperApk,
+                bundle = outputs.bundle,
                 compatibility = compatibility,
                 compatibilityBefore = prepared.compatibilityBefore,
                 adapterIds = compatibility.adapterDecisions
@@ -308,6 +296,43 @@ class SixBridgeService(
                 ),
                 transformedSha256 = requireNotNull(compatibility.sourceSha256),
             )
+        }
+    }
+
+    private fun buildOutputPaths(
+        input: String,
+        outputBundle: Path?,
+    ): BuildOutputPaths {
+        val bundle = outputBundle?.toAbsolutePath()?.normalize() ?: run {
+            val seed = if (
+                input.startsWith("http://") ||
+                input.startsWith("https://")
+            ) {
+                input
+            } else {
+                Path.of(input).toAbsolutePath().normalize().toString()
+            }
+            val basename = "sixbridge-${sha256(seed.toByteArray(UTF_8)).take(16)}"
+            workspaceRoot.resolve("dist/$basename.six").toAbsolutePath().normalize()
+        }
+        val filename = requireNotNull(bundle.fileName).toString()
+        val basename = if (filename.endsWith(".six", ignoreCase = true)) {
+            filename.dropLast(4)
+        } else {
+            filename
+        }
+        require(basename.isNotBlank()) {
+            "SixBundle output basename이 비어 있습니다."
+        }
+        val parent = requireNotNull(bundle.parent)
+        return BuildOutputPaths(
+            crx = parent.resolve("$basename.crx"),
+            wrapperApk = parent.resolve("$basename-wrapper.apk"),
+            bundle = bundle,
+        ).also {
+            require(it.all.toSet().size == it.all.size) {
+                "CRX, wrapper APK와 SixBundle 출력 경로가 서로 달라야 합니다."
+            }
         }
     }
 
@@ -398,10 +423,11 @@ class SixBridgeService(
     private fun preflightAnalyze(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
+        approvedAdapterIds: Iterable<String>,
     ) {
         ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             userInputBoundary("확장 입력을 분석할 수 없습니다.") {
-                pipeline.analyze(resolved, profile)
+                pipeline.preflight(resolved, profile, approvedAdapterIds)
             }
         }
     }
@@ -419,6 +445,8 @@ class SixBridgeService(
         block: () -> T,
     ): T = try {
         block()
+    } catch (error: AdapterApprovalException) {
+        throw error
     } catch (error: IllegalArgumentException) {
         throw SixBridgeUserInputException(
             "$message ${error.message}",
@@ -430,6 +458,15 @@ class SixBridgeService(
         val extensionId: String,
         val bytes: ByteArray,
     )
+
+    private data class BuildOutputPaths(
+        val crx: Path,
+        val wrapperApk: Path,
+        val bundle: Path,
+    ) {
+        val all: List<Path> = listOf(crx, wrapperApk, bundle)
+            .map { it.toAbsolutePath().normalize() }
+    }
 
     companion object {
         private const val CORE_VERSION = "0.1.0-SNAPSHOT"
@@ -471,6 +508,12 @@ private object ProtectedOutputPolicy {
             outputs,
             protectedInputList,
         )
+        val outputParent = outputs.map {
+            requireNotNull(it.toAbsolutePath().normalize().parent)
+        }.distinct().singleOrNull() ?: throw UnsafeOutputException(
+            "모든 출력은 같은 디렉터리에 있어야 합니다.",
+        )
+        val outputAncestorPath = nearestExistingAncestor(outputParent)
         val watchedPaths = buildList {
             resolved.sourceRoot?.let(::add)
             if (
@@ -481,19 +524,19 @@ private object ProtectedOutputPolicy {
             }
             addAll(protectedInputList)
             persistentRoots.forEach { add(localRoot.resolve(it)) }
-            outputs.forEach { output ->
-                add(nearestExistingAncestor(requireNotNull(output.toAbsolutePath().parent)))
-            }
+            add(outputAncestorPath)
         }.map { it.toAbsolutePath().normalize() }
             .distinct()
             .filter { Files.exists(it, NOFOLLOW_LINKS) }
         return unsafeBoundary("출력 보호 identity를 만들 수 없습니다.") {
+            val watched = watchedPaths.map(WorkspacePermissionPolicy::captureIdentity)
             ProtectedOutputGuard(
                 workspaceRoot = workspaceRoot,
                 localRoot = localRoot,
                 resolved = resolved,
                 protectedInputs = protectedInputList,
-                watched = watchedPaths.map(WorkspacePermissionPolicy::captureIdentity),
+                watched = watched,
+                outputAncestor = watched.single { it.path == outputAncestorPath },
                 publicationGuard = outputs.firstOrNull()?.let { output ->
                     val parent = requireNotNull(output.toAbsolutePath().normalize().parent)
                     if (Files.isDirectory(parent, NOFOLLOW_LINKS)) {
@@ -525,8 +568,12 @@ private object ProtectedOutputPolicy {
                 resolved = previous.resolved,
                 protectedInputs = previous.protectedInputs,
                 watched = previous.watched,
+                outputAncestor = previous.outputAncestor,
                 publicationGuard = if (previous.publicationGuard == null) {
-                    SecureBuildPublisher.capturePublicationGuard(outputs)
+                    SecureBuildPublisher.capturePublicationGuard(
+                        outputs = outputs,
+                        expectedAncestor = previous.outputAncestor,
+                    )
                 } else {
                     SecureBuildPublisher.capturePublicationGuard(
                         outputs,
@@ -640,6 +687,7 @@ private class ProtectedOutputGuard(
     val resolved: ResolvedExtensionInput,
     val protectedInputs: List<Path>,
     val watched: List<WorkspacePathIdentity>,
+    val outputAncestor: WorkspacePathIdentity,
     val publicationGuard: PublicationGuard?,
 ) {
     fun requireCurrent() {

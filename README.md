@@ -66,8 +66,15 @@ sixbridge draft \
 sixbridge build \
   --input fixtures/desktop-mobile-golden \
   --profile profiles/sbrowser-30.0.2.61.json \
-  --approve-adapter action-popup-entry
+  --approve-adapter action-popup-entry \
+  --output dist/desktop-mobile.six
 ```
+
+`--output dist/desktop-mobile.six`를 지정하면 같은 basename의
+`desktop-mobile.crx`, `desktop-mobile-wrapper.apk`,
+`desktop-mobile.six`를 만든다. `--output`을 생략하면 canonical 입력 문자열의
+SHA-256에서 만든 결정적 basename을 `dist/`에 사용한다. 산출물 파일명과
+무관하게 실제 extension ID는 CRX, descriptor, 래퍼 package에 유지된다.
 
 CLI `build`의 APK 서명은 개발 검증용이다. 일반 사용자에게 설치할 최종
 래퍼 서명과 설치 승인은 Android 관리자가 담당한다. 변환 과정에서 source를
@@ -84,11 +91,11 @@ ADB는 개발 중 래퍼 계약과 실기기 동작을 검증하는 용도로만
 
 ```sh
 sixbridge device install \
-  --bundle dist/<extension-id>.six \
+  --bundle dist/<bundle-basename>.six \
   --serial <adb-serial>
 
 sixbridge device smoke \
-  --bundle dist/<extension-id>.six \
+  --bundle dist/<bundle-basename>.six \
   --serial <adb-serial>
 ```
 

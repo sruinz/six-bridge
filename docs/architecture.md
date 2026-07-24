@@ -31,6 +31,12 @@ reader로 다시 읽어 서명, 항목 제한, source·계획 hash 결합을 확
 검증한 뒤 최종 일반 사용자용 서명과 설치 승인을 담당한다.
 
 `build`는 같은 변환 결과를 개발용 CRX3·래퍼 APK·SixBundle에 연결한다.
+요청한 SixBundle이 `foo.six`이면 prepare 전에 `foo.crx`,
+`foo-wrapper.apk`, `foo.six` 세 target을 확정하고 hardlink와 parent
+identity를 검증한다. 출력 경로를 생략하면 canonical 입력 문자열 hash로
+결정적 basename을 만든다. 파일명은 extension ID가 아니며 실제 ID는 CRX,
+descriptor와 래퍼 package에 유지된다.
+
 ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확인하기 위한
 검증 경로일 뿐, 일반 사용자 흐름의 필수 구성요소가 아니다.
 

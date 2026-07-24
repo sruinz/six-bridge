@@ -48,6 +48,16 @@ class ConversionPipeline private constructor(
         return analyzer.analyzeArchive(snapshot.sourceZip, profile)
     }
 
+    fun preflight(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        approvedAdapterIds: Iterable<String>,
+    ): CompatibilityReport {
+        val report = analyze(resolved, profile)
+        plan(report, approvedAdapterIds.toSet())
+        return report
+    }
+
     fun prepare(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
