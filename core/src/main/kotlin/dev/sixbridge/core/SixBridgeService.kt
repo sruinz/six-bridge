@@ -5,6 +5,7 @@ import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionWorkspace
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.input.ExtensionInputKind
@@ -47,7 +48,9 @@ class SixBridgeService(
         val resolved = inputResolver.resolve(input)
         val source = resolved.sourceRoot
             ?: throw IllegalArgumentException("분석할 확장 소스를 입력에서 추출하지 못했습니다.")
-        return compatibilityAnalyzer.analyze(source, profile)
+        return ConversionWorkspace().use { workspace ->
+            compatibilityAnalyzer.analyze(workspace.snapshot(source).workingRoot, profile)
+        }
     }
 
     fun build(
@@ -59,54 +62,57 @@ class SixBridgeService(
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
         val source = resolved.sourceRoot
             ?: throw IllegalArgumentException("빌드할 확장 소스를 입력에서 추출하지 못했습니다.")
-        val compatibility = compatibilityAnalyzer.analyze(source, profile)
-        require(
-            compatibility.status == CompatibilityStatus.COMPATIBLE ||
-                compatibility.status == CompatibilityStatus.PARTIAL,
-        ) {
-            "호환성 상태 ${compatibility.status.name.lowercase()}에서는 빌드하지 않습니다."
-        }
+        return ConversionWorkspace().use { workspace ->
+            val working = workspace.snapshot(source).workingRoot
+            val compatibility = compatibilityAnalyzer.analyze(working, profile)
+            require(
+                compatibility.status == CompatibilityStatus.COMPATIBLE ||
+                    compatibility.status == CompatibilityStatus.PARTIAL,
+            ) {
+                "호환성 상태 ${compatibility.status.name.lowercase()}에서는 빌드하지 않습니다."
+            }
 
-        val packed = prepareCrx(resolved, source)
-        val outputDirectory = (outputBundle?.toAbsolutePath()?.parent
-            ?: workspaceRoot.resolve("dist")).also { Files.createDirectories(it) }
-        val crxOutput = outputDirectory.resolve("${packed.extensionId}.crx")
-        crxOutput.writeBytes(packed.bytes)
-        val wrapperOutput = outputDirectory.resolve("${packed.extensionId}-wrapper.apk")
-        val wrapper = WrapperApkBuilder(toolchainProvider(), localRoot).build(
-            WrapperBuildRequest(
+            val packed = prepareCrx(resolved, working)
+            val outputDirectory = (outputBundle?.toAbsolutePath()?.parent
+                ?: workspaceRoot.resolve("dist")).also { Files.createDirectories(it) }
+            val crxOutput = outputDirectory.resolve("${packed.extensionId}.crx")
+            crxOutput.writeBytes(packed.bytes)
+            val wrapperOutput = outputDirectory.resolve("${packed.extensionId}-wrapper.apk")
+            val wrapper = WrapperApkBuilder(toolchainProvider(), localRoot).build(
+                WrapperBuildRequest(
+                    extensionId = packed.extensionId,
+                    extensionName = compatibility.extensionName ?: packed.extensionId,
+                    crxBytes = packed.bytes,
+                    outputApk = wrapperOutput,
+                ),
+            )
+            val bundleOutput = outputBundle?.toAbsolutePath()
+                ?: outputDirectory.resolve("${packed.extensionId}.six")
+            val descriptor = ExtensionDescriptor(
                 extensionId = packed.extensionId,
-                extensionName = compatibility.extensionName ?: packed.extensionId,
-                crxBytes = packed.bytes,
-                outputApk = wrapperOutput,
-            ),
-        )
-        val bundleOutput = outputBundle?.toAbsolutePath()
-            ?: outputDirectory.resolve("${packed.extensionId}.six")
-        val descriptor = ExtensionDescriptor(
-            extensionId = packed.extensionId,
-            name = compatibility.extensionName ?: packed.extensionId,
-            version = compatibility.extensionVersion ?: "0",
-            sourceKind = resolved.kind.name,
-            crxSha256 = sha256(packed.bytes),
-            wrapperSha256 = sha256(wrapperOutput.toFile().readBytes()),
-            wrapperPackage = wrapper.packageName,
-            wrapperVersionCode = wrapper.versionCode,
-            signerSha256 = wrapper.signerSha256,
-        )
-        SixBundle.write(bundleOutput, wrapperOutput, descriptor, compatibility)
-        if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY ||
-            resolved.kind == ExtensionInputKind.ZIP
-        ) {
-            saveLocalSource(source, packed.extensionId)
+                name = compatibility.extensionName ?: packed.extensionId,
+                version = compatibility.extensionVersion ?: "0",
+                sourceKind = resolved.kind.name,
+                crxSha256 = sha256(packed.bytes),
+                wrapperSha256 = sha256(wrapperOutput.toFile().readBytes()),
+                wrapperPackage = wrapper.packageName,
+                wrapperVersionCode = wrapper.versionCode,
+                signerSha256 = wrapper.signerSha256,
+            )
+            SixBundle.write(bundleOutput, wrapperOutput, descriptor, compatibility)
+            if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY ||
+                resolved.kind == ExtensionInputKind.ZIP
+            ) {
+                saveLocalSource(working, packed.extensionId)
+            }
+            SixBuildResult(
+                extensionId = packed.extensionId,
+                crx = crxOutput,
+                wrapperApk = wrapperOutput,
+                bundle = bundleOutput,
+                compatibility = compatibility,
+            )
         }
-        return SixBuildResult(
-            extensionId = packed.extensionId,
-            crx = crxOutput,
-            wrapperApk = wrapperOutput,
-            bundle = bundleOutput,
-            compatibility = compatibility,
-        )
     }
 
     private fun prepareCrx(

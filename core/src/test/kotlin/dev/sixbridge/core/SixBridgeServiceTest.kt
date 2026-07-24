@@ -6,10 +6,13 @@ import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.ResolvedExtensionInput
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import java.lang.reflect.InvocationTargetException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
+import java.security.MessageDigest
 import java.security.KeyPairGenerator
 import java.util.Base64
 import java.util.UUID
@@ -18,14 +21,30 @@ import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.writeText
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
     @Test
-    fun `gives same-name sources distinct IDs and preserves identity across move and rename`() {
+    fun `analyze uses a validated snapshot instead of reading an unsafe source directly`() {
+        val workspace = Files.createTempDirectory("six-analyze-snapshot-workspace")
+        val source = source("six-analyze-snapshot-source", "Analyze snapshot")
+        Files.createSymbolicLink(
+            source.resolve("linked-manifest.json"),
+            source.resolve("manifest.json"),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBridgeService(workspace).analyze(source.toString(), supportedProfile())
+        }
+    }
+
+    @Test
+    fun `uses sidecars without changing sources and preserves identity for known path or fingerprint`() {
         val workspace = Files.createTempDirectory("six-identity-workspace")
         val first = source("six-identity-first", "__MSG_appName__")
         val second = source("six-identity-second", "__MSG_appName__")
@@ -48,18 +67,24 @@ class SixBridgeServiceTest {
             ),
         )
         assertNotEquals(firstId, secondId)
+        assertFalse(Files.exists(first.resolve(".sixbridge-project-id")))
+        assertFalse(Files.exists(second.resolve(".sixbridge-project-id")))
 
-        val marker = first.resolve(".sixbridge-project-id")
-        assertTrue(Files.isRegularFile(marker))
-        assertEquals(
-            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
-            Files.getPosixFilePermissions(marker),
+        first.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Changed in place","version":"2"}""",
         )
+        val changedInPlaceId = prepare(
+            service,
+            ResolvedExtensionInput(
+                ExtensionInputKind.SOURCE_DIRECTORY,
+                first.toString(),
+                first,
+            ),
+        )
+        assertEquals(firstId, changedInPlaceId)
+
         val moved = first.parent.resolve("six-identity-moved-${UUID.randomUUID()}")
         Files.move(first, moved, StandardCopyOption.ATOMIC_MOVE)
-        moved.resolve("manifest.json").writeText(
-            """{"manifest_version":3,"name":"Renamed project","version":"2"}""",
-        )
         val movedId = prepare(
             service,
             ResolvedExtensionInput(
@@ -68,9 +93,37 @@ class SixBridgeServiceTest {
                 moved,
             ),
         )
+        assertEquals(firstId, movedId)
+
+        val projectIdentity = pathIdentity(workspace, moved)
+        val movedAndChanged = moved.parent.resolve("six-identity-moved-changed-${UUID.randomUUID()}")
+        Files.move(moved, movedAndChanged, StandardCopyOption.ATOMIC_MOVE)
+        movedAndChanged.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Moved and changed","version":"3"}""",
+        )
+        assertFailsWith<IllegalArgumentException> {
+            prepare(
+                service,
+                ResolvedExtensionInput(
+                    ExtensionInputKind.SOURCE_DIRECTORY,
+                    movedAndChanged.toString(),
+                    movedAndChanged,
+                ),
+            )
+        }
+        val movedAndChangedId = prepare(
+            service,
+            ResolvedExtensionInput(
+                ExtensionInputKind.SOURCE_DIRECTORY,
+                movedAndChanged.toString(),
+                movedAndChanged,
+                projectIdentity = projectIdentity,
+            ),
+        )
+        assertEquals(firstId, movedAndChangedId)
 
         val firstZip = workspace.resolve("first-name.zip")
-        ExtensionZip.create(moved, firstZip)
+        ExtensionZip.create(movedAndChanged, firstZip)
         val secondZip = workspace.resolve("renamed.zip")
         Files.move(firstZip, secondZip)
         val resolver = ExtensionInputResolver()
@@ -83,14 +136,64 @@ class SixBridgeServiceTest {
                 service,
                 ResolvedExtensionInput(
                     ExtensionInputKind.SOURCE_DIRECTORY,
-                    moved.toString(),
-                    moved,
+                    movedAndChanged.toString(),
+                    movedAndChanged,
                 ),
             ),
         )
         ZipInputStream(packed.zipBytes.inputStream()).use { zip ->
             val names = generateSequence { zip.nextEntry }.map(ZipEntry::getName).toSet()
             assertTrue(".sixbridge-project-id" !in names)
+        }
+    }
+
+    @Test
+    fun `reads an existing marker without rewriting the source`() {
+        val workspace = Files.createTempDirectory("six-legacy-marker-workspace")
+        val source = source("six-legacy-marker-source", "Legacy marker")
+        val marker = source.resolve(".sixbridge-project-id")
+        val identity = "a".repeat(32)
+        marker.writeText("sixbridge-project-v1:$identity")
+        val before = Files.readAllBytes(marker)
+
+        prepare(
+            SixBridgeService(workspace),
+            ResolvedExtensionInput(
+                ExtensionInputKind.SOURCE_DIRECTORY,
+                source.toString(),
+                source,
+            ),
+        )
+
+        assertContentEquals(before, Files.readAllBytes(marker))
+        assertEquals(identity, pathIdentity(workspace, source))
+    }
+
+    @Test
+    fun `preserves the active-source conflict check for legacy path sidecars`() {
+        val workspace = Files.createTempDirectory("six-legacy-sidecar-workspace")
+        val activeSource = source("six-legacy-active-source", "Active legacy source")
+        val duplicate = source("six-legacy-duplicate-source", "Legacy duplicate")
+        val identity = "c".repeat(32)
+        duplicate.resolve(".sixbridge-project-id")
+            .writeText("sixbridge-project-v1:$identity")
+        val legacyBinding = workspace.resolve(".local/source-identities/paths/$identity.txt")
+        Files.createDirectories(legacyBinding.parent)
+        Files.writeString(legacyBinding, activeSource.toRealPath().toString())
+        Files.setPosixFilePermissions(
+            legacyBinding,
+            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            prepare(
+                SixBridgeService(workspace),
+                ResolvedExtensionInput(
+                    ExtensionInputKind.SOURCE_DIRECTORY,
+                    duplicate.toString(),
+                    duplicate,
+                ),
+            )
         }
     }
 
@@ -149,15 +252,8 @@ class SixBridgeServiceTest {
         }
 
         val writable = source("six-writable-identity", "Writable")
-        prepare(
-            service,
-            ResolvedExtensionInput(
-                ExtensionInputKind.SOURCE_DIRECTORY,
-                writable.toString(),
-                writable,
-            ),
-        )
         val writableMarker = writable.resolve(".sixbridge-project-id")
+        writableMarker.writeText("sixbridge-project-v1:${"b".repeat(32)}")
         Files.setPosixFilePermissions(
             writableMarker,
             Files.getPosixFilePermissions(writableMarker) +
@@ -191,6 +287,9 @@ class SixBridgeServiceTest {
                 else Files.copy(path, target)
             }
         }
+        duplicate.resolve(".sixbridge-project-id").writeText(
+            "sixbridge-project-v1:${pathIdentity(workspace, first)}",
+        )
         assertFailsWith<IllegalArgumentException> {
             prepare(
                 service,
@@ -268,6 +367,17 @@ class SixBridgeServiceTest {
                 """{"manifest_version":3,"name":"$name","version":"1"}""",
             )
         }
+
+    private fun supportedProfile() = BrowserProfile(
+        browserPackage = "com.sec.android.app.sbrowser",
+        versionName = BrowserProfile.BASELINE_VERSION,
+        versionCode = 1_300_261_502,
+        majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION,
+        supportedApis = BrowserProfile.POC_SUPPORTED_APIS,
+        wrapperContract = WrapperContract.complete(),
+        sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+        sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+    )
 
     private fun keyedSource(prefix: String, publicKey: ByteArray) =
         Files.createTempDirectory(prefix).also { source ->
@@ -348,5 +458,15 @@ class SixBridgeServiceTest {
                 }
             }
         }
+    }
+
+    private fun pathIdentity(workspace: java.nio.file.Path, source: java.nio.file.Path): String {
+        val canonical = source.toRealPath().toString()
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(canonical.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return Files.readString(
+            workspace.resolve(".local/source-identities/paths/$key.txt"),
+        ).trim()
     }
 }

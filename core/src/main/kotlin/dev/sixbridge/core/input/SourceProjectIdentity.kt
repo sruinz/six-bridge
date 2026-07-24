@@ -1,7 +1,7 @@
 package dev.sixbridge.core.input
 
-import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -11,22 +11,19 @@ import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.UUID
-import kotlin.io.path.invariantSeparatorsPathString
 
 class SourceProjectIdentityStore(
     private val registryRoot: Path,
 ) {
     fun resolve(resolved: ResolvedExtensionInput, source: Path): String =
         withRegistryLock {
-            when (resolved.kind) {
-                ExtensionInputKind.SOURCE_DIRECTORY ->
-                    resolveDirectory(source, resolved.projectIdentity)
-                ExtensionInputKind.ZIP ->
-                    resolveZip(source, resolved.projectIdentity)
-                else -> throw IllegalArgumentException(
-                    "source project identity를 사용할 수 없는 입력입니다: ${resolved.kind}",
-                )
+            require(
+                resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY ||
+                    resolved.kind == ExtensionInputKind.ZIP,
+            ) {
+                "source project identity를 사용할 수 없는 입력입니다: ${resolved.kind}"
             }
+            resolveSource(resolved, source)
         }
 
     fun claimLegacy(legacyIdentity: String, projectIdentity: String): Boolean =
@@ -46,23 +43,77 @@ class SourceProjectIdentityStore(
             }
         }
 
-    private fun resolveDirectory(source: Path, requested: String?): String {
+    private fun resolveSource(
+        resolved: ResolvedExtensionInput,
+        source: Path,
+    ): String {
         val marker = source.resolve(MARKER_FILE)
-        val existing = if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
-            readMarker(marker, requireOwnerOnly = true)
+        val embedded = if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
+            readMarker(
+                marker,
+                requireOwnerOnly = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
+            )
         } else {
             null
         }
-        val requestedId = requested?.let(::validateProjectId)
-        require(existing == null || requestedId == null || existing == requestedId) {
-            "명시한 source project identity가 marker와 일치하지 않습니다."
-        }
-        val identity = existing ?: requestedId ?: newProjectId()
-        if (existing == null) writeMarker(marker, identity)
+        val requested = resolved.projectIdentity?.let(::validateProjectId)
+        val canonical = canonicalInputPath(resolved)
+        val pathBinding = registryRoot.resolve("paths").resolve("${sha256(canonical)}.txt")
+        val byPath = readProjectId(pathBinding)
+        val fingerprint = contentFingerprint(source)
+        val fingerprintBinding =
+            registryRoot.resolve("fingerprints").resolve("$fingerprint.txt")
+        val byFingerprint = readProjectId(fingerprintBinding)
 
-        val canonical = source.toRealPath().toString()
-        val binding = registryRoot.resolve("paths").resolve("$identity.txt")
-        val previous = readText(binding)
+        val direct = listOfNotNull(embedded, requested, byPath).distinct()
+        require(direct.size <= 1) {
+            "source project identity marker, 명시 identity, path sidecar가 충돌합니다."
+        }
+        val directIdentity = direct.singleOrNull()
+        if (directIdentity != null && byFingerprint != null) {
+            require(directIdentity == byFingerprint) {
+                "source fingerprint sidecar가 선택한 identity와 충돌합니다."
+            }
+        }
+
+        val fingerprintUsable = byFingerprint?.takeIf { identity ->
+            resolved.kind == ExtensionInputKind.ZIP ||
+                identityPath(identity)?.let { previous ->
+                    previous == canonical || !Files.exists(Path.of(previous))
+                } != false
+        }
+        val identity = directIdentity ?: fingerprintUsable ?: run {
+            if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY &&
+                hasMissingRegisteredSource()
+            ) {
+                throw IllegalArgumentException(
+                    "이동과 내용 변경이 함께 감지되었습니다. --identity를 명시하세요.",
+                )
+            }
+            newProjectId()
+        }
+
+        if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY) {
+            claimDirectoryIdentity(identity, canonical)
+        }
+        if (byPath == null) writeSecure(pathBinding, identity)
+        if (byFingerprint == null) {
+            writeSecure(fingerprintBinding, identity)
+        } else if (byFingerprint != identity) {
+            require(
+                resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY &&
+                    directIdentity == null &&
+                    fingerprintUsable == null,
+            ) {
+                "source fingerprint에 다른 project identity가 등록되어 있습니다."
+            }
+        }
+        return identity
+    }
+
+    private fun claimDirectoryIdentity(identity: String, canonical: String) {
+        val binding = registryRoot.resolve("identities").resolve("$identity.txt")
+        val previous = identityPath(identity)
         if (previous != null && previous != canonical) {
             val previousPath = runCatching { Path.of(previous) }.getOrNull()
             require(previousPath == null || !Files.exists(previousPath)) {
@@ -70,30 +121,29 @@ class SourceProjectIdentityStore(
             }
         }
         if (previous != canonical) writeSecure(binding, canonical)
-        return identity
     }
 
-    private fun resolveZip(source: Path, requested: String?): String {
-        val marker = source.resolve(MARKER_FILE)
-        val embedded = if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
-            readMarker(marker, requireOwnerOnly = false)
-        } else {
-            null
+    private fun identityPath(identity: String): String? =
+        readText(registryRoot.resolve("identities").resolve("$identity.txt"))
+            ?: readText(registryRoot.resolve("paths").resolve("$identity.txt"))
+
+    private fun hasMissingRegisteredSource(): Boolean {
+        val identities = registryRoot.resolve("identities")
+        if (!Files.isDirectory(identities, LinkOption.NOFOLLOW_LINKS)) return false
+        return Files.list(identities).use { paths ->
+            paths.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) }
+                .map(::readText)
+                .filter { it != null }
+                .map { Path.of(it!!) }
+                .anyMatch { !Files.exists(it) }
         }
-        val requestedId = requested?.let(::validateProjectId)
-        require(embedded == null || requestedId == null || embedded == requestedId) {
-            "명시한 source project identity가 ZIP marker와 일치하지 않습니다."
-        }
-        val fingerprint = contentFingerprint(source)
-        val binding = registryRoot.resolve("fingerprints").resolve("$fingerprint.txt")
-        val registered = readProjectId(binding)
-        val identity = embedded ?: requestedId ?: registered ?: newProjectId()
-        require(registered == null || registered == identity) {
-            "ZIP content fingerprint에 다른 source project identity가 등록되어 있습니다."
-        }
-        if (registered == null) writeSecure(binding, identity)
-        return identity
     }
+
+    private fun canonicalInputPath(resolved: ResolvedExtensionInput): String =
+        Path.of(resolved.originalInput).toAbsolutePath().normalize().toRealPath().toString()
+
+    private fun contentFingerprint(source: Path): String =
+        sha256(ExtensionZip.createBytes(source))
 
     private fun readMarker(path: Path, requireOwnerOnly: Boolean): String {
         require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
@@ -106,33 +156,6 @@ class SourceProjectIdentityStore(
                 "source project identity marker 형식이 올바르지 않습니다.",
             )
         return match.groupValues[1]
-    }
-
-    private fun writeMarker(path: Path, identity: String) {
-        writeSecure(path, "$MARKER_PREFIX$identity")
-        verifyOwnerOnly(path)
-    }
-
-    private fun contentFingerprint(source: Path): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val paths = Files.walk(source).use { stream ->
-            stream.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) }
-                .filter { it.fileName.toString() != MARKER_FILE }
-                .filter { path ->
-                    source.relativize(path).none { it.toString() in EXCLUDED_DIRECTORIES }
-                }
-                .sorted(compareBy { source.relativize(it).invariantSeparatorsPathString })
-                .toList()
-        }
-        paths.forEach { path ->
-            val relative = source.relativize(path).invariantSeparatorsPathString.toByteArray()
-            val contents = Files.readAllBytes(path)
-            digest.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(relative.size).array())
-            digest.update(relative)
-            digest.update(ByteBuffer.allocate(Long.SIZE_BYTES).putLong(contents.size.toLong()).array())
-            digest.update(contents)
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun validateProjectId(value: String): String {
@@ -219,6 +242,14 @@ class SourceProjectIdentityStore(
         }
     }
 
+    private fun sha256(value: String): String =
+        sha256(value.toByteArray(StandardCharsets.UTF_8))
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
     private fun newProjectId(): String =
         UUID.randomUUID().toString().replace("-", "")
 
@@ -231,6 +262,5 @@ class SourceProjectIdentityStore(
             PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE,
         )
-        private val EXCLUDED_DIRECTORIES = setOf(".git", ".gradle", "node_modules")
     }
 }
