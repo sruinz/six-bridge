@@ -6,6 +6,7 @@ import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.ResolvedExtensionInput
+import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.lang.reflect.InvocationTargetException
@@ -29,6 +30,73 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
+    @Test
+    fun `analyze delegates to mobile conversion analysis`() {
+        val workspace = Files.createTempDirectory("six-analyze-pipeline-workspace")
+        val source = source("six-analyze-pipeline-source", "Mobile analysis")
+        source.resolve("content.js").writeText(
+            """
+            document.addEventListener("mouseup", (event) => {
+              toolbar.button.disabled = false;
+              if (getSelection()?.toString()) console.log("selected");
+            });
+            """.trimIndent(),
+        )
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Mobile analysis",
+              "version": "1",
+              "content_scripts": [{
+                "matches": ["https://example.com/*"],
+                "js": ["content.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+
+        val report = SixBridgeService(workspace)
+            .analyze(source.toString(), supportedProfile())
+
+        assertEquals(ConversionState.AUTOMATIC, report.conversionState)
+        assertEquals(
+            setOf("desktop-selection-event-bridge"),
+            report.adapterDecisions.mapTo(mutableSetOf()) { it.id },
+        )
+    }
+
+    @Test
+    fun `build publishes no artifacts when required approval is missing`() {
+        val workspace = Files.createTempDirectory("six-build-no-output-workspace")
+        val source = source("six-build-no-output-source", "Missing approval")
+        source.resolve("content.js").writeText("console.log('content');")
+        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Missing approval",
+              "version": "1",
+              "action": {"default_popup": "popup.html"},
+              "content_scripts": [{
+                "matches": ["https://example.com/*"],
+                "js": ["content.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+        val service = SixBridgeService(workspace) {
+            error("승인 검증 실패 뒤 toolchain을 조회하면 안 됩니다.")
+        }
+
+        assertFailsWith<dev.sixbridge.core.conversion.MissingAdapterApprovalException> {
+            service.build(source.toString(), supportedProfile())
+        }
+
+        assertFalse(Files.exists(workspace.resolve("dist")))
+    }
+
     @Test
     fun `analyze uses a validated snapshot instead of reading an unsafe source directly`() {
         val workspace = Files.createTempDirectory("six-analyze-snapshot-workspace")

@@ -16,6 +16,13 @@ import kotlin.io.path.writeBytes
 class ExtensionKeyManager(
     private val keyRoot: Path,
 ) {
+    fun getOrCreateStoreConversionKey(
+        originalExtensionId: String,
+        profileMajorVersion: Int,
+    ): KeyPair = getOrCreate(
+        storeConversionIdentity(originalExtensionId, profileMajorVersion),
+    )
+
     fun getOrCreate(identity: String): KeyPair {
         Files.createDirectories(keyRoot)
         getExisting(identity)?.let { return it }
@@ -106,9 +113,23 @@ class ExtensionKeyManager(
     }
 
     companion object {
+        fun storeConversionIdentity(
+            originalExtensionId: String,
+            profileMajorVersion: Int,
+        ): String {
+            require(EXTENSION_ID.matches(originalExtensionId)) {
+                "원본 CRX extension ID 형식이 올바르지 않습니다."
+            }
+            require(profileMajorVersion > 0) {
+                "브라우저 profile 주 버전은 양수여야 합니다."
+            }
+            return "store:$originalExtensionId:profile-$profileMajorVersion"
+        }
+
         private val OWNER_ONLY = setOf(
             PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE,
         )
+        private val EXTENSION_ID = Regex("[a-p]{32}")
     }
 }
