@@ -1,6 +1,7 @@
 package dev.sixbridge.core.profile
 
 import java.nio.file.Files
+import java.nio.file.Path
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
@@ -9,6 +10,46 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class BrowserProfileExtractorTest {
+    @Test
+    fun `records option page accessibility only with the complete Samsung contract`() {
+        val complete = browserApk(
+            dex = """
+                six://ex extension-id .contentprovider dev_ext
+                getExtensionOptionPage six_add_on_settings updateGoAddonSettings
+            """.trimIndent(),
+            terrace = """{"namespace":"action"} options_ui options_page""",
+        )
+        val partial = browserApk(
+            dex = "getExtensionOptionPage six_add_on_settings",
+            terrace = "options_ui",
+        )
+        val absent = browserApk(
+            dex = "six://ex extension-id .contentprovider dev_ext",
+            terrace = """{"namespace":"action"}""",
+        )
+        val swapped = browserApk(
+            dex = "options_ui options_page",
+            terrace = "getExtensionOptionPage six_add_on_settings updateGoAddonSettings",
+        )
+
+        assertTrue(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(complete).supportedFeatures,
+        )
+        assertFalse(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(partial).supportedFeatures,
+        )
+        assertFalse(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(absent).supportedFeatures,
+        )
+        assertFalse(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(swapped).supportedFeatures,
+        )
+    }
+
     @Test
     fun `extracts the Samsung extension contract and supported namespaces`() {
         val directory = Files.createTempDirectory("browser-profile")
@@ -86,5 +127,18 @@ class BrowserProfileExtractorTest {
 
         assertEquals(ProfileSupport.UNKNOWN, profile.support)
         assertTrue(profile.profileDifferences.any { it.startsWith("missing_api:") })
+    }
+
+    private fun browserApk(dex: String, terrace: String): Path {
+        val apk = Files.createTempFile("six-browser-profile-", ".apk")
+        ZipOutputStream(Files.newOutputStream(apk)).use { zip ->
+            zip.putNextEntry(ZipEntry("classes.dex"))
+            zip.write(dex.toByteArray())
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("lib/arm64-v8a/libterrace.so"))
+            zip.write(terrace.toByteArray())
+            zip.closeEntry()
+        }
+        return apk
     }
 }

@@ -71,6 +71,7 @@ class BrowserProfileExtractor {
             sourceApkSha256 = sha256(browserApk),
             sourceApkSignerSha256 = readSignerSha256(browserApk).orEmpty(),
             profileDifferences = differences,
+            supportedFeatures = scan.supportedFeatures(),
         )
     }
 
@@ -182,12 +183,15 @@ class BrowserProfileExtractor {
     private class ApkScan {
         val markers = mutableSetOf<String>()
         val namespaces = mutableSetOf<String>()
+        private val dexMarkers = mutableSetOf<String>()
+        private val terraceMarkers = mutableSetOf<String>()
         var versionName: String? = null
         var versionCode: Long? = null
 
         fun scanContractData(input: InputStream) {
             scanText(input) { text ->
                 REQUIRED_MARKERS.filterTo(markers) { it in text }
+                OPTION_PAGE_DEX_MARKERS.filterTo(dexMarkers) { it in text }
                 if (versionName == null) {
                     versionName = VERSION_NAME_REGEX.find(text)?.groupValues?.get(1)
                 }
@@ -205,6 +209,16 @@ class BrowserProfileExtractor {
                 NAMESPACE_REGEX.findAll(text).forEach { match ->
                     namespaces += match.groupValues[1]
                 }
+                OPTION_PAGE_TERRACE_MARKERS.filterTo(terraceMarkers) { it in text }
+            }
+        }
+
+        fun supportedFeatures(): Set<String> = buildSet {
+            if (
+                dexMarkers.containsAll(OPTION_PAGE_DEX_MARKERS) &&
+                terraceMarkers.containsAll(OPTION_PAGE_TERRACE_MARKERS)
+            ) {
+                add(OPTIONS_PAGE_ACCESSIBLE_FEATURE)
             }
         }
 
@@ -228,6 +242,17 @@ class BrowserProfileExtractor {
             "extension-id",
             ".contentprovider",
             "dev_ext",
+        )
+        private const val OPTIONS_PAGE_ACCESSIBLE_FEATURE =
+            "extension.options-page.user-accessible"
+        private val OPTION_PAGE_DEX_MARKERS = setOf(
+            "getExtensionOptionPage",
+            "six_add_on_settings",
+            "updateGoAddonSettings",
+        )
+        private val OPTION_PAGE_TERRACE_MARKERS = setOf(
+            "options_ui",
+            "options_page",
         )
         private val NAMESPACE_REGEX =
             Regex("""["']namespace["']\s*:\s*["']([A-Za-z][A-Za-z0-9_.]*)["']""")
