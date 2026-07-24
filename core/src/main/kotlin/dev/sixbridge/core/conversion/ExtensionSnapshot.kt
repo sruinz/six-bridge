@@ -7,4 +7,5 @@ data class ExtensionSnapshot(
     val sourceSha256: String,
     val originalRoot: Path,
     val workingRoot: Path,
+    val sourceProjectIdentity: String?,
 )

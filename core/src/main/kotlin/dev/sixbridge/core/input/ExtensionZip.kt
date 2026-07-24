@@ -6,9 +6,14 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.OpenOption
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.text.Normalizer
 import java.util.Base64
@@ -28,6 +33,28 @@ object ExtensionZip {
         sourceRoot: Path,
         publicKey: ByteArray? = null,
         includeProjectMarker: Boolean = false,
+    ): ByteArray = createBytes(
+        sourceRoot,
+        publicKey,
+        includeProjectMarker,
+        beforeSourceRead = null,
+    )
+
+    internal fun createBytesForTesting(
+        sourceRoot: Path,
+        beforeSourceRead: (Path) -> Unit,
+    ): ByteArray = createBytes(
+        sourceRoot,
+        publicKey = null,
+        includeProjectMarker = false,
+        beforeSourceRead = beforeSourceRead,
+    )
+
+    private fun createBytes(
+        sourceRoot: Path,
+        publicKey: ByteArray?,
+        includeProjectMarker: Boolean,
+        beforeSourceRead: ((Path) -> Unit)?,
     ): ByteArray {
         require(Files.isDirectory(sourceRoot, LinkOption.NOFOLLOW_LINKS)) {
             "확장 소스 디렉터리가 아닙니다: $sourceRoot"
@@ -35,7 +62,11 @@ object ExtensionZip {
         require(Files.isRegularFile(sourceRoot.resolve("manifest.json"), LinkOption.NOFOLLOW_LINKS)) {
             "manifest.json 파일이 없습니다: $sourceRoot"
         }
-        val entries = readSourceEntries(sourceRoot, includeProjectMarker)
+        val entries = readSourceEntries(
+            sourceRoot,
+            includeProjectMarker,
+            beforeSourceRead,
+        )
         return ByteArrayOutputStream().run {
             ZipOutputStream(this).use { zip ->
                 entries.forEach { source ->
@@ -72,9 +103,12 @@ object ExtensionZip {
     }
 
     fun extract(zipPath: Path, destination: Path): Path {
-        validateUnixEntryTypes(zipPath)
+        val validatedEntryCount = validateUnixEntryTypes(zipPath)
         Files.createDirectories(destination)
         ZipFile(zipPath.toFile()).use { zip ->
+            require(zip.size() == validatedEntryCount) {
+                "ZIP 중앙 디렉터리 항목 수가 일치하지 않습니다."
+            }
             require(zip.size() <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
             var declaredTotal = 0L
             val rawNames = mutableSetOf<String>()
@@ -121,7 +155,7 @@ object ExtensionZip {
         return locateManifestRoot(destination)
     }
 
-    private fun validateUnixEntryTypes(zipPath: Path) {
+    private fun validateUnixEntryTypes(zipPath: Path): Int =
         RandomAccessFile(zipPath.toFile(), "r").use { archive ->
             val archiveSize = archive.length()
             require(archiveSize >= END_OF_CENTRAL_DIRECTORY_SIZE) {
@@ -132,12 +166,29 @@ object ExtensionZip {
                 END_OF_CENTRAL_DIRECTORY_SIZE + MAX_ZIP_COMMENT_SIZE,
             ).toInt()
             val tail = ByteArray(tailSize)
-            archive.seek(archiveSize - tailSize)
+            val tailOffset = archiveSize - tailSize
+            archive.seek(tailOffset)
             archive.readFully(tail)
-            val endOffset = (
-                tail.size - END_OF_CENTRAL_DIRECTORY_SIZE.toInt() downTo 0
-                )
-                .firstOrNull { littleEndianInt(tail, it) == END_OF_CENTRAL_DIRECTORY_SIGNATURE }
+            val endOffset = (tail.size - END_OF_CENTRAL_DIRECTORY_SIZE.toInt() downTo 0)
+                .firstOrNull { offset ->
+                    if (littleEndianInt(tail, offset) != END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
+                        return@firstOrNull false
+                    }
+                    val commentLength = littleEndianShort(tail, offset + 20)
+                    val disk = littleEndianShort(tail, offset + 4)
+                    val centralDisk = littleEndianShort(tail, offset + 6)
+                    val diskEntries = littleEndianShort(tail, offset + 8)
+                    val totalEntries = littleEndianShort(tail, offset + 10)
+                    val centralSize = littleEndianUnsignedInt(tail, offset + 12)
+                    val centralOffset = littleEndianUnsignedInt(tail, offset + 16)
+                    val absoluteOffset = tailOffset + offset
+                    offset + END_OF_CENTRAL_DIRECTORY_SIZE + commentLength ==
+                        tail.size.toLong() &&
+                        disk == 0 &&
+                        centralDisk == 0 &&
+                        diskEntries == totalEntries &&
+                        centralOffset + centralSize == absoluteOffset
+                }
                 ?: throw IllegalArgumentException("ZIP 중앙 디렉터리를 찾지 못했습니다.")
             val entryCount = littleEndianShort(tail, endOffset + 10)
             val centralSize = littleEndianUnsignedInt(tail, endOffset + 12)
@@ -178,60 +229,151 @@ object ExtensionZip {
                 }
                 archive.seek(next)
             }
+            require(archive.filePointer == centralOffset + centralSize) {
+                "ZIP 중앙 디렉터리 크기와 실제 항목이 일치하지 않습니다."
+            }
+            entryCount
         }
-    }
 
     private fun readSourceEntries(
         sourceRoot: Path,
         includeProjectMarker: Boolean,
+        beforeSourceRead: ((Path) -> Unit)?,
     ): List<SourceEntry> {
+        val inventory = captureInventory(sourceRoot, includeProjectMarker)
+        val files = inventory.filter { it.included }
+        require(files.size <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
+        var totalSize = 0L
+        files.forEach { entry ->
+            totalSize += entry.size
+            require(totalSize <= MAX_TOTAL_SIZE) { "ZIP 전체 크기가 제한을 초과합니다." }
+        }
+        val entries = files.map { entry ->
+            beforeSourceRead?.invoke(entry.path)
+            readSourceEntry(entry)
+        }
+        val finalInventory = captureInventory(sourceRoot, includeProjectMarker)
+        require(inventory == finalInventory) {
+            "snapshot 중 확장 소스 inventory가 변경되었습니다."
+        }
+        entries.forEach { expected ->
+            val inventoryEntry = files.single { it.name == expected.name }
+            val verified = readSourceEntry(inventoryEntry)
+            require(expected.sha256 == verified.sha256) {
+                "snapshot 중 확장 소스 파일 hash가 변경되었습니다: ${inventoryEntry.path}"
+            }
+        }
+        return entries.sortedBy(SourceEntry::name)
+    }
+
+    private fun captureInventory(
+        sourceRoot: Path,
+        includeProjectMarker: Boolean,
+    ): List<SourceInventoryEntry> {
         val normalizedPaths = mutableMapOf<String, String>()
         val foldedPaths = mutableMapOf<String, String>()
-        var totalSize = 0L
-        val entries = mutableListOf<SourceEntry>()
-        Files.walk(sourceRoot).use { stream ->
+        val inventory = Files.walk(sourceRoot).use { stream ->
             stream.iterator().asSequence()
                 .filter { it != sourceRoot }
-                .forEach { path ->
-                    val relative = sourceRoot.relativize(path).invariantSeparatorsPathString
-                    val name = validateRelativePath(relative, Files.isDirectory(path))
-                    registerPath(name, relative, normalizedPaths, foldedPaths)
+                .map { path ->
                     val attributes = Files.readAttributes(
                         path,
                         BasicFileAttributes::class.java,
                         LinkOption.NOFOLLOW_LINKS,
                     )
+                    val relative = sourceRoot.relativize(path).invariantSeparatorsPathString
+                    val name = validateRelativePath(relative, attributes.isDirectory)
+                    registerPath(name, relative, normalizedPaths, foldedPaths)
                     require(!attributes.isSymbolicLink &&
                         (attributes.isDirectory || attributes.isRegularFile)
                     ) {
                         "확장 소스에는 일반 파일과 디렉터리만 허용됩니다: $path"
                     }
-                    if (!attributes.isRegularFile ||
-                        !shouldInclude(sourceRoot.relativize(path), includeProjectMarker)
-                    ) {
-                        return@forEach
+                    val included = attributes.isRegularFile &&
+                        shouldInclude(sourceRoot.relativize(path), includeProjectMarker)
+                    if (included) {
+                        require(attributes.size() <= MAX_ENTRY_SIZE) {
+                            "ZIP 개별 파일 크기가 제한을 초과합니다: $path"
+                        }
                     }
-                    require(attributes.size() <= MAX_ENTRY_SIZE) {
-                        "ZIP 개별 파일 크기가 제한을 초과합니다: $path"
-                    }
-                    val bytes = Files.readAllBytes(path)
-                    require(bytes.size.toLong() == attributes.size() &&
-                        Files.size(path) == attributes.size()
-                    ) {
-                        "snapshot 중 확장 소스 파일이 변경되었습니다: $path"
-                    }
-                    totalSize += bytes.size
-                    require(totalSize <= MAX_TOTAL_SIZE) {
-                        "ZIP 전체 크기가 제한을 초과합니다."
-                    }
-                    entries += SourceEntry(name, bytes)
-                    require(entries.size <= MAX_ENTRIES) {
-                        "ZIP 항목 수가 제한을 초과합니다."
+                    SourceInventoryEntry(
+                        path = path,
+                        name = name,
+                        directory = attributes.isDirectory,
+                        size = attributes.size(),
+                        modifiedMillis = attributes.lastModifiedTime().toMillis(),
+                        fileKey = attributes.fileKey()?.toString(),
+                        included = included,
+                    )
+                }
+                .sortedBy(SourceInventoryEntry::name)
+                .toList()
+        }
+        return inventory
+    }
+
+    private fun readSourceEntry(entry: SourceInventoryEntry): SourceEntry {
+        val before = readAttributes(entry.path)
+        require(entry.matches(before)) {
+            "snapshot 중 확장 소스 파일이 변경되었습니다: ${entry.path}"
+        }
+        val bytes = try {
+            FileChannel.open(
+                entry.path,
+                StandardOpenOption.READ,
+                LinkOption.NOFOLLOW_LINKS,
+            ).use { channel ->
+                require(channel.size() == entry.size) {
+                    "snapshot 중 확장 소스 파일 크기가 변경되었습니다: ${entry.path}"
+                }
+                val buffer = ByteBuffer.allocate(entry.size.toInt())
+                while (buffer.hasRemaining()) {
+                    require(channel.read(buffer) >= 0) {
+                        "snapshot 중 확장 소스 파일이 잘렸습니다: ${entry.path}"
                     }
                 }
+                require(channel.read(ByteBuffer.allocate(1)) < 0) {
+                    "snapshot 중 확장 소스 파일이 커졌습니다: ${entry.path}"
+                }
+                buffer.array()
+            }
+        } catch (error: IllegalArgumentException) {
+            throw error
+        } catch (error: Exception) {
+            throw IllegalArgumentException(
+                "snapshot 중 확장 소스 파일이 변경되었습니다: ${entry.path}",
+                error,
+            )
         }
-        return entries.sortedBy(SourceEntry::name)
+        val after = readAttributes(entry.path)
+        require(entry.matches(after)) {
+            "snapshot 중 확장 소스 파일이 변경되었습니다: ${entry.path}"
+        }
+        return SourceEntry(
+            name = entry.name,
+            bytes = bytes,
+            sha256 = sha256(bytes),
+        )
     }
+
+    private fun readAttributes(path: Path): BasicFileAttributes =
+        try {
+            Files.readAttributes(
+                path,
+                BasicFileAttributes::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            )
+        } catch (error: Exception) {
+            throw IllegalArgumentException(
+                "snapshot 중 확장 소스 파일이 변경되었습니다: $path",
+                error,
+            )
+        }
+
+    private fun sha256(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     private fun manifestWithKey(manifestBytes: ByteArray, publicKey: ByteArray): ByteArray {
         val json = Json { prettyPrint = true }
@@ -316,7 +458,9 @@ object ExtensionZip {
             require(previousRaw == null || previousRaw == rawPrefix) {
                 "정규화 후 중복되는 경로를 거부했습니다: $raw"
             }
-            val folded = normalizedPrefix.lowercase(Locale.ROOT)
+            val folded = Normalizer.normalize(normalizedPrefix, Normalizer.Form.NFKC)
+                .uppercase(Locale.ROOT)
+                .lowercase(Locale.ROOT)
             val previousNormalized = foldedPaths.putIfAbsent(folded, normalizedPrefix)
             require(previousNormalized == null || previousNormalized == normalizedPrefix) {
                 "대소문자가 충돌하는 경로를 거부했습니다: $raw"
@@ -353,7 +497,15 @@ object ExtensionZip {
 
     private fun copyLimited(input: InputStream, output: Path): Long {
         var size = 0L
-        Files.newOutputStream(output).use { target ->
+        Files.newByteChannel(
+            output,
+            setOf<OpenOption>(
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS,
+            ),
+        ).use { channel ->
+            val target = Channels.newOutputStream(channel)
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
                 val read = input.read(buffer)
@@ -391,7 +543,26 @@ object ExtensionZip {
     private data class SourceEntry(
         val name: String,
         val bytes: ByteArray,
+        val sha256: String,
     )
+
+    private data class SourceInventoryEntry(
+        val path: Path,
+        val name: String,
+        val directory: Boolean,
+        val size: Long,
+        val modifiedMillis: Long,
+        val fileKey: String?,
+        val included: Boolean,
+    ) {
+        fun matches(attributes: BasicFileAttributes): Boolean =
+            !attributes.isSymbolicLink &&
+                attributes.isRegularFile &&
+                !directory &&
+                attributes.size() == size &&
+                attributes.lastModifiedTime().toMillis() == modifiedMillis &&
+                attributes.fileKey()?.toString() == fileKey
+    }
 
     private data class ValidatedEntry(
         val entry: ZipEntry,

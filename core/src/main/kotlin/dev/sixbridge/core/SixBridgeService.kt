@@ -49,7 +49,11 @@ class SixBridgeService(
         val source = resolved.sourceRoot
             ?: throw IllegalArgumentException("분석할 확장 소스를 입력에서 추출하지 못했습니다.")
         return ConversionWorkspace().use { workspace ->
-            compatibilityAnalyzer.analyze(workspace.snapshot(source).workingRoot, profile)
+            val snapshot = workspace.snapshot(
+                source,
+                requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
+            )
+            compatibilityAnalyzer.analyze(snapshot.workingRoot, profile)
         }
     }
 
@@ -63,7 +67,11 @@ class SixBridgeService(
         val source = resolved.sourceRoot
             ?: throw IllegalArgumentException("빌드할 확장 소스를 입력에서 추출하지 못했습니다.")
         return ConversionWorkspace().use { workspace ->
-            val working = workspace.snapshot(source).workingRoot
+            val snapshot = workspace.snapshot(
+                source,
+                requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
+            )
+            val working = snapshot.workingRoot
             val compatibility = compatibilityAnalyzer.analyze(working, profile)
             require(
                 compatibility.status == CompatibilityStatus.COMPATIBLE ||
@@ -72,7 +80,12 @@ class SixBridgeService(
                 "호환성 상태 ${compatibility.status.name.lowercase()}에서는 빌드하지 않습니다."
             }
 
-            val packed = prepareCrx(resolved, working)
+            val packed = prepareCrx(
+                resolved,
+                working,
+                snapshot.sourceProjectIdentity,
+                markerVerified = true,
+            )
             val outputDirectory = (outputBundle?.toAbsolutePath()?.parent
                 ?: workspaceRoot.resolve("dist")).also { Files.createDirectories(it) }
             val crxOutput = outputDirectory.resolve("${packed.extensionId}.crx")
@@ -118,6 +131,18 @@ class SixBridgeService(
     private fun prepareCrx(
         resolved: ResolvedExtensionInput,
         source: Path,
+    ): PreparedCrx = prepareCrx(
+        resolved,
+        source,
+        verifiedMarker = null,
+        markerVerified = false,
+    )
+
+    private fun prepareCrx(
+        resolved: ResolvedExtensionInput,
+        source: Path,
+        verifiedMarker: String?,
+        markerVerified: Boolean,
     ): PreparedCrx {
         val original = resolved.crxBytes
         if (original != null) {
@@ -153,7 +178,12 @@ class SixBridgeService(
             }
             existing
         } else {
-            val projectIdentity = identityStore.resolve(resolved, source)
+            val projectIdentity = identityStore.resolve(
+                resolved,
+                source,
+                verifiedMarker,
+                markerVerified,
+            )
             val logicalIdentity = "project-$projectIdentity"
             val manifestIdentity =
                 "manifest-${sha256(manifestName.lowercase().toByteArray()).take(32)}"

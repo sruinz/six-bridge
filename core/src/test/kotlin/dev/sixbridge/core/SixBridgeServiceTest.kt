@@ -44,6 +44,31 @@ class SixBridgeServiceTest {
     }
 
     @Test
+    fun `build rejects a group-writable source marker before snapshot permissions are lost`() {
+        val workspace = Files.createTempDirectory("six-build-marker-permission-workspace")
+        val source = source("six-build-marker-permission-source", "Unsafe marker")
+        val marker = source.resolve(".sixbridge-project-id")
+        marker.writeText("sixbridge-project-v1:${"d".repeat(32)}")
+        Files.setPosixFilePermissions(
+            marker,
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+                PosixFilePermission.GROUP_WRITE,
+            ),
+        )
+        val service = SixBridgeService(workspace) {
+            error("marker 검증 전에 toolchain을 조회하면 안 됩니다.")
+        }
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            service.build(source.toString(), supportedProfile())
+        }
+
+        assertTrue(error.message.orEmpty().contains("owner만 수정"))
+    }
+
+    @Test
     fun `uses sidecars without changing sources and preserves identity for known path or fingerprint`() {
         val workspace = Files.createTempDirectory("six-identity-workspace")
         val first = source("six-identity-first", "__MSG_appName__")
@@ -231,6 +256,36 @@ class SixBridgeServiceTest {
 
         assertEquals(firstId, renamedId)
         assertEquals(firstId, updatedId)
+    }
+
+    @Test
+    fun `requires explicit identity when a markerless zip moves and changes`() {
+        val workspace = Files.createTempDirectory("six-zip-move-change-workspace")
+        val source = source("six-zip-move-change-source", "ZIP before move")
+        val originalZip = workspace.resolve("original.zip")
+        markerlessZip(source, originalZip)
+        val service = SixBridgeService(workspace)
+        val resolver = ExtensionInputResolver()
+
+        val originalId = prepare(service, resolver.resolve(originalZip.toString()))
+        val projectIdentity = pathIdentity(workspace, originalZip)
+        val movedZip = workspace.resolve("moved.zip")
+        Files.move(originalZip, movedZip)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"ZIP after move","version":"2"}""",
+        )
+        markerlessZip(source, movedZip)
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            prepare(service, resolver.resolve(movedZip.toString()))
+        }
+        assertTrue(error.message.orEmpty().contains("--identity"))
+
+        val movedId = prepare(
+            service,
+            resolver.resolve(movedZip.toString()).copy(projectIdentity = projectIdentity),
+        )
+        assertEquals(originalId, movedId)
     }
 
     @Test

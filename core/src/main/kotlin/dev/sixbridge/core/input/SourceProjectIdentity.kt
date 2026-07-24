@@ -15,7 +15,12 @@ import java.util.UUID
 class SourceProjectIdentityStore(
     private val registryRoot: Path,
 ) {
-    fun resolve(resolved: ResolvedExtensionInput, source: Path): String =
+    fun resolve(
+        resolved: ResolvedExtensionInput,
+        source: Path,
+        verifiedMarker: String? = null,
+        markerVerified: Boolean = false,
+    ): String =
         withRegistryLock {
             require(
                 resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY ||
@@ -23,7 +28,7 @@ class SourceProjectIdentityStore(
             ) {
                 "source project identity를 사용할 수 없는 입력입니다: ${resolved.kind}"
             }
-            resolveSource(resolved, source)
+            resolveSource(resolved, source, verifiedMarker, markerVerified)
         }
 
     fun claimLegacy(legacyIdentity: String, projectIdentity: String): Boolean =
@@ -46,15 +51,16 @@ class SourceProjectIdentityStore(
     private fun resolveSource(
         resolved: ResolvedExtensionInput,
         source: Path,
+        verifiedMarker: String?,
+        markerVerified: Boolean,
     ): String {
-        val marker = source.resolve(MARKER_FILE)
-        val embedded = if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
-            readMarker(
-                marker,
+        val embedded = if (markerVerified) {
+            verifiedMarker
+        } else {
+            readSourceMarker(
+                source,
                 requireOwnerOnly = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
             )
-        } else {
-            null
         }
         val requested = resolved.projectIdentity?.let(::validateProjectId)
         val canonical = canonicalInputPath(resolved)
@@ -83,9 +89,12 @@ class SourceProjectIdentityStore(
                 } != false
         }
         val identity = directIdentity ?: fingerprintUsable ?: run {
-            if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY &&
-                hasMissingRegisteredSource()
-            ) {
+            val missingHistory = when (resolved.kind) {
+                ExtensionInputKind.SOURCE_DIRECTORY -> hasMissingRegisteredSource()
+                ExtensionInputKind.ZIP -> hasMissingRegisteredZip()
+                else -> false
+            }
+            if (missingHistory) {
                 throw IllegalArgumentException(
                     "이동과 내용 변경이 함께 감지되었습니다. --identity를 명시하세요.",
                 )
@@ -95,6 +104,8 @@ class SourceProjectIdentityStore(
 
         if (resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY) {
             claimDirectoryIdentity(identity, canonical)
+        } else {
+            recordZipIdentity(identity, canonical)
         }
         if (byPath == null) writeSecure(pathBinding, identity)
         if (byFingerprint == null) {
@@ -139,24 +150,34 @@ class SourceProjectIdentityStore(
         }
     }
 
+    private fun recordZipIdentity(identity: String, canonical: String) {
+        val binding = registryRoot.resolve("zip-history")
+            .resolve(identity)
+            .resolve("${sha256(canonical)}.txt")
+        val previous = readText(binding)
+        require(previous == null || previous == canonical) {
+            "ZIP identity history sidecar가 canonical path와 충돌합니다."
+        }
+        if (previous == null) writeSecure(binding, canonical)
+    }
+
+    private fun hasMissingRegisteredZip(): Boolean {
+        val history = registryRoot.resolve("zip-history")
+        if (!Files.isDirectory(history, LinkOption.NOFOLLOW_LINKS)) return false
+        return Files.walk(history).use { paths ->
+            paths.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) }
+                .map(::readText)
+                .filter { it != null }
+                .map { Path.of(it!!) }
+                .anyMatch { !Files.exists(it) }
+        }
+    }
+
     private fun canonicalInputPath(resolved: ResolvedExtensionInput): String =
         Path.of(resolved.originalInput).toAbsolutePath().normalize().toRealPath().toString()
 
     private fun contentFingerprint(source: Path): String =
         sha256(ExtensionZip.createBytes(source))
-
-    private fun readMarker(path: Path, requireOwnerOnly: Boolean): String {
-        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-            "source project identity marker는 일반 파일이어야 합니다."
-        }
-        if (requireOwnerOnly) verifyMarkerPermissions(path)
-        val value = Files.readString(path).trim()
-        val match = MARKER_FORMAT.matchEntire(value)
-            ?: throw IllegalArgumentException(
-                "source project identity marker 형식이 올바르지 않습니다.",
-            )
-        return match.groupValues[1]
-    }
 
     private fun validateProjectId(value: String): String {
         require(PROJECT_ID.matches(value)) {
@@ -213,20 +234,6 @@ class SourceProjectIdentityStore(
         }
     }
 
-    private fun verifyMarkerPermissions(path: Path) {
-        require(Files.getFileStore(path).supportsFileAttributeView("posix")) {
-            "source project identity marker 권한을 확인할 수 없는 파일 시스템입니다: $path"
-        }
-        val permissions = Files.getPosixFilePermissions(path)
-        require(PosixFilePermission.OWNER_READ in permissions &&
-            PosixFilePermission.OWNER_WRITE in permissions &&
-            PosixFilePermission.GROUP_WRITE !in permissions &&
-            PosixFilePermission.OTHERS_WRITE !in permissions
-        ) {
-            "source project identity marker는 owner만 수정할 수 있어야 합니다: $path"
-        }
-    }
-
     private fun <T> withRegistryLock(block: () -> T): T {
         Files.createDirectories(registryRoot)
         val lockPath = registryRoot.resolve("registry.lock")
@@ -262,5 +269,35 @@ class SourceProjectIdentityStore(
             PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE,
         )
+
+        internal fun readSourceMarker(
+            source: Path,
+            requireOwnerOnly: Boolean,
+        ): String? {
+            val path = source.resolve(MARKER_FILE)
+            if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return null
+            require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                "source project identity marker는 일반 파일이어야 합니다."
+            }
+            if (requireOwnerOnly) {
+                require(Files.getFileStore(path).supportsFileAttributeView("posix")) {
+                    "source project identity marker 권한을 확인할 수 없는 파일 시스템입니다: $path"
+                }
+                val permissions = Files.getPosixFilePermissions(path)
+                require(PosixFilePermission.OWNER_READ in permissions &&
+                    PosixFilePermission.OWNER_WRITE in permissions &&
+                    PosixFilePermission.GROUP_WRITE !in permissions &&
+                    PosixFilePermission.OTHERS_WRITE !in permissions
+                ) {
+                    "source project identity marker는 owner만 수정할 수 있어야 합니다: $path"
+                }
+            }
+            val value = Files.readString(path).trim()
+            val match = MARKER_FORMAT.matchEntire(value)
+                ?: throw IllegalArgumentException(
+                    "source project identity marker 형식이 올바르지 않습니다.",
+                )
+            return match.groupValues[1]
+        }
     }
 }
