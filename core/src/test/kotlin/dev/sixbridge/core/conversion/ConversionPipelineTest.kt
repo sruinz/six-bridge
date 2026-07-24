@@ -19,6 +19,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -63,11 +64,12 @@ class ConversionPipelineTest {
         }
 
         assertContentEquals(first.sourceZip, second.sourceZip)
-        assertContentEquals(first.sourceZip, independent.sourceZip)
+        assertFalse(first.sourceZip.contentEquals(independent.sourceZip))
         assertEquals(first.planSha256, second.planSha256)
         assertEquals(first.planSha256, independent.planSha256)
         assertEquals(first.reportSha256, second.reportSha256)
-        assertEquals(first.reportSha256, independent.reportSha256)
+        assertNotEquals(first.extensionId, independent.extensionId)
+        assertNotEquals(first.reportSha256, independent.reportSha256)
         assertEquals(first.extensionId, second.extensionId)
         assertEquals(ConversionState.CONVERTED, first.compatibilityAfter.conversionState)
         assertTrue(first.compatibilityAfter.adapterDecisions.all(AdapterDecision::applied))
@@ -123,6 +125,7 @@ class ConversionPipelineTest {
         assertEquals(first.extensionId, second.extensionId)
         val parsed = Crx3.parse(first.crxBytes)
         assertEquals(first.extensionId, parsed.extensionId)
+        assertContentEquals(first.sourceZip, parsed.zipBytes)
         val extracted = Files.createTempDirectory("six-pipeline-packed")
         ExtensionZip.extract(parsed.zipBytes, extracted)
         val manifest = Json.parseToJsonElement(
@@ -134,6 +137,106 @@ class ConversionPipelineTest {
         assertEquals(first.extensionId, Crx3.extensionId(publicKey))
         assertEquals(original.extensionId, first.compatibilityAfter.originalExtensionId)
         assertEquals(first.extensionId, first.compatibilityAfter.convertedExtensionId)
+    }
+
+    @Test
+    fun `rejects a CRX whose verified payload does not match the supplied source snapshot`() {
+        val localRoot = Files.createTempDirectory("six-pipeline-crx-binding")
+        val firstSource = plainSource("six-pipeline-crx-first")
+        val secondSource = convertibleSource("six-pipeline-crx-second")
+        val original = Crx3.pack(firstSource, keyPair())
+        val mismatched = ResolvedExtensionInput(
+            kind = ExtensionInputKind.CRX3,
+            originalInput = "mismatched.crx",
+            sourceRoot = secondSource,
+            crxBytes = original.bytes,
+            expectedExtensionId = original.extensionId,
+        )
+
+        assertFailsWith<CrxSourceBindingException> {
+            ConversionPipeline(localRoot).use {
+                it.analyze(mismatched, profile())
+            }
+        }
+        assertFailsWith<CrxSourceBindingException> {
+            ConversionPipeline(localRoot).use {
+                it.prepare(mismatched, profile(), emptyList())
+            }
+        }
+    }
+
+    @Test
+    fun `normal resolver CRX binds its verified payload to the canonical snapshot`() {
+        val localRoot = Files.createTempDirectory("six-pipeline-crx-resolver")
+        val source = plainSource("six-pipeline-crx-resolver-source")
+        val packed = Crx3.pack(source, keyPair())
+        val input = localRoot.resolve("normal.crx")
+        Files.write(input, packed.bytes)
+        val resolved = dev.sixbridge.core.input.ExtensionInputResolver()
+            .resolve(input.toString())
+
+        val result = ConversionPipeline(localRoot).use {
+            it.prepare(resolved, profile(), emptyList())
+        }
+
+        assertContentEquals(packed.bytes, result.crxBytes)
+        assertEquals(packed.extensionId, result.extensionId)
+    }
+
+    @Test
+    fun `storage conversion report carries sealed applied proof`() {
+        val source = Files.createTempDirectory("six-pipeline-storage").also { root ->
+            root.resolve("worker.js").writeText(
+                """chrome.storage.sync.get("theme").then(console.log);""",
+            )
+            root.resolve("manifest.json").writeText(
+                """
+                {
+                  "manifest_version": 3,
+                  "name": "Storage",
+                  "version": "1",
+                  "permissions": ["storage"],
+                  "background": {"service_worker": "worker.js"}
+                }
+                """.trimIndent(),
+            )
+        }
+        val storageProfile = profile().copy(
+            supportedFeatures = setOf("storage.local"),
+            unavailableFeatures = setOf("storage.sync"),
+        )
+
+        val result = ConversionPipeline(
+            Files.createTempDirectory("six-pipeline-storage-local"),
+        ).use {
+            it.prepare(resolvedSource(source), storageProfile, emptyList())
+        }
+
+        val decision = result.compatibilityAfter.adapterDecisions.single {
+            it.id == MobilePatternAnalyzer.STORAGE_FALLBACK
+        }
+        assertTrue(decision.applied)
+    }
+
+    @Test
+    fun `report hash is SHA-256 of final canonical compatibility bytes`() {
+        val localRoot = Files.createTempDirectory("six-pipeline-report-hash")
+        val result = ConversionPipeline(localRoot).use {
+            it.prepare(
+                resolvedSource(convertibleSource("six-pipeline-report-source")),
+                profile(),
+                emptyList(),
+            )
+        }
+        val expected = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(
+                dev.sixbridge.core.bundle.SixBundle
+                    .encodeCompatibility(result.compatibilityAfter)
+                    .toByteArray(Charsets.UTF_8),
+            )
+            .joinToString("") { "%02x".format(it) }
+
+        assertEquals(expected, result.reportSha256)
     }
 
     @Test

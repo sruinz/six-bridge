@@ -35,3 +35,6 @@ class ConversionUnavailableException(
 class ConversionValidationException(
     message: String,
 ) : IllegalStateException(message)
+
+class CrxSourceBindingException :
+    IllegalArgumentException("검증된 CRX payload와 canonical source snapshot이 다릅니다.")

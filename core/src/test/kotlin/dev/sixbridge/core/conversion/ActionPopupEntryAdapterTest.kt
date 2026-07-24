@@ -153,16 +153,28 @@ class ActionPopupEntryAdapterTest {
                 (updatedBackground["type"] as? JsonPrimitive)?.content,
             )
             if (workerType == "module") {
-                assertEquals(
+                assertTrue(
+                    bootstrap.startsWith(
+                        "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:module:",
+                    ),
+                )
+                assertTrue(
+                    bootstrap.endsWith(
                     "import \"./background.js\";\n" +
                         "import \"../_sixbridge/action-popup-entry-background.v1.js\";\n",
-                    bootstrap,
+                    ),
                 )
             } else {
-                assertEquals(
+                assertTrue(
+                    bootstrap.startsWith(
+                        "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:classic:",
+                    ),
+                )
+                assertTrue(
+                    bootstrap.endsWith(
                     "importScripts(\"./background.js\", " +
                         "\"../_sixbridge/action-popup-entry-background.v1.js\");\n",
-                    bootstrap,
+                    ),
                 )
             }
             assertContentEquals(workerBefore, source.resolve("scripts/background.js").readBytes())

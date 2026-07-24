@@ -1,6 +1,7 @@
 package dev.sixbridge.core.crx
 
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.conversion.VerifiedCrxPayload
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -14,6 +15,7 @@ import java.security.PublicKey
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import kotlin.jvm.JvmSynthetic
 
 class InvalidCrxException(message: String) : IllegalArgumentException(message)
 
@@ -35,6 +37,23 @@ object Crx3 {
 
     fun pack(sourceRoot: Path, keyPair: KeyPair): PackedCrx {
         val zipBytes = ExtensionZip.createBytes(sourceRoot, keyPair.public.encoded)
+        return packZip(zipBytes, keyPair)
+    }
+
+    @JvmSynthetic
+    internal fun packVerified(
+        payload: VerifiedCrxPayload,
+        keyPair: KeyPair,
+    ): PackedCrx {
+        val zipBytes = payload.bytes
+        return packZip(zipBytes, keyPair).also { packed ->
+            check(packed.zipBytes.contentEquals(zipBytes)) {
+                "verified CRX payload bytes가 packing 중 변경되었습니다."
+            }
+        }
+    }
+
+    private fun packZip(zipBytes: ByteArray, keyPair: KeyPair): PackedCrx {
         val crxIdBytes = MessageDigest.getInstance("SHA-256")
             .digest(keyPair.public.encoded)
             .copyOfRange(0, 16)

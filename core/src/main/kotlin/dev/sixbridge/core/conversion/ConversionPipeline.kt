@@ -3,6 +3,8 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.StableExtensionAnalysis
+import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.input.ExtensionInputKind
@@ -13,9 +15,9 @@ import dev.sixbridge.core.profile.BrowserProfile
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Path
+import java.security.KeyPair
 import java.security.MessageDigest
 import java.util.Base64
 import kotlin.io.path.readText
@@ -42,6 +44,7 @@ class ConversionPipeline private constructor(
             source,
             requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
         )
+        requireCrxSourceBinding(resolved, snapshot)
         return analyzer.analyzeArchive(snapshot.sourceZip, profile)
     }
 
@@ -58,6 +61,7 @@ class ConversionPipeline private constructor(
             source,
             requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
         )
+        requireCrxSourceBinding(resolved, snapshot)
         val before = analyzer.analyzeArchive(snapshot.sourceZip, profile)
         val plan = plan(before, approvals)
         val transformed = plan.selectedAdapters.isNotEmpty()
@@ -69,47 +73,22 @@ class ConversionPipeline private constructor(
         }
         requireAllApplied(plan, applied)
 
-        val sourceZip = ExtensionZip.createBytes(
+        val transformedArchive = ExtensionZip.createBytes(
             snapshot.workingRoot,
             includeProjectMarker = true,
         )
-        val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
-        validateCompatibility(before, rawAfter)
-
-        if (transformed) {
-            val replay = workspace.transform(snapshot, profile, plan)
-            requireAllApplied(plan, replay)
-            val replayedZip = ExtensionZip.createBytes(
-                snapshot.workingRoot,
-                includeProjectMarker = true,
+        val applicationProof = if (transformed) {
+            workspace.verifyApplied(
+                snapshot,
+                profile,
+                plan,
+                applied,
+                transformedArchive,
             )
-            if (!sourceZip.contentEquals(replayedZip)) {
-                throw ConversionValidationException(
-                    "adapter 재적용 결과가 결정적이지 않습니다.",
-                )
-            }
+        } else {
+            null
         }
-
-        val afterWithAdapters = conversionReport(
-            before = before,
-            rawAfter = rawAfter,
-            applied = applied,
-            transformed = transformed,
-        )
-        val verificationPlan = plan(afterWithAdapters, approvals)
-        if (transformed &&
-            verificationPlan.selectedAdapters.any { !it.applied }
-        ) {
-            throw ConversionValidationException(
-                "변환본 재계획에 미적용 adapter가 남았습니다.",
-            )
-        }
-        val reportSha256 = reportDigest(
-            sourceZip,
-            plan.proofSha256,
-            verificationPlan.proofSha256,
-        )
-        val packed = packaging.pack(
+        val identity = packaging.select(
             resolved = resolved,
             source = snapshot.workingRoot,
             identitySource = snapshot.originalRoot,
@@ -118,20 +97,66 @@ class ConversionPipeline private constructor(
             transformed = transformed,
             profileMajorVersion = profile.majorVersion,
         )
+        val sourceZip = if (identity.passthrough) {
+            requireNotNull(identity.originalCrxZip).copyOf()
+        } else {
+            ExtensionZip.createBytes(
+                snapshot.workingRoot,
+                requireNotNull(identity.keyPair).public.encoded,
+                includeProjectMarker = false,
+            )
+        }
+        val sealedPayload = if (identity.passthrough) {
+            null
+        } else {
+            workspace.sealArchive(
+                snapshot = snapshot,
+                publicKey = requireNotNull(identity.keyPair).public.encoded,
+                includeProjectMarker = false,
+                expectedArchive = sourceZip,
+            )
+        }
+        val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
+        validateCompatibility(before, rawAfter)
+
+        val afterWithAdapters = conversionReport(
+            rawAfter = rawAfter,
+            applicationProof = applicationProof,
+            transformed = transformed,
+        )
         val after = afterWithAdapters.copy(
-            originalExtensionId = packed.originalExtensionId,
-            convertedExtensionId = packed.extensionId,
+            originalExtensionId = identity.originalExtensionId,
+            convertedExtensionId = identity.extensionId,
         ).also(CompatibilityReport::validate)
+        val verificationPlan = plan(after, approvals)
+        if (transformed &&
+            verificationPlan.selectedAdapters.any { !it.applied }
+        ) {
+            throw ConversionValidationException(
+                "변환본 재계획에 미적용 adapter가 남았습니다.",
+            )
+        }
+        val reportSha256 = sha256(
+            SixBundle.encodeCompatibility(after).toByteArray(UTF_8),
+        )
+        val crxBytes = if (identity.passthrough) {
+            requireNotNull(identity.originalCrxBytes).copyOf()
+        } else {
+            packaging.packVerified(identity, requireNotNull(sealedPayload))
+        }
+        check(Crx3.parse(crxBytes).zipBytes.contentEquals(sourceZip)) {
+            "최종 CRX payload가 sealed canonical sourceZip과 다릅니다."
+        }
         return ConversionPipelineResult.create(
             sourceZip = sourceZip,
             compatibilityBefore = before,
             compatibilityAfter = after,
             planSha256 = plan.proofSha256,
             reportSha256 = reportSha256,
-            extensionId = packed.extensionId,
-            crxBytes = packed.bytes,
-            logicalIdentity = packed.logicalIdentity,
-            passthrough = packed.passthrough,
+            extensionId = identity.extensionId,
+            crxBytes = crxBytes,
+            logicalIdentity = identity.logicalIdentity,
+            passthrough = identity.passthrough,
             convertedSourceRoot = snapshot.workingRoot,
             artifactDirectory = snapshot.workingRoot.parent.resolve("artifacts").also {
                 java.nio.file.Files.createDirectory(it)
@@ -200,13 +225,16 @@ class ConversionPipeline private constructor(
     }
 
     private fun conversionReport(
-        before: CompatibilityReport,
         rawAfter: CompatibilityReport,
-        applied: List<AdapterDecision>,
+        applicationProof: VerifiedAdapterApplication?,
         transformed: Boolean,
     ): CompatibilityReport {
         if (!transformed) {
             return rawAfter.copy(conversionState = ConversionState.PASSTHROUGH)
+        }
+        val applied = requireNotNull(applicationProof).decisions
+        check(applied.all(AdapterDecision::applied)) {
+            "sealed adapter application proof가 완전하지 않습니다."
         }
         val selectedKeys = applied.mapTo(mutableSetOf()) { it.id to it.version }
         val newDecisions = rawAfter.adapterDecisions.filter {
@@ -238,7 +266,6 @@ class ConversionPipeline private constructor(
         return rawAfter.copy(
             conversionState = ConversionState.CONVERTED,
             adapterDecisions = decisions,
-            originalExtensionId = before.manifestKeyExtensionId,
         )
     }
 
@@ -249,28 +276,53 @@ class ConversionPipeline private constructor(
         CompatibilityStatus.UNKNOWN -> 3
     }
 
-    private fun reportDigest(
-        sourceZip: ByteArray,
-        planSha256: String,
-        afterPlanSha256: String,
-    ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        digest.field(
-            "schema",
-            "sixbridge-conversion-report-v1".toByteArray(UTF_8),
+    private fun requireCrxSourceBinding(
+        resolved: ResolvedExtensionInput,
+        snapshot: ExtensionSnapshot,
+    ) {
+        val crxBytes = resolved.crxBytes ?: return
+        val parsed = Crx3.parse(crxBytes)
+        if (resolved.expectedExtensionId != null &&
+            resolved.expectedExtensionId != parsed.extensionId
+        ) {
+            throw CrxSourceBindingException()
+        }
+        val (canonical, publicKey) =
+            StableExtensionAnalysis.fromArchive(parsed.zipBytes).use { stable ->
+                val manifest = Json.parseToJsonElement(
+                    stable.root.resolve("manifest.json").readText(),
+                ) as? JsonObject ?: throw CrxSourceBindingException()
+                val manifestKey = (manifest["key"] as? JsonPrimitive)
+                    ?.takeIf { it.isString }
+                    ?.content
+                    ?: throw CrxSourceBindingException()
+                val key = runCatching {
+                    Base64.getDecoder().decode(manifestKey)
+                }.getOrElse {
+                    throw CrxSourceBindingException()
+                }
+                ExtensionZip.createBytes(
+                    stable.root,
+                    includeProjectMarker = true,
+                ) to key
+            }
+        if (Crx3.extensionId(publicKey) != parsed.extensionId) {
+            throw CrxSourceBindingException()
+        }
+        val expected = ExtensionZip.createBytes(
+            snapshot.originalRoot,
+            publicKey,
+            includeProjectMarker = true,
         )
-        digest.field("source.zip", sourceZip)
-        digest.field("plan.sha256", planSha256.toByteArray(UTF_8))
-        digest.field("after-plan.sha256", afterPlanSha256.toByteArray(UTF_8))
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    private fun MessageDigest.field(name: String, value: ByteArray) {
-        listOf(name.toByteArray(UTF_8), value).forEach { bytes ->
-            update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes.size).array())
-            update(bytes)
+        if (!canonical.contentEquals(expected)) {
+            throw CrxSourceBindingException()
         }
     }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     companion object {
         @JvmSynthetic
@@ -351,6 +403,39 @@ internal class CrxIdentityPolicy private constructor(
         transformed: Boolean,
         profileMajorVersion: Int,
     ): PreparedPipelineCrx {
+        val identity = select(
+            resolved,
+            source,
+            identitySource,
+            sourceProjectIdentity,
+            markerVerified,
+            transformed,
+            profileMajorVersion,
+        )
+        val bytes = if (identity.passthrough) {
+            requireNotNull(identity.originalCrxBytes).copyOf()
+        } else {
+            Crx3.pack(source, requireNotNull(identity.keyPair)).bytes
+        }
+        return PreparedPipelineCrxValue(
+            extensionId = identity.extensionId,
+            bytes = bytes,
+            originalExtensionId = identity.originalExtensionId,
+            logicalIdentity = identity.logicalIdentity,
+            passthrough = identity.passthrough,
+        )
+    }
+
+    @JvmSynthetic
+    fun select(
+        resolved: ResolvedExtensionInput,
+        source: Path,
+        identitySource: Path = source,
+        sourceProjectIdentity: String?,
+        markerVerified: Boolean,
+        transformed: Boolean,
+        profileMajorVersion: Int,
+    ): PreparedCrxIdentity {
         val original = resolved.crxBytes
         val originalParsed = original?.let(Crx3::parse)
         if (originalParsed != null) {
@@ -361,12 +446,14 @@ internal class CrxIdentityPolicy private constructor(
                 "입력 CRX extension ID가 기대한 ID와 다릅니다."
             }
             if (!transformed) {
-                return PreparedPipelineCrxValue(
+                return PreparedCrxIdentityValue(
                     extensionId = originalParsed.extensionId,
-                    bytes = original.copyOf(),
                     originalExtensionId = originalParsed.extensionId,
                     logicalIdentity = null,
                     passthrough = true,
+                    keyPair = null,
+                    originalCrxBytes = original.copyOf(),
+                    originalCrxZip = originalParsed.zipBytes,
                 )
             }
             val identity = ExtensionKeyManager.storeConversionIdentity(
@@ -378,14 +465,16 @@ internal class CrxIdentityPolicy private constructor(
                 originalParsed.extensionId,
                 profileMajorVersion,
             )
-            val packed = Crx3.pack(source, key)
-            keyManager.persist(packed.extensionId, key)
-            return PreparedPipelineCrxValue(
-                extensionId = packed.extensionId,
-                bytes = packed.bytes,
+            val extensionId = Crx3.extensionId(key.public.encoded)
+            keyManager.persist(extensionId, key)
+            return PreparedCrxIdentityValue(
+                extensionId = extensionId,
                 originalExtensionId = originalParsed.extensionId,
                 logicalIdentity = identity,
                 passthrough = false,
+                keyPair = key,
+                originalCrxBytes = original.copyOf(),
+                originalCrxZip = originalParsed.zipBytes,
             )
         }
 
@@ -452,17 +541,37 @@ internal class CrxIdentityPolicy private constructor(
                 keyManager.persist(logicalIdentity, it)
             }
         }
-        val packed = Crx3.pack(source, key)
-        keyManager.persist(packed.extensionId, key)
-        return PreparedPipelineCrxValue(
-            extensionId = packed.extensionId,
-            bytes = packed.bytes,
+        val extensionId = Crx3.extensionId(key.public.encoded)
+        keyManager.persist(extensionId, key)
+        return PreparedCrxIdentityValue(
+            extensionId = extensionId,
             originalExtensionId = manifestKey?.let {
                 Crx3.extensionId(Base64.getDecoder().decode(it))
             },
             logicalIdentity = null,
             passthrough = false,
+            keyPair = key,
+            originalCrxBytes = null,
+            originalCrxZip = null,
         )
+    }
+
+    @JvmSynthetic
+    fun packVerified(
+        identity: PreparedCrxIdentity,
+        payload: VerifiedCrxPayload,
+    ): ByteArray {
+        check(!identity.passthrough) {
+            "passthrough CRX는 verified payload로 재서명하지 않습니다."
+        }
+        val packed = Crx3.packVerified(
+            payload,
+            requireNotNull(identity.keyPair),
+        )
+        check(packed.extensionId == identity.extensionId) {
+            "선택된 CRX identity와 verified pack 결과가 다릅니다."
+        }
+        return packed.bytes
     }
 
     private fun sha256(bytes: ByteArray): String =
@@ -494,3 +603,29 @@ private data class PreparedPipelineCrxValue(
     override val logicalIdentity: String?,
     override val passthrough: Boolean,
 ) : PreparedPipelineCrx
+
+internal sealed interface PreparedCrxIdentity {
+    val extensionId: String
+    val originalExtensionId: String?
+    val logicalIdentity: String?
+    val passthrough: Boolean
+
+    @get:JvmSynthetic
+    val keyPair: KeyPair?
+
+    @get:JvmSynthetic
+    val originalCrxBytes: ByteArray?
+
+    @get:JvmSynthetic
+    val originalCrxZip: ByteArray?
+}
+
+private data class PreparedCrxIdentityValue(
+    override val extensionId: String,
+    override val originalExtensionId: String?,
+    override val logicalIdentity: String?,
+    override val passthrough: Boolean,
+    override val keyPair: KeyPair?,
+    override val originalCrxBytes: ByteArray?,
+    override val originalCrxZip: ByteArray?,
+) : PreparedCrxIdentity

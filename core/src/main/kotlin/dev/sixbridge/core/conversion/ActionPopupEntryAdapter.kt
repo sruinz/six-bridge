@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.util.Base64
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.io.path.readText
 
@@ -117,7 +118,7 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
                 if (!Files.isRegularFile(bootstrapPath, NOFOLLOW_LINKS)) {
                     throw IllegalStateException("generated bootstrap provenance를 확인할 수 없습니다.")
                 }
-                val originalWorker = parseOriginalWorker(
+                val originalWorker = verifyGeneratedBootstrap(
                     Files.readString(bootstrapPath),
                     module,
                     canonicalWorker,
@@ -167,62 +168,49 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         val adapterImport = JsonPrimitive(
             relativeImport(bootstrapDirectory, BACKGROUND_RELATIVE_PATH),
         ).toString()
-        val source = if (module) {
+        val provenance = bootstrapProvenance(originalWorker, module)
+        val imports = if (module) {
             "import $originalImport;\nimport $adapterImport;\n"
         } else {
             "importScripts($originalImport, $adapterImport);\n"
         }
-        return source.toByteArray(UTF_8)
+        return "$provenance\n$imports".toByteArray(UTF_8)
     }
 
-    private fun parseOriginalWorker(
+    private fun verifyGeneratedBootstrap(
         source: String,
         module: Boolean,
         bootstrapPath: String,
     ): String {
-        val bootstrapDirectory = relativeParent(bootstrapPath)
-        val encodedImports = if (module) {
-            if (!source.startsWith("import ") || !source.endsWith(";\n")) {
-                throw IllegalStateException("generated module bootstrap provenance가 일치하지 않습니다.")
-            }
-            source.removeSuffix(";\n")
-                .split(";\nimport ")
-                .takeIf { it.size == 2 }
-                ?.mapIndexed { index, value ->
-                    if (index == 0) value.removePrefix("import ") else value
-                }
-        } else {
-            val prefix = "importScripts("
-            val suffix = ");\n"
-            if (!source.startsWith(prefix) || !source.endsWith(suffix)) {
-                throw IllegalStateException("generated classic bootstrap provenance가 일치하지 않습니다.")
-            }
-            runCatching {
-                Json.parseToJsonElement(
-                    "[${source.removePrefix(prefix).removeSuffix(suffix)}]",
-                ) as? JsonArray
-            }.getOrNull()
-                ?.takeIf { it.size == 2 }
-                ?.map { it.toString() }
+        val mode = if (module) MODULE_TOKEN else CLASSIC_TOKEN
+        val prefix = "$BOOTSTRAP_PROVENANCE_PREFIX$mode:"
+        val firstLine = source.substringBefore('\n', missingDelimiterValue = "")
+        if (!firstLine.startsWith(prefix)) {
+            throw IllegalStateException("generated bootstrap provenance token이 일치하지 않습니다.")
         }
-            ?: throw IllegalStateException("generated bootstrap import 개수가 일치하지 않습니다.")
-        val imports = encodedImports.map { encoded ->
-            runCatching {
-                (Json.parseToJsonElement(encoded) as? JsonPrimitive)
-                ?.takeIf(JsonPrimitive::isString)
-                ?.content
-            }.getOrNull()
-                ?: throw IllegalStateException("generated bootstrap import를 해석할 수 없습니다.")
+        val encoded = firstLine.removePrefix(prefix)
+        val original = runCatching {
+            Base64.getUrlDecoder().decode(encoded).toString(UTF_8)
+        }.getOrElse {
+            throw IllegalStateException("generated bootstrap provenance token이 손상되었습니다.")
         }
-        val original = resolveGeneratedImport(bootstrapDirectory, imports[0])
-        val adapter = resolveGeneratedImport(bootstrapDirectory, imports[1])
-        if (adapter != BACKGROUND_RELATIVE_PATH ||
+        if (bootstrapProvenance(original, module) != firstLine ||
             generatedBootstrapPath(original) != bootstrapPath ||
             !bootstrapBytes(original, module).contentEquals(source.toByteArray(UTF_8))
         ) {
             throw IllegalStateException("generated bootstrap provenance가 일치하지 않습니다.")
         }
         return original
+    }
+
+    private fun bootstrapProvenance(
+        originalWorker: String,
+        module: Boolean,
+    ): String {
+        val mode = if (module) MODULE_TOKEN else CLASSIC_TOKEN
+        val encoded = Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(originalWorker.toByteArray(UTF_8))
+        return "$BOOTSTRAP_PROVENANCE_PREFIX$mode:$encoded"
     }
 
     private fun generatedBootstrapPath(originalWorker: String): String {
@@ -245,25 +233,6 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
             .normalize()
             .invariantSeparatorsPathString
         return if (relative.startsWith("../")) relative else "./$relative"
-    }
-
-    private fun resolveGeneratedImport(baseDirectory: String, importPath: String): String {
-        if (!ActionPopupEntrySafety.isSafeUrlPath(importPath) ||
-            importPath.startsWith("/")
-        ) {
-            throw IllegalStateException("generated bootstrap import 경로가 안전하지 않습니다.")
-        }
-        val base = Path.of(baseDirectory.ifEmpty { "." })
-        val resolved = base.resolve(importPath)
-            .normalize()
-            .invariantSeparatorsPathString
-        if (resolved == ".." || resolved.startsWith("../")) {
-            throw IllegalStateException("generated bootstrap import가 확장 루트를 벗어납니다.")
-        }
-        if (relativeImport(baseDirectory, resolved) != importPath) {
-            throw IllegalStateException("generated bootstrap import가 canonical하지 않습니다.")
-        }
-        return resolved.removePrefix("./")
     }
 
     private fun generatedBackgroundBytes(popupPath: String): ByteArray {
@@ -359,6 +328,10 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         const val CONTENT_RESOURCE_PATH = "dev/sixbridge/adapters/$CONTENT_FILE_NAME"
         const val BACKGROUND_RESOURCE_PATH = "dev/sixbridge/adapters/$BACKGROUND_FILE_NAME"
         const val POPUP_PLACEHOLDER = "__SIXBRIDGE_POPUP_PATH_JSON__"
+        const val BOOTSTRAP_PROVENANCE_PREFIX =
+            "// SIXBRIDGE-ACTION-POPUP-ENTRY-V1:"
+        const val MODULE_TOKEN = "module"
+        const val CLASSIC_TOKEN = "classic"
     }
 }
 

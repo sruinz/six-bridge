@@ -25,6 +25,33 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.jvm.JvmSynthetic
+
+internal sealed interface VerifiedCrxPayload {
+    @get:JvmSynthetic
+    val bytes: ByteArray
+}
+
+private class WorkspaceVerifiedCrxPayload(
+    bytes: ByteArray,
+) : VerifiedCrxPayload {
+    private val stableBytes = bytes.copyOf()
+
+    override val bytes: ByteArray
+        get() = stableBytes.copyOf()
+}
+
+internal sealed interface VerifiedAdapterApplication {
+    @get:JvmSynthetic
+    val decisions: List<AdapterDecision>
+}
+
+private class WorkspaceVerifiedAdapterApplication(
+    decisions: List<AdapterDecision>,
+) : VerifiedAdapterApplication {
+    override val decisions: List<AdapterDecision> =
+        decisions.map { it.copy() }
+}
 
 class ConversionWorkspace : AutoCloseable {
     private val rootOwner = OwnedTempTree.create("sixbridge-conversion-")
@@ -163,6 +190,91 @@ class ConversionWorkspace : AutoCloseable {
             throw error
         } catch (_: Throwable) {
             throw ConversionExecutionException()
+        }
+    }
+
+    @Synchronized
+    @JvmSynthetic
+    internal fun verifyApplied(
+        snapshot: ExtensionSnapshot,
+        profile: BrowserProfile,
+        plan: ConversionPlan,
+        applied: List<AdapterDecision>,
+        expectedArchive: ByteArray,
+    ): VerifiedAdapterApplication {
+        requireOpen()
+        check(ownedSnapshots.containsKey(snapshot)) {
+            "이 ConversionWorkspace가 발급한 snapshot이 아닙니다."
+        }
+        verifyPlan(snapshot, profile, plan)
+        check(
+            applied.size == plan.selectedAdapters.size &&
+                applied.map { it.id to it.version } ==
+                plan.selectedAdapters.map { it.id to it.version } &&
+                applied.all(AdapterDecision::applied),
+        ) {
+            "adapter 실행 proof가 완전하지 않습니다."
+        }
+        val first = ExtensionZip.createBytes(
+            snapshot.workingRoot,
+            includeProjectMarker = true,
+        )
+        val second = ExtensionZip.createBytes(
+            snapshot.workingRoot,
+            includeProjectMarker = true,
+        )
+        check(
+            expectedArchive.contentEquals(first) &&
+                first.contentEquals(second),
+        ) {
+            "adapter 실행 결과를 canonical source와 함께 봉인하지 못했습니다."
+        }
+        return WorkspaceVerifiedAdapterApplication(applied)
+    }
+
+    @Synchronized
+    @JvmSynthetic
+    internal fun sealArchive(
+        snapshot: ExtensionSnapshot,
+        publicKey: ByteArray?,
+        includeProjectMarker: Boolean,
+        expectedArchive: ByteArray,
+    ): VerifiedCrxPayload {
+        requireOpen()
+        check(ownedSnapshots.containsKey(snapshot)) {
+            "이 ConversionWorkspace가 발급한 snapshot이 아닙니다."
+        }
+        val record = Ownership.record(snapshot.workingRoot)
+        return record.lock.withLock {
+            Ownership.verifyOriginalLocked(record)
+            val before = Ownership.captureWorkingTreeLocked(
+                snapshot.workingRoot,
+                record,
+            )
+            val first = ExtensionZip.createBytes(
+                snapshot.workingRoot,
+                publicKey,
+                includeProjectMarker,
+            )
+            check(expectedArchive.contentEquals(first)) {
+                "검증된 canonical archive와 현재 workspace가 다릅니다."
+            }
+            val second = ExtensionZip.createBytes(
+                snapshot.workingRoot,
+                publicKey,
+                includeProjectMarker,
+            )
+            val after = Ownership.captureWorkingTreeLocked(
+                snapshot.workingRoot,
+                record,
+            )
+            check(
+                first.contentEquals(second) &&
+                    before.state == after.state,
+            ) {
+                "canonical archive sealing 중 workspace가 변경되었습니다."
+            }
+            WorkspaceVerifiedCrxPayload(first)
         }
     }
 
