@@ -75,8 +75,13 @@ async function createHarness({ selection = "selected", rangeKey = "range-1" } = 
     flushFrame() {
       frames.shift()?.();
     },
-    flushFrames() {
-      while (frames.length) frames.shift()();
+    flushFrames(limit = 100) {
+      let count = 0;
+      while (frames.length) {
+        assert.ok(count < limit, "requestAnimationFrame loop");
+        frames.shift()();
+        count += 1;
+      }
     },
     setSelection(value, nextRangeKey = rangeKey) {
       currentSelection = value;
@@ -135,6 +140,17 @@ test("selection must remain stable across two animation frames", async () => {
   assert.equal(harness.dispatched.length, 0);
 });
 
+test("independent fingerprints do not treat Aa and BB as the same selection", async () => {
+  const harness = await createHarness({ selection: "Aa" });
+  harness.emit("pointerdown", { clientX: 1, clientY: 2 });
+  harness.emit("pointerup", { clientX: 1, clientY: 2 });
+  harness.flushFrame();
+  harness.setSelection("BB");
+  harness.flushFrames();
+
+  assert.equal(harness.dispatched.length, 0);
+});
+
 test("empty selection and actual mouseup suppress synthetic delivery", async () => {
   const empty = await createHarness({ selection: "" });
   empty.emit("pointerdown", { clientX: 1, clientY: 2 });
@@ -173,6 +189,36 @@ test("synthetic mouseup cannot loop when a handler changes selection", async () 
   harness.flushFrames();
 
   assert.equal(harness.dispatched.length, 1);
+});
+
+test("empty selectionchange does not reset the current gesture delivery cap", async () => {
+  const harness = await createHarness();
+  harness.setSyntheticMouseupHandler(() => {
+    harness.setSelection("");
+    harness.emit("selectionchange");
+  });
+  harness.emit("pointerdown", { clientX: 1, clientY: 2 });
+  harness.emit("pointerup", { clientX: 1, clientY: 2 });
+  harness.flushFrames();
+  harness.setSelection("selected");
+  harness.emit("selectionchange");
+  harness.flushFrames();
+
+  assert.equal(harness.dispatched.length, 1);
+});
+
+test("empty pointerup can later deliver one stable selection with its last coordinates", async () => {
+  const harness = await createHarness({ selection: "" });
+  harness.emit("pointerdown", { clientX: 23, clientY: 29 });
+  harness.emit("pointerup", { clientX: 23, clientY: 29 });
+  harness.flushFrames();
+  harness.setSelection("selected");
+  harness.emit("selectionchange");
+  harness.flushFrames();
+
+  assert.equal(harness.dispatched.length, 1);
+  assert.equal(harness.dispatched[0].clientX, 23);
+  assert.equal(harness.dispatched[0].clientY, 29);
 });
 
 test("shim keeps no raw selection text or live Range in persistent state", async () => {

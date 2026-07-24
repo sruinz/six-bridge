@@ -201,6 +201,29 @@ class DesktopSelectionEventBridgeTest {
     }
 
     @Test
+    fun `canonicalizes generated shim aliases in the target block`() {
+        val source = extension(
+            content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+        )
+        val decision = automaticDecision(source)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
+              {"matches":["<all_urls>"],"js":["content.js","./_sixbridge/desktop-selection-event-bridge.v1.js","/_sixbridge/desktop-selection-event-bridge.v1.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
+              {"matches":["<all_urls>"],"js":["unrelated.js"]}
+            ]}""",
+        )
+        writeGeneratedAsset(source)
+
+        DesktopSelectionEventBridge().apply(source, decision)
+
+        val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
+        assertEquals(
+            listOf("_sixbridge/desktop-selection-event-bridge.v1.js", "content.js"),
+            scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
+        )
+    }
+
+    @Test
     fun `rejects a conflicting generated asset without changing manifest or asset`() {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
@@ -219,6 +242,25 @@ class DesktopSelectionEventBridgeTest {
         assertContentEquals(assetBefore, asset.readBytes())
     }
 
+    @Test
+    fun `rejects a generated asset parent file before changing the manifest`() {
+        val source = extension(
+            content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+        )
+        val manifestBefore = source.resolve("manifest.json").readBytes()
+        val parent = source.resolve("_sixbridge")
+        parent.writeText("not a directory")
+        val parentBefore = parent.readBytes()
+
+        val error = runCatching {
+            DesktopSelectionEventBridge().apply(source, automaticDecision(source))
+        }.exceptionOrNull()
+
+        assertContentEquals(manifestBefore, source.resolve("manifest.json").readBytes())
+        assertContentEquals(parentBefore, parent.readBytes())
+        assertTrue(error is IllegalStateException)
+    }
+
     private fun automaticDecision(source: Path): AdapterDecision {
         val decision = MobilePatternAnalyzer().analyze(source, profile)
             .adapterDecisions.singleOrNull()
@@ -229,6 +271,18 @@ class DesktopSelectionEventBridgeTest {
 
     private fun scriptPaths(block: JsonObject): List<String> =
         (block["js"] as JsonArray).map { (it as JsonPrimitive).content }
+
+    private fun writeGeneratedAsset(root: Path) {
+        val asset = root.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        Files.createDirectories(asset.parent)
+        asset.writeBytes(
+            requireNotNull(
+                javaClass.classLoader.getResourceAsStream(
+                    "dev/sixbridge/adapters/desktop-selection-event-bridge.v1.js",
+                ),
+            ).use { it.readBytes() },
+        )
+    }
 
     private fun extension(
         name: String = "Unrelated extension name",

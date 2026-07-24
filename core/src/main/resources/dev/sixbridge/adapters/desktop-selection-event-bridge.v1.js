@@ -11,11 +11,14 @@
   let dispatching = false;
 
   const fingerprint = (value) => {
-    let result = value.length;
+    let first = 2166136261;
+    let second = 2246822519;
     for (let index = 0; index < value.length; index += 1) {
-      result = ((result * 31) + value.charCodeAt(index)) | 0;
+      const code = value.charCodeAt(index);
+      first = Math.imul(first ^ code, 16777619) >>> 0;
+      second = Math.imul(second ^ (code + index), 3266489917) >>> 0;
     }
-    return result;
+    return { length: value.length, first, second };
   };
 
   const nodeId = (node) => {
@@ -36,8 +39,11 @@
     const range = selection.getRangeAt(0);
     if (!range?.startContainer?.isConnected || !range.endContainer?.isConnected) return null;
     const rect = range.getBoundingClientRect();
+    const mark = fingerprint(value);
     return {
-      fingerprint: fingerprint(value),
+      length: mark.length,
+      first: mark.first,
+      second: mark.second,
       startNode: nodeId(range.startContainer),
       startOffset: range.startOffset,
       endNode: nodeId(range.endContainer),
@@ -49,7 +55,9 @@
 
   const sameSelection = (first, second) =>
     first && second &&
-    first.fingerprint === second.fingerprint &&
+    first.length === second.length &&
+    first.first === second.first &&
+    first.second === second.second &&
     first.startNode === second.startNode &&
     first.startOffset === second.startOffset &&
     first.endNode === second.endNode &&
@@ -105,11 +113,8 @@
   };
 
   const selectionSignal = () => {
-    if (!selectionSnapshot()) {
-      beginGesture();
-      return;
-    }
     generation += 1;
+    if (!selectionSnapshot()) return;
     queueStableCheck();
   };
 
@@ -134,7 +139,7 @@
     if (syntheticEvents.has(event) || !event.isTrusted) return;
     const selection = selectionSnapshot();
     if (!selection) {
-      beginGesture();
+      generation += 1;
       return;
     }
     actualMouseup = { gesture, selection };
