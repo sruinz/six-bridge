@@ -2,14 +2,18 @@ package dev.sixbridge.core.crx
 
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.SecureDirectoryStream
 import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.BasicFileAttributeView
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.KeyFactory
@@ -25,10 +29,18 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.jvm.JvmSynthetic
 
-class ExtensionKeyManager(
+class ExtensionKeyManager private constructor(
     keyRoot: Path,
+    trustedRoot: Path,
 ) {
+    constructor(keyRoot: Path) : this(
+        keyRoot,
+        requireNotNull(keyRoot.toAbsolutePath().normalize().parent),
+    )
+
     private val keyRoot = keyRoot.toAbsolutePath().normalize()
+    private val trustedRoot = trustedRoot.toAbsolutePath().normalize()
+    private val activeGuard = ThreadLocal<RootGuard?>()
 
     fun getOrCreateStoreConversionKey(
         originalExtensionId: String,
@@ -75,23 +87,25 @@ class ExtensionKeyManager(
                 publish(extensionId, it)
             }?.let { return@withRegistryLock it }
 
-            Files.newDirectoryStream(keyRoot, "*.identity").use { entries ->
-                entries.forEach { identityPath ->
-                    requireSafeRegular(identityPath)
-                    val identity = readStable(identityPath).toString(Charsets.UTF_8)
-                    val expectedName = "${canonicalBase(identity)}.identity"
-                    require(identityPath.fileName.toString() == expectedName) {
-                        "CRX key identity metadata 이름과 내용이 일치하지 않습니다."
-                    }
-                    val pair = loadCanonical(identity)
-                        ?: throw IllegalStateException(
-                            "CRX key identity metadata에 대응하는 key pair가 없습니다.",
-                        )
-                    if (Crx3.extensionId(pair.public.encoded) == extensionId) {
-                        return@withRegistryLock pair
-                    }
+            val guard = requireNotNull(activeGuard.get())
+            verifyRootGuard(guard)
+            for (identityPath in guard.handle) {
+                if (!identityPath.fileName.toString().endsWith(".identity")) continue
+                requireSafeRegular(identityPath)
+                val identity = readStable(identityPath).toString(Charsets.UTF_8)
+                val expectedName = "${canonicalBase(identity)}.identity"
+                require(identityPath.fileName.toString() == expectedName) {
+                    "CRX key identity metadata 이름과 내용이 일치하지 않습니다."
+                }
+                val pair = loadCanonical(identity)
+                    ?: throw IllegalStateException(
+                        "CRX key identity metadata에 대응하는 key pair가 없습니다.",
+                    )
+                if (Crx3.extensionId(pair.public.encoded) == extensionId) {
+                    return@withRegistryLock pair
                 }
             }
+            verifyRootGuard(guard)
             null
         }
     }
@@ -171,6 +185,7 @@ class ExtensionKeyManager(
             writeOwnerOnly(identityTemp, identity.toByteArray(Charsets.UTF_8))
             atomicPublish(privateTemp, files.privateKey)
             atomicPublish(publicTemp, files.publicKey)
+            forceDirectory()
             ExtensionKeyManagerFaultInjection.afterPairPublish()
             atomicPublish(identityTemp, files.identity)
             forceDirectory()
@@ -178,7 +193,7 @@ class ExtensionKeyManager(
             temps.forEach { temp ->
                 if (existsNoFollow(temp)) {
                     requireSafeRegular(temp)
-                    Files.delete(temp)
+                    deleteAnchored(temp)
                 }
             }
         }
@@ -188,7 +203,7 @@ class ExtensionKeyManager(
         listOf(files.privateKey, files.publicKey).forEach { path ->
             if (existsNoFollow(path)) {
                 requireSafeRegular(path)
-                Files.delete(path)
+                deleteAnchored(path)
             }
         }
         forceDirectory()
@@ -231,39 +246,73 @@ class ExtensionKeyManager(
         }
         return processLock.withLock {
             validateRoot()
-            val lockPath = keyRoot.resolve(REGISTRY_LOCK)
-            if (!existsNoFollow(lockPath)) {
+            secureRoot().use { rootHandle ->
+                val rootKey = requireNotNull(readAttributes(rootHandle).fileKey())
+                val guard = RootGuard(rootHandle, rootKey)
+                activeGuard.set(guard)
                 try {
-                    Files.createFile(
-                        lockPath,
-                        PosixFilePermissions.asFileAttribute(FILE_PERMISSIONS),
+                    verifyRootGuard(guard)
+                    val lockName = Path.of(REGISTRY_LOCK)
+                    if (readAttributesOrNull(rootHandle, lockName) == null) {
+                        try {
+                            rootHandle.newByteChannel(
+                                lockName,
+                                setOf(CREATE_NEW, WRITE, NOFOLLOW_LINKS),
+                            ).use { }
+                            setOwnerOnly(rootHandle, lockName)
+                        } catch (_: FileAlreadyExistsException) {
+                            // 다른 프로세스가 먼저 생성했으므로 아래에서 다시 검증한다.
+                        }
+                    }
+                    requireSafeRegular(keyRoot.resolve(REGISTRY_LOCK))
+                    val channel = rootHandle.newByteChannel(
+                        lockName,
+                        setOf(WRITE, NOFOLLOW_LINKS),
+                    ) as? FileChannel ?: throw IllegalStateException(
+                        "CRX key registry lock을 FileChannel로 열 수 없습니다.",
                     )
-                } catch (_: FileAlreadyExistsException) {
-                    // 다른 프로세스가 먼저 생성했으므로 아래에서 안전성을 다시 검증한다.
-                }
-            }
-            requireSafeRegular(lockPath)
-            FileChannel.open(lockPath, WRITE, NOFOLLOW_LINKS).use { channel ->
-                channel.lock().use {
-                    validateRoot()
-                    block()
+                    channel.use {
+                        it.lock().use {
+                            ExtensionKeyManagerFaultInjection.afterRootLock()
+                            verifyRootGuard(guard)
+                            block().also { verifyRootGuard(guard) }
+                        }
+                    }
+                } finally {
+                    activeGuard.remove()
                 }
             }
         }
     }
 
     private fun ensureRoot() {
-        val parent = keyRoot.parent
-            ?: throw IllegalArgumentException("CRX key root에는 부모 디렉터리가 필요합니다.")
-        Files.createDirectories(parent)
-        if (!existsNoFollow(keyRoot)) {
-            try {
-                Files.createDirectory(
-                    keyRoot,
-                    PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS),
-                )
-            } catch (_: FileAlreadyExistsException) {
-                // 경쟁 생성은 validateRoot에서 검사한다.
+        require(keyRoot.startsWith(trustedRoot) && keyRoot != trustedRoot) {
+            "CRX key root는 trusted root 내부여야 합니다."
+        }
+        require(
+            Files.isDirectory(trustedRoot, NOFOLLOW_LINKS) &&
+                !Files.isSymbolicLink(trustedRoot),
+        ) {
+            "trusted local root는 symlink가 아닌 디렉터리여야 합니다."
+        }
+        var current = trustedRoot
+        trustedRoot.relativize(keyRoot).forEach { component ->
+            current = current.resolve(component.toString())
+            if (!Files.exists(current, NOFOLLOW_LINKS)) {
+                try {
+                    Files.createDirectory(
+                        current,
+                        PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS),
+                    )
+                } catch (_: FileAlreadyExistsException) {
+                    // 경쟁 생성은 다음 검사에서 확인한다.
+                }
+            }
+            require(
+                Files.isDirectory(current, NOFOLLOW_LINKS) &&
+                    !Files.isSymbolicLink(current),
+            ) {
+                "CRX key root ancestor는 symlink가 아닌 디렉터리여야 합니다: $current"
             }
         }
         validateRoot()
@@ -283,18 +332,20 @@ class ExtensionKeyManager(
     }
 
     private fun requireSafeRegular(path: Path) {
+        activeGuard.get()?.let(::verifyRootGuard)
         require(!Files.isSymbolicLink(path) && Files.isRegularFile(path, NOFOLLOW_LINKS)) {
             "CRX key 파일은 symlink가 아닌 일반 파일이어야 합니다: $path"
         }
         require(Files.getPosixFilePermissions(path, NOFOLLOW_LINKS) == FILE_PERMISSIONS) {
             "CRX key 파일은 owner-only 권한이어야 합니다: $path"
         }
-        val links = runCatching {
+        val links = ExtensionKeyManagerFaultInjection.unixLinkCount(path) {
             (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number).toLong()
-        }.getOrNull()
-        require(links == null || links == 1L) {
+        }
+        require(links == 1L) {
             "CRX key 파일의 hard link는 허용되지 않습니다: $path"
         }
+        activeGuard.get()?.let(::verifyRootGuard)
     }
 
     private fun readStable(path: Path): ByteArray {
@@ -304,7 +355,11 @@ class ExtensionKeyManager(
             java.nio.file.attribute.BasicFileAttributes::class.java,
             NOFOLLOW_LINKS,
         )
-        val bytes = FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+        val guard = requireNotNull(activeGuard.get())
+        val bytes = guard.handle.newByteChannel(
+            relativeName(path),
+            setOf(READ, NOFOLLOW_LINKS),
+        ).use { channel ->
             require(channel.size() <= MAX_KEY_FILE_BYTES) {
                 "CRX key 파일이 비정상적으로 큽니다: $path"
             }
@@ -334,34 +389,39 @@ class ExtensionKeyManager(
     }
 
     private fun writeOwnerOnly(path: Path, bytes: ByteArray) {
-        Files.createFile(
-            path,
-            PosixFilePermissions.asFileAttribute(FILE_PERMISSIONS),
-        )
-        FileChannel.open(path, WRITE, NOFOLLOW_LINKS).use { channel ->
+        val guard = requireNotNull(activeGuard.get())
+        verifyRootGuard(guard)
+        guard.handle.newByteChannel(
+            relativeName(path),
+            setOf(CREATE_NEW, WRITE, NOFOLLOW_LINKS),
+        ).use { channel ->
             val buffer = ByteBuffer.wrap(bytes)
             while (buffer.hasRemaining()) channel.write(buffer)
-            channel.force(true)
+            (channel as? FileChannel)?.force(true)
+                ?: throw IllegalStateException("CRX key 파일을 fsync할 수 없습니다.")
         }
+        setOwnerOnly(guard.handle, relativeName(path))
         requireSafeRegular(path)
     }
 
     private fun atomicPublish(source: Path, target: Path) {
-        try {
-            Files.move(source, target, ATOMIC_MOVE)
-        } catch (error: AtomicMoveNotSupportedException) {
-            throw IllegalStateException(
-                "CRX key를 원자적으로 publish할 수 없는 파일 시스템입니다.",
-                error,
-            )
-        }
+        val guard = requireNotNull(activeGuard.get())
+        verifyRootGuard(guard)
+        guard.handle.move(
+            relativeName(source),
+            guard.handle,
+            relativeName(target),
+        )
+        verifyRootGuard(guard)
         requireSafeRegular(target)
     }
 
     private fun forceDirectory() {
-        runCatching {
-            FileChannel.open(keyRoot, READ).use { it.force(true) }
-        }
+        val guard = requireNotNull(activeGuard.get())
+        verifyRootGuard(guard)
+        ExtensionKeyManagerFaultInjection.beforeDirectoryFsync()
+        FileChannel.open(keyRoot, READ, NOFOLLOW_LINKS).use { it.force(true) }
+        verifyRootGuard(guard)
     }
 
     private fun files(identity: String): KeyFiles {
@@ -399,8 +459,93 @@ class ExtensionKeyManager(
         }
     }
 
-    private fun existsNoFollow(path: Path): Boolean =
-        Files.exists(path, NOFOLLOW_LINKS)
+    private fun existsNoFollow(path: Path): Boolean {
+        activeGuard.get()?.let(::verifyRootGuard)
+        val exists = Files.exists(path, NOFOLLOW_LINKS)
+        activeGuard.get()?.let(::verifyRootGuard)
+        return exists
+    }
+
+    private fun secureRoot(): SecureDirectoryStream<Path> {
+        val stream = Files.newDirectoryStream(keyRoot)
+        if (stream !is SecureDirectoryStream<Path>) {
+            stream.close()
+            throw IllegalStateException(
+                "CRX key 저장소가 secure directory stream을 지원하지 않습니다.",
+            )
+        }
+        return stream
+    }
+
+    private fun verifyRootGuard(guard: RootGuard) {
+        val pathAttributes = Files.readAttributes(
+            keyRoot,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        val handleAttributes = readAttributes(guard.handle)
+        require(
+            pathAttributes.isDirectory &&
+                !pathAttributes.isSymbolicLink &&
+                pathAttributes.fileKey() == guard.fileKey &&
+                handleAttributes.fileKey() == guard.fileKey,
+        ) {
+            "CRX key root identity가 lock 생명주기 중 변경되었습니다."
+        }
+    }
+
+    private fun readAttributes(
+        handle: SecureDirectoryStream<Path>,
+    ): BasicFileAttributes = requireNotNull(
+        handle.getFileAttributeView(BasicFileAttributeView::class.java),
+    ).readAttributes()
+
+    private fun readAttributesOrNull(
+        handle: SecureDirectoryStream<Path>,
+        name: Path,
+    ): BasicFileAttributes? = try {
+        requireNotNull(
+            handle.getFileAttributeView(
+                name,
+                BasicFileAttributeView::class.java,
+                NOFOLLOW_LINKS,
+            ),
+        ).readAttributes()
+    } catch (_: NoSuchFileException) {
+        null
+    }
+
+    private fun setOwnerOnly(
+        handle: SecureDirectoryStream<Path>,
+        name: Path,
+    ) {
+        val view = requireNotNull(
+            handle.getFileAttributeView(
+                name,
+                PosixFileAttributeView::class.java,
+                NOFOLLOW_LINKS,
+            ),
+        )
+        view.setPermissions(FILE_PERMISSIONS)
+        require(view.readAttributes().permissions() == FILE_PERMISSIONS) {
+            "CRX key 파일 owner-only 권한을 확인할 수 없습니다."
+        }
+    }
+
+    private fun deleteAnchored(path: Path) {
+        val guard = requireNotNull(activeGuard.get())
+        verifyRootGuard(guard)
+        guard.handle.deleteFile(relativeName(path))
+        verifyRootGuard(guard)
+    }
+
+    private fun relativeName(path: Path): Path {
+        val normalized = path.toAbsolutePath().normalize()
+        require(normalized.parent == keyRoot) {
+            "CRX key 파일은 key root의 직접 자식이어야 합니다."
+        }
+        return Path.of(normalized.fileName.toString())
+    }
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256")
@@ -414,7 +559,18 @@ class ExtensionKeyManager(
         val publicKey: Path,
     )
 
+    private data class RootGuard(
+        val handle: SecureDirectoryStream<Path>,
+        val fileKey: Any,
+    )
+
     companion object {
+        @JvmSynthetic
+        internal fun create(
+            trustedRoot: Path,
+            keyRoot: Path,
+        ): ExtensionKeyManager = ExtensionKeyManager(keyRoot, trustedRoot)
+
         fun storeConversionIdentity(
             originalExtensionId: String,
             profileMajorVersion: Int,
@@ -449,6 +605,9 @@ class ExtensionKeyManager(
 
 internal object ExtensionKeyManagerFaultInjection {
     private val afterPairPublish = ThreadLocal<(() -> Unit)?>()
+    private val afterRootLock = ThreadLocal<(() -> Unit)?>()
+    private val directoryFsync = ThreadLocal<(() -> Unit)?>()
+    private val failNlink = ThreadLocal<Boolean?>()
 
     @JvmSynthetic
     fun <T> failAfterPairPublish(block: () -> T): T {
@@ -466,5 +625,62 @@ internal object ExtensionKeyManagerFaultInjection {
     @JvmSynthetic
     fun afterPairPublish() {
         afterPairPublish.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> replaceRootAfterLock(
+        action: () -> Unit,
+        block: () -> T,
+    ): T {
+        check(afterRootLock.get() == null)
+        afterRootLock.set(action)
+        return try {
+            block()
+        } finally {
+            afterRootLock.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun afterRootLock() {
+        afterRootLock.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> failNextDirectoryFsync(block: () -> T): T {
+        check(directoryFsync.get() == null)
+        directoryFsync.set {
+            directoryFsync.remove()
+            throw IllegalStateException("injected directory fsync failure")
+        }
+        return try {
+            block()
+        } finally {
+            directoryFsync.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun beforeDirectoryFsync() {
+        directoryFsync.get()?.invoke()
+    }
+
+    @JvmSynthetic
+    fun <T> failUnixLinkCount(block: () -> T): T {
+        check(failNlink.get() == null)
+        failNlink.set(true)
+        return try {
+            block()
+        } finally {
+            failNlink.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun unixLinkCount(path: Path, read: () -> Long): Long {
+        if (failNlink.get() == true) {
+            throw IllegalStateException("injected unix:nlink unsupported: $path")
+        }
+        return read()
     }
 }

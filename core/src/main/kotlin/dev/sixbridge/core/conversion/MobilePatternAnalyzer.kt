@@ -172,6 +172,12 @@ class MobilePatternAnalyzer(
             }
         }
         val unavailable = unavailableLimitations.isNotEmpty()
+        val applied = !unavailable &&
+            ActionPopupEntryAdapter().isExactlyApplied(
+                manifestPath.parent,
+                manifest,
+                popup,
+            )
         return AdapterDecision(
             id = ACTION_POPUP_ENTRY,
             version = 1,
@@ -181,7 +187,7 @@ class MobilePatternAnalyzer(
             } else {
                 AdapterDisposition.REQUIRES_APPROVAL
             },
-            applied = false,
+            applied = applied,
             evidence = listOf(
                 SourceEvidence(
                     relativePath = "manifest.json",

@@ -114,6 +114,7 @@ class ConversionPipeline private constructor(
                 publicKey = requireNotNull(identity.keyPair).public.encoded,
                 includeProjectMarker = false,
                 expectedArchive = sourceZip,
+                applicationProof = applicationProof,
             )
         }
         val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
@@ -249,19 +250,23 @@ class ConversionPipeline private constructor(
         val reapplied = rawAfter.adapterDecisions
             .associateBy { it.id to it.version }
         val decisions = applied.map { decision ->
-            reapplied[decision.id to decision.version]?.let { current ->
-                if (current.applied ||
+            val current = reapplied[decision.id to decision.version]
+            if (current != null) {
+                if (!current.applied ||
                     current.risk != decision.risk ||
                     current.disposition != decision.disposition ||
                     current.changes != decision.changes ||
                     current.remainingLimitations != decision.remainingLimitations
                 ) {
                     throw ConversionValidationException(
-                        "변환본 재분석의 adapter 근거가 원본 계획과 다릅니다: ${decision.id}",
+                        "변환본 재분석의 adapter 근거가 원본 계획과 다릅니다: " +
+                            "${decision.id}; raw=$current; proof=$decision",
                     )
                 }
+                current
+            } else {
+                decision
             }
-            decision
         }.sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
         return rawAfter.copy(
             conversionState = ConversionState.CONVERTED,
@@ -287,29 +292,19 @@ class ConversionPipeline private constructor(
         ) {
             throw CrxSourceBindingException()
         }
-        val (canonical, publicKey) =
+        val publicKey = parsed.publicKey
+        val canonical =
             StableExtensionAnalysis.fromArchive(parsed.zipBytes).use { stable ->
-                val manifest = Json.parseToJsonElement(
-                    stable.root.resolve("manifest.json").readText(),
-                ) as? JsonObject ?: throw CrxSourceBindingException()
-                val manifestKey = (manifest["key"] as? JsonPrimitive)
-                    ?.takeIf { it.isString }
-                    ?.content
-                    ?: throw CrxSourceBindingException()
-                val key = runCatching {
-                    Base64.getDecoder().decode(manifestKey)
-                }.getOrElse {
-                    throw CrxSourceBindingException()
-                }
-                ExtensionZip.createBytes(
+                ExtensionZip.createCanonicalManifestBytes(
                     stable.root,
+                    publicKey,
                     includeProjectMarker = true,
-                ) to key
+                )
             }
         if (Crx3.extensionId(publicKey) != parsed.extensionId) {
             throw CrxSourceBindingException()
         }
-        val expected = ExtensionZip.createBytes(
+        val expected = ExtensionZip.createCanonicalManifestBytes(
             snapshot.originalRoot,
             publicKey,
             includeProjectMarker = true,
@@ -338,8 +333,8 @@ class ConversionPipeline private constructor(
 
 class ConversionPipelineResult private constructor(
     sourceZip: ByteArray,
-    val compatibilityBefore: CompatibilityReport,
-    val compatibilityAfter: CompatibilityReport,
+    compatibilityBefore: CompatibilityReport,
+    compatibilityAfter: CompatibilityReport,
     val planSha256: String,
     val reportSha256: String,
     val extensionId: String,
@@ -353,6 +348,10 @@ class ConversionPipelineResult private constructor(
 ) {
     private val stableSourceZip = sourceZip.copyOf()
     private val stableCrxBytes = crxBytes.copyOf()
+    val compatibilityBefore: CompatibilityReport =
+        compatibilityBefore.deepImmutableCopy()
+    val compatibilityAfter: CompatibilityReport =
+        compatibilityAfter.deepImmutableCopy()
 
     val sourceZip: ByteArray
         get() = stableSourceZip.copyOf()
@@ -460,7 +459,10 @@ internal class CrxIdentityPolicy private constructor(
                 originalParsed.extensionId,
                 profileMajorVersion,
             )
-            val keyManager = ExtensionKeyManager(localRoot.resolve("keystore/crx"))
+            val keyManager = ExtensionKeyManager.create(
+                requireNotNull(localRoot.parent),
+                localRoot.resolve("keystore/crx"),
+            )
             val key = keyManager.getOrCreateStoreConversionKey(
                 originalParsed.extensionId,
                 profileMajorVersion,
@@ -478,7 +480,10 @@ internal class CrxIdentityPolicy private constructor(
             )
         }
 
-        val keyManager = ExtensionKeyManager(localRoot.resolve("keystore/crx"))
+        val keyManager = ExtensionKeyManager.create(
+            requireNotNull(localRoot.parent),
+            localRoot.resolve("keystore/crx"),
+        )
         val identityStore = SourceProjectIdentityStore(
             localRoot.resolve("source-identities"),
         )

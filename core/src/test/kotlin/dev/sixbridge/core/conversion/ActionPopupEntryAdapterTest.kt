@@ -346,6 +346,27 @@ class ActionPopupEntryAdapterTest {
     }
 
     @Test
+    fun `analyzer marks only exact generated action assets and wiring as applied`() {
+        val source = extension(
+            worker = "scripts/background.js",
+            workerType = "module",
+        )
+        applyApproved(source)
+
+        val applied = MobilePatternAnalyzer().analyze(source, profile)
+            .adapterDecisions
+            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
+        assertTrue(applied.applied)
+
+        source.resolve("_sixbridge/action-popup-entry-background.v1.js")
+            .writeText("tampered generated asset")
+        val tampered = MobilePatternAnalyzer().analyze(source, profile)
+            .adapterDecisions
+            .single { it.id == MobilePatternAnalyzer.ACTION_POPUP_ENTRY }
+        assertFalse(tampered.applied)
+    }
+
+    @Test
     fun `rejects encoded and URL-like popup and worker paths`() {
         val unsafeSegments = listOf(
             "%2e%2e/popup.html",

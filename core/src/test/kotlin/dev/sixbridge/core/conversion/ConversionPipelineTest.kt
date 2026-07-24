@@ -11,6 +11,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 import java.security.KeyPairGenerator
 import java.util.Base64
 import kotlin.io.path.readText
@@ -181,6 +182,126 @@ class ConversionPipelineTest {
 
         assertContentEquals(packed.bytes, result.crxBytes)
         assertEquals(packed.extensionId, result.extensionId)
+    }
+
+    @Test
+    fun `external CRX binding canonicalizes manifest formatting and key order on both roots`() {
+        val localRoot = Files.createTempDirectory("six-pipeline-external-format")
+        val packedSource = Files.createTempDirectory("six-pipeline-packed-format").also {
+            it.resolve("manifest.json").writeText(
+                """{"version":"1","name":"External","manifest_version":3}""",
+            )
+            it.resolve("worker.js").writeText("console.log('same');")
+        }
+        val providedSource = Files.createTempDirectory("six-pipeline-provided-format").also {
+            it.resolve("manifest.json").writeText(
+                """
+                {
+                  "manifest_version": 3,
+                  "name": "External",
+                  "version": "1"
+                }
+                """.trimIndent(),
+            )
+            it.resolve("worker.js").writeText("console.log('same');")
+        }
+        val packed = Crx3.pack(packedSource, keyPair())
+        val resolved = ResolvedExtensionInput(
+            kind = ExtensionInputKind.CRX3,
+            originalInput = "external-format.crx",
+            sourceRoot = providedSource,
+            crxBytes = packed.bytes,
+            expectedExtensionId = packed.extensionId,
+        )
+
+        val result = ConversionPipeline(localRoot).use {
+            it.prepare(resolved, profile(), emptyList())
+        }
+
+        assertEquals(packed.extensionId, result.extensionId)
+        assertContentEquals(packed.bytes, result.crxBytes)
+    }
+
+    @Test
+    fun `valid signed CRX without manifest key binds through verified proof public key`() {
+        val localRoot = Files.createTempDirectory("six-pipeline-external-no-key")
+        val source = plainSource("six-pipeline-external-no-key-source")
+        val keyPair = keyPair()
+        val unsignedZip = ExtensionZip.createBytes(source)
+        val packZip = Crx3::class.java.getDeclaredMethod(
+            "packZip",
+            ByteArray::class.java,
+            java.security.KeyPair::class.java,
+        ).apply { isAccessible = true }
+        val packed = packZip.invoke(Crx3, unsignedZip, keyPair)
+            as dev.sixbridge.core.crx.PackedCrx
+        val resolved = ResolvedExtensionInput(
+            kind = ExtensionInputKind.CRX3,
+            originalInput = "external-no-key.crx",
+            sourceRoot = source,
+            crxBytes = packed.bytes,
+            expectedExtensionId = packed.extensionId,
+        )
+
+        val result = ConversionPipeline(localRoot).use {
+            it.prepare(resolved, profile(), emptyList())
+        }
+
+        assertEquals(packed.extensionId, result.extensionId)
+        assertContentEquals(packed.bytes, result.crxBytes)
+    }
+
+    @Test
+    fun `pipeline result reports and nested collections are deeply immutable`() {
+        val result = ConversionPipeline(
+            Files.createTempDirectory("six-pipeline-immutable-local"),
+        ).use {
+            it.prepare(
+                resolvedSource(convertibleSource("six-pipeline-immutable", includePopup = true)),
+                profile(),
+                listOf(
+                    MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
+                    MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
+                ),
+            )
+        }
+        val hashBefore = result.reportSha256
+        val after = result.compatibilityAfter
+        val decision = after.adapterDecisions.first()
+
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (after.declaredPermissions as MutableSet<String>).add("nativeMessaging")
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (after.adapterDecisions as MutableList<AdapterDecision>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (decision.evidence as MutableList<SourceEvidence>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (decision.changes as MutableList<String>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (decision.remainingLimitations as MutableList<String>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (result.compatibilityBefore.issues as MutableList<dev.sixbridge.core.compat.CompatibilityIssue>)
+                .clear()
+        }
+        val canonicalHash = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(
+                dev.sixbridge.core.bundle.SixBundle
+                    .encodeCompatibility(result.compatibilityAfter)
+                    .toByteArray(Charsets.UTF_8),
+            )
+            .joinToString("") { "%02x".format(it) }
+        assertEquals(hashBefore, canonicalHash)
     }
 
     @Test

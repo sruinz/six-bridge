@@ -13,6 +13,7 @@ import java.nio.file.Path
 import java.util.Base64
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.io.path.readText
+import kotlin.jvm.JvmSynthetic
 
 internal class ActionPopupEntryAdapter : MobileAdapter {
     override val id: String = MobilePatternAnalyzer.ACTION_POPUP_ENTRY
@@ -98,6 +99,60 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         }
         return decision.copy(applied = true)
     }
+
+    @JvmSynthetic
+    internal fun isExactlyApplied(
+        workingRoot: Path,
+        manifest: JsonObject,
+        popupPath: String,
+    ): Boolean = runCatching {
+        val canonicalPopup = ActionPopupEntrySafety.canonicalResourcePath(popupPath)
+            ?: return false
+        val contentScripts = manifest[CONTENT_SCRIPTS] as? JsonArray ?: return false
+        val wiredBlocks = contentScripts.mapNotNull { it as? JsonObject }
+            .mapNotNull { it[SCRIPTS] as? JsonArray }
+            .filter { it.isNotEmpty() }
+        if (wiredBlocks.isEmpty() || wiredBlocks.any { scripts ->
+                val paths = scripts.mapNotNull {
+                    (it as? JsonPrimitive)
+                        ?.takeIf(JsonPrimitive::isString)
+                        ?.content
+                        ?.let(ActionPopupEntrySafety::canonicalResourcePath)
+                }
+                paths.count { it == CONTENT_RELATIVE_PATH } != 1
+            }
+        ) {
+            return false
+        }
+        if (!hasExactBytes(
+                workingRoot.resolve(CONTENT_RELATIVE_PATH),
+                resourceBytes(CONTENT_RESOURCE_PATH),
+            ) ||
+            !hasExactBytes(
+                workingRoot.resolve(BACKGROUND_RELATIVE_PATH),
+                generatedBackgroundBytes(canonicalPopup),
+            )
+        ) {
+            return false
+        }
+        val background = manifest[BACKGROUND] as? JsonObject ?: return false
+        val worker = background.stringOrNull(SERVICE_WORKER)
+            ?.let(ActionPopupEntrySafety::canonicalResourcePath)
+            ?: return false
+        if (worker == BACKGROUND_RELATIVE_PATH) return true
+        if (Path.of(worker).fileName.toString() != BOOTSTRAP_FILE_NAME) return false
+        val module = background.stringOrNull(TYPE) == MODULE
+        val bootstrapPath = workingRoot.resolve(worker)
+        if (!Files.isRegularFile(bootstrapPath, NOFOLLOW_LINKS)) return false
+        val source = Files.readString(bootstrapPath)
+        val original = verifyGeneratedBootstrap(source, module, worker)
+        verifyOriginalWorker(workingRoot, original)
+        true
+    }.getOrDefault(false)
+
+    private fun hasExactBytes(path: Path, expected: ByteArray): Boolean =
+        Files.isRegularFile(path, NOFOLLOW_LINKS) &&
+            Files.readAllBytes(path).contentEquals(expected)
 
     private fun backgroundPlan(
         workingRoot: Path,

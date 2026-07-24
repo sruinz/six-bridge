@@ -12,7 +12,7 @@ class ConversionPlanner {
         report: CompatibilityReport,
         approvedAdapterIds: Set<String>,
     ): ConversionPlan {
-        val immutableReport = report.immutableCopy()
+        val immutableReport = report.deepImmutableCopy()
             .also(CompatibilityReport::validate)
         val approvals = approvedAdapterIds.toSet()
         if (
@@ -243,7 +243,7 @@ internal object ConversionPlanProof {
     }
 }
 
-private fun CompatibilityReport.immutableCopy(): CompatibilityReport = copy(
+internal fun CompatibilityReport.deepImmutableCopy(): CompatibilityReport = copy(
     declaredPermissions = Collections.unmodifiableSet(declaredPermissions.toSortedSet()),
     usedApis = Collections.unmodifiableSet(usedApis.toSortedSet()),
     unsupportedApis = Collections.unmodifiableSet(unsupportedApis.toSortedSet()),

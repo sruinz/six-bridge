@@ -26,6 +26,7 @@ class Crx3Test {
 
         assertEquals(packed.extensionId, parsed.extensionId)
         assertContentEquals(packed.zipBytes, parsed.zipBytes)
+        assertContentEquals(keyPair.public.encoded, parsed.publicKey)
         assertTrue(parsed.signaturesVerified)
         assertEquals(32, parsed.extensionId.length)
         assertTrue(parsed.extensionId.all { it in 'a'..'p' })

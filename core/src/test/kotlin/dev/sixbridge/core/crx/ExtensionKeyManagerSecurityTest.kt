@@ -17,6 +17,94 @@ import kotlin.test.assertTrue
 
 class ExtensionKeyManagerSecurityTest {
     @Test
+    fun `trusted root symlink ancestor is rejected`() {
+        val trustedParent = Files.createTempDirectory("six-key-trusted-parent")
+        val outside = Files.createTempDirectory("six-key-trusted-outside")
+        val linkedLocal = trustedParent.resolve(".local")
+        Files.createSymbolicLink(linkedLocal, outside)
+
+        assertFails {
+            ExtensionKeyManager.create(
+                trustedRoot = trustedParent,
+                keyRoot = linkedLocal.resolve("keystore/crx"),
+            ).getOrCreate("project-${"e".repeat(32)}")
+        }
+        assertTrue(outside.listDirectoryEntries().isEmpty())
+    }
+
+    @Test
+    fun `root replacement after anchored lock is rejected without writing replacement`() {
+        val parent = Files.createTempDirectory("six-key-root-race")
+        val root = parent.resolve("keys")
+        val backup = parent.resolve("keys-backup")
+
+        assertFails {
+            ExtensionKeyManagerFaultInjection.replaceRootAfterLock(
+                action = {
+                    Files.move(root, backup)
+                    Files.createDirectory(root)
+                },
+                block = {
+                    ExtensionKeyManager(root)
+                        .getOrCreate("project-${"f".repeat(32)}")
+                },
+            )
+        }
+
+        assertTrue(root.listDirectoryEntries().isEmpty())
+        assertTrue(backup.listDirectoryEntries().all {
+            it.fileName.toString() == ".sixbridge-key-registry.lock"
+        })
+    }
+
+    @Test
+    fun `directory fsync failure never commits metadata and recovers incomplete pair`() {
+        val root = Files.createTempDirectory("six-key-fsync")
+        val identity = "project-${"1".repeat(32)}"
+        val manager = ExtensionKeyManager(root)
+
+        assertFails {
+            ExtensionKeyManagerFaultInjection.failNextDirectoryFsync {
+                manager.getOrCreate(identity)
+            }
+        }
+        assertTrue(root.listDirectoryEntries("*.identity").isEmpty())
+
+        val recovered = manager.getOrCreate(identity)
+        assertEquals(
+            Crx3.extensionId(recovered.public.encoded),
+            Crx3.extensionId(manager.getOrCreate(identity).public.encoded),
+        )
+    }
+
+    @Test
+    fun `committed metadata with a missing pair is corruption not normal recovery`() {
+        val root = Files.createTempDirectory("six-key-committed-missing")
+        val identity = "project-${"2".repeat(32)}"
+        val manager = ExtensionKeyManager(root)
+        manager.getOrCreate(identity)
+        Files.delete(root.listDirectoryEntries("*.pub").single())
+
+        assertFails {
+            manager.getOrCreate(identity)
+        }
+        assertEquals(1, root.listDirectoryEntries("*.identity").size)
+    }
+
+    @Test
+    fun `unavailable unix link count fails closed`() {
+        val root = Files.createTempDirectory("six-key-nlink")
+
+        assertFails {
+            ExtensionKeyManagerFaultInjection.failUnixLinkCount {
+                ExtensionKeyManager(root)
+                    .getOrCreate("project-${"3".repeat(32)}")
+            }
+        }
+        assertTrue(root.listDirectoryEntries("*.identity").isEmpty())
+    }
+
+    @Test
     fun `identities that collided under the legacy safe name get distinct canonical keys`() {
         val root = Files.createTempDirectory("six-key-collision")
         val manager = ExtensionKeyManager(root)

@@ -25,11 +25,21 @@ data class PackedCrx(
     val zipBytes: ByteArray,
 )
 
-data class ParsedCrx(
+class ParsedCrx internal constructor(
     val extensionId: String,
-    val zipBytes: ByteArray,
+    zipBytes: ByteArray,
+    publicKey: ByteArray,
     val signaturesVerified: Boolean,
-)
+) {
+    private val stableZipBytes = zipBytes.copyOf()
+    private val stablePublicKey = publicKey.copyOf()
+
+    val zipBytes: ByteArray
+        get() = stableZipBytes.copyOf()
+
+    val publicKey: ByteArray
+        get() = stablePublicKey.copyOf()
+}
 
 object Crx3 {
     private val SIGNED_DATA_CONTEXT =
@@ -122,16 +132,17 @@ object Crx3 {
             fields[2].orEmpty().forEach { add(ProofKind.RSA to it) }
             fields[3].orEmpty().forEach { add(ProofKind.ECDSA to it) }
         }
-        val matchingProofVerified = proofs.any { (kind, encodedProof) ->
+        val verifiedPublicKey = proofs.firstNotNullOfOrNull { (kind, encodedProof) ->
             verifyProof(kind, encodedProof, crxId, input)
         }
-        if (!matchingProofVerified) {
+        if (verifiedPublicKey == null) {
             throw InvalidCrxException("CRX3 서명을 검증할 수 없습니다.")
         }
 
         return ParsedCrx(
             extensionId = extensionIdFromCrxId(crxId),
             zipBytes = zipBytes,
+            publicKey = verifiedPublicKey,
             signaturesVerified = true,
         )
     }
@@ -154,21 +165,22 @@ object Crx3 {
         encodedProof: ByteArray,
         expectedCrxId: ByteArray,
         signatureInput: ByteArray,
-    ): Boolean = runCatching {
+    ): ByteArray? = runCatching {
         val proof = Proto.parse(encodedProof)
-        val publicKeyBytes = proof[1]?.firstOrNull() ?: return false
-        val signatureBytes = proof[2]?.firstOrNull() ?: return false
+        val publicKeyBytes = proof[1]?.firstOrNull() ?: return null
+        val signatureBytes = proof[2]?.firstOrNull() ?: return null
         val actualCrxId = MessageDigest.getInstance("SHA-256")
             .digest(publicKeyBytes)
             .copyOfRange(0, 16)
-        if (!actualCrxId.contentEquals(expectedCrxId)) return false
+        if (!actualCrxId.contentEquals(expectedCrxId)) return null
         val publicKey = readPublicKey(kind, publicKeyBytes)
-        Signature.getInstance(kind.signatureAlgorithm).run {
+        val verified = Signature.getInstance(kind.signatureAlgorithm).run {
             initVerify(publicKey)
             update(signatureInput)
             verify(signatureBytes)
         }
-    }.getOrDefault(false)
+        publicKeyBytes.takeIf { verified }?.copyOf()
+    }.getOrNull()
 
     private fun readPublicKey(kind: ProofKind, encoded: ByteArray): PublicKey =
         KeyFactory.getInstance(kind.keyAlgorithm)

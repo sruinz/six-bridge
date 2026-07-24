@@ -1,5 +1,8 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.channels.ServerSocketChannel
@@ -10,6 +13,7 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
+import java.security.KeyPairGenerator
 import java.util.Comparator
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
@@ -26,6 +30,83 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class ConversionWorkspaceTest {
+    @Test
+    fun `adapter proof rejects metadata replacement before final archive sealing`() {
+        val source = Files.createTempDirectory("six-workspace-proof-source").also { root ->
+            root.resolve("content.js").writeText(
+                """
+                document.addEventListener("mouseup", (event) => {
+                  toolbar.button.disabled = false;
+                  const value = getSelection()?.toString();
+                  if (value) console.log(value);
+                });
+                """.trimIndent(),
+            )
+            root.resolve("manifest.json").writeText(
+                """
+                {
+                  "manifest_version":3,
+                  "name":"Proof",
+                  "version":"1",
+                  "content_scripts":[{"matches":["https://example.com/*"],"js":["content.js"]}]
+                }
+                """.trimIndent(),
+            )
+        }
+        val profile = BrowserProfile(
+            browserPackage = "com.sec.android.app.sbrowser",
+            versionName = BrowserProfile.BASELINE_VERSION,
+            versionCode = 1_300_261_502,
+            majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION,
+            supportedApis = BrowserProfile.POC_SUPPORTED_APIS,
+            wrapperContract = WrapperContract.complete(),
+            sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+            sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        )
+        val key = KeyPairGenerator.getInstance("RSA")
+            .apply { initialize(2048) }
+            .generateKeyPair()
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(source, requireOwnerOnlyMarker = false)
+            val report = MobilePatternAnalyzer().analyzeArchive(
+                snapshot.sourceZip,
+                profile,
+            )
+            val plan = ConversionPlanner().plan(report, emptySet())
+            val applied = workspace.transform(snapshot, profile, plan)
+            val archive = ExtensionZip.createBytes(
+                snapshot.workingRoot,
+                includeProjectMarker = true,
+            )
+            val proof = workspace.verifyApplied(
+                snapshot,
+                profile,
+                plan,
+                applied,
+                archive,
+            )
+            val manifest = snapshot.workingRoot.resolve("manifest.json")
+            Files.setLastModifiedTime(
+                manifest,
+                FileTime.fromMillis(
+                    Files.getLastModifiedTime(manifest).toMillis() + 2_000,
+                ),
+            )
+
+            assertFailsWith<IllegalStateException> {
+                workspace.sealArchive(
+                    snapshot,
+                    publicKey = key.public.encoded,
+                    includeProjectMarker = false,
+                    expectedArchive = ExtensionZip.createBytes(
+                        snapshot.workingRoot,
+                        key.public.encoded,
+                    ),
+                    applicationProof = proof,
+                )
+            }
+        }
+    }
     @Test
     fun `creates deterministic isolated snapshots without changing the source`() {
         val source = source("six-snapshot")

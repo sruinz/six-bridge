@@ -1,6 +1,8 @@
 package dev.sixbridge.core.input
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayOutputStream
@@ -39,6 +41,29 @@ object ExtensionZip {
         sourceRoot: Path,
         publicKey: ByteArray? = null,
         includeProjectMarker: Boolean = false,
+    ): ByteArray = createBytesInternal(
+        sourceRoot,
+        includeProjectMarker,
+    ) { manifest ->
+        if (publicKey == null) manifest else manifestWithKey(manifest, publicKey)
+    }
+
+    @JvmSynthetic
+    internal fun createCanonicalManifestBytes(
+        sourceRoot: Path,
+        publicKey: ByteArray,
+        includeProjectMarker: Boolean,
+    ): ByteArray = createBytesInternal(
+        sourceRoot,
+        includeProjectMarker,
+    ) { manifest ->
+        canonicalManifestWithKey(manifest, publicKey)
+    }
+
+    private fun createBytesInternal(
+        sourceRoot: Path,
+        includeProjectMarker: Boolean,
+        manifestTransform: (ByteArray) -> ByteArray,
     ): ByteArray {
         require(Files.isDirectory(sourceRoot, LinkOption.NOFOLLOW_LINKS)) {
             "확장 소스 디렉터리가 아닙니다: $sourceRoot"
@@ -53,8 +78,8 @@ object ExtensionZip {
         return ByteArrayOutputStream().run {
             ZipOutputStream(this).use { zip ->
                 entries.forEach { source ->
-                    val bytes = if (source.name == "manifest.json" && publicKey != null) {
-                        manifestWithKey(source.bytes, publicKey)
+                    val bytes = if (source.name == "manifest.json") {
+                        manifestTransform(source.bytes)
                     } else {
                         source.bytes
                     }
@@ -420,6 +445,27 @@ object ExtensionZip {
             manifest + ("key" to JsonPrimitive(Base64.getEncoder().encodeToString(publicKey))),
         )
         return json.encodeToString(JsonObject.serializer(), withKey).toByteArray()
+    }
+
+    private fun canonicalManifestWithKey(
+        manifestBytes: ByteArray,
+        publicKey: ByteArray,
+    ): ByteArray {
+        val json = Json
+        val manifest = json.parseToJsonElement(manifestBytes.decodeToString()) as JsonObject
+        val withKey = JsonObject(
+            manifest + ("key" to JsonPrimitive(Base64.getEncoder().encodeToString(publicKey))),
+        )
+        return canonicalJson(withKey).toString().toByteArray()
+    }
+
+    private fun canonicalJson(value: JsonElement): JsonElement = when (value) {
+        is JsonObject -> JsonObject(
+            value.entries.sortedBy { it.key }
+                .associate { (key, child) -> key to canonicalJson(child) },
+        )
+        is JsonArray -> JsonArray(value.map(::canonicalJson))
+        else -> value
     }
 
     private fun shouldInclude(relative: Path, includeProjectMarker: Boolean): Boolean {

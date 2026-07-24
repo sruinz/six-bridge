@@ -105,6 +105,7 @@ class SixBridgeService(
                         source = prepared.convertedSourceRoot,
                         destination = localRoot.resolve("extensions")
                             .resolve(prepared.extensionId),
+                        trustedRoot = workspaceRoot,
                     )
                 } else {
                     null

@@ -44,10 +44,14 @@ private class WorkspaceVerifiedCrxPayload(
 internal sealed interface VerifiedAdapterApplication {
     @get:JvmSynthetic
     val decisions: List<AdapterDecision>
+
+    @get:JvmSynthetic
+    val workspaceState: WorkspaceTreeDigest.State
 }
 
 private class WorkspaceVerifiedAdapterApplication(
     decisions: List<AdapterDecision>,
+    override val workspaceState: WorkspaceTreeDigest.State,
 ) : VerifiedAdapterApplication {
     override val decisions: List<AdapterDecision> =
         decisions.map { it.copy() }
@@ -229,7 +233,12 @@ class ConversionWorkspace : AutoCloseable {
         ) {
             "adapter 실행 결과를 canonical source와 함께 봉인하지 못했습니다."
         }
-        return WorkspaceVerifiedAdapterApplication(applied)
+        val firstState = WorkspaceTreeDigest.capture(snapshot.workingRoot)
+        val secondState = WorkspaceTreeDigest.capture(snapshot.workingRoot)
+        check(firstState == secondState) {
+            "adapter 실행 workspace state가 proof 생성 중 변경되었습니다."
+        }
+        return WorkspaceVerifiedAdapterApplication(applied, firstState)
     }
 
     @Synchronized
@@ -239,6 +248,7 @@ class ConversionWorkspace : AutoCloseable {
         publicKey: ByteArray?,
         includeProjectMarker: Boolean,
         expectedArchive: ByteArray,
+        applicationProof: VerifiedAdapterApplication? = null,
     ): VerifiedCrxPayload {
         requireOpen()
         check(ownedSnapshots.containsKey(snapshot)) {
@@ -251,6 +261,14 @@ class ConversionWorkspace : AutoCloseable {
                 snapshot.workingRoot,
                 record,
             )
+            if (applicationProof != null) {
+                check(
+                    WorkspaceTreeDigest.capture(snapshot.workingRoot) ==
+                        applicationProof.workspaceState,
+                ) {
+                    "adapter proof와 최종 archive workspace state가 다릅니다."
+                }
+            }
             val first = ExtensionZip.createBytes(
                 snapshot.workingRoot,
                 publicKey,
