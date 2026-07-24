@@ -1,6 +1,7 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.conversion.OwnedTempDirectory
+import dev.sixbridge.core.conversion.OwnedTempCleanupException
 import dev.sixbridge.core.conversion.OwnedTempTree
 import dev.sixbridge.core.input.ExtensionZip
 import java.nio.file.Path
@@ -27,7 +28,7 @@ internal class StableExtensionAnalysis private constructor(
     }
 
     override fun close() {
-        OwnedTempTree.delete(temporaryRoot)
+        cleanupStableOwner(temporaryRoot)?.let { throw it }
     }
 
     companion object {
@@ -95,16 +96,33 @@ internal class StableExtensionAnalysis private constructor(
             owner: OwnedTempDirectory,
             failure: Throwable,
         ) {
-            try {
-                OwnedTempTree.delete(owner)
-            } catch (cleanupError: Throwable) {
+            cleanupStableOwner(owner)?.let { cleanupError ->
                 failure.addSuppressed(cleanupError)
             }
+        }
+
+        private fun cleanupStableOwner(
+            owner: OwnedTempDirectory,
+        ): IllegalStateException? {
+            repeat(MAX_STABLE_DELETE_ATTEMPTS) {
+                try {
+                    OwnedTempTree.delete(owner)
+                    return null
+                } catch (_: Throwable) {
+                    // bounded retry before safe no-delete abandon
+                }
+            }
+            runCatching {
+                OwnedTempTree.abandonNoDelete(owner)
+            }
+            return OwnedTempCleanupException()
         }
 
         private fun sha256(bytes: ByteArray): String =
             MessageDigest.getInstance("SHA-256")
                 .digest(bytes)
                 .joinToString("") { "%02x".format(it) }
+
+        private const val MAX_STABLE_DELETE_ATTEMPTS = 2
     }
 }

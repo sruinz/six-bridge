@@ -8,8 +8,10 @@ import java.nio.file.attribute.AclFileAttributeView
 import java.nio.file.attribute.BasicFileAttributeView
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
+import kotlin.jvm.JvmSynthetic
 
 internal object NativeWorkspaceTree {
+    @JvmSynthetic
     fun copyInto(source: Path, destination: Path): Path {
         val sourceRoot = source.toAbsolutePath().normalize()
         val targetRoot = destination.toAbsolutePath().normalize()

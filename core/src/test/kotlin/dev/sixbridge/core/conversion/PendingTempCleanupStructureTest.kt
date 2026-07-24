@@ -1,5 +1,6 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.input.ExtensionZip
 import java.nio.charset.StandardCharsets.ISO_8859_1
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -37,5 +38,21 @@ class PendingTempCleanupStructureTest {
         assertTrue(cleanupClass.contains("closeRetryOwners"))
         assertTrue(cleanupClass.contains("MAX_ACTIVE_OWNERS"))
         assertFalse(cleanupClass.contains("registerCreated"))
+    }
+
+    @Test
+    fun `owner population helpers are hidden from ordinary Java calls`() {
+        val extractInto = ExtensionZip::class.java.declaredMethods.filter {
+            it.name == "extractInto"
+        }
+        val copyInto = NativeWorkspaceTree::class.java.declaredMethods.single {
+            it.name == "copyInto"
+        }
+
+        assertTrue(extractInto.isNotEmpty())
+        assertTrue(extractInto.all { it.isSynthetic })
+        assertTrue(copyInto.isSynthetic)
+        assertTrue(OwnedTempDirectory::class.java.isSealed)
+        assertTrue(OwnedTempDirectory::class.java.declaredConstructors.isEmpty())
     }
 }

@@ -4,11 +4,27 @@ import java.nio.file.Path
 import java.util.UUID
 import kotlin.jvm.JvmSynthetic
 
-internal class OwnedTempDirectory internal constructor(
+internal sealed interface OwnedTempDirectory {
     @get:JvmSynthetic
-    val rootPath: Path,
-    internal val token: UUID,
-)
+    val rootPath: Path
+
+    @get:JvmSynthetic
+    val token: UUID
+
+    companion object {
+        @JvmSynthetic
+        fun create(
+            rootPath: Path,
+            token: UUID,
+        ): OwnedTempDirectory =
+            DefaultOwnedTempDirectory(rootPath, token)
+    }
+}
+
+private class DefaultOwnedTempDirectory(
+    override val rootPath: Path,
+    override val token: UUID,
+) : OwnedTempDirectory
 
 internal object OwnedTempTree {
     internal const val MAX_ACTIVE_OWNERS = 64
@@ -61,6 +77,11 @@ internal object OwnedTempTree {
     @JvmSynthetic
     fun abandon(path: Path) {
         PendingTempCleanup.abandon(path)
+    }
+
+    @JvmSynthetic
+    fun abandonNoDelete(owner: OwnedTempDirectory) {
+        PendingTempCleanup.abandonNoDelete(owner)
     }
 }
 

@@ -1,10 +1,13 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.input.ExtensionZip
+import java.io.IOException
+import java.lang.management.ManagementFactory
 import java.net.URI
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.Path
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -123,4 +126,74 @@ class OwnedTempTreeTest {
             runCatching { OwnedTempTree.abandon(parent) }
         }
     }
+
+    @Test
+    fun `nested null file key failure closes handles and removes the empty child`() {
+        assertNestedCaptureFailure { null }
+    }
+
+    @Test
+    fun `nested attribute io failure closes handles and removes the empty child`() {
+        assertNestedCaptureFailure {
+            throw IOException("injected attribute failure")
+        }
+    }
+
+    private fun assertNestedCaptureFailure(
+        capture: (Path) -> Any?,
+    ) {
+        val parent = OwnedTempTree.create("six-owned-nested-failure-")
+        val ownersBefore = activeOwnerCount()
+        val descriptorsBefore = openFileDescriptorCount()
+        val override = fileKeyCaptureOverride()
+        override.set(capture)
+        try {
+            assertFailsWith<OwnedTempCleanupException> {
+                OwnedTempTree.createNamed(parent, "failed-child")
+            }
+
+            assertFalse(
+                Files.exists(
+                    parent.rootPath.resolve("failed-child"),
+                    NOFOLLOW_LINKS,
+                ),
+            )
+            assertEquals(ownersBefore, activeOwnerCount())
+            descriptorsBefore?.let { before ->
+                val after = requireNotNull(openFileDescriptorCount())
+                assertTrue(
+                    after <= before,
+                    "nested registration이 file descriptor를 누수했습니다: " +
+                        "$before -> $after",
+                )
+            }
+        } finally {
+            override.remove()
+            OwnedTempTree.delete(parent)
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun fileKeyCaptureOverride():
+        ThreadLocal<((Path) -> Any?)?> {
+        val field = PendingTempCleanup::class.java.getDeclaredField(
+            "fileKeyCaptureOverride",
+        )
+        field.isAccessible = true
+        return field.get(null) as ThreadLocal<((Path) -> Any?)?>
+    }
+
+    private fun activeOwnerCount(): Int {
+        val field = PendingTempCleanup::class.java.getDeclaredField(
+            "ownersByToken",
+        )
+        field.isAccessible = true
+        return (field.get(null) as Map<*, *>).size
+    }
+
+    private fun openFileDescriptorCount(): Long? =
+        (
+            ManagementFactory.getOperatingSystemMXBean() as?
+                com.sun.management.UnixOperatingSystemMXBean
+        )?.openFileDescriptorCount
 }

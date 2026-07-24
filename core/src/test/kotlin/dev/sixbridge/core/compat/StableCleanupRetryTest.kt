@@ -1,7 +1,9 @@
 package dev.sixbridge.core.compat
 
+import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import java.lang.management.ManagementFactory
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
@@ -30,7 +32,8 @@ class StableCleanupRetryTest {
     )
 
     @Test
-    fun `next public analysis retries a stable root after close-time root replacement`() {
+    fun `stable close abandons a replaced root without deleting the replacement`() {
+        val ownersBefore = activeOwnerCount()
         val source = Files.createTempDirectory("six-stable-cleanup-source")
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Cleanup","version":"1"}""",
@@ -88,9 +91,7 @@ class StableCleanupRetryTest {
             assertEquals(null, error.cause)
             assertTrue(Files.exists(abandonedRoot, NOFOLLOW_LINKS))
             assertEquals("outside", Files.readString(outsideProof))
-
-            Files.delete(abandonedRoot)
-            Files.move(movedRoot, abandonedRoot, StandardCopyOption.ATOMIC_MOVE)
+            assertEquals(ownersBefore, activeOwnerCount())
 
             val retrySource = Files.createTempDirectory("six-stable-cleanup-retry")
             retrySource.resolve("manifest.json").writeText(
@@ -98,7 +99,9 @@ class StableCleanupRetryTest {
             )
             CompatibilityAnalyzer().analyze(retrySource, profile)
 
-            assertFalse(Files.exists(abandonedRoot, NOFOLLOW_LINKS))
+            assertTrue(Files.isSymbolicLink(abandonedRoot))
+            assertTrue(Files.exists(movedRoot, NOFOLLOW_LINKS))
+            assertEquals("outside", Files.readString(outsideProof))
         } finally {
             analysisThread.join(5_000)
             attackerThread.join(5_000)
@@ -109,7 +112,8 @@ class StableCleanupRetryTest {
     }
 
     @Test
-    fun `missing stable root remains pending until the same inode returns`() {
+    fun `stable close abandons a missing root without deleting the moved inode`() {
+        val ownersBefore = activeOwnerCount()
         val source = Files.createTempDirectory("six-stable-missing-source")
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Missing","version":"1"}""",
@@ -161,8 +165,8 @@ class StableCleanupRetryTest {
                     NOFOLLOW_LINKS,
                 ),
             )
+            assertEquals(ownersBefore, activeOwnerCount())
 
-            Files.move(movedRoot, missingRoot, StandardCopyOption.ATOMIC_MOVE)
             val retrySource = Files.createTempDirectory("six-stable-missing-retry")
             retrySource.resolve("manifest.json").writeText(
                 """{"manifest_version":3,"name":"Retry","version":"1"}""",
@@ -170,11 +174,58 @@ class StableCleanupRetryTest {
             CompatibilityAnalyzer().analyze(retrySource, profile)
 
             assertFalse(Files.exists(missingRoot, NOFOLLOW_LINKS))
+            assertTrue(Files.exists(movedRoot, NOFOLLOW_LINKS))
         } finally {
             analysisThread.join(5_000)
             attackerThread.join(5_000)
             deleteTestTree(movedRoot)
             deleteTestTree(missingRoot)
+        }
+    }
+
+    @Test
+    fun `sixty four stable cleanup failures release owner and fd quota`() {
+        val source = Files.createTempDirectory("six-stable-quota-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Quota","version":"1"}""",
+        )
+        val archive = ExtensionZip.createBytes(source)
+        val ownersBefore = activeOwnerCount()
+        val descriptorsBefore = openFileDescriptorCount()
+
+        repeat(64) { index ->
+            val stable = StableExtensionAnalysis.fromArchive(archive)
+            val root = stable.root.parent
+            val moved = root.resolveSibling("${root.fileName}-quota-$index")
+            Files.move(root, moved, StandardCopyOption.ATOMIC_MOVE)
+            try {
+                val error = assertFailsWith<IllegalStateException> {
+                    stable.close()
+                }
+                assertEquals(
+                    "소유한 임시 경로를 정리하지 못했습니다.",
+                    error.message,
+                )
+                assertEquals(null, error.cause)
+                assertEquals(ownersBefore, activeOwnerCount())
+                assertFalse(Files.exists(root, NOFOLLOW_LINKS))
+                assertTrue(Files.exists(moved, NOFOLLOW_LINKS))
+            } finally {
+                deleteTestTree(moved)
+            }
+        }
+
+        StableExtensionAnalysis.fromArchive(archive).use { stable ->
+            assertTrue(Files.isRegularFile(stable.root.resolve("manifest.json")))
+        }
+
+        assertEquals(ownersBefore, activeOwnerCount())
+        descriptorsBefore?.let { before ->
+            val after = requireNotNull(openFileDescriptorCount())
+            assertTrue(
+                after <= before + 2,
+                "stable cleanup이 file descriptor를 누수했습니다: $before -> $after",
+            )
         }
     }
 
@@ -202,4 +253,18 @@ class StableCleanupRetryTest {
             paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
         }
     }
+
+    private fun activeOwnerCount(): Int {
+        val field = Class.forName(
+            "dev.sixbridge.core.conversion.PendingTempCleanup",
+        ).getDeclaredField("ownersByToken")
+        field.isAccessible = true
+        return (field.get(null) as Map<*, *>).size
+    }
+
+    private fun openFileDescriptorCount(): Long? =
+        (
+            ManagementFactory.getOperatingSystemMXBean() as?
+                com.sun.management.UnixOperatingSystemMXBean
+        )?.openFileDescriptorCount
 }

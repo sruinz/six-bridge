@@ -62,6 +62,8 @@ internal object PendingTempCleanup {
     private val ownersByToken = ConcurrentHashMap<UUID, Owner>()
     private val closeRetryOwners = ConcurrentHashMap.newKeySet<UUID>()
     private val registryLock = ReentrantLock()
+    private val fileKeyCaptureOverride =
+        ThreadLocal<((Path) -> Any?)?>()
 
     @JvmSynthetic
     fun createTempDirectory(prefix: String): OwnedTempDirectory {
@@ -192,6 +194,11 @@ internal object PendingTempCleanup {
         abandonRegistered(requireRegistered(path))
     }
 
+    @JvmSynthetic
+    fun abandonNoDelete(owner: OwnedTempDirectory) {
+        abandonNoDeleteRegistered(requireRegistered(owner))
+    }
+
     private fun createNamed(
         parentOwner: Owner,
         name: String,
@@ -212,30 +219,50 @@ internal object PendingTempCleanup {
     ): OwnedTempDirectory =
         parentOwner.lock.withLock {
             registryLock.withLock {
+                var parentHandle: SecureDirectoryStream<Path>? = null
+                var rootHandle: SecureDirectoryStream<Path>? = null
+                var created: Path? = null
+                var cleanupFileKey: Any? = null
                 try {
                     check(parentOwner.state == OwnerState.ACTIVE)
                     verifyLocation(parentOwner)
                     requireCapacity(parentOwner)
-                    val parentHandle = parentOwner.rootHandle.newDirectoryStream(
+                    parentHandle = parentOwner.rootHandle.newDirectoryStream(
                         Path.of("."),
                         NOFOLLOW_LINKS,
                     )
-                    val created = try {
-                        create()
-                    } catch (_: Throwable) {
-                        closeQuietly(parentHandle)
-                        throw OwnedTempCleanupException()
-                    }
+                    created = create()
+                    val name = singleName(created.fileName.toString())
+                    rootHandle = parentHandle.newDirectoryStream(
+                        name,
+                        NOFOLLOW_LINKS,
+                    )
+                    val openedRoot = readAttributes(rootHandle)
+                    cleanupFileKey = requireNotNull(openedRoot.fileKey())
+                    val capturedFileKey = captureCreatedFileKey(created)
                     sealCreated(
                         created = created,
                         parentHandle = parentHandle,
+                        rootHandle = rootHandle,
                         parentPath = parentOwner.root,
                         parentToken = parentOwner.token,
                         treeToken = parentOwner.treeToken,
+                        capturedFileKey = capturedFileKey,
                     )
-                } catch (error: OwnedTempCleanupException) {
-                    throw error
                 } catch (_: Throwable) {
+                    if (parentHandle != null) {
+                        if (created == null) {
+                            closeQuietly(parentHandle)
+                        } else {
+                            cleanupRegistrationFailure(
+                                root = created,
+                                name = singleName(created.fileName.toString()),
+                                capturedFileKey = cleanupFileKey,
+                                parentHandle = parentHandle,
+                                rootHandle = rootHandle,
+                            )
+                        }
+                    }
                     throw OwnedTempCleanupException()
                 }
             }
@@ -256,93 +283,101 @@ internal object PendingTempCleanup {
             cleanupWithoutHandle(normalized, capturedFileKey)
             throw OwnedTempCleanupException()
         }
-        return sealCreated(
-            created = normalized,
-            parentHandle = stream,
-            parentPath = parent,
-            parentToken = null,
-            treeToken = null,
-            capturedFileKey = capturedFileKey,
-        )
-    }
-
-    private fun sealCreated(
-        created: Path,
-        parentHandle: SecureDirectoryStream<Path>,
-        parentPath: Path,
-        parentToken: UUID?,
-        treeToken: UUID?,
-        capturedFileKey: Any = captureCreatedFileKey(created),
-    ): OwnedTempDirectory {
-        val normalizedRoot = created.toAbsolutePath().normalize()
-        val normalizedParent = parentPath.toAbsolutePath().normalize()
-        val name = singleName(normalizedRoot.fileName.toString())
         var rootHandle: SecureDirectoryStream<Path>? = null
-        try {
-            check(normalizedRoot.parent == normalizedParent)
-            val pathParent = Files.readAttributes(
-                normalizedParent,
-                BasicFileAttributes::class.java,
+        return try {
+            rootHandle = stream.newDirectoryStream(
+                singleName(normalized.fileName.toString()),
                 NOFOLLOW_LINKS,
             )
-            val handleParent = readAttributes(parentHandle)
-            check(
-                pathParent.isDirectory &&
-                    !pathParent.isSymbolicLink &&
-                    pathParent.fileKey() != null &&
-                    pathParent.fileKey() == handleParent.fileKey(),
-            )
-            val relativeRoot = readAttributes(parentHandle, name)
-            check(
-                relativeRoot.isDirectory &&
-                    !relativeRoot.isSymbolicLink &&
-                    relativeRoot.fileKey() == capturedFileKey,
-            )
-            rootHandle = parentHandle.newDirectoryStream(
-                name,
-                NOFOLLOW_LINKS,
-            )
-            val openedRoot = readAttributes(rootHandle)
-            check(
-                openedRoot.isDirectory &&
-                    !openedRoot.isSymbolicLink &&
-                    openedRoot.fileKey() == capturedFileKey,
-            )
-            val token = UUID.randomUUID()
-            verifyMarkerToken(
-                root = normalizedRoot,
+            sealCreated(
+                created = normalized,
+                parentHandle = stream,
                 rootHandle = rootHandle,
-                token = token,
-                expectedFileKey = capturedFileKey,
+                parentPath = parent,
+                parentToken = null,
+                treeToken = null,
+                capturedFileKey = capturedFileKey,
             )
-            val owner = Owner(
-                root = normalizedRoot,
-                parentPath = normalizedParent,
-                name = name,
-                rootFileKey = capturedFileKey,
-                parentFileKey = requireNotNull(handleParent.fileKey()),
-                rootHandle = rootHandle,
-                parentHandle = parentHandle,
-                token = token,
-                parentToken = parentToken,
-                treeToken = treeToken ?: token,
-            )
-            check(owners.putIfAbsent(normalizedRoot, owner) == null)
-            check(ownersByToken.putIfAbsent(token, owner) == null)
-            return OwnedTempDirectory(normalizedRoot, token)
         } catch (_: Throwable) {
             cleanupRegistrationFailure(
-                root = normalizedRoot,
-                name = name,
+                root = normalized,
+                name = singleName(normalized.fileName.toString()),
                 capturedFileKey = capturedFileKey,
-                parentHandle = parentHandle,
+                parentHandle = stream,
                 rootHandle = rootHandle,
             )
             throw OwnedTempCleanupException()
         }
     }
 
+    private fun sealCreated(
+        created: Path,
+        parentHandle: SecureDirectoryStream<Path>,
+        rootHandle: SecureDirectoryStream<Path>,
+        parentPath: Path,
+        parentToken: UUID?,
+        treeToken: UUID?,
+        capturedFileKey: Any,
+    ): OwnedTempDirectory {
+        val normalizedRoot = created.toAbsolutePath().normalize()
+        val normalizedParent = parentPath.toAbsolutePath().normalize()
+        val name = singleName(normalizedRoot.fileName.toString())
+        check(normalizedRoot.parent == normalizedParent)
+        val pathParent = Files.readAttributes(
+            normalizedParent,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        val handleParent = readAttributes(parentHandle)
+        check(
+            pathParent.isDirectory &&
+                !pathParent.isSymbolicLink &&
+                pathParent.fileKey() != null &&
+                pathParent.fileKey() == handleParent.fileKey(),
+        )
+        val relativeRoot = readAttributes(parentHandle, name)
+        check(
+            relativeRoot.isDirectory &&
+                !relativeRoot.isSymbolicLink &&
+                relativeRoot.fileKey() == capturedFileKey,
+        )
+        val openedRoot = readAttributes(rootHandle)
+        check(
+            openedRoot.isDirectory &&
+                !openedRoot.isSymbolicLink &&
+                openedRoot.fileKey() == capturedFileKey,
+        )
+        val token = UUID.randomUUID()
+        verifyMarkerToken(
+            root = normalizedRoot,
+            rootHandle = rootHandle,
+            token = token,
+            expectedFileKey = capturedFileKey,
+        )
+        val owner = Owner(
+            root = normalizedRoot,
+            parentPath = normalizedParent,
+            name = name,
+            rootFileKey = capturedFileKey,
+            parentFileKey = requireNotNull(handleParent.fileKey()),
+            rootHandle = rootHandle,
+            parentHandle = parentHandle,
+            token = token,
+            parentToken = parentToken,
+            treeToken = treeToken ?: token,
+        )
+        check(owners.putIfAbsent(normalizedRoot, owner) == null)
+        if (ownersByToken.putIfAbsent(token, owner) != null) {
+            owners.remove(normalizedRoot, owner)
+            error("owner token collision")
+        }
+        return OwnedTempDirectory.create(normalizedRoot, token)
+    }
+
     private fun captureCreatedFileKey(path: Path): Any {
+        fileKeyCaptureOverride.get()?.let { capture ->
+            return capture(path) ?: throw OwnedTempCleanupException()
+        }
         val attributes = try {
             Files.readAttributes(
                 path,
@@ -399,23 +434,49 @@ internal object PendingTempCleanup {
     private fun cleanupRegistrationFailure(
         root: Path,
         name: Path,
-        capturedFileKey: Any,
+        capturedFileKey: Any?,
         parentHandle: SecureDirectoryStream<Path>,
         rootHandle: SecureDirectoryStream<Path>?,
     ) {
         if (rootHandle == null) {
+            var anchoredCleanupSucceeded = false
+            runCatching {
+                parentHandle.newDirectoryStream(
+                    name,
+                    NOFOLLOW_LINKS,
+                ).use { reopened ->
+                    val reopenedKey = readAttributes(reopened).fileKey()
+                    deleteContents(reopened)
+                    val attributes = readAttributesOrNull(parentHandle, name)
+                    if (
+                        reopenedKey != null &&
+                        attributes != null &&
+                        attributes.isDirectory &&
+                        !attributes.isSymbolicLink &&
+                        attributes.fileKey() == reopenedKey
+                    ) {
+                        parentHandle.deleteDirectory(name)
+                        anchoredCleanupSucceeded = true
+                    }
+                }
+            }
             closeQuietly(parentHandle)
-            cleanupWithoutHandle(root, capturedFileKey)
+            if (!anchoredCleanupSucceeded && capturedFileKey != null) {
+                cleanupWithoutHandle(root, capturedFileKey)
+            }
             return
         }
         runCatching {
+            val retainedFileKey =
+                readAttributes(rootHandle).fileKey() ?: capturedFileKey
             deleteContents(rootHandle)
             val attributes = readAttributesOrNull(parentHandle, name)
             if (
+                retainedFileKey != null &&
                 attributes != null &&
                 attributes.isDirectory &&
                 !attributes.isSymbolicLink &&
-                attributes.fileKey() == capturedFileKey
+                attributes.fileKey() == retainedFileKey
             ) {
                 parentHandle.deleteDirectory(name)
             }
@@ -558,6 +619,34 @@ internal object PendingTempCleanup {
             }
         } catch (_: Throwable) {
             throw OwnedTempCleanupException()
+        }
+    }
+
+    private fun abandonNoDeleteRegistered(owner: Owner) {
+        owner.lock.withLock {
+            childrenOf(owner)
+                .sortedByDescending { it.root.nameCount }
+                .forEach(::abandonNoDeleteRegistered)
+            repeat(MAX_CLOSE_PASSES) {
+                if (!owner.rootHandleClosed) {
+                    owner.rootHandleClosed = runCatching {
+                        owner.rootHandle.close()
+                    }.isSuccess
+                }
+                if (!owner.parentHandleClosed) {
+                    owner.parentHandleClosed = runCatching {
+                        owner.parentHandle.close()
+                    }.isSuccess
+                }
+                if (owner.rootHandleClosed && owner.parentHandleClosed) {
+                    return@repeat
+                }
+            }
+            registryLock.withLock {
+                owners.remove(owner.root, owner)
+                ownersByToken.remove(owner.token, owner)
+                closeRetryOwners.remove(owner.token)
+            }
         }
     }
 

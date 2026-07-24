@@ -28,6 +28,7 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.invariantSeparatorsPathString
+import kotlin.jvm.JvmSynthetic
 
 object ExtensionZip {
     fun create(sourceRoot: Path, output: Path, publicKey: ByteArray? = null) {
@@ -93,6 +94,7 @@ object ExtensionZip {
         )
     }
 
+    @JvmSynthetic
     fun extractInto(bytes: ByteArray, destination: Path): Path {
         val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
         return try {
@@ -103,6 +105,7 @@ object ExtensionZip {
         }
     }
 
+    @JvmSynthetic
     fun extractInto(zipPath: Path, destination: Path): Path {
         val normalizedDestination = destination.toAbsolutePath().normalize()
         requireExtractionDirectory(normalizedDestination)
