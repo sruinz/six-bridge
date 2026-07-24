@@ -3,6 +3,7 @@ package dev.sixbridge.core.conversion
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -485,6 +486,322 @@ class SecureBuildPublisherTest {
     }
 
     @Test
+    fun `output stage recovery requires an internal token before identity is journaled`() {
+        OutputStageCrashPoint.entries.forEach { point ->
+            val parent = Files.createTempDirectory("six-output-stage-owner")
+            val output = parent.resolve("extension.crx")
+            Files.writeString(output, "old")
+
+            assertFails {
+                BuildPublicationFaultInjection.forceOutputStageCrash(point) {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                }
+            }
+            val stage = parent.listDirectoryEntries()
+                .single {
+                    Files.isDirectory(it) &&
+                        it.fileName.toString().startsWith(".sixbridge-publish-")
+                }
+            if (point == OutputStageCrashPoint.AFTER_DIRECTORY_CREATE) {
+                assertFails {
+                    SecureBuildPublisher.recoverPending(listOf(output), null)
+                }
+                assertTrue(Files.isDirectory(stage))
+                assertTrue(Files.exists(parent.resolve(".sixbridge-publish-journal.v1")))
+            } else {
+                SecureBuildPublisher.recoverPending(listOf(output), null)
+                assertEquals("old", Files.readString(output))
+                assertNoTransactionDebris(parent)
+            }
+        }
+    }
+
+    @Test
+    fun `local stage creation crashes recover only proven owned directories`() {
+        LocalStageCrashPoint.entries.forEach { point ->
+            val outputParent = Files.createTempDirectory("six-local-stage-output")
+            val output = outputParent.resolve("extension.crx")
+            Files.writeString(output, "old-output")
+            val localParent = Files.createTempDirectory("six-local-stage-parent")
+            val destination = localParent.resolve("extension-id")
+            Files.createDirectory(destination)
+            destination.resolve("manifest.json").writeText("old-source")
+            val source = Files.createTempDirectory("six-local-stage-source")
+            source.resolve("manifest.json").writeText("new-source")
+            val local = LocalSourcePublication(source, destination)
+
+            assertFails {
+                BuildPublicationFaultInjection.forceLocalStageCrash(point) {
+                    SecureBuildPublisher.publish(
+                        mapOf(output to "new-output".toByteArray()),
+                        local,
+                    )
+                }
+            }
+            val stage = localParent.listDirectoryEntries()
+                .single { it.fileName.toString().startsWith(".sixbridge-local-stage-") }
+            if (point == LocalStageCrashPoint.AFTER_DIRECTORY_CREATE) {
+                assertFails {
+                    SecureBuildPublisher.recoverPending(listOf(output), local)
+                }
+                assertTrue(Files.isDirectory(stage))
+                assertTrue(
+                    Files.exists(outputParent.resolve(".sixbridge-publish-journal.v1")),
+                )
+            } else {
+                SecureBuildPublisher.recoverPending(listOf(output), local)
+                assertEquals("old-output", Files.readString(output))
+                assertEquals("old-source", destination.resolve("manifest.json").readText())
+                assertNoTransactionDebris(outputParent)
+                assertNoTransactionDebris(localParent)
+            }
+        }
+    }
+
+    @Test
+    fun `wrong internal owner token and replaced recorded inode are preserved`() {
+        val outputParent = Files.createTempDirectory("six-stage-wrong-token")
+        val output = outputParent.resolve("extension.crx")
+        Files.writeString(output, "old")
+        assertFails {
+            BuildPublicationFaultInjection.forceOutputStageCrash(
+                OutputStageCrashPoint.AFTER_OWNER_MARKER,
+            ) {
+                SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+            }
+        }
+        val outputStage = outputParent.listDirectoryEntries()
+            .single {
+                Files.isDirectory(it) &&
+                    it.fileName.toString().startsWith(".sixbridge-publish-")
+            }
+        val ownerMarker = outputStage.listDirectoryEntries()
+            .single { it.fileName.toString().startsWith(".sixbridge-stage-owner-") }
+        ownerMarker.writeText("00000000-0000-4000-8000-000000000000")
+        assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+        assertTrue(Files.exists(outputStage))
+
+        val secondOutputParent = Files.createTempDirectory("six-stage-replaced-inode")
+        val secondOutput = secondOutputParent.resolve("extension.crx")
+        Files.writeString(secondOutput, "old-output")
+        val localParent = Files.createTempDirectory("six-stage-replaced-local")
+        val destination = localParent.resolve("extension-id")
+        val source = Files.createTempDirectory("six-stage-replaced-source")
+        source.resolve("manifest.json").writeText("new-source")
+        val local = LocalSourcePublication(source, destination)
+        assertFails {
+            BuildPublicationFaultInjection.forceLocalStageCrash(
+                LocalStageCrashPoint.AFTER_CREATED_JOURNAL,
+            ) {
+                SecureBuildPublisher.publish(
+                    mapOf(secondOutput to "new-output".toByteArray()),
+                    local,
+                )
+            }
+        }
+        val localStage = localParent.listDirectoryEntries()
+            .single { it.fileName.toString().startsWith(".sixbridge-local-stage-") }
+        deleteTestTree(localStage)
+        Files.createDirectory(localStage)
+        localStage.resolve("keep.txt").writeText("competitor")
+
+        assertFails {
+            SecureBuildPublisher.recoverPending(listOf(secondOutput), local)
+        }
+        assertEquals("competitor", localStage.resolve("keep.txt").readText())
+        assertTrue(
+            Files.exists(secondOutputParent.resolve(".sixbridge-publish-journal.v1")),
+        )
+    }
+
+    @Test
+    fun `journal structural corruption fails before recovery mutations`() {
+        val mutations = listOf<(MutableList<String>) -> Unit>(
+            { lines ->
+                val output = lines.first { it.startsWith("O|") }
+                lines.add(lines.indexOfLast { it.startsWith("O|") } + 1, output)
+                val metadata = lines[1].split('|').toMutableList()
+                metadata[2] = (metadata[2].toInt() + 1).toString()
+                lines[1] = metadata.joinToString("|")
+            },
+            { lines ->
+                val header = lines[2].split('|').toMutableList()
+                header[3] = "%"
+                lines[2] = header.joinToString("|")
+            },
+            { lines ->
+                val header = lines[2].split('|').toMutableList()
+                header[2] = "1"
+                lines[2] = header.joinToString("|")
+            },
+            { lines ->
+                lines.removeAt(lines.indexOfFirst { it.startsWith("L|") })
+                val metadata = lines[1].split('|').toMutableList()
+                metadata[4] = "false"
+                lines[1] = metadata.joinToString("|")
+            },
+            { lines ->
+                val outputIndex = lines.indexOfFirst { it.startsWith("O|") }
+                val fields = lines[outputIndex].split('|').toMutableList()
+                fields[4] = "z".repeat(64)
+                lines[outputIndex] = fields.joinToString("|")
+            },
+        )
+        mutations.forEachIndexed { index, mutation ->
+            val outputParent = Files.createTempDirectory("six-journal-invalid-$index")
+            val output = outputParent.resolve("extension.crx")
+            Files.writeString(output, "old-output")
+            val localParent = Files.createTempDirectory("six-journal-invalid-local-$index")
+            val destination = localParent.resolve("extension-id")
+            val source = Files.createTempDirectory("six-journal-invalid-source-$index")
+            source.resolve("manifest.json").writeText("new-source")
+            val local = LocalSourcePublication(source, destination)
+            assertFails {
+                BuildPublicationFaultInjection.forceLocalStageCrash(
+                    LocalStageCrashPoint.AFTER_CREATED_JOURNAL,
+                ) {
+                    SecureBuildPublisher.publish(
+                        mapOf(output to "new-output".toByteArray()),
+                        local,
+                    )
+                }
+            }
+            val journal = outputParent.resolve(".sixbridge-publish-journal.v1")
+            rewriteJournal(journal, mutation)
+            val journalBytes = Files.readAllBytes(journal)
+            val outputStage = outputParent.listDirectoryEntries()
+                .single {
+                    Files.isDirectory(it) &&
+                        it.fileName.toString().startsWith(".sixbridge-publish-")
+                }
+            val localStage = localParent.listDirectoryEntries()
+                .single { it.fileName.toString().startsWith(".sixbridge-local-stage-") }
+
+            assertFails {
+                SecureBuildPublisher.recoverPending(listOf(output), local)
+            }
+            assertContentEquals(journalBytes, Files.readAllBytes(journal))
+            assertTrue(Files.isDirectory(outputStage))
+            assertTrue(Files.isDirectory(localStage))
+            assertEquals("old-output", Files.readString(output))
+        }
+    }
+
+    @Test
+    fun `journal checksum mismatch and truncated lines preserve all recovery evidence`() {
+        listOf("checksum", "truncated").forEach { mode ->
+            val parent = Files.createTempDirectory("six-journal-integrity-$mode")
+            val output = parent.resolve("extension.crx")
+            Files.writeString(output, "old")
+            assertFails {
+                BuildPublicationFaultInjection.forceOutputStageCrash(
+                    OutputStageCrashPoint.AFTER_OWNER_MARKER,
+                ) {
+                    SecureBuildPublisher.publish(mapOf(output to "new".toByteArray()))
+                }
+            }
+            val journal = parent.resolve(".sixbridge-publish-journal.v1")
+            val lines = journal.readText().split('\n').toMutableList()
+            if (mode == "checksum") {
+                val metadata = lines[1].split('|').toMutableList()
+                metadata[5] = "0".repeat(64)
+                lines[1] = metadata.joinToString("|")
+            } else {
+                lines.removeAt(lines.indexOfFirst { it.startsWith("O|") })
+            }
+            journal.writeText(lines.joinToString("\n"))
+            val corrupted = Files.readAllBytes(journal)
+            val stage = parent.listDirectoryEntries().single {
+                Files.isDirectory(it) &&
+                    it.fileName.toString().startsWith(".sixbridge-publish-")
+            }
+
+            assertFails { SecureBuildPublisher.recoverPending(listOf(output), null) }
+            assertContentEquals(corrupted, Files.readAllBytes(journal))
+            assertTrue(Files.isDirectory(stage))
+            assertEquals("old", Files.readString(output))
+        }
+    }
+
+    @Test
+    fun `local tree durability flushes files then nested directories bottom up`() {
+        val outputParent = Files.createTempDirectory("six-tree-order-output")
+        val output = outputParent.resolve("extension.crx")
+        val localParent = Files.createTempDirectory("six-tree-order-local")
+        val destination = localParent.resolve("extension-id")
+        val source = Files.createTempDirectory("six-tree-order-source")
+        Files.createDirectories(source.resolve("a/b"))
+            .resolve("data.txt").writeText("data")
+        val files = mutableListOf<Path>()
+        val directories = mutableListOf<Path>()
+
+        BuildPublicationFaultInjection.observeLocalFileFsync(files::add) {
+            BuildPublicationFaultInjection.observeDirectoryFsync(directories::add) {
+                SecureBuildPublisher.publish(
+                    mapOf(output to "new".toByteArray()),
+                    LocalSourcePublication(source, destination),
+                )
+            }
+        }
+
+        assertTrue(files.any { it.fileName.toString() == "data.txt" })
+        val localStageDirectories = directories.filter {
+            it.startsWith(localParent) &&
+                it.toString().contains(".sixbridge-local-stage-")
+        }
+        val bIndex = localStageDirectories.indexOfLast { it.fileName.toString() == "b" }
+        val aIndex = localStageDirectories.indexOfLast { it.fileName.toString() == "a" }
+        val rootIndex = localStageDirectories.indexOfLast {
+            it.fileName.toString().startsWith(".sixbridge-local-stage-")
+        }
+        assertTrue(bIndex >= 0 && aIndex > bIndex && rootIndex > aIndex)
+    }
+
+    @Test
+    fun `local tree fsync covers nested files and directories and failures stay recoverable`() {
+        listOf("file", "directory").forEach { failureKind ->
+            val outputParent = Files.createTempDirectory("six-tree-fsync-output")
+            val output = outputParent.resolve("extension.crx")
+            Files.writeString(output, "old-output")
+            val localParent = Files.createTempDirectory("six-tree-fsync-local")
+            val destination = localParent.resolve("extension-id")
+            Files.createDirectory(destination)
+            destination.resolve("manifest.json").writeText("old-source")
+            val source = Files.createTempDirectory("six-tree-fsync-source")
+            val nested = Files.createDirectories(source.resolve("a/b"))
+            nested.resolve("data.txt").writeText("new-source")
+            val local = LocalSourcePublication(source, destination)
+            val operation = {
+                SecureBuildPublisher.publish(
+                    mapOf(output to "new-output".toByteArray()),
+                    local,
+                )
+            }
+
+            assertFails {
+                if (failureKind == "file") {
+                    BuildPublicationFaultInjection.failLocalFileFsyncWhen(
+                        { it.fileName.toString() == "data.txt" },
+                        operation,
+                    )
+                } else {
+                    BuildPublicationFaultInjection.failDirectoryFsyncWhen(
+                        { it.fileName.toString() == "b" },
+                        operation,
+                    )
+                }
+            }
+            assertTrue(Files.exists(outputParent.resolve(".sixbridge-publish-journal.v1")))
+            assertEquals("old-output", Files.readString(output))
+            assertEquals("old-source", destination.resolve("manifest.json").readText())
+
+            SecureBuildPublisher.recoverPending(listOf(output), local)
+            assertNoTransactionDebris(outputParent)
+            assertNoTransactionDebris(localParent)
+        }
+    }
+
+    @Test
     fun `orphan recovery never deletes an arbitrary same-prefix user directory`() {
         val parent = Files.createTempDirectory("six-publish-user-prefix")
         val userDirectory = parent.resolve(".sixbridge-publish-user-owned")
@@ -632,5 +949,29 @@ class SecureBuildPublisherTest {
             },
             entries.joinToString { it.fileName.toString() },
         )
+    }
+
+    private fun rewriteJournal(
+        journal: Path,
+        mutation: (MutableList<String>) -> Unit,
+    ) {
+        val lines = journal.readText().trimEnd('\n').split('\n').toMutableList()
+        mutation(lines)
+        val metadata = lines[1].split('|').toMutableList()
+        val checksumInput = (
+            listOf(lines.first(), metadata.take(5).joinToString("|")) +
+                lines.drop(2)
+            ).joinToString("\n", postfix = "\n")
+        metadata[5] = MessageDigest.getInstance("SHA-256")
+            .digest(checksumInput.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        lines[1] = metadata.joinToString("|")
+        journal.writeText(lines.joinToString("\n", postfix = "\n"))
+    }
+
+    private fun deleteTestTree(root: Path) {
+        Files.walk(root).use { paths ->
+            paths.sorted(Comparator.reverseOrder()).forEach(Files::delete)
+        }
     }
 }
