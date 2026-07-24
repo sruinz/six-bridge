@@ -242,6 +242,30 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
+    fun `compound callback expressions fail closed`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                function safe(event) {
+                  use(getSelection());
+                }
+                function unsafe(event) {
+                  if (event.button !== 0) return;
+                  use(getSelection());
+                }
+                document.addEventListener("mouseup", safe && unsafe);
+            """.trimIndent(),
+        )
+
+        val decision = MobilePatternAnalyzer().analyze(source, profile)
+            .decision("desktop-selection-event-bridge")
+
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertTrue("callback" in decision.evidence.single().detail)
+    }
+
+    @Test
     fun `requires approval for an inaccessible action popup with an existing content script`() {
         val source = extension(
             contentFile = "content.js",
@@ -458,6 +482,20 @@ class MobilePatternAnalyzerTest {
 
         assertNull(report.decision("storage-fallback"))
         assertTrue(report.usedApis.isEmpty())
+    }
+
+    @Test
+    fun `keeps division after a class expression as executable code`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource =
+                "const Constructor = class {} / chrome.storage.sync.value;",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        assertNotNull(report.decision("storage-fallback"))
+        assertEquals(setOf("storage"), report.usedApis)
     }
 
     private fun extension(

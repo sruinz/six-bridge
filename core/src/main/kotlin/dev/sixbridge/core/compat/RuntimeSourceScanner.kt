@@ -633,7 +633,7 @@ internal object JavaScriptLexicalMask {
         var regexAllowed = true
         var pendingControlKeyword: String? = null
         var pendingFunctionBlockResult: Boolean? = null
-        var pendingClass = false
+        var pendingClassBlockResult: Boolean? = null
         var blockExpected = false
         var expectedBlockResult = true
         var statementPosition = true
@@ -647,7 +647,7 @@ internal object JavaScriptLexicalMask {
             }
         }
 
-        fun functionDeclarationPosition(position: Int): Boolean {
+        fun declarationPosition(position: Int): Boolean {
             var cursor = position - 1
             while (cursor >= 0 && source[cursor].isWhitespace()) cursor--
             if (cursor < 0 || source[cursor] in setOf(';', '{', '}')) return true
@@ -693,16 +693,20 @@ internal object JavaScriptLexicalMask {
                         }
                         if (word == "function") {
                             pendingFunctionBlockResult =
-                                functionDeclarationPosition(index)
+                                declarationPosition(index)
                         }
-                        if (word == "class") pendingClass = true
-                        blockExpected = if (pendingClass) {
+                        if (word == "class") {
+                            pendingClassBlockResult = declarationPosition(index)
+                        }
+                        blockExpected = if (pendingClassBlockResult != null) {
                             true
                         } else {
                             word in BLOCK_PREFIX_KEYWORDS
                         }
                         if (blockExpected) expectedBlockResult = true
-                        if (!pendingClass && word !in STATEMENT_PREFIX_KEYWORDS) {
+                        if (pendingClassBlockResult == null &&
+                            word !in STATEMENT_PREFIX_KEYWORDS
+                        ) {
                             statementPosition = false
                         }
                         regexAllowed = word in REGEX_PREFIX_KEYWORDS
@@ -796,11 +800,12 @@ internal object JavaScriptLexicalMask {
                     }
                     current == '{' -> {
                         blockBraces += when {
-                            pendingClass -> true
+                            pendingClassBlockResult != null ->
+                                pendingClassBlockResult == true
                             blockExpected -> expectedBlockResult
                             else -> statementPosition
                         }
-                        pendingClass = false
+                        pendingClassBlockResult = null
                         blockExpected = false
                         expectedBlockResult = true
                         statementPosition = true

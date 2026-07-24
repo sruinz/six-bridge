@@ -260,15 +260,17 @@ class MobilePatternAnalyzer(
             val afterIdentifier = identifierEnd?.let {
                 skipWhitespace(codeOnly, it)
             }
-            if (identifierEnd != null &&
-                !codeOnly.startsWith("=>", afterIdentifier ?: -1)
-            ) {
-                readNamedFunctionCallback(
-                    codeOnly,
-                    codeOnly.substring(cursor, identifierEnd),
-                )
-            } else {
-                readArrowCallback(codeOnly, cursor)
+            when {
+                identifierEnd == null -> readArrowCallback(codeOnly, cursor)
+                codeOnly.startsWith("=>", afterIdentifier!!) ->
+                    readArrowCallback(codeOnly, cursor)
+                codeOnly.getOrNull(afterIdentifier) == ',' ||
+                    codeOnly.getOrNull(afterIdentifier) == ')' ->
+                    readNamedFunctionCallback(
+                        codeOnly,
+                        codeOnly.substring(cursor, identifierEnd),
+                    )
+                else -> null
             }
         }
     }
