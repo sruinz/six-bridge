@@ -76,5 +76,40 @@
 - 이 결과로 content script, MV3 background service worker, runtime 메시징,
   `storage.local` 경로의 실제 실행을 확인했다.
 
-게이트 A를 완료했다. 다음 단계는 네 확장의 Fold7 호환성 검증이며 Android
-관리자 앱 구현은 네 확장 검증 결과를 기록한 뒤 시작한다.
+게이트 A를 완료했다.
+
+## 스마트 컨텍스트 메뉴 실기기 결과
+
+네 확장 검증의 첫 대상으로 스마트 컨텍스트 메뉴를 Fold7에 설치했다.
+초기 산출물은 `resources.arsc`가 압축된 오래된 래퍼라 Android 11 설치 규칙에
+걸렸으며, 현행 빌더로 `versionCode 2`를 다시 생성했다. 새 래퍼는
+`zipalign`, APK v3 서명, SixBundle 해시 검증을 통과했고 다음 호스트 검사가
+성공했다.
+
+- 래퍼 APK 설치
+- `six://ex` Activity 해석
+- ContentProvider의 CRX3 스트림
+- 삼성 Add-ons 목록 표시와 활성화
+- 브라우저 재시작 뒤 `ON`, `OnExtensionLoaded`, `addAction` 등록
+
+그러나 action popup 진입점을 찾을 수 없었고, 터치로 본문 텍스트를 선택해도
+스마트 컨텍스트 메뉴 UI가 나타나지 않았다. 삼성 인터넷의 기본 선택 기능만
+표시됐다.
+
+소스와 런타임 로그를 비교한 결과 content script가 `mouseup`과 `mousedown`
+이벤트만 처리하고 모바일의 `touch`, `pointer`, `selectionchange`를 처리하지
+않는 것이 확인됐다. `contextMenus` 권한도 선언만 했고 실제 메뉴 등록 코드는
+없다.
+
+Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷이 시스템
+예약 이름 경고를 남겼지만, 해당 경고 뒤에 설치·로딩·action 등록이 계속
+완료됐으므로 주된 실행 실패와 분리해 기록한다.
+
+이 결과로 기존 정적 `compatible` 판정은 설치 API 호환성만 설명하며 모바일
+입력·UI 호환성을 과대 판정한다는 사실이 확인됐다. 네 확장 검증을 계속하기
+전에 확장별 하드코딩이 없는 범용 모바일 변환 엔진과 변환 상태 보고를
+구현해야 한다.
+
+또한 제공된 기준 APK는 `30.0.2.61`이지만 실기기 설치 버전은
+`30.0.0.67`로 확인됐다. 네 확장의 최종 합격 판정은 브라우저 버전을
+일치시키거나 설치 버전의 프로필을 별도로 검증한 뒤 수행한다.
