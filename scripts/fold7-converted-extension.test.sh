@@ -94,13 +94,13 @@ cat >"$before" <<'EOF'
   "adapterDecisions": [
     {
       "id": "action-popup-entry",
-      "version": 1,
+      "version": 2,
       "risk": "behavior-change",
       "disposition": "requires-approval",
       "applied": false,
       "evidence": [{"relativePath":"manifest.json","line":12,"detail":"action.default_popup=popup.html"}],
-      "changes": ["기존 content script에 action popup 보조 진입점을 추가합니다."],
-      "remainingLimitations": ["popup이 브라우저 action UI가 아닌 별도 탭에서 열립니다."]
+      "changes": ["삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다."],
+      "remainingLimitations": ["popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다."]
     },
     {
       "id": "desktop-selection-event-bridge",
@@ -134,14 +134,14 @@ jq '
 ' "$before" >"$after"
 
 six_assert_conversion_reports "$before" "$after"
-for mutation in extra version storage_evidence popup_risk selection_change popup_limit; do
+for mutation in extra popup_version popup_evidence popup_risk popup_change popup_limit; do
   broken="$fixture/after-$mutation.json"
   case "$mutation" in
     extra) jq '.adapterDecisions += [.adapterDecisions[0] | .id = "extra"]' "$after" >"$broken" ;;
-    version) jq '(.adapterDecisions[] | select(.id=="storage-fallback") | .version) = 2' "$after" >"$broken" ;;
-    storage_evidence) jq '(.adapterDecisions[] | select(.id=="storage-fallback") | .evidence[0].detail) = "변조"' "$after" >"$broken" ;;
+    popup_version) jq '(.adapterDecisions[] | select(.id=="action-popup-entry") | .version) = 1' "$after" >"$broken" ;;
+    popup_evidence) jq '(.adapterDecisions[] | select(.id=="action-popup-entry") | .evidence[0].detail) = "변조"' "$after" >"$broken" ;;
     popup_risk) jq '(.adapterDecisions[] | select(.id=="action-popup-entry") | .risk) = "safe"' "$after" >"$broken" ;;
-    selection_change) jq '(.adapterDecisions[] | select(.id=="desktop-selection-event-bridge") | .changes) = ["변조"]' "$after" >"$broken" ;;
+    popup_change) jq '(.adapterDecisions[] | select(.id=="action-popup-entry") | .changes) = ["변조"]' "$after" >"$broken" ;;
     popup_limit) jq '(.adapterDecisions[] | select(.id=="action-popup-entry") | .remainingLimitations) = []' "$after" >"$broken" ;;
   esac
   if six_assert_conversion_reports "$before" "$broken"; then

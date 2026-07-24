@@ -83,7 +83,7 @@ six_assert_conversion_reports() {
     def exact_keys:
       [.adapterDecisions[] | [.id, .version]] | sort ==
       [
-        ["action-popup-entry", 1],
+        ["action-popup-entry", 2],
         ["desktop-selection-event-bridge", 1],
         ["storage-fallback", 1]
       ];
@@ -99,9 +99,9 @@ six_assert_conversion_reports() {
       (.evidence[0].line | type) == "number" and
       .evidence[0].detail == "action.default_popup=popup.html" and
       .changes ==
-        ["기존 content script에 action popup 보조 진입점을 추가합니다."] and
+        ["삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다."] and
       .remainingLimitations ==
-        ["popup이 브라우저 action UI가 아닌 별도 탭에서 열립니다."]
+        ["popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다."]
     )) | length == 1) and
     (.adapterDecisions | map(select(
       .id == "desktop-selection-event-bridge" and
@@ -127,7 +127,7 @@ six_assert_conversion_reports() {
     def exact_keys:
       [.adapterDecisions[] | [.id, .version]] | sort ==
       [
-        ["action-popup-entry", 1],
+        ["action-popup-entry", 2],
         ["desktop-selection-event-bridge", 1],
         ["storage-fallback", 1]
       ];

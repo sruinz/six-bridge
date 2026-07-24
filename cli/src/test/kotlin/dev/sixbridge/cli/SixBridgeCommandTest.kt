@@ -1,6 +1,11 @@
 package dev.sixbridge.cli
 
 import dev.sixbridge.core.SixBridgeService
+import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.conversion.AdapterDecision
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.SourceEvidence
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.profile.BrowserProfile
@@ -171,6 +176,31 @@ class SixBridgeCommandTest {
                         path.split('/', '\\').none { it == ".." }
             },
         )
+        assertTrue(
+            """
+            {
+                "id": "action-popup-entry",
+                "version": 2,
+                "risk": "behavior-change",
+                "disposition": "requires-approval",
+                "applied": false,
+                "evidence": [
+                    {
+                        "relativePath": "manifest.json",
+                        "line": 6,
+                        "detail": "action.default_popup=popup.html"
+                    }
+                ],
+                "changes": [
+                    "삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다."
+                ],
+                "remainingLimitations": [
+                    "popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다."
+                ]
+            }
+            """.trimIndent().withoutLeadingIndent() in json.withoutLeadingIndent(),
+            json,
+        )
     }
 
     @Test
@@ -207,7 +237,15 @@ class SixBridgeCommandTest {
         assertEquals(0, result.exitCode, result.error)
         assertTrue(output.exists())
         val verified = SixDraft.read(output)
+        val popupBefore = verified.payload.compatibilityBefore.adapterDecisions.single {
+            it.id == "action-popup-entry"
+        }
+        val popupAfter = verified.payload.compatibilityAfter.adapterDecisions.single {
+            it.id == "action-popup-entry"
+        }
         assertEquals("converted", field(result.output, "conversion"))
+        assertPopupDecision(popupBefore, applied = false)
+        assertEquals(popupBefore.copy(applied = true), popupAfter)
         assertEquals(
             listOf(
                 "action-popup-entry",
@@ -544,6 +582,12 @@ class SixBridgeCommandTest {
             field(draftResult.output, "transformedSha256"),
             field(buildResult.output, "transformedSha256"),
         )
+        assertPopupDecision(
+            SixBundle.read(bundle).compatibility.adapterDecisions.single {
+                it.id == "action-popup-entry"
+            },
+            applied = true,
+        )
         assertTrue(bundle.exists())
     }
 
@@ -585,7 +629,10 @@ class SixBridgeCommandTest {
                         wrapperContract = WrapperContract.complete(),
                         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
                         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
-                        supportedFeatures = setOf("storage.local"),
+                        supportedFeatures = setOf(
+                            "storage.local",
+                            "extension.options-page.user-accessible",
+                        ),
                         unavailableFeatures = setOf("storage.sync"),
                     ),
                 ),
@@ -630,6 +677,38 @@ class SixBridgeCommandTest {
         output.lineSequence()
             .first { it.startsWith("$name=") }
             .substringAfter("=")
+
+    private fun String.withoutLeadingIndent(): String =
+        lineSequence().joinToString("\n") { it.trimStart() }
+
+    private fun assertPopupDecision(
+        actual: AdapterDecision,
+        applied: Boolean,
+    ) {
+        assertEquals(
+            AdapterDecision(
+                id = "action-popup-entry",
+                version = 2,
+                risk = AdapterRisk.BEHAVIOR_CHANGE,
+                disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                applied = applied,
+                evidence = listOf(
+                    SourceEvidence(
+                        relativePath = "manifest.json",
+                        line = 6,
+                        detail = "action.default_popup=popup.html",
+                    ),
+                ),
+                changes = listOf(
+                    "삼성 Add-ons 설정 메뉴에 기존 action popup을 연결합니다.",
+                ),
+                remainingLimitations = listOf(
+                    "popup은 삼성 Add-ons 상세 화면의 설정 메뉴에서 별도 탭으로 열립니다.",
+                ),
+            ),
+            actual,
+        )
+    }
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256")

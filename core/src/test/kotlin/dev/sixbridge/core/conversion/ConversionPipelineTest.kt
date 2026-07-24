@@ -77,6 +77,40 @@ class ConversionPipelineTest {
     }
 
     @Test
+    fun `converted popup uses an option page without runtime injection`() {
+        val source = convertibleSource(
+            "six-pipeline-options-entry",
+            includePopup = true,
+        )
+        val result = ConversionPipeline(
+            Files.createTempDirectory("six-pipeline-options-entry-local"),
+        ).use {
+            it.prepare(
+                resolvedSource(source),
+                profile().copy(
+                    supportedFeatures =
+                        setOf("extension.options-page.user-accessible"),
+                ),
+                listOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY),
+            )
+        }
+        val extracted = Files.createTempDirectory("six-options-entry")
+        ExtensionZip.extract(result.sourceZip, extracted)
+        val manifest = extracted.resolve("manifest.json").readText()
+
+        assertTrue("\"options_ui\"" in manifest)
+        assertTrue(Files.exists(extracted.resolve("_sixbridge/action-popup-entry.v2.json")))
+        listOf(
+            "_sixbridge/action-popup-entry-content.v1.js",
+            "_sixbridge/action-popup-entry-background.v1.js",
+            "_sixbridge-action-popup-entry-bootstrap.v1.js",
+        ).forEach { relativePath ->
+            assertFalse(Files.exists(extracted.resolve(relativePath)), relativePath)
+            assertFalse(relativePath in manifest, relativePath)
+        }
+    }
+
+    @Test
     fun `verified passthrough CRX preserves original bytes proof and id`() {
         val localRoot = Files.createTempDirectory("six-pipeline-passthrough")
         val source = plainSource("six-pipeline-passthrough-source")
