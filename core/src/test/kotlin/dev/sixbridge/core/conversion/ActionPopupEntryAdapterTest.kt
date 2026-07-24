@@ -238,6 +238,51 @@ class ActionPopupEntryAdapterTest {
     }
 
     @Test
+    fun `rejects options page added to exact application without changing bytes`() {
+        val source = extension()
+        val selected = approvedSelection(source)
+        applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            selected,
+        )
+        source.resolve("manifest.json").writeText(
+            JsonObject(
+                manifest(source) + ("options_page" to JsonPrimitive("popup.html")),
+            ).toString(),
+        )
+        val manifestBefore = source.resolve("manifest.json").readBytes()
+        val provenanceBefore = source.resolve(
+            "_sixbridge/action-popup-entry.v2.json",
+        ).readBytes()
+
+        assertFalse(
+            ActionPopupEntryAdapter().isExactlyApplied(
+                source,
+                manifest(source),
+                "popup.html",
+            ),
+        )
+        val rejected = applyAdapterToSource(
+            source,
+            profile,
+            ActionPopupEntryAdapter(),
+            selected,
+        )
+
+        assertFalse(rejected.applied)
+        assertContentEquals(
+            manifestBefore,
+            source.resolve("manifest.json").readBytes(),
+        )
+        assertContentEquals(
+            provenanceBefore,
+            source.resolve("_sixbridge/action-popup-entry.v2.json").readBytes(),
+        )
+    }
+
+    @Test
     fun `does not create version one runtime assets`() {
         val source = extension(worker = "background.js")
         applyApproved(source)

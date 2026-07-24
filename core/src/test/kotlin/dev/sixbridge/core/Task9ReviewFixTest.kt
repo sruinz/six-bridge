@@ -204,6 +204,7 @@ class Task9ReviewFixTest {
         wrapperContract = WrapperContract.complete(),
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
     private fun rsa() = KeyPairGenerator.getInstance("RSA")

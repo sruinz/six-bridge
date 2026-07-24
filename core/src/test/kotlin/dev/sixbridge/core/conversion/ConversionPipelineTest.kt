@@ -396,7 +396,10 @@ class ConversionPipelineTest {
                 "\nchrome.storage.sync.get(\"theme\").then(console.log);\n",
         )
         val fallbackProfile = profile().copy(
-            supportedFeatures = setOf("storage.local"),
+            supportedFeatures = setOf(
+                "storage.local",
+                "extension.options-page.user-accessible",
+            ),
             unavailableFeatures = setOf("storage.sync"),
         )
 
@@ -730,5 +733,6 @@ class ConversionPipelineTest {
         wrapperContract = WrapperContract.complete(),
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 }

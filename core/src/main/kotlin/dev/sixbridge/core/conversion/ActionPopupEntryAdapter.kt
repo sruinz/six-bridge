@@ -78,6 +78,7 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         val options = manifest[OPTIONS_UI] as? JsonObject ?: return false
         val openInTab = options[OPEN_IN_TAB] as? JsonPrimitive
         if (
+            OPTIONS_PAGE in manifest ||
             options.keys != setOf(PAGE, OPEN_IN_TAB) ||
             options.stringOrNull(PAGE) != canonicalPopup ||
             openInTab == null ||

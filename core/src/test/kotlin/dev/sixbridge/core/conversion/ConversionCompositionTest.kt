@@ -3,6 +3,9 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Files
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -11,6 +14,7 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ConversionCompositionTest {
@@ -23,7 +27,10 @@ class ConversionCompositionTest {
         wrapperContract = WrapperContract.complete(),
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
-        supportedFeatures = setOf("storage.local"),
+        supportedFeatures = setOf(
+            "storage.local",
+            "extension.options-page.user-accessible",
+        ),
         unavailableFeatures = setOf("storage.sync"),
     )
 
@@ -44,9 +51,37 @@ class ConversionCompositionTest {
                 plan.selectedAdapters.map(SelectedAdapter::id),
             )
             assertTrue(applied.all(AdapterDecision::applied))
-            val manifest = snapshot.workingRoot.resolve("manifest.json").readText()
-            assertTrue("action-popup-entry-content.v1.js" in manifest)
-            assertTrue("desktop-selection-event-bridge.v1.js" in manifest)
+            val manifest = Json.parseToJsonElement(
+                snapshot.workingRoot.resolve("manifest.json").readText(),
+            ) as JsonObject
+            assertEquals(
+                JsonObject(
+                    linkedMapOf(
+                        "page" to JsonPrimitive("popup.html"),
+                        "open_in_tab" to JsonPrimitive(true),
+                    ),
+                ),
+                manifest["options_ui"],
+            )
+            assertEquals(
+                """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
+                snapshot.workingRoot
+                    .resolve("_sixbridge/action-popup-entry.v2.json")
+                    .readText(),
+            )
+            listOf(
+                "_sixbridge/action-popup-entry-content.v1.js",
+                "_sixbridge/action-popup-entry-background.v1.js",
+                "_sixbridge-action-popup-entry-bootstrap.v1.js",
+            ).forEach { relativePath ->
+                assertFalse(
+                    Files.exists(snapshot.workingRoot.resolve(relativePath)),
+                    relativePath,
+                )
+            }
+            assertTrue(
+                "desktop-selection-event-bridge.v1.js" in manifest.toString(),
+            )
             assertTrue(
                 "chrome.storage.local" in
                     snapshot.workingRoot.resolve("content.js").readText(),
