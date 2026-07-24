@@ -5,11 +5,21 @@ import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionPipeline
+import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.CrxIdentityPolicy
 import dev.sixbridge.core.conversion.LocalSourcePublication
 import dev.sixbridge.core.conversion.SecureBuildPublisher
+import dev.sixbridge.core.draft.DraftConversionPlan
+import dev.sixbridge.core.draft.DraftInputMetadata
+import dev.sixbridge.core.draft.DraftMetadata
+import dev.sixbridge.core.draft.DraftSelectedAdapter
+import dev.sixbridge.core.draft.DraftSigningKeyStore
+import dev.sixbridge.core.draft.DraftSourceKind
+import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.draft.SixDraftPayload
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
+import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.ResolvedExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.wrapper.AndroidToolchain
@@ -25,6 +35,18 @@ data class SixBuildResult(
     val wrapperApk: Path,
     val bundle: Path,
     val compatibility: CompatibilityReport,
+    val compatibilityBefore: CompatibilityReport,
+    val adapterIds: List<String>,
+    val sourceSha256: String,
+    val transformedSha256: String,
+)
+
+data class SixDraftResult(
+    val draft: Path,
+    val conversionState: ConversionState,
+    val adapterIds: List<String>,
+    val sourceSha256: String,
+    val transformedSha256: String,
 )
 
 class SixBridgeService(
@@ -39,6 +61,96 @@ class SixBridgeService(
         val resolved = inputResolver.resolve(input)
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             pipeline.analyze(resolved, profile)
+        }
+    }
+
+    fun draft(
+        input: String,
+        profile: BrowserProfile,
+        outputDraft: Path,
+        projectIdentity: String? = null,
+        approvedAdapterIds: Iterable<String> = emptyList(),
+    ): SixDraftResult {
+        val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
+        return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
+            val prepared = pipeline.prepare(resolved, profile, approvedAdapterIds)
+            val applied = prepared.compatibilityAfter.adapterDecisions
+                .filter { it.applied }
+                .sortedWith(compareBy({ it.id }, { it.version }))
+            val before = prepared.compatibilityBefore.copy(
+                originalExtensionId = resolved.expectedExtensionId
+                    ?: prepared.compatibilityBefore.originalExtensionId,
+            )
+            val after = if (applied.isEmpty()) {
+                before.copy(convertedExtensionId = before.originalExtensionId)
+            } else {
+                prepared.compatibilityAfter
+            }
+            val sourceIdentity = prepared.logicalIdentity
+                ?: resolved.expectedExtensionId
+                ?: prepared.extensionId
+            val sourceKind = if (applied.isEmpty() && resolved.crxBytes != null) {
+                DraftSourceKind.CRX
+            } else {
+                DraftSourceKind.ZIP
+            }
+            val source = if (sourceKind == DraftSourceKind.CRX) {
+                requireNotNull(resolved.crxBytes).copyOf()
+            } else if (applied.isEmpty()) {
+                ExtensionZip.createBytes(
+                    requireNotNull(resolved.sourceRoot),
+                    includeProjectMarker = true,
+                )
+            } else {
+                prepared.sourceZip
+            }
+            val payload = SixDraftPayload.create(
+                draft = DraftMetadata.create(
+                    coreVersion = CORE_VERSION,
+                    adapterVersions = applied.associate { it.id to it.version },
+                    sourceIdentity = sourceIdentity,
+                ),
+                input = DraftInputMetadata(
+                    inputKind = resolved.kind,
+                    originalSourceSha256 = requireNotNull(
+                        before.sourceSha256,
+                    ),
+                    browserProfileSha256 = requireNotNull(
+                        before.browserProfileSha256,
+                    ),
+                    originalExtensionId = before.originalExtensionId,
+                    originalExtensionVersion = requireNotNull(
+                        before.extensionVersion,
+                    ),
+                    sourceIdentity = sourceIdentity,
+                ),
+                sourceKind = sourceKind,
+                source = source,
+                plan = DraftConversionPlan.create(
+                    before,
+                    applied.map { DraftSelectedAdapter(it.id, it.version) },
+                ),
+                compatibilityBefore = before,
+                compatibilityAfter = after,
+            )
+            val target = outputDraft.toAbsolutePath().normalize()
+            val key = DraftSigningKeyStore(
+                trustedRoot = workspaceRoot,
+                keyRoot = localRoot.resolve("keystore/draft-transfer"),
+            ).getOrCreate()
+            SixDraft.write(target, payload, key)
+            SixDraft.read(target)
+            SixDraftResult(
+                draft = target,
+                conversionState = after.conversionState,
+                adapterIds = applied.map { it.id },
+                sourceSha256 = requireNotNull(
+                    before.sourceSha256,
+                ),
+                transformedSha256 = requireNotNull(
+                    after.sourceSha256,
+                ),
+            )
         }
     }
 
@@ -117,6 +229,15 @@ class SixBridgeService(
                 wrapperApk = wrapperOutput,
                 bundle = bundleOutput,
                 compatibility = compatibility,
+                compatibilityBefore = prepared.compatibilityBefore,
+                adapterIds = compatibility.adapterDecisions
+                    .filter { it.applied }
+                    .map { it.id }
+                    .sorted(),
+                sourceSha256 = requireNotNull(
+                    prepared.compatibilityBefore.sourceSha256,
+                ),
+                transformedSha256 = requireNotNull(compatibility.sourceSha256),
             )
         }
     }
@@ -162,5 +283,9 @@ class SixBridgeService(
         val extensionId: String,
         val bytes: ByteArray,
     )
+
+    companion object {
+        private const val CORE_VERSION = "0.1.0-SNAPSHOT"
+    }
 
 }

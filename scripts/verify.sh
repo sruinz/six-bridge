@@ -15,9 +15,14 @@ if [ -n "${JAVA_HOME:-}" ] && [ ! -x "$JAVA_HOME/bin/java" ]; then
 fi
 
 GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
-  "$gradle_command" clean test installDist
+  "$gradle_command" -Pkotlin.jvm.target.validation.mode=IGNORE \
+  clean test installDist
 
 node --test fixtures/minimal-mv3/background.test.mjs \
-  fixtures/minimal-mv3/content.test.mjs
+  fixtures/minimal-mv3/content.test.mjs \
+  fixtures/desktop-mobile-golden/action-entry.test.mjs \
+  fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
+  fixtures/desktop-mobile-golden/storage-fallback.test.mjs
 
 bash -n scripts/fold7-gate.sh
+bash scripts/verify-mobile-conversion.sh

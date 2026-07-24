@@ -3,6 +3,7 @@ package dev.sixbridge.cli
 import dev.sixbridge.core.SixBridgeService
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.MissingAdapterApprovalException
 import dev.sixbridge.core.device.AdbDeviceClient
 import dev.sixbridge.core.profile.BrowserProfileExtractor
 import dev.sixbridge.core.profile.BrowserProfileJson
@@ -19,15 +20,23 @@ import kotlin.io.path.writeText
 import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
+    exitProcess(createCommandLine().execute(*args))
+}
+
+fun createCommandLine(): CommandLine {
     val command = CommandLine(SixBridgeCommand())
     command.executionExceptionHandler = CommandLine.IExecutionExceptionHandler { error, line, _ ->
         line.err.println("오류: ${error.message}")
         if (System.getenv("SIXBRIDGE_DEBUG") == "1") {
             error.printStackTrace(line.err)
         }
-        1
+        when (error) {
+            is MissingAdapterApprovalException -> 4
+            is IllegalArgumentException -> 2
+            else -> 1
+        }
     }
-    exitProcess(command.execute(*args))
+    return command
 }
 
 @Command(
@@ -38,6 +47,7 @@ fun main(args: Array<String>) {
     subcommands = [
         ProfileCommand::class,
         AnalyzeCommand::class,
+        DraftCommand::class,
         BuildCommand::class,
         DeviceCommand::class,
     ],
@@ -129,6 +139,56 @@ class AnalyzeCommand : Callable<Int> {
 }
 
 @Command(
+    name = "draft",
+    mixinStandardHelpOptions = true,
+    description = ["모바일 변환 결과를 서명된 SixDraft로 생성하고 즉시 검증합니다."],
+)
+class DraftCommand : Callable<Int> {
+    @ParentCommand
+    lateinit var root: SixBridgeCommand
+
+    @Option(names = ["--input"], required = true)
+    lateinit var input: String
+
+    @Option(names = ["--profile"], required = true)
+    lateinit var profilePath: Path
+
+    @Option(names = ["--output"], required = true)
+    lateinit var output: Path
+
+    @Option(
+        names = ["--identity"],
+        description = ["markerless 업데이트 ZIP에 사용할 source project identity"],
+    )
+    var projectIdentity: String? = null
+
+    @Option(names = ["--approve-adapter"])
+    var approvedAdapterIds: MutableSet<String> = linkedSetOf()
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val profile = BrowserProfileJson.decode(profilePath.readText())
+        val result = SixBridgeService(root.workspace).draft(
+            input = input,
+            profile = profile,
+            outputDraft = output,
+            projectIdentity = projectIdentity,
+            approvedAdapterIds = approvedAdapterIds,
+        )
+        spec.commandLine().out.println(
+            "conversion=${result.conversionState.name.lowercase()}",
+        )
+        spec.commandLine().out.println("adapters=${result.adapterIds.joinToString(",")}")
+        spec.commandLine().out.println("sourceSha256=${result.sourceSha256}")
+        spec.commandLine().out.println("transformedSha256=${result.transformedSha256}")
+        spec.commandLine().out.println("draft=${result.draft}")
+        return 0
+    }
+}
+
+@Command(
     name = "build",
     mixinStandardHelpOptions = true,
     description = ["CRX3, 서명된 Android 래퍼 APK와 SixBundle을 생성합니다."],
@@ -152,6 +212,9 @@ class BuildCommand : Callable<Int> {
     )
     var projectIdentity: String? = null
 
+    @Option(names = ["--approve-adapter"])
+    var approvedAdapterIds: MutableSet<String> = linkedSetOf()
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
@@ -162,7 +225,14 @@ class BuildCommand : Callable<Int> {
             profile,
             output,
             projectIdentity,
+            approvedAdapterIds,
         )
+        spec.commandLine().out.println(
+            "conversion=${result.compatibility.conversionState.name.lowercase()}",
+        )
+        spec.commandLine().out.println("adapters=${result.adapterIds.joinToString(",")}")
+        spec.commandLine().out.println("sourceSha256=${result.sourceSha256}")
+        spec.commandLine().out.println("transformedSha256=${result.transformedSha256}")
         spec.commandLine().out.println("extensionId=${result.extensionId}")
         spec.commandLine().out.println("compatibility=${result.compatibility.status.name.lowercase()}")
         spec.commandLine().out.println("crx=${result.crx.toAbsolutePath()}")

@@ -5,12 +5,34 @@ SIX Bridge는 삼성 인터넷 APK를 수정하지 않는다. 확장 프로그�
 인터넷에서 확인된 개발용 확장 검색 계약을 사용한다.
 
 ```text
-소스 / ZIP ── 고정 RSA 키 ── CRX3 ─────────┐
-                                           ├─ 서명된 wrapper.apk ─┐
-Chrome 웹 스토어 URL ── 원본 CRX3 보존 ───┘                      ├─ SixBundle
-호환성 분석기 ───────────────────────────── compatibility.json ─┤
-확장·서명자 메타데이터 ──────────────────── extension.json ─────┘
+원본 ── analyze ── 호환성·모바일 패턴 보고서
+  │
+  ├── draft + 승인 ── 임시 변환 ── 서명된 SixDraft ── Android 관리자
+  │
+  └── build + 승인 ── 임시 변환 ── CRX3 ── wrapper.apk ── SixBundle
 ```
+
+## 호환성 분석과 변환 경계
+
+호환성은 원본 확장이 삼성 인터넷에서 어떤 API를 사용할 수 있는지에 대한
+판정이다. 변환은 호환성 보고서가 식별한 데스크톱 전용 동작을 모바일
+어댑터로 바꾸는 별도 단계다. `analyze`는 변환 계획까지만 계산하며 출력
+보고서 외의 빌드 파일을 만들지 않는다.
+
+어댑터는 안전하게 의미가 보존되는 `automatic`, 사용자에게 보이는 동작이
+달라 명시 승인이 필요한 `requires-approval`, 안전한 변환을 증명할 수 없는
+`unavailable`로 구분한다. 승인 목록은 집합으로 정규화되며, 순서가 달라도
+동일한 source와 계획은 동일한 SixDraft를 만든다.
+
+`draft`는 공용 변환 파이프라인의 결과와 전후 호환성 보고서를
+`.local/keystore/draft-transfer/`의 Ed25519 키로 서명한다. 생성 직후 strict
+reader로 다시 읽어 서명, 항목 제한, source·계획 hash 결합을 확인한다.
+데스크톱 앱은 이 전달물을 만들 수 있고 Android 관리자는 같은 전달물을
+검증한 뒤 최종 일반 사용자용 서명과 설치 승인을 담당한다.
+
+`build`는 같은 변환 결과를 개발용 CRX3·래퍼 APK·SixBundle에 연결한다.
+ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확인하기 위한
+검증 경로일 뿐, 일반 사용자 흐름의 필수 구성요소가 아니다.
 
 ## 신뢰 및 식별자 경계
 
@@ -20,7 +42,10 @@ Chrome 웹 스토어 URL ── 원본 CRX3 보존 ───┘                 
 - `.local/keystore/wrapper.p12`는 모든 래퍼 APK에 서명한다. 비밀번호는
   소유자만 읽을 수 있는 `.local/keystore/wrapper.pass`에 저장한다.
 - Chrome 웹 스토어 CRX3 입력은 다시 패킹하지 않는다. 원본 바이트, 서명,
-  확장 ID를 그대로 보존한다.
+  확장 ID를 그대로 보존한다. 다만 모바일 어댑터를 적용해 source가 바뀌면
+  변환 전용 키로 다시 패킹하므로 원본 스토어 ID와 달라질 수 있다.
+- `.local/keystore/draft-transfer/`에는 데스크톱과 Android 관리자 사이의
+  SixDraft 전달 서명용 Ed25519 공개 키와 개인 키를 분리해 저장한다.
 - 래퍼 패키지명은 `dev.sixbridge.ext.<extensionId>`이다. 서명된 APK 검증이
   성공한 뒤에만 `versionCode`를 확정한다.
 

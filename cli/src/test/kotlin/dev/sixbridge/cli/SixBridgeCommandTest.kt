@@ -1,5 +1,7 @@
 package dev.sixbridge.cli
 
+import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
@@ -7,13 +9,19 @@ import picocli.CommandLine
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.nio.file.Files
+import java.nio.file.Path
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.exists
+import kotlin.io.path.readBytes
 import kotlin.io.path.readText
+import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SixBridgeCommandTest {
@@ -28,6 +36,7 @@ class SixBridgeCommandTest {
         assertEquals(0, exit)
         assertTrue("profile" in output.toString())
         assertTrue("analyze" in output.toString())
+        assertTrue("draft" in output.toString())
         assertTrue("build" in output.toString())
         assertTrue("device" in output.toString())
     }
@@ -107,4 +116,324 @@ class SixBridgeCommandTest {
         assertEquals(0, exit)
         assertTrue("\"status\": \"compatible\"" in report.readText())
     }
+
+    @Test
+    fun `analyze reports conversion state adapter decisions and relative evidence`() {
+        val workspace = Files.createTempDirectory("six-cli-conversion-analyze")
+        val profile = writeProfile(workspace)
+        val report = workspace.resolve("conversion.json")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "analyze",
+            "--input", conversionFixture(workspace).toString(),
+            "--profile", profile.toString(),
+            "--output", report.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        val json = report.readText()
+        assertTrue(
+            "\"conversionState\": \"requires-approval\"" in json,
+            json,
+        )
+        setOf(
+            "action-popup-entry",
+            "desktop-selection-event-bridge",
+            "storage-fallback",
+        ).forEach { id ->
+            assertTrue("\"id\": \"$id\"" in json)
+        }
+        assertTrue(
+            """"relativePath":\s*"([^"]+)"""".toRegex()
+                .findAll(json)
+                .map { it.groupValues[1] }
+                .all { path ->
+                    !Path.of(path).isAbsolute &&
+                        path.split('/', '\\').none { it == ".." }
+                },
+        )
+    }
+
+    @Test
+    fun `draft requires popup approval and leaves no output`() {
+        val workspace = Files.createTempDirectory("six-cli-draft-approval")
+        val output = workspace.resolve("missing.sixdraft")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", goldenFixture().toString(),
+            "--profile", writeProfile(workspace).toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(4, result.exitCode, result.error)
+        assertFalse(output.exists())
+    }
+
+    @Test
+    fun `approved draft is self verified and prints fixed conversion fields`() {
+        val workspace = Files.createTempDirectory("six-cli-draft-success")
+        val output = workspace.resolve("approved.sixdraft")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", goldenFixture().toString(),
+            "--profile", writeProfile(workspace).toString(),
+            "--approve-adapter", "action-popup-entry",
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        assertTrue(output.exists())
+        val verified = SixDraft.read(output)
+        assertEquals("converted", field(result.output, "conversion"))
+        assertEquals(
+            listOf(
+                "action-popup-entry",
+                "desktop-selection-event-bridge",
+            ),
+            field(result.output, "adapters").split(","),
+        )
+        assertEquals(
+            verified.payload.input.originalSourceSha256,
+            field(result.output, "sourceSha256"),
+        )
+        assertEquals(
+            verified.payload.compatibilityAfter.sourceSha256,
+            field(result.output, "transformedSha256"),
+        )
+        assertEquals(
+            output.toAbsolutePath().normalize().toString(),
+            field(result.output, "draft"),
+        )
+    }
+
+    @Test
+    fun `unknown and undetected adapter approvals are user input errors`() {
+        listOf("not-an-adapter", "storage-fallback").forEach { adapter ->
+            val workspace = Files.createTempDirectory("six-cli-invalid-approval")
+            val source = workspace.resolve("source").also(Files::createDirectory)
+            source.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Plain","version":"1"}""",
+            )
+            val result = execute(
+                "--workspace", workspace.toString(),
+                "draft",
+                "--input", source.toString(),
+                "--profile", writeProfile(workspace).toString(),
+                "--approve-adapter", adapter,
+                "--output", workspace.resolve("invalid.sixdraft").toString(),
+            )
+
+            assertEquals(2, result.exitCode, "$adapter: ${result.error}")
+        }
+    }
+
+    @Test
+    fun `draft preserves a compatible local source as passthrough`() {
+        val workspace = Files.createTempDirectory("six-cli-source-passthrough")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain","version":"1"}""",
+        )
+        val output = workspace.resolve("plain.sixdraft")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", writeProfile(workspace).toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        assertEquals("passthrough", field(result.output, "conversion"))
+        assertEquals(
+            SixDraft.read(output).payload.input.originalSourceSha256,
+            field(result.output, "transformedSha256"),
+        )
+    }
+
+    @Test
+    fun `draft preserves a verified CRX as passthrough`() {
+        val workspace = Files.createTempDirectory("six-cli-crx-passthrough")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"CRX","version":"1"}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val crx = workspace.resolve("plain.crx").also { it.writeBytes(packed.bytes) }
+        val output = workspace.resolve("plain-crx.sixdraft")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", crx.toString(),
+            "--profile", writeProfile(workspace).toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        val verified = SixDraft.read(output)
+        assertEquals("passthrough", field(result.output, "conversion"))
+        assertEquals(packed.extensionId, verified.payload.input.originalExtensionId)
+        assertEquals(packed.extensionId, verified.payload.compatibilityAfter.convertedExtensionId)
+    }
+
+    @Test
+    fun `approval order does not change draft hash`() {
+        val workspace = Files.createTempDirectory("six-cli-draft-order")
+        val profile = writeProfile(workspace)
+        val first = workspace.resolve("first.sixdraft")
+        val second = workspace.resolve("second.sixdraft")
+        val firstResult = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", goldenFixture().toString(),
+            "--profile", profile.toString(),
+            "--approve-adapter", "action-popup-entry",
+            "--approve-adapter", "desktop-selection-event-bridge",
+            "--output", first.toString(),
+        )
+        val secondResult = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", goldenFixture().toString(),
+            "--profile", profile.toString(),
+            "--approve-adapter", "desktop-selection-event-bridge",
+            "--approve-adapter", "action-popup-entry",
+            "--output", second.toString(),
+        )
+
+        assertEquals(0, firstResult.exitCode, firstResult.error)
+        assertEquals(0, secondResult.exitCode, secondResult.error)
+        assertEquals(sha256(first.readBytes()), sha256(second.readBytes()))
+    }
+
+    @Test
+    fun `build accepts popup approval and uses the draft transformed source hash`() {
+        val workspace = Files.createTempDirectory("six-cli-build-conversion")
+        val profile = writeProfile(workspace)
+        val draft = workspace.resolve("fixture.sixdraft")
+        val bundle = workspace.resolve("fixture.six")
+        val draftResult = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", goldenFixture().toString(),
+            "--profile", profile.toString(),
+            "--approve-adapter", "action-popup-entry",
+            "--output", draft.toString(),
+        )
+        val buildResult = execute(
+            "--workspace", workspace.toString(),
+            "build",
+            "--input", goldenFixture().toString(),
+            "--profile", profile.toString(),
+            "--approve-adapter", "action-popup-entry",
+            "--output", bundle.toString(),
+        )
+
+        assertEquals(0, draftResult.exitCode, draftResult.error)
+        assertEquals(0, buildResult.exitCode, buildResult.error)
+        assertEquals(
+            field(draftResult.output, "transformedSha256"),
+            field(buildResult.output, "transformedSha256"),
+        )
+        assertTrue(bundle.exists())
+    }
+
+    private fun execute(vararg arguments: String): Execution {
+        val output = StringWriter()
+        val error = StringWriter()
+        val command = createCommandLine()
+        command.out = PrintWriter(output)
+        command.err = PrintWriter(error)
+        return Execution(
+            command.execute(*arguments),
+            output.toString(),
+            error.toString(),
+        )
+    }
+
+    private fun writeProfile(workspace: Path): Path =
+        workspace.resolve("profile.json").also { path ->
+            path.writeText(
+                BrowserProfileJson.encode(
+                    BrowserProfile(
+                        browserPackage = "com.sec.android.app.sbrowser",
+                        versionName = "30.0.2.61",
+                        versionCode = 1_300_261_502,
+                        majorVersion = 30,
+                        supportedApis = setOf(
+                            "action",
+                            "runtime",
+                            "storage",
+                            "tabs",
+                        ),
+                        wrapperContract = WrapperContract.complete(),
+                        sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+                        sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+                        supportedFeatures = setOf("storage.local"),
+                        unavailableFeatures = setOf("storage.sync"),
+                    ),
+                ),
+            )
+        }
+
+    private fun goldenFixture(): Path =
+        Path.of("../fixtures/desktop-mobile-golden").toAbsolutePath().normalize()
+
+    private fun conversionFixture(workspace: Path): Path {
+        val source = goldenFixture()
+        val target = workspace.resolve("desktop-mobile-golden")
+        Files.walk(source).use { paths ->
+            paths.forEach { path ->
+                val relative = source.relativize(path)
+                val destination = target.resolve(relative)
+                if (Files.isDirectory(path)) {
+                    Files.createDirectories(destination)
+                } else {
+                    Files.copy(path, destination)
+                }
+            }
+        }
+        target.resolve("storage-input.js").writeText(
+            """
+            chrome.storage.sync.get("theme");
+            chrome?.storage?.sync.set({ mobile: true });
+            """.trimIndent(),
+        )
+        target.resolve("background.js").writeText("void 0;")
+        val manifest = target.resolve("manifest.json")
+        manifest.writeText(
+            manifest.readText().replace(
+                """"js": ["content.js"]""",
+                """"js": ["content.js", "storage-input.js"]""",
+            ),
+        )
+        return target
+    }
+
+    private fun field(output: String, name: String): String =
+        output.lineSequence()
+            .first { it.startsWith("$name=") }
+            .substringAfter("=")
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private data class Execution(
+        val exitCode: Int,
+        val output: String,
+        val error: String,
+    )
 }
