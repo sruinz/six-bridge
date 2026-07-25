@@ -21,7 +21,8 @@ GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
 node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/minimal-mv3/content.test.mjs \
   fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
-  fixtures/desktop-mobile-golden/storage-fallback.test.mjs
+  fixtures/desktop-mobile-golden/storage-fallback.test.mjs \
+  scripts/ai-recipe-lan-receiver.test.mjs
 
 bash -n scripts/fold7-gate.sh
 for shell_file in \
