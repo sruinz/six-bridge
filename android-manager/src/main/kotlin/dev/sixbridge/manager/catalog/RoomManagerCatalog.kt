@@ -18,5 +18,11 @@ class RoomManagerCatalog(
         dao.delete(packageName)
     }
 
+    override suspend fun removeAll(packageNames: Set<String>) {
+        if (packageNames.isNotEmpty()) {
+            dao.deleteAll(packageNames)
+        }
+    }
+
     override suspend fun get(packageName: String): CatalogRecord? = dao.get(packageName)?.toRecord()
 }

@@ -52,6 +52,8 @@ class ManagerDatabaseTest {
         )
         catalog.replaceVerified(replacement)
         catalog.replaceVerified(record(packageName = "dev.sixbridge.ext.two"))
+        catalog.replaceVerified(record(packageName = "dev.sixbridge.ext.stale-one"))
+        catalog.replaceVerified(record(packageName = "dev.sixbridge.ext.stale-two"))
 
         val stored = requireNotNull(catalog.get(first.packageName))
         assertEquals("Updated extension", stored.name)
@@ -59,12 +61,31 @@ class ManagerDatabaseTest {
         assertNull(stored.iconPng)
         assertNull(stored.reportJson)
         assertEquals(
-            listOf("dev.sixbridge.ext.one", "dev.sixbridge.ext.two"),
+            listOf(
+                "dev.sixbridge.ext.one",
+                "dev.sixbridge.ext.stale-one",
+                "dev.sixbridge.ext.stale-two",
+                "dev.sixbridge.ext.two",
+            ),
             catalog.observe().first().map(CatalogRecord::packageName),
         )
 
         catalog.remove(first.packageName)
         assertNull(catalog.get(first.packageName))
+
+        catalog.removeAll(
+            setOf("dev.sixbridge.ext.stale-one", "dev.sixbridge.ext.stale-two"),
+        )
+        assertEquals(
+            listOf("dev.sixbridge.ext.two"),
+            catalog.observe().first().map(CatalogRecord::packageName),
+        )
+
+        catalog.removeAll(emptySet())
+        assertEquals(
+            listOf("dev.sixbridge.ext.two"),
+            catalog.observe().first().map(CatalogRecord::packageName),
+        )
     }
 
     private fun record(

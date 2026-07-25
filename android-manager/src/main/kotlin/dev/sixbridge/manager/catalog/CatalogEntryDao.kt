@@ -18,4 +18,7 @@ interface CatalogEntryDao {
 
     @Query("DELETE FROM catalog_entries WHERE packageName = :packageName")
     suspend fun delete(packageName: String)
+
+    @Query("DELETE FROM catalog_entries WHERE packageName IN (:packageNames)")
+    suspend fun deleteAll(packageNames: Set<String>)
 }

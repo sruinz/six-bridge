@@ -52,9 +52,7 @@ class CatalogReconciler {
             catalogRecords = catalog.observe().first(),
             installedWrappers = installedWrappers.findAll(),
         )
-        for (packageName in reconciliation.stalePackageNames) {
-            catalog.remove(packageName)
-        }
+        catalog.removeAll(reconciliation.stalePackageNames.toSet())
         return reconciliation
     }
 }

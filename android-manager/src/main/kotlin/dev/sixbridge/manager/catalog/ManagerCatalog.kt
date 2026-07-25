@@ -18,5 +18,6 @@ interface ManagerCatalog {
     fun observe(): Flow<List<CatalogRecord>>
     suspend fun replaceVerified(record: CatalogRecord)
     suspend fun remove(packageName: String)
+    suspend fun removeAll(packageNames: Set<String>)
     suspend fun get(packageName: String): CatalogRecord?
 }

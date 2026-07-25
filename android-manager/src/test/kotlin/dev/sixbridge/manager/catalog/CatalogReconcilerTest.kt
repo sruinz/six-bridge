@@ -66,9 +66,10 @@ class CatalogReconcilerTest {
     }
 
     @Test
-    fun `queries installed wrappers and removes stale catalog entries`() = runBlocking {
-        val stale = catalogRecord(packageName = "dev.sixbridge.ext.stale")
-        val catalog = FakeCatalog(listOf(stale))
+    fun `queries installed wrappers and removes all stale catalog entries in one batch`() = runBlocking {
+        val staleFirst = catalogRecord(packageName = "dev.sixbridge.ext.stale-first")
+        val staleSecond = catalogRecord(packageName = "dev.sixbridge.ext.stale-second")
+        val catalog = FakeCatalog(listOf(staleFirst, staleSecond))
         val installed = installedWrapper(
             packageName = "dev.sixbridge.ext.external",
             versionCode = 3,
@@ -85,7 +86,10 @@ class CatalogReconcilerTest {
             },
         )
 
-        assertEquals(listOf(stale.packageName), catalog.removedPackageNames)
+        assertEquals(
+            listOf(setOf(staleFirst.packageName, staleSecond.packageName)),
+            catalog.removedPackageNameBatches,
+        )
         assertEquals(listOf(installed.packageName), result.records.map(CatalogRecord::packageName))
     }
 
@@ -126,14 +130,18 @@ class CatalogReconcilerTest {
     private class FakeCatalog(
         private val records: List<CatalogRecord>,
     ) : ManagerCatalog {
-        val removedPackageNames = mutableListOf<String>()
+        val removedPackageNameBatches = mutableListOf<Set<String>>()
 
         override fun observe(): Flow<List<CatalogRecord>> = flowOf(records)
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
 
         override suspend fun remove(packageName: String) {
-            removedPackageNames += packageName
+            throw AssertionError("CatalogReconciler must use removeAll instead of remove")
+        }
+
+        override suspend fun removeAll(packageNames: Set<String>) {
+            removedPackageNameBatches += packageNames
         }
 
         override suspend fun get(packageName: String): CatalogRecord? =
