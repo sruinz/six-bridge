@@ -35,6 +35,11 @@ class AndroidWrapperVerifier(
         } catch (_: Exception) {
             return failure(ImportFailureCode.ARCHIVE_INVALID)
         }
+        val inspectedSha256 = runCatching { sha256(apk) }
+            .getOrElse { return failure(ImportFailureCode.WRAPPER_HASH_MISMATCH) }
+        if (inspectedSha256 != wrapperSha256) {
+            return failure(ImportFailureCode.WRAPPER_HASH_MISMATCH)
+        }
         val expectedPackage = "dev.sixbridge.ext.${descriptor.extensionId}"
         if (descriptor.wrapperPackage != expectedPackage ||
             facts.packageName != descriptor.wrapperPackage
@@ -50,20 +55,32 @@ class AndroidWrapperVerifier(
         if (facts.metadata[EXTENSION_ID_METADATA] != descriptor.extensionId) {
             return failure(ImportFailureCode.METADATA_MISMATCH)
         }
-        val hasDiscoveryActivity = facts.activities.any { activity ->
-            activity.exported && activity.intentFilters.any { filter ->
-                VIEW_ACTION in filter.actions &&
-                    BROWSABLE_CATEGORY in filter.categories &&
-                    SIX_SCHEME in filter.schemes &&
-                    EX_HOST in filter.hosts
-            }
+        val activity = facts.activities.singleOrNull()
+            ?: return failure(ImportFailureCode.ACTIVITY_MISMATCH)
+        val filter = activity.intentFilters.singleOrNull()
+            ?: return failure(ImportFailureCode.ACTIVITY_MISMATCH)
+        if (activity.name != DISCOVERY_ACTIVITY ||
+            !activity.exported ||
+            filter.actionCount != 1 ||
+            filter.actions != setOf(VIEW_ACTION) ||
+            filter.categoryCount != 1 ||
+            filter.categories != setOf(BROWSABLE_CATEGORY) ||
+            filter.dataCount != 1 ||
+            filter.schemes != setOf(SIX_SCHEME) ||
+            filter.hosts != setOf(EX_HOST)
+        ) {
+            return failure(ImportFailureCode.ACTIVITY_MISMATCH)
         }
-        if (!hasDiscoveryActivity) return failure(ImportFailureCode.ACTIVITY_MISMATCH)
 
         val expectedAuthority = "${facts.packageName}.contentprovider"
-        val provider = facts.providers.firstOrNull {
-            it.exported && it.authority == expectedAuthority
-        } ?: return failure(ImportFailureCode.PROVIDER_MISMATCH)
+        val provider = facts.providers.singleOrNull()
+            ?: return failure(ImportFailureCode.PROVIDER_MISMATCH)
+        if (provider.name != EXTENSION_PROVIDER ||
+            !provider.exported ||
+            provider.authority != expectedAuthority
+        ) {
+            return failure(ImportFailureCode.PROVIDER_MISMATCH)
+        }
 
         val crx = try {
             Crx3Verifier.verify(facts.crxBytes)
@@ -95,6 +112,7 @@ class AndroidWrapperVerifier(
                 packageName = facts.packageName,
                 versionCode = facts.versionCode,
                 signerSha256 = facts.signerSha256,
+                wrapperSha256 = wrapperSha256,
                 extensionId = descriptor.extensionId,
                 providerAuthority = provider.authority,
                 crx = crx,
@@ -121,6 +139,8 @@ class AndroidWrapperVerifier(
     private companion object {
         const val REQUIRED_REPORT_SCHEMA = 3
         const val EXTENSION_ID_METADATA = "extension-id"
+        const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
+        const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
         const val VIEW_ACTION = "android.intent.action.VIEW"
         const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
         const val SIX_SCHEME = "six"

@@ -8,6 +8,7 @@ import dev.sixbridge.manager.importer.ImportFailureCode
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
 class AndroidArchiveInspector(
@@ -15,12 +16,13 @@ class AndroidArchiveInspector(
     private val manifestReader: BinaryAndroidManifestReader = BinaryAndroidManifestReader(),
 ) : ArchiveInspector {
     override fun inspect(apk: File): ArchiveFacts {
+        val archive = ApkArchiveEntries.preflight(apk)
         val packageInfo = archiveInfo(apk)
             ?: invalid(ImportFailureCode.ARCHIVE_INVALID)
         val signers = packageInfo.signingInfo?.apkContentsSigners.orEmpty()
         if (signers.size != 1) invalid(ImportFailureCode.SIGNER_COUNT_INVALID)
         val manifest = try {
-            manifestReader.read(ApkArchiveEntries.readManifest(apk))
+            manifestReader.read(archive.manifestBytes)
         } catch (error: ArchiveInspectionException) {
             throw error
         } catch (_: IllegalArgumentException) {
@@ -31,23 +33,23 @@ class AndroidArchiveInspector(
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
         val platformActivities = packageInfo.activities.orEmpty()
-        if (manifest.activities.any { expected ->
-                platformActivities.none {
-                    it.name == expected.name && it.exported == expected.exported
-                }
-            }
-        ) {
+        val manifestActivityCounts = manifest.activities
+            .groupingBy { it.name to it.exported }
+            .eachCount()
+        val platformActivityCounts = platformActivities
+            .groupingBy { it.name.orEmpty() to it.exported }
+            .eachCount()
+        if (manifestActivityCounts != platformActivityCounts) {
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
         val platformProviders = packageInfo.providers.orEmpty()
-        if (manifest.providers.any { expected ->
-                platformProviders.none {
-                    it.name == expected.name &&
-                        it.authority == expected.authority &&
-                        it.exported == expected.exported
-                }
-            }
-        ) {
+        val manifestProviderCounts = manifest.providers
+            .groupingBy { Triple(it.name, it.authority, it.exported) }
+            .eachCount()
+        val platformProviderCounts = platformProviders
+            .groupingBy { Triple(it.name.orEmpty(), it.authority.orEmpty(), it.exported) }
+            .eachCount()
+        if (manifestProviderCounts != platformProviderCounts) {
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
         return ArchiveFacts(
@@ -59,11 +61,7 @@ class AndroidArchiveInspector(
             metadata = manifest.metadata,
             activities = manifest.activities,
             providers = manifest.providers,
-            crxBytes = ApkArchiveEntries.readUniqueEntry(
-                apk,
-                EMBEDDED_CRX_ENTRY,
-                SixBundleContract.MAX_WRAPPER_SIZE,
-            ),
+            crxBytes = archive.crxBytes,
         )
     }
 
@@ -84,7 +82,6 @@ class AndroidArchiveInspector(
         throw ArchiveInspectionException(ImportFailure(code))
 
     private companion object {
-        const val EMBEDDED_CRX_ENTRY = "assets/extension.crx"
         const val EXTENSION_ID_METADATA = "extension-id"
         const val PACKAGE_FLAGS =
             PackageManager.GET_META_DATA or
@@ -96,82 +93,146 @@ class AndroidArchiveInspector(
 
 internal object ApkArchiveEntries {
     private const val MANIFEST_ENTRY = "AndroidManifest.xml"
+    private const val EMBEDDED_CRX_ENTRY = "assets/extension.crx"
     private const val MAX_MANIFEST_SIZE = 4L * 1024 * 1024
+    private const val MAX_ENTRY_COUNT = 64
+    private const val MAX_TOTAL_UNCOMPRESSED_SIZE = 144L * 1024 * 1024
+    private const val MAX_COMPRESSION_RATIO = 100L
 
-    fun readManifest(apk: File): ByteArray = readUnique(
-        apk = apk,
-        target = MANIFEST_ENTRY,
-        maximumSize = MAX_MANIFEST_SIZE,
-        missingOrMalformed = ImportFailureCode.ARCHIVE_INVALID,
-        tooLarge = ImportFailureCode.ARCHIVE_INVALID,
+    data class Contents(
+        val manifestBytes: ByteArray,
+        val crxBytes: ByteArray,
     )
 
-    fun readUniqueEntry(apk: File, target: String, maximumSize: Long): ByteArray = readUnique(
-        apk = apk,
-        target = target,
-        maximumSize = maximumSize,
-        missingOrMalformed = ImportFailureCode.CRX_ENTRY_INVALID,
-        tooLarge = ImportFailureCode.CRX_TOO_LARGE,
-    )
-
-    private fun readUnique(
-        apk: File,
-        target: String,
-        maximumSize: Long,
-        missingOrMalformed: ImportFailureCode,
-        tooLarge: ImportFailureCode,
-    ): ByteArray {
+    fun preflight(apk: File): Contents {
+        if (!apk.isFile || apk.length() !in 1..SixBundleContract.MAX_WRAPPER_SIZE) {
+            invalid(ImportFailureCode.ARCHIVE_INVALID)
+        }
         try {
             ZipFile(apk).use { zip ->
-                val candidates = zip.entries().asSequence()
-                    .filter { it.name == target || normalizedPath(it.name) == target }
-                    .toList()
-                if (candidates.size != 1 ||
-                    candidates.single().name != target ||
-                    candidates.single().isDirectory
-                ) {
-                    invalid(missingOrMalformed)
+                val entries = zip.entries().asSequence().toList()
+                if (entries.size !in 1..MAX_ENTRY_COUNT) {
+                    invalid(ImportFailureCode.ARCHIVE_INVALID)
                 }
-                val entry = candidates.single()
-                if (entry.size > maximumSize) invalid(tooLarge)
-                if (entry.size <= 0 || entry.size > Int.MAX_VALUE || entry.compressedSize < 0) {
-                    invalid(missingOrMalformed)
-                }
-                return zip.getInputStream(entry).use { input ->
-                    val output = ByteArrayOutputStream(minOf(entry.size, DEFAULT_BUFFER_SIZE.toLong()).toInt())
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var total = 0L
-                    while (true) {
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        if (total > maximumSize - count) invalid(tooLarge)
-                        output.write(buffer, 0, count)
-                        total += count
+                val names = hashSetOf<String>()
+                var totalUncompressed = 0L
+                var manifest: ZipEntry? = null
+                var crx: ZipEntry? = null
+                entries.forEach { entry ->
+                    val canonicalName = canonicalPath(entry.name)
+                    if (canonicalName == null ||
+                        canonicalName != entry.name ||
+                        entry.isDirectory ||
+                        !names.add(canonicalName)
+                    ) {
+                        invalid(ImportFailureCode.ARCHIVE_INVALID)
                     }
-                    if (total != entry.size) invalid(missingOrMalformed)
-                    output.toByteArray()
+                    if (entry.method != ZipEntry.STORED && entry.method != ZipEntry.DEFLATED) {
+                        invalid(ImportFailureCode.ARCHIVE_INVALID)
+                    }
+                    if (entry.size < 0 ||
+                        entry.compressedSize < 0 ||
+                        entry.compressedSize > apk.length()
+                    ) {
+                        invalid(ImportFailureCode.ARCHIVE_INVALID)
+                    }
+                    if (entry.size > SixBundleContract.MAX_WRAPPER_SIZE) {
+                        invalid(
+                            if (canonicalName == EMBEDDED_CRX_ENTRY) {
+                                ImportFailureCode.CRX_TOO_LARGE
+                            } else {
+                                ImportFailureCode.ARCHIVE_INVALID
+                            },
+                        )
+                    }
+                    if (totalUncompressed > MAX_TOTAL_UNCOMPRESSED_SIZE - entry.size) {
+                        invalid(ImportFailureCode.ARCHIVE_INVALID)
+                    }
+                    totalUncompressed += entry.size
+                    if (entry.size > 0) {
+                        val minimumCompressed =
+                            (entry.size + MAX_COMPRESSION_RATIO - 1) / MAX_COMPRESSION_RATIO
+                        if (entry.compressedSize < minimumCompressed) {
+                            invalid(ImportFailureCode.ARCHIVE_INVALID)
+                        }
+                    }
+                    when (canonicalName) {
+                        MANIFEST_ENTRY -> manifest = entry
+                        EMBEDDED_CRX_ENTRY -> crx = entry
+                    }
                 }
+                val manifestEntry = manifest ?: invalid(ImportFailureCode.ARCHIVE_INVALID)
+                val crxEntry = crx ?: invalid(ImportFailureCode.CRX_ENTRY_INVALID)
+                if (manifestEntry.size !in 1..MAX_MANIFEST_SIZE) {
+                    invalid(ImportFailureCode.ARCHIVE_INVALID)
+                }
+                if (crxEntry.size <= 0) invalid(ImportFailureCode.CRX_ENTRY_INVALID)
+                if (crxEntry.size > SixBundleContract.MAX_WRAPPER_SIZE) {
+                    invalid(ImportFailureCode.CRX_TOO_LARGE)
+                }
+                return Contents(
+                    manifestBytes = readBounded(
+                        zip,
+                        manifestEntry,
+                        MAX_MANIFEST_SIZE,
+                        ImportFailureCode.ARCHIVE_INVALID,
+                    ),
+                    crxBytes = readBounded(
+                        zip,
+                        crxEntry,
+                        SixBundleContract.MAX_WRAPPER_SIZE,
+                        ImportFailureCode.CRX_TOO_LARGE,
+                    ),
+                )
             }
         } catch (error: ArchiveInspectionException) {
             throw error
         } catch (_: Exception) {
-            invalid(missingOrMalformed)
+            invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
     }
 
-    private fun normalizedPath(name: String): String? {
-        if (name.startsWith('/') || name.startsWith('\\')) return null
-        val parts = mutableListOf<String>()
-        name.replace('\\', '/').split('/').forEach { part ->
-            when (part) {
-                "", "." -> Unit
-                ".." -> if (parts.isEmpty()) return null else parts.removeAt(parts.lastIndex)
-                else -> parts += part
+    private fun readBounded(
+        zip: ZipFile,
+        entry: ZipEntry,
+        maximumSize: Long,
+        tooLarge: ImportFailureCode,
+    ): ByteArray {
+        if (entry.size > Int.MAX_VALUE) invalid(tooLarge)
+        return zip.getInputStream(entry).use { input ->
+            val output = ByteArrayOutputStream(
+                minOf(entry.size, DEFAULT_BUFFER_SIZE.toLong()).toInt(),
+            )
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var total = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (total > maximumSize - count) invalid(tooLarge)
+                output.write(buffer, 0, count)
+                total += count
             }
+            if (total != entry.size) invalid(ImportFailureCode.ARCHIVE_INVALID)
+            output.toByteArray()
         }
+    }
+
+    private fun canonicalPath(name: String): String? {
+        if (name.isEmpty() ||
+            name.indexOf('\u0000') >= 0 ||
+            name.startsWith('/') ||
+            name.startsWith('\\') ||
+            DRIVE_PREFIX.containsMatchIn(name.substringBefore('/'))
+        ) {
+            return null
+        }
+        val parts = name.split('/')
+        if (parts.any { it.isEmpty() || it == "." || it == ".." || '\\' in it }) return null
         return parts.joinToString("/")
     }
 
     private fun invalid(code: ImportFailureCode): Nothing =
         throw ArchiveInspectionException(ImportFailure(code))
+
+    private val DRIVE_PREFIX = Regex("^[A-Za-z]:")
 }

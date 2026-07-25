@@ -11,12 +11,14 @@ data class ImportedBundle(
     val report: ContractCompatibilityReport,
     val verifiedApk: VerifiedWrapperApk,
     val wrapperFile: File,
+    val wrapperSha256: String,
 )
 
 data class VerifiedWrapperApk(
     val packageName: String,
     val versionCode: Long,
     val signerSha256: String,
+    val wrapperSha256: String,
     val extensionId: String,
     val providerAuthority: String,
     val crx: VerifiedCrx3,

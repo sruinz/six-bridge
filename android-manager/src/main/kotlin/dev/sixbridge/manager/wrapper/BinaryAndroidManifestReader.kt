@@ -24,6 +24,8 @@ class BinaryAndroidManifestReader {
         val providers = mutableListOf<ArchiveProvider>()
         var activity: ActivityBuilder? = null
         var intentFilter: IntentFilterBuilder? = null
+        var manifestSeen = false
+        var applicationCount = 0
 
         while (offset < rootSize) {
             require(offset <= rootSize - CHUNK_HEADER_SIZE) {
@@ -70,6 +72,51 @@ class BinaryAndroidManifestReader {
                         },
                     )
                     val parent = elements.lastOrNull()
+                    if (elements.isEmpty()) {
+                        require(!manifestSeen && element.name == "manifest") {
+                            "binary Android manifest root hierarchy가 올바르지 않습니다."
+                        }
+                        manifestSeen = true
+                    } else {
+                        require(manifestSeen) {
+                            "binary Android manifest root hierarchy가 올바르지 않습니다."
+                        }
+                    }
+                    when (element.name) {
+                        "manifest" -> require(elements.isEmpty()) {
+                            "binary Android manifest root hierarchy가 올바르지 않습니다."
+                        }
+                        "application" -> {
+                            require(elements == listOf("manifest")) {
+                                "binary Android manifest application hierarchy가 올바르지 않습니다."
+                            }
+                            applicationCount += 1
+                            require(applicationCount == 1) {
+                                "binary Android manifest application hierarchy가 올바르지 않습니다."
+                            }
+                        }
+                        "meta-data", "activity", "provider" ->
+                            require(elements == listOf("manifest", "application")) {
+                                "binary Android manifest component hierarchy가 올바르지 않습니다."
+                            }
+                        "intent-filter" ->
+                            require(
+                                elements == listOf("manifest", "application", "activity"),
+                            ) {
+                                "binary Android manifest intent-filter hierarchy가 올바르지 않습니다."
+                            }
+                        "action", "category", "data" ->
+                            require(
+                                elements == listOf(
+                                    "manifest",
+                                    "application",
+                                    "activity",
+                                    "intent-filter",
+                                ),
+                            ) {
+                                "binary Android manifest intent-filter child hierarchy가 올바르지 않습니다."
+                            }
+                    }
                     when {
                         element.name == "meta-data" && parent == "application" -> {
                             val name = element.androidValue("name")
@@ -102,13 +149,21 @@ class BinaryAndroidManifestReader {
                             }
                             intentFilter = IntentFilterBuilder()
                         }
-                        element.name == "action" && parent == "intent-filter" ->
-                            element.androidValue("name")?.let { intentFilter?.actions?.add(it) }
-                        element.name == "category" && parent == "intent-filter" ->
-                            element.androidValue("name")?.let { intentFilter?.categories?.add(it) }
+                        element.name == "action" && parent == "intent-filter" -> {
+                            val filter = requireNotNull(intentFilter)
+                            filter.actionCount += 1
+                            element.androidValue("name")?.let(filter.actions::add)
+                        }
+                        element.name == "category" && parent == "intent-filter" -> {
+                            val filter = requireNotNull(intentFilter)
+                            filter.categoryCount += 1
+                            element.androidValue("name")?.let(filter.categories::add)
+                        }
                         element.name == "data" && parent == "intent-filter" -> {
-                            element.androidValue("scheme")?.let { intentFilter?.schemes?.add(it) }
-                            element.androidValue("host")?.let { intentFilter?.hosts?.add(it) }
+                            val filter = requireNotNull(intentFilter)
+                            filter.dataCount += 1
+                            element.androidValue("scheme")?.let(filter.schemes::add)
+                            element.androidValue("host")?.let(filter.hosts::add)
                         }
                     }
                     elements += element.name
@@ -141,7 +196,14 @@ class BinaryAndroidManifestReader {
             }
             offset += size
         }
-        require(offset == rootSize && elements.isEmpty() && activity == null && intentFilter == null) {
+        require(
+            offset == rootSize &&
+                elements.isEmpty() &&
+                activity == null &&
+                intentFilter == null &&
+                manifestSeen &&
+                applicationCount == 1,
+        ) {
             "binary Android manifest가 완전하지 않습니다."
         }
         return BinaryManifestFacts(metadata, activities, providers)
@@ -181,10 +243,11 @@ class BinaryAndroidManifestReader {
             val attributeName = strings.required(nameIndex)
             val rawValueIndex = bytes.u32(attributeOffset + 8)
             val valueSize = bytes.u16(attributeOffset + 12)
+            val valueReserved = bytes.u8(attributeOffset + 14)
             val valueType = bytes.u8(attributeOffset + 15)
             val valueData = bytes.u32(attributeOffset + 16)
-            require(valueSize >= TYPED_VALUE_SIZE) {
-                "binary Android manifest typed attribute가 잘렸습니다."
+            require(valueSize == TYPED_VALUE_SIZE && valueReserved == 0) {
+                "binary Android manifest typed attribute header가 올바르지 않습니다."
             }
             val namespace = strings.optional(namespaceIndex)
             validateAndroidAttribute(
@@ -193,11 +256,16 @@ class BinaryAndroidManifestReader {
                 resourceId = resourceMap.id(nameIndex),
                 valueType = valueType,
             )
+            val rawValue = strings.optional(rawValueIndex)
             val value = when (valueType) {
-                TYPE_STRING -> strings.required(valueData)
+                TYPE_STRING -> strings.required(valueData).also { typedValue ->
+                    require(rawValue == null || rawValue == typedValue) {
+                        "binary Android manifest typed attribute raw string이 일치하지 않습니다."
+                    }
+                }
                 TYPE_INT_BOOLEAN -> if (valueData == 0) "false" else "true"
                 TYPE_INT_DEC, TYPE_INT_HEX -> valueData.toString()
-                else -> if (rawValueIndex == NO_INDEX) null else strings.required(rawValueIndex)
+                else -> rawValue
             }
             attributes += Attribute(
                 namespace = namespace,
@@ -269,12 +337,18 @@ class BinaryAndroidManifestReader {
         val categories: MutableSet<String> = linkedSetOf(),
         val schemes: MutableSet<String> = linkedSetOf(),
         val hosts: MutableSet<String> = linkedSetOf(),
+        var actionCount: Int = 0,
+        var categoryCount: Int = 0,
+        var dataCount: Int = 0,
     ) {
         fun build() = ArchiveIntentFilter(
             actions.toSet(),
             categories.toSet(),
             schemes.toSet(),
             hosts.toSet(),
+            actionCount,
+            categoryCount,
+            dataCount,
         )
     }
 

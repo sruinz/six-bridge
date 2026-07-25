@@ -28,6 +28,9 @@ data class ArchiveIntentFilter(
     val categories: Set<String>,
     val schemes: Set<String>,
     val hosts: Set<String>,
+    val actionCount: Int = actions.size,
+    val categoryCount: Int = categories.size,
+    val dataCount: Int = maxOf(schemes.size, hosts.size),
 )
 
 data class ArchiveProvider(
