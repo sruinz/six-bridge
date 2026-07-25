@@ -120,8 +120,10 @@ Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷�
 
 ### Host-side 결과
 
-2026-07-25 03:44 KST에 실제 개발 source를 범용 변환 pipeline에 입력했다.
-확장 ID·이름을 조건으로 한 별도 변환 분기는 사용하지 않았다.
+실제 개발 source를 범용 변환 pipeline에 입력했으며 확장 ID·이름을
+조건으로 한 별도 변환 분기는 사용하지 않았다. 초기 v9 실행은
+`30.0.2.61` profile과 Fold7의 `30.0.0.67`이 달라 보류했지만, 이후
+`profiles/sbrowser-30.0.0.67.json`으로 정확히 일치시켜 v14를 검증했다.
 
 변환 전 decision은 다음과 같았다.
 
@@ -136,25 +138,18 @@ Chrome 웹 스토어 CRX의 `_metadata` 디렉터리에 대해 삼성 인터넷�
 의미를 안전하게 보존할 수 없어 원래 제한과 증거를 유지한
 `unavailable`, `applied=false`다.
 
-첫 실제 draft에서는 기존의 미선택 `unavailable` decision까지 새 adapter로
-잘못 판정하는 pipeline 결함이 발견됐다. 회귀 테스트를 먼저 추가한 뒤,
-변환 전에도 없고 적용 proof에도 없는 decision만 새 계획으로 차단하도록
-수정했다. 기존 미선택 decision은 위험도, disposition, 적용 상태, 원본
-evidence, 변경·제한을 객체 전체 비교로 보존한다. evidence 추가·삭제·변경,
-중복 identity, 실제 새 decision은 모두 별도 테스트로 fail-closed를
-확인했다.
-
-popup 어댑터의 정확한 bytes와 wiring이 증명된 생성 content asset만 storage
-위험 분석에서 제외했다. 이 생성 asset은 안전한 storage fallback을
-오염시키지 않지만, 같은 원본 runtime closure의 별도 `eval` 등 위험 신호는
-계속 `unavailable`로 차단한다.
-
-두 SixDraft는 strict reader 검증을 통과했고 SHA-256이 모두
-`56dc38969c43869732a82a78c640e86084c7cfa332a4c98be041e7d0e474f722`로
+v14의 두 SixDraft는 strict reader 검증을 통과했고 SHA-256
+`c6701b208a074260b290f047341acd7c54c122e671f2d4d4a34f2e4d15c46913`으로
 일치했다. source archive SHA-256은
 `de0c607c94383a597905f260b635dc7d470dafe484fa6f5bd082154588fdcf81`,
 변환 archive SHA-256은
-`ca4761c486b54c88dda4439e92b67d908cd57448857e089d78648c2a34239bff`다.
+`d5269f3fcf98c149b5d94dbc5a19234effbfc2afeb835e0e0de3200dfb0f5a7c`다.
+transformed source에는 다음 두 entry가 있고 선행 밑줄 root entry는 0개다.
+
+```text
+sixbridge/action-popup-entry.v2.json
+sixbridge/desktop-selection-event-bridge.v1.js
+```
 
 최종 자동 실행 산출물은 다음과 같다.
 
@@ -162,69 +157,50 @@ popup 어댑터의 정확한 bytes와 wiring이 증명된 생성 content asset�
 |---|---|
 | 변환 extension ID | `dncifaeoabkkmddoeeccpjdkifeoemfd` |
 | wrapper package | `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` |
-| wrapper versionCode | `9` |
-| CRX SHA-256 | `18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f` |
-| wrapper SHA-256 | `20fad1755b74bc11d53396f5a15ec106ea55bb647946dc9afa2f513adc28c639` |
-| SixBundle SHA-256 | `54117fc6e600d8c451dad2d9dfae45715ec1806a3db93b28f4dd9be925808e91` |
+| wrapper versionCode | `14` |
+| CRX SHA-256 | `db747086b8f9356f570945ed884730803fdc48c343ee96c905723a4a037fa489` |
+| wrapper APK SHA-256 | `a132b210b942e693039bd5b6ef6749e4f3eba6bf9d299de90f328043592f90d1` |
+| SixBundle SHA-256 | `e2ba072a4596992b5cd271ee74ce292bfb00f6475e55ccb39683d83f978a9f15` |
+| wrapper signer SHA-256 | `436e837f7fae287a23dcead0d944bc9fb7dfdbee82fabf962fdb8846accd927a` |
 
-공용 `verify-build`로 외부 CRX·wrapper와 SixBundle bytes, CRX ID·hash,
-wrapper package·versionCode·signer, embedded CRX, APK v3 서명, zipalign,
-metadata·Activity·Provider 구조화 manifest 계약을 모두 검사했다. 외부
-CRX와 wrapper는 각각 128MiB를 넘으면 읽기 전에 거부하고, 허용 범위에서는
-bounded read와 streaming compare를 사용한다.
+실제 source의 기존 삭제 1건과 untracked 1건 및 tree SHA-256
+`2d5c1a951a76b2a071207ce6cc0bf1659642b20d53ff3e04b0a8a2139bd6f8bc`는
+실행 전후 같았으며 source를 수정·정리·커밋하지 않았다.
 
-실제 source repository에는 실행 전부터 다음 사용자 상태가 있었다.
+### Fold7 v14 자동 결과
 
-```text
- D icon_master_backup.png
-?? icon_master123.png
-```
+main evidence는
+`.local/evidence/20260725-095304-smart-context-converted.log.iZlDAW`,
+loader evidence는
+`.local/evidence/20260725-095304-v14-loader-after-tab-logcat.txt`다.
+`com.sec.android.app.sbrowser` / `30.0.0.67` / `1300067502`가 profile과
+정확히 일치했고 `profileMatch=true`, `deviceChecks=passed`,
+`installSuccess=true`, `discoverySuccess=true`,
+`providerReadSuccess=true`, `sourceUnchanged=true`가 기록됐다. provider
+CRX SHA-256은 build CRX SHA-256과 일치했다.
 
-relative-path/content tree SHA-256은 실행 전후 모두
-`2d5c1a951a76b2a071207ce6cc0bf1659642b20d53ff3e04b0a8a2139bd6f8bc`였고,
-위 Git 상태도 동일했다. source 파일을 수정·정리·커밋하지 않았다.
+실제 HTTPS 탭 loader 흐름에서 target의 `OnExtensionInstalled`는 1건,
+`handleCrxInstalled`는 `stat:1`, target `_sixbridge` 경고와 crash는
+각각 0건이다. 같은 로그의 `_metadata` 경고 1건은 비활성 원본 확장
+`lneaoklobohnoncgckmbbjfiajgpbdde`에서 발생했고 target과 무관하다.
 
-### Fold7 자동 smoke 결과
+### 기능별 결과
 
-- 기기: `SM-F966N`
-- serial: `adb-DEVICE_SERIAL._adb-tls-connect._tcp`
-- 삼성 인터넷: `30.0.0.67`, `versionCode 1300067502`
-- 적용 profile: `30.0.2.61`
-- 래퍼 설치: 성공
-- `six://ex` discovery: 성공
-- ContentProvider CRX3 stream: 성공
+v12에서는 사용자가 수동 UI 시나리오를 확인했다. v14는 예약 asset 경로만
+바꾼 업데이트이며 자동 게이트와 활성 유지만 통과했다. v14 수동 UI를 새로
+확인했다는 사용자 회신은 아직 없다.
 
-증거는
-`.local/evidence/20260725-040944-smart-context-converted.log.Wufwj5`와
-`.local/evidence/.smart-context-run.KzpSGy/1784920198-dncifaeoabkkmddoeeccpjdkifeoemfd.log`에
-있다.
+| 검증 항목 | 대상 | 결과 | evidence |
+|---|---|---|---|
+| 삼성 Add-ons 상세 설정 메뉴 | v12 수동 | 통과 | 사용자 확인(2026-07-25), `.local/evidence/20260725-085006-smart-context-converted.log.RuZqfU` |
+| 기존 popup 탭 열기 | v12 수동 | 통과 | 사용자 확인(2026-07-25), 같은 v12 main evidence |
+| 설정 저장·브라우저 재시작 유지 | v12 수동 | 통과 | 사용자 확인(2026-07-25), 같은 v12 main evidence |
+| 페이지 상시 `확장 열기` 버튼 부재 | v12 수동 | 통과 | 사용자 확인(2026-07-25), 같은 v12 main evidence |
+| 텍스트 선택 스마트 컨텍스트 메뉴 | v12 수동 | 통과 | 사용자 확인(2026-07-25), 같은 v12 main evidence |
+| `dev_ext` 상세 제거 버튼 미제공 | v12 수동 | 통과 | 사용자 확인(2026-07-25), 같은 v12 main evidence |
+| 최종 `sixbridge/` 두 entry와 선행 밑줄 root 0건 | v14 자동 | 통과 | `.local/evidence/20260725-095304-smart-context-converted.log.iZlDAW` |
+| target loader 설치·활성 유지·예약 경고 0건 | v14 자동 | 통과 | `.local/evidence/20260725-095304-v14-loader-after-tab-logcat.txt` |
+| 위 수동 UI 전체 재확인 | v14 수동 | 보류 | 사용자 회신 대기 |
 
-device smoke는 provider raw CRX를 로그에 넣지 않는다. 최종 evidence에는
-`providerMagic=Cr24`, `providerBytes=290509`,
-`providerSha256=18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f`
-요약만 있으며 `provider=<raw>` 필드는 없다. fake ADB의 NUL 뒤 sentinel이
-evidence에 전혀 나타나지 않는 회귀 테스트로 이 경계를 확인했다.
-
-binary process의 stderr는 byte 기준 1MiB로 제한한다. 큰 단일-line stderr가
-작은 테스트 상한을 넘으면 수집한 원문과 sentinel을 폐기하고 placeholder만
-남긴다. 이때 parent와 stdout/stderr pipe를 보유한 background descendant를
-모두 강제 종료하고, process stream close와 daemon reader bounded join으로
-무한 대기를 막는다. stdout 대상 symlink는 프로세스 시작 전에 거부하며 실제
-open에도 `NOFOLLOW_LINKS`를 사용한다.
-
-### Runtime 보류 결과
-
-브라우저와 profile 버전이 다르므로 변환 기능의 runtime 최종 합격은
-보류한다. 자동 smoke는 설치·discovery·provider 계약만 증명하며 다음
-항목을 증명하지 않는다.
-
-- Add-ons 활성화와 브라우저 재시작 후 유지
-- 한 selection당 스마트 컨텍스트 UI 한 번 표시
-- pointer·touch·selectionchange 중복 방지
-- `확장 열기`를 통한 popup 탭 진입
-- `storage.local` 설정 저장과 재시작 후 유지
-- 해당 사용자 조작 구간의 service worker 예외·resource 누락·무한 반복 부재
-
-`storage.sync`는 미검증이다. 일치 profile에서 위 항목을 사용자가 직접
-확인하기 전에는 스마트 컨텍스트 메뉴 모바일 변환을 최종 합격으로 기록하지
-않는다.
+`storage.sync`는 미검증이다. v12 수동 통과를 v14의 새 수동 UI 통과로
+확대 해석하지 않는다.

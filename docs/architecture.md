@@ -45,6 +45,28 @@ SIX Bridge는 이를 자동 생성하지 않고, 승인 검사와 persistent pre
 ADB 설치는 이 개발 결과의 삼성 인터넷 인식과 런타임을 확인하기 위한
 검증 경로일 뿐, 일반 사용자 흐름의 필수 구성요소가 아니다.
 
+## 삼성 설정 메뉴 변환
+
+`action-popup-entry` version 2는 browser profile에
+`extension.options-page.user-accessible` 증거가 있을 때만 기존
+`action.default_popup`을 삼성 Add-ons 상세 설정 메뉴에 연결한다. 적용
+범위는 `manifest.json`의 `options_ui`와 비실행 provenance
+`sixbridge/action-popup-entry.v2.json`뿐이다. 원본 popup, content script,
+background, 권한을 바꾸지 않으며 version 1의 페이지 상시 버튼과 popup
+runtime message shim도 생성하지 않는다.
+
+`desktop-selection-event-bridge`의 생성 asset은
+`sixbridge/desktop-selection-event-bridge.v1.js`다. 변환 산출물은 삼성
+loader의 예약 이름 규칙을 피하기 위해 `_sixbridge/`를 포함한 선행 밑줄
+root entry를 만들지 않는다.
+
+삼성 상세 화면의 `six_uninstall`은 install source가 `web_store` 또는
+`web_store_from_six`인 확장의 브라우저 내부 CRX를 제거하는 계약이다.
+SIX Bridge는 `dev_ext` source를 위조하거나 이 기능을 래퍼 제거에 사용하지
+않는다. 래퍼 APK 제거는 다음 Android 관리자가
+`Intent.ACTION_DELETE`와 `package:<wrapperPackage>`를 사용해 시스템 제거
+화면으로 위임한다.
+
 ## 신뢰 및 식별자 경계
 
 - `.local/keystore/crx/`에는 로컬에서 패킹한 확장마다 하나의 RSA 개인 키를

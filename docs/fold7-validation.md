@@ -56,7 +56,8 @@ Fold7 install/smoke를 연속 실행한다.
 
 ```bash
 ./scripts/fold7-converted-extension.sh \
-  --serial 'adb-DEVICE_SERIAL._adb-tls-connect._tcp'
+  --serial 'adb-DEVICE_SERIAL._adb-tls-connect._tcp' \
+  --profile profiles/sbrowser-30.0.0.67.json
 ```
 
 기기 없이 host 결과만 만들 때는 `--host-only`를 사용한다. `--host-only`가
@@ -94,38 +95,66 @@ stderr 원문을 폐기하고 고정 placeholder만 남기며, process tree 강�
 stdout 파일은 symlink가 아닌 기존 일반 파일만 허용하고 실제 open에도
 `NOFOLLOW_LINKS`를 적용한다.
 
-2026-07-25 04:09 KST 최종 자동 검증 증거는 다음과 같다.
+2026-07-25 04:09 KST의 초기 자동 실행
+`.local/evidence/20260725-040944-smart-context-converted.log.Wufwj5`는
+`30.0.2.61` profile로 `30.0.0.67` 기기를 검사해 profile 불일치로
+보류했던 과거 증거다. 이후 설치본과 정확히 일치하는 profile을 생성해
+다시 검증했다.
 
-- 전체 실행:
-  `.local/evidence/20260725-040944-smart-context-converted.log.Wufwj5`
-- device smoke:
-  `.local/evidence/.smart-context-run.KzpSGy/1784920198-dncifaeoabkkmddoeeccpjdkifeoemfd.log`
-- 변환 전후 report:
-  `.local/evidence/smart-context-before.json`,
-  `.local/evidence/smart-context-after.json`
-- SixDraft:
-  `.local/evidence/smart-context-a.sixdraft`,
-  `.local/evidence/smart-context-b.sixdraft`
+### v14 host와 device 자동 결과
 
-이 실행에서 APK 설치, `six://ex` discovery, ContentProvider `Cr24` read는
-통과했다. provider byte 길이는 `290509`, SHA-256은
-`18e2cc6864b941099633cb683dd6ceca015eaebff6d85c8a0488da89cf19b58f`로
-외부 CRX와 일치하며 raw CRX 필드는 없다. 최종 wrapper `versionCode`는
-`9`이다. 그러나 Fold7의 삼성
-인터넷 package는 `com.sec.android.app.sbrowser`로 일치하는 반면 버전은
-`30.0.0.67` (`versionCode 1300067502`)이고 적용 profile은 `30.0.2.61`
-(`versionCode 1300261502`)이므로 runtime 최종 합격으로 간주하지 않는다.
+최종 v14 자동 검증은 위 명령에
+`--profile profiles/sbrowser-30.0.0.67.json`을 명시해 실행했다.
 
-정확히 일치하는 profile을 확보한 뒤 다음 항목은 사용자가 직접 확인해야 한다.
+- main evidence:
+  `.local/evidence/20260725-095304-smart-context-converted.log.iZlDAW`
+- loader evidence:
+  `.local/evidence/20260725-095304-v14-loader-after-tab-logcat.txt`
+- 기기/브라우저 profile:
+  `SM-F966N`, `com.sec.android.app.sbrowser` /
+  `30.0.0.67` / `1300067502`
+- extension ID:
+  `dncifaeoabkkmddoeeccpjdkifeoemfd`
+- wrapper package:
+  `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd`
+- wrapper `versionCode`: `14`
+- CRX SHA-256:
+  `db747086b8f9356f570945ed884730803fdc48c343ee96c905723a4a037fa489`
+- wrapper APK SHA-256:
+  `a132b210b942e693039bd5b6ef6749e4f3eba6bf9d299de90f328043592f90d1`
+- SixBundle SHA-256:
+  `e2ba072a4596992b5cd271ee74ce292bfb00f6475e55ccb39683d83f978a9f15`
+- wrapper signer SHA-256:
+  `436e837f7fae287a23dcead0d944bc9fb7dfdbee82fabf962fdb8846accd927a`
 
-1. Add-ons에서 변환 확장을 켠다.
-2. 일반 HTTPS 페이지에서 텍스트를 한 번 선택한다.
-3. 스마트 컨텍스트 UI가 한 번만 나타나고 중복 생성되지 않는지 확인한다.
-4. `확장 열기`가 기존 popup 페이지를 새 탭으로 여는지 확인한다.
-5. 설정을 변경하고 브라우저를 재시작해 `storage.local` 유지 여부를 확인한다.
-6. 해당 조작 시점 logcat에 service worker 예외, resource 누락, adapter
-   반복 실행이 없는지 확인한다.
+main evidence에서 `profileMatch=true`, `deviceChecks=passed`,
+`installSuccess=true`, `discoverySuccess=true`,
+`providerReadSuccess=true`, `sourceUnchanged=true`를 확인했다. provider CRX
+SHA-256은 build CRX SHA-256과 일치한다. transformed source에는 다음
+두 entry가 각각 존재하며 선행 밑줄 root entry는 0개다.
 
-`storage.sync`는 이번 자동 검증에서 동작을 확인하지 않았다.
-`storage-fallback`은 source의 동적·계산된 접근을 안전하게 변환할 수 없어
-`unavailable`, `applied=false`로 보존됐다.
+```text
+sixbridge/action-popup-entry.v2.json
+sixbridge/desktop-selection-event-bridge.v1.js
+```
+
+실제 HTTPS 탭을 연 뒤 수집한 loader evidence에서 target
+`dncifaeoabkkmddoeeccpjdkifeoemfd`의 `OnExtensionInstalled`는 1건이고,
+바로 이어진 `handleCrxInstalled`는 `stat:1`이다. target의 `_sixbridge`
+예약 이름 경고와 crash는 각각 0건이며 status는 `ON`으로 유지됐다.
+
+같은 loader evidence에는 `_metadata` 예약 이름 경고가 1건 있지만 이는
+비활성 원본 확장 `lneaoklobohnoncgckmbbjfiajgpbdde`에서 발생했다. 해당
+확장은 `stat:0`이며 v14 변환 target의 경고로 집계하지 않는다.
+
+### 수동 UI 증거 경계
+
+사용자는 v12에서 삼성 Add-ons 상세 설정 메뉴, 기존 popup 탭, 설정
+저장·브라우저 재시작 유지, 페이지 상시 버튼 부재, 텍스트 선택 메뉴를
+모두 정상으로 확인했다. v14는 생성 asset의 예약 경로만 바꾼 업데이트이며
+자동 게이트와 활성 유지는 통과했다. v14 UI의 새 수동 재확인 회신은 아직
+없으므로 v14 수동 UI 결과는 보류한다.
+
+`storage.sync`는 동작을 확인하지 않았다. `storage-fallback`은 source의
+동적·계산된 접근을 안전하게 변환할 수 없어 `unavailable`,
+`applied=false`로 보존됐다.

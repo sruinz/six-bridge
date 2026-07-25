@@ -87,6 +87,25 @@ CLI `build`의 APK 서명은 개발 검증용이다. 일반 사용자에게 설�
 래퍼 서명과 설치 승인은 Android 관리자가 담당한다. 변환 과정에서 source를
 다시 패킹하면 원본 Chrome 웹 스토어 확장 ID가 바뀔 수 있다.
 
+## 삼성 Add-ons 설정 진입점
+
+`action-popup-entry` version 2는 browser profile이 삼성 Add-ons 상세
+설정 메뉴의 option page 계약을 증명할 때만 제안된다. 승인하면
+`manifest.json`에 기존 popup을 가리키는 `options_ui`를 추가하고
+`sixbridge/action-popup-entry.v2.json`에 비실행 provenance를 기록한다.
+페이지 상시 `확장 열기` 버튼과 popup runtime message shim은 생성하지
+않는다.
+
+자동 selection 어댑터는
+`sixbridge/desktop-selection-event-bridge.v1.js`를 생성한다. 두 생성
+asset은 삼성 loader가 거부하는 선행 밑줄 root를 피하며, 변환 산출물에는
+`_sixbridge/` 같은 선행 밑줄 root entry가 없어야 한다.
+
+삼성 상세 화면의 `six_uninstall`은 `web_store` 계열 확장의 브라우저 내부
+CRX를 제거하는 기능이므로 SIX Bridge의 `dev_ext` 래퍼 제거에 사용하지
+않는다. 래퍼 APK 제거는 다음 Android 관리자가
+`Intent.ACTION_DELETE`와 `package:<wrapperPackage>`로 요청한다.
+
 입력은 로컬 소스 디렉터리, ZIP, CRX3, Chrome 웹 스토어 URL을 지원한다.
 Edge 소스·ZIP·CRX3도 같은 경로를 사용하며 Edge 스토어 URL 자동 다운로드는
 후속 범위다.
