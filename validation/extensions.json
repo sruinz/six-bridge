@@ -6,6 +6,7 @@
       "id": "lneaoklobohnoncgckmbbjfiajgpbdde",
       "name": "스마트 컨텍스트 메뉴",
       "expectedStatus": "compatible",
+      "validationRole": "conversion-candidate",
       "requiredScenarios": [
         "popup",
         "selection-context-menu",
@@ -27,6 +28,7 @@
       "id": "meemjdgdjhjfhcfchppfapgifiipjnlo",
       "name": "AI 레시피 추출기",
       "expectedStatus": "compatible",
+      "validationRole": "conversion-candidate",
       "requiredScenarios": [
         "options-persistence",
         "selected-url",
@@ -46,6 +48,7 @@
       "id": "fchehlladkkanoekpjffcfffpfbdaalj",
       "name": "Video Download to NAS",
       "expectedStatus": "partial",
+      "validationRole": "conversion-candidate",
       "requiredScenarios": [
         "page-detection",
         "action-ui",
@@ -66,6 +69,7 @@
       "id": "ommjjncpoppekodegknkannmdhoppgkj",
       "name": "MediaNab",
       "expectedStatus": "partial",
+      "validationRole": "boundary-diagnostic",
       "requiredScenarios": [
         "installation-and-enable",
         "popup",

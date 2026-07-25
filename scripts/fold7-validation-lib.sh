@@ -159,10 +159,22 @@ six_assert_conversion_reports() {
   done
 }
 
+six_assert_validation_roles() {
+  local input=$1
+  jq -e '
+    ((.extensions | type) == "array") and
+    ((.extensions | length) > 0) and
+    all(.extensions[];
+      (.validationRole == "conversion-candidate") or
+      (.validationRole == "boundary-diagnostic"))
+  ' "$input" >/dev/null
+}
+
 six_validation_case() {
   local input=$1
   local extension_id=$2
   local result slug contract
+  six_assert_validation_roles "$input" || return 1
   result=$(jq -cer --arg id "$extension_id" '
     [.extensions[] | select(.id == $id)] |
     select(length == 1) |
@@ -171,6 +183,7 @@ six_validation_case() {
       (.id | type) == "string" and
       (.name | type) == "string" and
       (.expectedStatus | type) == "string" and
+      (.validationRole | type) == "string" and
       (.requiredScenarios | type) == "array" and
       (.fold7Validation | type) == "object" and
       (.fold7Validation.slug | type) == "string" and
@@ -179,7 +192,7 @@ six_validation_case() {
       (.fold7Validation.beforeState | type) == "string" and
       (.fold7Validation.afterState | type) == "string"
     ) |
-    {id, name, expectedStatus, requiredScenarios, fold7Validation}
+    {id, name, expectedStatus, validationRole, requiredScenarios, fold7Validation}
   ' "$input") || return 1
 
   slug=$(printf '%s' "$result" | jq -er '.fold7Validation.slug') || return 1

@@ -54,12 +54,51 @@ assert_no_reserved_without_pipefail() (
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
+six_assert_validation_roles "$validation"
+
 case_json=$(six_validation_case "$validation" meemjdgdjhjfhcfchppfapgifiipjnlo)
 [ "$(printf '%s' "$case_json" | jq -cS .)" = "$(jq -cS '
   .extensions[] |
   select(.id == "meemjdgdjhjfhcfchppfapgifiipjnlo") |
-  {id, name, expectedStatus, requiredScenarios, fold7Validation}
+  {
+    id,
+    name,
+    expectedStatus,
+    validationRole,
+    requiredScenarios,
+    fold7Validation
+  }
 ' "$validation")" ]
+
+expect_case_failure missing_boundary_role '
+  del(
+    .extensions[] |
+    select(.id == "ommjjncpoppekodegknkannmdhoppgkj") |
+    .validationRole
+  )'
+expect_case_failure unknown_boundary_role '
+  (
+    .extensions[] |
+    select(.id == "ommjjncpoppekodegknkannmdhoppgkj") |
+    .validationRole
+  ) = "unknown"'
+expect_case_failure non_string_candidate_role '
+  (
+    .extensions[] |
+    select(.id == "meemjdgdjhjfhcfchppfapgifiipjnlo") |
+    .validationRole
+  ) = 1'
+
+media_case=$(jq -cer '
+  .extensions[] |
+  select(.id == "ommjjncpoppekodegknkannmdhoppgkj")
+' "$validation")
+[ "$(printf '%s' "$media_case" |
+  jq -r '.expectedStatus')" = partial ]
+[ "$(printf '%s' "$media_case" |
+  jq -r '.validationRole')" = boundary-diagnostic ]
+[ "$(printf '%s' "$media_case" |
+  jq -c '.excludedFromPocPass')" = '["downloads","nativeMessaging"]' ]
 
 expect_case_failure duplicate_id \
   '.extensions += [.extensions[] | select(.id == "meemjdgdjhjfhcfchppfapgifiipjnlo")]'
