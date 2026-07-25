@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, realpath, writeFile } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 
 const successHtml = `<!doctype html>
 <meta charset="utf-8">
@@ -21,7 +21,7 @@ function closeServer(server, sockets) {
   });
 }
 
-function writeEvidence({ evidencePath, expectedUrl, requestMatched, reason, receivedUrl }) {
+function writeEvidence({ evidenceFile, expectedUrl, requestMatched, reason, receivedUrl }) {
   const evidence = {
     schemaVersion: 1,
     requestMatched,
@@ -33,10 +33,8 @@ function writeEvidence({ evidencePath, expectedUrl, requestMatched, reason, rece
     completedAt: new Date().toISOString(),
   };
 
-  return writeFile(evidencePath, `${JSON.stringify(evidence)}\n`, {
+  return evidenceFile.writeFile(`${JSON.stringify(evidence)}\n`, {
     encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
   });
 }
 
@@ -62,9 +60,11 @@ export async function startReceiver({
   evidencePath,
 }) {
   const token = randomBytes(24).toString("hex");
+  const evidenceFile = await open(evidencePath, "wx", 0o600);
   let timeoutHandle;
   let finish;
   let settled = false;
+  let evidenceClosed = false;
   let resolveCompleted;
   const sockets = new Set();
   const completed = new Promise((resolve) => {
@@ -77,6 +77,12 @@ export async function startReceiver({
     settled = true;
     clearTimeout(timeoutHandle);
     return true;
+  };
+  const closeEvidence = async () => {
+    if (!evidenceClosed) {
+      evidenceClosed = true;
+      await evidenceFile.close();
+    }
   };
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url, "http://receiver.invalid");
@@ -117,27 +123,39 @@ export async function startReceiver({
   const close = async () => {
     claim();
     await closeServer(server, sockets);
+    await closeEvidence();
   };
 
   finish = async ({ requestMatched, reason, receivedUrl }) => {
     let result = { requestMatched, reason };
     try {
-      await writeEvidence({ evidencePath, expectedUrl, requestMatched, reason, receivedUrl });
+      await writeEvidence({ evidenceFile, expectedUrl, requestMatched, reason, receivedUrl });
     } catch {
       result = { requestMatched: false, reason: "evidence" };
+    } finally {
+      try {
+        await closeEvidence();
+      } catch {
+        result = { requestMatched: false, reason: "evidence" };
+      }
     }
 
     await closeServer(server, sockets);
     resolveCompleted(result);
   };
 
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, bindHost, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, bindHost, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    await closeEvidence();
+    throw error;
+  }
   const address = server.address();
   timeoutHandle = setTimeout(() => {
     if (claim()) {

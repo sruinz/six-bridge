@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import os from "node:os";
@@ -30,7 +30,7 @@ function request(url, method = "GET") {
   });
 }
 
-function runCli(argumentsList) {
+function runCli(argumentsList, onStdout) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["scripts/ai-recipe-lan-receiver.mjs", ...argumentsList], {
       cwd: process.cwd(),
@@ -42,6 +42,7 @@ function runCli(argumentsList) {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
+      onStdout?.(stdout);
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -183,10 +184,30 @@ test("동시의 정확한 요청 중 한 건만 성공한다", async (t) => {
   });
 });
 
-test("기존 evidence 파일은 덮어쓰지 않는다", async (t) => {
+test("기존 evidence 파일을 선점하지 못하면 시작하지 않는다", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
   const evidencePath = path.join(directory, "evidence.json");
   await writeFile(evidencePath, "keep", "utf8");
+  t.after(async () => {
+    await rm(directory, { recursive: true, force: true });
+  });
+  await assert.rejects(startReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath,
+  }), (error) => {
+    assert.equal(error.code, "EEXIST");
+    return true;
+  });
+  assert.equal(await readFile(evidencePath, "utf8"), "keep");
+});
+
+test("evidence를 listen 전에 선점하고 close에서 handle을 정리한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const evidencePath = path.join(directory, "evidence.json");
   const receiver = await startReceiver({
     bindHost: "127.0.0.1",
     advertiseHost: "127.0.0.1",
@@ -200,12 +221,29 @@ test("기존 evidence 파일은 덮어쓰지 않는다", async (t) => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  await request(`${receiver.baseUrl}/ext_extract?url=${encodeURIComponent(expectedUrl)}`);
-  assert.deepEqual(await receiver.completed, {
-    requestMatched: false,
-    reason: "evidence",
+  assert.equal(await readFile(evidencePath, "utf8"), "");
+  await receiver.close();
+  await writeFile(evidencePath, "closed", { encoding: "utf8", flag: "r+" });
+  assert.equal(await readFile(evidencePath, "utf8"), "closed");
+});
+
+test("listen 실패 뒤에도 evidence handle을 정리한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const evidencePath = path.join(directory, "evidence.json");
+  t.after(async () => {
+    await rm(directory, { recursive: true, force: true });
   });
-  assert.equal(await readFile(evidencePath, "utf8"), "keep");
+
+  await assert.rejects(startReceiver({
+    bindHost: "invalid-listen-host",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath,
+  }));
+  await writeFile(evidencePath, "released", { encoding: "utf8", flag: "r+" });
+  assert.equal(await readFile(evidencePath, "utf8"), "released");
 });
 
 test("timeout은 실패 evidence를 redaction해 기록한다", async (t) => {
@@ -288,4 +326,44 @@ test("CLI는 evidence 직접 자식만 허용하고 symlink를 거부한다", as
   ]);
   assert.equal(direct.code, 1);
   assert.equal(JSON.parse(await readFile(directEvidence, "utf8")).requestMatched, false);
+});
+
+test("CLI는 실행 중 evidence root가 바뀌어도 외부에 쓰지 않는다", async (t) => {
+  const evidenceRoot = ".local/evidence";
+  const suffix = `${process.pid}-${Date.now()}`;
+  const movedRoot = `.local/evidence-moved-${suffix}`;
+  const filename = `ai-recipe-lan-root-race-${suffix}.json`;
+  const externalDirectory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  let rootSwapped = false;
+  t.after(async () => {
+    if (rootSwapped) {
+      await rm(evidenceRoot, { recursive: true, force: true });
+      await rename(movedRoot, evidenceRoot);
+    }
+    await rm(externalDirectory, { recursive: true, force: true });
+  });
+
+  let receiverStarted;
+  const started = new Promise((resolve) => {
+    receiverStarted = resolve;
+  });
+  const resultPromise = runCli([
+    "--advertise-host", "127.0.0.1",
+    "--expected-url", expectedUrl,
+    "--evidence", `${evidenceRoot}/${filename}`,
+    "--timeout-ms", "75",
+  ], (stdout) => {
+    if (stdout.startsWith("baseUrl=")) {
+      receiverStarted();
+    }
+  });
+  await started;
+  await rename(evidenceRoot, movedRoot);
+  await symlink(externalDirectory, evidenceRoot);
+  rootSwapped = true;
+
+  const result = await resultPromise;
+  assert.equal(result.code, 1);
+  await assert.rejects(readFile(path.join(externalDirectory, filename), "utf8"));
+  assert.equal(JSON.parse(await readFile(path.join(movedRoot, filename), "utf8")).requestMatched, false);
 });
