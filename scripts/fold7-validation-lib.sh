@@ -158,3 +158,171 @@ six_assert_conversion_reports() {
       return 1
   done
 }
+
+six_validation_case() {
+  local input=$1
+  local extension_id=$2
+  local result slug contract
+  result=$(jq -cer --arg id "$extension_id" '
+    [.extensions[] | select(.id == $id)] |
+    select(length == 1) |
+    .[0] |
+    select(
+      (.id | type) == "string" and
+      (.name | type) == "string" and
+      (.expectedStatus | type) == "string" and
+      (.requiredScenarios | type) == "array" and
+      (.fold7Validation | type) == "object" and
+      (.fold7Validation.slug | type) == "string" and
+      (.fold7Validation.contract | type) == "string" and
+      (.fold7Validation.approvedAdapters | type) == "array" and
+      (.fold7Validation.beforeState | type) == "string" and
+      (.fold7Validation.afterState | type) == "string"
+    ) |
+    {id, name, expectedStatus, requiredScenarios, fold7Validation}
+  ' "$input") || return 1
+
+  slug=$(printf '%s' "$result" | jq -er '.fold7Validation.slug') || return 1
+  contract=$(printf '%s' "$result" | jq -er '.fold7Validation.contract') || return 1
+  [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || return 1
+  case "$contract" in
+    smart-context-v2|ai-recipe-passthrough-v1) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$result" | jq -e '
+    .fold7Validation.approvedAdapters as $adapters |
+    all($adapters[]; type == "string") and
+    ($adapters | unique | length) == ($adapters | length) and
+    all($adapters[];
+      . == "action-popup-entry" or
+      . == "desktop-selection-event-bridge" or
+      . == "storage-fallback") and
+    (.fold7Validation.beforeState == "passthrough" or
+      .fold7Validation.beforeState == "automatic" or
+      .fold7Validation.beforeState == "requires-approval" or
+      .fold7Validation.beforeState == "converted" or
+      .fold7Validation.beforeState == "unavailable") and
+    (.fold7Validation.afterState == "passthrough" or
+      .fold7Validation.afterState == "automatic" or
+      .fold7Validation.afterState == "requires-approval" or
+      .fold7Validation.afterState == "converted" or
+      .fold7Validation.afterState == "unavailable")
+  ' >/dev/null || return 1
+  printf '%s\n' "$result"
+}
+
+six_assert_case_reports() {
+  local cases=$1
+  local id=$2
+  local before=$3
+  local after=$4
+  local config status before_state after_state contract
+  config=$(six_validation_case "$cases" "$id") || return 1
+  status=$(printf '%s' "$config" | jq -er '.expectedStatus') || return 1
+  before_state=$(printf '%s' "$config" |
+    jq -er '.fold7Validation.beforeState') || return 1
+  after_state=$(printf '%s' "$config" |
+    jq -er '.fold7Validation.afterState') || return 1
+  contract=$(printf '%s' "$config" |
+    jq -er '.fold7Validation.contract') || return 1
+
+  jq -e --arg status "$status" --arg state "$before_state" \
+    '.status == $status and .conversionState == $state' \
+    "$before" >/dev/null || return 1
+  jq -e --arg status "$status" --arg state "$after_state" \
+    '.status == $status and .conversionState == $state' \
+    "$after" >/dev/null || return 1
+
+  case "$contract" in
+    smart-context-v2)
+      six_assert_conversion_reports "$before" "$after"
+      ;;
+    ai-recipe-passthrough-v1)
+      jq -e '
+        .status == "compatible" and
+        .conversionState == "passthrough" and
+        .adapterDecisions == [] and
+        .unsupportedApis == [] and
+        (.usedApis | sort) ==
+          ["contextMenus", "runtime", "storage", "tabs"] and
+        any(.issues[]; .code == "storage_area_unknown" and
+          .blocking == false)
+      ' "$before" >/dev/null &&
+      jq -e '
+        .status == "compatible" and
+        .conversionState == "passthrough" and
+        .adapterDecisions == [] and
+        .unsupportedApis == [] and
+        .convertedExtensionId != null
+      ' "$after" >/dev/null
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+six_assert_no_reserved_zip_root() {
+  local source_zip=$1
+  ! zipinfo -1 "$source_zip" |
+    awk -F/ '$1 ~ /^_/ { found=1 } END { exit !found }'
+}
+
+six_assert_zip_entry_once() {
+  local source_zip=$1
+  local entry=$2
+  zipinfo -1 "$source_zip" |
+    awk -v entry="$entry" '$0 == entry { count++ } END { exit count != 1 }'
+}
+
+six_assert_smart_context_zip() {
+  local source_zip=$1
+  unzip -p "$source_zip" manifest.json | jq -e '
+    .options_ui.page == "popup.html" and
+    .options_ui.open_in_tab == true
+  ' >/dev/null || return 1
+  six_assert_zip_entry_once \
+    "$source_zip" sixbridge/action-popup-entry.v2.json || return 1
+  six_assert_zip_entry_once \
+    "$source_zip" sixbridge/desktop-selection-event-bridge.v1.js || return 1
+  ! zipinfo -1 "$source_zip" |
+    grep -E '(^|/)(action-popup-entry-(content|background)\.v1\.js|_sixbridge-action-popup-entry-bootstrap\.v1\.js)$'
+}
+
+six_assert_ai_recipe_zip() {
+  local source_zip=$1
+  local entry
+  unzip -p "$source_zip" manifest.json | jq -e '
+    .manifest_version == 3 and
+    .background.service_worker == "background.js" and
+    .options_ui.page == "options.html" and
+    .options_ui.open_in_tab == false and
+    (.permissions | sort) == ["activeTab", "contextMenus", "storage"]
+  ' >/dev/null || return 1
+  for entry in \
+    background.js \
+    options.html \
+    options.js \
+    images/icon16.png \
+    images/icon48.png \
+    images/icon128.png; do
+    six_assert_zip_entry_once "$source_zip" "$entry" || return 1
+  done
+}
+
+six_assert_transformed_contract() {
+  local contract=$1
+  local source_zip=$2
+  six_assert_no_reserved_zip_root "$source_zip" || return 1
+  case "$contract" in
+    smart-context-v2)
+      six_assert_smart_context_zip "$source_zip"
+      ;;
+    ai-recipe-passthrough-v1)
+      six_assert_ai_recipe_zip "$source_zip"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}

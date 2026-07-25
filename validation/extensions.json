@@ -11,7 +11,16 @@
         "selection-context-menu",
         "copy-and-search",
         "settings-persistence"
-      ]
+      ],
+      "fold7Validation": {
+        "slug": "smart-context",
+        "contract": "smart-context-v2",
+        "approvedAdapters": [
+          "action-popup-entry"
+        ],
+        "beforeState": "unavailable",
+        "afterState": "converted"
+      }
     },
     {
       "order": 2,
@@ -23,7 +32,14 @@
         "selected-url",
         "mobile-context-menu",
         "server-request-navigation"
-      ]
+      ],
+      "fold7Validation": {
+        "slug": "ai-recipe",
+        "contract": "ai-recipe-passthrough-v1",
+        "approvedAdapters": [],
+        "beforeState": "passthrough",
+        "afterState": "passthrough"
+      }
     },
     {
       "order": 3,
