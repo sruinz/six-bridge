@@ -163,6 +163,68 @@ expect_failure "AI 레시피 usedApis 계약" \
   six_assert_case_reports "$validation" meemjdgdjhjfhcfchppfapgifiipjnlo \
   "$fixture/ai-before-invalid.json" "$ai_after"
 
+video_case=$(six_validation_case \
+  "$validation" fchehlladkkanoekpjffcfffpfbdaalj)
+[ "$(printf '%s' "$video_case" | jq -r '.expectedStatus')" = partial ]
+[ "$(printf '%s' "$video_case" |
+  jq -r '.fold7Validation.contract')" = video-nas-passthrough-v1 ]
+[ "$(printf '%s' "$video_case" |
+  jq -c '.fold7Validation.approvedAdapters')" = '[]' ]
+
+video_before="$fixture/video-before.json"
+video_after="$fixture/video-after.json"
+cat >"$video_before" <<'EOF'
+{
+  "status": "partial",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": ["webNavigation"],
+  "usedApis": [
+    "webRequest", "tabs", "storage", "runtime",
+    "webNavigation", "contextMenus", "action"
+  ],
+  "issues": [
+    {"code":"unsupported_api","blocking":false},
+    {"code":"storage_area_unknown","blocking":false}
+  ]
+}
+EOF
+cat >"$video_after" <<'EOF'
+{
+  "status": "partial",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": ["webNavigation"],
+  "usedApis": [
+    "action", "contextMenus", "runtime", "storage",
+    "tabs", "webNavigation", "webRequest"
+  ],
+  "issues": [
+    {"code":"unsupported_api","blocking":false},
+    {"code":"storage_area_unknown","blocking":false}
+  ],
+  "convertedExtensionId": "abcdefghijklmnopabcdefghijklmnop"
+}
+EOF
+six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj "$video_before" "$video_after"
+jq '.unsupportedApis = []' "$video_before" >"$fixture/video-before-no-api.json"
+expect_failure "Video NAS unsupportedApis 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj \
+  "$fixture/video-before-no-api.json" "$video_after"
+jq '.adapterDecisions = [{"id":"storage-fallback"}]' "$video_before" \
+  >"$fixture/video-before-adapter.json"
+expect_failure "Video NAS adapter 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj \
+  "$fixture/video-before-adapter.json" "$video_after"
+jq '.status = "compatible"' "$video_before" >"$fixture/video-before-compatible.json"
+expect_failure "Video NAS status 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj \
+  "$fixture/video-before-compatible.json" "$video_after"
+
 smart_root="$fixture/smart-source"
 mkdir -p "$smart_root/sixbridge"
 printf '%s\n' \
@@ -200,6 +262,63 @@ for entry in \
   images/icon16.png images/icon48.png images/icon128.png; do
   expect_zip_entry_once "$ai_zip" "$entry"
 done
+
+video_root="$fixture/video-source"
+mkdir -p "$video_root"
+cat >"$video_root/manifest.json" <<'EOF'
+{
+  "manifest_version": 3,
+  "name": "Video NAS fixture",
+  "version": "1.0",
+  "permissions": ["contextMenus", "storage", "activeTab", "webRequest"],
+  "host_permissions": ["<all_urls>"],
+  "background": {"service_worker": "background.js"},
+  "action": {},
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"]
+  }],
+  "options_ui": {"page": "options.html", "open_in_tab": false}
+}
+EOF
+for entry in background.js content.js options.html options.js options.css; do
+  printf '%s\n' "$entry" >"$video_root/$entry"
+done
+video_zip="$fixture/video.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_zip" .
+)
+six_assert_transformed_contract video-nas-passthrough-v1 "$video_zip"
+mv "$video_root/options.css" "$fixture/video-options.css"
+video_missing_entry_zip="$fixture/video-missing-entry.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_missing_entry_zip" .
+)
+mv "$fixture/video-options.css" "$video_root/options.css"
+expect_failure "Video NAS ZIP 필수 entry" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_missing_entry_zip"
+mkdir "$video_root/_metadata"
+printf 'reserved\n' >"$video_root/_metadata/foreign.json"
+video_reserved_zip="$fixture/video-reserved.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_reserved_zip" .
+)
+expect_failure "Video NAS ZIP 예약 root" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_reserved_zip"
+mv "$video_root/_metadata" "$fixture/video-metadata"
+jq 'del(.permissions[] | select(. == "webRequest"))' "$video_root/manifest.json" \
+  >"$fixture/video-manifest.json"
+mv "$fixture/video-manifest.json" "$video_root/manifest.json"
+video_permission_zip="$fixture/video-no-permission.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_permission_zip" .
+)
+expect_failure "Video NAS ZIP permission" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_permission_zip"
 
 mkdir "$ai_root/_metadata"
 printf 'reserved\n' >"$ai_root/_metadata/foreign.json"

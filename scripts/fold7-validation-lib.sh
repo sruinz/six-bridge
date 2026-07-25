@@ -186,7 +186,7 @@ six_validation_case() {
   contract=$(printf '%s' "$result" | jq -er '.fold7Validation.contract') || return 1
   [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || return 1
   case "$contract" in
-    smart-context-v2|ai-recipe-passthrough-v1) ;;
+    smart-context-v2|ai-recipe-passthrough-v1|video-nas-passthrough-v1) ;;
     *) return 1 ;;
   esac
   printf '%s' "$result" | jq -e '
@@ -256,6 +256,29 @@ six_assert_case_reports() {
         .convertedExtensionId != null
       ' "$after" >/dev/null
       ;;
+    video-nas-passthrough-v1)
+      jq -e '
+        .status == "partial" and
+        .conversionState == "passthrough" and
+        .adapterDecisions == [] and
+        .unsupportedApis == ["webNavigation"] and
+        (.usedApis | sort) ==
+          ["action", "contextMenus", "runtime", "storage", "tabs",
+           "webNavigation", "webRequest"] and
+        any(.issues[]; .code == "unsupported_api" and .blocking == false) and
+        any(.issues[]; .code == "storage_area_unknown" and .blocking == false)
+      ' "$before" >/dev/null &&
+      jq -e '
+        .status == "partial" and
+        .conversionState == "passthrough" and
+        .adapterDecisions == [] and
+        .unsupportedApis == ["webNavigation"] and
+        (.usedApis | sort) ==
+          ["action", "contextMenus", "runtime", "storage", "tabs",
+           "webNavigation", "webRequest"] and
+        .convertedExtensionId != null
+      ' "$after" >/dev/null
+      ;;
     *)
       return 1
       ;;
@@ -312,6 +335,27 @@ six_assert_ai_recipe_zip() {
   done
 }
 
+six_assert_video_nas_zip() {
+  local source_zip=$1
+  local entry
+  unzip -p "$source_zip" manifest.json | jq -e '
+    .manifest_version == 3 and
+    .background.service_worker == "background.js" and
+    (.action | type) == "object" and
+    .options_ui.page == "options.html" and
+    .options_ui.open_in_tab == false and
+    (.permissions | sort) ==
+      ["activeTab", "contextMenus", "storage", "webRequest"] and
+    any(.content_scripts[];
+      (.matches | index("<all_urls>")) != null and
+      (.js | index("content.js")) != null)
+  ' >/dev/null || return 1
+  for entry in \
+    background.js content.js options.html options.js options.css; do
+    six_assert_zip_entry_once "$source_zip" "$entry" || return 1
+  done
+}
+
 six_assert_transformed_contract() {
   local contract=$1
   local source_zip=$2
@@ -322,6 +366,9 @@ six_assert_transformed_contract() {
       ;;
     ai-recipe-passthrough-v1)
       six_assert_ai_recipe_zip "$source_zip"
+      ;;
+    video-nas-passthrough-v1)
+      six_assert_video_nas_zip "$source_zip"
       ;;
     *)
       return 1

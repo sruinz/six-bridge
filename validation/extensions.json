@@ -45,13 +45,21 @@
       "order": 3,
       "id": "fchehlladkkanoekpjffcfffpfbdaalj",
       "name": "Video Download to NAS",
-      "expectedStatus": "compatible",
+      "expectedStatus": "partial",
       "requiredScenarios": [
         "page-detection",
         "action-ui",
         "settings-persistence",
-        "nas-authentication-and-request"
-      ]
+        "nas-authentication-and-request",
+        "hls-detection-and-request"
+      ],
+      "fold7Validation": {
+        "slug": "video-nas",
+        "contract": "video-nas-passthrough-v1",
+        "approvedAdapters": [],
+        "beforeState": "passthrough",
+        "afterState": "passthrough"
+      }
     },
     {
       "order": 4,
