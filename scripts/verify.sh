@@ -29,6 +29,7 @@ bash -n scripts/fold7-gate.sh
 for shell_file in \
   scripts/fold7-extension-validation.sh \
   scripts/fold7-ai-recipe.sh \
+  scripts/fold7-video-nas.sh \
   scripts/fold7-converted-extension.sh \
   scripts/fold7-validation-lib.sh \
   scripts/fold7-extension-validation.test.sh \

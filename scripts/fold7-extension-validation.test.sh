@@ -388,10 +388,15 @@ expect_failure "알 수 없는 ZIP contract" \
 
 runner="$project_dir/scripts/fold7-extension-validation.sh"
 ai_wrapper="$project_dir/scripts/fold7-ai-recipe.sh"
+video_wrapper="$project_dir/scripts/fold7-video-nas.sh"
 expect_exit 2 "AI wrapper --source 필수" "$ai_wrapper"
 expect_exit 0 "AI wrapper 도움말" "$ai_wrapper" --help
 expect_exit 2 "AI wrapper case ID 고정" \
   "$ai_wrapper" --case-id lneaoklobohnoncgckmbbjfiajgpbdde
+expect_exit 2 "Video NAS wrapper --source 필수" "$video_wrapper"
+expect_exit 0 "Video NAS wrapper 도움말" "$video_wrapper" --help
+expect_exit 2 "Video NAS wrapper case ID 고정" \
+  "$video_wrapper" --case-id meemjdgdjhjfhcfchppfapgifiipjnlo
 expect_failure "공용 runner --case-id 필수" \
   "$runner" --source "$ai_root" --host-only
 expect_failure "공용 runner --source 필수" \
@@ -497,9 +502,12 @@ mkdir -p \
   "$(dirname -- "$fixture_cli")"
 cp "$runner" "$fixture_project/scripts/fold7-extension-validation.sh"
 cp "$ai_wrapper" "$fixture_project/scripts/fold7-ai-recipe.sh"
+cp "$video_wrapper" "$fixture_project/scripts/fold7-video-nas.sh"
 cp "$library" "$fixture_project/scripts/fold7-validation-lib.sh"
 cp "$validation" "$fixture_manifest"
 cp -R "$project_dir/fixtures/ai-recipe-pattern" "$fixture_source"
+video_fixture_source="$fixture/video-nas-source"
+cp -R "$project_dir/fixtures/video-nas-pattern" "$video_fixture_source"
 mkdir "$fixture_source/images"
 cat >"$fixture_profile" <<'EOF'
 {
@@ -566,6 +574,75 @@ cp "$fixture_after" "$fixture_bundle_root/compatibility.json"
 )
 printf 'Cr24fixture\n' >"$fixture_crx"
 printf 'fixture wrapper\n' >"$fixture_wrapper"
+
+video_fixture_before="$fixture/video-runner-before.json"
+video_fixture_after="$fixture/video-runner-after.json"
+cat >"$video_fixture_before" <<'EOF'
+{
+  "status": "partial",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": ["webNavigation"],
+  "usedApis": [
+    "action", "contextMenus", "runtime", "storage",
+    "tabs", "webNavigation", "webRequest"
+  ],
+  "issues": [
+    {"code":"unsupported_api","blocking":false},
+    {"code":"storage_area_unknown","blocking":false}
+  ]
+}
+EOF
+cat >"$video_fixture_after" <<'EOF'
+{
+  "status": "partial",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": ["webNavigation"],
+  "usedApis": [
+    "action", "contextMenus", "runtime", "storage",
+    "tabs", "webNavigation", "webRequest"
+  ],
+  "issues": [
+    {"code":"unsupported_api","blocking":false},
+    {"code":"storage_area_unknown","blocking":false}
+  ],
+  "convertedExtensionId": "abcdefghijklmnopabcdefghijklmnop"
+}
+EOF
+video_fixture_transformed="$fixture/video-runner-transformed.zip"
+(
+  cd "$video_fixture_source"
+  zip -q -X -r "$video_fixture_transformed" .
+)
+video_fixture_draft_root="$fixture/video-runner-draft"
+video_fixture_draft="$fixture/video-runner.sixdraft"
+mkdir "$video_fixture_draft_root"
+cp "$video_fixture_transformed" "$video_fixture_draft_root/source.zip"
+(
+  cd "$video_fixture_draft_root"
+  zip -q -X "$video_fixture_draft" source.zip
+)
+video_fixture_bundle_root="$fixture/video-runner-bundle"
+video_fixture_bundle="$fixture/video-runner.six"
+video_fixture_crx="$fixture/video-runner.crx"
+video_fixture_wrapper="$fixture/video-runner-wrapper.apk"
+mkdir "$video_fixture_bundle_root"
+cat >"$video_fixture_bundle_root/extension.json" <<'EOF'
+{
+  "extensionId": "abcdefghijklmnopabcdefghijklmnop",
+  "wrapperPackage": "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
+  "wrapperVersionCode": 10
+}
+EOF
+cp "$video_fixture_after" \
+  "$video_fixture_bundle_root/compatibility.json"
+(
+  cd "$video_fixture_bundle_root"
+  zip -q -X "$video_fixture_bundle" extension.json compatibility.json
+)
+printf 'Cr24fixture\n' >"$video_fixture_crx"
+printf 'fixture wrapper\n' >"$video_fixture_wrapper"
 
 cat >"$fixture_cli" <<'EOF'
 #!/bin/bash
@@ -667,6 +744,21 @@ run_ai_wrapper_fixture() {
       "$@" >"$output_file" 2>&1
 }
 
+run_video_wrapper_fixture() {
+  output_file=$1
+  shift
+  SIX_VALIDATION_MANIFEST="$fixture_manifest" \
+    SIX_TEST_BEFORE="$video_fixture_before" \
+    SIX_TEST_DRAFT="$video_fixture_draft" \
+    SIX_TEST_BUNDLE="$video_fixture_bundle" \
+    SIX_TEST_CRX="$video_fixture_crx" \
+    SIX_TEST_WRAPPER="$video_fixture_wrapper" \
+    "$fixture_project/scripts/fold7-video-nas.sh" \
+      --source "$video_fixture_source" \
+      --profile "$fixture_profile" \
+      "$@" >"$output_file" 2>&1
+}
+
 runner_output="$fixture/runner-output.txt"
 run_runner_fixture "$runner_output" --host-only
 grep -Fx 'caseId=meemjdgdjhjfhcfchppfapgifiipjnlo' "$runner_output" >/dev/null
@@ -696,6 +788,28 @@ grep -Fx 'caseSlug=ai-recipe' "$wrapper_output" >/dev/null
 grep -Fx 'draftDeterministic=true' "$wrapper_output" >/dev/null
 grep -Fx 'hostContract=true' "$wrapper_output" >/dev/null
 grep -Fx 'deviceChecks=skipped' "$wrapper_output" >/dev/null
+
+video_wrapper_output="$fixture/video-wrapper-output.txt"
+run_video_wrapper_fixture "$video_wrapper_output" --host-only
+video_fixture_source_canonical=$(
+  CDPATH= cd -- "$video_fixture_source" && pwd -P
+)
+fixture_profile_dir=$(
+  CDPATH= cd -- "$(dirname -- "$fixture_profile")" && pwd -P
+)
+fixture_profile_canonical="$fixture_profile_dir/$(basename -- "$fixture_profile")"
+grep -Fx 'caseId=fchehlladkkanoekpjffcfffpfbdaalj' \
+  "$video_wrapper_output" >/dev/null
+grep -Fx 'caseSlug=video-nas' "$video_wrapper_output" >/dev/null
+grep -Fx "source=$video_fixture_source_canonical" \
+  "$video_wrapper_output" >/dev/null
+grep -Fx "profile=$fixture_profile_canonical" \
+  "$video_wrapper_output" >/dev/null
+grep -Fx 'draftDeterministic=true' "$video_wrapper_output" >/dev/null
+grep -Fx 'hostContract=true' "$video_wrapper_output" >/dev/null
+grep -Fx 'deviceChecks=skipped' "$video_wrapper_output" >/dev/null
+grep -Fx 'sourceGitRepository=false' "$video_wrapper_output" >/dev/null
+grep -Fx 'sourceUnchanged=true' "$video_wrapper_output" >/dev/null
 
 reserved_draft_root="$fixture/ai-reserved-draft"
 reserved_draft="$fixture/ai-reserved.sixdraft"

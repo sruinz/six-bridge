@@ -55,6 +55,37 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
+    fun `Video NAS pattern은 webNavigation만 부분 호환이다`() {
+        val report = MobilePatternAnalyzer().analyze(
+            fixture("video-nas-pattern"),
+            exactFold7Profile(),
+        )
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(ConversionState.PASSTHROUGH, report.conversionState)
+        assertTrue(report.adapterDecisions.isEmpty())
+        assertEquals(
+            setOf(
+                "action",
+                "contextMenus",
+                "runtime",
+                "storage",
+                "tabs",
+                "webNavigation",
+                "webRequest",
+            ),
+            report.usedApis,
+        )
+        assertEquals(setOf("webNavigation"), report.unsupportedApis)
+        assertTrue(report.issues.any {
+            it.code == "unsupported_api" && !it.blocking
+        })
+        assertTrue(report.issues.any {
+            it.code == "storage_area_unknown" && !it.blocking
+        })
+    }
+
+    @Test
     fun `detects a static desktop selection listener as an automatic adapter`() {
         val source = extension(
             contentFile = "content.js",

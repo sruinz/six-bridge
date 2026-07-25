@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Video NAS fixture",
+  "version": "1.0",
+  "permissions": ["contextMenus", "storage", "activeTab", "webRequest"],
+  "host_permissions": ["<all_urls>"],
+  "background": {"service_worker": "background.js"},
+  "action": {},
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"]
+  }],
+  "options_ui": {"page": "options.html", "open_in_tab": false}
+}
