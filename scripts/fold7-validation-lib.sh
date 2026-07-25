@@ -276,7 +276,9 @@ six_assert_case_reports() {
         (.usedApis | sort) ==
           ["action", "contextMenus", "runtime", "storage", "tabs",
            "webNavigation", "webRequest"] and
-        .convertedExtensionId != null
+        (.convertedExtensionId | type) == "string" and
+        (.convertedExtensionId | test("^[a-p]{32}$")) and
+        .convertedExtensionId != "fchehlladkkanoekpjffcfffpfbdaalj"
       ' "$after" >/dev/null
       ;;
     *)
@@ -338,8 +340,10 @@ six_assert_ai_recipe_zip() {
 six_assert_video_nas_zip() {
   local source_zip=$1
   local entry
+  six_assert_zip_entry_once "$source_zip" manifest.json || return 1
   unzip -p "$source_zip" manifest.json | jq -e '
     .manifest_version == 3 and
+    .host_permissions == ["<all_urls>"] and
     .background.service_worker == "background.js" and
     (.action | type) == "object" and
     .options_ui.page == "options.html" and

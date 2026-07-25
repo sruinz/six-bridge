@@ -224,6 +224,24 @@ expect_failure "Video NAS status 계약" \
   six_assert_case_reports "$validation" \
   fchehlladkkanoekpjffcfffpfbdaalj \
   "$fixture/video-before-compatible.json" "$video_after"
+jq '.convertedExtensionId = ""' "$video_after" \
+  >"$fixture/video-after-empty-id.json"
+expect_failure "Video NAS 빈 변환 ID 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj "$video_before" \
+  "$fixture/video-after-empty-id.json"
+jq '.convertedExtensionId = 1' "$video_after" \
+  >"$fixture/video-after-number-id.json"
+expect_failure "Video NAS 비문자열 변환 ID 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj "$video_before" \
+  "$fixture/video-after-number-id.json"
+jq '.convertedExtensionId = "fchehlladkkanoekpjffcfffpfbdaalj"' "$video_after" \
+  >"$fixture/video-after-source-id.json"
+expect_failure "Video NAS source 변환 ID 계약" \
+  six_assert_case_reports "$validation" \
+  fchehlladkkanoekpjffcfffpfbdaalj "$video_before" \
+  "$fixture/video-after-source-id.json"
 
 smart_root="$fixture/smart-source"
 mkdir -p "$smart_root/sixbridge"
@@ -284,6 +302,8 @@ EOF
 for entry in background.js content.js options.html options.js options.css; do
   printf '%s\n' "$entry" >"$video_root/$entry"
 done
+video_manifest="$fixture/video-manifest.json"
+cp "$video_root/manifest.json" "$video_manifest"
 video_zip="$fixture/video.zip"
 (
   cd "$video_root"
@@ -309,9 +329,8 @@ video_reserved_zip="$fixture/video-reserved.zip"
 expect_failure "Video NAS ZIP 예약 root" \
   six_assert_transformed_contract video-nas-passthrough-v1 "$video_reserved_zip"
 mv "$video_root/_metadata" "$fixture/video-metadata"
-jq 'del(.permissions[] | select(. == "webRequest"))' "$video_root/manifest.json" \
-  >"$fixture/video-manifest.json"
-mv "$fixture/video-manifest.json" "$video_root/manifest.json"
+jq 'del(.permissions[] | select(. == "webRequest"))' "$video_manifest" \
+  >"$video_root/manifest.json"
 video_permission_zip="$fixture/video-no-permission.zip"
 (
   cd "$video_root"
@@ -319,6 +338,36 @@ video_permission_zip="$fixture/video-no-permission.zip"
 )
 expect_failure "Video NAS ZIP permission" \
   six_assert_transformed_contract video-nas-passthrough-v1 "$video_permission_zip"
+cp "$video_manifest" "$video_root/manifest.json"
+jq 'del(.host_permissions)' "$video_manifest" >"$video_root/manifest.json"
+video_no_hosts_zip="$fixture/video-no-hosts.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_no_hosts_zip" .
+)
+expect_failure "Video NAS ZIP host_permissions 누락" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_no_hosts_zip"
+jq '.host_permissions = ["https://example.com/*"]' "$video_manifest" \
+  >"$video_root/manifest.json"
+video_bad_hosts_zip="$fixture/video-bad-hosts.zip"
+(
+  cd "$video_root"
+  zip -q -X -r "$video_bad_hosts_zip" .
+)
+expect_failure "Video NAS ZIP host_permissions 손상" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_bad_hosts_zip"
+cp "$video_manifest" "$video_root/manifest.json"
+video_duplicate_manifest_zip="$fixture/video-duplicate-manifest.zip"
+cp "$video_zip" "$video_duplicate_manifest_zip"
+PYTHONWARNINGS=ignore python3 - "$video_duplicate_manifest_zip" "$video_root/manifest.json" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "a") as archive:
+    archive.write(sys.argv[2], "manifest.json")
+PY
+expect_failure "Video NAS ZIP 중복 manifest" \
+  six_assert_transformed_contract video-nas-passthrough-v1 "$video_duplicate_manifest_zip"
 
 mkdir "$ai_root/_metadata"
 printf 'reserved\n' >"$ai_root/_metadata/foreign.json"
