@@ -180,10 +180,18 @@ class AdbDeviceClientTest {
     fun `rejects manipulated extension identity before invoking adb`() {
         val fixture = adbFixture()
         val malicious = "abc;touch-data-local-tmp-pwned"
-        val bundle = bundle(
-            extensionId = malicious,
-            wrapperPackage = "dev.sixbridge.ext.$malicious",
-        )
+        val extensionId = "abcdefghijklmnopabcdefghijklmnop"
+        val bundle = rewriteBundleEntry(
+            bundle(
+                extensionId = extensionId,
+                wrapperPackage = "dev.sixbridge.ext.$extensionId",
+            ),
+            "extension.json",
+        ) { bytes ->
+            bytes.decodeToString()
+                .replace(extensionId, malicious)
+                .encodeToByteArray()
+        }
 
         assertFailsWith<IllegalArgumentException> {
             AdbDeviceClient(fixture.adb.toString()).smoke(
@@ -479,6 +487,23 @@ class AdbDeviceClientTest {
                 ),
             )
         }
+
+    private fun rewriteBundleEntry(
+        bundle: java.nio.file.Path,
+        target: String,
+        transform: (ByteArray) -> ByteArray,
+    ): java.nio.file.Path = Files.createTempFile("six-adb-rewritten", ".six").also { output ->
+        ZipFile(bundle.toFile()).use { source ->
+            ZipOutputStream(Files.newOutputStream(output)).use { zip ->
+                source.entries().asSequence().forEach { entry ->
+                    zip.putNextEntry(ZipEntry(entry.name).apply { time = entry.time })
+                    val bytes = source.getInputStream(entry).use { it.readBytes() }
+                    zip.write(if (entry.name == target) transform(bytes) else bytes)
+                    zip.closeEntry()
+                }
+            }
+        }
+    }
 
     private fun bundle(wrapper: java.nio.file.Path, descriptor: ExtensionDescriptor) =
         Files.createTempFile("six-adb-contract", ".six").also { output ->

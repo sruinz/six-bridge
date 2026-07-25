@@ -2,6 +2,7 @@ package dev.sixbridge.contract.bundle
 
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.zip.CRC32
@@ -52,12 +53,53 @@ class SixBundleContractTest {
     }
 
     @Test
-    fun `rejects wrapper whose digest differs from descriptor`() {
+    fun `writer rejects wrapper whose digest differs from descriptor`() {
         val contents = validContents().copy(wrapperApk = byteArrayOf(9, 8, 7))
 
         assertFailsWith<IllegalArgumentException> {
-            SixBundleContract.read(ByteArrayInputStream(encoded(contents)))
+            SixBundleContract.write(ByteArrayOutputStream(), contents)
         }
+    }
+
+    @Test
+    fun `reader rejects raw wrapper whose digest differs from descriptor`() {
+        val malformed = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.WRAPPER_ENTRY) byteArrayOf(9, 8, 7) else bytes
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(malformed))
+        }
+    }
+
+    @Test
+    fun `rejects archive without central directory and end record`() {
+        val localHeaderOnly = withoutCentralDirectory(encoded(validContents()))
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(localHeaderOnly))
+        }
+    }
+
+    @Test
+    fun `rejects trailing data after end record`() {
+        val trailing = encoded(validContents()) + byteArrayOf(0)
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(trailing))
+        }
+    }
+
+    @Test
+    fun `deletes temporary archive after read`() {
+        val before = temporaryArchiveNames()
+
+        SixBundleContract.read(ByteArrayInputStream(encoded(validContents())))
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(withoutCentralDirectory(encoded(validContents()))))
+        }
+
+        assertEquals(before, temporaryArchiveNames())
     }
 
     @Test
@@ -119,23 +161,38 @@ class SixBundleContractTest {
 
     @Test
     fun `rejects invalid extension id`() {
-        val invalid = validContents().copy(
-            extension = validContents().extension.copy(extensionId = "q".repeat(32)),
-        )
+        val invalid = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.EXTENSION_ENTRY) {
+                bytes.decodeToString()
+                    .replace("abcdefghijklmnopabcdefghijklmnop", "q".repeat(32))
+                    .encodeToByteArray()
+            } else {
+                bytes
+            }
+        }
 
         assertFailsWith<IllegalArgumentException> {
-            SixBundleContract.read(ByteArrayInputStream(encoded(invalid)))
+            SixBundleContract.read(ByteArrayInputStream(invalid))
         }
     }
 
     @Test
     fun `rejects invalid wrapper package`() {
-        val invalid = validContents().copy(
-            extension = validContents().extension.copy(wrapperPackage = "dev.sixbridge.ext.other"),
-        )
+        val invalid = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.EXTENSION_ENTRY) {
+                bytes.decodeToString()
+                    .replace(
+                        "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
+                        "dev.sixbridge.ext.other",
+                    )
+                    .encodeToByteArray()
+            } else {
+                bytes
+            }
+        }
 
         assertFailsWith<IllegalArgumentException> {
-            SixBundleContract.read(ByteArrayInputStream(encoded(invalid)))
+            SixBundleContract.read(ByteArrayInputStream(invalid))
         }
     }
 
@@ -268,6 +325,22 @@ class SixBundleContractTest {
             output.write(bytes)
         }
     }.toByteArray()
+
+    private fun withoutCentralDirectory(archive: ByteArray): ByteArray {
+        val centralDirectory = byteArrayOf(0x50, 0x4b, 0x01, 0x02)
+        val offset = archive.indices.first { index ->
+            index <= archive.size - centralDirectory.size &&
+                centralDirectory.indices.all { archive[index + it] == centralDirectory[it] }
+        }
+        return archive.copyOf(offset)
+    }
+
+    private fun temporaryArchiveNames(): Set<String> = File(System.getProperty("java.io.tmpdir"))
+        .listFiles()
+        .orEmpty()
+        .filter { it.name.startsWith("six-bundle-contract-") }
+        .map { it.name }
+        .toSet()
 
     private fun ByteArrayOutputStream.writeLe(value: Number, bytes: Int) {
         repeat(bytes) { index -> write((value.toLong() shr (index * 8)).toInt() and 0xff) }
