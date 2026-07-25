@@ -1,9 +1,10 @@
 package dev.sixbridge.manager.wrapper
 
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.Build
 import android.net.Uri
+import android.os.Build
 import java.security.MessageDigest
 
 class PackageManagerInstalledWrapperRepository(
@@ -14,11 +15,11 @@ class PackageManagerInstalledWrapperRepository(
     )
 
     override suspend fun findAll(): List<InstalledWrapper> = gateway.querySixExtensionPackages()
-        .mapNotNull(::validatedWrapper)
-        .sortedWith(
-            compareBy<InstalledWrapper>({ it.packageName }, { it.extensionId }, { it.name }, { it.versionCode }),
-        )
-        .distinctBy(InstalledWrapper::packageName)
+        .groupBy(InstalledWrapperPackageFacts::packageName)
+        .filterValues { it.size == 1 }
+        .values
+        .mapNotNull { it.singleOrNull()?.let(::validatedWrapper) }
+        .sortedBy(InstalledWrapper::packageName)
 
     override suspend fun find(packageName: String): InstalledWrapper? =
         findAll().singleOrNull { it.packageName == packageName }
@@ -30,6 +31,30 @@ class PackageManagerInstalledWrapperRepository(
         if (!EXTENSION_ID.matches(extensionId)) return null
         if (facts.packageName != "$PACKAGE_PREFIX$extensionId") return null
         if (facts.signerSha256.size != 1) return null
+        if (facts.matchedActivity.packageName != facts.packageName ||
+            facts.matchedActivity.name != DISCOVERY_ACTIVITY ||
+            !facts.matchedActivity.exported
+        ) {
+            return null
+        }
+        val filter = facts.resolvedIntentFilter
+        if (filter.actionCount != 1 ||
+            filter.actions != setOf(VIEW_ACTION) ||
+            filter.categoryCount != 1 ||
+            filter.categories != setOf(BROWSABLE_CATEGORY) ||
+            filter.schemeCount != 1 ||
+            filter.schemes != setOf(SIX_SCHEME) ||
+            filter.authorityCount != 1 ||
+            filter.authorityHosts != setOf(EX_HOST) ||
+            filter.authorityPorts != setOf(null) ||
+            filter.dataTypeCount != 0 ||
+            filter.dataTypes.isNotEmpty() ||
+            filter.dataPathCount != 0 ||
+            filter.dataPaths.isNotEmpty() ||
+            filter.schemeSpecificPartCount != 0
+        ) {
+            return null
+        }
         val activity = facts.activities.singleOrNull() ?: return null
         if (activity.name != DISCOVERY_ACTIVITY || !activity.exported) return null
         val provider = facts.providers.singleOrNull() ?: return null
@@ -53,6 +78,10 @@ class PackageManagerInstalledWrapperRepository(
         const val PACKAGE_PREFIX = "dev.sixbridge.ext."
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
+        const val VIEW_ACTION = "android.intent.action.VIEW"
+        const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
+        const val SIX_SCHEME = "six"
+        const val EX_HOST = "ex"
         val EXTENSION_ID = Regex("[a-p]{32}")
     }
 }
@@ -66,9 +95,34 @@ data class InstalledWrapperPackageFacts(
     val applicationLabel: String,
     val versionCode: Long,
     val signerSha256: List<String>,
+    val matchedActivity: ResolvedDiscoveryActivity,
+    val resolvedIntentFilter: ResolvedDiscoveryIntentFilter,
     val metadata: Map<String, String>,
     val activities: List<InstalledWrapperActivity>,
     val providers: List<InstalledWrapperProvider>,
+)
+
+data class ResolvedDiscoveryActivity(
+    val packageName: String,
+    val name: String,
+    val exported: Boolean,
+)
+
+data class ResolvedDiscoveryIntentFilter(
+    val actions: Set<String>,
+    val actionCount: Int,
+    val categories: Set<String>,
+    val categoryCount: Int,
+    val schemes: Set<String>,
+    val schemeCount: Int,
+    val authorityHosts: Set<String>,
+    val authorityPorts: Set<Int?>,
+    val authorityCount: Int,
+    val dataTypes: Set<String>,
+    val dataTypeCount: Int,
+    val dataPaths: Set<String>,
+    val dataPathCount: Int,
+    val schemeSpecificPartCount: Int,
 )
 
 data class InstalledWrapperActivity(
@@ -87,24 +141,26 @@ private class AndroidInstalledWrapperPackageGateway(
 ) : InstalledWrapperPackageGateway {
     override fun querySixExtensionPackages(): List<InstalledWrapperPackageFacts> {
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse("six://ex"))
-        val packageNames = queryActivities(intent)
-            .mapNotNull { it.activityInfo?.packageName }
-            .distinct()
-        return packageNames.mapNotNull(::packageFacts)
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+        return queryActivities(intent).mapNotNull(::packageFacts)
     }
 
     private fun queryActivities(intent: Intent) =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             packageManager.queryIntentActivities(
                 intent,
-                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong()),
+                PackageManager.ResolveInfoFlags.of(QUERY_FLAGS.toLong()),
             )
         } else {
             @Suppress("DEPRECATION")
-            packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+            packageManager.queryIntentActivities(intent, QUERY_FLAGS)
         }
 
-    private fun packageFacts(packageName: String): InstalledWrapperPackageFacts? = runCatching {
+    private fun packageFacts(resolveInfo: android.content.pm.ResolveInfo): InstalledWrapperPackageFacts? = runCatching {
+        val matched = resolveInfo.activityInfo ?: return null
+        val matchedName = matched.name ?: return null
+        val filter = resolveInfo.filter ?: return null
+        val packageName = matched.packageName ?: return null
         val info = packageInfo(packageName)
         val application = info.applicationInfo ?: return null
         val signers = info.signingInfo?.apkContentsSigners.orEmpty()
@@ -113,6 +169,12 @@ private class AndroidInstalledWrapperPackageGateway(
             applicationLabel = application.loadLabel(packageManager).toString(),
             versionCode = info.longVersionCode,
             signerSha256 = signers.map { sha256(it.toByteArray()) },
+            matchedActivity = ResolvedDiscoveryActivity(
+                packageName = packageName,
+                name = matchedName,
+                exported = matched.exported,
+            ),
+            resolvedIntentFilter = filterFacts(filter),
             metadata = application.metaData?.getString(EXTENSION_ID_METADATA)
                 ?.let { mapOf(EXTENSION_ID_METADATA to it) }
                 .orEmpty(),
@@ -126,6 +188,26 @@ private class AndroidInstalledWrapperPackageGateway(
             },
         )
     }.getOrNull()
+
+    private fun filterFacts(filter: IntentFilter): ResolvedDiscoveryIntentFilter {
+        val authorities = filter.authoritiesIterator()?.asSequence()?.toList().orEmpty()
+        return ResolvedDiscoveryIntentFilter(
+            actions = filter.actionsIterator()?.asSequence()?.toSet().orEmpty(),
+            actionCount = filter.countActions(),
+            categories = filter.categoriesIterator()?.asSequence()?.toSet().orEmpty(),
+            categoryCount = filter.countCategories(),
+            schemes = filter.schemesIterator()?.asSequence()?.toSet().orEmpty(),
+            schemeCount = filter.countDataSchemes(),
+            authorityHosts = authorities.map { it.host }.toSet(),
+            authorityPorts = authorities.map { it.port.takeIf { port -> port >= 0 } }.toSet(),
+            authorityCount = filter.countDataAuthorities(),
+            dataTypes = filter.typesIterator()?.asSequence()?.toSet().orEmpty(),
+            dataTypeCount = filter.countDataTypes(),
+            dataPaths = filter.pathsIterator()?.asSequence()?.map { it.path }?.toSet().orEmpty(),
+            dataPathCount = filter.countDataPaths(),
+            schemeSpecificPartCount = filter.countDataSchemeSpecificParts(),
+        )
+    }
 
     @Suppress("DEPRECATION")
     private fun packageInfo(packageName: String) =
@@ -143,6 +225,7 @@ private class AndroidInstalledWrapperPackageGateway(
 
     private companion object {
         const val EXTENSION_ID_METADATA = "extension-id"
+        const val QUERY_FLAGS = PackageManager.MATCH_ALL or PackageManager.GET_RESOLVED_FILTER
         const val PACKAGE_FLAGS =
             PackageManager.GET_META_DATA or
                 PackageManager.GET_ACTIVITIES or
