@@ -467,13 +467,20 @@ class ConversionPipelineTest {
             source.resolve("content.js").readText() +
                 "\nglobalThis.sixbridgeProbe = chrome.storage.sync;\n",
         )
+        val fallbackProfile = profile().copy(
+            supportedFeatures = setOf(
+                "extension.options-page.user-accessible",
+                "storage.local",
+            ),
+            unavailableFeatures = setOf("storage.sync"),
+        )
 
         val result = ConversionPipeline(
             Files.createTempDirectory("six-pipeline-unavailable-local"),
         ).use {
             it.prepare(
                 resolvedSource(source),
-                profile(),
+                fallbackProfile,
                 listOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY),
             )
         }

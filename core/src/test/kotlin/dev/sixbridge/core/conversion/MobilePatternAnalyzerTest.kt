@@ -705,6 +705,46 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
+    fun `unknown storage profile ignores unrelated global hazard`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                chrome.storage.sync.get('value');
+                window.close();
+            """.trimIndent(),
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+
+        assertNull(report.decision("storage-fallback"))
+        assertEquals(ConversionState.PASSTHROUGH, report.conversionState)
+        assertTrue(report.issues.any {
+            it.code == "storage_area_unknown" && !it.blocking
+        })
+    }
+
+    @Test
+    fun `complete storage fallback profile keeps global hazard unavailable`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = """
+                chrome.storage.sync.get('value');
+                window.close();
+            """.trimIndent(),
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, fallbackProfile)
+
+        val decision = report.decision("storage-fallback")
+        assertNotNull(decision)
+        assertEquals(AdapterDisposition.UNAVAILABLE, decision.disposition)
+        assertEquals(ConversionState.UNAVAILABLE, report.conversionState)
+        assertTrue(decision.evidence.any {
+            it.relativePath == "content.js" && it.line == 2
+        })
+    }
+
+    @Test
     fun `dynamic and obfuscated usage keeps compatibility unknown and creates no unsafe decision`() {
         val dynamicApi = extension(
             contentFile = "content.js",

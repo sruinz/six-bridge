@@ -398,6 +398,11 @@ class MobilePatternAnalyzer(
         val localSupported = STORAGE_LOCAL_FEATURE in profile.supportedFeatures
         val syncUnavailable = STORAGE_SYNC_FEATURE in profile.unavailableFeatures
         val profileEvidenceUnknown = !localSupported || !syncUnavailable
+        val bothUnavailable =
+            STORAGE_LOCAL_FEATURE in profile.unavailableFeatures && syncUnavailable
+        if (profileEvidenceUnknown && !bothUnavailable) {
+            return StorageDecision(unknown = true)
+        }
         if (unsafeEvidence.isNotEmpty()) {
             return StorageDecision(
                 decision = AdapterDecision(
@@ -424,8 +429,6 @@ class MobilePatternAnalyzer(
             )
         }
         if (!localSupported || !syncUnavailable) {
-            val bothUnavailable =
-                STORAGE_LOCAL_FEATURE in profile.unavailableFeatures && syncUnavailable
             return if (bothUnavailable) {
                 StorageDecision(
                     decision = AdapterDecision(
