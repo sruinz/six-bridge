@@ -58,9 +58,10 @@ export async function startReceiver({
   expectedUrl,
   timeoutMs,
   evidencePath,
+  evidenceFile: providedEvidenceFile,
 }) {
   const token = randomBytes(24).toString("hex");
-  const evidenceFile = await open(evidencePath, "wx", 0o600);
+  const evidenceFile = providedEvidenceFile ?? await open(evidencePath, "wx", 0o600);
   let timeoutHandle;
   let finish;
   let settled = false;
@@ -206,7 +207,7 @@ function parseArguments(argumentsList) {
   };
 }
 
-async function cliEvidencePath(evidencePath) {
+async function prepareCliEvidence(evidencePath) {
   const rootInfo = await lstat(".local/evidence");
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
     throw new Error(".local/evidence must be a real directory");
@@ -232,16 +233,23 @@ async function cliEvidencePath(evidencePath) {
       throw error;
     }
   }
-  return resolvedEvidencePath;
+  process.chdir(evidenceRoot);
+  if (await realpath(".") !== evidenceRoot) {
+    throw new Error(".local/evidence changed while preparing evidence");
+  }
+  return {
+    evidencePath: filename,
+    evidenceFile: await open(filename, "wx", 0o600),
+  };
 }
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  const evidencePath = await cliEvidencePath(options.evidencePath);
+  const evidence = await prepareCliEvidence(options.evidencePath);
   const receiver = await startReceiver({
     bindHost: "0.0.0.0",
     ...options,
-    evidencePath,
+    ...evidence,
   });
   console.log(`baseUrl=${receiver.baseUrl}`);
   const result = await receiver.completed;
