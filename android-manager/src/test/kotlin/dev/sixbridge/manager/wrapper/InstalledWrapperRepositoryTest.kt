@@ -9,6 +9,10 @@ class InstalledWrapperRepositoryTest {
     @Test
     fun `returns only query candidates satisfying the complete wrapper contract`() = runBlocking {
         val valid = facts(extensionId = VALID_ID, name = "Installed extension")
+        assertEquals(
+            setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
+            valid.resolvedIntentFilter.categories,
+        )
         val repository = PackageManagerInstalledWrapperRepository(
             InstalledWrapperPackageGateway {
                 listOf(
@@ -82,8 +86,9 @@ class InstalledWrapperRepositoryTest {
                     ),
                     facts(extensionId = pair('a', 'c'), filter = strictFilter().copy(actions = setOf(VIEW_ACTION, "extra"), actionCount = 2)),
                     facts(extensionId = pair('a', 'd'), filter = strictFilter().copy(actions = setOf("extra"), actionCount = 1)),
-                    facts(extensionId = pair('a', 'e'), filter = strictFilter().copy(categories = setOf(BROWSABLE_CATEGORY, "extra"), categoryCount = 2)),
-                    facts(extensionId = pair('a', 'f'), filter = strictFilter().copy(categories = setOf("extra"), categoryCount = 1)),
+                    facts(extensionId = pair('a', 'e'), filter = strictFilter().copy(categories = setOf(BROWSABLE_CATEGORY), categoryCount = 1)),
+                    facts(extensionId = pair('a', 'f'), filter = strictFilter().copy(categories = setOf(DEFAULT_CATEGORY), categoryCount = 1)),
+                    facts(extensionId = pair('a', 'n'), filter = strictFilter().copy(categories = setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY, "extra"), categoryCount = 3)),
                     facts(extensionId = pair('a', 'g'), filter = strictFilter().copy(schemes = setOf("six", "extra"), schemeCount = 2)),
                     facts(extensionId = pair('a', 'h'), filter = strictFilter().copy(schemes = setOf("extra"), schemeCount = 1)),
                     facts(extensionId = pair('a', 'i'), filter = strictFilter().copy(authorityHosts = setOf("ex", "other"), authorityCount = 2)),
@@ -185,8 +190,8 @@ class InstalledWrapperRepositoryTest {
     private fun strictFilter() = ResolvedDiscoveryIntentFilter(
         actions = setOf(VIEW_ACTION),
         actionCount = 1,
-        categories = setOf(BROWSABLE_CATEGORY),
-        categoryCount = 1,
+        categories = setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
+        categoryCount = 2,
         schemes = setOf("six"),
         schemeCount = 1,
         authorityHosts = setOf("ex"),
@@ -205,6 +210,7 @@ class InstalledWrapperRepositoryTest {
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
         const val VIEW_ACTION = "android.intent.action.VIEW"
+        const val DEFAULT_CATEGORY = "android.intent.category.DEFAULT"
         const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
     }
 }

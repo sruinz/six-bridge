@@ -33,6 +33,10 @@ class AndroidWrapperVerifierTest {
     @Test
     fun `returns verified wrapper when all APK descriptor CRX and report identities agree`() {
         val fixture = fixture()
+        assertEquals(
+            setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
+            fixture.facts.activities.single().intentFilters.single().categories,
+        )
 
         val result = verifier(fixture.facts).verify(
             fixture.wrapperFile,
@@ -184,7 +188,7 @@ class AndroidWrapperVerifierTest {
     }
 
     @Test
-    fun `requires VIEW and BROWSABLE and six ex on the same exported intent filter`() {
+    fun `requires VIEW DEFAULT BROWSABLE and six ex on the same exported intent filter`() {
         val base = fixture()
         val split = base.facts.copy(
             activities = listOf(
@@ -200,7 +204,7 @@ class AndroidWrapperVerifierTest {
                         ),
                         ArchiveIntentFilter(
                             actions = emptySet(),
-                            categories = setOf("android.intent.category.BROWSABLE"),
+                            categories = setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
                             schemes = setOf("six"),
                             hosts = setOf("ex"),
                         ),
@@ -253,14 +257,16 @@ class AndroidWrapperVerifierTest {
     }
 
     @Test
-    fun `rejects extra discovery filters actions categories schemes and hosts`() {
+    fun `rejects missing or extra discovery filter actions categories schemes and hosts`() {
         val base = fixture()
         val activity = base.facts.activities.single()
         val filter = activity.intentFilters.single()
         val invalidFilters = listOf(
             listOf(filter, filter),
             listOf(filter.copy(actions = filter.actions + "android.intent.action.EDIT")),
-            listOf(filter.copy(categories = filter.categories + "android.intent.category.DEFAULT")),
+            listOf(filter.copy(categories = filter.categories - DEFAULT_CATEGORY, categoryCount = 1)),
+            listOf(filter.copy(categories = filter.categories - BROWSABLE_CATEGORY, categoryCount = 1)),
+            listOf(filter.copy(categories = filter.categories + "android.intent.category.ALTERNATIVE", categoryCount = 3)),
             listOf(filter.copy(schemes = filter.schemes + "https")),
             listOf(filter.copy(hosts = filter.hosts + "other")),
         )
@@ -382,6 +388,10 @@ class AndroidWrapperVerifierTest {
             "AndroidManifest.xml",
         )
 
+        assertEquals(
+            setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
+            parsed.activities.single().intentFilters.single().categories,
+        )
         assertEquals(parseAaptFacts(xmlTree), parsed)
     }
 
@@ -560,7 +570,7 @@ class AndroidWrapperVerifierTest {
                     intentFilters = listOf(
                         ArchiveIntentFilter(
                             actions = setOf("android.intent.action.VIEW"),
-                            categories = setOf("android.intent.category.BROWSABLE"),
+                            categories = setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
                             schemes = setOf("six"),
                             hosts = setOf("ex"),
                         ),
@@ -633,6 +643,7 @@ class AndroidWrapperVerifierTest {
                         android:theme="@android:style/Theme.NoDisplay">
                         <intent-filter>
                             <action android:name="android.intent.action.VIEW" />
+                            <category android:name="android.intent.category.DEFAULT" />
                             <category android:name="android.intent.category.BROWSABLE" />
                             <data android:scheme="six" android:host="ex" />
                         </intent-filter>
@@ -1075,6 +1086,8 @@ class AndroidWrapperVerifierTest {
     )
 
     private companion object {
+        const val DEFAULT_CATEGORY = "android.intent.category.DEFAULT"
+        const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
         const val STRING_POOL_TYPE = 0x0001
         const val RESOURCE_MAP_TYPE = 0x0180
         const val START_ELEMENT_TYPE = 0x0102

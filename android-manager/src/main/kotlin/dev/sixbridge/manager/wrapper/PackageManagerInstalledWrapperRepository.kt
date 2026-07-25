@@ -40,8 +40,8 @@ class PackageManagerInstalledWrapperRepository(
         val filter = facts.resolvedIntentFilter
         if (filter.actionCount != 1 ||
             filter.actions != setOf(VIEW_ACTION) ||
-            filter.categoryCount != 1 ||
-            filter.categories != setOf(BROWSABLE_CATEGORY) ||
+            filter.categoryCount != 2 ||
+            filter.categories != setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY) ||
             filter.schemeCount != 1 ||
             filter.schemes != setOf(SIX_SCHEME) ||
             filter.authorityCount != 1 ||
@@ -79,6 +79,7 @@ class PackageManagerInstalledWrapperRepository(
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
         const val VIEW_ACTION = "android.intent.action.VIEW"
+        const val DEFAULT_CATEGORY = "android.intent.category.DEFAULT"
         const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
         const val SIX_SCHEME = "six"
         const val EX_HOST = "ex"

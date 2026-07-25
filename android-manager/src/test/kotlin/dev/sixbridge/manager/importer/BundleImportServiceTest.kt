@@ -351,7 +351,10 @@ class BundleImportServiceTest {
         )
         val filter = ArchiveIntentFilter(
             actions = setOf("android.intent.action.VIEW"),
-            categories = setOf("android.intent.category.BROWSABLE"),
+            categories = setOf(
+                "android.intent.category.DEFAULT",
+                "android.intent.category.BROWSABLE",
+            ),
             schemes = setOf("six"),
             hosts = setOf("ex"),
         )
