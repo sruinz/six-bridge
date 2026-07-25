@@ -250,3 +250,134 @@ Fold7에서 통과했다.
   `SiTextGetSentences` 관련 비치명 `ReferenceError`가 관찰됐다. 실제 옵션
   저장과 레시피 추출은 완료됐으므로 현재 합격 흐름을 중단시키지는 않았지만,
   삼성 인터넷 30.x 버전 비교 시 재확인할 관찰 항목으로 남긴다.
+
+## Video Download to NAS v1.2.1
+
+실제 개발 source를 수정하지 않고 `fold7-video-nas.sh`에 입력했다. 기준
+source와 검증 종료 후 신원은 다음과 같이 일치했다.
+
+| 항목 | 값 |
+|---|---|
+| source commit | `435d7c57e6cb22817471e319d3cf2e855f9b67af` |
+| Git tree | `b2eb34993fcb72a20b8f7e768bacec6e13685b82` |
+| source subtree | `63d6c42a6b449963269deb3c3edd7b5576733d2e` |
+| source tree SHA-256 | `e19ee46d257983a972adf5100f30c41cbc57bd73a21dccbc28c7e9dda3f590e7` |
+| manifest SHA-256 | `3887cab794343209c1cb7459f9b3881f5c815d96c4b8392706892f5ac1ce9dd3` |
+
+source 저장소에 검증 전부터 있던 untracked 디렉터리 한 건도 실행 전후
+동일했다. 실제 확장 source와 삼성 인터넷 APK는 수정하지 않았다.
+
+### Host·device 자동 결과
+
+최종 정적 판정은 `partial`, 변환 상태는 `passthrough`다. 사용 API는
+`action`, `contextMenus`, `runtime`, `storage`, `tabs`, `webNavigation`,
+`webRequest`이고 unsupported API는 `webNavigation` 하나다.
+`storage_area_unknown`도 비차단 issue로 유지했으며 적용하거나 승인한
+adapter는 없다. `webNavigation`은 optional chaining으로 이전 HLS 목록을
+정리하는 경로이고 HLS 감지 자체는 `webRequest`를 사용한다.
+
+최종 설치 산출물과 Fold7 profile은 다음과 같다.
+
+| 항목 | 값 |
+|---|---|
+| 기기 | `SM-F966N` |
+| 브라우저 package | `com.sec.android.app.sbrowser` |
+| 브라우저 versionName / versionCode | `30.0.0.67` / `1300067502` |
+| 변환 extension ID | `iefgkdhgegchhlhcjfhcbbelkmpklmhd` |
+| wrapper package | `dev.sixbridge.ext.iefgkdhgegchhlhcjfhcbbelkmpklmhd` |
+| wrapper versionCode / versionName | `2` / `1.0.2` |
+| CRX SHA-256 | `c9f5841697650f4bab8b6dbad4f6d586f3447fdfac89af44dfd87e0f9af4947c` |
+| provider CRX SHA-256 | `c9f5841697650f4bab8b6dbad4f6d586f3447fdfac89af44dfd87e0f9af4947c` |
+| wrapper APK SHA-256 | `19de62bd8b9dba6574c2fb75ef0612ce93af10995d29660a03273569f6ba8d62` |
+| SixBundle SHA-256 | `e60756e9b704c39d1a116d397a8db0e29113f1da7b69dbd19c58635473a6f020` |
+| wrapper signer SHA-256 | `436e837f7fae287a23dcead0d944bc9fb7dfdbee82fabf962fdb8846accd927a` |
+
+`profileMatch=true`, install·discovery·provider read와 독립
+`verify-build`가 모두 통과했다. 관련 evidence는 다음과 같다.
+
+| evidence | 경로 | SHA-256 |
+|---|---|---|
+| host main | `.local/evidence/20260725-163026-video-nas-converted.log.nhFtZY` | `7499ac34fa2de42855377f202e0b45cee088060e049aad1ba01ef6eab5a881da` |
+| device main | `.local/evidence/20260725-163435-video-nas-converted.log.aqzqCU` | `59502c05beadc27d6b7def7c9c91af3467a767eecfc6b8108491f812054b1465` |
+| device smoke | `.local/evidence/.video-nas-run.fUnEQn/1784964887-iefgkdhgegchhlhcjfhcbbelkmpklmhd.log` | `1d367a0f73dfba21e144e63c054e53e8ebe5d0ae094e296fdd214077fc6111f1` |
+| loader·action | `.local/evidence/20260725-172600-video-nas-loader-action-target-only.txt` | `2f77b6ade02775bb3a6f9155b24257024600dfe0b6fff9cc35a60087b205d128` |
+
+삼성 Add-ons 활성화와 브라우저 재시작 뒤 target service worker와
+`ExecuteAction`을 확인했다. service worker fatal, reserved root warning,
+AndroidRuntime crash는 없었다.
+
+### 일반 page LAN 결과
+
+사용자가 일회성 Config URL을 저장하고 삼성 인터넷을 완전히 종료·재실행한
+뒤 새 문서에서 VDtN action을 실행해 `PAGE` 항목을 선택했다. receiver는
+인증과 페이지 URL hash가 일치하고 `resolution=best`인 POST를 받았다.
+
+- evidence:
+  `.local/evidence/20260725-174930-video-nas-page.json`
+- evidence SHA-256:
+  `e0b5b4e712abf5d796e56ec2a876f88f3f104d5de89bf315b7a35cf92a907d94`
+- 결과:
+  `mode=page`, `requestMatched=true`, `authMatched=true`
+
+Config URL, 인증 token, NAS 주소와 요청 원문 URL은 evidence와 문서에
+기록하지 않았다. 저장 후 브라우저를 완전히 재시작한 세션에서 인증 요청이
+성공했으므로 options 설정의 저장·재시작 유지 경로도 통과했다.
+
+재시작 직후 복원된 탭에서는 content script가 주입되지 않아 action의
+`tabs.sendMessage`가 두 번 실패했다. 새로 탐색한 문서에서는 action,
+영상 목록 overlay와 항목 선택이 정상 동작했다. 다만 `findVideos`
+listener가 `sendResponse`를 호출하지 않아 성공한 새 문서 action callback에
+`runtime.lastError`가 남았다. `PAGE` POST 뒤 background listener도 응답을
+반환하지 않아 원본 `content.js`가 `undefined`인 `response.message`를 읽는
+비치명 `TypeError`가 한 번 발생했다. POST, overlay와 서버 전달은 성공했으며
+서버 요청 오류나 확장 fatal은 없었다.
+
+### HLS LAN 결과
+
+사용자는 HLS probe 페이지의 감지 요청 완료를 확인한 뒤 VDtN action에서
+`HLS` badge와 `master.m3u8` 항목을 확인하고 해당 항목을 선택했다.
+video 태그가 없는 probe 문서에서 target `background.js`의
+`webRequest` 감지 로그가 기록됐고 receiver가 인증과 HLS URL hash가
+일치하는 POST를 받았다.
+
+- evidence:
+  `.local/evidence/20260725-180630-video-nas-hls.json`
+- evidence SHA-256:
+  `bb0d316f0b09df686be9d5877478a5be101981edbb4c9fb84835df3b8cfb2813`
+- 결과:
+  `mode=hls`, `requestMatched=true`, `authMatched=true`,
+  `resolution=best`
+
+HLS 경로에서도 응답 callback의 `undefined response.message` TypeError와
+응답 전 message port 종료가 각각 한 번 관찰됐지만, HLS 감지·overlay·POST를
+막지는 않았다. `webRequest` permission 오류, service worker fatal과
+AndroidRuntime crash는 없었다.
+
+### 실제 NAS 사용자 결과
+
+사용자는 실제 NAS token과 Config를 Fold7 options에 직접 입력했으며
+assistant와 자동 검증 도구에는 전달하지 않았다. 새로 로드한 YouTube
+페이지에서 VDtN action을 실행하자 현재 페이지의 영상 목록이 표시됐고,
+항목 하나를 선택한 뒤 NAS 서버 전달과 실제 다운로드가 완료됐다.
+
+이는 데스크톱과 같은 action → 영상 목록 → 항목 선택 → 서버 요청 흐름이다.
+실제 Config URL, token, NAS 주소, 영상 URL과 응답 payload는 기록하지
+않았다.
+
+### 컨텍스트 메뉴와 알려진 제한
+
+사용자 관찰로 삼성 기본 컨텍스트 메뉴의 원본 중첩 메뉴도 확인했다.
+
+| 컨텍스트 | `Download with VDtN` 부모 | resolution·audio·subtitle 하위 메뉴 |
+|---|---|---|
+| 일반 HTTPS 페이지의 link 길게 누르기 | 표시 | 모두 표시 |
+| 선택한 텍스트 영상 URL | 표시 | 모두 표시 |
+| 일반 HTML5 video 길게 누르기 | 표시 | 모두 표시 |
+
+YouTube player는 사이트가 길게 누르기를 재생 제어로 가로채므로 이 경로
+대신 삼성 더보기 메뉴나 툴바에 배치한 extension action을 사용한다.
+
+`webNavigation` 비지원과 `storage_area_unknown`은 실제 주요 기능 통과로
+지우거나 `compatible`로 승격하지 않는다. 복원 탭의 content script
+미주입과 원본 callback 응답 오류도 알려진 비치명 경계다. 따라서 최종
+판정은 **부분 호환 상태에서 주요 기능 통과**다.

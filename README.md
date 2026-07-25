@@ -125,8 +125,9 @@ sixbridge device smoke \
   --serial <adb-serial>
 ```
 
-확장별 공용 검증 runner와 AI 레시피 추출기 wrapper는 다음처럼 실행한다.
-실제 source 경로는 저장소에 고정하지 않고 호출할 때 전달한다.
+확장별 공용 검증 runner와 AI 레시피 추출기·Video Download to NAS
+wrapper는 다음처럼 실행한다. 실제 source 경로는 저장소에 고정하지 않고
+호출할 때 전달한다.
 
 ```sh
 source_dir='/workspace/T5다운로드/vscode/AI Recipe Extractor'
@@ -142,6 +143,18 @@ serial='adb-DEVICE_SERIAL._adb-tls-connect._tcp'
   --source "$source_dir" \
   --profile profiles/sbrowser-30.0.0.67.json \
   --serial "$serial"
+
+source_dir='/workspace/T5다운로드/작업중/vdtn/Video-Download-to-NAS-main/Video-Download-to-NAS-Extension-main/video download to nas'
+
+./scripts/fold7-video-nas.sh \
+  --source "$source_dir" \
+  --profile profiles/sbrowser-30.0.0.67.json \
+  --host-only
+
+./scripts/fold7-video-nas.sh \
+  --source "$source_dir" \
+  --profile profiles/sbrowser-30.0.0.67.json \
+  --serial "$serial"
 ```
 
 삼성 인터넷의 `더보기 메뉴 사용자 설정` 또는 `툴바 사용자 설정`에서
@@ -149,6 +162,29 @@ serial='adb-DEVICE_SERIAL._adb-tls-connect._tcp'
 YouTube 페이지를 전달하므로, YouTube가 길게 누르기 동작을 가로채더라도
 별도 플로팅 버튼이 필요하지 않다. 일반 페이지의 링크·선택 텍스트·이미지·
 동영상에서는 삼성 기본 컨텍스트 메뉴의 확장 항목도 그대로 사용한다.
+
+Video Download to NAS의 Config URL 인증과 page·HLS 요청은 일회성 LAN
+receiver로 검증할 수 있다.
+
+```sh
+node scripts/video-nas-lan-receiver.mjs \
+  --mode page \
+  --advertise-host <Fold7에서-접근-가능한-LAN-IP> \
+  --expected-url <검증할-페이지-URL> \
+  --evidence .local/evidence/<실행명>-video-nas-page.json
+
+node scripts/video-nas-lan-receiver.mjs \
+  --mode hls \
+  --advertise-host <Fold7에서-접근-가능한-LAN-IP> \
+  --evidence .local/evidence/<실행명>-video-nas-hls.json
+```
+
+receiver는 임의의 빈 포트와 기본 10분 제한으로 실행된다. `page` 모드는
+stdout의 `configUrl`을 VDtN options에 저장한 뒤 검증할 페이지에서 action의
+`PAGE` 항목을 선택한다. `hls` 모드는 같은 `configUrl`을 저장하고 stdout의
+`probeUrl`을 연 뒤 action에서 `HLS` 항목을 선택한다. 두 URL에는 일회성
+비밀값이 있으므로 stdout에서 사용자에게만 전달하고 문서·로그·Git에는
+복사하지 않는다.
 
 최소 기술 게이트는 `./scripts/fold7-gate.sh <adb-serial>`로 실행할 수 있다.
 

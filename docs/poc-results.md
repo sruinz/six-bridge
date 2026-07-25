@@ -36,7 +36,7 @@
 |---:|---|---|---|
 | 1 | 스마트 컨텍스트 메뉴 | compatible | 없음 |
 | 2 | AI 레시피 추출기 | compatible | 없음 |
-| 3 | Video Download to NAS | compatible | 없음 |
+| 3 | Video Download to NAS | partial | webNavigation |
 | 4 | MediaNab | partial | downloads, nativeMessaging |
 
 네 입력 CRX3 모두 서명 검증을 통과했다. 바이트 비교 결과 생성된
@@ -237,3 +237,51 @@ YouTube 플레이어는 사이트 자체가 길게 누르기를 빠르게 넘기
 `tabs.create` 이동과 결과 생성이 모두 확인됐으므로 AI 레시피의 PoC 주요
 기능은 통과로 판정한다. 브라우저 완전 재시작 뒤 설정 유지와 options 문맥의
 삼성 내부 `SiText*` 비치명 로그는 후속 재검증 항목이다.
+
+## Video Download to NAS v1.2.1 실기기 결과
+
+실제 개발 source를 수정하지 않고 공용 pipeline으로 변환했다. host 분석은
+`partial`·`passthrough`, unsupported API는 `webNavigation` 하나이며
+adapter는 0개다. `storage_area_unknown`도 비차단 정적 issue로 유지한다.
+이를 실제 동작 결과 때문에 `compatible`로 바꾸지 않는다.
+
+Fold7의 정확한 검증 profile은 `SM-F966N`,
+`com.sec.android.app.sbrowser` / `30.0.0.67` / `1300067502`다. 최종
+변환 ID는 `iefgkdhgegchhlhcjfhcbbelkmpklmhd`, wrapper package는
+`dev.sixbridge.ext.iefgkdhgegchhlhcjfhcbbelkmpklmhd`,
+`versionCode`는 `2`다. install·discovery·provider CRX·서명·source 불변과
+Add-ons 활성화·재시작 뒤 action 실행을 확인했다.
+
+| 검증 항목 | 자동/수동 | 결과 | evidence |
+|---|---|---|---|
+| page detection | Fold7 수동 | 통과 — 새 문서 action에서 영상 목록 overlay 표시 | `.local/evidence/20260725-174930-video-nas-page.json` |
+| action UI | Fold7 수동 | 통과 — 목록의 항목 선택 후 요청 전송 | 같은 page evidence와 사용자 확인 |
+| settings persistence | LAN 인증 | 통과 — Config 저장·브라우저 완전 재시작 뒤 인증 POST 성공 | 같은 page evidence |
+| HLS detection·request | LAN 자동+수동 | 통과 — `webRequest` 감지, `HLS` badge·항목 표시와 POST 성공 | `.local/evidence/20260725-180630-video-nas-hls.json` |
+| NAS authentication·request | 실제 NAS 사용자 | 통과 — 영상 목록 선택, 서버 전달과 실제 다운로드 완료 | 사용자 확인(2026-07-25) |
+| context submenu | Fold7 진단 | 통과 — link·선택 텍스트 URL·일반 HTML5 video에서 resolution·audio·subtitle 모두 표시 | 사용자 확인(2026-07-25) |
+
+page evidence SHA-256은
+`e0b5b4e712abf5d796e56ec2a876f88f3f104d5de89bf315b7a35cf92a907d94`,
+HLS evidence SHA-256은
+`bb0d316f0b09df686be9d5877478a5be101981edbb4c9fb84835df3b8cfb2813`다.
+두 evidence에는 Config URL, token, NAS 주소와 요청 원문 URL이 없다. 실제
+NAS 검증도 사용자가 비밀값을 직접 입력하고 수행했으며 해당 값은 수집하거나
+기록하지 않았다.
+
+재시작 뒤 복원된 탭에서는 content script가 주입되지 않아 action 메시지가
+두 번 실패했다. 새로 로드한 문서에서는 정상 동작했다. 그 성공 흐름에서도
+원본 listener가 `sendResponse`를 호출하지 않아 action callback의
+`runtime.lastError`가 남았고, POST 뒤 `undefined`인
+`response.message`를 읽는 비치명 `TypeError`가 관찰됐다. 두 오류는 영상
+목록 표시, page·HLS POST와 실제 NAS 다운로드를 막지 않았지만 결과에서
+제외하거나 자동 수정하지 않는다.
+
+`webNavigation`은 이전 HLS 목록 정리용 optional 경로이며 HLS 감지 자체는
+지원되는 `webRequest`로 통과했다. YouTube player의 길게 누르기는 사이트가
+재생 제어로 사용하므로 삼성 더보기 메뉴나 툴바의 VDtN action을 사용한다.
+일반 DOM 대상에서는 삼성 기본 컨텍스트 메뉴와 원본 중첩 하위 메뉴가
+동작한다.
+
+따라서 Video Download to NAS의 최종 판정은
+**부분 호환 상태에서 주요 기능 통과**다.
