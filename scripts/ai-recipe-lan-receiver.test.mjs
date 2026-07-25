@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -26,6 +27,27 @@ function request(url, method = "GET") {
     });
     requestHandle.on("error", reject);
     requestHandle.end();
+  });
+}
+
+function runCli(argumentsList) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["scripts/ai-recipe-lan-receiver.mjs", ...argumentsList], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -113,6 +135,79 @@ test("첫 정확한 요청을 기록하고 서버를 닫는다", async (t) => {
   await assert.rejects(request(`${receiver.baseUrl}/ext_extract`));
 });
 
+test("추가 또는 중복 URL query를 거부한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const receiver = await startReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath: path.join(directory, "evidence.json"),
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  for (const query of [
+    `url=${encodeURIComponent(expectedUrl)}&extra=1`,
+    `url=${encodeURIComponent(expectedUrl)}&url=other`,
+  ]) {
+    const response = await request(`${receiver.baseUrl}/ext_extract?${query}`);
+    assert.equal(response.status, 400);
+  }
+});
+
+test("동시의 정확한 요청 중 한 건만 성공한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const receiver = await startReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath: path.join(directory, "evidence.json"),
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const exactRequest = `${receiver.baseUrl}/ext_extract?url=${encodeURIComponent(expectedUrl)}`;
+  const responses = await Promise.all([request(exactRequest), request(exactRequest)]);
+  assert.deepEqual(responses.map(({ status }) => status).sort(), [200, 404]);
+  assert.deepEqual(await receiver.completed, {
+    requestMatched: true,
+    reason: "matched",
+  });
+});
+
+test("기존 evidence 파일은 덮어쓰지 않는다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const evidencePath = path.join(directory, "evidence.json");
+  await writeFile(evidencePath, "keep", "utf8");
+  const receiver = await startReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath,
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await request(`${receiver.baseUrl}/ext_extract?url=${encodeURIComponent(expectedUrl)}`);
+  assert.deepEqual(await receiver.completed, {
+    requestMatched: false,
+    reason: "evidence",
+  });
+  assert.equal(await readFile(evidencePath, "utf8"), "keep");
+});
+
 test("timeout은 실패 evidence를 redaction해 기록한다", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
   const evidencePath = path.join(directory, "evidence.json");
@@ -152,4 +247,45 @@ test("timeout은 실패 evidence를 redaction해 기록한다", async (t) => {
   assert.match(evidence.expectedUrlSha256, /^[0-9a-f]{64}$/);
   assert.match(evidence.receivedUrlSha256, /^[0-9a-f]{64}$/);
   assert.doesNotMatch(evidenceText, /youtube\.com|test123|url=/i);
+  await assert.rejects(request(`${receiver.baseUrl}/ext_extract`));
+});
+
+test("CLI는 evidence 직접 자식만 허용하고 symlink를 거부한다", async (t) => {
+  const evidenceDirectory = ".local/evidence";
+  const suffix = `${process.pid}-${Date.now()}`;
+  const directEvidence = `${evidenceDirectory}/ai-recipe-lan-test-${suffix}.json`;
+  const symlinkEvidence = `${evidenceDirectory}/ai-recipe-lan-link-${suffix}.json`;
+  const externalDirectory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
+  const externalEvidence = path.join(externalDirectory, "evidence.json");
+  t.after(async () => {
+    await rm(directEvidence, { force: true });
+    await rm(symlinkEvidence, { force: true });
+    await rm(externalDirectory, { recursive: true, force: true });
+  });
+
+  const outside = await runCli([
+    "--advertise-host", "127.0.0.1",
+    "--expected-url", expectedUrl,
+    "--evidence", externalEvidence,
+  ]);
+  assert.equal(outside.code, 1);
+  assert.match(outside.stderr, /directly inside \.local\/evidence/);
+
+  await symlink(externalEvidence, symlinkEvidence);
+  const symlinkResult = await runCli([
+    "--advertise-host", "127.0.0.1",
+    "--expected-url", expectedUrl,
+    "--evidence", symlinkEvidence,
+  ]);
+  assert.equal(symlinkResult.code, 1);
+  assert.match(symlinkResult.stderr, /symbolic link/);
+
+  const direct = await runCli([
+    "--advertise-host", "127.0.0.1",
+    "--expected-url", expectedUrl,
+    "--evidence", directEvidence,
+    "--timeout-ms", "1",
+  ]);
+  assert.equal(direct.code, 1);
+  assert.equal(JSON.parse(await readFile(directEvidence, "utf8")).requestMatched, false);
 });

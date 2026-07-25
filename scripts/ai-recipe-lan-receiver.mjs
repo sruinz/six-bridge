@@ -35,6 +35,7 @@ function writeEvidence({ evidencePath, expectedUrl, requestMatched, reason, rece
 
   return writeFile(evidencePath, `${JSON.stringify(evidence)}\n`, {
     encoding: "utf8",
+    flag: "wx",
     mode: 0o600,
   });
 }
@@ -69,9 +70,20 @@ export async function startReceiver({
   const completed = new Promise((resolve) => {
     resolveCompleted = resolve;
   });
+  const claim = () => {
+    if (settled) {
+      return false;
+    }
+    settled = true;
+    clearTimeout(timeoutHandle);
+    return true;
+  };
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url, "http://receiver.invalid");
-    const actualUrl = requestUrl.searchParams.get("url") ?? "";
+    const queryEntries = [...requestUrl.searchParams];
+    const actualUrl = queryEntries.length === 1 && queryEntries[0][0] === "url"
+      ? queryEntries[0][1]
+      : "";
     const validation = validateReceiverRequest({
       method: request.method,
       pathname: requestUrl.pathname,
@@ -86,6 +98,12 @@ export async function startReceiver({
       return;
     }
 
+    if (!claim()) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("route");
+      return;
+    }
+
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(successHtml, () => {
       void finish({ requestMatched: true, reason: "matched", receivedUrl: actualUrl });
@@ -97,17 +115,11 @@ export async function startReceiver({
   });
 
   const close = async () => {
-    clearTimeout(timeoutHandle);
+    claim();
     await closeServer(server, sockets);
   };
 
   finish = async ({ requestMatched, reason, receivedUrl }) => {
-    if (settled) {
-      return;
-    }
-    settled = true;
-    clearTimeout(timeoutHandle);
-
     let result = { requestMatched, reason };
     try {
       await writeEvidence({ evidencePath, expectedUrl, requestMatched, reason, receivedUrl });
@@ -128,7 +140,9 @@ export async function startReceiver({
   });
   const address = server.address();
   timeoutHandle = setTimeout(() => {
-    void finish({ requestMatched: false, reason: "timeout", receivedUrl: "" });
+    if (claim()) {
+      void finish({ requestMatched: false, reason: "timeout", receivedUrl: "" });
+    }
   }, timeoutMs);
 
   return {
@@ -175,6 +189,10 @@ function parseArguments(argumentsList) {
 }
 
 async function cliEvidencePath(evidencePath) {
+  const rootInfo = await lstat(".local/evidence");
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw new Error(".local/evidence must be a real directory");
+  }
   const evidenceRoot = await realpath(".local/evidence");
   const absolutePath = evidencePath.startsWith("/")
     ? evidencePath
