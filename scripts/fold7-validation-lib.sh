@@ -264,7 +264,9 @@ six_assert_case_reports() {
 
 six_assert_no_reserved_zip_root() {
   local source_zip=$1
-  LC_ALL=C zipinfo -1 "$source_zip" |
+  local entries
+  entries=$(LC_ALL=C zipinfo -1 "$source_zip") || return 1
+  printf '%s\n' "$entries" |
     LC_ALL=C awk -F/ '$1 ~ /^_/ { found=1 } END { exit found ? 1 : 0 }'
 }
 

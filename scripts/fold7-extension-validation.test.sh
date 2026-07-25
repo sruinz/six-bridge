@@ -46,6 +46,11 @@ expect_zip_entry_once() {
   [ "$(zipinfo -1 "$source_zip" | grep -Fxc "$entry")" -eq 1 ]
 }
 
+assert_no_reserved_without_pipefail() (
+  set +o pipefail
+  six_assert_no_reserved_zip_root "$1"
+)
+
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
@@ -208,6 +213,8 @@ expect_failure "예약 ZIP root" \
 printf '손상 ZIP\n' >"$fixture/corrupt.zip"
 expect_failure "손상 ZIP" \
   six_assert_no_reserved_zip_root "$fixture/corrupt.zip"
+expect_failure "손상 ZIP(pipefail 비활성)" \
+  assert_no_reserved_without_pipefail "$fixture/corrupt.zip"
 expect_failure "알 수 없는 ZIP contract" \
   six_assert_transformed_contract unknown "$ai_zip"
 
