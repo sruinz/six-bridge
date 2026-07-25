@@ -26,7 +26,7 @@ object SixBundleContract {
         try {
             val centralDirectory = validateArchiveBoundary(archive)
             ZipFile(archive.file).use { zip ->
-                val entries = validateEntries(zip, centralDirectory, archive.size)
+                val entries = validateEntries(zip, centralDirectory)
                 val extensionBytes = readEntry(
                     zip,
                     entries.getValue(EXTENSION_ENTRY),
@@ -233,7 +233,6 @@ object SixBundleContract {
     private fun validateEntries(
         zip: ZipFile,
         centralDirectory: List<CentralDirectoryEntry>,
-        archiveSize: Long,
     ): Map<String, ZipEntry> {
         val zipEntries = zip.entries().asSequence().toList()
         require(zipEntries.size == centralDirectory.size) { "SixBundle central directory 항목 수가 일치하지 않습니다." }
@@ -257,12 +256,18 @@ object SixBundleContract {
             require(entry.size in 0..limit && entry.compressedSize >= 0) {
                 "SixBundle 항목 크기가 제한을 초과합니다: ${entry.name}"
             }
+            when {
+                entry.size == 0L -> Unit
+                entry.compressedSize == 0L -> {
+                    throw IllegalArgumentException("SixBundle 압축 항목 크기가 올바르지 않습니다: ${entry.name}")
+                }
+                else -> require(entry.size.toDouble() / entry.compressedSize <= MAX_COMPRESSION_RATIO) {
+                    "SixBundle 압축 비율이 제한을 초과합니다: ${entry.name}"
+                }
+            }
             total + entry.size
         }
         require(totalSize <= MAX_TOTAL_SIZE) { "SixBundle 압축 해제 크기가 제한을 초과합니다." }
-        require(totalSize.toDouble() / archiveSize.coerceAtLeast(1) <= MAX_COMPRESSION_RATIO) {
-            "SixBundle 압축 비율이 제한을 초과합니다."
-        }
         return entries
     }
 

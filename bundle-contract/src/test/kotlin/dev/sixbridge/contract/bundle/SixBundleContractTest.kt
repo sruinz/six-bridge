@@ -160,6 +160,20 @@ class SixBundleContractTest {
     }
 
     @Test
+    fun `rejects compression ratio padding between local entries and central directory`() {
+        val wrapper = ByteArray(1024 * 1024)
+        val contents = validContents().copy(
+            wrapperApk = wrapper,
+            extension = validContents().extension.copy(wrapperSha256 = sha256(wrapper)),
+        )
+        val padded = withLocalCentralPadding(encoded(contents), 256 * 1024)
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(padded))
+        }
+    }
+
+    @Test
     fun `rejects invalid extension id`() {
         val invalid = rewrite(encoded(validContents())) { name, bytes ->
             if (name == SixBundleContract.EXTENSION_ENTRY) {
@@ -333,6 +347,24 @@ class SixBundleContractTest {
                 centralDirectory.indices.all { archive[index + it] == centralDirectory[it] }
         }
         return archive.copyOf(offset)
+    }
+
+    private fun withLocalCentralPadding(archive: ByteArray, paddingSize: Int): ByteArray {
+        val centralOffset = signatureOffset(archive, byteArrayOf(0x50, 0x4b, 0x01, 0x02))
+        val endOffset = signatureOffset(archive, byteArrayOf(0x50, 0x4b, 0x05, 0x06))
+        val padded = ByteArray(archive.size + paddingSize)
+        archive.copyInto(padded, endIndex = centralOffset)
+        archive.copyInto(padded, centralOffset + paddingSize, centralOffset)
+        padded.writeLe(endOffset + paddingSize + 16, centralOffset + paddingSize)
+        return padded
+    }
+
+    private fun signatureOffset(archive: ByteArray, signature: ByteArray): Int = archive.indices.first { index ->
+        index <= archive.size - signature.size && signature.indices.all { archive[index + it] == signature[it] }
+    }
+
+    private fun ByteArray.writeLe(offset: Int, value: Int) {
+        repeat(4) { index -> this[offset + index] = (value ushr (index * 8)).toByte() }
     }
 
     private fun temporaryArchiveNames(): Set<String> = File(System.getProperty("java.io.tmpdir"))
