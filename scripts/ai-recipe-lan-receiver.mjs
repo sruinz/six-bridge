@@ -234,7 +234,8 @@ async function prepareCliEvidence(evidencePath) {
     }
   }
   process.chdir(evidenceRoot);
-  if (await realpath(".") !== evidenceRoot) {
+  const currentDirectory = await lstat(".");
+  if (currentDirectory.dev !== rootInfo.dev || currentDirectory.ino !== rootInfo.ino) {
     throw new Error(".local/evidence changed while preparing evidence");
   }
   return {
