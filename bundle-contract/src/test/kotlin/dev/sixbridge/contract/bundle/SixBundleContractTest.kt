@@ -1,0 +1,285 @@
+package dev.sixbridge.contract.bundle
+
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.util.zip.CRC32
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+
+class SixBundleContractTest {
+    @Test
+    fun `round trips the fixed three-entry bundle contract`() {
+        val contents = validContents()
+        val output = ByteArrayOutputStream()
+
+        SixBundleContract.write(output, contents)
+        val read = SixBundleContract.read(ByteArrayInputStream(output.toByteArray()))
+
+        assertEquals(contents.extension, read.extension)
+        assertEquals(contents.compatibility, read.compatibility)
+        assertContentEquals(contents.wrapperApk, read.wrapperApk)
+        ZipFile(writeTempBundle(output.toByteArray()).toFile()).use { zip ->
+            assertEquals(
+                listOf("wrapper.apk", "extension.json", "compatibility.json"),
+                zip.entries().asSequence().map { it.name }.toList(),
+            )
+        }
+    }
+
+    @Test
+    fun `rejects unknown extension metadata keys`() {
+        val malformed = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.EXTENSION_ENTRY) {
+                bytes.decodeToString().replace(
+                    "\"schemaVersion\":1",
+                    "\"schemaVersion\":1,\"unexpected\":true",
+                ).encodeToByteArray()
+            } else {
+                bytes
+            }
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(malformed))
+        }
+    }
+
+    @Test
+    fun `rejects wrapper whose digest differs from descriptor`() {
+        val contents = validContents().copy(wrapperApk = byteArrayOf(9, 8, 7))
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(encoded(contents)))
+        }
+    }
+
+    @Test
+    fun `writes reproducible archives in the required order`() {
+        val first = ByteArrayOutputStream()
+        val second = ByteArrayOutputStream()
+
+        SixBundleContract.write(first, validContents())
+        SixBundleContract.write(second, validContents())
+
+        assertContentEquals(first.toByteArray(), second.toByteArray())
+    }
+
+    @Test
+    fun `rejects duplicate entries`() {
+        val archive = rawStoredZip(
+            listOf(
+                SixBundleContract.WRAPPER_ENTRY to byteArrayOf(1),
+                SixBundleContract.WRAPPER_ENTRY to byteArrayOf(2),
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(archive))
+        }
+    }
+
+    @Test
+    fun `rejects traversal and directory entries`() {
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(rawStoredZip(listOf("../wrapper.apk" to byteArrayOf()))))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(rawStoredZip(listOf("folder/" to byteArrayOf()))))
+        }
+    }
+
+    @Test
+    fun `rejects extra entries`() {
+        val archive = append(encoded(validContents()), "extra.txt", byteArrayOf(1))
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(archive))
+        }
+    }
+
+    @Test
+    fun `rejects archive whose total expansion exceeds compression ratio`() {
+        val wrapper = ByteArray(1024 * 1024)
+        val contents = validContents().copy(
+            wrapperApk = wrapper,
+            extension = validContents().extension.copy(wrapperSha256 = sha256(wrapper)),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(encoded(contents)))
+        }
+    }
+
+    @Test
+    fun `rejects invalid extension id`() {
+        val invalid = validContents().copy(
+            extension = validContents().extension.copy(extensionId = "q".repeat(32)),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(encoded(invalid)))
+        }
+    }
+
+    @Test
+    fun `rejects invalid wrapper package`() {
+        val invalid = validContents().copy(
+            extension = validContents().extension.copy(wrapperPackage = "dev.sixbridge.ext.other"),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(encoded(invalid)))
+        }
+    }
+
+    @Test
+    fun `rejects unsupported metadata schema versions`() {
+        val unsupportedExtension = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.EXTENSION_ENTRY) {
+                bytes.decodeToString().replace("\"schemaVersion\":1", "\"schemaVersion\":9").encodeToByteArray()
+            } else {
+                bytes
+            }
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.read(ByteArrayInputStream(unsupportedExtension))
+        }
+    }
+
+    @Test
+    fun `reads compatibility schema versions one and two`() {
+        val v1 = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.COMPATIBILITY_ENTRY) legacyCompatibility(1).encodeToByteArray() else bytes
+        }
+        val v2 = rewrite(encoded(validContents())) { name, bytes ->
+            if (name == SixBundleContract.COMPATIBILITY_ENTRY) legacyCompatibility(2).encodeToByteArray() else bytes
+        }
+
+        assertEquals(1, SixBundleContract.read(ByteArrayInputStream(v1)).compatibility.schemaVersion)
+        assertEquals(2, SixBundleContract.read(ByteArrayInputStream(v2)).compatibility.schemaVersion)
+    }
+
+    private fun validContents(): ContractBundleContents {
+        val wrapper = byteArrayOf(0x50, 0x4b, 1, 2, 3)
+        return ContractBundleContents(
+            wrapperApk = wrapper,
+            extension = ContractExtensionDescriptor(
+                schemaVersion = 1,
+                extensionId = "abcdefghijklmnopabcdefghijklmnop",
+                name = "Tiny",
+                version = "1.0.0",
+                sourceKind = "SOURCE_DIRECTORY",
+                crxSha256 = "a".repeat(64),
+                wrapperSha256 = sha256(wrapper),
+                wrapperPackage = "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
+                wrapperVersionCode = 7,
+                signerSha256 = "b".repeat(64),
+            ),
+            compatibility = ContractCompatibilityReport(
+                schemaVersion = 3,
+                status = ContractCompatibilityStatus.COMPATIBLE,
+                manifestVersion = 3,
+                extensionName = "Tiny",
+                extensionVersion = "1.0.0",
+                manifestKeyPresent = false,
+                manifestKeyExtensionId = null,
+                declaredPermissions = listOf("storage"),
+                usedApis = listOf("storage"),
+                unsupportedApis = emptyList(),
+                issues = emptyList(),
+                conversionState = "requires-approval",
+                adapterDecisions = emptyList(),
+                originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
+                convertedExtensionId = "abcdefghijklmnopabcdefghijklmnop",
+                sourceSha256 = "c".repeat(64),
+                browserProfileSha256 = "d".repeat(64),
+            ),
+        )
+    }
+
+    private fun encoded(contents: ContractBundleContents): ByteArray {
+        val output = ByteArrayOutputStream()
+        SixBundleContract.write(output, contents)
+        return output.toByteArray()
+    }
+
+    private fun rewrite(
+        archive: ByteArray,
+        transform: (String, ByteArray) -> ByteArray,
+    ): ByteArray = ByteArrayOutputStream().also { output ->
+        ZipInputStream(ByteArrayInputStream(archive)).use { input ->
+            ZipOutputStream(output).use { zip ->
+                generateSequence { input.nextEntry }.forEach { entry ->
+                    zip.putNextEntry(entry)
+                    zip.write(transform(entry.name, input.readBytes()))
+                    zip.closeEntry()
+                }
+            }
+        }
+    }.toByteArray()
+
+    private fun append(archive: ByteArray, name: String, bytes: ByteArray): ByteArray =
+        ByteArrayOutputStream().also { output ->
+            ZipInputStream(ByteArrayInputStream(archive)).use { input ->
+                ZipOutputStream(output).use { zip ->
+                    generateSequence { input.nextEntry }.forEach { entry ->
+                        zip.putNextEntry(entry)
+                        zip.write(input.readBytes())
+                        zip.closeEntry()
+                    }
+                    zip.putNextEntry(java.util.zip.ZipEntry(name))
+                    zip.write(bytes)
+                    zip.closeEntry()
+                }
+            }
+        }.toByteArray()
+
+    private fun legacyCompatibility(schemaVersion: Int): String =
+        if (schemaVersion == 1) {
+            """{"schemaVersion":1,"status":"compatible","manifestKeyPresent":false,"declaredPermissions":[],"usedApis":[],"unsupportedApis":[],"issues":[]}"""
+        } else {
+            """{"schemaVersion":2,"status":"compatible","manifestKeyPresent":false,"declaredPermissions":[],"usedApis":[],"unsupportedApis":[],"issues":[],"conversionState":"passthrough","adapterDecisions":[]}"""
+        }
+
+    private fun rawStoredZip(entries: List<Pair<String, ByteArray>>): ByteArray = ByteArrayOutputStream().also { output ->
+        entries.forEach { (name, bytes) ->
+            val encodedName = name.encodeToByteArray()
+            val crc = CRC32().apply { update(bytes) }.value
+            output.writeLe(0x04034b50, 4)
+            output.writeLe(20, 2)
+            output.writeLe(0, 2)
+            output.writeLe(0, 2)
+            output.writeLe(0, 2)
+            output.writeLe(0, 2)
+            output.writeLe(crc, 4)
+            output.writeLe(bytes.size, 4)
+            output.writeLe(bytes.size, 4)
+            output.writeLe(encodedName.size, 2)
+            output.writeLe(0, 2)
+            output.write(encodedName)
+            output.write(bytes)
+        }
+    }.toByteArray()
+
+    private fun ByteArrayOutputStream.writeLe(value: Number, bytes: Int) {
+        repeat(bytes) { index -> write((value.toLong() shr (index * 8)).toInt() and 0xff) }
+    }
+
+    private fun writeTempBundle(bytes: ByteArray) =
+        kotlin.io.path.createTempFile("six-bundle-contract", ".six").also { path ->
+            Files.write(path, bytes)
+        }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+}

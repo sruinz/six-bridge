@@ -62,7 +62,7 @@ class SixBundleTest {
                 ),
             ),
             originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
-            convertedExtensionId = "ponmlkjihgfedcbaponmlkjihgfedcba",
+            convertedExtensionId = "abcdefghijklmnopabcdefghijklmnop",
             sourceSha256 = "c".repeat(64),
             browserProfileSha256 = "d".repeat(64),
         )
@@ -198,8 +198,8 @@ class SixBundleTest {
             if (name == "compatibility.json") {
                 bytes.decodeToString()
                     .replace(
-                        "\"sourceSha256\": \"${"c".repeat(64)}\"",
-                        "\"sourceSha256\": null",
+                        "\"sourceSha256\":\"${"c".repeat(64)}\"",
+                        "\"sourceSha256\":null",
                     )
                     .toByteArray()
             } else {
@@ -217,7 +217,7 @@ class SixBundleTest {
         rewrite(bundle) { name, bytes ->
             if (name == "compatibility.json") {
                 bytes.decodeToString()
-                    .replace("\"schemaVersion\": 3", "\"schemaVersion\": 2")
+                    .replace("\"schemaVersion\":3", "\"schemaVersion\":2")
                     .toByteArray()
             } else {
                 bytes
@@ -288,7 +288,7 @@ class SixBundleTest {
             when (name) {
                 "extension.json", "compatibility.json" ->
                     bytes.decodeToString()
-                        .replace("\"schemaVersion\": 1", "\"schemaVersion\": 2")
+                        .replace("\"schemaVersion\":1", "\"schemaVersion\":2")
                         .toByteArray()
                 else -> bytes
             }
@@ -309,7 +309,28 @@ class SixBundleTest {
                         "abcdefghijklmnopabcdefghijklmnop",
                         "invalid-extension-id",
                     )
-                    .replace("\"wrapperVersionCode\": 7", "\"wrapperVersionCode\": 0")
+                    .replace("\"wrapperVersionCode\":7", "\"wrapperVersionCode\":0")
+                    .toByteArray()
+            } else {
+                bytes
+            }
+        }
+
+        assertFailsWith<InvalidSixBundleException> {
+            SixBundle.read(bundle)
+        }
+    }
+
+    @Test
+    fun `rejects unknown extension metadata through the contract adapter`() {
+        val bundle = validBundle()
+        rewrite(bundle) { name, bytes ->
+            if (name == "extension.json") {
+                bytes.decodeToString()
+                    .replace(
+                        "\"schemaVersion\":1,",
+                        "\"schemaVersion\":1,\"unexpected\":true,",
+                    )
                     .toByteArray()
             } else {
                 bytes
@@ -353,8 +374,8 @@ class SixBundleTest {
                 wrapper,
                 ExtensionDescriptor(
                     extensionId = "abcdefghijklmnopabcdefghijklmnop",
-                    name = "Tiny",
-                    version = "1.0.0",
+                    name = compatibility.extensionName ?: "Tiny",
+                    version = compatibility.extensionVersion ?: "1.0.0",
                     sourceKind = "SOURCE_DIRECTORY",
                     crxSha256 = "a".repeat(64),
                     wrapperSha256 = sha256(wrapper.toFile().readBytes()),
@@ -371,8 +392,8 @@ class SixBundleTest {
     private fun compatibilityWithProofs() = CompatibilityReport(
         status = CompatibilityStatus.COMPATIBLE,
         manifestVersion = 3,
-        extensionName = "Proof",
-        extensionVersion = "1",
+        extensionName = "Tiny",
+        extensionVersion = "1.0.0",
         declaredPermissions = emptySet(),
         usedApis = emptySet(),
         unsupportedApis = emptySet(),

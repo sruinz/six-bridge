@@ -13,4 +13,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "six-bridge"
-include("core", "cli")
+include("bundle-contract", "core", "cli")
