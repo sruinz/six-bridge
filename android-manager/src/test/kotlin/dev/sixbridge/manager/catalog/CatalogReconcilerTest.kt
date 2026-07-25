@@ -1,0 +1,142 @@
+package dev.sixbridge.manager.catalog
+
+import dev.sixbridge.manager.wrapper.InstalledWrapper
+import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.runBlocking
+import org.junit.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNull
+
+class CatalogReconcilerTest {
+    @Test
+    fun `uses installed wrappers as the source of truth and marks stale catalog entries for removal`() {
+        val matching = catalogRecord(
+            packageName = "dev.sixbridge.ext.matching",
+            installedVersionCode = 1,
+            signerSha256 = "a".repeat(64),
+            reportJson = "{\"report\":\"matching\"}",
+        )
+        val stale = catalogRecord(packageName = "dev.sixbridge.ext.stale")
+        val changed = catalogRecord(
+            packageName = "dev.sixbridge.ext.changed",
+            installedVersionCode = 4,
+            signerSha256 = "b".repeat(64),
+            reportJson = "{\"report\":\"previous\"}",
+        )
+
+        val result = CatalogReconciler().reconcile(
+            catalogRecords = listOf(matching, stale, changed),
+            installedWrappers = listOf(
+                installedWrapper("dev.sixbridge.ext.matching", versionCode = 2, signerSha256 = "c".repeat(64)),
+                installedWrapper("dev.sixbridge.ext.external", versionCode = 3, signerSha256 = "d".repeat(64)),
+                installedWrapper("dev.sixbridge.ext.changed", versionCode = 5, signerSha256 = "e".repeat(64)),
+            ),
+        )
+
+        assertEquals(listOf("dev.sixbridge.ext.stale"), result.stalePackageNames)
+        assertEquals(
+            listOf(
+                matching.copy(
+                    name = "matching name",
+                    installedVersionCode = 2,
+                    signerSha256 = "c".repeat(64),
+                ),
+                catalogRecord(
+                    packageName = "dev.sixbridge.ext.external",
+                    extensionId = "external",
+                    name = "external name",
+                    iconPng = null,
+                    installedVersionCode = 3,
+                    signerSha256 = "d".repeat(64),
+                    compatibilityStatus = "UNKNOWN",
+                    reportJson = null,
+                    lastVerifiedAtEpochMillis = 0,
+                ),
+                changed.copy(
+                    name = "changed name",
+                    installedVersionCode = 5,
+                    signerSha256 = "e".repeat(64),
+                ),
+            ),
+            result.records,
+        )
+        assertNull(result.records.single { it.packageName == "dev.sixbridge.ext.external" }.reportJson)
+    }
+
+    @Test
+    fun `queries installed wrappers and removes stale catalog entries`() = runBlocking {
+        val stale = catalogRecord(packageName = "dev.sixbridge.ext.stale")
+        val catalog = FakeCatalog(listOf(stale))
+        val installed = installedWrapper(
+            packageName = "dev.sixbridge.ext.external",
+            versionCode = 3,
+            signerSha256 = "d".repeat(64),
+        )
+
+        val result = CatalogReconciler().reconcile(
+            catalog = catalog,
+            installedWrappers = object : InstalledWrapperRepository {
+                override suspend fun findAll(): List<InstalledWrapper> = listOf(installed)
+
+                override suspend fun find(packageName: String): InstalledWrapper? =
+                    installed.takeIf { it.packageName == packageName }
+            },
+        )
+
+        assertEquals(listOf(stale.packageName), catalog.removedPackageNames)
+        assertEquals(listOf(installed.packageName), result.records.map(CatalogRecord::packageName))
+    }
+
+    private fun catalogRecord(
+        packageName: String,
+        extensionId: String = packageName.substringAfterLast('.'),
+        name: String = "$extensionId catalog name",
+        iconPng: ByteArray? = byteArrayOf(1, 2, 3),
+        installedVersionCode: Long = 1,
+        signerSha256: String = "a".repeat(64),
+        compatibilityStatus: String = "COMPATIBLE",
+        reportJson: String? = "{\"report\":\"known\"}",
+        lastVerifiedAtEpochMillis: Long = 99,
+    ) = CatalogRecord(
+        packageName = packageName,
+        extensionId = extensionId,
+        name = name,
+        iconPng = iconPng,
+        installedVersionCode = installedVersionCode,
+        signerSha256 = signerSha256,
+        compatibilityStatus = compatibilityStatus,
+        reportJson = reportJson,
+        lastVerifiedAtEpochMillis = lastVerifiedAtEpochMillis,
+    )
+
+    private fun installedWrapper(
+        packageName: String,
+        versionCode: Long,
+        signerSha256: String,
+    ) = InstalledWrapper(
+        packageName = packageName,
+        extensionId = packageName.substringAfterLast('.'),
+        name = "${packageName.substringAfterLast('.')} name",
+        versionCode = versionCode,
+        signerSha256 = signerSha256,
+    )
+
+    private class FakeCatalog(
+        private val records: List<CatalogRecord>,
+    ) : ManagerCatalog {
+        val removedPackageNames = mutableListOf<String>()
+
+        override fun observe(): Flow<List<CatalogRecord>> = flowOf(records)
+
+        override suspend fun replaceVerified(record: CatalogRecord) = Unit
+
+        override suspend fun remove(packageName: String) {
+            removedPackageNames += packageName
+        }
+
+        override suspend fun get(packageName: String): CatalogRecord? =
+            records.singleOrNull { it.packageName == packageName }
+    }
+}

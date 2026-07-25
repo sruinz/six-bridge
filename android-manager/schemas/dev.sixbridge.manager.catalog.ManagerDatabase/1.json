@@ -1,0 +1,77 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "88a35799402c72589462d9e14c85d6dc",
+    "entities": [
+      {
+        "tableName": "catalog_entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packageName` TEXT NOT NULL, `extensionId` TEXT NOT NULL, `name` TEXT NOT NULL, `iconPng` BLOB, `installedVersionCode` INTEGER NOT NULL, `signerSha256` TEXT NOT NULL, `compatibilityStatus` TEXT NOT NULL, `reportJson` TEXT, `lastVerifiedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`packageName`))",
+        "fields": [
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "extensionId",
+            "columnName": "extensionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "iconPng",
+            "columnName": "iconPng",
+            "affinity": "BLOB"
+          },
+          {
+            "fieldPath": "installedVersionCode",
+            "columnName": "installedVersionCode",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "signerSha256",
+            "columnName": "signerSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "compatibilityStatus",
+            "columnName": "compatibilityStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reportJson",
+            "columnName": "reportJson",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastVerifiedAtEpochMillis",
+            "columnName": "lastVerifiedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packageName"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '88a35799402c72589462d9e14c85d6dc')"
+    ]
+  }
+}
