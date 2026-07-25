@@ -94,18 +94,31 @@ case_json=$(six_validation_case "$validation_manifest" "$case_id") ||
 case_slug=$(printf '%s' "$case_json" |
   jq -er '.fold7Validation.slug') ||
   usage_error "검증 case slug를 읽을 수 없습니다: $case_id"
+[[ "$case_slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] ||
+  usage_error "검증 case slug가 안전하지 않습니다: $case_id"
 case_name=$(printf '%s' "$case_json" | jq -er '.name') ||
   usage_error "검증 case 이름을 읽을 수 없습니다: $case_id"
 case_contract=$(printf '%s' "$case_json" |
   jq -er '.fold7Validation.contract') ||
   usage_error "검증 case contract를 읽을 수 없습니다: $case_id"
 
+approved_adapters_json=$(printf '%s' "$case_json" | jq -cer '
+  .fold7Validation.approvedAdapters |
+  select(type == "array") |
+  select(all(.[]; type == "string"))
+') ||
+  usage_error "검증 case 승인 adapter 설정을 읽을 수 없습니다: $case_id"
+adapter_count=$(printf '%s' "$approved_adapters_json" | jq -er 'length') ||
+  usage_error "검증 case 승인 adapter 개수를 읽을 수 없습니다: $case_id"
 adapter_args=()
-while IFS= read -r adapter_id; do
-  [ -n "$adapter_id" ] || continue
+adapter_index=0
+while [ "$adapter_index" -lt "$adapter_count" ]; do
+  adapter_id=$(printf '%s' "$approved_adapters_json" |
+    jq -er --argjson index "$adapter_index" '.[$index]') ||
+    usage_error "검증 case 승인 adapter를 읽을 수 없습니다: $case_id"
   adapter_args+=(--approve-adapter "$adapter_id")
-done < <(printf '%s' "$case_json" |
-  jq -er '.fold7Validation.approvedAdapters[]?')
+  adapter_index=$((adapter_index + 1))
+done
 
 cli="$project_dir/cli/build/install/sixbridge/bin/sixbridge"
 [ -x "$cli" ] ||

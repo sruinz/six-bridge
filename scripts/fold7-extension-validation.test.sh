@@ -204,6 +204,88 @@ expect_failure "공용 runner host/device 모드 충돌" \
     --host-only \
     --serial fixture-serial
 
+run_rejected_case_fixture() {
+  variant=$1
+  rejected_case_json=$2
+  rejected_project="$fixture/rejected-$variant"
+  rejected_source="$fixture/rejected-source-$variant"
+  rejected_profile="$rejected_project/profile.json"
+  rejected_cli="$rejected_project/cli/build/install/sixbridge/bin/sixbridge"
+  rejected_calls="$fixture/rejected-calls-$variant.txt"
+  rejected_output="$fixture/rejected-output-$variant.txt"
+  mkdir -p \
+    "$rejected_project/scripts" \
+    "$(dirname -- "$rejected_cli")" \
+    "$rejected_source"
+  cp "$runner" "$rejected_project/scripts/fold7-extension-validation.sh"
+  cp "$library" "$rejected_project/scripts/fold7-validation-lib.sh"
+  cat >>"$rejected_project/scripts/fold7-validation-lib.sh" <<'EOF'
+
+six_validation_case() {
+  printf '%s\n' "$SIX_TEST_CASE_JSON"
+}
+EOF
+  printf '{}\n' >"$rejected_project/extensions.json"
+  cat >"$rejected_profile" <<'EOF'
+{
+  "browserPackage": "com.sec.android.app.sbrowser",
+  "versionName": "30.0.0.67",
+  "versionCode": 1300067502
+}
+EOF
+  printf 'source\n' >"$rejected_source/source.txt"
+  cat >"$rejected_cli" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf 'called\n' >>"$SIX_TEST_CLI_CALLS"
+exit 9
+EOF
+  chmod +x "$rejected_cli"
+  touch "$rejected_calls"
+
+  set +e
+  SIX_VALIDATION_MANIFEST="$rejected_project/extensions.json" \
+    SIX_TEST_CASE_JSON="$rejected_case_json" \
+    SIX_TEST_CLI_CALLS="$rejected_calls" \
+    "$rejected_project/scripts/fold7-extension-validation.sh" \
+      --case-id fixture-case \
+      --source "$rejected_source" \
+      --profile "$rejected_profile" \
+      --host-only >"$rejected_output" 2>&1
+  rejected_exit=$?
+  set -e
+  if [ "$rejected_exit" -ne 2 ]; then
+    cat "$rejected_output" >&2
+    echo "$variant fixture 예상 exit=2, 실제 exit=$rejected_exit" >&2
+    exit 1
+  fi
+  [ ! -s "$rejected_calls" ] || {
+    echo "$variant fixture가 CLI를 호출했습니다." >&2
+    exit 1
+  }
+  if [ -e "$rejected_project/.local" ] ||
+    [ -e "$rejected_project/dist" ]; then
+    echo "$variant fixture가 검증 경계 디렉터리를 만들었습니다." >&2
+    exit 1
+  fi
+  if find "$rejected_project" -name '*escape*' -print -quit |
+    grep -q .; then
+    echo "unsafe slug가 검증 경계 밖 파일을 만들었습니다." >&2
+    exit 1
+  fi
+}
+
+run_rejected_case_fixture missing-adapters \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"fixture","contract":"ai-recipe-passthrough-v1"}}'
+run_rejected_case_fixture malformed-adapters \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"fixture","contract":"ai-recipe-passthrough-v1","approvedAdapters":"broken"}}'
+run_rejected_case_fixture unsafe-slug \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"../escape","contract":"ai-recipe-passthrough-v1","approvedAdapters":[]}}'
+run_rejected_case_fixture unsafe-separator \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"escape/name","contract":"ai-recipe-passthrough-v1","approvedAdapters":[]}}'
+run_rejected_case_fixture unsafe-control \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"escape\tslug","contract":"ai-recipe-passthrough-v1","approvedAdapters":[]}}'
+
 fixture_project="$fixture/project"
 fixture_source="$fixture/non-git-source"
 fixture_profile="$fixture_project/profile.json"
