@@ -51,6 +51,22 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+async function settleWithin(promise, timeoutMs = 500) {
+  let timeoutHandle;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`promise did not settle within ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 function receiverDetails(receiver) {
   const config = new URL(receiver.configUrl);
   return {
@@ -360,6 +376,101 @@ test("65,537 bytes body는 413이고 success claim을 소비하지 않는다", a
     requestMatched: true,
     reason: "matched",
   });
+});
+
+test("요청 없는 close는 completed와 closed evidence를 settle하고 handle을 닫는다", {
+  timeout: 1_000,
+}, async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "video-nas-receiver-"));
+  const evidencePath = path.join(directory, "evidence.json");
+  const evidenceFile = await open(evidencePath, "wx", 0o600);
+  const receiver = await startVideoNasReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    mode: "page",
+    expectedUrl: exactInput.expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath,
+    evidenceFile,
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const details = receiverDetails(receiver);
+
+  await receiver.close();
+
+  assert.deepEqual(await settleWithin(receiver.completed), {
+    requestMatched: false,
+    reason: "closed",
+  });
+  const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+  assert.equal(evidence.requestMatched, false);
+  assert.equal(evidence.reason, "closed");
+  await assert.rejects(evidenceFile.writeFile("not-written"), { code: "EBADF" });
+  await assert.rejects(request(details.restUrl));
+});
+
+test("exact HTTP claim 직후 close해도 성공 finalization을 보존한다", {
+  timeout: 1_500,
+}, async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "video-nas-receiver-"));
+  const evidencePath = path.join(directory, "evidence.json");
+  const evidenceFile = await open(evidencePath, "wx", 0o600);
+  const writeFile = evidenceFile.writeFile.bind(evidenceFile);
+  let markWriteStarted;
+  const writeStarted = new Promise((resolve) => {
+    markWriteStarted = resolve;
+  });
+  let releaseWrite;
+  const writeReleased = new Promise((resolve) => {
+    releaseWrite = resolve;
+  });
+  evidenceFile.writeFile = async (...argumentsList) => {
+    markWriteStarted();
+    await writeReleased;
+    return writeFile(...argumentsList);
+  };
+  const receiver = await startVideoNasReceiver({
+    bindHost: "127.0.0.1",
+    advertiseHost: "127.0.0.1",
+    port: 0,
+    mode: "page",
+    expectedUrl: exactInput.expectedUrl,
+    timeoutMs: 1_000,
+    evidencePath,
+    evidenceFile,
+  });
+  t.after(async () => {
+    releaseWrite();
+    await receiver.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const details = receiverDetails(receiver);
+  const responsePromise = postJson(receiver, {
+    url: exactInput.expectedUrl,
+    resolution: "best",
+  });
+
+  await settleWithin(writeStarted);
+  const closePromise = receiver.close();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  releaseWrite();
+
+  const response = await settleWithin(responsePromise);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await settleWithin(receiver.completed), {
+    requestMatched: true,
+    reason: "matched",
+  });
+  await settleWithin(closePromise);
+  const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+  assert.equal(evidence.requestMatched, true);
+  assert.equal(evidence.reason, "matched");
+  await assert.rejects(evidenceFile.writeFile("not-written"), { code: "EBADF" });
+  await assert.rejects(request(details.restUrl));
 });
 
 test("timeout은 redacted evidence를 기록하고 server·socket·file handle을 닫는다", {

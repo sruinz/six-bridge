@@ -90,19 +90,12 @@ export async function startVideoNasReceiver({
   let evidenceClosed = false;
   let serverClosed = false;
   let closePromise;
+  let finalizationPromise;
   let timeoutHandle;
   let resolveCompleted;
   const completed = new Promise((resolve) => {
     resolveCompleted = resolve;
   });
-  const claim = () => {
-    if (settled) {
-      return false;
-    }
-    settled = true;
-    clearTimeout(timeoutHandle);
-    return true;
-  };
   const closeEvidence = async () => {
     if (!evidenceClosed) {
       evidenceClosed = true;
@@ -127,7 +120,23 @@ export async function startVideoNasReceiver({
     resolution,
     completedAt: new Date().toISOString(),
   })}\n`, "utf8");
-  let finish;
+  const endResponse = (response) => new Promise((resolve) => {
+    if (response.writableFinished || response.destroyed) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      response.off("finish", done);
+      response.off("close", done);
+      response.off("error", done);
+      resolve();
+    };
+    response.once("finish", done);
+    response.once("close", done);
+    response.once("error", done);
+    response.end("matched");
+  });
+  let startFinalization;
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url, "http://receiver.invalid");
 
@@ -204,22 +213,18 @@ export async function startVideoNasReceiver({
         response.end(validation.reason);
         return;
       }
-      if (!claim()) {
+      const finalization = startFinalization({
+        requestMatched: true,
+        reason: "matched",
+        receivedUrl: validation.url,
+        resolution: validation.resolution,
+        authMatched: true,
+      }, response);
+      if (!finalization) {
         response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
         response.end("route");
         return;
       }
-
-      response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      response.end("matched", () => {
-        void finish({
-          requestMatched: true,
-          reason: "matched",
-          receivedUrl: validation.url,
-          resolution: validation.resolution,
-          authMatched: true,
-        });
-      });
     });
   });
   server.on("connection", (socket) => {
@@ -256,23 +261,37 @@ export async function startVideoNasReceiver({
     await closePromise;
   };
 
-  finish = async (details) => {
-    let result = {
-      requestMatched: details.requestMatched,
-      reason: details.reason,
-    };
-    try {
-      await writeEvidence(details);
-    } catch {
-      result = { requestMatched: false, reason: "evidence" };
-    } finally {
+  startFinalization = (details, response) => {
+    if (settled) {
+      return null;
+    }
+    settled = true;
+    clearTimeout(timeoutHandle);
+    if (response) {
+      response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    }
+    finalizationPromise = (async () => {
+      let result = {
+        requestMatched: details.requestMatched,
+        reason: details.reason,
+      };
+      try {
+        await writeEvidence(details);
+      } catch {
+        result = { requestMatched: false, reason: "evidence" };
+      }
+      if (response) {
+        await endResponse(response);
+      }
       try {
         await cleanup();
       } catch {
         result = { requestMatched: false, reason: "evidence" };
       }
       resolveCompleted(result);
-    }
+      return result;
+    })();
+    return finalizationPromise;
   };
 
   try {
@@ -292,18 +311,18 @@ export async function startVideoNasReceiver({
     downloadUrl = `http://${advertiseHost}:${address.port}/${runToken}/hls/master.m3u8`;
   }
   timeoutHandle = setTimeout(() => {
-    if (claim()) {
-      void finish({
-        requestMatched: false,
-        reason: "timeout",
-      });
-    }
+    void startFinalization({
+      requestMatched: false,
+      reason: "timeout",
+    });
   }, timeoutMs);
 
   const close = async () => {
-    settled = true;
-    clearTimeout(timeoutHandle);
-    await cleanup();
+    const finalization = startFinalization({
+      requestMatched: false,
+      reason: "closed",
+    }) ?? finalizationPromise;
+    await finalization;
   };
 
   return {
