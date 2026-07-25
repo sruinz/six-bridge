@@ -3,7 +3,9 @@ set -euo pipefail
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 script="$project_dir/scripts/fold7-converted-extension.sh"
+runner="$project_dir/scripts/fold7-extension-validation.sh"
 library="$project_dir/scripts/fold7-validation-lib.sh"
+validation="$project_dir/validation/extensions.json"
 
 # shellcheck source=fold7-validation-lib.sh
 . "$library"
@@ -25,6 +27,9 @@ expect_exit 0 "$script" --help
 expect_exit 2 "$script" --unknown-option
 expect_exit 2 "$script" --host-only --serial serial-1
 expect_exit 2 "$script"
+expect_exit 2 "$script" \
+  --case-id meemjdgdjhjfhcfchppfapgifiipjnlo \
+  --host-only
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
@@ -154,6 +159,7 @@ fixture_project="$fixture/project"
 fixture_source="$fixture/source"
 fixture_profile="$fixture_project/profiles/sbrowser-30.0.0.67.json"
 fixture_cli="$fixture_project/cli/build/install/sixbridge/bin/sixbridge"
+fixture_manifest="$fixture/extensions.json"
 mkdir -p \
   "$fixture_project/scripts" \
   "$(dirname -- "$fixture_profile")" \
@@ -162,7 +168,9 @@ mkdir -p \
 fixture_profile_dir=$(CDPATH= cd -- "$(dirname -- "$fixture_profile")" && pwd -P)
 fixture_profile_real="$fixture_profile_dir/$(basename -- "$fixture_profile")"
 cp "$script" "$fixture_project/scripts/fold7-converted-extension.sh"
+cp "$runner" "$fixture_project/scripts/fold7-extension-validation.sh"
 cp "$library" "$fixture_project/scripts/fold7-validation-lib.sh"
+cp "$validation" "$fixture_manifest"
 jq '
   .versionName = "30.0.0.67" |
   .versionCode = 1300067502
@@ -202,10 +210,19 @@ if [ "$command_name" = device ]; then
   shift
 fi
 output=
+approved_action=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output)
       output=$2
+      shift 2
+      ;;
+    --approve-adapter)
+      [ "$2" = action-popup-entry ] || {
+        echo "예상하지 않은 승인 adapter입니다: $2" >&2
+        exit 1
+      }
+      approved_action=true
       shift 2
       ;;
     *)
@@ -214,6 +231,14 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$command_name" in
+  draft|build)
+    [ "$approved_action" = true ] || {
+      echo "스마트 컨텍스트 승인 adapter가 전달되지 않았습니다." >&2
+      exit 1
+    }
+    ;;
+esac
 case "$command_name" in
   analyze)
     cp "$SIX_TEST_BEFORE" "$output"
@@ -225,10 +250,9 @@ case "$command_name" in
     ;;
   build)
     cp "$SIX_TEST_BUNDLE" "$output"
-    artifact_dir=$(dirname -- "$output")
-    cp "$SIX_TEST_CRX" "$artifact_dir/smart-context-converted.crx"
-    cp "$SIX_TEST_WRAPPER" \
-      "$artifact_dir/smart-context-converted-wrapper.apk"
+    artifact_stem=${output%.six}
+    cp "$SIX_TEST_CRX" "${artifact_stem}.crx"
+    cp "$SIX_TEST_WRAPPER" "${artifact_stem}-wrapper.apk"
     ;;
   device)
     printf '%s\n' "$device_command" >>"$SIX_TEST_DEVICE_CALLS"
@@ -355,6 +379,7 @@ run_option_entry_fixture() {
     SIX_TEST_BUNDLE="$fixture_bundle" \
     SIX_TEST_CRX="$fixture_crx" \
     SIX_TEST_WRAPPER="$fixture_wrapper" \
+    SIX_VALIDATION_MANIFEST="$fixture_manifest" \
     "$fixture_project/scripts/fold7-converted-extension.sh" "$@" \
     >"$output_file" 2>&1
   actual=$?
@@ -385,6 +410,7 @@ done
 run_option_entry_fixture legacy_content_backup 0 explicit
 run_option_entry_fixture valid 0 default
 grep -Fx "profile=$fixture_profile_real" "$fixture/output-valid.txt" >/dev/null
+grep -Fx 'sourceGitRepository=true' "$fixture/output-valid.txt" >/dev/null
 
 device_calls="$fixture/device-calls.txt"
 device_output="$fixture/output-profile-mismatch.txt"
@@ -398,6 +424,7 @@ PATH="$fixture_bin:$PATH" \
   SIX_TEST_WRAPPER="$fixture_wrapper" \
   SIX_TEST_DEVICE_CALLS="$device_calls" \
   SIX_TEST_BROWSER_DUMP="$dump" \
+  SIX_VALIDATION_MANIFEST="$fixture_manifest" \
   "$fixture_project/scripts/fold7-converted-extension.sh" \
     --serial fixture-serial \
     --source "$fixture_source" \

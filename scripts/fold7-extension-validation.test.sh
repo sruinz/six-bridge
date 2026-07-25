@@ -192,4 +192,277 @@ expect_failure "예약 ZIP root" \
 expect_failure "알 수 없는 ZIP contract" \
   six_assert_transformed_contract unknown "$ai_zip"
 
+runner="$project_dir/scripts/fold7-extension-validation.sh"
+expect_failure "공용 runner --case-id 필수" \
+  "$runner" --source "$ai_root" --host-only
+expect_failure "공용 runner --source 필수" \
+  "$runner" --case-id meemjdgdjhjfhcfchppfapgifiipjnlo --host-only
+expect_failure "공용 runner host/device 모드 충돌" \
+  "$runner" \
+    --case-id meemjdgdjhjfhcfchppfapgifiipjnlo \
+    --source "$ai_root" \
+    --host-only \
+    --serial fixture-serial
+
+fixture_project="$fixture/project"
+fixture_source="$fixture/non-git-source"
+fixture_profile="$fixture_project/profile.json"
+fixture_cli="$fixture_project/cli/build/install/sixbridge/bin/sixbridge"
+fixture_manifest="$fixture/extensions.json"
+mkdir -p \
+  "$fixture_project/scripts" \
+  "$(dirname -- "$fixture_cli")" \
+  "$fixture_source/images"
+cp "$runner" "$fixture_project/scripts/fold7-extension-validation.sh"
+cp "$library" "$fixture_project/scripts/fold7-validation-lib.sh"
+cp "$validation" "$fixture_manifest"
+cat >"$fixture_profile" <<'EOF'
+{
+  "browserPackage": "com.sec.android.app.sbrowser",
+  "versionName": "30.0.0.67",
+  "versionCode": 1300067502
+}
+EOF
+cat >"$fixture_source/manifest.json" <<'EOF'
+{
+  "manifest_version": 3,
+  "background": {"service_worker": "background.js"},
+  "options_ui": {"page": "options.html", "open_in_tab": false},
+  "permissions": ["storage", "activeTab", "contextMenus"]
+}
+EOF
+for entry in background.js options.html options.js; do
+  printf '%s\n' "$entry" >"$fixture_source/$entry"
+done
+for entry in icon16.png icon48.png icon128.png; do
+  printf '%s\n' "$entry" >"$fixture_source/images/$entry"
+done
+printf 'source 불변성 포함 대상\n' >"$fixture_source/.DS_Store"
+
+fixture_before="$fixture/ai-runner-before.json"
+fixture_after="$fixture/ai-runner-after.json"
+cat >"$fixture_before" <<'EOF'
+{
+  "status": "compatible",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": [],
+  "usedApis": ["tabs", "storage", "runtime", "contextMenus"],
+  "issues": [{"code": "storage_area_unknown", "blocking": false}]
+}
+EOF
+cat >"$fixture_after" <<'EOF'
+{
+  "status": "compatible",
+  "conversionState": "passthrough",
+  "adapterDecisions": [],
+  "unsupportedApis": [],
+  "convertedExtensionId": "meemjdgdjhjfhcfchppfapgifiipjnlo"
+}
+EOF
+fixture_transformed="$fixture/ai-runner-transformed.zip"
+(
+  cd "$fixture_source"
+  zip -q -X -r "$fixture_transformed" .
+)
+fixture_draft_root="$fixture/ai-runner-draft"
+fixture_draft="$fixture/ai-runner.sixdraft"
+mkdir "$fixture_draft_root"
+cp "$fixture_transformed" "$fixture_draft_root/source.zip"
+(
+  cd "$fixture_draft_root"
+  zip -q -X "$fixture_draft" source.zip
+)
+fixture_bundle_root="$fixture/ai-runner-bundle"
+fixture_bundle="$fixture/ai-runner.six"
+fixture_crx="$fixture/ai-runner.crx"
+fixture_wrapper="$fixture/ai-runner-wrapper.apk"
+mkdir "$fixture_bundle_root"
+cat >"$fixture_bundle_root/extension.json" <<'EOF'
+{
+  "extensionId": "meemjdgdjhjfhcfchppfapgifiipjnlo",
+  "wrapperPackage": "dev.sixbridge.ext.meemjdgdjhjfhcfchppfapgifiipjnlo",
+  "wrapperVersionCode": 10
+}
+EOF
+cp "$fixture_after" "$fixture_bundle_root/compatibility.json"
+(
+  cd "$fixture_bundle_root"
+  zip -q -X "$fixture_bundle" extension.json compatibility.json
+)
+printf 'Cr24fixture\n' >"$fixture_crx"
+printf 'fixture wrapper\n' >"$fixture_wrapper"
+
+cat >"$fixture_cli" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+command_name=$1
+shift
+device_command=
+if [ "$command_name" = device ]; then
+  device_command=$1
+  shift
+fi
+input=
+output=
+approved_adapter=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input)
+      input=$2
+      shift 2
+      ;;
+    --output)
+      output=$2
+      shift 2
+      ;;
+    --approve-adapter)
+      approved_adapter=true
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [ "$approved_adapter" = true ]; then
+  echo "AI fixture에 승인 adapter가 전달되었습니다." >&2
+  exit 1
+fi
+case "$command_name" in
+  analyze)
+    if [ "${SIX_TEST_MUTATE_SOURCE:-false}" = true ]; then
+      printf '검증 중 변경\n' >>"$input/background.js"
+    fi
+    cp "$SIX_TEST_BEFORE" "$output"
+    ;;
+  draft)
+    cp "$SIX_TEST_DRAFT" "$output"
+    ;;
+  verify-draft|verify-build)
+    ;;
+  build)
+    cp "$SIX_TEST_BUNDLE" "$output"
+    artifact_stem=${output%.six}
+    cp "$SIX_TEST_CRX" "${artifact_stem}.crx"
+    cp "$SIX_TEST_WRAPPER" "${artifact_stem}-wrapper.apk"
+    ;;
+  device)
+    printf '%s\n' "$device_command" >>"$SIX_TEST_DEVICE_CALLS"
+    ;;
+  *)
+    echo "예상하지 않은 fixture command입니다: $command_name" >&2
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "$fixture_cli"
+
+run_runner_fixture() {
+  output_file=$1
+  shift
+  SIX_VALIDATION_MANIFEST="$fixture_manifest" \
+    SIX_TEST_BEFORE="$fixture_before" \
+    SIX_TEST_DRAFT="$fixture_draft" \
+    SIX_TEST_BUNDLE="$fixture_bundle" \
+    SIX_TEST_CRX="$fixture_crx" \
+    SIX_TEST_WRAPPER="$fixture_wrapper" \
+    "$fixture_project/scripts/fold7-extension-validation.sh" \
+      --case-id meemjdgdjhjfhcfchppfapgifiipjnlo \
+      --source "$fixture_source" \
+      --profile "$fixture_profile" \
+      "$@" >"$output_file" 2>&1
+}
+
+runner_output="$fixture/runner-output.txt"
+run_runner_fixture "$runner_output" --host-only
+grep -Fx 'caseId=meemjdgdjhjfhcfchppfapgifiipjnlo' "$runner_output" >/dev/null
+grep -Fx 'caseSlug=ai-recipe' "$runner_output" >/dev/null
+grep -Fx 'sourceGitRepository=false' "$runner_output" >/dev/null
+grep -Fx 'sourceUnchanged=true' "$runner_output" >/dev/null
+grep -Fx 'draftDeterministic=true' "$runner_output" >/dev/null || {
+  cat "$runner_output" >&2
+  echo "공용 runner deterministic 출력을 찾을 수 없습니다." >&2
+  exit 1
+}
+grep -Fx 'hostContract=true' "$runner_output" >/dev/null
+grep -Fx 'deviceChecks=skipped' "$runner_output" >/dev/null
+test -f "$fixture_project/dist/ai-recipe-converted.six"
+test -f "$fixture_project/dist/ai-recipe-converted.crx"
+test -f "$fixture_project/dist/ai-recipe-converted-wrapper.apk"
+test -f "$fixture_project/.local/evidence/ai-recipe-before.json"
+test -f "$fixture_project/.local/evidence/ai-recipe-a.sixdraft"
+test -f "$fixture_project/.local/evidence/ai-recipe-b.sixdraft"
+test -f "$fixture_project/.local/evidence/ai-recipe-extension.json"
+test -f "$fixture_project/.local/evidence/ai-recipe-after.json"
+
+mutation_output="$fixture/runner-mutation-output.txt"
+set +e
+SIX_TEST_MUTATE_SOURCE=true \
+  run_runner_fixture "$mutation_output" --host-only
+mutation_exit=$?
+set -e
+if [ "$mutation_exit" -ne 4 ]; then
+  cat "$mutation_output" >&2
+  echo "source mutation fixture 예상 exit=4, 실제 exit=$mutation_exit" >&2
+  exit 1
+fi
+grep -Fx '실제 source가 검증 중 변경되었습니다.' \
+  "$mutation_output" >/dev/null
+
+printf '%s\n' 'background.js' >"$fixture_source/background.js"
+fixture_bin="$fixture/bin"
+fixture_adb="$fixture_bin/adb"
+fixture_dump="$fixture/browser-dump.txt"
+device_calls="$fixture/device-calls.txt"
+device_output="$fixture/device-output.txt"
+mkdir "$fixture_bin"
+touch "$device_calls"
+cat >"$fixture_dump" <<'EOF'
+Package [com.sec.android.app.sbrowser] (abc):
+    versionCode=1300261502 minSdk=30 targetSdk=36
+    versionName=30.0.2.61
+EOF
+cat >"$fixture_adb" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+case "$1" in
+  devices)
+    printf '%s\n' \
+      'List of devices attached' \
+      'fixture-serial device product:fixture model:fixture'
+    ;;
+  -s)
+    shift 2
+    if [ "$*" = "shell dumpsys package com.sec.android.app.sbrowser" ]; then
+      cat "$SIX_TEST_BROWSER_DUMP"
+    else
+      exit 1
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "$fixture_adb"
+set +e
+PATH="$fixture_bin:$PATH" \
+  SIX_TEST_DEVICE_CALLS="$device_calls" \
+  SIX_TEST_BROWSER_DUMP="$fixture_dump" \
+  run_runner_fixture "$device_output" --serial fixture-serial
+device_exit=$?
+set -e
+if [ "$device_exit" -ne 3 ]; then
+  cat "$device_output" >&2
+  echo "profile mismatch fixture 예상 exit=3, 실제 exit=$device_exit" >&2
+  exit 1
+fi
+grep -Fx 'profileMatch=false' "$device_output" >/dev/null
+grep -Fx 'deviceChecks=failed' "$device_output" >/dev/null
+[ "$(grep -c '^install$' "$device_calls" || true)" -eq 0 ]
+[ "$(grep -c '^smoke$' "$device_calls" || true)" -eq 0 ]
+
 echo "fold7 extension validation shell tests passed"
