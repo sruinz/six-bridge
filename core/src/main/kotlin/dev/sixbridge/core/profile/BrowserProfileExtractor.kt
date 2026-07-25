@@ -184,7 +184,7 @@ class BrowserProfileExtractor {
         val markers = mutableSetOf<String>()
         val namespaces = mutableSetOf<String>()
         private val dexMarkers = mutableSetOf<String>()
-        private val terraceMarkers = mutableSetOf<String>()
+        private val terraceMarkerSets = mutableListOf<Set<String>>()
         var versionName: String? = null
         var versionCode: Long? = null
 
@@ -205,18 +205,20 @@ class BrowserProfileExtractor {
         }
 
         fun scanTerraceLibrary(input: InputStream) {
+            val libraryMarkers = mutableSetOf<String>()
             scanText(input) { text ->
                 NAMESPACE_REGEX.findAll(text).forEach { match ->
                     namespaces += match.groupValues[1]
                 }
-                OPTION_PAGE_TERRACE_MARKERS.filterTo(terraceMarkers) { it in text }
+                OPTION_PAGE_TERRACE_MARKERS.filterTo(libraryMarkers) { it in text }
             }
+            terraceMarkerSets += libraryMarkers
         }
 
         fun supportedFeatures(): Set<String> = buildSet {
             if (
                 dexMarkers.containsAll(OPTION_PAGE_DEX_MARKERS) &&
-                terraceMarkers.containsAll(OPTION_PAGE_TERRACE_MARKERS)
+                terraceMarkerSets.any { it.containsAll(OPTION_PAGE_TERRACE_MARKERS) }
             ) {
                 add(OPTIONS_PAGE_ACCESSIBLE_FEATURE)
             }

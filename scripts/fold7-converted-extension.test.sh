@@ -196,6 +196,11 @@ set -euo pipefail
 
 command_name=$1
 shift
+device_command=
+if [ "$command_name" = device ]; then
+  device_command=$1
+  shift
+fi
 output=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -225,6 +230,9 @@ case "$command_name" in
     cp "$SIX_TEST_WRAPPER" \
       "$artifact_dir/smart-context-converted-wrapper.apk"
     ;;
+  device)
+    printf '%s\n' "$device_command" >>"$SIX_TEST_DEVICE_CALLS"
+    ;;
   *)
     echo "예상하지 않은 fixture command입니다: $command_name" >&2
     exit 1
@@ -232,6 +240,36 @@ case "$command_name" in
 esac
 EOF
 chmod +x "$fixture_cli"
+
+fixture_bin="$fixture/bin"
+fixture_adb="$fixture_bin/adb"
+mkdir "$fixture_bin"
+cat >"$fixture_adb" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "$1" in
+  devices)
+    printf '%s\n' \
+      'List of devices attached' \
+      'fixture-serial device product:fixture model:fixture'
+    ;;
+  -s)
+    shift 2
+    if [ "$*" = "shell dumpsys package com.sec.android.app.sbrowser" ]; then
+      cat "$SIX_TEST_BROWSER_DUMP"
+    else
+      echo "예상하지 않은 fixture adb command입니다: $*" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "예상하지 않은 fixture adb command입니다: $*" >&2
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "$fixture_adb"
 
 run_option_entry_fixture() {
   variant=$1
@@ -275,6 +313,10 @@ run_option_entry_fixture() {
     printf 'reserved selection bridge\n' \
       >"$source_root/_sixbridge/desktop-selection-event-bridge.v1.js"
   fi
+  if [ "$variant" = arbitrary_reserved_root ]; then
+    mkdir -p "$source_root/_metadata"
+    printf 'foreign metadata\n' >"$source_root/_metadata/foreign.json"
+  fi
   case "$variant" in
     legacy_content)
       printf 'legacy\n' >"$source_root/action-popup-entry-content.v1.js"
@@ -285,6 +327,10 @@ run_option_entry_fixture() {
     legacy_bootstrap)
       printf 'legacy\n' \
         >"$source_root/_sixbridge-action-popup-entry-bootstrap.v1.js"
+      ;;
+    legacy_content_backup)
+      printf 'backup\n' \
+        >"$source_root/action-popup-entry-content.v1.js.backup"
       ;;
   esac
   (
@@ -330,12 +376,52 @@ for mutation in \
   reserved_provenance \
   missing_selection \
   reserved_selection \
+  arbitrary_reserved_root \
   legacy_content \
   legacy_background \
   legacy_bootstrap; do
   run_option_entry_fixture "$mutation" 3 explicit
 done
+run_option_entry_fixture legacy_content_backup 0 explicit
 run_option_entry_fixture valid 0 default
 grep -Fx "profile=$fixture_profile_real" "$fixture/output-valid.txt" >/dev/null
+
+device_calls="$fixture/device-calls.txt"
+device_output="$fixture/output-profile-mismatch.txt"
+touch "$device_calls"
+set +e
+PATH="$fixture_bin:$PATH" \
+  SIX_TEST_BEFORE="$before" \
+  SIX_TEST_DRAFT="$fixture/draft-valid.sixdraft" \
+  SIX_TEST_BUNDLE="$fixture_bundle" \
+  SIX_TEST_CRX="$fixture_crx" \
+  SIX_TEST_WRAPPER="$fixture_wrapper" \
+  SIX_TEST_DEVICE_CALLS="$device_calls" \
+  SIX_TEST_BROWSER_DUMP="$dump" \
+  "$fixture_project/scripts/fold7-converted-extension.sh" \
+    --serial fixture-serial \
+    --source "$fixture_source" \
+    --profile "$fixture_profile" \
+    >"$device_output" 2>&1
+device_actual=$?
+set -e
+if [ "$device_actual" -ne 3 ]; then
+  cat "$device_output" >&2
+  echo "profile mismatch device fixture 예상 exit=3, 실제 exit=$device_actual" >&2
+  exit 1
+fi
+grep -Fx 'profileMatch=false' "$device_output" >/dev/null
+grep -Fx 'deviceChecks=failed' "$device_output" >/dev/null
+if grep -Fx 'installSuccess=true' "$device_output" >/dev/null ||
+  grep -Fx 'deviceChecks=passed' "$device_output" >/dev/null; then
+  echo "profile mismatch를 device 성공으로 기록했습니다." >&2
+  exit 1
+fi
+install_calls=$(grep -c '^install$' "$device_calls" || true)
+smoke_calls=$(grep -c '^smoke$' "$device_calls" || true)
+if [ "$install_calls" -ne 0 ] || [ "$smoke_calls" -ne 0 ]; then
+  echo "profile mismatch에서 device 명령을 호출했습니다: install=$install_calls smoke=$smoke_calls" >&2
+  exit 1
+fi
 
 echo "fold7 converted extension shell tests passed"

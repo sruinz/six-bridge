@@ -51,6 +51,34 @@ class BrowserProfileExtractorTest {
     }
 
     @Test
+    fun `requires one ABI runtime library to contain every option page marker`() {
+        val dex = "getExtensionOptionPage six_add_on_settings updateGoAddonSettings"
+        val splitAcrossAbis = browserApk(
+            dex = dex,
+            terraceByAbi = mapOf(
+                "arm64-v8a" to "options_ui",
+                "armeabi-v7a" to "options_page",
+            ),
+        )
+        val completeInOneAbi = browserApk(
+            dex = dex,
+            terraceByAbi = mapOf(
+                "arm64-v8a" to "options_ui options_page",
+                "armeabi-v7a" to "options_ui",
+            ),
+        )
+
+        assertFalse(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(splitAcrossAbis).supportedFeatures,
+        )
+        assertTrue(
+            "extension.options-page.user-accessible" in
+                BrowserProfileExtractor().extract(completeInOneAbi).supportedFeatures,
+        )
+    }
+
+    @Test
     fun `extracts the Samsung extension contract and supported namespaces`() {
         val directory = Files.createTempDirectory("browser-profile")
         val apk = directory.resolve(
@@ -130,14 +158,20 @@ class BrowserProfileExtractorTest {
     }
 
     private fun browserApk(dex: String, terrace: String): Path {
+        return browserApk(dex, mapOf("arm64-v8a" to terrace))
+    }
+
+    private fun browserApk(dex: String, terraceByAbi: Map<String, String>): Path {
         val apk = Files.createTempFile("six-browser-profile-", ".apk")
         ZipOutputStream(Files.newOutputStream(apk)).use { zip ->
             zip.putNextEntry(ZipEntry("classes.dex"))
             zip.write(dex.toByteArray())
             zip.closeEntry()
-            zip.putNextEntry(ZipEntry("lib/arm64-v8a/libterrace.so"))
-            zip.write(terrace.toByteArray())
-            zip.closeEntry()
+            terraceByAbi.forEach { (abi, terrace) ->
+                zip.putNextEntry(ZipEntry("lib/$abi/libterrace.so"))
+                zip.write(terrace.toByteArray())
+                zip.closeEntry()
+            }
         }
         return apk
     }
