@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, open, readFile, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   startVideoNasReceiver,
@@ -26,6 +38,47 @@ const exactInput = {
   expectedUrl: "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
 };
 
+const receiverScript = fileURLToPath(
+  new URL("./video-nas-lan-receiver.mjs", import.meta.url),
+);
+
+async function createCliProject(t) {
+  const project = await mkdtemp(path.join(os.tmpdir(), "video-nas-cli-"));
+  await mkdir(path.join(project, ".local", "evidence"), { recursive: true });
+  t.after(async () => {
+    await rm(project, { recursive: true, force: true });
+  });
+  return project;
+}
+
+function runCli(argumentsList, { cwd, onStdoutLine } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [receiverScript, ...argumentsList], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stdoutRemainder = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      stdoutRemainder += chunk;
+      const lines = stdoutRemainder.split("\n");
+      stdoutRemainder = lines.pop();
+      for (const line of lines) {
+        onStdoutLine?.(line);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
 function request(url, options = {}) {
   return new Promise((resolve, reject) => {
     const requestHandle = http.request(url, options, (response) => {
@@ -44,6 +97,23 @@ function request(url, options = {}) {
     });
     requestHandle.on("error", reject);
     requestHandle.end(options.body);
+  });
+}
+
+function postCliDownload(configUrl, downloadUrl) {
+  const config = new URL(configUrl);
+  const body = JSON.stringify({
+    url: downloadUrl,
+    resolution: "best",
+  });
+  return request(`${config.origin}${config.pathname}/rest`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${config.hash.slice(1)}`,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+    },
+    body,
   });
 }
 
@@ -110,6 +180,444 @@ async function startTestReceiver(t, options) {
   });
   return receiver;
 }
+
+test("CLI는 mode·host·mode별 URL과 정수 경계를 검증한다", async (t) => {
+  const project = await createCliProject(t);
+  const evidence = ".local/evidence/arguments.json";
+  const rejectedCases = [
+    [
+      "mode 없음",
+      ["--advertise-host", "127.0.0.1", "--expected-url", exactInput.expectedUrl,
+        "--evidence", evidence],
+      /missing required option: --mode/,
+    ],
+    [
+      "지원하지 않는 mode",
+      ["--mode", "invalid", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence],
+      /--mode must be page or hls/,
+    ],
+    [
+      "page expected URL 없음",
+      ["--mode", "page", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence],
+      /missing required option: --expected-url/,
+    ],
+    [
+      "hls expected URL 지정",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--expected-url", exactInput.expectedUrl, "--evidence", evidence],
+      /--expected-url is not allowed in hls mode/,
+    ],
+    [
+      "advertise host 없음",
+      ["--mode", "hls", "--evidence", evidence],
+      /missing required option: --advertise-host/,
+    ],
+    [
+      "evidence 없음",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1"],
+      /missing required option: --evidence/,
+    ],
+    [
+      "port 음수",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence, "--port", "-1"],
+      /--port must be an integer from 0 to 65535/,
+    ],
+    [
+      "port 상한 초과",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence, "--port", "65536"],
+      /--port must be an integer from 0 to 65535/,
+    ],
+    [
+      "port 소수",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence, "--port", "1.5"],
+      /--port must be an integer from 0 to 65535/,
+    ],
+    [
+      "timeout 0",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence, "--timeout-ms", "0"],
+      /--timeout-ms must be a positive integer/,
+    ],
+    [
+      "timeout 소수",
+      ["--mode", "hls", "--advertise-host", "127.0.0.1",
+        "--evidence", evidence, "--timeout-ms", "1.5"],
+      /--timeout-ms must be a positive integer/,
+    ],
+  ];
+
+  for (const [name, argumentsList, errorPattern] of rejectedCases) {
+    await t.test(name, async () => {
+      const result = await runCli(argumentsList, { cwd: project });
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout.length, 0);
+      assert.match(result.stderr, errorPattern);
+    });
+  }
+});
+
+test("CLI는 evidence 외부 parent와 symlink를 거부한다", async (t) => {
+  const project = await createCliProject(t);
+  const externalDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "video-nas-cli-external-"),
+  );
+  const externalEvidence = path.join(externalDirectory, "evidence.json");
+  const symlinkEvidence = path.join(
+    project,
+    ".local",
+    "evidence",
+    "link.json",
+  );
+  await symlink(externalEvidence, symlinkEvidence);
+  t.after(async () => {
+    await rm(externalDirectory, { recursive: true, force: true });
+  });
+
+  const outside = await runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", externalEvidence,
+  ], { cwd: project });
+  assert.equal(outside.code, 1);
+  assert.equal(outside.stdout.length, 0);
+  assert.match(outside.stderr, /directly inside \.local\/evidence/);
+
+  const symlinkResult = await runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", ".local/evidence/link.json",
+  ], { cwd: project });
+  assert.equal(symlinkResult.code, 1);
+  assert.equal(symlinkResult.stdout.length, 0);
+  assert.match(symlinkResult.stderr, /symbolic link/);
+});
+
+test("CLI는 기존 evidence 파일이면 listen 전에 실패한다", async (t) => {
+  const project = await createCliProject(t);
+  const evidencePath = path.join(
+    project,
+    ".local",
+    "evidence",
+    "occupied.json",
+  );
+  await writeFile(evidencePath, "keep", { encoding: "utf8", mode: 0o600 });
+
+  const result = await runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", ".local/evidence/occupied.json",
+  ], { cwd: project });
+
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout.length, 0);
+  assert.match(result.stderr, /EEXIST/);
+  assert.equal(await readFile(evidencePath, "utf8"), "keep");
+});
+
+test("CLI는 evidence root 교체 뒤에도 선점한 handle에만 timeout을 기록한다", {
+  timeout: 4_000,
+}, async (t) => {
+  const project = await createCliProject(t);
+  const evidenceRoot = path.join(project, ".local", "evidence");
+  const movedRoot = path.join(project, ".local", "evidence-moved");
+  const externalDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "video-nas-cli-external-"),
+  );
+  const filename = "root-race.json";
+  let rootSwapped = false;
+  let configSecrets;
+  t.after(async () => {
+    if (rootSwapped) {
+      await rm(evidenceRoot, { recursive: true, force: true });
+      await rename(movedRoot, evidenceRoot);
+    }
+    await rm(externalDirectory, { recursive: true, force: true });
+  });
+
+  let resolveSwapped;
+  let rejectSwapped;
+  const swapped = new Promise((resolve, reject) => {
+    resolveSwapped = resolve;
+    rejectSwapped = reject;
+  });
+  let swapStarted = false;
+  const resultPromise = runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", `.local/evidence/${filename}`,
+    "--timeout-ms", "1000",
+  ], {
+    cwd: project,
+    onStdoutLine(line) {
+      if (!line.startsWith("configUrl=")) {
+        return;
+      }
+      let config;
+      try {
+        config = new URL(line.slice("configUrl=".length));
+      } catch {
+        rejectSwapped(new Error("CLI emitted an invalid configUrl"));
+        return;
+      }
+      configSecrets = [config.pathname.slice(1), config.hash.slice(1)];
+      if (swapStarted) {
+        return;
+      }
+      swapStarted = true;
+      void (async () => {
+        await rename(evidenceRoot, movedRoot);
+        await symlink(externalDirectory, evidenceRoot);
+        rootSwapped = true;
+        resolveSwapped();
+      })().catch(rejectSwapped);
+    },
+  });
+
+  await swapped;
+  const result = await resultPromise;
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /completed without a matched request: timeout/);
+  await assert.rejects(
+    readFile(path.join(externalDirectory, filename), "utf8"),
+    { code: "ENOENT" },
+  );
+
+  await rm(evidenceRoot, { recursive: true, force: true });
+  await rename(movedRoot, evidenceRoot);
+  rootSwapped = false;
+  const evidencePath = path.join(evidenceRoot, filename);
+  const evidenceText = await readFile(evidencePath, "utf8");
+  const evidence = JSON.parse(evidenceText);
+  assert.equal(evidence.requestMatched, false);
+  assert.equal(evidence.reason, "timeout");
+  assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
+  assert.equal(evidenceText.includes("http://"), false);
+  for (const secret of configSecrets) {
+    assert.equal(evidenceText.includes(secret), false);
+  }
+});
+
+test("CLI listen 실패는 server와 선점한 evidence handle을 정리한다", async (t) => {
+  const project = await createCliProject(t);
+  const holder = http.createServer((_request, response) => response.end("held"));
+  let holderListening = true;
+  await new Promise((resolve, reject) => {
+    holder.once("error", reject);
+    holder.listen(0, "0.0.0.0", resolve);
+  });
+  const occupiedPort = holder.address().port;
+  t.after(async () => {
+    if (holderListening) {
+      await new Promise((resolve) => holder.close(resolve));
+    }
+  });
+
+  const result = await runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", ".local/evidence/listen-failure.json",
+    "--port", String(occupiedPort),
+  ], { cwd: project });
+
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout.length, 0);
+  assert.match(result.stderr, /EADDRINUSE/);
+  const evidencePath = path.join(
+    project,
+    ".local",
+    "evidence",
+    "listen-failure.json",
+  );
+  assert.equal(await readFile(evidencePath, "utf8"), "");
+  assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
+  await writeFile(evidencePath, "released", { encoding: "utf8", flag: "r+" });
+
+  await new Promise((resolve) => holder.close(resolve));
+  holderListening = false;
+  const replacement = http.createServer();
+  await new Promise((resolve, reject) => {
+    replacement.once("error", reject);
+    replacement.listen(occupiedPort, "0.0.0.0", resolve);
+  });
+  await new Promise((resolve) => replacement.close(resolve));
+});
+
+test("CLI page subprocess는 configUrl의 정확한 POST로 성공하고 정리한다", {
+  timeout: 4_000,
+}, async (t) => {
+  const project = await createCliProject(t);
+  const evidencePath = path.join(
+    project,
+    ".local",
+    "evidence",
+    "page-success.json",
+  );
+  const stdoutLabels = [];
+  let exchangeStarted = false;
+  let resolveExchange;
+  const exchange = new Promise((resolve) => {
+    resolveExchange = resolve;
+  });
+  const resultPromise = runCli([
+    "--mode", "page",
+    "--advertise-host", "127.0.0.1",
+    "--expected-url", exactInput.expectedUrl,
+    "--evidence", ".local/evidence/page-success.json",
+    "--timeout-ms", "1000",
+  ], {
+    cwd: project,
+    onStdoutLine(line) {
+      if (!line.startsWith("configUrl=")) {
+        stdoutLabels.push("unexpected");
+        return;
+      }
+      stdoutLabels.push("configUrl");
+      if (exchangeStarted) {
+        return;
+      }
+      exchangeStarted = true;
+      void (async () => {
+        const configUrl = line.slice("configUrl=".length);
+        const config = new URL(configUrl);
+        const response = await postCliDownload(
+          configUrl,
+          exactInput.expectedUrl,
+        );
+        resolveExchange({
+          ok: true,
+          responseStatus: response.status,
+          restUrl: `${config.origin}${config.pathname}/rest`,
+          secrets: [config.pathname.slice(1), config.hash.slice(1)],
+        });
+      })().catch(() => {
+        resolveExchange({ ok: false });
+      });
+    },
+  });
+
+  const [result, exchangeResult] = await Promise.all([
+    resultPromise,
+    settleWithin(exchange, 2_000),
+  ]);
+  assert.equal(exchangeResult.ok, true);
+  assert.equal(exchangeResult.responseStatus, 200);
+  assert.equal(result.code, 0);
+  assert.equal(result.stderr.length, 0);
+  assert.deepEqual(stdoutLabels, ["configUrl"]);
+
+  const evidenceText = await readFile(evidencePath, "utf8");
+  const evidence = JSON.parse(evidenceText);
+  assert.equal(evidence.requestMatched, true);
+  assert.equal(evidence.reason, "matched");
+  assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));
+  assert.equal(evidence.receivedUrlSha256, evidence.expectedUrlSha256);
+  assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
+  assert.equal(evidenceText.includes(exactInput.expectedUrl), false);
+  for (const secret of exchangeResult.secrets) {
+    assert.equal(evidenceText.includes(secret), false);
+  }
+  await assert.rejects(request(exchangeResult.restUrl));
+  await writeFile(evidencePath, "released", { encoding: "utf8", flag: "r+" });
+});
+
+test("CLI HLS subprocess는 probe GET과 정확한 HLS POST로 성공하고 정리한다", {
+  timeout: 4_000,
+}, async (t) => {
+  const project = await createCliProject(t);
+  const evidencePath = path.join(
+    project,
+    ".local",
+    "evidence",
+    "hls-success.json",
+  );
+  const stdoutLabels = [];
+  let configUrl;
+  let probeUrl;
+  let exchangeStarted = false;
+  let resolveExchange;
+  const exchange = new Promise((resolve) => {
+    resolveExchange = resolve;
+  });
+  const maybeExchange = () => {
+    if (!configUrl || !probeUrl || exchangeStarted) {
+      return;
+    }
+    exchangeStarted = true;
+    void (async () => {
+      const config = new URL(configUrl);
+      const probe = new URL(probeUrl);
+      const probeMatchesConfig = (
+        probe.origin === config.origin &&
+        probe.pathname === `${config.pathname}/probe.html` &&
+        probe.search === "" &&
+        probe.hash === ""
+      );
+      const probeResponse = await request(probeUrl);
+      const masterUrl = `${config.origin}${config.pathname}/hls/master.m3u8`;
+      const downloadResponse = await postCliDownload(configUrl, masterUrl);
+      resolveExchange({
+        ok: true,
+        probeMatchesConfig,
+        probeStatus: probeResponse.status,
+        downloadStatus: downloadResponse.status,
+        restUrl: `${config.origin}${config.pathname}/rest`,
+        secrets: [config.pathname.slice(1), config.hash.slice(1)],
+      });
+    })().catch(() => {
+      resolveExchange({ ok: false });
+    });
+  };
+  const resultPromise = runCli([
+    "--mode", "hls",
+    "--advertise-host", "127.0.0.1",
+    "--evidence", ".local/evidence/hls-success.json",
+    "--timeout-ms", "1000",
+  ], {
+    cwd: project,
+    onStdoutLine(line) {
+      if (line.startsWith("configUrl=")) {
+        stdoutLabels.push("configUrl");
+        configUrl = line.slice("configUrl=".length);
+      } else if (line.startsWith("probeUrl=")) {
+        stdoutLabels.push("probeUrl");
+        probeUrl = line.slice("probeUrl=".length);
+      } else {
+        stdoutLabels.push("unexpected");
+      }
+      maybeExchange();
+    },
+  });
+
+  const [result, exchangeResult] = await Promise.all([
+    resultPromise,
+    settleWithin(exchange, 2_000),
+  ]);
+  assert.equal(exchangeResult.ok, true);
+  assert.equal(exchangeResult.probeMatchesConfig, true);
+  assert.equal(exchangeResult.probeStatus, 200);
+  assert.equal(exchangeResult.downloadStatus, 200);
+  assert.equal(result.code, 0);
+  assert.equal(result.stderr.length, 0);
+  assert.deepEqual(stdoutLabels, ["configUrl", "probeUrl"]);
+
+  const evidenceText = await readFile(evidencePath, "utf8");
+  const evidence = JSON.parse(evidenceText);
+  assert.equal(evidence.requestMatched, true);
+  assert.equal(evidence.reason, "matched");
+  assert.equal(evidence.expectedUrlSha256, evidence.receivedUrlSha256);
+  assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
+  assert.equal(evidenceText.includes("http://"), false);
+  for (const secret of exchangeResult.secrets) {
+    assert.equal(evidenceText.includes(secret), false);
+  }
+  await assert.rejects(request(exchangeResult.restUrl));
+  await writeFile(evidencePath, "released", { encoding: "utf8", flag: "r+" });
+});
 
 test("정확한 Bearer POST만 허용한다", () => {
   assert.deepEqual(validateDownloadRequest(exactInput), {
@@ -198,10 +706,9 @@ test("HLS mode는 probe와 master playlist를 제공한다", async (t) => {
   });
   const evidenceText = await readFile(receiver.testEvidencePath, "utf8");
   const details = receiverDetails(receiver);
-  assert.doesNotMatch(evidenceText, /m3u8/i);
-  assert.doesNotMatch(evidenceText, new RegExp(
-    `${details.runToken}|${details.bearerToken}`,
-  ));
+  assert.equal(/m3u8/i.test(evidenceText), false);
+  assert.equal(evidenceText.includes(details.runToken), false);
+  assert.equal(evidenceText.includes(details.bearerToken), false);
 });
 
 test("page mode는 HLS GET endpoint를 제공하지 않는다", async (t) => {
@@ -242,9 +749,9 @@ test("page mode의 첫 정확한 POST를 완료하고 모든 handle을 닫는다
   });
 
   const details = receiverDetails(receiver);
-  assert.match(details.runToken, /^[0-9a-f]{48}$/);
-  assert.match(details.bearerToken, /^[0-9a-f]{48}$/);
-  assert.notEqual(details.runToken, details.bearerToken);
+  assert.equal(/^[0-9a-f]{48}$/.test(details.runToken), true);
+  assert.equal(/^[0-9a-f]{48}$/.test(details.bearerToken), true);
+  assert.equal(details.runToken !== details.bearerToken, true);
 
   const response = await postJson(receiver, {
     url: exactInput.expectedUrl,
@@ -278,10 +785,9 @@ test("page mode의 첫 정확한 POST를 완료하고 모든 handle을 닫는다
   assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));
   assert.equal(evidence.receivedUrlSha256, evidence.expectedUrlSha256);
   assert.equal(evidence.resolution, "best");
-  assert.doesNotMatch(evidenceText, /youtube\.com|authorization|configUrl/i);
-  assert.doesNotMatch(evidenceText, new RegExp(
-    `${details.runToken}|${details.bearerToken}`,
-  ));
+  assert.equal(/youtube\.com|authorization|configUrl/i.test(evidenceText), false);
+  assert.equal(evidenceText.includes(details.runToken), false);
+  assert.equal(evidenceText.includes(details.bearerToken), false);
   await assert.rejects(evidenceFile.writeFile("not-written"), { code: "EBADF" });
   await assert.rejects(request(details.restUrl));
 });
@@ -507,7 +1013,7 @@ test("timeout은 redacted evidence를 기록하고 server·socket·file handle�
   assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));
   assert.equal(evidence.receivedUrlSha256, sha256(""));
   assert.equal(evidence.resolution, "");
-  assert.doesNotMatch(evidenceText, /youtube\.com|authorization|configUrl/i);
+  assert.equal(/youtube\.com|authorization|configUrl/i.test(evidenceText), false);
   await assert.rejects(evidenceFile.writeFile("not-written"), { code: "EBADF" });
   await assert.rejects(request(receiverDetails(receiver).restUrl));
 });

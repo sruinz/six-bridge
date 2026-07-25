@@ -23,7 +23,8 @@ node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
   fixtures/desktop-mobile-golden/storage-fallback.test.mjs \
   scripts/lan-receiver-evidence.test.mjs \
-  scripts/ai-recipe-lan-receiver.test.mjs
+  scripts/ai-recipe-lan-receiver.test.mjs \
+  scripts/video-nas-lan-receiver.test.mjs
 
 bash -n scripts/fold7-gate.sh
 for shell_file in \

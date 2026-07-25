@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { open } from "node:fs/promises";
 import { createServer } from "node:http";
+import { prepareCliEvidence } from "./lan-receiver-evidence.mjs";
 
 export const MAX_BODY_BYTES = 65_536;
 
@@ -334,4 +335,89 @@ export async function startVideoNasReceiver({
     completed,
     close,
   };
+}
+
+function parseArguments(argumentsList) {
+  const values = {};
+  for (let index = 0; index < argumentsList.length; index += 2) {
+    const option = argumentsList[index];
+    const value = argumentsList[index + 1];
+    if (!option?.startsWith("--") || value === undefined) {
+      throw new Error(
+        "usage: --mode --advertise-host [--expected-url] --evidence "
+        + "[--port] [--timeout-ms]",
+      );
+    }
+    values[option] = value;
+  }
+
+  for (const requiredOption of [
+    "--mode",
+    "--advertise-host",
+    "--evidence",
+  ]) {
+    if (!values[requiredOption]) {
+      throw new Error(`missing required option: ${requiredOption}`);
+    }
+  }
+  if (!["page", "hls"].includes(values["--mode"])) {
+    throw new Error("--mode must be page or hls");
+  }
+  if (values["--mode"] === "page" && !values["--expected-url"]) {
+    throw new Error("missing required option: --expected-url");
+  }
+  if (
+    values["--mode"] === "hls" &&
+    values["--expected-url"] !== undefined
+  ) {
+    throw new Error("--expected-url is not allowed in hls mode");
+  }
+
+  const port = Number(values["--port"] ?? "0");
+  const timeoutMs = Number(values["--timeout-ms"] ?? "600000");
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("--port must be an integer from 0 to 65535");
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive integer");
+  }
+
+  return {
+    mode: values["--mode"],
+    advertiseHost: values["--advertise-host"],
+    expectedUrl: values["--expected-url"],
+    evidencePath: values["--evidence"],
+    port,
+    timeoutMs,
+  };
+}
+
+async function main() {
+  const options = parseArguments(process.argv.slice(2));
+  const evidence = await prepareCliEvidence(options.evidencePath);
+  const receiver = await startVideoNasReceiver({
+    bindHost: "0.0.0.0",
+    ...options,
+    ...evidence,
+  });
+  console.log(`configUrl=${receiver.configUrl}`);
+  if (receiver.probeUrl !== null) {
+    console.log(`probeUrl=${receiver.probeUrl}`);
+  }
+  const result = await receiver.completed;
+  if (!result.requestMatched) {
+    throw new Error(
+      `receiver completed without a matched request: ${result.reason}`,
+    );
+  }
+}
+
+if (
+  process.argv[1] &&
+  new URL(`file://${process.argv[1]}`).href === import.meta.url
+) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
+  });
 }
