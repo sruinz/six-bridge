@@ -681,6 +681,7 @@ test("CLI page subprocess는 configUrl의 정확한 POST로 성공하고 정리�
   const evidence = JSON.parse(evidenceText);
   assert.equal(evidence.requestMatched, true);
   assert.equal(evidence.reason, "matched");
+  assert.equal(evidence.mode, "page");
   assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));
   assert.equal(evidence.receivedUrlSha256, evidence.expectedUrlSha256);
   assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
@@ -777,6 +778,7 @@ test("CLI HLS subprocess는 probe GET과 정확한 HLS POST로 성공하고 정�
   const evidence = JSON.parse(evidenceText);
   assert.equal(evidence.requestMatched, true);
   assert.equal(evidence.reason, "matched");
+  assert.equal(evidence.mode, "hls");
   assert.equal(evidence.expectedUrlSha256, evidence.receivedUrlSha256);
   assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
   assert.equal(evidenceText.includes("http://"), false);
@@ -873,7 +875,9 @@ test("HLS mode는 probe와 master playlist를 제공한다", async (t) => {
     reason: "matched",
   });
   const evidenceText = await readFile(receiver.testEvidencePath, "utf8");
+  const evidence = JSON.parse(evidenceText);
   const details = receiverDetails(receiver);
+  assert.equal(evidence.mode, "hls");
   assert.equal(/m3u8/i.test(evidenceText), false);
   assert.equal(evidenceText.includes(details.runToken), false);
   assert.equal(evidenceText.includes(details.bearerToken), false);
@@ -937,6 +941,7 @@ test("page mode의 첫 정확한 POST를 완료하고 모든 handle을 닫는다
     "completedAt",
     "expectedUrlSha256",
     "method",
+    "mode",
     "reason",
     "receivedUrlSha256",
     "requestMatched",
@@ -948,11 +953,13 @@ test("page mode의 첫 정확한 POST를 완료하고 모든 handle을 닫는다
   assert.equal(evidence.requestMatched, true);
   assert.equal(evidence.reason, "matched");
   assert.equal(evidence.method, "POST");
+  assert.equal(evidence.mode, "page");
   assert.equal(evidence.route, "/<redacted>/rest");
   assert.equal(evidence.authMatched, true);
   assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));
   assert.equal(evidence.receivedUrlSha256, evidence.expectedUrlSha256);
   assert.equal(evidence.resolution, "best");
+  assert.equal(evidenceText.match(/"mode":/g)?.length, 1);
   assert.equal(/youtube\.com|authorization|configUrl/i.test(evidenceText), false);
   assert.equal(evidenceText.includes(details.runToken), false);
   assert.equal(evidenceText.includes(details.bearerToken), false);
@@ -1083,6 +1090,7 @@ test("요청 없는 close는 completed와 closed evidence를 settle하고 handle
   const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
   assert.equal(evidence.requestMatched, false);
   assert.equal(evidence.reason, "closed");
+  assert.equal(evidence.mode, "page");
   await assert.rejects(evidenceFile.writeFile("not-written"), { code: "EBADF" });
   await assert.rejects(request(details.restUrl));
 });
@@ -1176,6 +1184,7 @@ test("timeout은 redacted evidence를 기록하고 server·socket·file handle�
   const evidence = JSON.parse(evidenceText);
   assert.equal(evidence.requestMatched, false);
   assert.equal(evidence.reason, "timeout");
+  assert.equal(evidence.mode, "page");
   assert.equal(evidence.route, "/<redacted>/rest");
   assert.equal(evidence.authMatched, false);
   assert.equal(evidence.expectedUrlSha256, sha256(exactInput.expectedUrl));

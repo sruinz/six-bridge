@@ -114,6 +114,7 @@ export async function startVideoNasReceiver({
     requestMatched,
     reason,
     method: "POST",
+    mode,
     route: "/<redacted>/rest",
     authMatched,
     expectedUrlSha256: sha256(downloadUrl),
