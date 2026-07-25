@@ -279,6 +279,8 @@ run_rejected_case_fixture missing-adapters \
   '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"fixture","contract":"ai-recipe-passthrough-v1"}}'
 run_rejected_case_fixture malformed-adapters \
   '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"fixture","contract":"ai-recipe-passthrough-v1","approvedAdapters":"broken"}}'
+run_rejected_case_fixture empty-adapter \
+  '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"fixture","contract":"ai-recipe-passthrough-v1","approvedAdapters":[""]}}'
 run_rejected_case_fixture unsafe-slug \
   '{"id":"fixture-case","name":"fixture","fold7Validation":{"slug":"../escape","contract":"ai-recipe-passthrough-v1","approvedAdapters":[]}}'
 run_rejected_case_fixture unsafe-separator \

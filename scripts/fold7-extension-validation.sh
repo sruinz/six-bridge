@@ -105,7 +105,7 @@ case_contract=$(printf '%s' "$case_json" |
 approved_adapters_json=$(printf '%s' "$case_json" | jq -cer '
   .fold7Validation.approvedAdapters |
   select(type == "array") |
-  select(all(.[]; type == "string"))
+  select(all(.[]; type == "string" and length > 0))
 ') ||
   usage_error "검증 case 승인 adapter 설정을 읽을 수 없습니다: $case_id"
 adapter_count=$(printf '%s' "$approved_adapters_json" | jq -er 'length') ||
