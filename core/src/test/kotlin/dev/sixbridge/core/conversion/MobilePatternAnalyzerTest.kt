@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -32,6 +33,26 @@ class MobilePatternAnalyzerTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
+
+    @Test
+    fun `AI recipe pattern은 storage 세부 증거가 없으면 passthrough다`() {
+        val report = MobilePatternAnalyzer().analyze(
+            fixture("ai-recipe-pattern"),
+            exactFold7Profile(),
+        )
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(ConversionState.PASSTHROUGH, report.conversionState)
+        assertTrue(report.adapterDecisions.isEmpty())
+        assertEquals(
+            setOf("contextMenus", "runtime", "storage", "tabs"),
+            report.usedApis,
+        )
+        assertTrue(report.unsupportedApis.isEmpty())
+        assertTrue(report.issues.any {
+            it.code == "storage_area_unknown" && !it.blocking
+        })
+    }
 
     @Test
     fun `detects a static desktop selection listener as an automatic adapter`() {
@@ -879,6 +900,17 @@ class MobilePatternAnalyzerTest {
             .encoded
         return Base64.getEncoder().encodeToString(publicKey)
     }
+
+    private fun fixture(name: String): Path =
+        Path.of("../fixtures", name).toAbsolutePath().normalize()
+
+    private fun exactFold7Profile(): BrowserProfile =
+        BrowserProfileJson.decode(
+            Path.of("../profiles/sbrowser-30.0.0.67.json")
+                .toAbsolutePath()
+                .normalize()
+                .readText(),
+        )
 
     private fun dev.sixbridge.core.compat.CompatibilityReport.decision(
         id: String,

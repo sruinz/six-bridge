@@ -17,6 +17,21 @@ expect_failure() {
   fi
 }
 
+expect_exit() {
+  local expected=$1
+  local name=$2
+  shift 2
+  local actual
+  set +e
+  "$@" >/dev/null 2>&1
+  actual=$?
+  set -e
+  if [ "$actual" -ne "$expected" ]; then
+    echo "$name 예상 exit=$expected, 실제 exit=$actual" >&2
+    exit 1
+  fi
+}
+
 expect_case_failure() {
   local mutation=$1
   local input="$fixture/extensions-$mutation.json"
@@ -193,6 +208,11 @@ expect_failure "알 수 없는 ZIP contract" \
   six_assert_transformed_contract unknown "$ai_zip"
 
 runner="$project_dir/scripts/fold7-extension-validation.sh"
+ai_wrapper="$project_dir/scripts/fold7-ai-recipe.sh"
+expect_exit 2 "AI wrapper --source 필수" "$ai_wrapper"
+expect_exit 0 "AI wrapper 도움말" "$ai_wrapper" --help
+expect_exit 2 "AI wrapper case ID 고정" \
+  "$ai_wrapper" --case-id lneaoklobohnoncgckmbbjfiajgpbdde
 expect_failure "공용 runner --case-id 필수" \
   "$runner" --source "$ai_root" --host-only
 expect_failure "공용 runner --source 필수" \
@@ -295,11 +315,13 @@ fixture_cli="$fixture_project/cli/build/install/sixbridge/bin/sixbridge"
 fixture_manifest="$fixture/extensions.json"
 mkdir -p \
   "$fixture_project/scripts" \
-  "$(dirname -- "$fixture_cli")" \
-  "$fixture_source/images"
+  "$(dirname -- "$fixture_cli")"
 cp "$runner" "$fixture_project/scripts/fold7-extension-validation.sh"
+cp "$ai_wrapper" "$fixture_project/scripts/fold7-ai-recipe.sh"
 cp "$library" "$fixture_project/scripts/fold7-validation-lib.sh"
 cp "$validation" "$fixture_manifest"
+cp -R "$project_dir/fixtures/ai-recipe-pattern" "$fixture_source"
+mkdir "$fixture_source/images"
 cat >"$fixture_profile" <<'EOF'
 {
   "browserPackage": "com.sec.android.app.sbrowser",
@@ -307,17 +329,6 @@ cat >"$fixture_profile" <<'EOF'
   "versionCode": 1300067502
 }
 EOF
-cat >"$fixture_source/manifest.json" <<'EOF'
-{
-  "manifest_version": 3,
-  "background": {"service_worker": "background.js"},
-  "options_ui": {"page": "options.html", "open_in_tab": false},
-  "permissions": ["storage", "activeTab", "contextMenus"]
-}
-EOF
-for entry in background.js options.html options.js; do
-  printf '%s\n' "$entry" >"$fixture_source/$entry"
-done
 for entry in icon16.png icon48.png icon128.png; do
   printf '%s\n' "$entry" >"$fixture_source/images/$entry"
 done
@@ -447,14 +458,31 @@ chmod +x "$fixture_cli"
 run_runner_fixture() {
   output_file=$1
   shift
+  draft=${SIX_TEST_DRAFT_OVERRIDE:-$fixture_draft}
   SIX_VALIDATION_MANIFEST="$fixture_manifest" \
     SIX_TEST_BEFORE="$fixture_before" \
-    SIX_TEST_DRAFT="$fixture_draft" \
+    SIX_TEST_DRAFT="$draft" \
     SIX_TEST_BUNDLE="$fixture_bundle" \
     SIX_TEST_CRX="$fixture_crx" \
     SIX_TEST_WRAPPER="$fixture_wrapper" \
     "$fixture_project/scripts/fold7-extension-validation.sh" \
       --case-id meemjdgdjhjfhcfchppfapgifiipjnlo \
+      --source "$fixture_source" \
+      --profile "$fixture_profile" \
+      "$@" >"$output_file" 2>&1
+}
+
+run_ai_wrapper_fixture() {
+  output_file=$1
+  shift
+  draft=${SIX_TEST_DRAFT_OVERRIDE:-$fixture_draft}
+  SIX_VALIDATION_MANIFEST="$fixture_manifest" \
+    SIX_TEST_BEFORE="$fixture_before" \
+    SIX_TEST_DRAFT="$draft" \
+    SIX_TEST_BUNDLE="$fixture_bundle" \
+    SIX_TEST_CRX="$fixture_crx" \
+    SIX_TEST_WRAPPER="$fixture_wrapper" \
+    "$fixture_project/scripts/fold7-ai-recipe.sh" \
       --source "$fixture_source" \
       --profile "$fixture_profile" \
       "$@" >"$output_file" 2>&1
@@ -481,6 +509,34 @@ test -f "$fixture_project/.local/evidence/ai-recipe-a.sixdraft"
 test -f "$fixture_project/.local/evidence/ai-recipe-b.sixdraft"
 test -f "$fixture_project/.local/evidence/ai-recipe-extension.json"
 test -f "$fixture_project/.local/evidence/ai-recipe-after.json"
+
+wrapper_output="$fixture/wrapper-output.txt"
+run_ai_wrapper_fixture "$wrapper_output" --host-only
+grep -Fx 'caseId=meemjdgdjhjfhcfchppfapgifiipjnlo' "$wrapper_output" >/dev/null
+grep -Fx 'caseSlug=ai-recipe' "$wrapper_output" >/dev/null
+grep -Fx 'draftDeterministic=true' "$wrapper_output" >/dev/null
+grep -Fx 'hostContract=true' "$wrapper_output" >/dev/null
+grep -Fx 'deviceChecks=skipped' "$wrapper_output" >/dev/null
+
+reserved_draft_root="$fixture/ai-reserved-draft"
+reserved_draft="$fixture/ai-reserved.sixdraft"
+mkdir "$reserved_draft_root"
+cp "$reserved_zip" "$reserved_draft_root/source.zip"
+(
+  cd "$reserved_draft_root"
+  zip -q -X "$reserved_draft" source.zip
+)
+reserved_output="$fixture/wrapper-reserved-output.txt"
+set +e
+SIX_TEST_DRAFT_OVERRIDE="$reserved_draft" \
+  run_ai_wrapper_fixture "$reserved_output" --host-only
+reserved_exit=$?
+set -e
+if [ "$reserved_exit" -ne 3 ]; then
+  cat "$reserved_output" >&2
+  echo "예약 ZIP runner fixture 예상 exit=3, 실제 exit=$reserved_exit" >&2
+  exit 1
+fi
 
 mutation_output="$fixture/runner-mutation-output.txt"
 set +e
