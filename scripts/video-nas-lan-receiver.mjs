@@ -338,6 +338,15 @@ export async function startVideoNasReceiver({
 }
 
 function parseArguments(argumentsList) {
+  const allowedOptions = new Set([
+    "--mode",
+    "--advertise-host",
+    "--expected-url",
+    "--evidence",
+    "--port",
+    "--timeout-ms",
+  ]);
+  const seenOptions = new Set();
   const values = {};
   for (let index = 0; index < argumentsList.length; index += 2) {
     const option = argumentsList[index];
@@ -348,6 +357,13 @@ function parseArguments(argumentsList) {
         + "[--port] [--timeout-ms]",
       );
     }
+    if (!allowedOptions.has(option)) {
+      throw new Error(`unknown option: ${option}`);
+    }
+    if (seenOptions.has(option)) {
+      throw new Error(`duplicate option: ${option}`);
+    }
+    seenOptions.add(option);
     values[option] = value;
   }
 

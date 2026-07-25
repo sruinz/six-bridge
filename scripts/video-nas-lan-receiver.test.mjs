@@ -51,32 +51,108 @@ async function createCliProject(t) {
   return project;
 }
 
-function runCli(argumentsList, { cwd, onStdoutLine } = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [receiverScript, ...argumentsList], {
+function runCli(argumentsList, {
+  t,
+  cwd,
+  onStdoutLine,
+  nodeArguments,
+  deadlineMs = 5_000,
+} = {}) {
+  const child = spawn(
+    process.execPath,
+    nodeArguments ?? [receiverScript, ...argumentsList],
+    {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stdoutRemainder = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      stdoutRemainder += chunk;
-      const lines = stdoutRemainder.split("\n");
-      stdoutRemainder = lines.pop();
-      for (const line of lines) {
-        onStdoutLine?.(line);
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    },
+  );
+  let stdout = "";
+  let stdoutRemainder = "";
+  let stderr = "";
+  let closed = false;
+  let deadlineExceeded = false;
+  let spawnError;
+  let callbackError;
+  let terminatePromise;
+  let forceKillHandle;
+  let resolveClosed;
+  const closedPromise = new Promise((resolve) => {
+    resolveClosed = resolve;
   });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    stdoutRemainder += chunk;
+    const lines = stdoutRemainder.split("\n");
+    stdoutRemainder = lines.pop();
+    for (const line of lines) {
+      try {
+        onStdoutLine?.(line);
+      } catch (error) {
+        callbackError = error;
+        void terminate();
+      }
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  child.once("close", (code, signal) => {
+    closed = true;
+    resolveClosed({
+      code,
+      signal,
+      pid: child.pid,
+      stdout,
+      stderr,
+      deadlineExceeded,
+    });
+  });
+
+  const terminate = async () => {
+    if (!terminatePromise) {
+      terminatePromise = (async () => {
+        if (!closed) {
+          child.kill("SIGTERM");
+          forceKillHandle = setTimeout(() => {
+            if (!closed) {
+              child.kill("SIGKILL");
+            }
+          }, 250);
+        }
+        await closedPromise;
+      })();
+    }
+    try {
+      await terminatePromise;
+    } finally {
+      clearTimeout(forceKillHandle);
+    }
+  };
+  t.after(terminate);
+
+  const deadlineHandle = setTimeout(() => {
+    deadlineExceeded = true;
+    void terminate();
+  }, deadlineMs);
+  return (async () => {
+    try {
+      const result = await closedPromise;
+      if (spawnError) {
+        throw spawnError;
+      }
+      if (callbackError) {
+        throw callbackError;
+      }
+      return result;
+    } finally {
+      clearTimeout(deadlineHandle);
+    }
+  })();
 }
 
 function request(url, options = {}) {
@@ -181,6 +257,50 @@ async function startTestReceiver(t, options) {
   return receiver;
 }
 
+test("runCli deadline은 종료하지 않는 child를 kill하고 close까지 기다린다", async (t) => {
+  const result = await runCli([], {
+    t,
+    nodeArguments: ["-e", "setInterval(() => {}, 1000);"],
+    deadlineMs: 25,
+  });
+
+  assert.equal(result.deadlineExceeded, true);
+  assert.equal(result.code, null);
+  assert.equal(result.signal, "SIGTERM");
+  assert.throws(() => process.kill(result.pid, 0), { code: "ESRCH" });
+});
+
+test("runCli after cleanup은 완료되지 않은 child를 kill하고 close까지 기다린다", async (t) => {
+  let childResultPromise;
+  let markReady;
+  const ready = new Promise((resolve) => {
+    markReady = resolve;
+  });
+
+  await t.test("controlled child", async (childTest) => {
+    childResultPromise = runCli([], {
+      t: childTest,
+      nodeArguments: [
+        "-e",
+        'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+      ],
+      deadlineMs: 5_000,
+      onStdoutLine(line) {
+        if (line === "ready") {
+          markReady();
+        }
+      },
+    });
+    await settleWithin(ready);
+  });
+
+  const result = await settleWithin(childResultPromise);
+  assert.equal(result.deadlineExceeded, false);
+  assert.equal(result.code, null);
+  assert.equal(result.signal, "SIGTERM");
+  assert.throws(() => process.kill(result.pid, 0), { code: "ESRCH" });
+});
+
 test("CLI는 mode·host·mode별 URL과 정수 경계를 검증한다", async (t) => {
   const project = await createCliProject(t);
   const evidence = ".local/evidence/arguments.json";
@@ -253,10 +373,55 @@ test("CLI는 mode·host·mode별 URL과 정수 경계를 검증한다", async (t
 
   for (const [name, argumentsList, errorPattern] of rejectedCases) {
     await t.test(name, async () => {
-      const result = await runCli(argumentsList, { cwd: project });
+      const result = await runCli(argumentsList, { t, cwd: project });
       assert.equal(result.code, 1);
       assert.equal(result.stdout.length, 0);
       assert.match(result.stderr, errorPattern);
+    });
+  }
+});
+
+test("CLI는 unknown·duplicate 옵션을 evidence 선점 전에 거부한다", async (t) => {
+  const project = await createCliProject(t);
+  const rejectedCases = [
+    {
+      name: "unknown",
+      argumentsList: [
+        "--mode", "hls",
+        "--advertise-host", "127.0.0.1",
+        "--evidence", ".local/evidence/unknown.json",
+        "--timeout-ms", "1",
+        "--unknown", "value",
+      ],
+      evidencePath: path.join(project, ".local", "evidence", "unknown.json"),
+      errorPattern: /unknown option: --unknown/,
+    },
+    {
+      name: "duplicate",
+      argumentsList: [
+        "--mode", "hls",
+        "--mode", "hls",
+        "--advertise-host", "127.0.0.1",
+        "--evidence", ".local/evidence/duplicate.json",
+        "--timeout-ms", "1",
+      ],
+      evidencePath: path.join(project, ".local", "evidence", "duplicate.json"),
+      errorPattern: /duplicate option: --mode/,
+    },
+  ];
+
+  for (const {
+    name,
+    argumentsList,
+    evidencePath,
+    errorPattern,
+  } of rejectedCases) {
+    await t.test(name, async () => {
+      const result = await runCli(argumentsList, { t, cwd: project });
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout.length, 0);
+      assert.match(result.stderr, errorPattern);
+      await assert.rejects(readFile(evidencePath, "utf8"), { code: "ENOENT" });
     });
   }
 });
@@ -282,7 +447,7 @@ test("CLI는 evidence 외부 parent와 symlink를 거부한다", async (t) => {
     "--mode", "hls",
     "--advertise-host", "127.0.0.1",
     "--evidence", externalEvidence,
-  ], { cwd: project });
+  ], { t, cwd: project });
   assert.equal(outside.code, 1);
   assert.equal(outside.stdout.length, 0);
   assert.match(outside.stderr, /directly inside \.local\/evidence/);
@@ -291,7 +456,7 @@ test("CLI는 evidence 외부 parent와 symlink를 거부한다", async (t) => {
     "--mode", "hls",
     "--advertise-host", "127.0.0.1",
     "--evidence", ".local/evidence/link.json",
-  ], { cwd: project });
+  ], { t, cwd: project });
   assert.equal(symlinkResult.code, 1);
   assert.equal(symlinkResult.stdout.length, 0);
   assert.match(symlinkResult.stderr, /symbolic link/);
@@ -311,7 +476,7 @@ test("CLI는 기존 evidence 파일이면 listen 전에 실패한다", async (t)
     "--mode", "hls",
     "--advertise-host", "127.0.0.1",
     "--evidence", ".local/evidence/occupied.json",
-  ], { cwd: project });
+  ], { t, cwd: project });
 
   assert.equal(result.code, 1);
   assert.equal(result.stdout.length, 0);
@@ -352,6 +517,7 @@ test("CLI는 evidence root 교체 뒤에도 선점한 handle에만 timeout을 �
     "--evidence", `.local/evidence/${filename}`,
     "--timeout-ms", "1000",
   ], {
+    t,
     cwd: project,
     onStdoutLine(line) {
       if (!line.startsWith("configUrl=")) {
@@ -422,7 +588,7 @@ test("CLI listen 실패는 server와 선점한 evidence handle을 정리한다",
     "--advertise-host", "127.0.0.1",
     "--evidence", ".local/evidence/listen-failure.json",
     "--port", String(occupiedPort),
-  ], { cwd: project });
+  ], { t, cwd: project });
 
   assert.equal(result.code, 1);
   assert.equal(result.stdout.length, 0);
@@ -470,6 +636,7 @@ test("CLI page subprocess는 configUrl의 정확한 POST로 성공하고 정리�
     "--evidence", ".local/evidence/page-success.json",
     "--timeout-ms", "1000",
   ], {
+    t,
     cwd: project,
     onStdoutLine(line) {
       if (!line.startsWith("configUrl=")) {
@@ -578,6 +745,7 @@ test("CLI HLS subprocess는 probe GET과 정확한 HLS POST로 성공하고 정�
     "--evidence", ".local/evidence/hls-success.json",
     "--timeout-ms", "1000",
   ], {
+    t,
     cwd: project,
     onStdoutLine(line) {
       if (line.startsWith("configUrl=")) {
