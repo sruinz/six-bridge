@@ -180,6 +180,7 @@ printf '%s\n' \
 for entry in background.js options.html options.js; do
   printf '%s\n' "$entry" >"$ai_root/$entry"
 done
+printf '다국어 ZIP 항목 검증\n' >"$ai_root/검증-파일.txt"
 for entry in icon16.png icon48.png icon128.png; do
   printf '%s\n' "$entry" >"$ai_root/images/$entry"
 done
@@ -204,6 +205,9 @@ reserved_zip="$fixture/ai-reserved.zip"
 )
 expect_failure "예약 ZIP root" \
   six_assert_transformed_contract ai-recipe-passthrough-v1 "$reserved_zip"
+printf '손상 ZIP\n' >"$fixture/corrupt.zip"
+expect_failure "손상 ZIP" \
+  six_assert_no_reserved_zip_root "$fixture/corrupt.zip"
 expect_failure "알 수 없는 ZIP contract" \
   six_assert_transformed_contract unknown "$ai_zip"
 
