@@ -619,7 +619,7 @@ class StorageFallbackAdapterTest {
             assertTrue(
                 Files.exists(
                     snapshot.workingRoot.resolve(
-                        "_sixbridge/desktop-selection-event-bridge.v1.js",
+                        "sixbridge/desktop-selection-event-bridge.v1.js",
                     ),
                 ),
             )

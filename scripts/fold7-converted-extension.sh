@@ -257,6 +257,16 @@ if zipinfo -1 "$transformed_source_zip" |
   echo "삼성 예약 action popup provenance 경로가 남아 있습니다." >&2
   exit 3
 fi
+zipinfo -1 "$transformed_source_zip" |
+  grep -Fx 'sixbridge/desktop-selection-event-bridge.v1.js' >/dev/null || {
+  echo "desktop selection event bridge asset을 찾을 수 없습니다." >&2
+  exit 3
+}
+if zipinfo -1 "$transformed_source_zip" |
+  grep -Fx '_sixbridge/desktop-selection-event-bridge.v1.js' >/dev/null; then
+  echo "삼성 예약 desktop selection bridge 경로가 남아 있습니다." >&2
+  exit 3
+fi
 if zipinfo -1 "$transformed_source_zip" |
   grep -E 'action-popup-entry-(content|background)\.v1\.js|_sixbridge-action-popup-entry-bootstrap\.v1\.js' >/dev/null; then
   echo "version 1 action popup runtime asset이 남아 있습니다." >&2

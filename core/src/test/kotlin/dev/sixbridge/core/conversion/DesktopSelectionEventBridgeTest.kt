@@ -9,6 +9,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
@@ -16,6 +17,7 @@ import kotlin.io.path.writeBytes
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -45,7 +47,7 @@ class DesktopSelectionEventBridgeTest {
             val manifest = Json.parseToJsonElement(working.resolve("manifest.json").readText()) as JsonObject
             val blocks = manifest["content_scripts"] as JsonArray
             assertEquals(
-                listOf("_sixbridge/desktop-selection-event-bridge.v1.js", "renamed-handler.mjs"),
+                listOf("sixbridge/desktop-selection-event-bridge.v1.js", "renamed-handler.mjs"),
                 scriptPaths(blocks[0] as JsonObject),
             )
             assertEquals(listOf("unrelated.js"), scriptPaths(blocks[1] as JsonObject))
@@ -54,6 +56,11 @@ class DesktopSelectionEventBridgeTest {
             assertContentEquals(contentBefore, working.resolve("renamed-handler.mjs").readBytes())
             assertTrue(
                 Files.isRegularFile(
+                    working.resolve("sixbridge/desktop-selection-event-bridge.v1.js"),
+                ),
+            )
+            assertFalse(
+                Files.exists(
                     working.resolve("_sixbridge/desktop-selection-event-bridge.v1.js"),
                 ),
             )
@@ -101,7 +108,7 @@ class DesktopSelectionEventBridgeTest {
             assertTrue(applied.applied)
             val manifest = Json.parseToJsonElement(source.resolve("manifest.json").readText()) as JsonObject
             val scripts = scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject)
-            assertEquals("_sixbridge/desktop-selection-event-bridge.v1.js", scripts.first())
+            assertEquals("sixbridge/desktop-selection-event-bridge.v1.js", scripts.first())
             assertEquals(contentName, scripts[1])
         }
     }
@@ -131,13 +138,13 @@ class DesktopSelectionEventBridgeTest {
             ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
             planningError.failure,
         )
-        assertFalse(Files.exists(sensitive.resolve("_sixbridge")))
+        assertFalse(Files.exists(sensitive.resolve("sixbridge")))
 
         assertNull(
             MobilePatternAnalyzer().analyze(mobileAware, profile)
                 .adapterDecisions.singleOrNull(),
         )
-        assertFalse(Files.exists(mobileAware.resolve("_sixbridge")))
+        assertFalse(Files.exists(mobileAware.resolve("sixbridge")))
     }
 
     @Test
@@ -174,7 +181,7 @@ class DesktopSelectionEventBridgeTest {
 
             assertTrue(applied.applied)
             assertEquals(
-                listOf("_sixbridge/desktop-selection-event-bridge.v1.js") + scripts,
+                listOf("sixbridge/desktop-selection-event-bridge.v1.js") + scripts,
                 scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
             )
             assertEquals(
@@ -192,11 +199,11 @@ class DesktopSelectionEventBridgeTest {
         val selection = automaticSelection(source)
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
-              {"matches":["<all_urls>"],"js":["content.js","_sixbridge/desktop-selection-event-bridge.v1.js","content.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
+              {"matches":["<all_urls>"],"js":["content.js","sixbridge/desktop-selection-event-bridge.v1.js","content.js","sixbridge/desktop-selection-event-bridge.v1.js"]},
               {"matches":["<all_urls>"],"js":["unrelated.js"]}
             ]}""",
         )
-        val asset = source.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        val asset = source.resolve("sixbridge/desktop-selection-event-bridge.v1.js")
         Files.createDirectories(asset.parent)
         asset.writeBytes(
             requireNotNull(
@@ -217,9 +224,9 @@ class DesktopSelectionEventBridgeTest {
         assertEquals(
             listOf(
                 "content.js",
-                "_sixbridge/desktop-selection-event-bridge.v1.js",
+                "sixbridge/desktop-selection-event-bridge.v1.js",
                 "content.js",
-                "_sixbridge/desktop-selection-event-bridge.v1.js",
+                "sixbridge/desktop-selection-event-bridge.v1.js",
             ),
             scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
         )
@@ -233,7 +240,7 @@ class DesktopSelectionEventBridgeTest {
         val selection = automaticSelection(source)
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Synthetic","version":"1","content_scripts":[
-              {"matches":["<all_urls>"],"js":["content.js","./_sixbridge/desktop-selection-event-bridge.v1.js","/_sixbridge/desktop-selection-event-bridge.v1.js","_sixbridge/desktop-selection-event-bridge.v1.js"]},
+              {"matches":["<all_urls>"],"js":["content.js","./sixbridge/desktop-selection-event-bridge.v1.js","/sixbridge/desktop-selection-event-bridge.v1.js","sixbridge/desktop-selection-event-bridge.v1.js"]},
               {"matches":["<all_urls>"],"js":["unrelated.js"]}
             ]}""",
         )
@@ -250,9 +257,9 @@ class DesktopSelectionEventBridgeTest {
         assertEquals(
             listOf(
                 "content.js",
-                "./_sixbridge/desktop-selection-event-bridge.v1.js",
-                "/_sixbridge/desktop-selection-event-bridge.v1.js",
-                "_sixbridge/desktop-selection-event-bridge.v1.js",
+                "./sixbridge/desktop-selection-event-bridge.v1.js",
+                "/sixbridge/desktop-selection-event-bridge.v1.js",
+                "sixbridge/desktop-selection-event-bridge.v1.js",
             ),
             scriptPaths((manifest["content_scripts"] as JsonArray)[0] as JsonObject),
         )
@@ -264,7 +271,7 @@ class DesktopSelectionEventBridgeTest {
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
         val manifestBefore = source.resolve("manifest.json").readBytes()
-        val asset = source.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        val asset = source.resolve("sixbridge/desktop-selection-event-bridge.v1.js")
         Files.createDirectories(asset.parent)
         asset.writeText("different adapter bytes")
         val assetBefore = asset.readBytes()
@@ -283,12 +290,54 @@ class DesktopSelectionEventBridgeTest {
     }
 
     @Test
+    fun `rejects generated asset directory or symlink before changing the manifest`() {
+        listOf<(Path) -> Unit>(
+            { asset ->
+                Files.createDirectory(asset)
+                asset.resolve("foreign.txt").writeText("foreign directory")
+            },
+            { asset ->
+                val target = Files.createTempFile("six-selection-bridge", ".js")
+                asset.createSymbolicLinkPointingTo(target)
+            },
+        ).forEachIndexed { index, createCollision ->
+            val source = extension(
+                content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
+            )
+            val manifestBefore = source.resolve("manifest.json").readBytes()
+            val asset = source.resolve("sixbridge/desktop-selection-event-bridge.v1.js")
+            Files.createDirectories(asset.parent)
+            createCollision(asset)
+
+            assertFails("collision $index") {
+                applyAdapterToSource(
+                    source,
+                    profile,
+                    DesktopSelectionEventBridge(),
+                    automaticSelection(source),
+                )
+            }
+
+            assertContentEquals(
+                manifestBefore,
+                source.resolve("manifest.json").readBytes(),
+                "collision $index",
+            )
+            if (index == 0) {
+                assertTrue(Files.isDirectory(asset), "collision $index")
+            } else {
+                assertTrue(Files.isSymbolicLink(asset), "collision $index")
+            }
+        }
+    }
+
+    @Test
     fun `rejects a generated asset parent file before changing the manifest`() {
         val source = extension(
             content = "document.addEventListener(\"mouseup\", (event) => use(getSelection()));",
         )
         val manifestBefore = source.resolve("manifest.json").readBytes()
-        val parent = source.resolve("_sixbridge")
+        val parent = source.resolve("sixbridge")
         parent.writeText("not a directory")
         val parentBefore = parent.readBytes()
 
@@ -319,7 +368,7 @@ class DesktopSelectionEventBridgeTest {
         (block["js"] as JsonArray).map { (it as JsonPrimitive).content }
 
     private fun writeGeneratedAsset(root: Path) {
-        val asset = root.resolve("_sixbridge/desktop-selection-event-bridge.v1.js")
+        val asset = root.resolve("sixbridge/desktop-selection-event-bridge.v1.js")
         Files.createDirectories(asset.parent)
         asset.writeBytes(
             requireNotNull(

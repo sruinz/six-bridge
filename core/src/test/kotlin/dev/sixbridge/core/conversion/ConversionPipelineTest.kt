@@ -664,8 +664,18 @@ class ConversionPipelineTest {
         val extracted = Files.createTempDirectory("six-pipeline-source-zip")
         ExtensionZip.extract(result.sourceZip, extracted)
         assertTrue(
-            "_sixbridge/desktop-selection-event-bridge.v1.js" in
+            "sixbridge/desktop-selection-event-bridge.v1.js" in
                 extracted.resolve("manifest.json").readText(),
+        )
+        assertTrue(
+            Files.isRegularFile(
+                extracted.resolve("sixbridge/desktop-selection-event-bridge.v1.js"),
+            ),
+        )
+        assertFalse(
+            Files.exists(
+                extracted.resolve("_sixbridge/desktop-selection-event-bridge.v1.js"),
+            ),
         )
     }
 

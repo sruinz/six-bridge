@@ -265,6 +265,16 @@ run_option_entry_fixture() {
     printf 'reserved provenance\n' \
       >"$source_root/_sixbridge/action-popup-entry.v2.json"
   fi
+  if [ "$variant" != missing_selection ]; then
+    mkdir -p "$source_root/sixbridge"
+    printf 'selection bridge\n' \
+      >"$source_root/sixbridge/desktop-selection-event-bridge.v1.js"
+  fi
+  if [ "$variant" = reserved_selection ]; then
+    mkdir -p "$source_root/_sixbridge"
+    printf 'reserved selection bridge\n' \
+      >"$source_root/_sixbridge/desktop-selection-event-bridge.v1.js"
+  fi
   case "$variant" in
     legacy_content)
       printf 'legacy\n' >"$source_root/action-popup-entry-content.v1.js"
@@ -318,6 +328,8 @@ for mutation in \
   missing_options_ui \
   missing_provenance \
   reserved_provenance \
+  missing_selection \
+  reserved_selection \
   legacy_content \
   legacy_background \
   legacy_bootstrap; do

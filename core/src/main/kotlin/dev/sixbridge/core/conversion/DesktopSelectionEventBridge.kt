@@ -106,7 +106,7 @@ internal class DesktopSelectionEventBridge : MobileAdapter {
         const val CONTENT_SCRIPTS = "content_scripts"
         const val SCRIPTS = "js"
         const val ASSET_FILE_NAME = "desktop-selection-event-bridge.v1.js"
-        const val ASSET_RELATIVE_PATH = "_sixbridge/$ASSET_FILE_NAME"
+        const val ASSET_RELATIVE_PATH = "sixbridge/$ASSET_FILE_NAME"
         const val ASSET_RESOURCE_PATH = "dev/sixbridge/adapters/$ASSET_FILE_NAME"
     }
 }
