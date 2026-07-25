@@ -99,7 +99,10 @@ class ConversionPipelineTest {
         val manifest = extracted.resolve("manifest.json").readText()
 
         assertTrue("\"options_ui\"" in manifest)
-        assertTrue(Files.exists(extracted.resolve("_sixbridge/action-popup-entry.v2.json")))
+        assertTrue(Files.exists(extracted.resolve("sixbridge/action-popup-entry.v2.json")))
+        assertFalse(
+            Files.exists(extracted.resolve("_sixbridge/action-popup-entry.v2.json")),
+        )
         listOf(
             "_sixbridge/action-popup-entry-content.v1.js",
             "_sixbridge/action-popup-entry-background.v1.js",

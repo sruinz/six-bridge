@@ -66,7 +66,7 @@ class ConversionCompositionTest {
             assertEquals(
                 """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
                 snapshot.workingRoot
-                    .resolve("_sixbridge/action-popup-entry.v2.json")
+                    .resolve("sixbridge/action-popup-entry.v2.json")
                     .readText(),
             )
             listOf(

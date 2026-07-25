@@ -245,21 +245,26 @@ run_option_entry_fixture() {
   case "$variant" in
     missing_options_ui)
       printf '{"manifest_version":3}\n' >"$source_root/manifest.json"
-      mkdir "$source_root/_sixbridge"
+      mkdir "$source_root/sixbridge"
       printf 'provenance\n' \
-        >"$source_root/_sixbridge/action-popup-entry.v2.json"
+        >"$source_root/sixbridge/action-popup-entry.v2.json"
       ;;
     *)
       printf '%s\n' \
         '{"manifest_version":3,"options_ui":{"page":"popup.html","open_in_tab":true}}' \
         >"$source_root/manifest.json"
       if [ "$variant" != missing_provenance ]; then
-        mkdir "$source_root/_sixbridge"
+        mkdir "$source_root/sixbridge"
         printf 'provenance\n' \
-          >"$source_root/_sixbridge/action-popup-entry.v2.json"
+          >"$source_root/sixbridge/action-popup-entry.v2.json"
       fi
       ;;
   esac
+  if [ "$variant" = reserved_provenance ]; then
+    mkdir "$source_root/_sixbridge"
+    printf 'reserved provenance\n' \
+      >"$source_root/_sixbridge/action-popup-entry.v2.json"
+  fi
   case "$variant" in
     legacy_content)
       printf 'legacy\n' >"$source_root/action-popup-entry-content.v1.js"
@@ -312,6 +317,7 @@ run_option_entry_fixture() {
 for mutation in \
   missing_options_ui \
   missing_provenance \
+  reserved_provenance \
   legacy_content \
   legacy_background \
   legacy_bootstrap; do

@@ -248,10 +248,15 @@ if ! unzip -p "$transformed_source_zip" manifest.json |
   exit 3
 fi
 zipinfo -1 "$transformed_source_zip" |
-  grep -Fx '_sixbridge/action-popup-entry.v2.json' >/dev/null || {
+  grep -Fx 'sixbridge/action-popup-entry.v2.json' >/dev/null || {
   echo "action popup option entry provenance를 찾을 수 없습니다." >&2
   exit 3
 }
+if zipinfo -1 "$transformed_source_zip" |
+  grep -Fx '_sixbridge/action-popup-entry.v2.json' >/dev/null; then
+  echo "삼성 예약 action popup provenance 경로가 남아 있습니다." >&2
+  exit 3
+fi
 if zipinfo -1 "$transformed_source_zip" |
   grep -E 'action-popup-entry-(content|background)\.v1\.js|_sixbridge-action-popup-entry-bootstrap\.v1\.js' >/dev/null; then
   echo "version 1 action popup runtime asset이 남아 있습니다." >&2

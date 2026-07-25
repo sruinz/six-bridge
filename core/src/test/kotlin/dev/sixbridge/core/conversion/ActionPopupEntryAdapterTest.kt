@@ -52,7 +52,10 @@ class ActionPopupEntryAdapterTest {
         assertContentEquals(popupBefore, source.resolve("popup.html").readBytes())
         assertEquals(
             """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
-            source.resolve("_sixbridge/action-popup-entry.v2.json").readText(),
+            source.resolve("sixbridge/action-popup-entry.v2.json").readText(),
+        )
+        assertFalse(
+            Files.exists(source.resolve("_sixbridge/action-popup-entry.v2.json")),
         )
     }
 
@@ -88,7 +91,7 @@ class ActionPopupEntryAdapterTest {
                 source.resolve("manifest.json").readBytes(),
                 name,
             )
-            assertFalse(Files.exists(source.resolve("_sixbridge")), name)
+            assertFalse(Files.exists(source.resolve("sixbridge")), name)
         }
     }
 
@@ -111,7 +114,7 @@ class ActionPopupEntryAdapterTest {
             },
         ).forEachIndexed { index, createCollision ->
             val source = extension()
-            val marker = source.resolve("_sixbridge/action-popup-entry.v2.json")
+            val marker = source.resolve("sixbridge/action-popup-entry.v2.json")
             val manifestBefore = source.resolve("manifest.json").readBytes()
             createCollision(marker)
 
@@ -160,7 +163,7 @@ class ActionPopupEntryAdapterTest {
                 source.resolve("manifest.json").readBytes(),
                 "popup mutation $index",
             )
-            assertFalse(Files.exists(source.resolve("_sixbridge")), "popup mutation $index")
+            assertFalse(Files.exists(source.resolve("sixbridge")), "popup mutation $index")
         }
     }
 
@@ -197,7 +200,7 @@ class ActionPopupEntryAdapterTest {
 
         assertTrue(adapter.isExactlyApplied(source, manifest(source), "popup.html"))
 
-        source.resolve("_sixbridge/action-popup-entry.v2.json")
+        source.resolve("sixbridge/action-popup-entry.v2.json")
             .writeText("""{"adapter":"foreign","version":2,"popup":"popup.html"}""")
 
         assertFalse(adapter.isExactlyApplied(source, manifest(source), "popup.html"))
@@ -254,7 +257,7 @@ class ActionPopupEntryAdapterTest {
         )
         val manifestBefore = source.resolve("manifest.json").readBytes()
         val provenanceBefore = source.resolve(
-            "_sixbridge/action-popup-entry.v2.json",
+            "sixbridge/action-popup-entry.v2.json",
         ).readBytes()
 
         assertFalse(
@@ -278,7 +281,7 @@ class ActionPopupEntryAdapterTest {
         )
         assertContentEquals(
             provenanceBefore,
-            source.resolve("_sixbridge/action-popup-entry.v2.json").readBytes(),
+            source.resolve("sixbridge/action-popup-entry.v2.json").readBytes(),
         )
     }
 
@@ -321,7 +324,7 @@ class ActionPopupEntryAdapterTest {
         )
         assertEquals(
             """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
-            source.resolve("_sixbridge/action-popup-entry.v2.json").readText(),
+            source.resolve("sixbridge/action-popup-entry.v2.json").readText(),
         )
     }
 

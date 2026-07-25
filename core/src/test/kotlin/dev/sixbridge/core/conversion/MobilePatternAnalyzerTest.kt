@@ -437,8 +437,8 @@ class MobilePatternAnalyzerTest {
         )
         source.resolve("popup.html").writeText("<p>popup</p>")
         writeOptionsUi(source, "popup.html")
-        Files.createDirectories(source.resolve("_sixbridge"))
-        source.resolve("_sixbridge/action-popup-entry.v2.json").writeText(
+        Files.createDirectories(source.resolve("sixbridge"))
+        source.resolve("sixbridge/action-popup-entry.v2.json").writeText(
             """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
         )
 
@@ -460,8 +460,8 @@ class MobilePatternAnalyzerTest {
         )
         source.resolve("popup.html").writeText("<p>popup</p>")
         writeOptionsUi(source, "popup.html")
-        Files.createDirectories(source.resolve("_sixbridge"))
-        source.resolve("_sixbridge/action-popup-entry.v2.json").writeText(
+        Files.createDirectories(source.resolve("sixbridge"))
+        source.resolve("sixbridge/action-popup-entry.v2.json").writeText(
             """{"adapter":"action-popup-entry","version":2,"popup":"popup.html"}""",
         )
 
@@ -501,8 +501,8 @@ class MobilePatternAnalyzerTest {
             source.resolve("other.html").writeText("<p>other</p>")
             writeOptionsUi(source, optionsPage)
             if (provenance != null) {
-                Files.createDirectories(source.resolve("_sixbridge"))
-                source.resolve("_sixbridge/action-popup-entry.v2.json")
+                Files.createDirectories(source.resolve("sixbridge"))
+                source.resolve("sixbridge/action-popup-entry.v2.json")
                     .writeText(provenance)
             }
 

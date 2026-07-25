@@ -175,7 +175,7 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
         const val PAGE = "page"
         const val OPEN_IN_TAB = "open_in_tab"
         const val PROVENANCE_RELATIVE_PATH =
-            "_sixbridge/action-popup-entry.v2.json"
+            "sixbridge/action-popup-entry.v2.json"
     }
 }
 
