@@ -136,13 +136,27 @@ object Crx3 {
         val headerLength = readUInt32(bytes, 8)
         val fields = Proto.parse(bytes.copyOfRange(12, 12 + headerLength))
         val proofs = fields[2].orEmpty() + fields[3].orEmpty()
-        return proofs.firstNotNullOfOrNull { encodedProof ->
-            Proto.parse(encodedProof)[1]?.firstOrNull()?.takeIf { publicKey ->
-                MessageDigest.getInstance("SHA-256")
-                    .digest(publicKey)
-                    .joinToString("") { "%02x".format(it) } == verified.publicKeySha256
-            }
+        val publicKeys = proofs.map { encodedProof ->
+            val proof = Proto.parse(encodedProof)
+            val publicKey = requiredSingleField(proof, 1, "CRX3 proof public_key")
+            requiredSingleField(proof, 2, "CRX3 proof signature")
+            publicKey
+        }
+        return publicKeys.firstOrNull { publicKey ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(publicKey)
+                .joinToString("") { "%02x".format(it) } == verified.publicKeySha256
         }?.copyOf() ?: throw InvalidCrxException("검증된 CRX3 공개 키를 찾을 수 없습니다.")
+    }
+
+    private fun requiredSingleField(
+        fields: Map<Int, List<ByteArray>>,
+        field: Int,
+        name: String,
+    ): ByteArray {
+        val values = fields[field] ?: throw InvalidCrxException("${name}가 없습니다.")
+        if (values.size != 1) throw InvalidCrxException("${name}는 정확히 하나여야 합니다.")
+        return values.single()
     }
 
     fun extensionId(publicKey: ByteArray): String {

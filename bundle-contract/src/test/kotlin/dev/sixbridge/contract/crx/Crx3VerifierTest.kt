@@ -9,6 +9,7 @@ import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.Signature
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
@@ -98,6 +99,94 @@ class Crx3VerifierTest {
     }
 
     @Test
+    fun `rejects duplicated signed header data`() {
+        val packed = crx3("RSA")
+        val header = Proto.message(
+            Proto.bytes(2, packed.proof),
+            Proto.bytes(10_000, packed.signedHeaderData),
+            Proto.bytes(10_000, packed.signedHeaderData),
+        )
+
+        assertInvalid(crx(header, packed.zipBytes), "signed_header_data는 정확히 하나")
+    }
+
+    @Test
+    fun `rejects duplicated CRX ID`() {
+        val packed = crx3("RSA")
+        val duplicatedSignedHeaderData = Proto.message(
+            Proto.bytes(1, packed.crxId),
+            Proto.bytes(1, packed.crxId),
+        )
+        val header = Proto.message(
+            Proto.bytes(2, packed.proof),
+            Proto.bytes(10_000, duplicatedSignedHeaderData),
+        )
+
+        assertInvalid(crx(header, packed.zipBytes), "crx_id는 정확히 하나")
+    }
+
+    @Test
+    fun `rejects duplicated proof public key`() {
+        val packed = crx3("RSA")
+        val duplicatedProof = Proto.message(
+            Proto.bytes(1, packed.publicKey),
+            Proto.bytes(1, packed.publicKey),
+            Proto.bytes(2, packed.signature),
+        )
+        val header = Proto.message(
+            Proto.bytes(2, duplicatedProof),
+            Proto.bytes(10_000, packed.signedHeaderData),
+        )
+
+        assertInvalid(crx(header, packed.zipBytes), "proof public_key는 정확히 하나")
+    }
+
+    @Test
+    fun `rejects duplicated proof signature`() {
+        val packed = crx3("RSA")
+        val duplicatedProof = Proto.message(
+            Proto.bytes(1, packed.publicKey),
+            Proto.bytes(2, packed.signature),
+            Proto.bytes(2, packed.signature),
+        )
+        val header = Proto.message(
+            Proto.bytes(2, duplicatedProof),
+            Proto.bytes(10_000, packed.signedHeaderData),
+        )
+
+        assertInvalid(crx(header, packed.zipBytes), "proof signature는 정확히 하나")
+    }
+
+    @Test
+    fun `rejects protobuf field number zero`() {
+        assertInvalid(crx(byteArrayOf(2), zipBytes()), "protobuf field number가 올바르지 않습니다")
+    }
+
+    @Test
+    fun `rejects protobuf field number above maximum`() {
+        assertInvalid(
+            crx(byteArrayOf(0x82.toByte(), 0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x10), zipBytes()),
+            "protobuf field number가 올바르지 않습니다",
+        )
+    }
+
+    @Test
+    fun `rejects a ten byte overflow protobuf tag`() {
+        assertInvalid(
+            crx(ByteArray(9) { 0x80.toByte() } + byteArrayOf(2), zipBytes()),
+            "protobuf varint가 overflow했습니다",
+        )
+    }
+
+    @Test
+    fun `rejects a ten byte overflow protobuf length`() {
+        assertInvalid(
+            crx(byteArrayOf(10) + ByteArray(9) { 0x80.toByte() } + byteArrayOf(2), zipBytes()),
+            "protobuf varint가 overflow했습니다",
+        )
+    }
+
+    @Test
     fun `rejects a modified signed payload`() {
         val bytes = crx3("RSA").bytes.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
 
@@ -114,8 +203,9 @@ class Crx3VerifierTest {
         assertInvalid(bytes)
     }
 
-    private fun assertInvalid(bytes: ByteArray) {
-        assertFailsWith<IllegalArgumentException> { Crx3Verifier.verify(bytes) }
+    private fun assertInvalid(bytes: ByteArray, message: String? = null) {
+        val error = assertFailsWith<IllegalArgumentException> { Crx3Verifier.verify(bytes) }
+        message?.let { assertContains(error.message.orEmpty(), it) }
     }
 
     private fun crx3(
@@ -145,8 +235,20 @@ class Crx3VerifierTest {
             Proto.bytes(10_000, signedHeaderData),
         )
         val bytes = crx(header, zipBytes)
-        return PackedFixture(keyPair, proof, zipBytes, bytes, 12 + header.size)
+        return PackedFixture(
+            keyPair = keyPair,
+            proof = proof,
+            publicKey = keyPair.public.encoded,
+            signature = signature,
+            crxId = crxId,
+            signedHeaderData = signedHeaderData,
+            zipBytes = zipBytes,
+            bytes = bytes,
+            zipOffset = 12 + header.size,
+        )
     }
+
+    private fun zipBytes(): ByteArray = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4)
 
     private fun crx(header: ByteArray, zipBytes: ByteArray): ByteArray =
         byteArrayOf('C'.code.toByte(), 'r'.code.toByte(), '2'.code.toByte(), '4'.code.toByte()) +
@@ -172,6 +274,10 @@ class Crx3VerifierTest {
     private data class PackedFixture(
         val keyPair: KeyPair,
         val proof: ByteArray,
+        val publicKey: ByteArray,
+        val signature: ByteArray,
+        val crxId: ByteArray,
+        val signedHeaderData: ByteArray,
         val zipBytes: ByteArray,
         val bytes: ByteArray,
         val zipOffset: Int,

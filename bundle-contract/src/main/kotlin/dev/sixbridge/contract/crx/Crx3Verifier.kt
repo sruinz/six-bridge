@@ -60,17 +60,15 @@ object Crx3Verifier {
         }
 
         val fields = Proto.parse(bytes.copyOfRange(headerStart, headerEnd))
-        val signedHeaderData = fields[10_000]?.firstOrNull()
-            ?: invalid("CRX3 signed_header_data가 없습니다.")
-        val crxId = Proto.parse(signedHeaderData)[1]?.firstOrNull()
-            ?: invalid("CRX3 crx_id가 없습니다.")
+        val signedHeaderData = requiredSingleField(fields, 10_000, "CRX3 signed_header_data")
+        val crxId = requiredSingleField(Proto.parse(signedHeaderData), 1, "CRX3 crx_id")
         if (crxId.size != 16) invalid("CRX3 crx_id 길이가 올바르지 않습니다.")
 
         val proof = buildList {
-            fields[2].orEmpty().forEach { add(ProofKind.RSA to it) }
-            fields[3].orEmpty().forEach { add(ProofKind.ECDSA to it) }
+            fields[2].orEmpty().forEach { add(readProof(ProofKind.RSA, it)) }
+            fields[3].orEmpty().forEach { add(readProof(ProofKind.ECDSA, it)) }
         }.firstNotNullOfOrNull { (kind, encodedProof) ->
-            verifyProof(kind, encodedProof, crxId, signedHeaderData, bytes, headerEnd, end - headerEnd)
+            verifyProof(kind, encodedProof.publicKey, encodedProof.signature, crxId, signedHeaderData, bytes, headerEnd, end - headerEnd)
         } ?: invalid("CRX3 서명을 검증할 수 없습니다.")
 
         return VerifiedCrx3(
@@ -84,16 +82,14 @@ object Crx3Verifier {
 
     private fun verifyProof(
         kind: ProofKind,
-        encodedProof: ByteArray,
+        publicKeyBytes: ByteArray,
+        signatureBytes: ByteArray,
         expectedCrxId: ByteArray,
         signedHeaderData: ByteArray,
         source: ByteArray,
         zipOffset: Int,
         zipLength: Int,
     ): ByteArray? = runCatching {
-        val proof = Proto.parse(encodedProof)
-        val publicKeyBytes = proof[1]?.firstOrNull() ?: return null
-        val signatureBytes = proof[2]?.firstOrNull() ?: return null
         val actualCrxId = MessageDigest.getInstance("SHA-256")
             .digest(publicKeyBytes)
             .copyOfRange(0, 16)
@@ -109,6 +105,24 @@ object Crx3Verifier {
         }
         publicKeyBytes.takeIf { verified }?.copyOf()
     }.getOrNull()
+
+    private fun readProof(kind: ProofKind, encodedProof: ByteArray): Pair<ProofKind, Proof> {
+        val fields = Proto.parse(encodedProof)
+        return kind to Proof(
+            publicKey = requiredSingleField(fields, 1, "CRX3 proof public_key"),
+            signature = requiredSingleField(fields, 2, "CRX3 proof signature"),
+        )
+    }
+
+    private fun requiredSingleField(
+        fields: Map<Int, List<ByteArray>>,
+        field: Int,
+        name: String,
+    ): ByteArray {
+        val values = fields[field] ?: invalid("${name}가 없습니다.")
+        if (values.size != 1) invalid("${name}는 정확히 하나여야 합니다.")
+        return values.single()
+    }
 
     private fun readPublicKey(kind: ProofKind, encoded: ByteArray): PublicKey =
         KeyFactory.getInstance(kind.keyAlgorithm).generatePublic(X509EncodedKeySpec(encoded)).also { publicKey ->
@@ -164,6 +178,11 @@ object Crx3Verifier {
         ECDSA("EC", "SHA256withECDSA"),
     }
 
+    private data class Proof(
+        val publicKey: ByteArray,
+        val signature: ByteArray,
+    )
+
     private object Proto {
         fun parse(message: ByteArray): Map<Int, List<ByteArray>> {
             val result = linkedMapOf<Int, MutableList<ByteArray>>()
@@ -171,19 +190,22 @@ object Crx3Verifier {
             while (offset < message.size) {
                 val (tag, afterTag) = readVarInt(message, offset)
                 offset = afterTag
-                val field = (tag ushr 3).toInt()
+                val field = tag ushr 3
+                if (field !in 1L..MAX_FIELD_NUMBER.toLong()) {
+                    invalid("protobuf field number가 올바르지 않습니다.")
+                }
                 when ((tag and 7).toInt()) {
                     0 -> {
                         val (value, next) = readVarInt(message, offset)
                         offset = next
-                        result.getOrPut(field) { mutableListOf() } += encodeVarInt(value)
+                        result.getOrPut(field.toInt()) { mutableListOf() } += encodeVarInt(value)
                     }
                     1 -> offset = checkedOffset(message, offset, 8)
                     2 -> {
                         val (length, afterLength) = readVarInt(message, offset)
-                        if (length > Int.MAX_VALUE) invalid("protobuf 필드가 너무 큽니다.")
+                        if (length < 0 || length > Int.MAX_VALUE) invalid("protobuf 필드가 너무 큽니다.")
                         val end = checkedOffset(message, afterLength, length.toInt())
-                        result.getOrPut(field) { mutableListOf() } += message.copyOfRange(afterLength, end)
+                        result.getOrPut(field.toInt()) { mutableListOf() } += message.copyOfRange(afterLength, end)
                         offset = end
                     }
                     5 -> offset = checkedOffset(message, offset, 4)
@@ -201,15 +223,15 @@ object Crx3Verifier {
 
         private fun readVarInt(bytes: ByteArray, start: Int): Pair<Long, Int> {
             var value = 0L
-            var shift = 0
             var offset = start
-            while (offset < bytes.size && shift < 64) {
+            repeat(10) { index ->
+                if (offset >= bytes.size) invalid("protobuf varint가 손상되었습니다.")
                 val byte = bytes[offset++].toInt() and 0xff
-                value = value or ((byte and 0x7f).toLong() shl shift)
+                if (index == 9 && byte > 1) invalid("protobuf varint가 overflow했습니다.")
+                value = value or ((byte and 0x7f).toLong() shl (index * 7))
                 if (byte and 0x80 == 0) return value to offset
-                shift += 7
             }
-            invalid("protobuf varint가 손상되었습니다.")
+            invalid("protobuf varint가 overflow했습니다.")
         }
 
         private fun encodeVarInt(value: Long): ByteArray = ByteArrayOutputStream().run {
@@ -231,6 +253,7 @@ object Crx3Verifier {
     }
 
     private const val MAX_HEADER_SIZE = 1024 * 1024
+    private const val MAX_FIELD_NUMBER = 536_870_911
     private const val VERSION = 3
     private val MAGIC = byteArrayOf('C'.code.toByte(), 'r'.code.toByte(), '2'.code.toByte(), '4'.code.toByte())
     private val NIST_P256_PARAMETERS: ECParameterSpec = AlgorithmParameters.getInstance("EC").run {
