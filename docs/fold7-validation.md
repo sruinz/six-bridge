@@ -152,8 +152,8 @@ sixbridge/desktop-selection-event-bridge.v1.js
 사용자는 v12에서 삼성 Add-ons 상세 설정 메뉴, 기존 popup 탭, 설정
 저장·브라우저 재시작 유지, 페이지 상시 버튼 부재, 텍스트 선택 메뉴를
 모두 정상으로 확인했다. v14는 생성 asset의 예약 경로만 바꾼 업데이트이며
-자동 게이트와 활성 유지는 통과했다. v14 UI의 새 수동 재확인 회신은 아직
-없으므로 v14 수동 UI 결과는 보류한다.
+자동 게이트와 활성 유지를 통과했다. 사용자는 2026-07-25에 v14의 설정
+popup과 텍스트 선택 메뉴도 정상이라고 재확인했다.
 
 `storage.sync`는 동작을 확인하지 않았다. `storage-fallback`은 source의
 동적·계산된 접근을 안전하게 변환할 수 없어 `unavailable`,
