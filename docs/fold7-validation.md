@@ -158,3 +158,95 @@ popup과 텍스트 선택 메뉴도 정상이라고 재확인했다.
 `storage.sync`는 동작을 확인하지 않았다. `storage-fallback`은 source의
 동적·계산된 접근을 안전하게 변환할 수 없어 `unavailable`,
 `applied=false`로 보존됐다.
+
+## AI 레시피 추출기
+
+### Host·device 자동 결과
+
+실제 개발 source를 수정하지 않고 공용 runner에 입력했다. 분석 결과는
+`compatible`, 변환 상태는 `passthrough`이며 별도 adapter는 적용하지 않았다.
+기준 source tree SHA-256
+`bf61114c94a9377577458f69bfb62cef5cfd66db40652b3d4f11f59d49930d31`은
+host와 device 검증 전후에 유지됐다.
+
+- main evidence:
+  `.local/evidence/20260725-122327-ai-recipe-converted.log.PIK0ja`
+- loader evidence:
+  `.local/evidence/20260725-122327-ai-recipe-loader-after-tab-logcat.txt`
+- 기기/브라우저 profile:
+  `SM-F966N`, `com.sec.android.app.sbrowser` /
+  `30.0.0.67` / `1300067502`
+- extension ID:
+  `fdacompblnicnhgpkjnodoojgpglbpnh`
+- wrapper package:
+  `dev.sixbridge.ext.fdacompblnicnhgpkjnodoojgpglbpnh`
+- wrapper `versionCode`: `3`
+- CRX SHA-256:
+  `15cf9a99056b04224cf99bc4e5fc4ea477ead6854ec44a2bf939c63abcdcae0b`
+- wrapper APK SHA-256:
+  `fbb31603ba8adeffa2f0b2aa953dce6a98aa7190cd5682c6c4a23d2324f13007`
+- SixBundle SHA-256:
+  `b261513ef6767c75cdecf7d1c7a074aefe00b840292f648b649b2538f1f08a71`
+- wrapper signer SHA-256:
+  `436e837f7fae287a23dcead0d944bc9fb7dfdbee82fabf962fdb8846accd927a`
+
+main evidence에서 `profileMatch=true`, `deviceChecks=passed`,
+`installSuccess=true`, `discoverySuccess=true`,
+`providerReadSuccess=true`, `sourceUnchanged=true`를 확인했다. provider가
+제공한 CRX SHA-256도 build CRX와 일치했다.
+
+### 모바일 진입점 결과
+
+사용자는 일반 웹 페이지의 링크·선택 텍스트·이미지·동영상을 길게 눌렀을 때
+삼성 기본 컨텍스트 메뉴에 `AI 레시피 추출하기`가 표시되는 것을 확인했다.
+YouTube 모바일 플레이어는 길게 누르기를 빠르게 넘기기로 사용해 브라우저
+컨텍스트 메뉴가 열리지 않는다.
+
+삼성 인터넷은 브라우저 설정의 `더보기 메뉴 사용자 설정`과
+`툴바 사용자 설정`에서 확장 action을 배치할 수 있다. 사용자는 AI 레시피
+action을 더보기 메뉴에 배치했고, YouTube 영상 페이지에서 이를 눌러 현재
+페이지 URL을 전달했다. 따라서 삼성 기본 UI가 다음 두 진입점을 담당한다.
+
+- 일반 DOM 대상: 삼성 기본 컨텍스트 메뉴
+- 현재 페이지 실행: 더보기 메뉴 또는 툴바의 확장 action
+
+별도 플로팅 버튼이나 YouTube 전용 content script는 필요하지 않다.
+
+### LAN 전달 결과
+
+일회성 LAN receiver 증거
+`.local/evidence/20260725-123139-ai-recipe-lan.json`은
+`requestMatched=false`, `reason=timeout`이다. 당시 YouTube 플레이어에서
+컨텍스트 메뉴를 열 수 없어 요청을 발생시키지 못했으며, 이 결과를 성공으로
+해석하지 않는다. 이후 실제 서버 검증 결과와도 합쳐 쓰지 않는다.
+
+### 실제 서버 사용자 결과
+
+2026-07-25 사용자가 options에서 실제 서버
+`https://recipe.sruinz.com`을 설정하고, 실제 떡볶이 YouTube 영상 페이지에서
+더보기 메뉴의 `AI 레시피 추출기` action을 실행했다.
+
+사용자 제공 화면과 실행 직후 로그에서 다음을 확인했다.
+
+1. 삼성 더보기 메뉴에 AI 레시피 action이 표시됐다.
+2. 로그에
+   `ExecuteAction id : fdacompblnicnhgpkjnodoojgpglbpnh`가 기록됐다.
+3. 실제 서버의 분석 진행 화면으로 이동했다.
+4. 영상 제목·채널과 떡볶이 재료 및 조리 방법이 포함된 결과가 표시됐다.
+
+따라서 현재 페이지 URL 획득, `storage.sync`에 저장한 서버 URL 읽기,
+`tabs.create` 화면 이동과 실제 서버 요청으로 이어지는 주요 흐름은
+Fold7에서 통과했다.
+
+### 알려진 제한과 로그 관찰
+
+- 설정값의 저장과 실제 실행 반영은 확인했지만, 삼성 인터넷을 완전히
+  종료·재실행한 뒤의 설정 유지 여부는 이번 실제 서버 시나리오에서 별도로
+  재확인하지 않았다.
+- 실행 직후 제한 로그에는 대상 확장의 `contextMenus`, `storage`,
+  `tabs.create` 관련 예외와 AndroidRuntime crash가 없었다.
+- 같은 로그의 extension options 문맥에서 삼성 내부 텍스트 분석 전역 함수
+  `SiTextIsRobotsIndexBlocked`, `SiTextIsPayWallPage`,
+  `SiTextGetSentences` 관련 비치명 `ReferenceError`가 관찰됐다. 실제 옵션
+  저장과 레시피 추출은 완료됐으므로 현재 합격 흐름을 중단시키지는 않았지만,
+  삼성 인터넷 30.x 버전 비교 시 재확인할 관찰 항목으로 남긴다.

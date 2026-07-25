@@ -125,6 +125,31 @@ sixbridge device smoke \
   --serial <adb-serial>
 ```
 
+확장별 공용 검증 runner와 AI 레시피 추출기 wrapper는 다음처럼 실행한다.
+실제 source 경로는 저장소에 고정하지 않고 호출할 때 전달한다.
+
+```sh
+source_dir='/workspace/T5다운로드/vscode/AI Recipe Extractor'
+serial='adb-DEVICE_SERIAL._adb-tls-connect._tcp'
+
+./scripts/fold7-extension-validation.sh \
+  --case-id meemjdgdjhjfhcfchppfapgifiipjnlo \
+  --source "$source_dir" \
+  --profile profiles/sbrowser-30.0.0.67.json \
+  --host-only
+
+./scripts/fold7-ai-recipe.sh \
+  --source "$source_dir" \
+  --profile profiles/sbrowser-30.0.0.67.json \
+  --serial "$serial"
+```
+
+삼성 인터넷의 `더보기 메뉴 사용자 설정` 또는 `툴바 사용자 설정`에서
+확장 action을 배치할 수 있다. AI 레시피 추출기는 이 기본 action으로 현재
+YouTube 페이지를 전달하므로, YouTube가 길게 누르기 동작을 가로채더라도
+별도 플로팅 버튼이 필요하지 않다. 일반 페이지의 링크·선택 텍스트·이미지·
+동영상에서는 삼성 기본 컨텍스트 메뉴의 확장 항목도 그대로 사용한다.
+
 최소 기술 게이트는 `./scripts/fold7-gate.sh <adb-serial>`로 실행할 수 있다.
 
 생성된 소스 스냅샷, 키, 검증 증거는 Git에서 제외된 `.local/`에 저장된다.

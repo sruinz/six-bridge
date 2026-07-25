@@ -204,3 +204,36 @@ v12에서는 사용자가 수동 UI 시나리오를 확인했다. v14는 예약 
 
 `storage.sync`는 미검증이다. v12 수동 통과를 v14의 새 수동 UI 통과로
 확대 해석하지 않으며, v14에서 재확인한 범위는 위 표에 명시한 두 항목이다.
+
+## AI 레시피 추출기 실기기 결과
+
+AI 레시피 추출기는 실제 개발 source를 수정하지 않은
+`passthrough` 변환으로 Fold7에 설치했다. 최종 변환 ID는
+`fdacompblnicnhgpkjnodoojgpglbpnh`, wrapper package는
+`dev.sixbridge.ext.fdacompblnicnhgpkjnodoojgpglbpnh`,
+`versionCode`는 `3`이다.
+
+Host·device 자동 검증에서 exact profile, 설치, discovery, provider CRX
+SHA-256, APK signer와 source 불변이 모두 통과했다. 실제 서버의 기능 결과는
+자동 LAN receiver와 분리해 사용자가 직접 확인했다.
+
+| 검증 항목 | 대상 | 결과 | evidence |
+|---|---|---|---|
+| options 서버 URL 저장·실행 반영 | Fold7 수동 | 통과 | 실제 서버 URL 설정 후 background action이 해당 서버로 이동 |
+| 설정의 브라우저 완전 재시작 유지 | Fold7 수동 | 보류 | 이번 실제 서버 시나리오에서 별도 재확인하지 않음 |
+| 일반 페이지 모바일 context menu | Fold7 수동 | 통과 | 링크·선택 텍스트·이미지·동영상 메뉴에서 사용자 확인(2026-07-25) |
+| YouTube 현재 페이지 실행 | Fold7 수동 | 통과 | 삼성 더보기 메뉴의 확장 action과 `ExecuteAction` 로그 |
+| 실제 서버 화면 이동 | Fold7 수동 | 통과 | `recipe.sruinz.com` 분석 진행 화면 |
+| 실제 레시피 추출 | Fold7 수동 | 통과 | 떡볶이 영상 제목·채널·재료·조리 방법 결과 화면 |
+| 일회성 LAN receiver | 자동+수동 | 미통과 | `.local/evidence/20260725-123139-ai-recipe-lan.json`, `reason=timeout` |
+
+YouTube 플레이어는 사이트 자체가 길게 누르기를 빠르게 넘기기로 사용하므로
+삼성 기본 컨텍스트 메뉴가 열리지 않는다. 그러나 삼성 인터넷이 확장 action을
+더보기 메뉴나 툴바에 배치하는 기본 기능을 제공하며 실제 추출도 통과했다.
+따라서 플로팅 버튼이나 AI 레시피 전용 변환 분기는 추가하지 않는다.
+
+자동 LAN 수신기 타임아웃은 성공으로 바꾸지 않는다. 다만 실제 서버
+종단간 검증에서 현재 YouTube URL 전달, 저장된 서버 URL 사용,
+`tabs.create` 이동과 결과 생성이 모두 확인됐으므로 AI 레시피의 PoC 주요
+기능은 통과로 판정한다. 브라우저 완전 재시작 뒤 설정 유지와 options 문맥의
+삼성 내부 `SiText*` 비치명 로그는 후속 재검증 항목이다.
