@@ -56,6 +56,22 @@ trap 'rm -rf "$fixture"' EXIT
 
 six_assert_validation_roles "$validation"
 
+jq -e '
+  .extensions as $extensions |
+  {
+    "lneaoklobohnoncgckmbbjfiajgpbdde": "conversion-candidate",
+    "meemjdgdjhjfhcfchppfapgifiipjnlo": "conversion-candidate",
+    "fchehlladkkanoekpjffcfffpfbdaalj": "conversion-candidate",
+    "ommjjncpoppekodegknkannmdhoppgkj": "boundary-diagnostic"
+  } as $expected_roles |
+  ([ $extensions[].id ] | sort) == ([ $expected_roles | keys[] ] | sort) and
+  all(
+    $extensions[];
+    . as $extension |
+    $extension.validationRole == $expected_roles[$extension.id]
+  )
+' "$validation" >/dev/null
+
 case_json=$(six_validation_case "$validation" meemjdgdjhjfhcfchppfapgifiipjnlo)
 [ "$(printf '%s' "$case_json" | jq -cS .)" = "$(jq -cS '
   .extensions[] |
