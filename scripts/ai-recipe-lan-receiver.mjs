@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, open, realpath } from "node:fs/promises";
+import { open } from "node:fs/promises";
+import { prepareCliEvidence } from "./lan-receiver-evidence.mjs";
 
 const successHtml = `<!doctype html>
 <meta charset="utf-8">
@@ -204,43 +205,6 @@ function parseArguments(argumentsList) {
     evidencePath: values["--evidence"],
     port,
     timeoutMs,
-  };
-}
-
-async function prepareCliEvidence(evidencePath) {
-  const rootInfo = await lstat(".local/evidence");
-  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
-    throw new Error(".local/evidence must be a real directory");
-  }
-  const evidenceRoot = await realpath(".local/evidence");
-  const absolutePath = evidencePath.startsWith("/")
-    ? evidencePath
-    : `${process.cwd()}/${evidencePath}`;
-  const separator = absolutePath.lastIndexOf("/");
-  const parentPath = absolutePath.slice(0, separator) || "/";
-  const filename = absolutePath.slice(separator + 1);
-  if (!filename || filename === "." || filename === ".." || await realpath(parentPath) !== evidenceRoot) {
-    throw new Error("--evidence must be directly inside .local/evidence");
-  }
-
-  const resolvedEvidencePath = `${evidenceRoot}/${filename}`;
-  try {
-    if ((await lstat(resolvedEvidencePath)).isSymbolicLink()) {
-      throw new Error("--evidence must not be a symbolic link");
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-  process.chdir(evidenceRoot);
-  const currentDirectory = await lstat(".");
-  if (currentDirectory.dev !== rootInfo.dev || currentDirectory.ino !== rootInfo.ino) {
-    throw new Error(".local/evidence changed while preparing evidence");
-  }
-  return {
-    evidencePath: filename,
-    evidenceFile: await open(filename, "wx", 0o600),
   };
 }
 
