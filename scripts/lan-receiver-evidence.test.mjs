@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { renameSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -39,4 +40,35 @@ test("기존 evidence 파일을 덮어쓰지 않는다", async (t) => {
     code: "EEXIST",
   });
   assert.equal(await readFile(file, "utf8"), "keep");
+});
+
+test("기본 evidence root 교체는 기존 AI CLI 오류 문구를 유지한다", async (t) => {
+  const cwd = process.cwd();
+  const project = await mkdtemp(path.join(os.tmpdir(), "six-lan-evidence-project-"));
+  const root = path.join(project, ".local", "evidence");
+  const movedRoot = `${root}-moved`;
+  const externalRoot = await mkdtemp(path.join(os.tmpdir(), "six-lan-evidence-external-"));
+  await mkdir(root, { recursive: true });
+  const originalChdir = process.chdir;
+  let rootSwapped = false;
+  process.chdir(project);
+  process.chdir = (directory) => {
+    if (!rootSwapped) {
+      renameSync(root, movedRoot);
+      symlinkSync(externalRoot, root);
+      rootSwapped = true;
+    }
+    originalChdir(directory);
+  };
+  t.after(async () => {
+    process.chdir = originalChdir;
+    originalChdir(cwd);
+    await rm(project, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    prepareCliEvidence(".local/evidence/result.json"),
+    /\.local\/evidence changed while preparing evidence/,
+  );
 });

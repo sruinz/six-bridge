@@ -42,7 +42,9 @@ export async function prepareCliEvidence(
     currentDirectory.dev !== rootInfo.dev ||
     currentDirectory.ino !== rootInfo.ino
   ) {
-    throw new Error("evidence root changed while preparing evidence");
+    throw new Error(evidenceRootPath === ".local/evidence"
+      ? ".local/evidence changed while preparing evidence"
+      : "evidence root changed while preparing evidence");
   }
   return {
     evidencePath: filename,
