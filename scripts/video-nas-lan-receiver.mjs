@@ -140,7 +140,16 @@ export async function startVideoNasReceiver({
   });
   let startFinalization;
   const server = createServer((request, response) => {
-    const requestUrl = new URL(request.url, "http://receiver.invalid");
+    let requestUrl;
+    try {
+      requestUrl = new URL(request.url, "http://receiver.invalid");
+    } catch {
+      response.writeHead(400, {
+        "content-type": "text/plain; charset=utf-8",
+      });
+      response.end("bad-request");
+      return;
+    }
 
     if (
       mode === "hls" &&
@@ -390,7 +399,11 @@ function parseArguments(argumentsList) {
     throw new Error("--expected-url is not allowed in hls mode");
   }
 
-  const port = Number(values["--port"] ?? "0");
+  const portText = values["--port"] ?? "0";
+  if (!/^\d+$/.test(portText)) {
+    throw new Error("--port must be an integer from 0 to 65535");
+  }
+  const port = Number(portText);
   const timeoutMs = Number(values["--timeout-ms"] ?? "600000");
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error("--port must be an integer from 0 to 65535");

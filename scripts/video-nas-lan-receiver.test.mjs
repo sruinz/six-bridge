@@ -13,6 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -173,6 +174,23 @@ function request(url, options = {}) {
     });
     requestHandle.on("error", reject);
     requestHandle.end(options.body);
+  });
+}
+
+function rawHttpRequest(port, requestText) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({
+      host: "127.0.0.1",
+      port,
+    });
+    let responseText = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(requestText));
+    socket.on("data", (chunk) => {
+      responseText += chunk;
+    });
+    socket.on("end", () => resolve(responseText));
+    socket.on("error", reject);
   });
 }
 
@@ -377,6 +395,43 @@ test("CLI는 mode·host·mode별 URL과 정수 경계를 검증한다", async (t
       assert.equal(result.code, 1);
       assert.equal(result.stdout.length, 0);
       assert.match(result.stderr, errorPattern);
+    });
+  }
+});
+
+test("CLI는 명시적인 빈 port를 evidence 선점 전에 거부한다", async (t) => {
+  const project = await createCliProject(t);
+  const rejectedCases = [
+    ["빈 문자열", "", "empty-port.json"],
+    ["공백 문자열", "   ", "whitespace-port.json"],
+  ];
+
+  for (const [name, portValue, evidenceName] of rejectedCases) {
+    await t.test(name, async () => {
+      const evidencePath = path.join(
+        project,
+        ".local",
+        "evidence",
+        evidenceName,
+      );
+      const result = await runCli([
+        "--mode", "hls",
+        "--advertise-host", "127.0.0.1",
+        "--evidence", `.local/evidence/${evidenceName}`,
+        "--port", portValue,
+      ], {
+        t,
+        cwd: project,
+        deadlineMs: 250,
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout.length, 0);
+      assert.match(
+        result.stderr,
+        /--port must be an integer from 0 to 65535/,
+      );
+      await assert.rejects(readFile(evidencePath, "utf8"), { code: "ENOENT" });
     });
   }
 });
@@ -1022,6 +1077,42 @@ test("잘못된 route·token·authorization·URL은 success claim을 소비하�
     reason: "matched",
   });
   await assert.rejects(request(details.restUrl));
+});
+
+test("malformed absolute-form target은 generic 400이고 success claim을 소비하지 않는다", async (t) => {
+  const receiver = await startTestReceiver(t, { mode: "page" });
+  const details = receiverDetails(receiver);
+  const malformedTarget = "http://[";
+  const rawResponse = await rawHttpRequest(
+    receiver.port,
+    `GET ${malformedTarget} HTTP/1.1\r\n`
+      + "Host: receiver.invalid\r\n"
+      + "Connection: close\r\n"
+      + "\r\n",
+  );
+
+  assert.match(rawResponse, /^HTTP\/1\.1 400 /);
+  assert.equal(rawResponse.includes(malformedTarget), false);
+  assert.equal(rawResponse.includes(details.runToken), false);
+  assert.equal(rawResponse.includes(details.bearerToken), false);
+  assert.equal(await readFile(receiver.testEvidencePath, "utf8"), "");
+
+  const exact = await postJson(receiver, {
+    url: exactInput.expectedUrl,
+    resolution: "best",
+  });
+  assert.equal(exact.status, 200);
+  assert.deepEqual(await receiver.completed, {
+    requestMatched: true,
+    reason: "matched",
+  });
+  const evidenceText = await readFile(receiver.testEvidencePath, "utf8");
+  const evidence = JSON.parse(evidenceText);
+  assert.equal(evidence.requestMatched, true);
+  assert.equal(evidence.reason, "matched");
+  assert.equal(evidenceText.includes(malformedTarget), false);
+  assert.equal(evidenceText.includes(details.runToken), false);
+  assert.equal(evidenceText.includes(details.bearerToken), false);
 });
 
 test("정확히 65,536 bytes인 유효 JSON body를 허용한다", async (t) => {
