@@ -32,15 +32,18 @@
 
 ## 확장 정적 분석
 
-| 순서 | 확장 프로그램 | 정적 결과 | 비지원 API |
-|---:|---|---|---|
-| 1 | 스마트 컨텍스트 메뉴 | compatible | 없음 |
-| 2 | AI 레시피 추출기 | compatible | 없음 |
-| 3 | Video Download to NAS | partial | webNavigation |
-| 4 | MediaNab | partial | downloads, nativeMessaging |
+| 순서 | 확장 프로그램 | 검증 역할 | 정적 결과 | 비지원 API |
+|---:|---|---|---|---|
+| 1 | 스마트 컨텍스트 메뉴 | conversion-candidate | compatible | 없음 |
+| 2 | AI 레시피 추출기 | conversion-candidate | compatible | 없음 |
+| 3 | Video Download to NAS | conversion-candidate | partial | webNavigation |
+| 4 | MediaNab | boundary-diagnostic | partial | downloads, nativeMessaging |
 
 네 입력 CRX3 모두 서명 검증을 통과했다. 바이트 비교 결과 생성된
 `dist/<id>.crx`가 Chrome 웹 스토어 입력과 동일했다.
+
+MediaNab은 자동 변환 성공 건수에 포함하지 않고 진단 정확도와 실패 격리를
+검증한다.
 
 ## 정적 분석 범위
 

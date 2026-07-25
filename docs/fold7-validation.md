@@ -33,7 +33,7 @@ Chrome 웹 스토어 CRX와 개발 키로 다시 패킹한 CRX를 각각 시험�
 기록한다. 삼성 인터넷 APK는 수정하지 않으며 Android 관리자 앱 단계도
 시작하지 않는다.
 
-## 게이트 B — 네 확장 프로그램
+## 게이트 B — 세 변환 후보와 한 경계 진단
 
 `validation/extensions.json`의 순서대로 실행한다. 각 시나리오마다 다음을
 기록한다.
@@ -44,10 +44,11 @@ Chrome 웹 스토어 CRX와 개발 키로 다시 패킹한 CRX를 각각 시험�
 - 관련 스크린샷과 `.local/evidence` 로그 경로
 - 실행한 API와 발생한 런타임 예외
 
-앞의 세 확장은 목록의 주요 시나리오가 모두 동작해야 통과한다. MediaNab은
-지원되는 storage, tabs, webRequest, offscreen 경로가 동작하고,
-`downloads`와 `nativeMessaging`이 다른 기능을 중단시키지 않은 채
-비지원으로 정확히 진단되면 PoC를 통과한다.
+앞의 세 확장은 `conversion-candidate`이며 목록의 주요 시나리오가 모두
+동작해야 통과한다. MediaNab은 `boundary-diagnostic`이며 자동 변환 성공
+집계에 포함하지 않는다. 지원되는 storage, tabs, webRequest, offscreen
+경로가 동작하고 `downloads`와 `nativeMessaging`이 다른 기능을 중단시키지
+않은 채 비지원으로 정확히 진단되면 경계 진단을 통과한다.
 
 ## 게이트 C — 변환된 스마트 컨텍스트 메뉴
 
