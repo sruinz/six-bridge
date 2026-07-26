@@ -1,6 +1,7 @@
 package dev.sixbridge.manager
 
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -46,6 +47,10 @@ fun ManagerAppContent(
         onAction(ManagerAction.InstallReviewedBundle)
     },
 ) {
+    val backAction = state.route.backAction()
+    BackHandler(enabled = backAction != null) {
+        backAction?.let(onAction)
+    }
     when (val route = state.route) {
         ManagerRoute.Home -> HomeScreen(
             state = state,
@@ -81,4 +86,10 @@ fun ManagerAppContent(
             modifier = modifier,
         )
     }
+}
+
+internal fun ManagerRoute.backAction(): ManagerAction? = when (this) {
+    ManagerRoute.Home -> null
+    is ManagerRoute.Review -> ManagerAction.CancelReview
+    is ManagerRoute.Report -> ManagerAction.ReturnHome
 }

@@ -2,7 +2,11 @@ package dev.sixbridge.manager.ui
 
 import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
+import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.contract.bundle.ContractAdapterDecision
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
 import dev.sixbridge.manager.app.ManagerRestoreResult
@@ -82,6 +86,60 @@ class ManagerViewModelTest {
         viewModel.accept(ManagerAction.ReturnHome)
         assertEquals(ManagerRoute.Home, viewModel.state.value.route)
     }
+
+    @Test
+    fun `catalog의 정상 report status와 내용만 표시 모델로 사용한다`() =
+        runTest(dispatcher.scheduler) {
+            val report = compatibilityReport(ContractCompatibilityStatus.PARTIAL)
+            val repository = FakeManagerRepository().apply {
+                catalogFlow.tryEmit(
+                    listOf(
+                        catalogRecord(
+                            compatibilityStatus = "COMPATIBLE",
+                            reportJson = BundleJson.encodeCompatibility(report),
+                        ),
+                    ),
+                )
+            }
+
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            val item = viewModel.state.value.installed.single()
+            assertEquals(ContractCompatibilityStatus.PARTIAL, item.compatibilityStatus)
+            assertEquals(ReportAvailability.AVAILABLE, item.reportAvailability)
+            assertEquals(listOf("storage"), item.report?.declaredPermissions)
+            assertEquals(listOf("API_LIMIT"), item.report?.issues?.map(ContractIssue::code))
+            assertEquals(listOf("tabs"), item.report?.adapterDecisions?.map(ContractAdapterDecision::id))
+        }
+
+    @Test
+    fun `catalog report가 없거나 깨졌으면 stored compatible을 신뢰하지 않고 unknown으로 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                catalogFlow.tryEmit(
+                    listOf(
+                        catalogRecord(reportJson = null),
+                        catalogRecord(
+                            packageName = "$PACKAGE.invalid",
+                            reportJson = "{broken",
+                        ),
+                    ),
+                )
+            }
+
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            val missing = viewModel.state.value.installed.first()
+            assertEquals(ContractCompatibilityStatus.UNKNOWN, missing.compatibilityStatus)
+            assertEquals(ReportAvailability.MISSING, missing.reportAvailability)
+            assertNull(missing.report)
+            val unreadable = viewModel.state.value.installed.last()
+            assertEquals(ContractCompatibilityStatus.UNKNOWN, unreadable.compatibilityStatus)
+            assertEquals(ReportAvailability.UNREADABLE, unreadable.reportAvailability)
+            assertNull(unreadable.report)
+        }
 
     @Test
     fun `initialize transient 실패는 saved review token을 지우지 않고 재생성에서 복원한다`() =
@@ -293,6 +351,28 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `unknown sources에서 writing 또는 approval로 진행하면 권한 메시지를 지운다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            assertEquals(UserMessageKind.UNKNOWN_SOURCES_PERMISSION, viewModel.state.value.message?.kind)
+
+            repository.installFlow.value = InstallState.WritingSession(40)
+            advanceUntilIdle()
+            assertNull(viewModel.state.value.message)
+
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            advanceUntilIdle()
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
     fun `설치 성공 취소 실패를 각각 상태와 한국어 메시지로 반영한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository()
@@ -318,6 +398,7 @@ class ManagerViewModelTest {
             repository.installFlow.value = InstallState.Failed("WRITE_FAILED", "raw")
             advanceUntilIdle()
             assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            assertEquals(RecoveryAction.SELECT_ANOTHER_FILE, viewModel.state.value.message?.recoveryAction)
         }
 
     @Test
@@ -344,6 +425,122 @@ class ManagerViewModelTest {
         assertEquals(UserMessageKind.UNINSTALLED, viewModel.state.value.message?.kind)
         assertEquals(2, repository.reconcileRequests)
     }
+
+    @Test
+    fun `제거 취소 RETRY는 동일 package 제거 effect를 다시 요청한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            assertEquals(PACKAGE, repository.uninstallPackages.single())
+            viewModel.effects.first()
+            repository.uninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+
+            assertEquals(listOf(PACKAGE, PACKAGE), repository.uninstallPackages)
+            assertEquals(
+                LaunchDestination.UNINSTALL,
+                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
+            )
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `Add-ons 불가 RETRY는 foreground reconcile이 아니라 Add-ons를 다시 연다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                navigationResult = RepositoryNavigationResult.AddOnsIntentUnavailable
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            assertEquals(UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE, viewModel.state.value.message?.kind)
+
+            repository.navigationResult = RepositoryNavigationResult.Launch(
+                RepositoryLaunch(
+                    LaunchDestination.SAMSUNG_ADD_ONS,
+                    intentFactory = { error("unit test에서는 Intent를 만들지 않습니다.") },
+                ),
+            )
+            viewModel.accept(ManagerAction.RetryRecovery)
+
+            assertEquals(0, repository.reconcileRequests)
+            assertEquals(
+                LaunchDestination.SAMSUNG_ADD_ONS,
+                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
+            )
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `launch 실패 RETRY는 저장한 동일 effect를 비운 뒤 재enqueue하고 재실패를 다시 저장한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            val effect = ManagerEffect.LaunchIntent(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                intentFactory = { error("launch failure") },
+                installSessionId = 41,
+            )
+
+            viewModel.accept(ManagerAction.LaunchFailed(effect))
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+            viewModel.accept(ManagerAction.RetryRecovery)
+            val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertTrue(effect === retried)
+            assertNull(viewModel.state.value.message)
+
+            viewModel.accept(ManagerAction.LaunchFailed(retried))
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+            viewModel.accept(ManagerAction.RetryRecovery)
+            assertTrue(retried === viewModel.effects.first())
+        }
+
+    @Test
+    fun `message dismiss와 새 user action은 stale RETRY 소유권을 지운다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                navigationResult = RepositoryNavigationResult.AddOnsIntentUnavailable
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            viewModel.accept(ManagerAction.DismissMessage)
+            repository.navigationResult = RepositoryNavigationResult.Launch(
+                RepositoryLaunch(
+                    LaunchDestination.SAMSUNG_ADD_ONS,
+                    intentFactory = { error("unit test에서는 Intent를 만들지 않습니다.") },
+                ),
+            )
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+
+            repository.navigationResult = RepositoryNavigationResult.AddOnsIntentUnavailable
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            viewModel.accept(ManagerAction.ReturnHome)
+            repository.navigationResult = RepositoryNavigationResult.Launch(
+                RepositoryLaunch(
+                    LaunchDestination.SAMSUNG_ADD_ONS,
+                    intentFactory = { error("unit test에서는 Intent를 만들지 않습니다.") },
+                ),
+            )
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+            collector.cancel()
+        }
 
     @Test
     fun `SavedStateHandle token과 session ID는 repository 검증 뒤에만 복원한다`() =
@@ -962,17 +1159,53 @@ class ManagerViewModelTest {
         issues = emptyList(),
     )
 
-    private fun catalogRecord() = CatalogRecord(
-        packageName = PACKAGE,
+    private fun catalogRecord(
+        packageName: String = PACKAGE,
+        compatibilityStatus: String = "COMPATIBLE",
+        reportJson: String? = null,
+    ) = CatalogRecord(
+        packageName = packageName,
         extensionId = EXTENSION_ID,
         name = "확장",
         iconPng = null,
         installedVersionCode = 1,
         signerSha256 = "a".repeat(64),
-        compatibilityStatus = "COMPATIBLE",
-        reportJson = null,
+        compatibilityStatus = compatibilityStatus,
+        reportJson = reportJson,
         lastVerifiedAtEpochMillis = 1,
     )
+
+    private fun compatibilityReport(status: ContractCompatibilityStatus) =
+        ContractCompatibilityReport(
+            schemaVersion = 3,
+            status = status,
+            manifestVersion = 3,
+            extensionName = "확장",
+            extensionVersion = "1.0",
+            manifestKeyPresent = false,
+            manifestKeyExtensionId = null,
+            declaredPermissions = listOf("storage"),
+            usedApis = listOf("tabs"),
+            unsupportedApis = emptyList(),
+            issues = listOf(ContractIssue("API_LIMIT", "일부 API 제한", false)),
+            conversionState = "converted",
+            adapterDecisions = listOf(
+                ContractAdapterDecision(
+                    id = "tabs",
+                    version = 1,
+                    risk = "behavior-change",
+                    disposition = "requires-approval",
+                    applied = true,
+                    evidence = emptyList(),
+                    changes = listOf("tabs API 변환"),
+                    remainingLimitations = emptyList(),
+                ),
+            ),
+            originalExtensionId = EXTENSION_ID,
+            convertedExtensionId = EXTENSION_ID,
+            sourceSha256 = "b".repeat(64),
+            browserProfileSha256 = "c".repeat(64),
+        )
 
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
@@ -1001,6 +1234,7 @@ private class FakeManagerRepository : ManagerRepository {
     var resumeRequests = 0
     var reconcileRequests = 0
     var uninstallOutcome: UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
+    val uninstallPackages = mutableListOf<String>()
     var navigationResult: RepositoryNavigationResult = RepositoryNavigationResult.Launch(
         RepositoryLaunch(
             destination = LaunchDestination.SAMSUNG_ADD_ONS,
@@ -1110,10 +1344,13 @@ private class FakeManagerRepository : ManagerRepository {
         resumeRequests += 1
     }
 
-    override fun uninstall(packageName: String): RepositoryLaunch = RepositoryLaunch(
-        destination = LaunchDestination.UNINSTALL,
-        intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
-    )
+    override fun uninstall(packageName: String): RepositoryLaunch {
+        uninstallPackages += packageName
+        return RepositoryLaunch(
+            destination = LaunchDestination.UNINSTALL,
+            intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
+        )
+    }
 
     override suspend fun reconcileUninstall(packageName: String): UninstallOutcome = uninstallOutcome
 

@@ -72,10 +72,7 @@ fun HomeScreen(
                             onAction(ManagerAction.ConfirmPartial)
                         RecoveryAction.SELECT_ANOTHER_FILE,
                         -> onAddSix()
-                        RecoveryAction.RETRY -> {
-                            onAction(ManagerAction.ReturnedToForeground)
-                            onAction(ManagerAction.DismissMessage)
-                        }
+                        RecoveryAction.RETRY -> onAction(ManagerAction.RetryRecovery)
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)
                     }
                 },

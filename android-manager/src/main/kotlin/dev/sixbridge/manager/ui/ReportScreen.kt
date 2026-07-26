@@ -8,7 +8,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.R
 
 @Composable
@@ -28,6 +27,8 @@ fun ReportScreen(
         if (item == null) {
             Text(text = stringResource(R.string.report_missing))
         } else {
+            val reportAvailable =
+                item.reportAvailability == ReportAvailability.AVAILABLE && item.report != null
             Text(text = item.name, style = MaterialTheme.typography.titleLarge)
             Text(text = item.packageName)
             Text(text = stringResource(R.string.extension_version_code, item.installedVersionCode))
@@ -36,31 +37,49 @@ fun ReportScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (!reportAvailable) {
+                Text(
+                    text = stringResource(
+                        when (item.reportAvailability) {
+                            ReportAvailability.UNREADABLE -> R.string.report_unreadable_state
+                            ReportAvailability.MISSING,
+                            ReportAvailability.AVAILABLE,
+                            -> R.string.report_missing_state
+                        },
+                    ),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.testTag("report:availability"),
+                )
+            }
             SectionCard(
                 title = stringResource(R.string.review_status),
                 modifier = Modifier.testTag("report:status"),
             ) {
-                val status = runCatching {
-                    ContractCompatibilityStatus.valueOf(item.compatibilityStatus)
-                }.getOrDefault(ContractCompatibilityStatus.UNKNOWN)
-                CompatibilityStatusText(status)
+                CompatibilityStatusText(item.compatibilityStatus)
             }
             SectionCard(
                 title = stringResource(R.string.review_permissions),
             ) {
-                TextList(item.report?.declaredPermissions.orEmpty())
+                ReportList(reportAvailable, item.report?.declaredPermissions.orEmpty())
             }
             SectionCard(
                 title = stringResource(R.string.review_issues),
             ) {
-                TextList(item.report?.issues.orEmpty().map { "${it.code}: ${it.message}" })
+                ReportList(
+                    reportAvailable,
+                    item.report?.issues.orEmpty().map { "${it.code}: ${it.message}" },
+                )
             }
             SectionCard(
                 title = stringResource(R.string.review_adapters),
             ) {
-                TextList(item.report?.adapterDecisions.orEmpty().map { decision ->
-                    "${decision.id} v${decision.version} · ${decision.disposition}"
-                })
+                ReportList(
+                    reportAvailable,
+                    item.report?.adapterDecisions.orEmpty().map { decision ->
+                        "${decision.id} v${decision.version} · ${decision.disposition}"
+                    },
+                )
             }
             SectionCard(
                 title = stringResource(R.string.review_signer),
@@ -80,5 +99,14 @@ fun ReportScreen(
         ) {
             Text(text = stringResource(R.string.report_back))
         }
+    }
+}
+
+@Composable
+private fun ReportList(reportAvailable: Boolean, items: List<String>) {
+    if (reportAvailable) {
+        TextList(items)
+    } else {
+        Text(text = stringResource(R.string.report_section_unavailable))
     }
 }

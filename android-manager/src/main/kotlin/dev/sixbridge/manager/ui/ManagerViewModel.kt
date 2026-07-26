@@ -37,6 +37,7 @@ class ManagerViewModel(
     private var installJob: Job? = null
     private var operationGeneration = 0L
     private var pendingUninstallPackage: String? = null
+    private var pendingRecovery: PendingRecovery? = null
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
     private var firstInstallStateObserved = false
@@ -60,6 +61,12 @@ class ManagerViewModel(
     }
 
     fun accept(action: ManagerAction) {
+        if (action != ManagerAction.RetryRecovery &&
+            action !is ManagerAction.LaunchFailed &&
+            action != ManagerAction.ReturnedToForeground
+        ) {
+            clearRecoveryOwnership()
+        }
         when (action) {
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
             ManagerAction.ConfirmPartial -> confirmPartial()
@@ -72,6 +79,8 @@ class ManagerViewModel(
             ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
             ManagerAction.ReturnedToForeground -> returnedToForeground()
             ManagerAction.DismissMessage -> mutableState.update { it.copy(message = null) }
+            ManagerAction.RetryRecovery -> retryRecovery()
+            is ManagerAction.LaunchFailed -> recordLaunchFailure(action.effect)
         }
     }
 
@@ -201,8 +210,14 @@ class ManagerViewModel(
                 val suppressedTerminal = installState == suppressedInstallTerminal
                 if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
-                    is InstallState.WritingSession -> saveSessionIfInitialized(installState.sessionId)
-                    is InstallState.AwaitingUserApproval -> saveSessionIfInitialized(installState.sessionId)
+                    is InstallState.WritingSession -> {
+                        saveSessionIfInitialized(installState.sessionId)
+                        clearUnknownSourcesMessage()
+                    }
+                    is InstallState.AwaitingUserApproval -> {
+                        saveSessionIfInitialized(installState.sessionId)
+                        clearUnknownSourcesMessage()
+                    }
                     InstallState.UnknownSourcesPermissionRequired -> if (changed) {
                         mutableState.update {
                             it.copy(
@@ -334,6 +349,9 @@ class ManagerViewModel(
                     repository.reconcileCatalog()
                 }
                 if (generation != operationGeneration) return@launch
+                if (outcome == UninstallOutcome.CancelledOrStillInstalled) {
+                    pendingRecovery = PendingRecovery.Uninstall(uninstallPackage)
+                }
                 mutableState.update {
                     it.copy(
                         message = when (outcome) {
@@ -377,14 +395,17 @@ class ManagerViewModel(
                     ),
                 )
             }
-            RepositoryNavigationResult.AddOnsIntentUnavailable -> mutableState.update {
-                it.copy(
-                    message = UserMessage(
-                        UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE,
-                        "삼성 인터넷 Add-ons 화면을 열 수 없습니다.",
-                        RecoveryAction.RETRY,
-                    ),
-                )
+            RepositoryNavigationResult.AddOnsIntentUnavailable -> {
+                pendingRecovery = PendingRecovery.SamsungAddOns
+                mutableState.update {
+                    it.copy(
+                        message = UserMessage(
+                            UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE,
+                            "삼성 인터넷 Add-ons 화면을 열 수 없습니다.",
+                            RecoveryAction.RETRY,
+                        ),
+                    )
+                }
             }
         }
     }
@@ -397,6 +418,50 @@ class ManagerViewModel(
     private fun openUnknownSourcesSettings() {
         if (mutableState.value.installState != InstallState.UnknownSourcesPermissionRequired) return
         enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
+    }
+
+    private fun recordLaunchFailure(effect: ManagerEffect.LaunchIntent) {
+        pendingRecovery = PendingRecovery.Launch(effect)
+        mutableState.update {
+            it.copy(
+                message = UserMessage(
+                    UserMessageKind.LAUNCH_FAILED,
+                    "시스템 화면을 열 수 없습니다.",
+                    RecoveryAction.RETRY,
+                ),
+            )
+        }
+    }
+
+    private fun retryRecovery() {
+        val recovery = pendingRecovery ?: return
+        pendingRecovery = null
+        mutableState.update { it.copy(message = null) }
+        when (recovery) {
+            PendingRecovery.SamsungAddOns -> openSamsungAddOns()
+            is PendingRecovery.Uninstall -> remove(recovery.packageName)
+            is PendingRecovery.Launch -> enqueueEffect(recovery.effect)
+        }
+    }
+
+    private fun clearRecoveryOwnership() {
+        val recovery = pendingRecovery
+        pendingRecovery = null
+        if (recovery is PendingRecovery.Launch &&
+            recovery.effect.destination == LaunchDestination.UNINSTALL
+        ) {
+            pendingUninstallPackage = null
+        }
+    }
+
+    private fun clearUnknownSourcesMessage() {
+        mutableState.update {
+            if (it.message?.kind == UserMessageKind.UNKNOWN_SOURCES_PERMISSION) {
+                it.copy(message = null)
+            } else {
+                it
+            }
+        }
     }
 
     private fun showReview(review: ReviewBundle) {
@@ -573,17 +638,26 @@ class ManagerViewModel(
     }
 }
 
-private fun CatalogRecord.toItem() = ManagedExtensionItem(
-    packageName = packageName,
-    extensionId = extensionId,
-    name = name,
-    installedVersionCode = installedVersionCode,
-    compatibilityStatus = compatibilityStatus,
-    signerSha256 = signerSha256,
-    report = reportJson?.let { encoded ->
-        runCatching { BundleJson.decodeCompatibility(encoded) }.getOrNull()
-    },
-)
+private fun CatalogRecord.toItem(): ManagedExtensionItem {
+    val decoded = reportJson?.let { encoded ->
+        runCatching { BundleJson.decodeCompatibility(encoded) }
+    }
+    val report = decoded?.getOrNull()
+    return ManagedExtensionItem(
+        packageName = packageName,
+        extensionId = extensionId,
+        name = name,
+        installedVersionCode = installedVersionCode,
+        compatibilityStatus = report?.status ?: ContractCompatibilityStatus.UNKNOWN,
+        signerSha256 = signerSha256,
+        report = report,
+        reportAvailability = when {
+            reportJson == null -> ReportAvailability.MISSING
+            report != null -> ReportAvailability.AVAILABLE
+            else -> ReportAvailability.UNREADABLE
+        },
+    )
+}
 
 private fun InstallState.isTerminalState(): Boolean =
     this is InstallState.Installed || this == InstallState.Cancelled || this is InstallState.Failed
@@ -632,6 +706,12 @@ private fun installFailureMessage(code: String): UserMessage = when (code) {
     else -> UserMessage(
         UserMessageKind.INSTALL_FAILED,
         "시스템 설치를 완료하지 못했습니다.",
-        RecoveryAction.RETRY,
+        RecoveryAction.SELECT_ANOTHER_FILE,
     )
+}
+
+private sealed interface PendingRecovery {
+    data object SamsungAddOns : PendingRecovery
+    data class Uninstall(val packageName: String) : PendingRecovery
+    data class Launch(val effect: ManagerEffect.LaunchIntent) : PendingRecovery
 }

@@ -75,7 +75,14 @@ class MainActivity : ComponentActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 managerViewModel.effects.collect { effect ->
                     if (effect is ManagerEffect.LaunchIntent) {
-                        startActivity(effect.intentFactory())
+                        executeLaunch(
+                            effect = effect,
+                            resolveIntent = { it.intentFactory() },
+                            launchIntent = ::startActivity,
+                            onFailure = {
+                                managerViewModel.accept(ManagerAction.LaunchFailed(it))
+                            },
+                        )
                     }
                 }
             }
@@ -122,6 +129,19 @@ class MainActivity : ComponentActivity() {
             "application/vnd.sixbridge.bundle",
         )
     }
+}
+
+internal fun <T> executeLaunch(
+    effect: ManagerEffect.LaunchIntent,
+    resolveIntent: (ManagerEffect.LaunchIntent) -> T,
+    launchIntent: (T) -> Unit,
+    onFailure: (ManagerEffect.LaunchIntent) -> Unit,
+): Boolean = try {
+    launchIntent(resolveIntent(effect))
+    true
+} catch (_: RuntimeException) {
+    onFailure(effect)
+    false
 }
 
 internal class NotificationPermissionInstallGate(

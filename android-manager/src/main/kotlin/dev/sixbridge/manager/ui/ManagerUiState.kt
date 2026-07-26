@@ -19,10 +19,17 @@ data class ManagedExtensionItem(
     val extensionId: String,
     val name: String,
     val installedVersionCode: Long,
-    val compatibilityStatus: String,
+    val compatibilityStatus: ContractCompatibilityStatus,
     val signerSha256: String = "",
     val report: ContractCompatibilityReport? = null,
+    val reportAvailability: ReportAvailability = ReportAvailability.MISSING,
 )
+
+enum class ReportAvailability {
+    AVAILABLE,
+    MISSING,
+    UNREADABLE,
+}
 
 sealed interface ImportUiState {
     data object Idle : ImportUiState
@@ -64,6 +71,7 @@ enum class UserMessageKind {
     SAMSUNG_ADD_ONS_UNAVAILABLE,
     UNINSTALL_CANCELLED,
     UNINSTALLED,
+    LAUNCH_FAILED,
 }
 
 data class UserMessage(
@@ -92,6 +100,8 @@ sealed interface ManagerAction {
     data object OpenUnknownSourcesSettings : ManagerAction
     data object ReturnedToForeground : ManagerAction
     data object DismissMessage : ManagerAction
+    data object RetryRecovery : ManagerAction
+    data class LaunchFailed(val effect: ManagerEffect.LaunchIntent) : ManagerAction
 }
 
 enum class LaunchDestination {

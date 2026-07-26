@@ -12,11 +12,14 @@ import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.espresso.Espresso.pressBack
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.ManagerAppContent
@@ -153,6 +156,97 @@ class ManagerAppTest {
         composeRule.onNodeWithTag("report:scroll")
             .performScrollToNode(hasTestTag("report:signer"))
         composeRule.onNodeWithTag("report:signer").assertIsDisplayed()
+        composeRule.onNodeWithText("storage", substring = true).assertExists()
+        composeRule.onNodeWithText(
+            "API_LIMIT: 일부 API가 제한됩니다.",
+            substring = true,
+        ).assertExists()
+        composeRule.onNodeWithText("tabs v1 · requires-approval", substring = true).assertExists()
+        composeRule.onNodeWithText(
+            "이 보고서는 호환성·식별자 검증 결과이며 악성 코드 검사나 보안 보증을 의미하지 않습니다.",
+        ).assertExists()
+    }
+
+    @Test
+    fun missing_and_unreadable_reports_show_unknown_without_verified_empty_sections() {
+        var item by mutableStateOf(
+            installedItem(
+                report = null,
+                reportAvailability = ReportAvailability.MISSING,
+            ),
+        )
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    route = ManagerRoute.Report(item.packageName),
+                    installed = listOf(item),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("보고서 없음").assertExists()
+        composeRule.onNodeWithText("알 수 없음").assertExists()
+        composeRule.onNodeWithText("없음").assertDoesNotExist()
+
+        item = installedItem(
+            report = null,
+            reportAvailability = ReportAvailability.UNREADABLE,
+        )
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("보고서를 읽을 수 없음").assertExists()
+        composeRule.onNodeWithText("알 수 없음").assertExists()
+        composeRule.onNodeWithText("없음").assertDoesNotExist()
+    }
+
+    @Test
+    fun retry_card_dispatches_only_view_model_owned_retry_action() {
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    message = UserMessage(
+                        UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE,
+                        "Add-ons를 열 수 없습니다.",
+                        RecoveryAction.RETRY,
+                    ),
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("다시 확인").performClick()
+
+        assertEquals(listOf(ManagerAction.RetryRecovery), actions)
+    }
+
+    @Test
+    fun review_and_report_back_dispatch_route_owned_actions() {
+        var state by mutableStateOf(reviewState(ContractCompatibilityStatus.COMPATIBLE))
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setContent {
+            ManagerAppContent(
+                state = state,
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        pressBack()
+        composeRule.waitForIdle()
+        assertEquals(listOf(ManagerAction.CancelReview), actions)
+
+        actions.clear()
+        state = ManagerUiState(
+            route = ManagerRoute.Report(PACKAGE),
+            installed = listOf(installedItem()),
+        )
+        composeRule.waitForIdle()
+        pressBack()
+        composeRule.waitForIdle()
+        assertEquals(listOf(ManagerAction.ReturnHome), actions)
     }
 
     @Test
@@ -202,14 +296,49 @@ class ManagerAppTest {
         )
     }
 
-    private fun installedItem() = ManagedExtensionItem(
+    private fun installedItem(
+        report: ContractCompatibilityReport? = compatibilityReport(),
+        reportAvailability: ReportAvailability = ReportAvailability.AVAILABLE,
+    ) = ManagedExtensionItem(
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
         name = "테스트 확장",
         installedVersionCode = 7,
-        compatibilityStatus = "COMPATIBLE",
+        compatibilityStatus = report?.status ?: ContractCompatibilityStatus.UNKNOWN,
         signerSha256 = "a".repeat(64),
-        report = null,
+        report = report,
+        reportAvailability = reportAvailability,
+    )
+
+    private fun compatibilityReport() = ContractCompatibilityReport(
+        schemaVersion = 3,
+        status = ContractCompatibilityStatus.PARTIAL,
+        manifestVersion = 3,
+        extensionName = "테스트 확장",
+        extensionVersion = "1.2.3",
+        manifestKeyPresent = false,
+        manifestKeyExtensionId = null,
+        declaredPermissions = listOf("storage"),
+        usedApis = listOf("tabs"),
+        unsupportedApis = emptyList(),
+        issues = listOf(ContractIssue("API_LIMIT", "일부 API가 제한됩니다.", false)),
+        conversionState = "converted",
+        adapterDecisions = listOf(
+            ContractAdapterDecision(
+                id = "tabs",
+                version = 1,
+                risk = "behavior-change",
+                disposition = "requires-approval",
+                applied = true,
+                evidence = emptyList(),
+                changes = listOf("tabs API 변환"),
+                remainingLimitations = emptyList(),
+            ),
+        ),
+        originalExtensionId = EXTENSION_ID,
+        convertedExtensionId = EXTENSION_ID,
+        sourceSha256 = "b".repeat(64),
+        browserProfileSha256 = "c".repeat(64),
     )
 
     private companion object {
