@@ -89,6 +89,7 @@ data class ManagerUiState(
 )
 
 sealed interface ManagerAction {
+    data object FilePickerOpened : ManagerAction
     data class ImportSelected(val uri: Uri) : ManagerAction
     data object ConfirmPartial : ManagerAction
     data object InstallReviewedBundle : ManagerAction
@@ -117,11 +118,16 @@ sealed interface ManagerEffect {
         val destination: LaunchDestination,
         val intentFactory: () -> Intent,
         val installSessionId: Int? = null,
+        val ownerGeneration: Long? = null,
     ) : ManagerEffect {
-        constructor(launch: RepositoryLaunch) : this(
+        constructor(
+            launch: RepositoryLaunch,
+            ownerGeneration: Long? = null,
+        ) : this(
             launch.destination,
             launch.intentFactory,
             launch.installSessionId,
+            ownerGeneration,
         )
     }
 }

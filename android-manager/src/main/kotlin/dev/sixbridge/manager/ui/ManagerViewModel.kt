@@ -7,6 +7,7 @@ import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
+import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.catalog.CatalogRecord
@@ -36,6 +37,7 @@ class ManagerViewModel(
     private var routeOperation: Job? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
+    private var launchGeneration = 0L
     private var uninstallGeneration = 0L
     private var pendingUninstallLaunch: PendingUninstallLaunch? = null
     private var pendingUninstallReturn: PendingUninstallReturn? = null
@@ -71,6 +73,7 @@ class ManagerViewModel(
             beginNewUserAction()
         }
         when (action) {
+            ManagerAction.FilePickerOpened -> Unit
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
@@ -197,12 +200,6 @@ class ManagerViewModel(
                 val changed = installState != lastInstallState
                 lastInstallState = installState
                 mutableState.update { it.copy(installState = installState) }
-                if (installState.isTerminalState()) {
-                    clearLaunchRecovery(
-                        LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
-                        LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                    )
-                }
                 if (firstEmission &&
                     installState == installStateAtInitialization &&
                     installState.isTerminalState() &&
@@ -240,7 +237,7 @@ class ManagerViewModel(
                                 ),
                             )
                         }
-                        enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
+                        enqueueEffect(currentLaunchEffect(repository.unknownSourcesSettings()))
                     }
                     is InstallState.Installed -> {
                         if (suppressedTerminal) return@collect
@@ -262,7 +259,7 @@ class ManagerViewModel(
     private fun observeRepositoryLaunches() {
         viewModelScope.launch {
             repository.launches.collect { launch ->
-                enqueueEffect(ManagerEffect.LaunchIntent(launch))
+                enqueueEffect(currentLaunchEffect(launch))
             }
         }
     }
@@ -345,7 +342,7 @@ class ManagerViewModel(
     }
 
     private fun remove(packageName: String) {
-        val effect = ManagerEffect.LaunchIntent(repository.uninstall(packageName))
+        val effect = currentLaunchEffect(repository.uninstall(packageName))
         pendingUninstallLaunch = PendingUninstallLaunch(
             effect = effect,
             packageName = packageName,
@@ -401,7 +398,7 @@ class ManagerViewModel(
     private fun openSamsungAddOns() {
         when (val result = repository.samsungAddOns()) {
             is RepositoryNavigationResult.Launch ->
-                enqueueEffect(ManagerEffect.LaunchIntent(result.effect))
+                enqueueEffect(currentLaunchEffect(result.effect))
             RepositoryNavigationResult.SamsungBrowserMissing -> mutableState.update {
                 it.copy(
                     message = UserMessage(
@@ -433,10 +430,11 @@ class ManagerViewModel(
 
     private fun openUnknownSourcesSettings() {
         if (mutableState.value.installState != InstallState.UnknownSourcesPermissionRequired) return
-        enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
+        enqueueEffect(currentLaunchEffect(repository.unknownSourcesSettings()))
     }
 
     private fun recordLaunchFailure(effect: ManagerEffect.LaunchIntent) {
+        if (!isEffectCurrent(effect)) return
         val uninstallPackage = if (effect.destination == LaunchDestination.UNINSTALL) {
             val pendingLaunch = pendingUninstallLaunch
                 ?.takeIf {
@@ -463,6 +461,7 @@ class ManagerViewModel(
     }
 
     private fun recordLaunchSuccess(effect: ManagerEffect.LaunchIntent) {
+        if (!isEffectCurrent(effect)) return
         if (effect.destination != LaunchDestination.UNINSTALL) return
         val pendingLaunch = pendingUninstallLaunch
             ?.takeIf {
@@ -481,26 +480,37 @@ class ManagerViewModel(
         val recovery = pendingRecovery ?: return
         pendingRecovery = null
         invalidateUninstallAttempt()
+        launchGeneration += 1
         mutableState.update { it.copy(message = null) }
         when (recovery) {
             PendingRecovery.SamsungAddOns -> openSamsungAddOns()
             is PendingRecovery.Uninstall -> remove(recovery.packageName)
             is PendingRecovery.Launch -> {
+                val retriedEffect = ManagerEffect.LaunchIntent(
+                    destination = recovery.effect.destination,
+                    intentFactory = recovery.effect.intentFactory,
+                    installSessionId = recovery.effect.installSessionId,
+                    ownerGeneration = launchGeneration,
+                )
                 recovery.uninstallPackage?.let { packageName ->
                     pendingUninstallLaunch = PendingUninstallLaunch(
-                        effect = recovery.effect,
+                        effect = retriedEffect,
                         packageName = packageName,
                         generation = uninstallGeneration,
                     )
                 }
-                enqueueEffect(recovery.effect)
+                enqueueEffect(retriedEffect)
             }
         }
     }
 
     private fun beginNewUserAction() {
         invalidateUninstallAttempt()
+        launchGeneration += 1
         pendingRecovery = null
+        if (mutableState.value.message?.recoveryAction == RecoveryAction.RETRY) {
+            mutableState.update { it.copy(message = null) }
+        }
     }
 
     private fun invalidateUninstallAttempt() {
@@ -643,6 +653,7 @@ class ManagerViewModel(
     }
 
     private fun applyInstallTerminal(installState: InstallState) {
+        supersedeRecoveryForTerminal()
         if (installState is InstallState.Failed &&
             installState.code in CLEANUP_RETRYABLE_FAILURES &&
             savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
@@ -680,12 +691,42 @@ class ManagerViewModel(
         effectChannel.trySend(effect)
     }
 
-    private fun isEffectCurrent(effect: ManagerEffect): Boolean {
-        if (effect !is ManagerEffect.LaunchIntent ||
-            effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
-        ) {
-            return true
+    private fun currentLaunchEffect(launch: RepositoryLaunch) =
+        ManagerEffect.LaunchIntent(
+            launch = launch,
+            ownerGeneration = if (
+                launch.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
+            ) {
+                null
+            } else {
+                launchGeneration
+            },
+        )
+
+    private fun supersedeRecoveryForTerminal() {
+        val ownsRetry = pendingRecovery != null ||
+            mutableState.value.message?.recoveryAction == RecoveryAction.RETRY
+        if (ownsRetry) launchGeneration += 1
+        pendingRecovery = null
+        if (mutableState.value.message?.recoveryAction == RecoveryAction.RETRY) {
+            mutableState.update { it.copy(message = null) }
         }
+    }
+
+    private fun isEffectCurrent(effect: ManagerEffect): Boolean {
+        if (effect !is ManagerEffect.LaunchIntent) return true
+        if (effect.ownerGeneration?.let { it != launchGeneration } == true) return false
+        if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION &&
+            effect.ownerGeneration == null
+        ) {
+            return false
+        }
+        if (effect.destination == LaunchDestination.UNKNOWN_SOURCES_SETTINGS &&
+            repository.installState.value != InstallState.UnknownSourcesPermissionRequired
+        ) {
+            return false
+        }
+        if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION) return true
         val sessionId = effect.installSessionId ?: return false
         return repository.installState.value == InstallState.AwaitingUserApproval(sessionId)
     }

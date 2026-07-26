@@ -66,7 +66,10 @@ class MainActivity : ComponentActivity() {
             SixBridgeManagerApp(
                 viewModel = managerViewModel,
                 onAddSix = {
-                    openDocument.launch(SIX_MIME_TYPES)
+                    openSixFilePicker(
+                        onAction = managerViewModel::accept,
+                        launchPicker = { openDocument.launch(SIX_MIME_TYPES) },
+                    )
                 },
                 onInstallReviewed = notificationInstallGate::requestInstall,
             )
@@ -132,6 +135,14 @@ class MainActivity : ComponentActivity() {
             "application/vnd.sixbridge.bundle",
         )
     }
+}
+
+internal fun openSixFilePicker(
+    onAction: (ManagerAction) -> Unit,
+    launchPicker: () -> Unit,
+) {
+    onAction(ManagerAction.FilePickerOpened)
+    launchPicker()
 }
 
 internal fun <T> executeLaunch(

@@ -474,7 +474,9 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.RetryRecovery)
             val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            assertTrue(failed === retried)
+            assertFalse(failed === retried)
+            assertTrue(failed.intentFactory === retried.intentFactory)
+            assertTrue(failed.ownerGeneration != retried.ownerGeneration)
             viewModel.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
             assertTrue(repository.reconcileUninstallPackages.isEmpty())
@@ -578,7 +580,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `launch 실패 RETRY는 저장한 동일 effect를 비운 뒤 재enqueue하고 재실패를 다시 저장한다`() =
+    fun `launch 실패 RETRY는 저장한 factory와 session으로 현재 세대 effect를 새로 만든다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository()
             val viewModel = ManagerViewModel(repository, SavedStateHandle())
@@ -594,13 +596,18 @@ class ManagerViewModelTest {
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
             viewModel.accept(ManagerAction.RetryRecovery)
             val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            assertTrue(effect === retried)
+            assertFalse(effect === retried)
+            assertTrue(effect.intentFactory === retried.intentFactory)
+            assertEquals(effect.installSessionId, retried.installSessionId)
             assertNull(viewModel.state.value.message)
 
             viewModel.accept(ManagerAction.LaunchFailed(retried))
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
             viewModel.accept(ManagerAction.RetryRecovery)
-            assertTrue(retried === viewModel.effects.first())
+            val retriedAgain = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertFalse(retried === retriedAgain)
+            assertTrue(retried.intentFactory === retriedAgain.intentFactory)
+            assertEquals(retried.installSessionId, retriedAgain.installSessionId)
         }
 
     @Test
@@ -684,7 +691,162 @@ class ManagerViewModelTest {
 
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
             viewModel.accept(ManagerAction.RetryRecovery)
-            assertTrue(effect === viewModel.effects.first())
+            val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertFalse(effect === retried)
+            assertTrue(effect.intentFactory === retried.intentFactory)
+        }
+
+    @Test
+    fun `구독 전 A 제거 effect는 B 제거가 시작되면 폐기되고 B만 전달된다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            viewModel.accept(ManagerAction.Remove(SECOND_PACKAGE))
+
+            val delivered = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertEquals(LaunchDestination.UNINSTALL, delivered.destination)
+            assertEquals(SECOND_PACKAGE, repository.uninstallPackages.last())
+            assertTrue(delivered.intentFactory === repository.uninstallLaunches.last().intentFactory)
+            assertTrue(delivered.ownerGeneration != null)
+
+            val reportRepository = FakeManagerRepository().apply {
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val reportViewModel = ManagerViewModel(reportRepository, SavedStateHandle())
+            advanceUntilIdle()
+            reportViewModel.accept(ManagerAction.Remove(PACKAGE))
+            reportViewModel.accept(ManagerAction.OpenReport(PACKAGE))
+            val reportEffects = mutableListOf<ManagerEffect>()
+            val reportCollector = launch { reportViewModel.effects.collect(reportEffects::add) }
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), reportViewModel.state.value.route)
+            assertTrue(reportEffects.isEmpty())
+            reportCollector.cancel()
+        }
+
+    @Test
+    fun `구독 전 Add-ons와 settings effect는 새 작업 뒤 전달되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val addOnsRepository = FakeManagerRepository()
+            val addOnsViewModel = ManagerViewModel(addOnsRepository, SavedStateHandle())
+            advanceUntilIdle()
+            addOnsViewModel.accept(ManagerAction.OpenSamsungAddOns)
+            addOnsViewModel.accept(ManagerAction.ReturnHome)
+            val addOnsEffects = mutableListOf<ManagerEffect>()
+            val addOnsCollector = launch { addOnsViewModel.effects.collect(addOnsEffects::add) }
+            dispatcher.scheduler.runCurrent()
+            assertTrue(addOnsEffects.isEmpty())
+            addOnsCollector.cancel()
+
+            val settingsRepository = FakeManagerRepository()
+            val settingsViewModel = ManagerViewModel(settingsRepository, SavedStateHandle())
+            advanceUntilIdle()
+            settingsRepository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            settingsViewModel.accept(ManagerAction.FilePickerOpened)
+            val settingsEffects = mutableListOf<ManagerEffect>()
+            val settingsCollector = launch { settingsViewModel.effects.collect(settingsEffects::add) }
+            dispatcher.scheduler.runCurrent()
+            assertTrue(settingsEffects.isEmpty())
+            settingsCollector.cancel()
+        }
+
+    @Test
+    fun `동일 Add-ons 버튼의 새 시도는 이전 launch 실패 카드와 소유권을 함께 지운다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            val failed = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            val current = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+
+            assertNull(viewModel.state.value.message)
+            assertFalse(failed === current)
+            assertTrue(failed.ownerGeneration != current.ownerGeneration)
+        }
+
+    @Test
+    fun `terminal install은 다른 destination 복구도 폐기하고 terminal 메시지만 소유한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            val failed = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+            repository.installFlow.value = InstallState.Cancelled
+            advanceUntilIdle()
+
+            assertEquals(UserMessageKind.INSTALL_CANCELLED, viewModel.state.value.message?.kind)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+            collector.cancel()
+        }
+
+    @Test
+    fun `파일 선택기를 연 뒤 늦은 uninstall reconcile은 취소 카드와 RETRY를 만들지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                suspendUninstallReconcile = true
+                ignoreUninstallReconcileCancellation = true
+                uninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchSucceeded(effect))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.FilePickerOpened)
+            repository.completeUninstallReconcile()
+            advanceUntilIdle()
+
+            assertNull(viewModel.state.value.message)
+            assertEquals(1, repository.reconcileRequests)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+            collector.cancel()
+        }
+
+    @Test
+    fun `새 작업 뒤 stale launch 성공과 실패 ACK는 상태를 만들지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            val stale = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.FilePickerOpened)
+            viewModel.accept(ManagerAction.LaunchSucceeded(stale))
+            viewModel.accept(ManagerAction.LaunchFailed(stale))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            assertNull(viewModel.state.value.message)
+            assertTrue(repository.reconcileUninstallPackages.isEmpty())
         }
 
     @Test
@@ -1396,6 +1558,7 @@ class ManagerViewModelTest {
         const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
         val EXTENSION_ID = "a".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
+        val SECOND_PACKAGE = "$PACKAGE.second"
     }
 }
 
@@ -1419,6 +1582,7 @@ private class FakeManagerRepository : ManagerRepository {
     var reconcileRequests = 0
     var uninstallOutcome: UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
     val uninstallPackages = mutableListOf<String>()
+    val uninstallLaunches = mutableListOf<RepositoryLaunch>()
     val reconcileUninstallPackages = mutableListOf<String>()
     var suspendUninstallReconcile = false
     var ignoreUninstallReconcileCancellation = false
@@ -1537,7 +1701,7 @@ private class FakeManagerRepository : ManagerRepository {
         return RepositoryLaunch(
             destination = LaunchDestination.UNINSTALL,
             intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
-        )
+        ).also(uninstallLaunches::add)
     }
 
     override suspend fun reconcileUninstall(packageName: String): UninstallOutcome {
