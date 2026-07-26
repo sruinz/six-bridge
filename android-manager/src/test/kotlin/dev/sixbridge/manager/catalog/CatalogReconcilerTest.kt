@@ -2,6 +2,7 @@ package dev.sixbridge.manager.catalog
 
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
+import dev.sixbridge.manager.catalog.identity
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
@@ -148,6 +149,24 @@ class CatalogReconcilerTest {
         assertEquals(listOf(installed.packageName), result.records.map(CatalogRecord::packageName))
     }
 
+    @Test
+    fun `fake catalog ensure는 변경된 identity를 unknown baseline으로 교체한다`() = runBlocking {
+        val current = catalogRecord(packageName = "dev.sixbridge.ext.fake")
+        val discovered = current.copy(
+            extensionId = "different",
+            iconPng = null,
+            compatibilityStatus = "UNKNOWN",
+            reportJson = null,
+            lastVerifiedAtEpochMillis = 0,
+        )
+        val catalog = FakeCatalog(listOf(current))
+
+        val ensured = catalog.ensureDiscoveredIdentity(discovered)
+
+        assertEquals(discovered, ensured)
+        assertEquals(discovered, catalog.get(current.packageName))
+    }
+
     private fun catalogRecord(
         packageName: String,
         extensionId: String = packageName.substringAfterLast('.'),
@@ -184,7 +203,7 @@ class CatalogReconcilerTest {
     )
 
     private class FakeCatalog(
-        private val records: List<CatalogRecord>,
+        private var records: List<CatalogRecord>,
     ) : ManagerCatalog {
         val removedPackageNameBatches = mutableListOf<Set<String>>()
 
@@ -192,8 +211,12 @@ class CatalogReconcilerTest {
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
 
-        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord =
-            records.singleOrNull { it.packageName == discovered.packageName } ?: discovered
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord {
+            val current = records.singleOrNull { it.packageName == discovered.packageName }
+            if (current != null && current.identity() == discovered.identity()) return current
+            records = records.filterNot { it.packageName == discovered.packageName } + discovered
+            return discovered
+        }
 
         override suspend fun persistIconIfIdentity(
             identity: CatalogIdentity,

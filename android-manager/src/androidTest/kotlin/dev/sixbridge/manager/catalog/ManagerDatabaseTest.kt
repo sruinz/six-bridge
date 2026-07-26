@@ -3,12 +3,18 @@ package dev.sixbridge.manager.catalog
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import java.util.Collections
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executor
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -17,12 +23,16 @@ import org.junit.runner.RunWith
 class ManagerDatabaseTest {
     private lateinit var database: ManagerDatabase
     private lateinit var catalog: RoomManagerCatalog
+    private val queries = Collections.synchronizedList(mutableListOf<String>())
 
     @Before
     fun setUp() {
         database = Room.inMemoryDatabaseBuilder(
             ApplicationProvider.getApplicationContext(),
             ManagerDatabase::class.java,
+        ).setQueryCallback(
+            { query, _ -> queries += query },
+            Executor { command -> command.run() },
         ).allowMainThreadQueries().build()
         catalog = RoomManagerCatalog(database.catalogEntryDao())
     }
@@ -107,6 +117,23 @@ class ManagerDatabaseTest {
     }
 
     @Test
+    fun ensure_identity_read_stays_inside_room_transaction_before_baseline_write() = runBlocking {
+        val discovered = record("dev.sixbridge.ext.transaction")
+        queries.clear()
+
+        catalog.ensureDiscoveredIdentity(discovered)
+
+        val selectIndex = queries.indexOfFirst { query ->
+            query.startsWith("SELECT * FROM catalog_entries WHERE packageName")
+        }
+        val transactionIndex = queries.indexOfFirst { query ->
+            query.startsWith("BEGIN")
+        }
+        assertTrue("identity SELECT must be recorded", selectIndex >= 0)
+        assertTrue("transaction must begin before identity SELECT", transactionIndex in 0 until selectIndex)
+    }
+
+    @Test
     fun ensure_same_identity_preserves_latest_verified_columns() = runBlocking {
         val discovered = record("dev.sixbridge.ext.atomic").copy(
             name = "Discovered",
@@ -134,13 +161,14 @@ class ManagerDatabaseTest {
     @Test
     fun ensure_changed_identity_replaces_with_unknown_baseline() = runBlocking {
         val current = record("dev.sixbridge.ext.changed")
-        catalog.replaceVerified(current)
 
         listOf(
             current.copy(extensionId = "different"),
             current.copy(installedVersionCode = current.installedVersionCode + 1),
             current.copy(signerSha256 = "b".repeat(64)),
         ).forEach { changed ->
+            database.clearAllTables()
+            catalog.replaceVerified(current)
             val discovered = changed.copy(
                 name = "Discovered",
                 iconPng = null,
@@ -153,6 +181,92 @@ class ManagerDatabaseTest {
 
             assertEquals(discovered, ensured)
             assertEquals(discovered, catalog.get(current.packageName))
+        }
+    }
+
+    @Test
+    fun persist_same_identity_updates_only_icon_and_preserves_latest_verified_columns() = runBlocking {
+        val discovered = record("dev.sixbridge.ext.persist")
+        val latest = discovered.copy(
+            name = "Latest",
+            iconPng = byteArrayOf(1, 2, 3),
+            compatibilityStatus = "BLOCKED",
+            reportJson = "{\"status\":\"BLOCKED\"}",
+            lastVerifiedAtEpochMillis = 999,
+        )
+        catalog.replaceVerified(latest)
+
+        val persisted = requireNotNull(
+            catalog.persistIconIfIdentity(discovered.identity(), byteArrayOf(7, 8, 9)),
+        )
+
+        assertEquals("Latest", persisted.name)
+        assertArrayEquals(byteArrayOf(7, 8, 9), persisted.iconPng)
+        assertEquals("BLOCKED", persisted.compatibilityStatus)
+        assertEquals("{\"status\":\"BLOCKED\"}", persisted.reportJson)
+        assertEquals(999, persisted.lastVerifiedAtEpochMillis)
+    }
+
+    @Test
+    fun persist_changed_identity_rejects_each_identity_field_without_changing_current_row() = runBlocking {
+        val current = record("dev.sixbridge.ext.persist-changed")
+
+        listOf(
+            current.copy(extensionId = "different"),
+            current.copy(installedVersionCode = current.installedVersionCode + 1),
+            current.copy(signerSha256 = "b".repeat(64)),
+        ).forEach { stale ->
+            database.clearAllTables()
+            catalog.replaceVerified(current)
+
+            assertNull(catalog.persistIconIfIdentity(stale.identity(), byteArrayOf(9)))
+
+            val stored = requireNotNull(catalog.get(current.packageName))
+            assertEquals(current.name, stored.name)
+            assertArrayEquals(current.iconPng, stored.iconPng)
+            assertEquals(current.compatibilityStatus, stored.compatibilityStatus)
+            assertEquals(current.reportJson, stored.reportJson)
+            assertEquals(current.lastVerifiedAtEpochMillis, stored.lastVerifiedAtEpochMillis)
+        }
+    }
+
+    @Test
+    fun concurrent_ensure_and_replace_preserve_latest_verified_columns() = runBlocking {
+        repeat(20) { iteration ->
+            database.clearAllTables()
+            val discovered = record("dev.sixbridge.ext.concurrent-$iteration").copy(
+                name = "Discovered",
+                iconPng = null,
+                compatibilityStatus = "UNKNOWN",
+                reportJson = null,
+                lastVerifiedAtEpochMillis = 0,
+            )
+            val latest = discovered.copy(
+                name = "Latest",
+                iconPng = byteArrayOf(1, 2, 3),
+                compatibilityStatus = "BLOCKED",
+                reportJson = "{\"status\":\"BLOCKED\"}",
+                lastVerifiedAtEpochMillis = 999,
+            )
+            val barrier = CyclicBarrier(2)
+
+            val ensure = async(Dispatchers.Default) {
+                barrier.await()
+                catalog.ensureDiscoveredIdentity(discovered)
+            }
+            val replace = async(Dispatchers.Default) {
+                barrier.await()
+                catalog.replaceVerified(latest)
+            }
+            ensure.await()
+            replace.await()
+
+            val stored = requireNotNull(catalog.get(discovered.packageName))
+            assertEquals("Latest", stored.name)
+            assertArrayEquals(byteArrayOf(1, 2, 3), stored.iconPng)
+            assertEquals("BLOCKED", stored.compatibilityStatus)
+            assertEquals("{\"status\":\"BLOCKED\"}", stored.reportJson)
+            assertEquals(999, stored.lastVerifiedAtEpochMillis)
         }
     }
 

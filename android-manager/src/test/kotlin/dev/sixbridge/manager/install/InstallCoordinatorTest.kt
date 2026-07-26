@@ -9,6 +9,7 @@ import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
+import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -1710,6 +1711,35 @@ class InstallCoordinatorTest {
         }
     }
 
+    @Test
+    fun `fake catalog ensure는 변경된 identity를 unknown baseline으로 교체한다`() = runBlocking {
+        val current = CatalogRecord(
+            packageName = PACKAGE_NAME,
+            extensionId = EXTENSION_ID,
+            name = "Verified",
+            iconPng = byteArrayOf(1),
+            installedVersionCode = VERSION_CODE,
+            signerSha256 = SIGNER,
+            compatibilityStatus = "COMPATIBLE",
+            reportJson = "{\"status\":\"COMPATIBLE\"}",
+            lastVerifiedAtEpochMillis = FINISHED_AT,
+        )
+        val discovered = current.copy(
+            signerSha256 = "2".repeat(64),
+            name = "Discovered",
+            iconPng = null,
+            compatibilityStatus = "UNKNOWN",
+            reportJson = null,
+            lastVerifiedAtEpochMillis = 0,
+        )
+        val catalog = FakeManagerCatalog().also { it.replaceVerified(current) }
+
+        val ensured = catalog.ensureDiscoveredIdentity(discovered)
+
+        assertEquals(discovered, ensured)
+        assertEquals(discovered, catalog.replaced)
+    }
+
     private class FakeManagerCatalog : ManagerCatalog {
         var replaced: CatalogRecord? = null
 
@@ -1719,8 +1749,12 @@ class InstallCoordinatorTest {
             replaced = record
         }
 
-        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord =
-            replaced ?: discovered.also { replaced = it }
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord {
+            val current = replaced
+            if (current != null && current.identity() == discovered.identity()) return current
+            replaced = discovered
+            return discovered
+        }
 
         override suspend fun persistIconIfIdentity(
             identity: CatalogIdentity,

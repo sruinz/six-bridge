@@ -11,6 +11,7 @@ import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
+import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.InstalledExtensionIconSource
@@ -1302,7 +1303,7 @@ class ManagerRepositoryTest {
     }
 
     @Test
-    fun `catalog publisher publish 경로는 전달 record icon을 보강한다`() = runBlocking {
+    fun `Task 3 전 publish는 미저장 record의 icon을 반영하지 않는다`() = runBlocking {
         val catalog = FakeCatalog(emptyList())
         val installed = FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
         val publisher = catalogPublisher(
@@ -1313,8 +1314,30 @@ class ManagerRepositoryTest {
 
         publisher.publish(listOf(record(version = 1, signer = "same")))
 
-        assertNull(publisher.state.value.single().iconPng)
+        assertNull(
+            publisher.state.value.single().iconPng,
+            "Task 3 전에는 기준 행이 없는 icon을 state에 반영하지 않는다.",
+        )
         assertTrue(catalog.records.isEmpty())
+    }
+
+    @Test
+    fun `fake catalog ensure는 변경된 identity를 unknown baseline으로 교체한다`() = runBlocking {
+        val current = record(version = 1, signer = "same")
+        val discovered = current.copy(
+            extensionId = "different",
+            name = "Discovered",
+            iconPng = null,
+            compatibilityStatus = "UNKNOWN",
+            reportJson = null,
+            lastVerifiedAtEpochMillis = 0,
+        )
+        val catalog = FakeCatalog(listOf(current))
+
+        val ensured = catalog.ensureDiscoveredIdentity(discovered)
+
+        assertEquals(discovered, ensured)
+        assertEquals(discovered, catalog.records.single())
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1669,8 +1692,10 @@ private class FakeCatalog(
         records = records.filterNot { it.packageName == record.packageName } + record
     }
     override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord {
-        return records.singleOrNull { it.packageName == discovered.packageName }
-            ?: discovered.also { records += it }
+        val current = records.singleOrNull { it.packageName == discovered.packageName }
+        if (current != null && current.identity() == discovered.identity()) return current
+        records = records.filterNot { it.packageName == discovered.packageName } + discovered
+        return discovered
     }
     override suspend fun persistIconIfIdentity(
         identity: CatalogIdentity,
