@@ -40,7 +40,9 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -94,7 +96,7 @@ interface ManagerRepository {
     suspend fun import(uri: Uri): ManagerImportResult
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean)
     suspend fun cancelInstall(): Boolean
-    fun discardReview(token: String)
+    fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
     suspend fun resumeAfterUnknownSourcesSettings()
     fun uninstall(packageName: String): RepositoryLaunch
@@ -112,13 +114,26 @@ internal class DefaultManagerRepository(
     private val uninstallCoordinator: UninstallCoordinator,
     private val samsungBrowserNavigator: SamsungBrowserNavigator,
     private val catalogPublisher: CatalogPublisher,
+    private val installEvents: Flow<PackageInstallCallback> = PackageInstallEvents.events,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ManagerRepository {
     private val started = AtomicBoolean()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
     private val callbackRouter = InstallCallbackRouter(
         onResult = installCoordinator::onPackageInstallerResult,
         onLaunch = launchChannel::send,
+        onConfirmationDelivered = { sessionId ->
+            installCoordinator.markConfirmationDelivered(sessionId)
+        },
         onRefresh = catalogPublisher::reconcile,
+    )
+    private val startup = RepositoryStartup(
+        retainedImports = retainedImports,
+        startupCleanup = startupCleanup,
+        installCoordinator = installCoordinator,
+        pendingStore = pendingStore,
+        catalogPublisher = catalogPublisher,
+        ioDispatcher = ioDispatcher,
     )
 
     override val catalog: Flow<List<CatalogRecord>> = catalogPublisher.state
@@ -138,23 +153,22 @@ internal class DefaultManagerRepository(
                 }
             }
         }
-        applicationScope.launch {
-            collectPackageInstallEvents(PackageInstallEvents.events, callbackRouter)
-        }
+        startup.start(applicationScope, installEvents, callbackRouter)
     }
 
     override suspend fun initialize(
         reviewToken: String?,
         installSessionId: Int?,
     ): ManagerRestoreResult {
-        startupCleanup.run()
-        val pendingBeforeRestore = pendingStore.load()
-        val retained = (pendingBeforeRestore?.importToken ?: reviewToken)?.let { token ->
-            withContext(Dispatchers.IO) { retainedImports.load(token) }
-        }
-        installCoordinator.restore(retained)
-        catalogPublisher.reconcile()
+        startup.awaitReady()
         val pending = pendingStore.load()
+        val retained = if (pending == null) {
+            reviewToken?.let { token ->
+                withContext(ioDispatcher) { retainedImports.load(token) }
+            }
+        } else {
+            null
+        }
         val restoredSession = installSessionId?.takeIf { pending?.sessionId == it }
         val review = retained
             ?.takeIf { it.token == reviewToken && pending == null }
@@ -183,18 +197,16 @@ internal class DefaultManagerRepository(
     }
 
     override suspend fun install(review: ReviewBundle, partialConfirmed: Boolean) {
-        val bundle = withContext(Dispatchers.IO) { retainedImports.load(review.token) } ?: return
+        val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) } ?: return
         installCoordinator.request(bundle, partialConfirmed)
     }
 
     override suspend fun cancelInstall(): Boolean {
-        installCoordinator.cancel()
-        return pendingStore.load() == null
+        return installCoordinator.cancel()
     }
 
-    override fun discardReview(token: String) {
-        importer.discard(token)
-    }
+    override fun discardReview(token: String): Boolean =
+        runCatching { pendingStore.discardImport(token) }.isSuccess
 
     override fun unknownSourcesSettings(): RepositoryLaunch = RepositoryLaunch(
         LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
@@ -230,7 +242,65 @@ internal class DefaultManagerRepository(
     override suspend fun reconcileCatalog() {
         catalogPublisher.reconcile()
     }
+}
 
+internal class RepositoryStartup(
+    private val retainedImports: RetainedImportStore,
+    private val startupCleanup: StartupCleanup,
+    private val installCoordinator: InstallCoordinator,
+    private val pendingStore: PendingInstallStore,
+    private val catalogPublisher: CatalogPublisher,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
+    private val mutex = Mutex()
+    private val ready = CompletableDeferred<Unit>()
+    private val started = AtomicBoolean()
+
+    fun start(
+        applicationScope: CoroutineScope,
+        installEvents: Flow<PackageInstallCallback>,
+        callbackRouter: InstallCallbackRouter,
+    ) {
+        if (!started.compareAndSet(false, true)) return
+        applicationScope.launch {
+            awaitReady()
+            collectPackageInstallEvents(installEvents, callbackRouter)
+        }
+    }
+
+    suspend fun awaitReady() {
+        if (!ready.isCompleted) {
+            mutex.withLock {
+                if (!ready.isCompleted) {
+                    runStartupStep { startupCleanup.run() }
+                    val pending = runCatching { pendingStore.load() }.getOrNull()
+                    val retained = pending?.importToken?.let { token ->
+                        try {
+                            withContext(ioDispatcher) { retainedImports.load(token) }
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    runStartupStep { installCoordinator.restore(retained) }
+                    runStartupStep { catalogPublisher.reconcile() }
+                    ready.complete(Unit)
+                }
+            }
+        }
+        ready.await()
+    }
+
+    private suspend fun runStartupStep(step: suspend () -> Unit) {
+        try {
+            step()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            // A foreground initialization or later callback can retry durable work.
+        }
+    }
 }
 
 internal suspend fun collectPackageInstallEvents(
@@ -255,6 +325,7 @@ internal data class InstallEvent(
 internal class InstallCallbackRouter(
     private val onResult: suspend (PackageInstallResult) -> Boolean,
     private val onLaunch: suspend (RepositoryLaunch) -> Unit,
+    private val onConfirmationDelivered: suspend (Int) -> Unit = {},
     private val onRefresh: suspend () -> Unit,
 ) {
     suspend fun handle(event: InstallEvent) {
@@ -275,6 +346,7 @@ internal class InstallCallbackRouter(
                             event.result.sessionId,
                         ),
                     )
+                    onConfirmationDelivered(event.result.sessionId)
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: Exception) {

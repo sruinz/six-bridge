@@ -15,6 +15,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +33,7 @@ class ManagerViewModel(
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
     private var routeOperation: Job? = null
+    private var installJob: Job? = null
     private var operationGeneration = 0L
     private var pendingUninstallPackage: String? = null
     private var initialized = false
@@ -69,9 +71,12 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         moveOwnedReviewToPendingDiscard()
+        val supersededInstall = detachInstallJob()
+        supersededInstall?.cancel()
         val generation = replaceRouteOperation()
         savedStateHandle[REVIEW_TOKEN_KEY] = null
         routeOperation = viewModelScope.launch {
+            supersededInstall?.cancelAndJoin()
             val cleaned = try {
                 cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
             } catch (error: CancellationException) {
@@ -100,7 +105,7 @@ class ManagerViewModel(
             }
             if (generation != operationGeneration) {
                 if (result is ManagerImportResult.Success) {
-                    repository.discardReview(result.review.token)
+                    queuePendingReviewDiscard(result.review.token)
                 }
                 return@launch
             }
@@ -239,8 +244,9 @@ class ManagerViewModel(
             mutableState.update { it.copy(message = message) }
             return
         }
+        if (installJob?.isActive == true) return
         val generation = operationGeneration
-        routeOperation = viewModelScope.launch {
+        installJob = viewModelScope.launch {
             repository.install(ready.review, ready.partialConfirmed)
             if (generation != operationGeneration) return@launch
         }
@@ -248,8 +254,11 @@ class ManagerViewModel(
 
     private fun cancelReview() {
         moveOwnedReviewToPendingDiscard()
+        val supersededInstall = detachInstallJob()
+        supersededInstall?.cancel()
         val generation = replaceRouteOperation()
         routeOperation = viewModelScope.launch {
+            supersededInstall?.cancelAndJoin()
             val cleaned = try {
                 cancelInstallForRoute(generation, suppressTerminalOnSuccess = false)
             } catch (error: CancellationException) {
@@ -369,6 +378,9 @@ class ManagerViewModel(
         return operationGeneration
     }
 
+    private fun detachInstallJob(): Job? =
+        installJob.also { installJob = null }
+
     private fun saveSessionIfInitialized(sessionId: Int) {
         if (initialized && sessionId >= 0) savedStateHandle[INSTALL_SESSION_ID_KEY] = sessionId
     }
@@ -395,8 +407,7 @@ class ManagerViewModel(
     private fun discardPendingReviews() {
         val iterator = pendingReviewDiscards.iterator()
         while (iterator.hasNext()) {
-            repository.discardReview(iterator.next())
-            iterator.remove()
+            if (repository.discardReview(iterator.next())) iterator.remove()
         }
     }
 
@@ -408,7 +419,8 @@ class ManagerViewModel(
         val replacingActiveInstall =
             previous == InstallState.UnknownSourcesPermissionRequired ||
             previous is InstallState.WritingSession ||
-            previous is InstallState.AwaitingUserApproval
+            previous is InstallState.AwaitingUserApproval ||
+            previous is InstallState.Failed && previous.code == "CLEANUP_FAILED"
         if (replacingActiveInstall) replacementCancelGeneration = generation
         val cleaned = try {
             repository.cancelInstall()

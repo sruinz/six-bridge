@@ -27,6 +27,7 @@ import org.junit.rules.TemporaryFolder
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -92,6 +93,86 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `같은 session의 pending confirmation은 process 재생성 뒤에도 한 번만 승인한다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+            assertTrue(
+                fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+            assertTrue(fixture.coordinator.markConfirmationDelivered(SESSION_ID))
+            assertTrue(
+                !fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+
+            val recreated = coordinator(
+                fixture.gateway,
+                fixture.pendingStore,
+                fixture.installedWrappers,
+                fixture.catalog,
+            )
+            assertTrue(
+                !recreated.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+        }
+
+    @Test
+    fun `terminal cleanup 뒤 재사용된 session id의 confirmation은 다시 승인한다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            assertTrue(
+                fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+            assertTrue(fixture.coordinator.markConfirmationDelivered(SESSION_ID))
+            fixture.coordinator.onPackageInstallerResult(
+                PackageInstallResult.Cancelled(SESSION_ID),
+            )
+
+            val nextToken = "123e4567-e89b-12d3-a456-426614174001"
+            fixture.coordinator.request(
+                importedBundle(ContractCompatibilityStatus.COMPATIBLE, nextToken),
+                partialConfirmed = false,
+            )
+
+            assertTrue(
+                fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+        }
+
+    @Test
+    fun `confirmation marker 저장 실패도 process 수명 중 duplicate를 차단한다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            fixture.pendingStore.confirmationMarkFailure = true
+
+            assertTrue(
+                fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+            assertTrue(!fixture.coordinator.markConfirmationDelivered(SESSION_ID))
+
+            assertTrue(
+                !fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.PendingUserAction(SESSION_ID),
+                ),
+            )
+        }
+
+    @Test
     fun `cancelling from package installer abandons the session and clears pending import`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
@@ -103,6 +184,43 @@ class InstallCoordinatorTest {
         assertNull(fixture.pendingStore.record)
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
+
+    @Test
+    fun `session 생성 전 cleanup 실패는 bundle 소유권을 유지해 cancel 재시도를 허용한다`() =
+        runBlocking {
+            val fixture = fixture(canInstallPackages = false)
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            fixture.pendingStore.discardFailure = true
+
+            assertTrue(!fixture.coordinator.cancel())
+            assertEquals("CLEANUP_FAILED", assertIs<InstallState.Failed>(fixture.coordinator.state.value).code)
+
+            fixture.pendingStore.discardFailure = false
+
+            assertTrue(fixture.coordinator.cancel())
+            assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        }
+
+    @Test
+    fun `pending prefs만 지워진 partial cleanup 실패도 cancel 성공으로 보고하지 않는다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            fixture.pendingStore.clearPendingAfterFailure = true
+
+            assertTrue(!fixture.coordinator.cancel())
+            assertNull(fixture.pendingStore.record)
+            assertEquals(
+                "CLEANUP_FAILED",
+                assertIs<InstallState.Failed>(fixture.coordinator.state.value).code,
+            )
+
+            fixture.pendingStore.clearPendingAfterFailure = false
+
+            assertTrue(fixture.coordinator.cancel())
+            assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+        }
 
     @Test
     fun `write failure abandons its allocated session and clears pending import`() = runBlocking {
@@ -525,9 +643,11 @@ class InstallCoordinatorTest {
         assertNull(fixture.pendingStore.record)
         assertEquals(PACKAGE_NAME, fixture.pendingStore.terminalResult?.packageName)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
+        assertTrue(!fixture.coordinator.cancel())
+        assertNotNull(fixture.pendingStore.terminalResult)
 
         fixture.pendingStore.clearTerminalFailure = false
-        fixture.coordinator.restore()
+        assertTrue(fixture.coordinator.cancel())
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.terminalResult)
@@ -632,7 +752,7 @@ class InstallCoordinatorTest {
     }
 
     @Test
-    fun `does not accept a success callback after process recreation without expected signer and version`() = runBlocking {
+    fun `검증 bundle 없는 terminal success는 ledger와 inbox를 보존한다`() = runBlocking {
         val pending = PendingInstall(
             sessionId = SESSION_ID,
             packageName = PACKAGE_NAME,
@@ -646,8 +766,9 @@ class InstallCoordinatorTest {
 
         assertIs<InstallState.Failed>(fixture.coordinator.state.value)
         assertNull(fixture.catalog.replaced)
-        assertNull(fixture.pendingStore.record)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertEquals(pending, fixture.pendingStore.record)
+        assertNotNull(fixture.pendingStore.terminalResult)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -819,7 +940,7 @@ class InstallCoordinatorTest {
         fixture.installedWrappers.findFailure = CancellationException("cancelled")
 
         assertFailsWith<CancellationException> {
-            fixture.coordinator.restore()
+            fixture.coordinator.restore(fixture.bundle)
         }
 
         assertEquals(pendingInstall(), fixture.pendingStore.record)
@@ -1234,10 +1355,13 @@ class InstallCoordinatorTest {
         var recoverSessionSuccess = false
         var afterAssign: (() -> Unit)? = null
         var discardFailure = false
+        var clearPendingAfterFailure = false
         var clearTerminalFailure = false
         var clearMissingFailure = false
         var terminalBeforeStaleClear: PackageInstallResult? = null
         var loadBarrier: CyclicBarrier? = null
+        var confirmationDeliveredSessionId: Int? = null
+        var confirmationMarkFailure = false
         private var barrierLoadsRemaining = 2
 
         override fun load(): PendingInstall? {
@@ -1254,6 +1378,7 @@ class InstallCoordinatorTest {
             startedAtEpochMillis: Long,
         ): PendingInstall? = synchronized(this) {
             if (record != null) return@synchronized null
+            confirmationDeliveredSessionId = null
             PendingInstall(
                 sessionId = -1,
                 packageName = packageName,
@@ -1266,6 +1391,7 @@ class InstallCoordinatorTest {
             synchronized(this) {
                 if (assignFailure) return@synchronized null
                 if (record != claim) return@synchronized null
+                confirmationDeliveredSessionId = null
                 val pending = claim.copy(sessionId = sessionId).also { record = it }
                 if (assignFailureAfterWrite) return@synchronized null
                 afterAssign?.invoke()
@@ -1287,6 +1413,7 @@ class InstallCoordinatorTest {
             if (clearFailure) throw IllegalStateException("clear failed")
             if (record != expected) return@synchronized false
             record = null
+            confirmationDeliveredSessionId = null
             missingObservedAt = null
             true
         }
@@ -1310,7 +1437,9 @@ class InstallCoordinatorTest {
             }
             discardedTokens += expected.importToken
             record = null
+            confirmationDeliveredSessionId = null
             missingObservedAt = null
+            if (clearPendingAfterFailure) return@synchronized PendingCleanupResult.Failed
             PendingCleanupResult.Cleared
         }
 
@@ -1323,6 +1452,19 @@ class InstallCoordinatorTest {
 
         override fun loadTerminalResult(): PendingInstallResult? = synchronized(this) {
             terminalResult
+        }
+
+        override fun markConfirmationDelivered(sessionId: Int): Boolean = synchronized(this) {
+            if (record?.sessionId != sessionId || confirmationDeliveredSessionId == sessionId) {
+                return@synchronized false
+            }
+            if (confirmationMarkFailure) return@synchronized false
+            confirmationDeliveredSessionId = sessionId
+            true
+        }
+
+        override fun isConfirmationDelivered(sessionId: Int): Boolean = synchronized(this) {
+            record?.sessionId == sessionId && confirmationDeliveredSessionId == sessionId
         }
 
         override fun recordTerminalResult(
@@ -1341,6 +1483,7 @@ class InstallCoordinatorTest {
             )
             val existing = terminalResult
             if (existing != null) return@synchronized false
+            confirmationDeliveredSessionId = null
             terminalResult = pendingResult
             true
         }
@@ -1358,6 +1501,7 @@ class InstallCoordinatorTest {
                 if (terminalResult != expected) return@synchronized false
                 clearedTerminalResults += expected
                 terminalResult = null
+                confirmationDeliveredSessionId = null
                 true
             }
 

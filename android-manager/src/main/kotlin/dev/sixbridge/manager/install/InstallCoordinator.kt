@@ -27,6 +27,7 @@ class InstallCoordinator(
 ) {
     private val mutex = Mutex()
     private var activeBundle: ImportedBundle? = null
+    private var volatileConfirmation: Pair<Int, String>? = null
     private val mutableState = MutableStateFlow<InstallState>(restoreState())
 
     val state: StateFlow<InstallState> = mutableState.asStateFlow()
@@ -119,21 +120,40 @@ class InstallCoordinator(
     suspend fun onPackageInstallerResult(result: PackageInstallResult): Boolean = mutex.withLock {
         if (result is PackageInstallResult.PendingUserAction) {
             val pending = pendingStore.load()
-            val accepted = pending?.sessionId == result.sessionId
+            val accepted = pending?.sessionId == result.sessionId &&
+                !pendingStore.isConfirmationDelivered(result.sessionId) &&
+                volatileConfirmation != (result.sessionId to pending.importToken)
             if (accepted) {
                 mutableState.value = InstallState.AwaitingUserApproval(result.sessionId)
             }
             return@withLock accepted
         }
+        volatileConfirmation = null
         val accepted = pendingStore.load()?.sessionId == result.sessionId
         runCatching { pendingStore.recordTerminalResult(result, clock()) }
         restoreTerminalResultLocked()
         accepted
     }
 
-    suspend fun cancel() = mutex.withLock {
+    suspend fun markConfirmationDelivered(sessionId: Int): Boolean = mutex.withLock {
+        val pending = pendingStore.load()
+        if (pending?.sessionId != sessionId) return@withLock false
+        val persisted = pendingStore.markConfirmationDelivered(sessionId)
+        if (!persisted && !pendingStore.isConfirmationDelivered(sessionId)) {
+            volatileConfirmation = sessionId to pending.importToken
+        }
+        persisted
+    }
+
+    suspend fun cancel(): Boolean = mutex.withLock {
         restoreTerminalResultLocked()
-        if (mutableState.value.isTerminal()) return@withLock
+        if (pendingStore.loadTerminalResult() != null) return@withLock false
+        if (mutableState.value.isTerminal() &&
+            pendingStore.load() == null &&
+            activeBundle == null
+        ) {
+            return@withLock cleanupComplete()
+        }
         val pending = pendingStore.load()
         if (pending != null && pending.sessionId >= 0) {
             finishSession(
@@ -142,7 +162,7 @@ class InstallCoordinator(
                 abandon = true,
                 inbox = null,
             )
-            return@withLock
+            return@withLock cleanupComplete()
         }
         if (pending != null) {
             val owned = try {
@@ -152,13 +172,13 @@ class InstallCoordinator(
                     "SESSION_OWNERSHIP_QUERY_FAILED",
                     "설치 session 소유 상태를 확인하지 못했습니다.",
                 )
-                return@withLock
+                return@withLock false
             }
             if (owned.size == 1) {
                 val recovered = recoverUnassignedSession(pending, owned.single())
                 if (recovered == null) {
                     mutableState.value = sessionRecoveryFailed()
-                    return@withLock
+                    return@withLock false
                 }
                 finishSession(
                     pending = recovered,
@@ -166,11 +186,11 @@ class InstallCoordinator(
                     abandon = true,
                     inbox = null,
                 )
-                return@withLock
+                return@withLock cleanupComplete()
             }
             if (owned.isNotEmpty()) {
                 mutableState.value = sessionRecoveryFailed()
-                return@withLock
+                return@withLock false
             }
             finishSession(
                 pending = pending,
@@ -178,15 +198,17 @@ class InstallCoordinator(
                 abandon = false,
                 inbox = null,
             )
-            return@withLock
+            return@withLock cleanupComplete()
         }
-        val bundle = activeBundle ?: return@withLock
-        activeBundle = null
-        mutableState.value = if (pendingStore.discardImportSafely(bundle.token)) {
+        val bundle = activeBundle ?: return@withLock true
+        val discarded = pendingStore.discardImportSafely(bundle.token)
+        mutableState.value = if (discarded) {
+            activeBundle = null
             InstallState.Cancelled
         } else {
             cleanupFailed()
         }
+        cleanupComplete()
     }
 
     fun unknownSourcesSettingsIntent() = gateway.unknownSourcesSettingsIntent()
@@ -467,6 +489,14 @@ class InstallCoordinator(
         pending: PendingInstall,
         inbox: PendingInstallResult,
     ) {
+        val bundle = activeBundle
+        if (bundle == null) {
+            mutableState.value = InstallState.Failed(
+                "IMPORT_NOT_AVAILABLE",
+                "설치 결과를 검증할 임시 래퍼를 복원하지 못했습니다.",
+            )
+            return
+        }
         val installed = try {
             installedWrappers.find(pending.packageName)
         } catch (error: CancellationException) {
@@ -474,7 +504,6 @@ class InstallCoordinator(
         } catch (_: Exception) {
             null
         }
-        val bundle = activeBundle
         if (!isExpectedInstall(pending, installed, bundle)) {
             finishSession(
                 pending = pending,
@@ -677,6 +706,14 @@ class InstallCoordinator(
         } catch (_: Exception) {
             false
         }
+
+    private fun cleanupComplete(): Boolean {
+        val complete = activeBundle == null &&
+            pendingStore.load() == null &&
+            pendingStore.loadTerminalResult() == null
+        if (complete) volatileConfirmation = null
+        return complete
+    }
 
     private fun PendingInstall.toState(): InstallState =
         if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)

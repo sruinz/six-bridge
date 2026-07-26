@@ -20,6 +20,8 @@ interface PendingInstallStore {
     fun clearWithoutTerminal(expected: PendingInstall): PendingCleanupResult
     fun discardImport(importToken: String)
     fun loadTerminalResult(): PendingInstallResult?
+    fun isConfirmationDelivered(sessionId: Int): Boolean = false
+    fun markConfirmationDelivered(sessionId: Int): Boolean = true
     fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean
     fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult?
     fun clearTerminalResult(expected: PendingInstallResult): Boolean
@@ -48,6 +50,9 @@ class SharedPreferencesPendingInstallStore private constructor(
         startedAtEpochMillis: Long,
     ): PendingInstall? = synchronized(PROCESS_LOCK) {
         if (loadPendingLocked() != null || loadTerminalLocked() != null) return@synchronized null
+        if (!recoveryPreferences.edit().remove(KEY_CONFIRMATION_SESSION_ID).commit()) {
+            return@synchronized null
+        }
         val claim = PendingInstall(
             sessionId = UNASSIGNED_SESSION_ID,
             packageName = packageName,
@@ -67,10 +72,14 @@ class SharedPreferencesPendingInstallStore private constructor(
             if (!pendingPreferences.edit().putInt(KEY_SESSION_ID, sessionId).commit()) {
                 return@synchronized null
             }
-            recoveryPreferences.edit()
+            if (!recoveryPreferences.edit()
                 .remove(KEY_RECOVERY_SESSION_ID)
                 .remove(KEY_RECOVERY_IMPORT_TOKEN)
+                .remove(KEY_CONFIRMATION_SESSION_ID)
                 .commit()
+            ) {
+                return@synchronized null
+            }
             pending
         }
 
@@ -127,6 +136,23 @@ class SharedPreferencesPendingInstallStore private constructor(
         loadTerminalLocked()
     }
 
+    override fun markConfirmationDelivered(sessionId: Int): Boolean =
+        synchronized(PROCESS_LOCK) {
+            if (loadPendingLocked()?.sessionId != sessionId) return@synchronized false
+            if (recoveryPreferences.getInt(KEY_CONFIRMATION_SESSION_ID, -1) == sessionId) {
+                return@synchronized false
+            }
+            recoveryPreferences.edit()
+                .putInt(KEY_CONFIRMATION_SESSION_ID, sessionId)
+                .commit()
+        }
+
+    override fun isConfirmationDelivered(sessionId: Int): Boolean =
+        synchronized(PROCESS_LOCK) {
+            loadPendingLocked()?.sessionId == sessionId &&
+                recoveryPreferences.getInt(KEY_CONFIRMATION_SESSION_ID, -1) == sessionId
+        }
+
     override fun recordTerminalResult(
         result: PackageInstallResult,
         terminalAtEpochMillis: Long,
@@ -151,6 +177,7 @@ class SharedPreferencesPendingInstallStore private constructor(
             .putString(KEY_RESULT_PACKAGE_NAME, sanitized.packageName)
             .putLong(KEY_TERMINAL_AT, sanitized.terminalAtEpochMillis)
             .remove(KEY_RESULT_PROCESSED)
+            .remove(KEY_CONFIRMATION_SESSION_ID)
             .remove(KEY_MISSING_SESSION_ID)
             .remove(KEY_MISSING_IMPORT_TOKEN)
             .remove(KEY_MISSING_OBSERVED_AT)
@@ -184,6 +211,7 @@ class SharedPreferencesPendingInstallStore private constructor(
                 .remove(KEY_RESULT_MESSAGE)
                 .remove(KEY_RESULT_PACKAGE_NAME)
                 .remove(KEY_RESULT_PROCESSED)
+                .remove(KEY_CONFIRMATION_SESSION_ID)
                 .remove(KEY_TERMINAL_AT)
                 .commit()
         }
@@ -276,6 +304,7 @@ class SharedPreferencesPendingInstallStore private constructor(
         val missingObservationCleared = recoveryPreferences.edit()
             .remove(KEY_RECOVERY_SESSION_ID)
             .remove(KEY_RECOVERY_IMPORT_TOKEN)
+            .remove(KEY_CONFIRMATION_SESSION_ID)
             .remove(KEY_MISSING_SESSION_ID)
             .remove(KEY_MISSING_IMPORT_TOKEN)
             .remove(KEY_MISSING_OBSERVED_AT)
@@ -395,6 +424,7 @@ class SharedPreferencesPendingInstallStore private constructor(
         const val KEY_RESULT_MESSAGE = "result_message"
         const val KEY_RESULT_PACKAGE_NAME = "result_package_name"
         const val KEY_RESULT_PROCESSED = "result_processed"
+        const val KEY_CONFIRMATION_SESSION_ID = "confirmation_session_id"
         const val KEY_TERMINAL_AT = "terminal_at"
         const val KEY_MISSING_SESSION_ID = "missing_session_id"
         const val KEY_MISSING_IMPORT_TOKEN = "missing_import_token"

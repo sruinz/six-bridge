@@ -364,6 +364,32 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `install double tap 직후 import하면 어떤 install job도 시작하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            repository.importResult = ManagerImportResult.Success(
+                review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+            )
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            assertEquals(0, repository.installRequests)
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState).review.token,
+            )
+        }
+
+    @Test
     fun `연속 import는 취소된 cleanup의 기존 review token 소유권을 이어받는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -510,6 +536,33 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertTrue(repository.discardedTokens.isEmpty())
+        }
+
+    @Test
+    fun `review 파일 삭제 실패 token은 다음 cleanup 성공까지 소유한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            repository.discardReviewResult = false
+            viewModel.accept(ManagerAction.CancelReview)
+            advanceUntilIdle()
+            assertEquals(listOf(TOKEN), repository.discardAttempts)
+
+            repository.discardReviewResult = true
+            repository.importResult = ManagerImportResult.Success(
+                review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+            )
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN, TOKEN), repository.discardAttempts)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
         }
 
     @Test
@@ -726,6 +779,7 @@ private class FakeManagerRepository : ManagerRepository {
     var terminalStateOnCancelInstall: InstallState? = null
     var cancelInstallResult = true
     var cancelInstallException: RuntimeException? = null
+    var discardReviewResult = true
     var ignoreImportCancellation = false
     private val importGate = MutableSharedFlow<Unit>()
     private val installGate = MutableSharedFlow<Unit>()
@@ -797,9 +851,12 @@ private class FakeManagerRepository : ManagerRepository {
     }
 
     val discardedTokens = mutableListOf<String>()
+    val discardAttempts = mutableListOf<String>()
 
-    override fun discardReview(token: String) {
-        discardedTokens += token
+    override fun discardReview(token: String): Boolean {
+        discardAttempts += token
+        if (discardReviewResult) discardedTokens += token
+        return discardReviewResult
     }
 
     override fun unknownSourcesSettings(): RepositoryLaunch = RepositoryLaunch(
