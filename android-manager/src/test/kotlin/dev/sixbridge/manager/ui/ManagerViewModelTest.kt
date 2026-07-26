@@ -526,7 +526,8 @@ class ManagerViewModelTest {
             val repository = FakeManagerRepository().apply {
                 importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
             }
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
             viewModel.startImport(repository::nextImport)
             advanceUntilIdle()
@@ -536,6 +537,26 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+            repository.restoreResult = ManagerRestoreResult(
+                review = review(ContractCompatibilityStatus.COMPATIBLE),
+            )
+            var importCalls = 0
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            recreated.startImport {
+                importCalls += 1
+                ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+                )
+            }
+            advanceUntilIdle()
+
+            assertEquals(0, importCalls)
+            assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
         }
 
     @Test
@@ -544,7 +565,8 @@ class ManagerViewModelTest {
             val repository = FakeManagerRepository().apply {
                 importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
             }
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
             viewModel.startImport(repository::nextImport)
             advanceUntilIdle()
@@ -553,16 +575,84 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.CancelReview)
             advanceUntilIdle()
             assertEquals(listOf(TOKEN), repository.discardAttempts)
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+            repository.restoreResult = ManagerRestoreResult(
+                review = review(ContractCompatibilityStatus.COMPATIBLE),
+            )
+            var blockedImportCalls = 0
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            recreated.startImport {
+                blockedImportCalls += 1
+                ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+                )
+            }
+            advanceUntilIdle()
+            assertEquals(0, blockedImportCalls)
+            assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
 
             repository.discardReviewResult = true
             repository.importResult = ManagerImportResult.Success(
                 review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
             )
-            viewModel.startImport(repository::nextImport)
+            recreated.startImport(repository::nextImport)
             advanceUntilIdle()
 
-            assertEquals(listOf(TOKEN, TOKEN), repository.discardAttempts)
+            assertEquals(listOf(TOKEN, TOKEN, TOKEN), repository.discardAttempts)
             assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState).review.token,
+            )
+        }
+
+    @Test
+    fun `cleanup 실패 뒤 늦은 stale token은 현재 review 파일을 자동 또는 부분 삭제하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                suspendInitialize = true
+                ignoreInitializeCancellation = true
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE).copy(
+                        token = SECOND_TOKEN,
+                    ),
+                )
+                discardReviewResults[TOKEN] = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.startImport {
+                ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
+            }
+            dispatcher.scheduler.runCurrent()
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+
+            viewModel.accept(ManagerAction.CancelReview)
+            dispatcher.scheduler.runCurrent()
+            assertEquals(listOf(TOKEN), repository.discardAttempts)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+            repository.discardReviewResults[TOKEN] = true
+            repository.discardReviewResults[SECOND_TOKEN] = false
+            repository.completeInitialize()
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+            viewModel.accept(ManagerAction.CancelReview)
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
         }
 
     @Test
@@ -780,6 +870,7 @@ private class FakeManagerRepository : ManagerRepository {
     var cancelInstallResult = true
     var cancelInstallException: RuntimeException? = null
     var discardReviewResult = true
+    val discardReviewResults = mutableMapOf<String, Boolean>()
     var ignoreImportCancellation = false
     private val importGate = MutableSharedFlow<Unit>()
     private val installGate = MutableSharedFlow<Unit>()
@@ -855,8 +946,9 @@ private class FakeManagerRepository : ManagerRepository {
 
     override fun discardReview(token: String): Boolean {
         discardAttempts += token
-        if (discardReviewResult) discardedTokens += token
-        return discardReviewResult
+        val result = discardReviewResults[token] ?: discardReviewResult
+        if (result) discardedTokens += token
+        return result
     }
 
     override fun unknownSourcesSettings(): RepositoryLaunch = RepositoryLaunch(

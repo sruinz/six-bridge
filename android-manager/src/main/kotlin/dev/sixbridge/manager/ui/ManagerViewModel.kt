@@ -74,7 +74,6 @@ class ManagerViewModel(
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
         val generation = replaceRouteOperation()
-        savedStateHandle[REVIEW_TOKEN_KEY] = null
         routeOperation = viewModelScope.launch {
             supersededInstall?.cancelAndJoin()
             val cleaned = try {
@@ -86,9 +85,10 @@ class ManagerViewModel(
             }
             if (!cleaned) return@launch
             if (generation != operationGeneration) return@launch
-            completedReplacementCleanupGeneration = generation
-            discardPendingReviews()
+            if (!discardPendingReviews()) return@launch
             if (generation != operationGeneration) return@launch
+            completedReplacementCleanupGeneration = generation
+            clearSavedReviewAndSession()
             mutableState.update {
                 it.copy(
                     route = ManagerRoute.Home,
@@ -260,7 +260,7 @@ class ManagerViewModel(
         routeOperation = viewModelScope.launch {
             supersededInstall?.cancelAndJoin()
             val cleaned = try {
-                cancelInstallForRoute(generation, suppressTerminalOnSuccess = false)
+                cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -269,17 +269,17 @@ class ManagerViewModel(
             if (cleaned &&
                 generation == operationGeneration
             ) {
+                if (!discardPendingReviews()) return@launch
                 completedReplacementCleanupGeneration = generation
-                discardPendingReviews()
+                clearSavedReviewAndSession()
+                mutableState.update {
+                    it.copy(
+                        route = ManagerRoute.Home,
+                        importState = ImportUiState.Idle,
+                        message = null,
+                    )
+                }
             }
-        }
-        clearSavedReviewAndSession()
-        mutableState.update {
-            it.copy(
-                route = ManagerRoute.Home,
-                importState = ImportUiState.Idle,
-                message = null,
-            )
         }
     }
 
@@ -393,7 +393,6 @@ class ManagerViewModel(
 
     private fun moveOwnedReviewToPendingDiscard() {
         ownedReviewToken?.let(pendingReviewDiscards::add)
-        ownedReviewToken = null
     }
 
     private fun queuePendingReviewDiscard(token: String) {
@@ -404,11 +403,20 @@ class ManagerViewModel(
         }
     }
 
-    private fun discardPendingReviews() {
-        val iterator = pendingReviewDiscards.iterator()
-        while (iterator.hasNext()) {
-            if (repository.discardReview(iterator.next())) iterator.remove()
+    private fun discardPendingReviews(): Boolean {
+        val currentReviewToken = ownedReviewToken
+        pendingReviewDiscards
+            .toList()
+            .filterNot { it == currentReviewToken }
+            .forEach { token ->
+                if (!repository.discardReview(token)) return false
+                pendingReviewDiscards.remove(token)
+            }
+        if (currentReviewToken != null && currentReviewToken in pendingReviewDiscards) {
+            if (!repository.discardReview(currentReviewToken)) return false
+            pendingReviewDiscards.remove(currentReviewToken)
         }
+        return true
     }
 
     private suspend fun cancelInstallForRoute(
@@ -428,13 +436,23 @@ class ManagerViewModel(
             clearReplacementCancelMarker(generation)
             throw error
         } catch (error: Exception) {
-            clearReplacementCancelMarker(generation)?.let(::applyInstallTerminal)
+            when (val deferred = clearReplacementCancelMarker(generation)) {
+                is InstallState.Installed -> applyInstallTerminal(deferred)
+                null -> Unit
+                else -> suppressedInstallTerminal = deferred
+            }
             throw error
         }
         if (!replacingActiveInstall || replacementCancelGeneration != generation) return cleaned
 
         val deferred = clearReplacementCancelMarker(generation)
-        if (cleaned && suppressTerminalOnSuccess) {
+        if (!cleaned) {
+            val terminal = deferred ?: repository.installState.value
+                .takeIf(InstallState::isTerminalState)
+            if (terminal != null) suppressedInstallTerminal = terminal
+            return false
+        }
+        if (suppressTerminalOnSuccess) {
             if (deferred == null) {
                 repository.installState.value
                     .takeIf(InstallState::isTerminalState)

@@ -46,6 +46,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertIs
@@ -54,6 +55,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -68,7 +70,9 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.Rule
@@ -100,23 +104,19 @@ class ManagerRepositoryTest {
     }
 
     @Test
-    fun `callback router는 confirmation effect와 terminal result를 각각 한 번 전달한다`() =
+    fun `callback router는 confirmation을 launch하지 않고 terminal result만 전달한다`() =
         runBlocking {
             val results = mutableListOf<PackageInstallResult>()
             val launches = mutableListOf<RepositoryLaunch>()
             var refreshes = 0
             val router = InstallCallbackRouter(
                 onResult = results::add,
-                onLaunch = launches::add,
                 onRefresh = { refreshes += 1 },
             )
 
             router.handle(
                 InstallEvent(
                     result = PackageInstallResult.PendingUserAction(41),
-                    confirmationIntentFactory = {
-                        error("unit test에서 Android Intent를 만들지 않습니다.")
-                    },
                 ),
             )
             router.handle(InstallEvent(PackageInstallResult.Success(41)))
@@ -128,10 +128,7 @@ class ManagerRepositoryTest {
                 ),
                 results,
             )
-            assertEquals(
-                listOf(LaunchDestination.SYSTEM_INSTALL_CONFIRMATION),
-                launches.map(RepositoryLaunch::destination),
-            )
+            assertTrue(launches.isEmpty())
             assertEquals(2, refreshes)
         }
 
@@ -143,55 +140,16 @@ class ManagerRepositoryTest {
                 onResult = { result ->
                     result !is PackageInstallResult.PendingUserAction || result.sessionId == 41
                 },
-                onLaunch = launches::add,
                 onRefresh = {},
             )
 
             router.handle(
                 InstallEvent(
                     result = PackageInstallResult.PendingUserAction(42),
-                    confirmationIntentFactory = {
-                        error("unit test에서 Android Intent를 만들지 않습니다.")
-                    },
                 ),
             )
 
             assertEquals(emptyList(), launches)
-        }
-
-    @Test
-    fun `confirmation enqueue 실패는 marker를 확정하지 않고 다음 callback에서 재시도한다`() =
-        runBlocking {
-            var delivered = false
-            var launchAttempts = 0
-            var markerWrites = 0
-            val router = InstallCallbackRouter(
-                onResult = { result ->
-                    result is PackageInstallResult.PendingUserAction && !delivered
-                },
-                onLaunch = {
-                    launchAttempts += 1
-                    if (launchAttempts == 1) error("transient enqueue failure")
-                },
-                onConfirmationDelivered = {
-                    markerWrites += 1
-                    delivered = true
-                },
-                onRefresh = {},
-            )
-            val event = InstallEvent(
-                result = PackageInstallResult.PendingUserAction(41),
-                confirmationIntentFactory = {
-                    error("unit test에서 Android Intent를 만들지 않습니다.")
-                },
-            )
-
-            router.handle(event)
-            router.handle(event)
-
-            assertEquals(2, launchAttempts)
-            assertEquals(1, markerWrites)
-            assertTrue(delivered)
         }
 
     @Test
@@ -201,7 +159,6 @@ class ManagerRepositoryTest {
             var refreshes = 0
             val router = InstallCallbackRouter(
                 onResult = results::add,
-                onLaunch = {},
                 onRefresh = {
                     refreshes += 1
                     if (refreshes == 1) error("transient")
@@ -227,7 +184,6 @@ class ManagerRepositoryTest {
             val results = mutableListOf<PackageInstallResult>()
             val router = InstallCallbackRouter(
                 onResult = results::add,
-                onLaunch = {},
                 onRefresh = {},
             )
             val collector = launch {
@@ -303,13 +259,12 @@ class ManagerRepositoryTest {
             val callbacks = Channel<PackageInstallCallback>(Channel.UNLIMITED)
             val router = InstallCallbackRouter(
                 onResult = coordinator::onPackageInstallerResult,
-                onLaunch = {},
                 onRefresh = publisher::reconcile,
             )
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
             startup.start(scope, callbacks.receiveAsFlow(), router)
-            startup.awaitReady()
+            startup.ensureReady()
             callbacks.send(PackageInstallCallback(PackageInstallResult.Success(41)))
             withTimeout(1_000) {
                 coordinator.state.first { it is InstallState.Installed }
@@ -361,7 +316,7 @@ class ManagerRepositoryTest {
                 Dispatchers.Unconfined,
             )
 
-            startup.awaitReady()
+            startup.ensureReady()
 
             assertEquals(
                 "IMPORT_NOT_AVAILABLE",
@@ -370,6 +325,88 @@ class ManagerRepositoryTest {
             assertEquals(pending, pendingStore.record)
             assertNotNull(pendingStore.terminal)
             Unit
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `startup 첫 복원 예외는 readiness 전 terminal 소비를 막고 다음 시도에서 복원한다`() =
+        runTest {
+            val root = temporaryFolder.newFolder("retry-startup-import")
+            val bundle = importedBundle(root)
+            val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            val retainedImports = RetainedImportStore(root, verifier)
+            retainedImports.save(bundle)
+            val pendingStore = StartupPendingStore(
+                PendingInstall(41, PACKAGE, TOKEN, 1),
+            )
+            val gateway = StartupGateway(listOf(41))
+            val installed = FakeInstalledWrappers(
+                listOf(
+                    InstalledWrapper(
+                        packageName = PACKAGE,
+                        extensionId = EXTENSION_ID,
+                        name = "Example",
+                        versionCode = 2,
+                        signerSha256 = "a".repeat(64),
+                    ),
+                ),
+            )
+            val catalog = FakeCatalog(emptyList())
+            val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+            )
+            pendingStore.loadFailures = 1
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val startup = RepositoryStartup(
+                retainedImports,
+                StartupCleanup(
+                    root,
+                    gateway,
+                    pendingStore,
+                    Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+                ),
+                coordinator,
+                pendingStore,
+                publisher,
+                ioDispatcher = dispatcher,
+                retryDelayMillis = 100,
+            )
+            val callbacks = Channel<PackageInstallCallback>(Channel.UNLIMITED)
+            val router = InstallCallbackRouter(
+                onResult = coordinator::onPackageInstallerResult,
+                onRefresh = publisher::reconcile,
+            )
+
+            val scope = CoroutineScope(SupervisorJob() + dispatcher)
+            startup.start(scope, callbacks.receiveAsFlow(), router)
+            val foregroundInitialization = async { startup.awaitReady() }
+            callbacks.send(PackageInstallCallback(PackageInstallResult.Success(41)))
+            runCurrent()
+
+            assertFalse(foregroundInitialization.isCancelled)
+            assertEquals(InstallState.AwaitingUserApproval(41), coordinator.state.value)
+            assertNull(pendingStore.terminal)
+            assertTrue(catalog.records.isEmpty())
+
+            advanceTimeBy(101)
+            withTimeout(1_000) {
+                coordinator.state.first { it is InstallState.Installed }
+            }
+
+            assertEquals(0, pendingStore.loadFailures)
+            assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
+            assertNull(pendingStore.terminal)
+            assertEquals(PACKAGE, catalog.records.single().packageName)
+            foregroundInitialization.await()
+            scope.cancel()
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -431,10 +468,8 @@ class ManagerRepositoryTest {
                     installEvents = emptyFlow(),
                     ioDispatcher = dispatcher,
                 )
-                val viewModel = ManagerViewModel(
-                    repository,
-                    SavedStateHandle(mapOf("review_token" to TOKEN)),
-                )
+                val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+                val viewModel = ManagerViewModel(repository, savedState)
                 advanceUntilIdle()
                 assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
 
@@ -449,12 +484,36 @@ class ManagerRepositoryTest {
                 viewModel.accept(ManagerAction.CancelReview)
                 advanceUntilIdle()
 
-                assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+                assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+                assertEquals(TOKEN, savedState.get<String>("review_token"))
                 assertEquals(1, pendingStore.discardAttempts)
                 assertTrue(File(root, TOKEN).exists())
 
+                var blockedImportCalls = 0
+                val recreated = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+                recreated.startImport {
+                    blockedImportCalls += 1
+                    ManagerImportResult.Success(
+                        ReviewBundle(
+                            token = SECOND_TOKEN,
+                            packageName = bundle.verifiedApk.packageName,
+                            extensionId = bundle.descriptor.extensionId,
+                            name = bundle.descriptor.name,
+                            version = bundle.descriptor.version,
+                            status = bundle.report.status,
+                            issues = bundle.report.issues,
+                        ),
+                    )
+                }
+                advanceUntilIdle()
+                assertEquals(0, blockedImportCalls)
+                assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+                assertEquals(TOKEN, savedState.get<String>("review_token"))
+
                 pendingStore.discardFailure = false
-                viewModel.startImport {
+                recreated.startImport {
                     ManagerImportResult.Success(
                         ReviewBundle(
                             token = SECOND_TOKEN,
@@ -469,11 +528,11 @@ class ManagerRepositoryTest {
                 }
                 advanceUntilIdle()
 
-                assertEquals(3, pendingStore.discardAttempts)
+                assertEquals(4, pendingStore.discardAttempts)
                 assertTrue(!File(root, TOKEN).exists())
                 assertEquals(
                     SECOND_TOKEN,
-                    assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+                    assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
                         .review.token,
                 )
             }
@@ -661,8 +720,15 @@ private class StartupPendingStore(
     var terminal: PendingInstallResult? = null
     var discardFailure = false
     var discardAttempts = 0
+    var loadFailures = 0
 
-    override fun load(): PendingInstall? = record
+    override fun load(): PendingInstall? {
+        if (loadFailures > 0) {
+            loadFailures -= 1
+            error("transient pending load failure")
+        }
+        return record
+    }
     override fun tryClaim(
         packageName: String,
         importToken: String,

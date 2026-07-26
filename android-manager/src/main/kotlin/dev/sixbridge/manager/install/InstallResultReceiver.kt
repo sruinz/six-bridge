@@ -1,5 +1,10 @@
 package dev.sixbridge.manager.install
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -7,13 +12,14 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.os.Build
+import dev.sixbridge.manager.R
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 
 data class PackageInstallCallback(
     val result: PackageInstallResult,
-    val confirmationIntent: Intent? = null,
 )
 
 object PackageInstallEvents {
@@ -49,6 +55,77 @@ internal fun packageInstallResultFromStatus(
 internal fun matchesPendingInstallSession(pending: PendingInstall?, sessionId: Int): Boolean =
     sessionId >= 0 && pending?.sessionId == sessionId
 
+internal fun pendingConfirmationFlags(existingFlags: Int): Int =
+    existingFlags or Intent.FLAG_ACTIVITY_NEW_TASK
+
+internal object ManagerAppVisibility {
+    private val visibleActivities = AtomicInteger()
+
+    fun onActivityStarted() {
+        visibleActivities.incrementAndGet()
+    }
+
+    fun onActivityStopped() {
+        visibleActivities.updateAndGet { count -> (count - 1).coerceAtLeast(0) }
+    }
+
+    fun isVisible(): Boolean = visibleActivities.get() > 0
+}
+
+internal class PendingConfirmationDelivery(
+    private val isAppVisible: () -> Boolean,
+    private val launchForeground: (Intent) -> Unit,
+    private val postBackgroundNotification: (Int, Intent) -> Unit,
+) {
+    fun deliver(sessionId: Int, confirmationIntent: Intent) {
+        if (isAppVisible()) {
+            launchForeground(confirmationIntent)
+        } else {
+            postBackgroundNotification(sessionId, confirmationIntent)
+        }
+    }
+}
+
+internal class PendingConfirmationHandoff {
+    private var launched: Pair<Int, String>? = null
+
+    @Synchronized
+    fun handle(
+        pending: PendingInstall?,
+        sessionId: Int,
+        confirmationIntent: Intent,
+        isDelivered: (Int) -> Boolean,
+        markDelivered: (Int) -> Boolean,
+        launch: (Intent) -> Unit,
+    ): Boolean {
+        if (!matchesPendingInstallSession(pending, sessionId)) return false
+        val owned = requireNotNull(pending)
+        val key = sessionId to owned.importToken
+        val alreadyDelivered = try {
+            isDelivered(sessionId)
+        } catch (_: Exception) {
+            return false
+        }
+        if (alreadyDelivered) {
+            if (launched == key) launched = null
+            return false
+        }
+        if (launched != key) {
+            try {
+                launch(confirmationIntent)
+            } catch (_: Exception) {
+                return false
+            }
+            launched = key
+        }
+        val marked = runCatching { markDelivered(sessionId) }.getOrDefault(false)
+        if (marked) launched = null
+        return marked
+    }
+}
+
+private val processPendingConfirmationHandoff = PendingConfirmationHandoff()
+
 class InstallResultReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_INSTALL_RESULT) return
@@ -59,9 +136,8 @@ class InstallResultReceiver : BroadcastReceiver() {
         if (sessionId < 0) return
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val pending = runCatching {
-                    SharedPreferencesPendingInstallStore(context).load()
-                }.getOrNull()
+                val store = SharedPreferencesPendingInstallStore(context)
+                val pending = runCatching { store.load() }.getOrNull()
                 if (!matchesPendingInstallSession(pending, sessionId)) return
                 val confirmation = confirmationIntent(intent)
                     ?.let { makeExplicitSystemIntent(context, it) }
@@ -75,11 +151,30 @@ class InstallResultReceiver : BroadcastReceiver() {
                         ),
                     )
                 } else {
-                    PackageInstallEvents.dispatch(
-                        PackageInstallCallback(
-                            result = PackageInstallResult.PendingUserAction(sessionId),
-                            confirmationIntent = confirmation,
-                        ),
+                    val delivery = PendingConfirmationDelivery(
+                        isAppVisible = ManagerAppVisibility::isVisible,
+                        launchForeground = { target ->
+                            context.startActivity(
+                                Intent(target).addFlags(
+                                    pendingConfirmationFlags(target.flags),
+                                ),
+                            )
+                        },
+                        postBackgroundNotification = { ownedSessionId, target ->
+                            postPendingConfirmationNotification(
+                                context = context,
+                                sessionId = ownedSessionId,
+                                confirmationIntent = target,
+                            )
+                        },
+                    )
+                    handoffPendingConfirmation(
+                        pending = pending,
+                        sessionId = sessionId,
+                        confirmationIntent = confirmation,
+                        isDelivered = store::isConfirmationDelivered,
+                        markDelivered = store::markConfirmationDelivered,
+                        launch = { target -> delivery.deliver(sessionId, target) },
                     )
                 }
             }
@@ -92,7 +187,25 @@ class InstallResultReceiver : BroadcastReceiver() {
         }
     }
 
+    internal fun handoffPendingConfirmation(
+        pending: PendingInstall?,
+        sessionId: Int,
+        confirmationIntent: Intent,
+        isDelivered: (Int) -> Boolean,
+        markDelivered: (Int) -> Boolean,
+        launch: (Intent) -> Unit,
+    ): Boolean = processPendingConfirmationHandoff.handle(
+        pending = pending,
+        sessionId = sessionId,
+        confirmationIntent = confirmationIntent,
+        isDelivered = isDelivered,
+        markDelivered = markDelivered,
+        launch = launch,
+    )
+
     private fun persistAndNotify(context: Context, result: PackageInstallResult) {
+        context.getSystemService(NotificationManager::class.java)
+            ?.cancel(INSTALL_CONFIRMATION_NOTIFICATION_BASE + result.sessionId)
         val recorded = runCatching {
             SharedPreferencesPendingInstallStore(context).recordTerminalResult(
                 result = result,
@@ -102,6 +215,45 @@ class InstallResultReceiver : BroadcastReceiver() {
         if (recorded) {
             PackageInstallEvents.dispatch(PackageInstallCallback(result))
         }
+    }
+
+    private fun postPendingConfirmationNotification(
+        context: Context,
+        sessionId: Int,
+        confirmationIntent: Intent,
+    ) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+            ?: error("notification service unavailable")
+        if (!manager.areNotificationsEnabled()) error("notifications disabled")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            error("notification permission unavailable")
+        }
+        manager.createNotificationChannel(
+            NotificationChannel(
+                INSTALL_CONFIRMATION_CHANNEL,
+                context.getString(R.string.install_confirmation_channel),
+                NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            sessionId,
+            Intent(confirmationIntent).addFlags(
+                pendingConfirmationFlags(confirmationIntent.flags),
+            ),
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(context, INSTALL_CONFIRMATION_CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle(context.getString(R.string.install_confirmation_title))
+            .setContentText(context.getString(R.string.install_confirmation_text))
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(INSTALL_CONFIRMATION_NOTIFICATION_BASE + sessionId, notification)
     }
 
     @Suppress("DEPRECATION")
@@ -125,6 +277,8 @@ class InstallResultReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_INSTALL_RESULT = "dev.sixbridge.manager.action.INSTALL_RESULT"
         const val EXTRA_CALLBACK_SESSION_ID = "dev.sixbridge.manager.extra.CALLBACK_SESSION_ID"
+        private const val INSTALL_CONFIRMATION_CHANNEL = "install_confirmation"
+        private const val INSTALL_CONFIRMATION_NOTIFICATION_BASE = 10_000
     }
 }
 

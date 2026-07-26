@@ -2,4 +2,7 @@
 <resources>
     <string name="app_name">SIX Bridge</string>
     <string name="manager_initializing">관리자 초기화 중</string>
+    <string name="install_confirmation_channel">설치 승인</string>
+    <string name="install_confirmation_title">확장 설치를 계속하세요</string>
+    <string name="install_confirmation_text">눌러서 시스템 설치 승인 화면을 여세요.</string>
 </resources>

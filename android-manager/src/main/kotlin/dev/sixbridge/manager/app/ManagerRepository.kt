@@ -45,6 +45,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -121,10 +122,6 @@ internal class DefaultManagerRepository(
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
     private val callbackRouter = InstallCallbackRouter(
         onResult = installCoordinator::onPackageInstallerResult,
-        onLaunch = launchChannel::send,
-        onConfirmationDelivered = { sessionId ->
-            installCoordinator.markConfirmationDelivered(sessionId)
-        },
         onRefresh = catalogPublisher::reconcile,
     )
     private val startup = RepositoryStartup(
@@ -251,6 +248,7 @@ internal class RepositoryStartup(
     private val pendingStore: PendingInstallStore,
     private val catalogPublisher: CatalogPublisher,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val retryDelayMillis: Long = 250,
 ) {
     private val mutex = Mutex()
     private val ready = CompletableDeferred<Unit>()
@@ -269,22 +267,29 @@ internal class RepositoryStartup(
     }
 
     suspend fun awaitReady() {
+        while (!ready.isCompleted) {
+            try {
+                ensureReady()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                delay(retryDelayMillis)
+            }
+        }
+        ready.await()
+    }
+
+    suspend fun ensureReady() {
         if (!ready.isCompleted) {
             mutex.withLock {
                 if (!ready.isCompleted) {
-                    runStartupStep { startupCleanup.run() }
-                    val pending = runCatching { pendingStore.load() }.getOrNull()
+                    startupCleanup.run()
+                    val pending = pendingStore.load()
                     val retained = pending?.importToken?.let { token ->
-                        try {
-                            withContext(ioDispatcher) { retainedImports.load(token) }
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (_: Exception) {
-                            null
-                        }
+                        withContext(ioDispatcher) { retainedImports.load(token) }
                     }
-                    runStartupStep { installCoordinator.restore(retained) }
-                    runStartupStep { catalogPublisher.reconcile() }
+                    installCoordinator.restore(retained)
+                    runBestEffortStartupStep { catalogPublisher.reconcile() }
                     ready.complete(Unit)
                 }
             }
@@ -292,7 +297,7 @@ internal class RepositoryStartup(
         ready.await()
     }
 
-    private suspend fun runStartupStep(step: suspend () -> Unit) {
+    private suspend fun runBestEffortStartupStep(step: suspend () -> Unit) {
         try {
             step()
         } catch (error: CancellationException) {
@@ -314,45 +319,23 @@ internal suspend fun collectPackageInstallEvents(
 
 private fun PackageInstallCallback.toInstallEvent() = InstallEvent(
     result = result,
-    confirmationIntentFactory = confirmationIntent?.let { intent -> { intent } },
 )
 
 internal data class InstallEvent(
     val result: PackageInstallResult,
-    val confirmationIntentFactory: (() -> Intent)? = null,
 )
 
 internal class InstallCallbackRouter(
     private val onResult: suspend (PackageInstallResult) -> Boolean,
-    private val onLaunch: suspend (RepositoryLaunch) -> Unit,
-    private val onConfirmationDelivered: suspend (Int) -> Unit = {},
     private val onRefresh: suspend () -> Unit,
 ) {
     suspend fun handle(event: InstallEvent) {
-        val accepted = try {
+        try {
             onResult(event.result)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
-            false
-        }
-        if (accepted && event.result is PackageInstallResult.PendingUserAction) {
-            event.confirmationIntentFactory?.let { factory ->
-                try {
-                    onLaunch(
-                        RepositoryLaunch(
-                            LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                            factory,
-                            event.result.sessionId,
-                        ),
-                    )
-                    onConfirmationDelivered(event.result.sessionId)
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (_: Exception) {
-                    // Keep the single application collector alive for later callbacks.
-                }
-            }
+            // Keep the application callback collector alive for later events.
         }
         try {
             onRefresh()
