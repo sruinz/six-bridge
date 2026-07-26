@@ -66,6 +66,24 @@ class ManagerViewModelTest {
     }
 
     @Test
+    fun `설치 목록의 보고서만 열고 홈으로 돌아온다`() = runTest(dispatcher.scheduler) {
+        val repository = FakeManagerRepository().apply {
+            catalogFlow.tryEmit(listOf(catalogRecord()))
+        }
+        val viewModel = ManagerViewModel(repository, SavedStateHandle())
+        advanceUntilIdle()
+
+        viewModel.accept(ManagerAction.OpenReport("설치되지.않은.package"))
+        assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+
+        viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+        assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+
+        viewModel.accept(ManagerAction.ReturnHome)
+        assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+    }
+
+    @Test
     fun `initialize transient 실패는 saved review token을 지우지 않고 재생성에서 복원한다`() =
         runTest(dispatcher.scheduler) {
             val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))

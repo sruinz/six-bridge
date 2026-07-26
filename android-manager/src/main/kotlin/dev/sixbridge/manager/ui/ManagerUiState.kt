@@ -2,6 +2,7 @@ package dev.sixbridge.manager.ui
 
 import android.content.Intent
 import android.net.Uri
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.ReviewBundle
@@ -19,6 +20,8 @@ data class ManagedExtensionItem(
     val name: String,
     val installedVersionCode: Long,
     val compatibilityStatus: String,
+    val signerSha256: String = "",
+    val report: ContractCompatibilityReport? = null,
 )
 
 sealed interface ImportUiState {
@@ -83,6 +86,8 @@ sealed interface ManagerAction {
     data object InstallReviewedBundle : ManagerAction
     data object CancelReview : ManagerAction
     data class Remove(val packageName: String) : ManagerAction
+    data class OpenReport(val packageName: String) : ManagerAction
+    data object ReturnHome : ManagerAction
     data object OpenSamsungAddOns : ManagerAction
     data object OpenUnknownSourcesSettings : ManagerAction
     data object ReturnedToForeground : ManagerAction

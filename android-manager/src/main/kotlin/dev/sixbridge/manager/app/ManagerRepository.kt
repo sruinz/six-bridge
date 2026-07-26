@@ -3,6 +3,7 @@ package dev.sixbridge.manager.app
 import android.content.Intent
 import android.net.Uri
 import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
@@ -72,6 +73,10 @@ data class ReviewBundle(
     val version: String,
     val status: ContractCompatibilityStatus,
     val issues: List<ContractIssue>,
+    val declaredPermissions: List<String> = emptyList(),
+    val adapterDecisions: List<ContractAdapterDecision> = emptyList(),
+    val signerSha256: String = "",
+    val wrapperVersionCode: Int = 0,
 )
 
 sealed interface ManagerImportResult {
@@ -720,4 +725,8 @@ private fun ImportedBundle.toReview() = ReviewBundle(
     version = descriptor.version,
     status = report.status,
     issues = report.issues,
+    declaredPermissions = report.declaredPermissions,
+    adapterDecisions = report.adapterDecisions,
+    signerSha256 = descriptor.signerSha256,
+    wrapperVersionCode = descriptor.wrapperVersionCode,
 )

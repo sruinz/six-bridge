@@ -3,6 +3,7 @@ package dev.sixbridge.manager.ui
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
@@ -65,6 +66,8 @@ class ManagerViewModel(
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
             is ManagerAction.Remove -> remove(action.packageName)
+            is ManagerAction.OpenReport -> openReport(action.packageName)
+            ManagerAction.ReturnHome -> mutableState.update { it.copy(route = ManagerRoute.Home) }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
             ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
             ManagerAction.ReturnedToForeground -> returnedToForeground()
@@ -386,6 +389,11 @@ class ManagerViewModel(
         }
     }
 
+    private fun openReport(packageName: String) {
+        if (mutableState.value.installed.none { it.packageName == packageName }) return
+        mutableState.update { it.copy(route = ManagerRoute.Report(packageName), message = null) }
+    }
+
     private fun openUnknownSourcesSettings() {
         if (mutableState.value.installState != InstallState.UnknownSourcesPermissionRequired) return
         enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
@@ -571,6 +579,10 @@ private fun CatalogRecord.toItem() = ManagedExtensionItem(
     name = name,
     installedVersionCode = installedVersionCode,
     compatibilityStatus = compatibilityStatus,
+    signerSha256 = signerSha256,
+    report = reportJson?.let { encoded ->
+        runCatching { BundleJson.decodeCompatibility(encoded) }.getOrNull()
+    },
 )
 
 private fun InstallState.isTerminalState(): Boolean =
