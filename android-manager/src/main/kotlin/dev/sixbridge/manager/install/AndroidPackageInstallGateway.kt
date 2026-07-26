@@ -28,65 +28,50 @@ class AndroidPackageInstallGateway(
             Uri.parse("package:${applicationContext.packageName}"),
         )
 
-    override suspend fun createAndWrite(packageName: String, apk: File): Int {
-        var allocatedSessionId: Int? = null
-        return try {
-            withContext(Dispatchers.IO) {
-                require(apk.isFile && apk.length() > 0) { "설치할 APK가 올바르지 않습니다." }
-                val parameters = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
-                    .apply {
-                        setAppPackageName(packageName)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
-                        }
-                    }
-                val sessionId = try {
-                    installer.createSession(parameters)
-                } catch (error: Exception) {
-                    throw PackageInstallSessionException(
-                        sessionId = null,
-                        code = "SESSION_CREATE_FAILED",
-                        message = "설치 session을 만들지 못했습니다.",
-                        cause = error,
-                    )
-                }
-                allocatedSessionId = sessionId
-                try {
-                    installer.openSession(sessionId).use { session ->
-                        apk.inputStream().use { input ->
-                            session.openWrite(BASE_APK_NAME, 0, apk.length()).use { output ->
-                                input.copyTo(output)
-                                session.fsync(output)
-                            }
-                        }
-                    }
-                    sessionId
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    throw PackageInstallSessionException(
-                        sessionId = sessionId,
-                        code = "WRITE_FAILED",
-                        message = "설치 session에 APK를 기록하지 못했습니다.",
-                        cause = error,
-                    )
+    override suspend fun createSession(packageName: String): Int = withContext(Dispatchers.IO) {
+        val parameters = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            .apply {
+                setAppPackageName(packageName)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
                 }
             }
+        try {
+            installer.createSession(parameters)
         } catch (error: CancellationException) {
-            val sessionId = allocatedSessionId ?: throw error
-            val abandonConfirmed = try {
-                installer.abandonSession(sessionId)
-                true
-            } catch (_: Exception) {
-                runCatching {
-                    installer.mySessions.none { it.sessionId == sessionId }
-                }.getOrDefault(false)
-            }
-            throw PackageInstallCancellationException(
-                sessionId = sessionId,
-                abandonConfirmed = abandonConfirmed,
+            throw error
+        } catch (error: Exception) {
+            throw PackageInstallSessionException(
+                sessionId = null,
+                code = "SESSION_CREATE_FAILED",
+                message = "설치 session을 만들지 못했습니다.",
                 cause = error,
             )
+        }
+    }
+
+    override suspend fun writeSession(sessionId: Int, apk: File) {
+        withContext(Dispatchers.IO) {
+            require(apk.isFile && apk.length() > 0) { "설치할 APK가 올바르지 않습니다." }
+            try {
+                installer.openSession(sessionId).use { session ->
+                    apk.inputStream().use { input ->
+                        session.openWrite(BASE_APK_NAME, 0, apk.length()).use { output ->
+                            input.copyTo(output)
+                            session.fsync(output)
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                throw PackageInstallSessionException(
+                    sessionId = sessionId,
+                    code = "WRITE_FAILED",
+                    message = "설치 session에 APK를 기록하지 못했습니다.",
+                    cause = error,
+                )
+            }
         }
     }
 

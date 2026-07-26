@@ -28,6 +28,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class InstallCoordinatorTest {
@@ -106,7 +107,7 @@ class InstallCoordinatorTest {
     @Test
     fun `write failure abandons its allocated session and clears pending import`() = runBlocking {
         val fixture = fixture()
-        fixture.gateway.createFailure = PackageInstallSessionException(
+        fixture.gateway.writeFailure = PackageInstallSessionException(
             sessionId = SESSION_ID,
             code = "WRITE_FAILED",
             message = "write failed",
@@ -122,12 +123,9 @@ class InstallCoordinatorTest {
 
     @Test
     fun `write cancellation keeps recovery ledger when allocated session cannot be abandoned`() = runBlocking {
-        val fixture = fixture(ownedSessions = listOf(SESSION_ID))
-        fixture.gateway.createFailure = PackageInstallCancellationException(
-            sessionId = SESSION_ID,
-            abandonConfirmed = false,
-            cause = CancellationException("write cancelled"),
-        )
+        val fixture = fixture()
+        fixture.gateway.writeFailure = CancellationException("write cancelled")
+        fixture.gateway.abandonFailure = IllegalStateException("abandon failed")
 
         assertFailsWith<CancellationException> {
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
@@ -142,28 +140,21 @@ class InstallCoordinatorTest {
     }
 
     @Test
-    fun `write cancellation reports abandon failure when session assignment also fails`() = runBlocking {
-        val fixture = fixture(ownedSessions = listOf(SESSION_ID))
+    fun `assignment failure retains recovered session id when abandon cannot be confirmed`() = runBlocking {
+        val fixture = fixture()
         fixture.pendingStore.assignFailure = true
-        fixture.gateway.createFailure = PackageInstallCancellationException(
-            sessionId = SESSION_ID,
-            abandonConfirmed = false,
-            cause = CancellationException("write cancelled"),
-        )
+        fixture.pendingStore.recoverSessionSuccess = true
+        fixture.gateway.abandonFailure = IllegalStateException("abandon failed")
 
-        assertFailsWith<CancellationException> {
-            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
-        }
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
 
         assertEquals(
             InstallState.Failed("ABANDON_FAILED", "설치 session을 정리하지 못했습니다."),
             fixture.coordinator.state.value,
         )
-        assertEquals(
-            pendingInstall().copy(sessionId = -1),
-            fixture.pendingStore.record,
-        )
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        assertTrue(fixture.gateway.writtenSessions.isEmpty())
     }
 
     @Test
@@ -273,11 +264,7 @@ class InstallCoordinatorTest {
     @Test
     fun `write cancellation releases recovery ledger after abandon was confirmed`() = runBlocking {
         val fixture = fixture()
-        fixture.gateway.createFailure = PackageInstallCancellationException(
-            sessionId = SESSION_ID,
-            abandonConfirmed = true,
-            cause = CancellationException("write cancelled"),
-        )
+        fixture.gateway.writeFailure = CancellationException("write cancelled")
 
         assertFailsWith<CancellationException> {
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
@@ -288,18 +275,156 @@ class InstallCoordinatorTest {
     }
 
     @Test
-    fun `write failure still abandons allocated session when session assignment fails`() = runBlocking {
+    fun `assignment failure abandons allocated session and clears claim before write`() = runBlocking {
         val fixture = fixture()
         fixture.pendingStore.assignFailure = true
-        fixture.gateway.createFailure = PackageInstallSessionException(
-            sessionId = SESSION_ID,
-            code = "WRITE_FAILED",
-            message = "write failed",
-        )
 
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
 
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.writtenSessions.isEmpty())
+        assertNull(fixture.pendingStore.record)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `assignment disk failure clears the memory-updated session after abandon`() = runBlocking {
+        val fixture = fixture()
+        fixture.pendingStore.assignFailureAfterWrite = true
+
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.writtenSessions.isEmpty())
+        assertNull(fixture.pendingStore.record)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `restore binds an allocation interrupted before durable assignment`() = runBlocking {
+        val claim = pendingInstall().copy(sessionId = -1)
+        val fixture = fixture(
+            pending = claim,
+            ownedSessions = listOf(SESSION_ID),
+        )
+        fixture.pendingStore.recoverSessionSuccess = true
+
+        fixture.coordinator.restore()
+
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        assertEquals(
+            InstallState.AwaitingUserApproval(SESSION_ID),
+            fixture.coordinator.state.value,
+        )
+    }
+
+    @Test
+    fun `cancel binds and abandons a sole session allocated before assignment`() = runBlocking {
+        val claim = pendingInstall().copy(sessionId = -1)
+        val fixture = fixture(
+            pending = claim,
+            ownedSessions = listOf(SESSION_ID),
+        )
+        fixture.pendingStore.recoverSessionSuccess = true
+
+        fixture.coordinator.cancel()
+
+        assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertNull(fixture.pendingStore.record)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `assignment recovery failure is explicit and retains the unassigned claim`() = runBlocking {
+        val fixture = fixture()
+        fixture.pendingStore.assignFailure = true
+        fixture.gateway.abandonFailure = IllegalStateException("abandon failed")
+
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+        assertEquals(
+            InstallState.Failed(
+                "SESSION_RECOVERY_FAILED",
+                "설치 session ID를 복구 저장하지 못했습니다.",
+            ),
+            fixture.coordinator.state.value,
+        )
+        assertEquals(pendingInstall().copy(sessionId = -1), fixture.pendingStore.record)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        assertTrue(fixture.gateway.writtenSessions.isEmpty())
+    }
+
+    @Test
+    fun `create cancellation after allocation recovers and abandons before rethrow`() = runBlocking {
+        val fixture = fixture()
+        val cancellation = CancellationException("create cancelled")
+        fixture.gateway.createFailureAfterAllocation = cancellation
+        fixture.pendingStore.recoverSessionSuccess = true
+
+        val thrown = assertFailsWith<CancellationException> {
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        }
+
+        assertSame(cancellation, thrown)
+        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertNull(fixture.pendingStore.record)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `persists allocated session id before writing apk bytes`() = runBlocking {
+        val fixture = fixture()
+        fixture.gateway.onWrite = { sessionId ->
+            assertEquals(SESSION_ID, sessionId)
+            assertEquals(pendingInstall(), fixture.pendingStore.record)
+        }
+
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+        assertEquals(listOf(SESSION_ID), fixture.gateway.writtenSessions)
+        assertEquals(listOf(SESSION_ID), fixture.gateway.committedSessions)
+    }
+
+    @Test
+    fun `process death after durable assignment restores known id without starting write`() {
+        val fixture = fixture()
+        val processDeath = IllegalStateException("simulated process death")
+        fixture.pendingStore.afterAssign = { throw processDeath }
+
+        val thrown = assertFailsWith<IllegalStateException> {
+            runBlocking {
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            }
+        }
+
+        assertSame(processDeath, thrown)
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        assertTrue(fixture.gateway.writtenSessions.isEmpty())
+        val restored = coordinator(
+            gateway = fixture.gateway,
+            pendingStore = fixture.pendingStore,
+        )
+        assertEquals(InstallState.AwaitingUserApproval(SESSION_ID), restored.state.value)
+    }
+
+    @Test
+    fun `write cancellation preserves original exception when atomic cleanup fails`() = runBlocking {
+        val fixture = fixture()
+        val cancellation = CancellationException("write cancelled")
+        fixture.gateway.writeFailure = cancellation
+        fixture.pendingStore.discardFailure = true
+
+        val thrown = assertFailsWith<CancellationException> {
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        }
+
+        assertSame(cancellation, thrown)
+        assertEquals(
+            InstallState.Failed("CLEANUP_FAILED", "설치 임시 데이터를 정리하지 못했습니다."),
+            fixture.coordinator.state.value,
+        )
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
     }
 
     @Test
@@ -773,6 +898,75 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `terminal success recorded during cancel abandon wins before cleanup`() = runBlocking {
+        val fixture = fixture()
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        fixture.installedWrappers.installed = installedWrapper()
+        fixture.gateway.onAbandon = {
+            fixture.gateway.onAbandon = null
+            assertTrue(
+                fixture.pendingStore.recordTerminalResult(
+                    PackageInstallResult.Success(SESSION_ID),
+                    FINISHED_AT,
+                ),
+            )
+        }
+
+        fixture.coordinator.cancel()
+
+        assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
+        assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
+        assertNull(fixture.pendingStore.record)
+        assertNull(fixture.pendingStore.terminalResult)
+    }
+
+    @Test
+    fun `terminal failure recorded during cancel abandon wins before cleanup`() = runBlocking {
+        val fixture = fixture()
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        val result = PackageInstallResult.Failure(
+            sessionId = SESSION_ID,
+            code = "SYSTEM_FAILURE",
+            message = "installer rejected package",
+        )
+        fixture.gateway.onAbandon = {
+            fixture.gateway.onAbandon = null
+            assertTrue(fixture.pendingStore.recordTerminalResult(result, FINISHED_AT))
+        }
+
+        fixture.coordinator.cancel()
+
+        assertEquals(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+            fixture.coordinator.state.value,
+        )
+        assertNull(fixture.pendingStore.record)
+        assertNull(fixture.pendingStore.terminalResult)
+    }
+
+    @Test
+    fun `does not trust an inbox-only success without a processed marker`() = runBlocking {
+        val terminal = PendingInstallResult(
+            result = PackageInstallResult.Success(SESSION_ID),
+            terminalAtEpochMillis = FINISHED_AT,
+            packageName = PACKAGE_NAME,
+        )
+        val fixture = fixture(terminalResult = terminal)
+
+        fixture.coordinator.restore()
+
+        assertEquals(
+            InstallState.Failed(
+                "TERMINAL_RECOVERY_FAILED",
+                "검증 완료 표지가 없는 설치 결과를 복구하지 못했습니다.",
+            ),
+            fixture.coordinator.state.value,
+        )
+        assertEquals(terminal, fixture.pendingStore.terminalResult)
+        assertNull(fixture.catalog.replaced)
+    }
+
+    @Test
     fun `retains ledger temp and inbox when abandon fails and session is still owned`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
@@ -954,11 +1148,16 @@ class InstallCoordinatorTest {
         ownedSessions: List<Int>,
     ) : PackageInstallGateway {
         val createdPackages = mutableListOf<String>()
+        val writtenSessions = mutableListOf<Int>()
         val committedSessions = mutableListOf<Int>()
         val abandonedSessions = mutableListOf<Int>()
         var createFailure: Throwable? = null
+        var createFailureAfterAllocation: Throwable? = null
+        var writeFailure: Throwable? = null
         var commitFailure: RuntimeException? = null
         var abandonFailure: RuntimeException? = null
+        var onAbandon: (() -> Unit)? = null
+        var onWrite: ((Int) -> Unit)? = null
         private val owned = ownedSessions.toMutableList()
 
         override fun canRequestPackageInstalls(): Boolean = canInstallPackages
@@ -966,11 +1165,18 @@ class InstallCoordinatorTest {
         override fun unknownSourcesSettingsIntent(): Intent =
             throw UnsupportedOperationException("not called by coordinator")
 
-        override suspend fun createAndWrite(packageName: String, apk: File): Int {
+        override suspend fun createSession(packageName: String): Int {
             createFailure?.let { throw it }
             createdPackages += packageName
             owned += SESSION_ID
+            createFailureAfterAllocation?.let { throw it }
             return SESSION_ID
+        }
+
+        override suspend fun writeSession(sessionId: Int, apk: File) {
+            onWrite?.invoke(sessionId)
+            writeFailure?.let { throw it }
+            writtenSessions += sessionId
         }
 
         override fun commit(sessionId: Int) {
@@ -980,6 +1186,7 @@ class InstallCoordinatorTest {
 
         override fun abandon(sessionId: Int) {
             abandonFailure?.let { throw it }
+            onAbandon?.invoke()
             abandonedSessions += sessionId
             owned -= sessionId
         }
@@ -1002,6 +1209,9 @@ class InstallCoordinatorTest {
         val clearedTerminalResults = mutableListOf<PendingInstallResult>()
         var clearFailure = false
         var assignFailure = false
+        var assignFailureAfterWrite = false
+        var recoverSessionSuccess = false
+        var afterAssign: (() -> Unit)? = null
         var discardFailure = false
         var clearTerminalFailure = false
         var clearMissingFailure = false
@@ -1035,8 +1245,22 @@ class InstallCoordinatorTest {
             synchronized(this) {
                 if (assignFailure) return@synchronized null
                 if (record != claim) return@synchronized null
-                claim.copy(sessionId = sessionId).also { record = it }
+                val pending = claim.copy(sessionId = sessionId).also { record = it }
+                if (assignFailureAfterWrite) return@synchronized null
+                afterAssign?.invoke()
+                pending
             }
+
+        override fun recoverSession(
+            claim: PendingInstall,
+            sessionId: Int,
+        ): PendingInstall? = synchronized(this) {
+            val recovered = claim.copy(sessionId = sessionId)
+            if (!recoverSessionSuccess || record !in setOf(claim, recovered)) {
+                return@synchronized null
+            }
+            recovered.also { record = it }
+        }
 
         override fun clear(expected: PendingInstall): Boolean = synchronized(this) {
             if (clearFailure) throw IllegalStateException("clear failed")
@@ -1046,7 +1270,9 @@ class InstallCoordinatorTest {
             true
         }
 
-        override fun clearStale(expected: PendingInstall): Boolean = synchronized(this) {
+        override fun clearWithoutTerminal(
+            expected: PendingInstall,
+        ): PendingCleanupResult = synchronized(this) {
             terminalBeforeStaleClear?.let { result ->
                 terminalBeforeStaleClear = null
                 terminalResult = PendingInstallResult(
@@ -1055,13 +1281,16 @@ class InstallCoordinatorTest {
                     packageName = record?.packageName.orEmpty(),
                 )
             }
-            if (record != expected || terminalResult != null || discardFailure) {
-                return@synchronized false
+            if (record != expected || discardFailure) {
+                return@synchronized PendingCleanupResult.Failed
+            }
+            if (terminalResult != null) {
+                return@synchronized PendingCleanupResult.TerminalAvailable
             }
             discardedTokens += expected.importToken
             record = null
             missingObservedAt = null
-            true
+            PendingCleanupResult.Cleared
         }
 
         override fun discardImport(importToken: String) {
@@ -1093,6 +1322,13 @@ class InstallCoordinatorTest {
             if (existing != null) return@synchronized false
             terminalResult = pendingResult
             true
+        }
+
+        override fun markTerminalProcessed(
+            expected: PendingInstallResult,
+        ): PendingInstallResult? = synchronized(this) {
+            if (terminalResult != expected) return@synchronized null
+            expected.copy(processed = true).also { terminalResult = it }
         }
 
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean =
@@ -1155,17 +1391,24 @@ class InstallCoordinatorTest {
                 claim.copy(sessionId = sessionId).also { backend.record = it }
             }
 
+        override fun recoverSession(
+            claim: PendingInstall,
+            sessionId: Int,
+        ): PendingInstall? = null
+
         override fun clear(expected: PendingInstall): Boolean = synchronized(backend) {
             if (backend.record != expected) return@synchronized false
             backend.record = null
             true
         }
 
-        override fun clearStale(expected: PendingInstall): Boolean = synchronized(backend) {
-            if (backend.record != expected) return@synchronized false
+        override fun clearWithoutTerminal(
+            expected: PendingInstall,
+        ): PendingCleanupResult = synchronized(backend) {
+            if (backend.record != expected) return@synchronized PendingCleanupResult.Failed
             backend.discardedTokens += expected.importToken
             backend.record = null
-            true
+            PendingCleanupResult.Cleared
         }
 
         override fun discardImport(importToken: String) {
@@ -1180,6 +1423,10 @@ class InstallCoordinatorTest {
             result: PackageInstallResult,
             terminalAtEpochMillis: Long,
         ): Boolean = false
+
+        override fun markTerminalProcessed(
+            expected: PendingInstallResult,
+        ): PendingInstallResult? = null
 
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean = false
 

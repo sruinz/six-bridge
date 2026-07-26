@@ -143,8 +143,22 @@ class InstallCoordinator(
                 )
                 return@withLock
             }
+            if (owned.size == 1) {
+                val recovered = recoverUnassignedSession(pending, owned.single())
+                if (recovered == null) {
+                    mutableState.value = sessionRecoveryFailed()
+                    return@withLock
+                }
+                finishSession(
+                    pending = recovered,
+                    next = InstallState.Cancelled,
+                    abandon = true,
+                    inbox = null,
+                )
+                return@withLock
+            }
             if (owned.isNotEmpty()) {
-                mutableState.value = abandonFailed()
+                mutableState.value = sessionRecoveryFailed()
                 return@withLock
             }
             finishSession(
@@ -191,15 +205,16 @@ class InstallCoordinator(
         }
 
         val sessionId = try {
-            gateway.createAndWrite(bundle.verifiedApk.packageName, bundle.wrapperFile)
-        } catch (error: PackageInstallCancellationException) {
-            handleCreateCancellation(claim, error)
-            throw error
+            gateway.createSession(bundle.verifiedApk.packageName)
         } catch (error: CancellationException) {
-            releaseClaim(claim, bundle.token, InstallState.Cancelled)
+            finishInterruptedCreate(claim)
             throw error
         } catch (error: PackageInstallSessionException) {
-            handleCreateFailure(claim, bundle, error)
+            releaseClaim(
+                claim,
+                bundle.token,
+                InstallState.Failed(error.code, error.message),
+            )
             return
         } catch (_: Exception) {
             releaseClaim(
@@ -212,16 +227,35 @@ class InstallCoordinator(
 
         val pending = pendingStore.assignSession(claim, sessionId)
         if (pending == null) {
-            val abandoned = abandonConfirmed(sessionId)
-            activeBundle = null
-            mutableState.value = if (abandoned) {
-                InstallState.Failed("INSTALL_CLAIM_LOST", "설치 claim을 확인하지 못했습니다.")
-            } else {
-                abandonFailed()
-            }
+            handleAssignmentFailure(claim, sessionId)
             return
         }
         mutableState.value = InstallState.WritingSession(sessionId)
+        try {
+            gateway.writeSession(sessionId, bundle.wrapperFile)
+        } catch (error: CancellationException) {
+            finishSession(pending, InstallState.Cancelled, abandon = true, inbox = null)
+            throw error
+        } catch (error: PackageInstallSessionException) {
+            finishSession(
+                pending = pending,
+                next = InstallState.Failed(error.code, error.message),
+                abandon = true,
+                inbox = null,
+            )
+            return
+        } catch (_: Exception) {
+            finishSession(
+                pending = pending,
+                next = InstallState.Failed(
+                    "WRITE_FAILED",
+                    "설치 session에 APK를 기록하지 못했습니다.",
+                ),
+                abandon = true,
+                inbox = null,
+            )
+            return
+        }
         try {
             gateway.commit(sessionId)
             mutableState.value = InstallState.AwaitingUserApproval(sessionId)
@@ -241,41 +275,69 @@ class InstallCoordinator(
         }
     }
 
-    private fun handleCreateCancellation(
+    private suspend fun handleAssignmentFailure(
         claim: PendingInstall,
-        error: PackageInstallCancellationException,
+        sessionId: Int,
     ) {
-        val sessionId = error.sessionId
-        if (sessionId == null || error.abandonConfirmed) {
-            releaseClaim(claim, claim.importToken, InstallState.Cancelled)
-            return
-        }
-        pendingStore.assignSession(claim, sessionId)
-        mutableState.value = abandonFailed()
-    }
-
-    private fun handleCreateFailure(
-        claim: PendingInstall,
-        bundle: ImportedBundle,
-        error: PackageInstallSessionException,
-    ) {
-        val sessionId = error.sessionId
-        if (sessionId == null) {
-            releaseClaim(claim, bundle.token, InstallState.Failed(error.code, error.message))
-            return
-        }
-        val pending = pendingStore.assignSession(claim, sessionId)
-        if (pending == null) {
-            if (abandonConfirmed(sessionId)) {
-                releaseClaim(claim, bundle.token, InstallState.Failed(error.code, error.message))
+        if (!abandonConfirmed(sessionId)) {
+            val recovered = runCatching {
+                pendingStore.recoverSession(claim, sessionId)
+            }.getOrNull()
+            mutableState.value = if (recovered != null) {
+                abandonFailed()
             } else {
-                mutableState.value = abandonFailed()
+                sessionRecoveryFailed()
             }
             return
         }
+        val observed = runCatching { pendingStore.load() }.getOrNull()
+        val expected = when (observed) {
+            claim -> claim
+            claim.copy(sessionId = sessionId) -> observed
+            else -> null
+        }
+        if (expected == null) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        when (runCatching { pendingStore.clearWithoutTerminal(expected) }
+            .getOrDefault(PendingCleanupResult.Failed)
+        ) {
+            PendingCleanupResult.Cleared -> {
+                activeBundle = null
+                mutableState.value = InstallState.Failed(
+                    "INSTALL_CLAIM_LOST",
+                    "설치 claim을 확인하지 못했습니다.",
+                )
+            }
+            PendingCleanupResult.TerminalAvailable -> restoreTerminalResultLocked()
+            PendingCleanupResult.Failed -> mutableState.value = cleanupFailed()
+        }
+    }
+
+    private suspend fun finishInterruptedCreate(claim: PendingInstall) {
+        val owned = try {
+            gateway.ownedSessions()
+        } catch (_: Exception) {
+            mutableState.value = sessionRecoveryFailed()
+            return
+        }
+        if (owned.isEmpty()) {
+            releaseClaim(claim, claim.importToken, InstallState.Cancelled)
+            return
+        }
+        if (owned.size != 1) {
+            mutableState.value = sessionRecoveryFailed()
+            return
+        }
+        val recovered = recoverUnassignedSession(claim, owned.single())
+        if (recovered == null) {
+            mutableState.value = sessionRecoveryFailed()
+            return
+        }
         finishSession(
-            pending = pending,
-            next = InstallState.Failed(error.code, error.message),
+            pending = recovered,
+            next = InstallState.Cancelled,
             abandon = true,
             inbox = null,
         )
@@ -311,12 +373,21 @@ class InstallCoordinator(
     }
 
     private suspend fun restoreMissingSessionLocked() {
-        val pending = pendingStore.load() ?: return
+        var pending = pendingStore.load() ?: return
         if (pendingStore.loadTerminalResult() != null) return
         val owned = try {
             gateway.ownedSessions()
         } catch (_: Exception) {
             return
+        }
+        if (pending.sessionId < 0 && owned.size == 1) {
+            val recovered = recoverUnassignedSession(pending, owned.single())
+            if (recovered == null) {
+                runCatching { pendingStore.clearSessionMissingObservation(pending) }
+                return
+            }
+            pending = recovered
+            mutableState.value = pending.toState()
         }
         if (pending.isStillOwned(owned)) {
             val reset = runCatching {
@@ -339,18 +410,26 @@ class InstallCoordinator(
             return
         }
         if (pending.isStillOwned(stillOwned)) return
-        val cleared = runCatching { pendingStore.clearStale(pending) }.getOrDefault(false)
-        if (cleared) {
-            activeBundle = null
-            mutableState.value = InstallState.Idle
-        } else if (pendingStore.loadTerminalResult() != null) {
-            restoreTerminalResultLocked()
-        } else {
-            mutableState.value = cleanupFailed()
+        when (runCatching { pendingStore.clearWithoutTerminal(pending) }
+            .getOrDefault(PendingCleanupResult.Failed)
+        ) {
+            PendingCleanupResult.Cleared -> {
+                activeBundle = null
+                mutableState.value = InstallState.Idle
+            }
+            PendingCleanupResult.TerminalAvailable -> restoreTerminalResultLocked()
+            PendingCleanupResult.Failed -> mutableState.value = cleanupFailed()
         }
     }
 
     private fun finishCompletedTerminalCleanup(inbox: PendingInstallResult) {
+        if (inbox.result is PackageInstallResult.Success && !inbox.processed) {
+            mutableState.value = InstallState.Failed(
+                "TERMINAL_RECOVERY_FAILED",
+                "검증 완료 표지가 없는 설치 결과를 복구하지 못했습니다.",
+            )
+            return
+        }
         if (!pendingStore.clearTerminalResult(inbox)) {
             mutableState.value = cleanupFailed()
             return
@@ -503,7 +582,7 @@ class InstallCoordinator(
         mutableState.value = if (ledgerCleared && importDiscarded) next else cleanupFailed()
     }
 
-    private fun finishSession(
+    private suspend fun finishSession(
         pending: PendingInstall,
         next: InstallState,
         abandon: Boolean,
@@ -512,6 +591,27 @@ class InstallCoordinator(
         if (abandon && !abandonConfirmed(pending.sessionId)) {
             mutableState.value = abandonFailed()
             return
+        }
+        if (inbox == null) {
+            when (runCatching { pendingStore.clearWithoutTerminal(pending) }
+                .getOrDefault(PendingCleanupResult.Failed)
+            ) {
+                PendingCleanupResult.Cleared -> {
+                    activeBundle = null
+                    mutableState.value = next
+                }
+                PendingCleanupResult.TerminalAvailable -> restoreTerminalResultLocked()
+                PendingCleanupResult.Failed -> mutableState.value = cleanupFailed()
+            }
+            return
+        }
+        val cleanupInbox = if (next is InstallState.Installed) {
+            pendingStore.markTerminalProcessed(inbox) ?: run {
+                mutableState.value = cleanupFailed()
+                return
+            }
+        } else {
+            inbox
         }
         val importDiscarded = pendingStore.discardImportSafely(pending.importToken)
         if (!importDiscarded) {
@@ -523,7 +623,7 @@ class InstallCoordinator(
             mutableState.value = cleanupFailed()
             return
         }
-        if (inbox != null && !pendingStore.clearTerminalResult(inbox)) {
+        if (!pendingStore.clearTerminalResult(cleanupInbox)) {
             mutableState.value = cleanupFailed()
             return
         }
@@ -543,6 +643,16 @@ class InstallCoordinator(
                 false
             }
         }
+    }
+
+    private fun recoverUnassignedSession(
+        pending: PendingInstall,
+        sessionId: Int,
+    ): PendingInstall? {
+        if (pending.sessionId >= 0) return pending.takeIf { it.sessionId == sessionId }
+        return runCatching {
+            pendingStore.recoverSession(pending, sessionId)
+        }.getOrNull()
     }
 
     private fun discardCompetingImport(importToken: String, activeToken: String?) {
@@ -580,6 +690,11 @@ class InstallCoordinator(
     private fun abandonFailed() = InstallState.Failed(
         "ABANDON_FAILED",
         "설치 session을 정리하지 못했습니다.",
+    )
+
+    private fun sessionRecoveryFailed() = InstallState.Failed(
+        "SESSION_RECOVERY_FAILED",
+        "설치 session ID를 복구 저장하지 못했습니다.",
     )
 
     private fun missingObservationResetFailed() = InstallState.Failed(

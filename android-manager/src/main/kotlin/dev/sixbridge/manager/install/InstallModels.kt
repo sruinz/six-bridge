@@ -34,4 +34,11 @@ data class PendingInstallResult(
     val result: PackageInstallResult,
     val terminalAtEpochMillis: Long,
     val packageName: String = "",
+    val processed: Boolean = false,
 )
+
+sealed interface PendingCleanupResult {
+    data object Cleared : PendingCleanupResult
+    data object TerminalAvailable : PendingCleanupResult
+    data object Failed : PendingCleanupResult
+}

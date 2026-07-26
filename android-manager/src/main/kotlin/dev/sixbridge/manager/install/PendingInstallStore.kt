@@ -15,11 +15,13 @@ interface PendingInstallStore {
     fun load(): PendingInstall?
     fun tryClaim(packageName: String, importToken: String, startedAtEpochMillis: Long): PendingInstall?
     fun assignSession(claim: PendingInstall, sessionId: Int): PendingInstall?
+    fun recoverSession(claim: PendingInstall, sessionId: Int): PendingInstall?
     fun clear(expected: PendingInstall): Boolean
-    fun clearStale(expected: PendingInstall): Boolean
+    fun clearWithoutTerminal(expected: PendingInstall): PendingCleanupResult
     fun discardImport(importToken: String)
     fun loadTerminalResult(): PendingInstallResult?
     fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean
+    fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult?
     fun clearTerminalResult(expected: PendingInstallResult): Boolean
     fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long
     fun clearSessionMissingObservation(pending: PendingInstall): Boolean
@@ -65,22 +67,51 @@ class SharedPreferencesPendingInstallStore private constructor(
             if (!pendingPreferences.edit().putInt(KEY_SESSION_ID, sessionId).commit()) {
                 return@synchronized null
             }
+            recoveryPreferences.edit()
+                .remove(KEY_RECOVERY_SESSION_ID)
+                .remove(KEY_RECOVERY_IMPORT_TOKEN)
+                .commit()
             pending
         }
+
+    override fun recoverSession(
+        claim: PendingInstall,
+        sessionId: Int,
+    ): PendingInstall? = synchronized(PROCESS_LOCK) {
+        if (sessionId < 0 || claim.sessionId != UNASSIGNED_SESSION_ID) return@synchronized null
+        val recovered = claim.copy(sessionId = sessionId)
+        val current = loadPendingLocked()
+        if (current != claim && current != recovered) return@synchronized null
+        if (!recoveryPreferences.edit()
+                .putInt(KEY_RECOVERY_SESSION_ID, sessionId)
+                .putString(KEY_RECOVERY_IMPORT_TOKEN, claim.importToken)
+                .commit()
+        ) {
+            return@synchronized null
+        }
+        recovered
+    }
 
     override fun clear(expected: PendingInstall): Boolean = synchronized(PROCESS_LOCK) {
         if (loadPendingLocked() != expected) return@synchronized false
         clearPendingLocked()
     }
 
-    override fun clearStale(expected: PendingInstall): Boolean = synchronized(PROCESS_LOCK) {
-        if (loadPendingLocked() != expected || loadTerminalLocked() != null) {
-            return@synchronized false
+    override fun clearWithoutTerminal(
+        expected: PendingInstall,
+    ): PendingCleanupResult = synchronized(PROCESS_LOCK) {
+        if (loadPendingLocked() != expected) return@synchronized PendingCleanupResult.Failed
+        if (loadTerminalLocked() != null) {
+            return@synchronized PendingCleanupResult.TerminalAvailable
         }
         val importDiscarded = runCatching {
             discardImport(expected.importToken)
         }.isSuccess
-        importDiscarded && clearPendingLocked()
+        if (importDiscarded && clearPendingLocked()) {
+            PendingCleanupResult.Cleared
+        } else {
+            PendingCleanupResult.Failed
+        }
     }
 
     override fun discardImport(importToken: String) {
@@ -119,6 +150,7 @@ class SharedPreferencesPendingInstallStore private constructor(
             .putString(KEY_RESULT_KIND, sanitized.result.kind())
             .putString(KEY_RESULT_PACKAGE_NAME, sanitized.packageName)
             .putLong(KEY_TERMINAL_AT, sanitized.terminalAtEpochMillis)
+            .remove(KEY_RESULT_PROCESSED)
             .remove(KEY_MISSING_SESSION_ID)
             .remove(KEY_MISSING_IMPORT_TOKEN)
             .remove(KEY_MISSING_OBSERVED_AT)
@@ -132,6 +164,16 @@ class SharedPreferencesPendingInstallStore private constructor(
         editor.commit()
     }
 
+    override fun markTerminalProcessed(
+        expected: PendingInstallResult,
+    ): PendingInstallResult? = synchronized(PROCESS_LOCK) {
+        if (loadTerminalLocked() != expected) return@synchronized null
+        if (!recoveryPreferences.edit().putBoolean(KEY_RESULT_PROCESSED, true).commit()) {
+            return@synchronized null
+        }
+        expected.copy(processed = true)
+    }
+
     override fun clearTerminalResult(expected: PendingInstallResult): Boolean =
         synchronized(PROCESS_LOCK) {
             if (loadTerminalLocked() != expected) return@synchronized false
@@ -141,6 +183,7 @@ class SharedPreferencesPendingInstallStore private constructor(
                 .remove(KEY_RESULT_CODE)
                 .remove(KEY_RESULT_MESSAGE)
                 .remove(KEY_RESULT_PACKAGE_NAME)
+                .remove(KEY_RESULT_PROCESSED)
                 .remove(KEY_TERMINAL_AT)
                 .commit()
         }
@@ -190,10 +233,26 @@ class SharedPreferencesPendingInstallStore private constructor(
 
     private fun loadPendingLocked(): PendingInstall? {
         if (!pendingPreferences.contains(KEY_SESSION_ID)) return null
+        val rawSessionId = pendingPreferences.getInt(KEY_SESSION_ID, Int.MIN_VALUE)
+        val importToken = pendingPreferences.getString(KEY_IMPORT_TOKEN, null).orEmpty()
+        val recoveredSessionId = recoveryPreferences.getInt(
+            KEY_RECOVERY_SESSION_ID,
+            Int.MIN_VALUE,
+        )
+        val recoveredToken = recoveryPreferences.getString(KEY_RECOVERY_IMPORT_TOKEN, null)
+        val sessionId = if (
+            rawSessionId == UNASSIGNED_SESSION_ID &&
+            recoveredSessionId >= 0 &&
+            recoveredToken == importToken
+        ) {
+            recoveredSessionId
+        } else {
+            rawSessionId
+        }
         val pending = PendingInstall(
-            sessionId = pendingPreferences.getInt(KEY_SESSION_ID, Int.MIN_VALUE),
+            sessionId = sessionId,
             packageName = pendingPreferences.getString(KEY_PACKAGE_NAME, null).orEmpty(),
-            importToken = pendingPreferences.getString(KEY_IMPORT_TOKEN, null).orEmpty(),
+            importToken = importToken,
             startedAtEpochMillis = pendingPreferences.getLong(KEY_STARTED_AT, -1),
         )
         return pending.takeIf(::isValid)
@@ -215,6 +274,8 @@ class SharedPreferencesPendingInstallStore private constructor(
             .remove(KEY_STARTED_AT)
             .commit()
         val missingObservationCleared = recoveryPreferences.edit()
+            .remove(KEY_RECOVERY_SESSION_ID)
+            .remove(KEY_RECOVERY_IMPORT_TOKEN)
             .remove(KEY_MISSING_SESSION_ID)
             .remove(KEY_MISSING_IMPORT_TOKEN)
             .remove(KEY_MISSING_OBSERVED_AT)
@@ -241,7 +302,12 @@ class SharedPreferencesPendingInstallStore private constructor(
             )
             else -> return null
         }
-        return PendingInstallResult(result, terminalAt, packageName)
+        return PendingInstallResult(
+            result = result,
+            terminalAtEpochMillis = terminalAt,
+            packageName = packageName,
+            processed = recoveryPreferences.getBoolean(KEY_RESULT_PROCESSED, false),
+        )
     }
 
     private fun sanitize(result: PackageInstallResult): PackageInstallResult = when (result) {
@@ -321,11 +387,14 @@ class SharedPreferencesPendingInstallStore private constructor(
         const val KEY_PACKAGE_NAME = "package_name"
         const val KEY_IMPORT_TOKEN = "import_token"
         const val KEY_STARTED_AT = "started_at"
+        const val KEY_RECOVERY_SESSION_ID = "recovery_session_id"
+        const val KEY_RECOVERY_IMPORT_TOKEN = "recovery_import_token"
         const val KEY_RESULT_SESSION_ID = "result_session_id"
         const val KEY_RESULT_KIND = "result_kind"
         const val KEY_RESULT_CODE = "result_code"
         const val KEY_RESULT_MESSAGE = "result_message"
         const val KEY_RESULT_PACKAGE_NAME = "result_package_name"
+        const val KEY_RESULT_PROCESSED = "result_processed"
         const val KEY_TERMINAL_AT = "terminal_at"
         const val KEY_MISSING_SESSION_ID = "missing_session_id"
         const val KEY_MISSING_IMPORT_TOKEN = "missing_import_token"
