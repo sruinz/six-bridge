@@ -1,6 +1,7 @@
 .gradle/
 build/
 **/build/
+local.properties
 .idea/
 *.iml
 .DS_Store
@@ -13,6 +14,10 @@ build/
 
 # Generated proof-of-concept artifacts.
 dist/
+
+# Keep canonical Room JSON schemas tracked; ignore only transient writes.
+android-manager/schemas/.tmp/
+android-manager/schemas/**/*.tmp
 
 # Subagent-driven development scratch state.
 .superpowers/

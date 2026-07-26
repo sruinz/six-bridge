@@ -31,6 +31,46 @@ SIX Bridge는 데스크톱 Chrome/Edge Manifest V3 확장을 삼성 인터넷 30
 export PATH="$PWD/cli/build/install/sixbridge/bin:$PATH"
 ```
 
+Android 관리자 debug APK 패키징:
+
+```sh
+./scripts/package-manager-debug.sh
+shasum -a 256 dist/sixbridge-manager-debug.apk
+```
+
+패키징 스크립트는 전체 검증을 다시 실행해 성공한 경우에만 새 debug APK를
+`dist/`에 배치한다. 검증이 실패하면 이전 APK를 배포 대상으로 남기지 않는다.
+
+## Android 관리자와 사용자 파일
+
+Android 관리자 1단계의 파일 역할은 다음과 같다.
+
+| 파일 | 역할 |
+|---|---|
+| `sixbridge-manager.apk` | 사용자가 최초 설치하는 SIX Bridge 관리자 앱 |
+| `<확장 이름>.six` | 변환 확장을 보관·공유하고 관리자에서 가져오는 사용자 파일 |
+| `.six` 내부 `wrapper.apk` | Android에 실제 설치되는 확장별 래퍼 package |
+| 래퍼 내부 CRX3 | 래퍼가 삼성 인터넷에 제공하는 실제 확장 본체 |
+
+일반 사용자는 ADB를 사용하지 않는다. Android 파일 앱에서 관리자 APK를
+설치한 뒤 관리자의 `.six 파일 추가`를 누르면 시스템 파일 선택기가 열린다.
+여기서 기기에 저장한 `.six`를 선택하고 호환성·권한·서명·버전을 검토한 다음,
+Android의 출처 허용 설정과 시스템 설치 승인 화면을 직접 확인한다.
+
+- `compatible`: 검토 뒤 설치할 수 있다.
+- `partial`: 제한 사항을 확인하는 추가 동의 뒤 설치할 수 있다.
+- `blocked`, `unknown`: 설치할 수 없다.
+- 업데이트: 같은 package·같은 signer·더 높은 versionCode만 허용한다.
+- 제거: 표준 Android 제거 화면을 사용하고 실제 package를 다시 확인한다.
+- Add-ons: 공개 `internet://extension`으로 삼성 인터넷의 전체 Add-ons
+  화면을 열며 특정 확장의 활성 상태를 관리자가 추정하지 않는다.
+
+debug APK는 개발 검증용 파일명인 `sixbridge-manager-debug.apk`로 생성된다.
+일반 배포본은 릴리스 서명과 검증을 거친 `sixbridge-manager.apk`여야 한다.
+상세 절차와 경계는 [Android 관리자 사용자 흐름](docs/android-manager-user-flow.md),
+[Android 관리자 보안 경계](docs/android-manager-security-boundary.md),
+[Fold7 관리자 검증표](docs/fold7-manager-validation.md)를 참고한다.
+
 기준 브라우저 프로필 생성:
 
 ```sh
