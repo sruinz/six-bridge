@@ -7,7 +7,7 @@ import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -24,7 +24,7 @@ class UninstallCoordinatorTest {
     }
 
     @Test
-    fun `return with installed package keeps catalog record`() = runBlocking {
+    fun `return with installed package keeps catalog record`() = runTest {
         val catalog = FakeCatalog()
         val coordinator = DefaultUninstallCoordinator(
             FakeInstalledWrappers(installedPackage = PACKAGE_NAME),
@@ -38,9 +38,23 @@ class UninstallCoordinatorTest {
     }
 
     @Test
-    fun `return after confirmed removal deletes catalog record`() = runBlocking {
+    fun `return after confirmed removal deletes catalog record`() = runTest {
         val catalog = FakeCatalog()
         val coordinator = DefaultUninstallCoordinator(FakeInstalledWrappers(), catalog)
+
+        val outcome = coordinator.reconcileAfterReturn(PACKAGE_NAME)
+
+        assertEquals(UninstallOutcome.Removed, outcome)
+        assertEquals(PACKAGE_NAME, catalog.removedPackage)
+    }
+
+    @Test
+    fun `return while package state is propagating waits for confirmed removal`() = runTest {
+        val catalog = FakeCatalog()
+        val coordinator = DefaultUninstallCoordinator(
+            SequencedInstalledWrappers(listOf(true, false)),
+            catalog,
+        )
 
         val outcome = coordinator.reconcileAfterReturn(PACKAGE_NAME)
 
@@ -70,6 +84,24 @@ class UninstallCoordinatorTest {
 
         override suspend fun removeAll(packageNames: Set<String>) = Unit
         override suspend fun get(packageName: String): CatalogRecord? = null
+    }
+
+    private class SequencedInstalledWrappers(
+        private val installedStates: List<Boolean>,
+    ) : InstalledWrapperRepository {
+        private var findIndex = 0
+
+        override suspend fun findAll(): List<InstalledWrapper> = emptyList()
+
+        override suspend fun find(packageName: String): InstalledWrapper? {
+            val installed = installedStates.getOrElse(findIndex) { installedStates.last() }
+            findIndex += 1
+            return if (installed) {
+                InstalledWrapper(packageName, "extension", "Example", 1, "signer")
+            } else {
+                null
+            }
+        }
     }
 
     private companion object {

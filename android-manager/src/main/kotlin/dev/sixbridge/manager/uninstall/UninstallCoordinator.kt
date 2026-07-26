@@ -5,6 +5,7 @@ import android.net.Uri
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.delay
 
 internal data class IntentRoute(
     val action: String,
@@ -31,15 +32,26 @@ class DefaultUninstallCoordinator(
         IntentRoute(Intent.ACTION_DELETE, "package:$packageName")
 
     override suspend fun reconcileAfterReturn(packageName: String): UninstallOutcome {
-        val installed = try {
-            installedWrappers.find(packageName)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            return UninstallOutcome.CancelledOrStillInstalled
+        repeat(PACKAGE_STATE_CHECK_COUNT) { index ->
+            val installed = try {
+                installedWrappers.find(packageName)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return UninstallOutcome.CancelledOrStillInstalled
+            }
+            if (installed == null) {
+                return removeCatalogRecord(packageName)
+            }
+            if (index < PACKAGE_STATE_CHECK_COUNT - 1) {
+                delay(PACKAGE_STATE_CHECK_INTERVAL_MS)
+            }
         }
-        if (installed != null) return UninstallOutcome.CancelledOrStillInstalled
 
+        return UninstallOutcome.CancelledOrStillInstalled
+    }
+
+    private suspend fun removeCatalogRecord(packageName: String): UninstallOutcome {
         return try {
             catalog.remove(packageName)
             UninstallOutcome.Removed
@@ -51,4 +63,9 @@ class DefaultUninstallCoordinator(
     }
 
     private fun IntentRoute.toIntent(): Intent = Intent(action, Uri.parse(data))
+
+    private companion object {
+        const val PACKAGE_STATE_CHECK_COUNT = 5
+        const val PACKAGE_STATE_CHECK_INTERVAL_MS = 200L
+    }
 }

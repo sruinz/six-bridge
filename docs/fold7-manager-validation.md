@@ -13,12 +13,15 @@
 ## 기기와 산출물
 
 - 기기 모델: `SM-F966N` (Fold7)
-- Android 버전: 미기록
-- 삼성 인터넷 버전: 미기록
+- Android 버전: Android 16 (API 36)
+- 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
 - 관리자 APK SHA-256:
-  `be0e8824264c304185ca08996c04acb03dce17ad949fd5f2c7ee08259a7f06ae`
+  `374ced51904ad4642a9cc50a1963185ec2bcd3c663aa7882a4b89de8bb86ada6`
 - 자동 검증 일자: 2026-07-26
+- 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
+- 개발용 증거:
+  `.local/evidence/20260726-154314-android-manager-phase1.log`
 - Fold7 최종 수동 실행 일시: 미기록
 - 실행자: 미기록
 
@@ -35,7 +38,7 @@
     `dist/sixbridge-manager-debug.apk` 패키징 완료
 - [x] `shasum -a 256 dist/sixbridge-manager-debug.apk`
   - 증거: 패키징 출력과 독립 실행 hash가
-    `be0e8824264c304185ca08996c04acb03dce17ad949fd5f2c7ee08259a7f06ae`로
+    `374ced51904ad4642a9cc50a1963185ec2bcd3c663aa7882a4b89de8bb86ada6`로
     일치하고 fresh build APK와 byte-for-byte 동일
 - [x] Git 제외 경계
   - 증거: `git check-ignore -v`로 `dist/`, `**/build/`, Room 임시 schema,
@@ -44,6 +47,68 @@
 - [x] `:android-manager:connectedDebugAndroidTest`
   - 증거: debug test Activity를 비공개로 병합한 APK로 Fold7에서 10/10 통과,
     failures/errors/skipped 0
+
+## Task 12 개발용 무선 ADB 확인
+
+이 절의 체크는 개발용 설치와 읽기 전용 상태 확인 결과다. 아래 Fold7 완료
+조건과 최종 무ADB 사용자 흐름을 대신하지 않는다.
+
+- [x] 지정 Fold7의 모델·Android·삼성 인터넷 버전을 읽었다.
+  - 결과: `SM-F966N`, Android 16/API 36, 삼성 인터넷 `30.0.0.67`
+- [x] 검증한 debug 관리자 APK를 `adb install -r`로 설치하고 MainActivity를
+  cold start했다.
+  - 결과: 설치 `Success`, Activity `Status: ok`, 시작 시간 712ms
+  - 설치 package: `dev.sixbridge.manager` version `0.1.0`, versionCode `1`
+- [x] 관리자 package 권한과 프로세스 오류를 확인했다.
+  - 결과: 세 보안 경계 권한 중 `REQUEST_INSTALL_PACKAGES`는 존재하고
+    `INTERNET`, `QUERY_ALL_PACKAGES`는 없었다. 관리자 PID의 최근
+    logcat에 `FATAL EXCEPTION`과 `AndroidRuntime` 오류가 없었다.
+- [x] 공개 확장 discovery query에서 SIX Bridge 규격 Activity 후보 5개를
+  확인했다.
+  - 결과: 설치 versionCode는 `dncif...` 14, `fdac...` 3, `iefg...` 2,
+    `lnea...` 2, `odgob...` 4였다.
+  - 관리자의 검증·정렬을 거친 홈 catalog 표시는 아래 별도 항목에서
+    확인했다.
+- [x] repository와 로컬 산출물에서 설치 정책용 bundle 후보를 조사했다.
+  - `compatible` 신규: `fche...` v2 또는 `meem...` v2
+  - `partial` 신규: MediaNab `ommj...` v2
+  - 증가 versionCode 업데이트 후보: 설치 `odgob...` v4, bundle v8
+  - 같은 versionCode 차단 후보: `dnc...` v14/v14, `fdac...` v3/v3,
+    `iefg...` v2/v2
+  - 위 신규·partial·업데이트·같은 버전 후보 5개의 bundle/CRX3/wrapper
+    결합 계약은 `sixbridge verify-build`로 모두 통과했다.
+  - 모든 조사 대상 dist bundle의 signer 지문은 같지만 설치 APK signer와의
+    실제 정책 비교는 관리자 검토 화면에서 확인해야 한다.
+- [ ] 다른 signer의 실기기 차단 fixture를 확인했다.
+  - repository, `fixtures/`, `dist/`, `.local/`에서 별도 signer bundle을
+    찾지 못했다.
+  - 현재 `.local/` 키를 바꾸지 않는다. 후속 생성이 필요하면 격리된 임시
+    workspace에 입력과 profile을 두고
+    `sixbridge --workspace <격리-workspace> build ...`를 실행해 별도
+    `.local/keystore`로 만든 뒤 package·descriptor·signer 계약을 다시
+    검증해야 한다.
+- [x] 관리자 홈에서 기존 래퍼의 catalog 표시와 제거 버튼을 확인했다.
+  - 결과: 공개 discovery로 찾은 래퍼가 카드로 표시되고 각 카드에 `제거`
+    동작이 제공됐다.
+
+### 제거 직후 상태 전파 회귀
+
+- 최초 실기기 제거에서 Android 시스템 제거 화면과 실제 package 삭제는
+  정상 동작했다.
+  - 대상: `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd`
+  - 증거: `pm path` 결과가 비었고 관리자 목록에서도 카드가 사라졌다.
+- 삭제 직후 관리자 복귀에서는 PackageManager의 이전 설치 상태를 한 번만
+  읽어 `제거가 취소되었거나...`라고 잘못 표시했다.
+- `DefaultUninstallCoordinator`가 최대 0.8초 동안 실제 package 소멸 조건을
+  재확인하도록 수정했다.
+  - 회귀 테스트는 첫 조회 `설치됨`, 다음 조회 `없음`을 재현하며 수정 전
+    `CancelledOrStillInstalled`, 수정 후 `Removed`를 확인했다.
+  - Android unit 219건, lint, assemble, 전체 Gradle 74 task, Node 89건,
+    Android manifest·distribution 계약이 통과했다.
+- 수정된 관리자 APK를 Fold7에 업데이트하고 조사 중 제거했던 스마트
+  컨텍스트 메뉴 래퍼를 같은 APK로 복구했다.
+- 수정 후 제거 성공 메시지와 목록 정리는 사용자 재확인 전까지 완료로
+  표시하지 않는다.
 
 ## Fold7 완료 조건
 
@@ -91,5 +156,8 @@
 
 ## 실행 결과
 
-아직 Task 12 Fold7 최종 검증을 실행하지 않았다. 위 수동 항목은 모두
-미체크 상태로 유지한다.
+Task 12의 개발용 ADB 설치·기동·package query·fixture 조사와 관리자 홈
+catalog 표시는 확인했다. 표준 Android 제거 자체도 실제 package 소멸까지
+확인했으며, 제거 직후 잘못된 취소 안내를 수정한 관리자 APK를 다시
+설치했다. 수정 후 제거 안내의 최종 사용자 재확인과 나머지 무ADB 항목은
+미완료 상태로 유지한다.
