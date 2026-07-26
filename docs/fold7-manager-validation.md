@@ -17,13 +17,18 @@
 - 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
 - 관리자 APK SHA-256:
-  `374ced51904ad4642a9cc50a1963185ec2bcd3c663aa7882a4b89de8bb86ada6`
+  `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`
 - 자동 검증 일자: 2026-07-26
 - 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
 - 개발용 증거:
   `.local/evidence/20260726-154314-android-manager-phase1.log`
-- Fold7 최종 수동 실행 일시: 미기록
-- 실행자: 미기록
+- Task 5 제거·아이콘 증거:
+  `.local/evidence/20260726-182158-manager-uninstall-icons.log`
+- Task 5 Home screenshot:
+  `.local/evidence/manager-uninstall-icons-home.png`
+  (`107e57b98f71f0e29cc291e2a25c63850e45e74082ed45af8d224a1aee6666da`)
+- Fold7 Task 5 실행 일시: 2026-07-26 18:18~18:37 KST
+- 실행자: 사용자(제거 확인·취소·승인), Codex(설치·읽기 전용 증거)
 
 ## 자동 검증
 
@@ -34,11 +39,12 @@
   - 증거: Gradle 74 task 성공, Node 89/89 통과, 기존 shell/mobile conversion
     통과, Android manifest와 distribution 계약 `PASS`
 - [x] `./scripts/package-manager-debug.sh`
-  - 증거: 내부 전체 검증 성공 뒤
+  - 증거: Gradle 74/74 task, Android unit 259/259, Node 89/89,
+    shell·conversion·manifest·distribution 계약 통과 뒤
     `dist/sixbridge-manager-debug.apk` 패키징 완료
 - [x] `shasum -a 256 dist/sixbridge-manager-debug.apk`
   - 증거: 패키징 출력과 독립 실행 hash가
-    `374ced51904ad4642a9cc50a1963185ec2bcd3c663aa7882a4b89de8bb86ada6`로
+    `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`로
     일치하고 fresh build APK와 byte-for-byte 동일
 - [x] Git 제외 경계
   - 증거: `git check-ignore -v`로 `dist/`, `**/build/`, Room 임시 schema,
@@ -91,14 +97,18 @@
   - 결과: 공개 discovery로 찾은 래퍼가 카드로 표시되고 각 카드에 `제거`
     동작이 제공됐다.
 
-### 제거 직후 상태 전파 회귀
+### 제거 권한 누락과 상태 전파 회귀
 
 - 최초 실기기 제거에서 Android 시스템 제거 화면과 실제 package 삭제는
   정상 동작했다.
   - 대상: `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd`
   - 증거: `pm path` 결과가 비었고 관리자 목록에서도 카드가 사라졌다.
+- 제거 화면 실행 실패의 근본 원인은 관리자 manifest에
+  `REQUEST_DELETE_PACKAGES`가 누락된 것이었다. ADB shell과 관리자 UI는
+  제거 요청의 호출 주체가 서로 달라 ADB shell 결과만으로 관리자 권한을
+  검증할 수 없었다.
 - 삭제 직후 관리자 복귀에서는 PackageManager의 이전 설치 상태를 한 번만
-  읽어 `제거가 취소되었거나...`라고 잘못 표시했다.
+  읽어 `제거가 취소되었거나...`라고 잘못 표시하는 보조 회귀가 있었다.
 - `DefaultUninstallCoordinator`가 최대 0.8초 동안 실제 package 소멸 조건을
   재확인하도록 수정했다.
   - 회귀 테스트는 첫 조회 `설치됨`, 다음 조회 `없음`을 재현하며 수정 전
@@ -107,8 +117,46 @@
     Android manifest·distribution 계약이 통과했다.
 - 수정된 관리자 APK를 Fold7에 업데이트하고 조사 중 제거했던 스마트
   컨텍스트 메뉴 래퍼를 같은 APK로 복구했다.
-- 수정 후 제거 성공 메시지와 목록 정리는 사용자 재확인 전까지 완료로
-  표시하지 않는다.
+- 수정 후 제거 성공과 목록 정리는 아래 Task 5 사용자 절차와 package
+  재조회로 다시 확인했다.
+
+### Task 5 제거 수동 재검증
+
+- [x] 비활성 스마트 컨텍스트 메뉴 v2의 표준 제거 화면에서 취소했다.
+  - 사용자 확인: 시스템 제거 화면이 표시됐고 취소 뒤 관리자 상태와
+    `dev.sixbridge.ext.lneaoklobohnoncgckmbbjfiajgpbdde` versionCode 2
+    카드가 유지됐다.
+  - 읽기 전용 확인: 취소 뒤 v2 package와 기존 wrapper 5개가 모두 유지됐다.
+- [x] 같은 v2의 제거를 승인했다.
+  - 사용자 확인: 관리자에서 v2 카드가 사라졌고 삼성 인터넷 Add-ons에서도
+    해당 항목이 사라졌다.
+  - 읽기 전용 확인: v2 package는 없고 현재 스마트 컨텍스트 메뉴
+    `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` versionCode 14는
+    설치 상태로 유지됐다.
+- [x] Video Download to NAS의 표준 제거 화면에서 취소했다.
+  - 사용자 확인: `dev.sixbridge.ext.iefgkdhgegchhlhcjfhcbbelkmpklmhd`
+    versionCode 2 카드에서 표준 제거 화면이 표시됐고 취소 뒤 카드가 유지됐다.
+  - 읽기 전용 확인: 취소 뒤 같은 package와 versionCode 2가 유지됐다.
+- [x] 설치 카드에 실제 CRX 아이콘과 fallback이 표시됐다.
+  - screenshot 확인: Video Download to NAS의 구름 artwork와 스마트 컨텍스트
+    메뉴 v2의 돋보기 artwork는 실제 아이콘이었다.
+  - SIX Bridge Technical Gate는 이름 첫 글자인 보라색 `S` fallback을
+    표시했다.
+- [x] 관리자 재시작 뒤 제거된 v2가 package 목록에 재등장하지 않았다.
+  - `am force-stop`과 `am start` 뒤 설치 wrapper는 현재 스마트 컨텍스트 메뉴
+    v14, AI 레시피 추출기 v3, Video Download to NAS v2, SIX Bridge Technical
+    Gate v4의 4개였다.
+  - v2 `dev.sixbridge.ext.lneaoklobohnoncgckmbbjfiajgpbdde`의 `pm path`는
+    비었고 현재 v14와 Video package는 유지됐다.
+  - 재시작 시점 화면이 잠겨 fresh Home screenshot은 확보하지 못했다.
+    카드 소멸·Video 카드 유지는 사용자 확인, package 상태는 ADB 읽기 전용
+    확인으로 구분한다.
+  - 재시작 관리자 PID 범위 redaction log 107줄에서
+    `FATAL EXCEPTION`·`AndroidRuntime` 표식은 0건이었다.
+- [x] 관리자 권한 최소 계약을 확인했다.
+  - `REQUEST_DELETE_PACKAGES`와 `REQUEST_INSTALL_PACKAGES`는 존재했다.
+  - `DELETE_PACKAGES`, `INTERNET`, `QUERY_ALL_PACKAGES`는 요청 권한에서
+    부재했다.
 
 ## Fold7 완료 조건
 
@@ -134,9 +182,10 @@
 6. - [ ] 다른 signer와 같거나 낮은 versionCode가 차단된다.
    - 절차: signer 불일치, 같은 versionCode, 낮은 versionCode fixture 각각 선택
    - 증거: 설치 버튼 차단과 서로 구분되는 한글 안내
-7. - [ ] 표준 제거와 실제 목록 정리가 동작한다.
+7. - [x] 표준 제거와 실제 목록 정리가 동작한다.
    - 절차: 제거 취소 1회, 제거 성공 1회, 관리자 복귀
-   - 증거: 표준 Android 제거 화면과 package 재조회 뒤 목록 변화
+   - 증거: 스마트 컨텍스트 메뉴 v2의 취소·성공, Video Download to NAS의
+     취소, package 재조회와 관리자·삼성 인터넷 Add-ons 목록 변화
 8. - [ ] 삼성 인터넷의 전체 Add-ons 화면을 열 수 있다.
    - 절차: 홈의 `삼성 Add-ons 열기`
    - 증거: `internet://extension`으로 열린 전체 Add-ons 목록
@@ -159,5 +208,8 @@
 Task 12의 개발용 ADB 설치·기동·package query·fixture 조사와 관리자 홈
 catalog 표시는 확인했다. 표준 Android 제거 자체도 실제 package 소멸까지
 확인했으며, 제거 직후 잘못된 취소 안내를 수정한 관리자 APK를 다시
-설치했다. 수정 후 제거 안내의 최종 사용자 재확인과 나머지 무ADB 항목은
-미완료 상태로 유지한다.
+설치했다. Task 5에서 표준 제거 취소·승인·다른 wrapper 취소, 실제 아이콘과
+fallback, v2 package·관리자 카드·삼성 인터넷 Add-ons 항목 정리, 관리자
+재시작 뒤 package 정리 유지와 치명 오류 부재를 확인했다. 위에 체크하지 않은
+나머지 무ADB 설치·업데이트·차단·삼성 인터넷 재시작 항목은 미완료 상태로
+유지한다.
