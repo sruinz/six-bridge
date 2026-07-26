@@ -19,11 +19,25 @@ class CatalogReconciler {
 
         return CatalogReconciliation(
             records = installedWrappers.map { installed ->
-                recordsByPackage[installed.packageName]?.copy(
+                val existing = recordsByPackage[installed.packageName]
+                val identityChanged = existing != null && (
+                    existing.extensionId != installed.extensionId ||
+                        existing.installedVersionCode != installed.versionCode ||
+                        existing.signerSha256 != installed.signerSha256
+                    )
+                existing?.copy(
                     extensionId = installed.extensionId,
                     name = installed.name,
                     installedVersionCode = installed.versionCode,
                     signerSha256 = installed.signerSha256,
+                    compatibilityStatus = if (identityChanged) {
+                        "UNKNOWN"
+                    } else {
+                        existing.compatibilityStatus
+                    },
+                    reportJson = existing.reportJson.takeUnless { identityChanged },
+                    lastVerifiedAtEpochMillis = existing.lastVerifiedAtEpochMillis
+                        .takeUnless { identityChanged } ?: 0,
                 ) ?: CatalogRecord(
                     packageName = installed.packageName,
                     extensionId = installed.extensionId,

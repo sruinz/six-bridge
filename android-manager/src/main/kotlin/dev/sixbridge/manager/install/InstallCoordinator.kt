@@ -101,23 +101,34 @@ class InstallCoordinator(
         }
     }
 
-    suspend fun restore() = mutex.withLock {
+    suspend fun restore(bundle: ImportedBundle? = null) = mutex.withLock {
+        val pending = pendingStore.load()
+        if (bundle != null &&
+            pending?.importToken == bundle.token &&
+            pending.packageName == bundle.verifiedApk.packageName &&
+            matchesRetainedWrapper(bundle)
+        ) {
+            activeBundle = bundle
+        }
         restoreTerminalResultLocked()
         if (pendingStore.loadTerminalResult() == null) {
             restoreMissingSessionLocked()
         }
     }
 
-    suspend fun onPackageInstallerResult(result: PackageInstallResult) = mutex.withLock {
+    suspend fun onPackageInstallerResult(result: PackageInstallResult): Boolean = mutex.withLock {
         if (result is PackageInstallResult.PendingUserAction) {
             val pending = pendingStore.load()
-            if (pending?.sessionId == result.sessionId) {
+            val accepted = pending?.sessionId == result.sessionId
+            if (accepted) {
                 mutableState.value = InstallState.AwaitingUserApproval(result.sessionId)
             }
-            return@withLock
+            return@withLock accepted
         }
+        val accepted = pendingStore.load()?.sessionId == result.sessionId
         runCatching { pendingStore.recordTerminalResult(result, clock()) }
         restoreTerminalResultLocked()
+        accepted
     }
 
     suspend fun cancel() = mutex.withLock {

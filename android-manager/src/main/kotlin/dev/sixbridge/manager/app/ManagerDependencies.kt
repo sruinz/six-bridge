@@ -19,9 +19,13 @@ import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.PackageManagerInstalledWrapperRepository
 import java.io.File
 import java.time.Clock
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 class ManagerDependencies private constructor(
     val repository: ManagerRepository,
+    private val applicationScope: CoroutineScope,
 ) {
     companion object {
         @Volatile
@@ -42,6 +46,9 @@ class ManagerDependencies private constructor(
             val installedWrappers = PackageManagerInstalledWrapperRepository(application.packageManager)
             val pendingStore = SharedPreferencesPendingInstallStore(application)
             val installGateway = AndroidPackageInstallGateway(application)
+            val verifier = AndroidWrapperVerifier(
+                AndroidArchiveInspector(application.packageManager),
+            )
             val installCoordinator = InstallCoordinator(
                 policy = InstallPolicy(),
                 gateway = installGateway,
@@ -51,29 +58,44 @@ class ManagerDependencies private constructor(
             )
             val importer = BundleImportService(
                 source = ContentResolverBundleSource(application.contentResolver),
-                verifier = AndroidWrapperVerifier(AndroidArchiveInspector(application.packageManager)),
+                verifier = verifier,
                 cacheDirectory = application.cacheDir,
             )
             val uninstall = DefaultUninstallCoordinator(installedWrappers, catalog)
-            return ManagerDependencies(
-                DefaultManagerRepository(
-                    importer = importer,
-                    catalogStore = catalog,
-                    installedWrappers = installedWrappers,
-                    reconciler = CatalogReconciler(),
-                    startupCleanup = StartupCleanup(
-                        importRoot = File(application.cacheDir, "imports"),
-                        installGateway = installGateway,
-                        pendingStore = pendingStore,
-                        clock = Clock.systemUTC(),
-                    ),
-                    installCoordinator = installCoordinator,
-                    pendingStore = pendingStore,
-                    uninstallCoordinator = uninstall,
-                    samsungBrowserNavigator =
-                        AndroidSamsungBrowserNavigator(application.packageManager),
-                ),
+            val catalogPublisher = CatalogPublisher(
+                catalog = catalog,
+                installedWrappers = installedWrappers,
+                reconciler = CatalogReconciler(),
             )
+            val repository = DefaultManagerRepository(
+                importer = importer,
+                retainedImports = RetainedImportStore(
+                    File(application.cacheDir, "imports"),
+                    verifier,
+                ),
+                startupCleanup = StartupCleanup(
+                    importRoot = File(application.cacheDir, "imports"),
+                    installGateway = installGateway,
+                    pendingStore = pendingStore,
+                    clock = Clock.systemUTC(),
+                ),
+                installCoordinator = installCoordinator,
+                pendingStore = pendingStore,
+                uninstallCoordinator = uninstall,
+                samsungBrowserNavigator =
+                    AndroidSamsungBrowserNavigator(application.packageManager),
+                catalogPublisher = catalogPublisher,
+            )
+            val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            repository.start(applicationScope, catalog)
+            return ManagerDependencies(repository, applicationScope)
         }
+    }
+}
+
+class SixBridgeManagerApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        ManagerDependencies.create(this)
     }
 }

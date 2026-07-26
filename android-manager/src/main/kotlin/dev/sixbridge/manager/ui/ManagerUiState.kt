@@ -84,6 +84,7 @@ sealed interface ManagerAction {
     data object CancelReview : ManagerAction
     data class Remove(val packageName: String) : ManagerAction
     data object OpenSamsungAddOns : ManagerAction
+    data object OpenUnknownSourcesSettings : ManagerAction
     data object ReturnedToForeground : ManagerAction
     data object DismissMessage : ManagerAction
 }
@@ -92,13 +93,19 @@ enum class LaunchDestination {
     UNKNOWN_SOURCES_SETTINGS,
     UNINSTALL,
     SAMSUNG_ADD_ONS,
+    SYSTEM_INSTALL_CONFIRMATION,
 }
 
 sealed interface ManagerEffect {
     class LaunchIntent(
         val destination: LaunchDestination,
         val intentFactory: () -> Intent,
+        val installSessionId: Int? = null,
     ) : ManagerEffect {
-        constructor(launch: RepositoryLaunch) : this(launch.destination, launch.intentFactory)
+        constructor(launch: RepositoryLaunch) : this(
+            launch.destination,
+            launch.intentFactory,
+            launch.installSessionId,
+        )
     }
 }

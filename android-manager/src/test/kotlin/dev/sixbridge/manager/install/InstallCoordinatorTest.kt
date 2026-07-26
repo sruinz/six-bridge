@@ -651,6 +651,27 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `process recreation rebinds the verified retained bundle before consuming terminal success`() =
+        runBlocking {
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Success(SESSION_ID),
+                terminalAtEpochMillis = FINISHED_AT,
+            )
+            val fixture = fixture(
+                pending = pendingInstall(),
+                terminalResult = terminal,
+            )
+            fixture.installedWrappers.installed = installedWrapper()
+
+            fixture.coordinator.restore(fixture.bundle)
+
+            assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
+            assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
+            assertNull(fixture.pendingStore.record)
+            assertNull(fixture.pendingStore.terminalResult)
+        }
+
+    @Test
     fun `keeps a recently completed session pending until its result can be delivered`() {
         val pending = PendingInstall(
             sessionId = SESSION_ID,

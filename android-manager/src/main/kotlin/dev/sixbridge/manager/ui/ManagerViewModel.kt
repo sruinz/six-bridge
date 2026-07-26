@@ -15,12 +15,13 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -29,53 +30,80 @@ class ManagerViewModel(
     private val savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
-    private val mutableEffects = MutableSharedFlow<ManagerEffect>(extraBufferCapacity = 8)
+    private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
     private var routeOperation: Job? = null
     private var operationGeneration = 0L
     private var pendingUninstallPackage: String? = null
     private var initialized = false
     private var lastInstallState: InstallState? = null
+    private var ownedReviewToken: String? = null
+    private val pendingReviewDiscards = linkedSetOf<String>()
+    private var completedReplacementCleanupGeneration = -1L
+    private var suppressedInstallTerminal: InstallState? = null
+    private var replacementCancelGeneration: Long? = null
+    private var deferredReplacementTerminal: Pair<Long, InstallState>? = null
 
     val state: StateFlow<ManagerUiState> = mutableState.asStateFlow()
-    val effects: SharedFlow<ManagerEffect> = mutableEffects.asSharedFlow()
+    val effects: Flow<ManagerEffect> = effectChannel.receiveAsFlow().filter(::isEffectCurrent)
 
     init {
         restoreAndInitialize()
         observeCatalog()
         observeInstallState()
+        observeRepositoryLaunches()
     }
 
     fun accept(action: ManagerAction) {
         when (action) {
-            is ManagerAction.ImportSelected -> importSelected(action.uri)
+            is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
             is ManagerAction.Remove -> remove(action.packageName)
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
+            ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
             ManagerAction.ReturnedToForeground -> returnedToForeground()
             ManagerAction.DismissMessage -> mutableState.update { it.copy(message = null) }
         }
     }
 
-    internal fun importSelected(request: Any) {
+    internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
+        moveOwnedReviewToPendingDiscard()
         val generation = replaceRouteOperation()
-        mutableState.update {
-            it.copy(
-                route = ManagerRoute.Home,
-                importState = ImportUiState.Importing,
-                message = null,
-            )
-        }
+        savedStateHandle[REVIEW_TOKEN_KEY] = null
         routeOperation = viewModelScope.launch {
+            val cleaned = try {
+                cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return@launch
+            }
+            if (!cleaned) return@launch
+            if (generation != operationGeneration) return@launch
+            completedReplacementCleanupGeneration = generation
+            discardPendingReviews()
+            if (generation != operationGeneration) return@launch
+            mutableState.update {
+                it.copy(
+                    route = ManagerRoute.Home,
+                    importState = ImportUiState.Importing,
+                    message = null,
+                )
+            }
             val result = try {
-                repository.importRequest(request)
+                importOperation()
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
                 ManagerImportResult.Failure(ImportFailure(ImportFailureCode.SOURCE_UNREADABLE))
             }
-            if (generation != operationGeneration) return@launch
+            if (generation != operationGeneration) {
+                if (result is ManagerImportResult.Success) {
+                    repository.discardReview(result.review.token)
+                }
+                return@launch
+            }
             when (result) {
                 is ManagerImportResult.Success -> showReview(result.review)
                 is ManagerImportResult.Failure -> mutableState.update {
@@ -90,6 +118,7 @@ class ManagerViewModel(
     }
 
     private fun restoreAndInitialize() {
+        val generation = operationGeneration
         viewModelScope.launch {
             val savedToken = savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
             val savedSession = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
@@ -101,6 +130,10 @@ class ManagerViewModel(
                 null
             }
             initialized = true
+            if (generation != operationGeneration) {
+                restored?.review?.token?.let(::queuePendingReviewDiscard)
+                return@launch
+            }
             if (restored?.review != null) {
                 showReview(restored.review)
             } else {
@@ -128,6 +161,14 @@ class ManagerViewModel(
                 val changed = installState != lastInstallState
                 lastInstallState = installState
                 mutableState.update { it.copy(installState = installState) }
+                if (installState.isTerminalState()) {
+                    replacementCancelGeneration?.let { generation ->
+                        deferredReplacementTerminal = generation to installState
+                        return@collect
+                    }
+                }
+                val suppressedTerminal = installState == suppressedInstallTerminal
+                if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
                     is InstallState.WritingSession -> saveSessionIfInitialized(installState.sessionId)
                     is InstallState.AwaitingUserApproval -> saveSessionIfInitialized(installState.sessionId)
@@ -141,44 +182,29 @@ class ManagerViewModel(
                                 ),
                             )
                         }
-                        mutableEffects.emit(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
+                        enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
                     }
                     is InstallState.Installed -> {
-                        clearSavedReviewAndSession()
-                        mutableState.update {
-                            it.copy(
-                                route = ManagerRoute.Report(installState.packageName),
-                                importState = ImportUiState.Idle,
-                                message = null,
-                            )
-                        }
+                        if (suppressedTerminal) return@collect
+                        applyInstallTerminal(installState)
                     }
                     InstallState.Cancelled -> {
-                        clearSavedReviewAndSession()
-                        mutableState.update {
-                            it.copy(
-                                route = ManagerRoute.Home,
-                                importState = ImportUiState.Idle,
-                                message = UserMessage(
-                                    UserMessageKind.INSTALL_CANCELLED,
-                                    "시스템 설치가 취소되었습니다.",
-                                    RecoveryAction.SELECT_ANOTHER_FILE,
-                                ),
-                            )
-                        }
+                        if (!suppressedTerminal) applyInstallTerminal(installState)
                     }
                     is InstallState.Failed -> {
-                        clearSavedReviewAndSession()
-                        mutableState.update {
-                            it.copy(
-                                route = ManagerRoute.Home,
-                                importState = ImportUiState.Idle,
-                                message = installFailureMessage(installState.code),
-                            )
-                        }
+                        if (suppressedTerminal) return@collect
+                        applyInstallTerminal(installState)
                     }
                     InstallState.Idle -> Unit
                 }
+            }
+        }
+    }
+
+    private fun observeRepositoryLaunches() {
+        viewModelScope.launch {
+            repository.launches.collect { launch ->
+                enqueueEffect(ManagerEffect.LaunchIntent(launch))
             }
         }
     }
@@ -214,16 +240,30 @@ class ManagerViewModel(
             return
         }
         val generation = operationGeneration
-        viewModelScope.launch {
+        routeOperation = viewModelScope.launch {
             repository.install(ready.review, ready.partialConfirmed)
             if (generation != operationGeneration) return@launch
         }
     }
 
     private fun cancelReview() {
-        val token = (mutableState.value.importState as? ImportUiState.ReviewReady)?.review?.token
-        replaceRouteOperation()
-        if (token != null) repository.discardReview(token)
+        moveOwnedReviewToPendingDiscard()
+        val generation = replaceRouteOperation()
+        routeOperation = viewModelScope.launch {
+            val cleaned = try {
+                cancelInstallForRoute(generation, suppressTerminalOnSuccess = false)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return@launch
+            }
+            if (cleaned &&
+                generation == operationGeneration
+            ) {
+                completedReplacementCleanupGeneration = generation
+                discardPendingReviews()
+            }
+        }
         clearSavedReviewAndSession()
         mutableState.update {
             it.copy(
@@ -236,7 +276,7 @@ class ManagerViewModel(
 
     private fun remove(packageName: String) {
         pendingUninstallPackage = packageName
-        mutableEffects.tryEmit(ManagerEffect.LaunchIntent(repository.uninstall(packageName)))
+        enqueueEffect(ManagerEffect.LaunchIntent(repository.uninstall(packageName)))
     }
 
     private fun returnedToForeground() {
@@ -245,7 +285,11 @@ class ManagerViewModel(
             pendingUninstallPackage = null
             val generation = operationGeneration
             viewModelScope.launch {
-                val outcome = repository.reconcileUninstall(uninstallPackage)
+                val outcome = try {
+                    repository.reconcileUninstall(uninstallPackage)
+                } finally {
+                    repository.reconcileCatalog()
+                }
                 if (generation != operationGeneration) return@launch
                 mutableState.update {
                     it.copy(
@@ -266,15 +310,21 @@ class ManagerViewModel(
             }
             return
         }
-        if (mutableState.value.installState == InstallState.UnknownSourcesPermissionRequired) {
-            viewModelScope.launch { repository.resumeAfterUnknownSourcesSettings() }
+        viewModelScope.launch {
+            try {
+                if (mutableState.value.installState == InstallState.UnknownSourcesPermissionRequired) {
+                    repository.resumeAfterUnknownSourcesSettings()
+                }
+            } finally {
+                repository.reconcileCatalog()
+            }
         }
     }
 
     private fun openSamsungAddOns() {
         when (val result = repository.samsungAddOns()) {
             is RepositoryNavigationResult.Launch ->
-                mutableEffects.tryEmit(ManagerEffect.LaunchIntent(result.effect))
+                enqueueEffect(ManagerEffect.LaunchIntent(result.effect))
             RepositoryNavigationResult.SamsungBrowserMissing -> mutableState.update {
                 it.copy(
                     message = UserMessage(
@@ -296,7 +346,13 @@ class ManagerViewModel(
         }
     }
 
+    private fun openUnknownSourcesSettings() {
+        if (mutableState.value.installState != InstallState.UnknownSourcesPermissionRequired) return
+        enqueueEffect(ManagerEffect.LaunchIntent(repository.unknownSourcesSettings()))
+    }
+
     private fun showReview(review: ReviewBundle) {
+        ownedReviewToken = review.token
         savedStateHandle[REVIEW_TOKEN_KEY] = review.token
         mutableState.update {
             it.copy(
@@ -318,8 +374,116 @@ class ManagerViewModel(
     }
 
     private fun clearSavedReviewAndSession() {
+        ownedReviewToken = null
         savedStateHandle[REVIEW_TOKEN_KEY] = null
         savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+    }
+
+    private fun moveOwnedReviewToPendingDiscard() {
+        ownedReviewToken?.let(pendingReviewDiscards::add)
+        ownedReviewToken = null
+    }
+
+    private fun queuePendingReviewDiscard(token: String) {
+        if (token == ownedReviewToken) return
+        pendingReviewDiscards += token
+        if (completedReplacementCleanupGeneration == operationGeneration) {
+            discardPendingReviews()
+        }
+    }
+
+    private fun discardPendingReviews() {
+        val iterator = pendingReviewDiscards.iterator()
+        while (iterator.hasNext()) {
+            repository.discardReview(iterator.next())
+            iterator.remove()
+        }
+    }
+
+    private suspend fun cancelInstallForRoute(
+        generation: Long,
+        suppressTerminalOnSuccess: Boolean,
+    ): Boolean {
+        val previous = repository.installState.value
+        val replacingActiveInstall =
+            previous == InstallState.UnknownSourcesPermissionRequired ||
+            previous is InstallState.WritingSession ||
+            previous is InstallState.AwaitingUserApproval
+        if (replacingActiveInstall) replacementCancelGeneration = generation
+        val cleaned = try {
+            repository.cancelInstall()
+        } catch (error: CancellationException) {
+            clearReplacementCancelMarker(generation)
+            throw error
+        } catch (error: Exception) {
+            clearReplacementCancelMarker(generation)?.let(::applyInstallTerminal)
+            throw error
+        }
+        if (!replacingActiveInstall || replacementCancelGeneration != generation) return cleaned
+
+        val deferred = clearReplacementCancelMarker(generation)
+        if (cleaned && suppressTerminalOnSuccess) {
+            if (deferred == null) {
+                repository.installState.value
+                    .takeIf(InstallState::isTerminalState)
+                    ?.let { suppressedInstallTerminal = it }
+            }
+        } else {
+            deferred?.let(::applyInstallTerminal)
+        }
+        return cleaned
+    }
+
+    private fun clearReplacementCancelMarker(generation: Long): InstallState? {
+        if (replacementCancelGeneration != generation) return null
+        val deferred = deferredReplacementTerminal
+            ?.takeIf { it.first == generation }
+            ?.second
+        replacementCancelGeneration = null
+        deferredReplacementTerminal = null
+        return deferred
+    }
+
+    private fun applyInstallTerminal(installState: InstallState) {
+        clearSavedReviewAndSession()
+        mutableState.update {
+            when (installState) {
+                is InstallState.Installed -> it.copy(
+                    route = ManagerRoute.Report(installState.packageName),
+                    importState = ImportUiState.Idle,
+                    message = null,
+                )
+                InstallState.Cancelled -> it.copy(
+                    route = ManagerRoute.Home,
+                    importState = ImportUiState.Idle,
+                    message = UserMessage(
+                        UserMessageKind.INSTALL_CANCELLED,
+                        "시스템 설치가 취소되었습니다.",
+                        RecoveryAction.SELECT_ANOTHER_FILE,
+                    ),
+                )
+                is InstallState.Failed -> it.copy(
+                    route = ManagerRoute.Home,
+                    importState = ImportUiState.Idle,
+                    message = installFailureMessage(installState.code),
+                )
+                else -> it
+            }
+        }
+    }
+
+    private fun enqueueEffect(effect: ManagerEffect) {
+        effectChannel.trySend(effect)
+    }
+
+    private fun isEffectCurrent(effect: ManagerEffect): Boolean {
+        if (effect !is ManagerEffect.LaunchIntent ||
+            effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
+        ) {
+            return true
+        }
+        val sessionId = effect.installSessionId ?: return false
+        return repository.installState.value == InstallState.AwaitingUserApproval(sessionId)
     }
 
     companion object {
@@ -335,6 +499,9 @@ private fun CatalogRecord.toItem() = ManagedExtensionItem(
     installedVersionCode = installedVersionCode,
     compatibilityStatus = compatibilityStatus,
 )
+
+private fun InstallState.isTerminalState(): Boolean =
+    this is InstallState.Installed || this == InstallState.Cancelled || this is InstallState.Failed
 
 private fun importFailureMessage(code: ImportFailureCode): UserMessage = when (code) {
     ImportFailureCode.SOURCE_UNREADABLE,
