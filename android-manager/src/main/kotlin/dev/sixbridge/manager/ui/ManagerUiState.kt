@@ -18,6 +18,7 @@ data class ManagedExtensionItem(
     val packageName: String,
     val extensionId: String,
     val name: String,
+    val iconPng: ByteArray? = null,
     val installedVersionCode: Long,
     val compatibilityStatus: ContractCompatibilityStatus,
     val signerSha256: String = "",

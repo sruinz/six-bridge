@@ -8,6 +8,7 @@
     <string name="home_empty">설치된 확장 래퍼가 없습니다.</string>
     <string name="home_add_six">.six 파일 추가</string>
     <string name="extension_android_installed">Android package 설치됨</string>
+    <string name="extension_icon_description">%1$s 아이콘</string>
     <string name="extension_version_code">versionCode %1$d</string>
     <string name="extension_report">보고서</string>
     <string name="extension_remove">제거</string>

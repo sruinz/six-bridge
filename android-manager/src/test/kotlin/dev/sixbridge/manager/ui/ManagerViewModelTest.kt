@@ -18,6 +18,7 @@ import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
@@ -68,6 +69,10 @@ class ManagerViewModelTest {
         assertTrue(repository.initialized)
         assertEquals(ManagerRoute.Home, viewModel.state.value.route)
         assertEquals(listOf("확장"), viewModel.state.value.installed.map(ManagedExtensionItem::name))
+        assertContentEquals(
+            ICON,
+            viewModel.state.value.installed.single().iconPng,
+        )
     }
 
     @Test
@@ -1521,7 +1526,7 @@ class ManagerViewModelTest {
         packageName = packageName,
         extensionId = EXTENSION_ID,
         name = "확장",
-        iconPng = null,
+        iconPng = ICON,
         installedVersionCode = 1,
         signerSha256 = "a".repeat(64),
         compatibilityStatus = compatibilityStatus,
@@ -1567,6 +1572,7 @@ class ManagerViewModelTest {
         val EXTENSION_ID = "a".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
         val SECOND_PACKAGE = "$PACKAGE.second"
+        val ICON = byteArrayOf(1, 2, 3)
     }
 }
 

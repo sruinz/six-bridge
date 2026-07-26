@@ -1,5 +1,7 @@
 package dev.sixbridge.manager.ui
 
+import android.graphics.Bitmap
+import android.graphics.Color
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.getValue
@@ -24,6 +26,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.ManagerAppContent
 import dev.sixbridge.manager.app.ReviewBundle
+import java.io.ByteArrayOutputStream
 import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertEquals
@@ -66,6 +69,22 @@ class ManagerAppTest {
             actions,
         )
         assertEquals(1, addFileRequests)
+    }
+
+    @Test
+    fun home_displays_decoded_extension_icon() {
+        setHome(iconPng = pngBytes())
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertIsDisplayed()
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertDoesNotExist()
+    }
+
+    @Test
+    fun home_uses_name_initial_when_icon_is_missing() {
+        setHome(iconPng = null)
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
+        composeRule.onNodeWithText("테").assertIsDisplayed()
     }
 
     @Test
@@ -297,12 +316,14 @@ class ManagerAppTest {
     }
 
     private fun installedItem(
+        iconPng: ByteArray? = null,
         report: ContractCompatibilityReport? = compatibilityReport(),
         reportAvailability: ReportAvailability = ReportAvailability.AVAILABLE,
     ) = ManagedExtensionItem(
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
         name = "테스트 확장",
+        iconPng = iconPng,
         installedVersionCode = 7,
         compatibilityStatus = report?.status ?: ContractCompatibilityStatus.UNKNOWN,
         signerSha256 = "a".repeat(64),
@@ -340,6 +361,25 @@ class ManagerAppTest {
         sourceSha256 = "b".repeat(64),
         browserProfileSha256 = "c".repeat(64),
     )
+
+    private fun pngBytes(): ByteArray = ByteArrayOutputStream().use { output ->
+        Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLUE)
+        }.compress(Bitmap.CompressFormat.PNG, 100, output)
+        output.toByteArray()
+    }
+
+    private fun setHome(iconPng: ByteArray?) {
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    installed = listOf(installedItem(iconPng = iconPng)),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+    }
 
     private companion object {
         const val PACKAGE = "dev.sixbridge.ext.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

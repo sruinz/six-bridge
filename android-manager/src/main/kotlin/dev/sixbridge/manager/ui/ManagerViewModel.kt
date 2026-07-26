@@ -757,6 +757,7 @@ private fun CatalogRecord.toItem(): ManagedExtensionItem {
         packageName = packageName,
         extensionId = extensionId,
         name = name,
+        iconPng = iconPng,
         installedVersionCode = installedVersionCode,
         compatibilityStatus = report?.status ?: ContractCompatibilityStatus.UNKNOWN,
         signerSha256 = signerSha256,
