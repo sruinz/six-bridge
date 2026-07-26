@@ -87,14 +87,30 @@ class ManagerDatabaseTest {
             catalog.observe().first().map(CatalogRecord::packageName),
         )
 
-        verifyIdentityConditionalIconPreservesLatestColumns()
-        verifyIdentityConditionalIconRejectsChangedIdentity()
-        verifyIdentityConditionalIconInsertsDiscoveredRow()
     }
 
-    private suspend fun verifyIdentityConditionalIconPreservesLatestColumns() {
+    @Test
+    fun ensure_absent_identity_inserts_unknown_baseline() = runBlocking {
+        val discovered = record(
+            packageName = "dev.sixbridge.ext.discovered",
+            iconPng = null,
+            reportJson = null,
+        ).copy(
+            compatibilityStatus = "UNKNOWN",
+            lastVerifiedAtEpochMillis = 0,
+        )
+
+        val ensured = catalog.ensureDiscoveredIdentity(discovered)
+
+        assertEquals(discovered, ensured)
+        assertEquals(discovered, catalog.get(discovered.packageName))
+    }
+
+    @Test
+    fun ensure_same_identity_preserves_latest_verified_columns() = runBlocking {
         val discovered = record("dev.sixbridge.ext.atomic").copy(
             name = "Discovered",
+            iconPng = null,
             compatibilityStatus = "UNKNOWN",
             reportJson = null,
             lastVerifiedAtEpochMillis = 0,
@@ -107,17 +123,16 @@ class ManagerDatabaseTest {
         )
         catalog.replaceVerified(latest)
 
-        val stored = requireNotNull(
-            catalog.persistIconIfIdentity(discovered, byteArrayOf(7, 8, 9)),
-        )
+        val stored = catalog.ensureDiscoveredIdentity(discovered)
         assertEquals("Latest", stored.name)
+        assertArrayEquals(latest.iconPng, stored.iconPng)
         assertEquals("BLOCKED", stored.compatibilityStatus)
         assertEquals("{\"status\":\"BLOCKED\"}", stored.reportJson)
         assertEquals(999, stored.lastVerifiedAtEpochMillis)
-        assertArrayEquals(byteArrayOf(7, 8, 9), stored.iconPng)
     }
 
-    private suspend fun verifyIdentityConditionalIconRejectsChangedIdentity() {
+    @Test
+    fun ensure_changed_identity_replaces_with_unknown_baseline() = runBlocking {
         val current = record("dev.sixbridge.ext.changed")
         catalog.replaceVerified(current)
 
@@ -125,24 +140,31 @@ class ManagerDatabaseTest {
             current.copy(extensionId = "different"),
             current.copy(installedVersionCode = current.installedVersionCode + 1),
             current.copy(signerSha256 = "b".repeat(64)),
-        ).forEach { stale ->
-            assertNull(catalog.persistIconIfIdentity(stale, byteArrayOf(9)))
-            assertArrayEquals(current.iconPng, catalog.get(current.packageName)?.iconPng)
+        ).forEach { changed ->
+            val discovered = changed.copy(
+                name = "Discovered",
+                iconPng = null,
+                compatibilityStatus = "UNKNOWN",
+                reportJson = null,
+                lastVerifiedAtEpochMillis = 0,
+            )
+
+            val ensured = catalog.ensureDiscoveredIdentity(discovered)
+
+            assertEquals(discovered, ensured)
+            assertEquals(discovered, catalog.get(current.packageName))
         }
     }
 
-    private suspend fun verifyIdentityConditionalIconInsertsDiscoveredRow() {
-        val discovered = record(
-            packageName = "dev.sixbridge.ext.discovered",
-            iconPng = null,
-            reportJson = null,
-        )
+    @Test
+    fun delete_followed_by_late_icon_update_does_not_reinsert_row() = runBlocking {
+        val discovered = record(packageName = "dev.sixbridge.ext.deleted")
 
-        val stored = requireNotNull(
-            catalog.persistIconIfIdentity(discovered, byteArrayOf(3, 2, 1)),
-        )
-        assertEquals(discovered, stored.copy(iconPng = null))
-        assertArrayEquals(byteArrayOf(3, 2, 1), stored.iconPng)
+        catalog.ensureDiscoveredIdentity(discovered)
+        catalog.remove(discovered.packageName)
+
+        assertNull(catalog.persistIconIfIdentity(discovered.identity(), byteArrayOf(3, 2, 1)))
+        assertNull(catalog.get(discovered.packageName))
     }
 
     private fun record(

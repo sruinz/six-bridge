@@ -192,8 +192,11 @@ class CatalogReconcilerTest {
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
 
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord =
+            records.singleOrNull { it.packageName == discovered.packageName } ?: discovered
+
         override suspend fun persistIconIfIdentity(
-            discovered: CatalogRecord,
+            identity: CatalogIdentity,
             iconPng: ByteArray,
         ): CatalogRecord? = null
 

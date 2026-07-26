@@ -6,6 +6,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.crx.VerifiedCrx3
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.importer.ImportedBundle
@@ -1718,8 +1719,11 @@ class InstallCoordinatorTest {
             replaced = record
         }
 
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord =
+            replaced ?: discovered.also { replaced = it }
+
         override suspend fun persistIconIfIdentity(
-            discovered: CatalogRecord,
+            identity: CatalogIdentity,
             iconPng: ByteArray,
         ): CatalogRecord? = null
 

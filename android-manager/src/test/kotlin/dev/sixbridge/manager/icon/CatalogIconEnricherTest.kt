@@ -1,7 +1,9 @@
 package dev.sixbridge.manager.icon
 
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
+import dev.sixbridge.manager.catalog.identity
 import java.util.concurrent.CancellationException
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -27,7 +29,7 @@ class CatalogIconEnricherTest {
             PNG,
             (result as IconPersistenceResult.Stored).record.iconPng,
         )
-        assertContentEquals(PNG, catalog.persisted.single().iconPng)
+        assertEquals(record().identity(), catalog.persisted.single())
         assertEquals(listOf(PACKAGE), source.packages)
     }
 
@@ -179,20 +181,32 @@ class CatalogIconEnricherTest {
     private class RecordingCatalog(
         private val persistFailure: Exception? = null,
     ) : ManagerCatalog {
-        val persistAttempts = mutableListOf<CatalogRecord>()
-        val persisted = mutableListOf<CatalogRecord>()
+        val persistAttempts = mutableListOf<CatalogIdentity>()
+        val persisted = mutableListOf<CatalogIdentity>()
 
         override fun observe(): Flow<List<CatalogRecord>> = flowOf(emptyList())
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
 
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord = discovered
+
         override suspend fun persistIconIfIdentity(
-            discovered: CatalogRecord,
+            identity: CatalogIdentity,
             iconPng: ByteArray,
         ): CatalogRecord {
-            persistAttempts += discovered
+            persistAttempts += identity
             persistFailure?.let { throw it }
-            return discovered.copy(iconPng = iconPng).also(persisted::add)
+            return CatalogRecord(
+                packageName = identity.packageName,
+                extensionId = identity.extensionId,
+                name = "Example",
+                iconPng = iconPng,
+                installedVersionCode = identity.installedVersionCode,
+                signerSha256 = identity.signerSha256,
+                compatibilityStatus = "COMPATIBLE",
+                reportJson = "{\"status\":\"COMPATIBLE\"}",
+                lastVerifiedAtEpochMillis = 99,
+            ).also { persisted += identity }
         }
 
         override suspend fun remove(packageName: String) = Unit

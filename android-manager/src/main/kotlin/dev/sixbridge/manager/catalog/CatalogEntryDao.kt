@@ -1,12 +1,16 @@
 package dev.sixbridge.manager.catalog
 
 import androidx.room.Dao
-import androidx.room.Insert
-import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
+
+private fun CatalogEntryEntity.hasIdentityOf(other: CatalogEntryEntity): Boolean =
+    packageName == other.packageName &&
+        extensionId == other.extensionId &&
+        installedVersionCode == other.installedVersionCode &&
+        signerSha256 == other.signerSha256
 
 @Dao
 interface CatalogEntryDao {
@@ -15,9 +19,6 @@ interface CatalogEntryDao {
 
     @Upsert
     suspend fun upsert(entry: CatalogEntryEntity)
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertIfAbsent(entry: CatalogEntryEntity): Long
 
     @Query(
         """
@@ -41,19 +42,30 @@ interface CatalogEntryDao {
     suspend fun get(packageName: String): CatalogEntryEntity?
 
     @Transaction
-    suspend fun persistIconIfIdentity(
+    suspend fun ensureDiscoveredIdentity(
         discovered: CatalogEntryEntity,
+    ): CatalogEntryEntity {
+        val current = get(discovered.packageName)
+        if (current == null || !current.hasIdentityOf(discovered)) {
+            upsert(discovered)
+            return requireNotNull(get(discovered.packageName))
+        }
+        return current
+    }
+
+    @Transaction
+    suspend fun persistIconIfIdentity(
+        identity: CatalogIdentity,
         iconPng: ByteArray,
     ): CatalogEntryEntity? {
-        insertIfAbsent(discovered.copy(iconPng = null))
         val updated = updateIconIfIdentity(
-            packageName = discovered.packageName,
-            extensionId = discovered.extensionId,
-            installedVersionCode = discovered.installedVersionCode,
-            signerSha256 = discovered.signerSha256,
+            packageName = identity.packageName,
+            extensionId = identity.extensionId,
+            installedVersionCode = identity.installedVersionCode,
+            signerSha256 = identity.signerSha256,
             iconPng = iconPng,
         )
-        return if (updated == 1) get(discovered.packageName) else null
+        return if (updated == 1) get(identity.packageName) else null
     }
 
     @Query("DELETE FROM catalog_entries WHERE packageName = :packageName")

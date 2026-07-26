@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.uninstall
 
 import android.content.Intent
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -78,8 +79,9 @@ class UninstallCoordinatorTest {
 
         override fun observe(): Flow<List<CatalogRecord>> = emptyFlow()
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
+        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord = discovered
         override suspend fun persistIconIfIdentity(
-            discovered: CatalogRecord,
+            identity: CatalogIdentity,
             iconPng: ByteArray,
         ): CatalogRecord? = null
         override suspend fun remove(packageName: String) {

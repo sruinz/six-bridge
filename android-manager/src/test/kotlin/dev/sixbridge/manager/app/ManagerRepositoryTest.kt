@@ -7,6 +7,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.crx.VerifiedCrx3
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
@@ -1312,8 +1313,8 @@ class ManagerRepositoryTest {
 
         publisher.publish(listOf(record(version = 1, signer = "same")))
 
-        assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
-        assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
+        assertNull(publisher.state.value.single().iconPng)
+        assertTrue(catalog.records.isEmpty())
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1667,18 +1668,19 @@ private class FakeCatalog(
     override suspend fun replaceVerified(record: CatalogRecord) {
         records = records.filterNot { it.packageName == record.packageName } + record
     }
+    override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord {
+        return records.singleOrNull { it.packageName == discovered.packageName }
+            ?: discovered.also { records += it }
+    }
     override suspend fun persistIconIfIdentity(
-        discovered: CatalogRecord,
+        identity: CatalogIdentity,
         iconPng: ByteArray,
     ): CatalogRecord? {
-        if (records.none { it.packageName == discovered.packageName }) {
-            records += discovered.copy(iconPng = null)
-        }
-        val index = records.indexOfFirst { it.packageName == discovered.packageName }
+        val index = records.indexOfFirst { it.packageName == identity.packageName }
         val current = records.getOrNull(index) ?: return null
-        if (current.extensionId != discovered.extensionId ||
-            current.installedVersionCode != discovered.installedVersionCode ||
-            current.signerSha256 != discovered.signerSha256
+        if (current.extensionId != identity.extensionId ||
+            current.installedVersionCode != identity.installedVersionCode ||
+            current.signerSha256 != identity.signerSha256
         ) {
             return null
         }

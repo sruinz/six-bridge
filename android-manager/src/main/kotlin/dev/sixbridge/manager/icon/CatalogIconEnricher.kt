@@ -2,6 +2,7 @@ package dev.sixbridge.manager.icon
 
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
+import dev.sixbridge.manager.catalog.identity
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -53,7 +54,7 @@ internal class CatalogIconEnricher(
         current: CatalogRecord,
         iconPng: ByteArray,
     ): IconPersistenceResult = try {
-        catalog.persistIconIfIdentity(current, iconPng)
+        catalog.persistIconIfIdentity(current.identity(), iconPng)
             ?.let(IconPersistenceResult::Stored)
             ?: IconPersistenceResult.IdentityMismatch
     } catch (error: CancellationException) {
