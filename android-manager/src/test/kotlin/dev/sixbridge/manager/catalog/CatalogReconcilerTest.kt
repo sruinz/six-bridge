@@ -192,6 +192,11 @@ class CatalogReconcilerTest {
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
 
+        override suspend fun persistIconIfIdentity(
+            discovered: CatalogRecord,
+            iconPng: ByteArray,
+        ): CatalogRecord? = null
+
         override suspend fun remove(packageName: String) {
             throw AssertionError("CatalogReconciler must use removeAll instead of remove")
         }

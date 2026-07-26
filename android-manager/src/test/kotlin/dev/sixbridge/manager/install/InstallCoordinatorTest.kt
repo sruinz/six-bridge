@@ -1718,6 +1718,11 @@ class InstallCoordinatorTest {
             replaced = record
         }
 
+        override suspend fun persistIconIfIdentity(
+            discovered: CatalogRecord,
+            iconPng: ByteArray,
+        ): CatalogRecord? = null
+
         override suspend fun remove(packageName: String) = Unit
 
         override suspend fun removeAll(packageNames: Set<String>) = Unit

@@ -78,6 +78,10 @@ class UninstallCoordinatorTest {
 
         override fun observe(): Flow<List<CatalogRecord>> = emptyFlow()
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
+        override suspend fun persistIconIfIdentity(
+            discovered: CatalogRecord,
+            iconPng: ByteArray,
+        ): CatalogRecord? = null
         override suspend fun remove(packageName: String) {
             removedPackage = packageName
         }

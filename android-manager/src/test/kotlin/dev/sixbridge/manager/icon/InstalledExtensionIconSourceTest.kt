@@ -1,11 +1,23 @@
 package dev.sixbridge.manager.icon
 
+import java.io.InputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CancellationException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 import kotlin.test.assertNull
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.Test
 
 class InstalledExtensionIconSourceTest {
@@ -90,6 +102,77 @@ class InstalledExtensionIconSourceTest {
 
         assertFailsWith<CancellationException> { provider.load(PACKAGE) }
         assertFailsWith<CancellationException> { extractor.load(PACKAGE) }
+    }
+
+    @Test
+    fun `provider open suspend 취소는 opener에 전달된다`() = runTest {
+        val openStarted = CompletableDeferred<Unit>()
+        val openCancelled = CompletableDeferred<Unit>()
+        val source = ContentProviderInstalledExtensionIconSource(
+            extract = { PNG },
+            openStream = {
+                openStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    openCancelled.complete(Unit)
+                }
+            },
+        )
+        val load = launch { source.load(PACKAGE) }
+        openStarted.await()
+
+        load.cancelAndJoin()
+
+        openCancelled.await()
+    }
+
+    @Test
+    fun `blocking extract 취소는 worker를 interrupt하고 stream을 닫는다`() = runBlocking {
+        val stream = CloseUnblocksInputStream()
+        val source = ContentProviderInstalledExtensionIconSource(
+            extract = {
+                it.read()
+                PNG
+            },
+            openStream = { stream },
+        )
+        val load = launch(Dispatchers.Default) { source.load(PACKAGE) }
+        assertTrue(stream.readStarted.await(1, TimeUnit.SECONDS))
+
+        try {
+            load.cancel()
+            withTimeout(1_000) { load.join() }
+            assertTrue(stream.interrupted.get())
+            assertTrue(stream.closed.get())
+        } finally {
+            stream.close()
+            load.join()
+        }
+    }
+
+    private class CloseUnblocksInputStream : InputStream() {
+        val readStarted = CountDownLatch(1)
+        val interrupted = AtomicBoolean()
+        val closed = AtomicBoolean()
+        private val closeSignal = CountDownLatch(1)
+
+        override fun read(): Int {
+            readStarted.countDown()
+            while (!closed.get()) {
+                try {
+                    closeSignal.await()
+                } catch (_: InterruptedException) {
+                    interrupted.set(true)
+                }
+            }
+            return -1
+        }
+
+        override fun close() {
+            closed.set(true)
+            closeSignal.countDown()
+        }
     }
 
     private companion object {

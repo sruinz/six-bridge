@@ -86,6 +86,63 @@ class ManagerDatabaseTest {
             listOf("dev.sixbridge.ext.two"),
             catalog.observe().first().map(CatalogRecord::packageName),
         )
+
+        verifyIdentityConditionalIconPreservesLatestColumns()
+        verifyIdentityConditionalIconRejectsChangedIdentity()
+        verifyIdentityConditionalIconInsertsDiscoveredRow()
+    }
+
+    private suspend fun verifyIdentityConditionalIconPreservesLatestColumns() {
+        val discovered = record("dev.sixbridge.ext.atomic").copy(
+            name = "Discovered",
+            compatibilityStatus = "UNKNOWN",
+            reportJson = null,
+            lastVerifiedAtEpochMillis = 0,
+        )
+        val latest = discovered.copy(
+            name = "Latest",
+            compatibilityStatus = "BLOCKED",
+            reportJson = "{\"status\":\"BLOCKED\"}",
+            lastVerifiedAtEpochMillis = 999,
+        )
+        catalog.replaceVerified(latest)
+
+        val stored = requireNotNull(
+            catalog.persistIconIfIdentity(discovered, byteArrayOf(7, 8, 9)),
+        )
+        assertEquals("Latest", stored.name)
+        assertEquals("BLOCKED", stored.compatibilityStatus)
+        assertEquals("{\"status\":\"BLOCKED\"}", stored.reportJson)
+        assertEquals(999, stored.lastVerifiedAtEpochMillis)
+        assertArrayEquals(byteArrayOf(7, 8, 9), stored.iconPng)
+    }
+
+    private suspend fun verifyIdentityConditionalIconRejectsChangedIdentity() {
+        val current = record("dev.sixbridge.ext.changed")
+        catalog.replaceVerified(current)
+
+        listOf(
+            current.copy(extensionId = "different"),
+            current.copy(installedVersionCode = current.installedVersionCode + 1),
+            current.copy(signerSha256 = "b".repeat(64)),
+        ).forEach { stale ->
+            assertNull(catalog.persistIconIfIdentity(stale, byteArrayOf(9)))
+            assertArrayEquals(current.iconPng, catalog.get(current.packageName)?.iconPng)
+        }
+    }
+
+    private suspend fun verifyIdentityConditionalIconInsertsDiscoveredRow() {
+        val discovered = record(
+            packageName = "dev.sixbridge.ext.discovered",
+            iconPng = null,
+            reportJson = null,
+        )
+
+        val stored = requireNotNull(
+            catalog.persistIconIfIdentity(discovered, byteArrayOf(3, 2, 1)),
+        )
+        assertEquals(discovered, stored.copy(iconPng = null))
+        assertArrayEquals(byteArrayOf(3, 2, 1), stored.iconPng)
     }
 
     private fun record(

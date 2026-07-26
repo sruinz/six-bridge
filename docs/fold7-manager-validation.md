@@ -16,7 +16,9 @@
 - Android 버전: Android 16 (API 36)
 - 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
-- 관리자 APK SHA-256:
+- 최종 수정 관리자 APK SHA-256:
+  `fa864eb00b4e201b3a4205733c6c2b94cb268f5045553527a41c6d703f78f627`
+- Task 5 검증 당시 관리자 APK SHA-256:
   `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`
 - 자동 검증 일자: 2026-07-26
 - 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
@@ -39,20 +41,25 @@
   - 증거: Gradle 74 task 성공, Node 89/89 통과, 기존 shell/mobile conversion
     통과, Android manifest와 distribution 계약 `PASS`
 - [x] `./scripts/package-manager-debug.sh`
-  - 증거: Gradle 74/74 task, Android unit 259/259, Node 89/89,
+  - 증거: Gradle 74/74 task, Android unit 269/269, Node 89/89,
     shell·conversion·manifest·distribution 계약 통과 뒤
     `dist/sixbridge-manager-debug.apk` 패키징 완료
 - [x] `shasum -a 256 dist/sixbridge-manager-debug.apk`
-  - 증거: 패키징 출력과 독립 실행 hash가
+  - Task 5 당시 증거: 패키징 출력과 독립 실행 hash가
     `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`로
     일치하고 fresh build APK와 byte-for-byte 동일
+  - 최종 수정 증거: 전체 패키징 재실행 뒤 build와 dist APK가
+    `fa864eb00b4e201b3a4205733c6c2b94cb268f5045553527a41c6d703f78f627`로
+    일치하고 `cmp` 결과도 동일
 - [x] Git 제외 경계
   - 증거: `git check-ignore -v`로 `dist/`, `**/build/`, Room 임시 schema,
     `local.properties`를 확인하고 canonical Room JSON schema가 계속 추적됨을
     확인
 - [x] `:android-manager:connectedDebugAndroidTest`
-  - 증거: debug test Activity를 비공개로 병합한 APK로 Fold7에서 10/10 통과,
-    failures/errors/skipped 0
+  - 현재 최종 증거: 2026-07-26 19:43 KST에 debug test Activity를 비공개로
+    병합한 APK로 Fold7에서 16/16 통과, failures/errors/skipped 0
+  - 과거 10/10 기록은 아이콘 UI 회귀 테스트가 추가되기 전 부분 실행이며,
+    현재 최종 connected 결과를 의미하지 않는다.
 
 ## Task 12 개발용 무선 ADB 확인
 

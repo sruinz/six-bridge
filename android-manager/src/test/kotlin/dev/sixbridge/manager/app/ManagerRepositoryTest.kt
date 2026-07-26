@@ -64,6 +64,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -1315,6 +1316,200 @@ class ManagerRepositoryTest {
         assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `지연된 icon 저장은 같은 identity의 최신 report와 timestamp를 되돌리지 않는다`() =
+        runTest {
+            val sourceStarted = CompletableDeferred<Unit>()
+            val releaseSource = CompletableDeferred<Unit>()
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog,
+                installed,
+                InstalledExtensionIconSource {
+                    sourceStarted.complete(Unit)
+                    releaseSource.await()
+                    PUBLISHER_PNG
+                },
+            )
+            val refresh = async { publisher.reconcile() }
+            sourceStarted.await()
+            val latest = catalog.records.single().copy(
+                name = "Latest",
+                compatibilityStatus = "BLOCKED",
+                reportJson = "{\"status\":\"BLOCKED\"}",
+                lastVerifiedAtEpochMillis = 999,
+            )
+            catalog.replaceVerified(latest)
+
+            releaseSource.complete(Unit)
+            refresh.await()
+            advanceUntilIdle()
+
+            val stored = catalog.records.single()
+            assertEquals("Latest", stored.name)
+            assertEquals("BLOCKED", stored.compatibilityStatus)
+            assertEquals("{\"status\":\"BLOCKED\"}", stored.reportJson)
+            assertEquals(999, stored.lastVerifiedAtEpochMillis)
+            assertContentEquals(PUBLISHER_PNG, stored.iconPng)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `지연된 icon 결과는 변경된 설치 identity의 state와 catalog에 병합하지 않는다`() =
+        runTest {
+            val sourceStarted = CompletableDeferred<Unit>()
+            val releaseSource = CompletableDeferred<Unit>()
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog,
+                installed,
+                InstalledExtensionIconSource {
+                    sourceStarted.complete(Unit)
+                    releaseSource.await()
+                    PUBLISHER_PNG
+                },
+            )
+            val refresh = async { publisher.reconcile() }
+            sourceStarted.await()
+            val changed = record(version = 2, signer = "new")
+            catalog.replaceVerified(changed)
+            installed.values = listOf(installed(version = 2, signer = "new"))
+
+            releaseSource.complete(Unit)
+            refresh.await()
+            advanceUntilIdle()
+
+            assertEquals(changed, catalog.records.single())
+            assertNull(publisher.state.value.single().iconPng)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `영구 suspend icon source는 제거 reconciliation을 막지 않고 stale 작업을 정리한다`() =
+        runTest {
+            val sourceStarted = CompletableDeferred<Unit>()
+            val sourceCancelled = CompletableDeferred<Unit>()
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog,
+                installed,
+                InstalledExtensionIconSource {
+                    sourceStarted.complete(Unit)
+                    try {
+                        kotlinx.coroutines.awaitCancellation()
+                    } finally {
+                        sourceCancelled.complete(Unit)
+                    }
+                },
+            )
+            val initial = async { publisher.reconcile() }
+            sourceStarted.await()
+            installed.values = emptyList()
+            catalog.remove(PACKAGE)
+            val removal = async { publisher.reconcile() }
+
+            try {
+                runCurrent()
+                assertTrue(removal.isCompleted)
+                removal.await()
+                sourceCancelled.await()
+                assertTrue(publisher.state.value.isEmpty())
+                assertTrue(catalog.records.isEmpty())
+            } finally {
+                initial.cancelAndJoin()
+                removal.cancelAndJoin()
+            }
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `같은 identity의 background icon 작업은 하나만 실행한다`() = runTest {
+        val sourceStarted = CompletableDeferred<Unit>()
+        val sourceCancelled = CompletableDeferred<Unit>()
+        var calls = 0
+        val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+        val installed =
+            FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+        val publisher = catalogPublisher(
+            catalog = catalog,
+            installed = installed,
+            source = InstalledExtensionIconSource {
+                calls += 1
+                sourceStarted.complete(Unit)
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    sourceCancelled.complete(Unit)
+                }
+            },
+            scope = backgroundScope,
+        )
+
+        publisher.reconcile()
+        sourceStarted.await()
+        publisher.reconcile()
+        runCurrent()
+
+        assertEquals(1, calls)
+        installed.values = emptyList()
+        publisher.reconcile()
+        sourceCancelled.await()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `icon timeout은 source를 취소 정리하고 다음 publish에서 재시도한다`() = runTest {
+        var calls = 0
+        var active = 0
+        val firstCancelled = CompletableDeferred<Unit>()
+        val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+        val installed =
+            FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+        val publisher = catalogPublisher(
+            catalog = catalog,
+            installed = installed,
+            source = InstalledExtensionIconSource {
+                calls += 1
+                active += 1
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    active -= 1
+                    firstCancelled.complete(Unit)
+                }
+            },
+            scope = backgroundScope,
+            iconLoadTimeoutMillis = 1_000,
+        )
+
+        publisher.reconcile()
+        runCurrent()
+        assertEquals(1, calls)
+        assertEquals(1, active)
+
+        advanceTimeBy(1_001)
+        runCurrent()
+        firstCancelled.await()
+        assertEquals(0, active)
+
+        publisher.reconcile()
+        runCurrent()
+        assertEquals(2, calls)
+        assertEquals(1, active)
+
+        installed.values = emptyList()
+        publisher.reconcile()
+        runCurrent()
+        assertEquals(0, active)
+    }
+
     private fun managerRepository(
         root: File,
         retainedImports: RetainedImportStore,
@@ -1359,11 +1554,15 @@ class ManagerRepositoryTest {
         catalog: ManagerCatalog,
         installed: InstalledWrapperRepository,
         source: InstalledExtensionIconSource = InstalledExtensionIconSource { null },
+        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+        iconLoadTimeoutMillis: Long = 5_000,
     ) = CatalogPublisher(
         catalog = catalog,
         installedWrappers = installed,
         reconciler = CatalogReconciler(),
         iconEnricher = CatalogIconEnricher(catalog, source),
+        scope = scope,
+        iconLoadTimeoutMillis = iconLoadTimeoutMillis,
     )
 
     private fun importedBundle(root: File, token: String = TOKEN): ImportedBundle {
@@ -1468,7 +1667,28 @@ private class FakeCatalog(
     override suspend fun replaceVerified(record: CatalogRecord) {
         records = records.filterNot { it.packageName == record.packageName } + record
     }
-    override suspend fun remove(packageName: String) = Unit
+    override suspend fun persistIconIfIdentity(
+        discovered: CatalogRecord,
+        iconPng: ByteArray,
+    ): CatalogRecord? {
+        if (records.none { it.packageName == discovered.packageName }) {
+            records += discovered.copy(iconPng = null)
+        }
+        val index = records.indexOfFirst { it.packageName == discovered.packageName }
+        val current = records.getOrNull(index) ?: return null
+        if (current.extensionId != discovered.extensionId ||
+            current.installedVersionCode != discovered.installedVersionCode ||
+            current.signerSha256 != discovered.signerSha256
+        ) {
+            return null
+        }
+        return current.copy(iconPng = iconPng).also { stored ->
+            records = records.toMutableList().also { it[index] = stored }
+        }
+    }
+    override suspend fun remove(packageName: String) {
+        records = records.filterNot { it.packageName == packageName }
+    }
     override suspend fun removeAll(packageNames: Set<String>) {
         records = records.filterNot { it.packageName in packageNames }
     }

@@ -14,6 +14,11 @@ class RoomManagerCatalog(
         dao.upsert(record.toEntity())
     }
 
+    override suspend fun persistIconIfIdentity(
+        discovered: CatalogRecord,
+        iconPng: ByteArray,
+    ): CatalogRecord? = dao.persistIconIfIdentity(discovered.toEntity(), iconPng)?.toRecord()
+
     override suspend fun remove(packageName: String) {
         dao.delete(packageName)
     }

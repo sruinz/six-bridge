@@ -69,11 +69,13 @@ class ManagerDependencies private constructor(
                 File(application.cacheDir, "extension-icons"),
             )
             val iconEnricher = CatalogIconEnricher(catalog, iconSource)
+            val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val catalogPublisher = CatalogPublisher(
                 catalog = catalog,
                 installedWrappers = installedWrappers,
                 reconciler = CatalogReconciler(),
                 iconEnricher = iconEnricher,
+                scope = applicationScope,
             )
             val repository = DefaultManagerRepository(
                 importer = importer,
@@ -94,7 +96,6 @@ class ManagerDependencies private constructor(
                     AndroidSamsungBrowserNavigator(application.packageManager),
                 catalogPublisher = catalogPublisher,
             )
-            val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             repository.start(applicationScope, catalog)
             return ManagerDependencies(repository, applicationScope)
         }

@@ -18,11 +18,16 @@ class CatalogIconEnricherTest {
         val source = RecordingIconSource { PNG }
         val catalog = RecordingCatalog()
         val enricher = CatalogIconEnricher(catalog, source)
+        val record = record(iconPng = null)
 
-        val result = enricher.enrich(listOf(record(iconPng = null)))
+        val loaded = requireNotNull(enricher.load(record))
+        val result = enricher.persist(record, loaded)
 
-        assertContentEquals(PNG, result.single().iconPng)
-        assertContentEquals(PNG, catalog.replaced.single().iconPng)
+        assertContentEquals(
+            PNG,
+            (result as IconPersistenceResult.Stored).record.iconPng,
+        )
+        assertContentEquals(PNG, catalog.persisted.single().iconPng)
         assertEquals(listOf(PACKAGE), source.packages)
     }
 
@@ -32,11 +37,11 @@ class CatalogIconEnricherTest {
         val catalog = RecordingCatalog()
         val enricher = CatalogIconEnricher(catalog, source)
 
-        val result = enricher.enrich(listOf(record(iconPng = EXISTING_PNG)))
+        val result = enricher.load(record(iconPng = EXISTING_PNG))
 
-        assertContentEquals(EXISTING_PNG, result.single().iconPng)
+        assertContentEquals(EXISTING_PNG, result)
         assertEquals(emptyList(), source.packages)
-        assertEquals(emptyList(), catalog.replaceAttempts)
+        assertEquals(emptyList(), catalog.persistAttempts)
     }
 
     @Test
@@ -45,30 +50,32 @@ class CatalogIconEnricherTest {
         val catalog = RecordingCatalog()
         val enricher = CatalogIconEnricher(catalog, source)
 
-        val first = enricher.enrich(listOf(record()))
-        val second = enricher.enrich(listOf(record()))
+        val first = enricher.load(record())
+        val second = enricher.load(record())
 
-        assertNull(first.single().iconPng)
-        assertNull(second.single().iconPng)
+        assertNull(first)
+        assertNull(second)
         assertEquals(listOf(PACKAGE), source.packages)
-        assertEquals(emptyList(), catalog.replaceAttempts)
+        assertEquals(emptyList(), catalog.persistAttempts)
     }
 
     @Test
     fun `양성 cache는 Room 저장 실패 뒤에도 source와 저장을 반복하지 않는다`() = runTest {
         val source = RecordingIconSource { PNG }
         val catalog = RecordingCatalog(
-            replaceFailure = IllegalStateException("Room unavailable"),
+            persistFailure = IllegalStateException("Room unavailable"),
         )
         val enricher = CatalogIconEnricher(catalog, source)
 
-        val first = enricher.enrich(listOf(record()))
-        val second = enricher.enrich(listOf(record()))
+        val first = requireNotNull(enricher.load(record()))
+        val persistence = enricher.persist(record(), first)
+        val second = enricher.load(record())
 
-        assertContentEquals(PNG, first.single().iconPng)
-        assertContentEquals(PNG, second.single().iconPng)
+        assertContentEquals(PNG, first)
+        assertEquals(IconPersistenceResult.WriteFailed, persistence)
+        assertContentEquals(PNG, second)
         assertEquals(listOf(PACKAGE), source.packages)
-        assertEquals(1, catalog.replaceAttempts.size)
+        assertEquals(1, catalog.persistAttempts.size)
     }
 
     @Test
@@ -84,40 +91,39 @@ class CatalogIconEnricherTest {
             record(),
         )
 
-        val results = identities.map { identity ->
-            enricher.enrich(listOf(identity)).single()
-        }
+        val results = identities.map { identity -> enricher.load(identity) }
 
-        assertEquals(listOf(1, 2, 3, 4, 1), results.map { it.iconPng!!.single().toInt() })
+        assertEquals(listOf(1, 2, 3, 4, 1), results.map { it!!.single().toInt() })
         assertEquals(List(4) { PACKAGE }, source.packages)
-        assertEquals(4, catalog.replaceAttempts.size)
+        assertEquals(0, catalog.persistAttempts.size)
     }
 
     @Test
     fun `replaceVerified 일반 예외는 현재 목록의 추출 성공 icon을 막지 않는다`() = runTest {
         val catalog = RecordingCatalog(
-            replaceFailure = IllegalArgumentException("write failed"),
+            persistFailure = IllegalArgumentException("write failed"),
         )
         val enricher = CatalogIconEnricher(catalog, RecordingIconSource { PNG })
+        val loaded = requireNotNull(enricher.load(record()))
 
-        val result = enricher.enrich(listOf(record()))
+        val result = enricher.persist(record(), loaded)
 
-        assertContentEquals(PNG, result.single().iconPng)
-        assertEquals(1, catalog.replaceAttempts.size)
+        assertEquals(IconPersistenceResult.WriteFailed, result)
+        assertEquals(1, catalog.persistAttempts.size)
     }
 
     @Test
     fun `새 enricher process cache는 이전 저장 실패 identity를 다시 시도한다`() = runTest {
         val source = RecordingIconSource { PNG }
         val catalog = RecordingCatalog(
-            replaceFailure = IllegalStateException("Room unavailable"),
+            persistFailure = IllegalStateException("Room unavailable"),
         )
 
-        CatalogIconEnricher(catalog, source).enrich(listOf(record()))
-        CatalogIconEnricher(catalog, source).enrich(listOf(record()))
+        CatalogIconEnricher(catalog, source).load(record())
+        CatalogIconEnricher(catalog, source).load(record())
 
         assertEquals(listOf(PACKAGE, PACKAGE), source.packages)
-        assertEquals(2, catalog.replaceAttempts.size)
+        assertEquals(0, catalog.persistAttempts.size)
     }
 
     @Test
@@ -129,15 +135,16 @@ class CatalogIconEnricherTest {
         )
         val catalogCancellation = CancellationException("catalog cancelled")
         val catalogEnricher = CatalogIconEnricher(
-            RecordingCatalog(replaceFailure = catalogCancellation),
+            RecordingCatalog(persistFailure = catalogCancellation),
             RecordingIconSource { PNG },
         )
 
         assertFailsWith<CancellationException> {
-            sourceEnricher.enrich(listOf(record()))
+            sourceEnricher.load(record())
         }
+        val loaded = requireNotNull(catalogEnricher.load(record()))
         assertFailsWith<CancellationException> {
-            catalogEnricher.enrich(listOf(record()))
+            catalogEnricher.persist(record(), loaded)
         }
     }
 
@@ -170,17 +177,22 @@ class CatalogIconEnricherTest {
     }
 
     private class RecordingCatalog(
-        private val replaceFailure: Exception? = null,
+        private val persistFailure: Exception? = null,
     ) : ManagerCatalog {
-        val replaceAttempts = mutableListOf<CatalogRecord>()
-        val replaced = mutableListOf<CatalogRecord>()
+        val persistAttempts = mutableListOf<CatalogRecord>()
+        val persisted = mutableListOf<CatalogRecord>()
 
         override fun observe(): Flow<List<CatalogRecord>> = flowOf(emptyList())
 
-        override suspend fun replaceVerified(record: CatalogRecord) {
-            replaceAttempts += record
-            replaceFailure?.let { throw it }
-            replaced += record
+        override suspend fun replaceVerified(record: CatalogRecord) = Unit
+
+        override suspend fun persistIconIfIdentity(
+            discovered: CatalogRecord,
+            iconPng: ByteArray,
+        ): CatalogRecord {
+            persistAttempts += discovered
+            persistFailure?.let { throw it }
+            return discovered.copy(iconPng = iconPng).also(persisted::add)
         }
 
         override suspend fun remove(packageName: String) = Unit

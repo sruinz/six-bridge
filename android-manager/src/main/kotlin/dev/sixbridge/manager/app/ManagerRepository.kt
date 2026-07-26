@@ -13,6 +13,9 @@ import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.icon.CatalogIconEnricher
+import dev.sixbridge.manager.icon.IconIdentity
+import dev.sixbridge.manager.icon.IconPersistenceResult
+import dev.sixbridge.manager.icon.iconIdentity
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -52,8 +55,11 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -61,10 +67,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 data class ReviewBundle(
     val token: String,
@@ -407,20 +416,135 @@ internal class CatalogPublisher(
     private val installedWrappers: InstalledWrapperRepository,
     private val reconciler: CatalogReconciler,
     private val iconEnricher: CatalogIconEnricher,
+    private val scope: CoroutineScope,
+    private val iconLoadTimeoutMillis: Long = 5_000,
 ) {
     private val mutex = Mutex()
+    private val iconJobs = mutableMapOf<IconIdentity, Job>()
     private val mutableState = MutableStateFlow<List<CatalogRecord>>(emptyList())
     val state: StateFlow<List<CatalogRecord>> = mutableState.asStateFlow()
 
-    suspend fun reconcile() = mutex.withLock {
-        val reconciled = reconciler.reconcile(catalog, installedWrappers).records
-        mutableState.value = iconEnricher.enrich(reconciled)
+    suspend fun reconcile() {
+        val publication = mutex.withLock {
+            publishFallbackLocked(
+                reconciler.reconcile(catalog, installedWrappers).records,
+            )
+        }
+        publication.cancelledJobs.forEach(Job::cancel)
+        scheduleIcons(publication.records)
     }
 
-    suspend fun publish(records: List<CatalogRecord>) = mutex.withLock {
-        val reconciled = reconciler.reconcile(records, installedWrappers.findAll()).records
-        mutableState.value = iconEnricher.enrich(reconciled)
+    suspend fun publish(records: List<CatalogRecord>) {
+        val publication = mutex.withLock {
+            publishFallbackLocked(
+                reconciler.reconcile(records, installedWrappers.findAll()).records,
+            )
+        }
+        publication.cancelledJobs.forEach(Job::cancel)
+        scheduleIcons(publication.records)
     }
+
+    private fun publishFallbackLocked(records: List<CatalogRecord>): IconPublication {
+        mutableState.value = records
+        val requiredIdentities = records
+            .asSequence()
+            .filter { it.iconPng == null }
+            .map(CatalogRecord::iconIdentity)
+            .toSet()
+        val cancelled = iconJobs
+            .filterKeys { it !in requiredIdentities }
+            .toList()
+        cancelled.forEach { (identity, _) -> iconJobs.remove(identity) }
+        return IconPublication(records, cancelled.map { it.second })
+    }
+
+    private suspend fun scheduleIcons(records: List<CatalogRecord>) {
+        records.asSequence()
+            .filter { it.iconPng == null }
+            .forEach { record ->
+                val identity = record.iconIdentity()
+                var job: Job? = null
+                mutex.withLock {
+                    val current = mutableState.value
+                        .singleOrNull { it.packageName == identity.packageName }
+                    if (current?.iconIdentity() == identity && iconJobs[identity] == null) {
+                        job = scope.launch(start = CoroutineStart.LAZY) {
+                            loadAndPublishIcon(record)
+                        }
+                        iconJobs[identity] = requireNotNull(job)
+                    }
+                }
+                val scheduled = job ?: return@forEach
+                if (!scheduled.start()) {
+                    mutex.withLock {
+                        if (iconJobs[identity] === scheduled) {
+                            iconJobs.remove(identity)
+                        }
+                    }
+                }
+            }
+    }
+
+    private suspend fun loadAndPublishIcon(discovered: CatalogRecord) {
+        val identity = discovered.iconIdentity()
+        val job = currentCoroutineContext().job
+        try {
+            val iconPng = withTimeout(iconLoadTimeoutMillis) {
+                iconEnricher.load(discovered)
+            } ?: return
+            val installed = try {
+                installedWrappers.find(discovered.packageName)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return
+            }
+            if (installed == null ||
+                installed.extensionId != identity.extensionId ||
+                installed.versionCode != identity.versionCode ||
+                installed.signerSha256 != identity.signerSha256
+            ) {
+                return
+            }
+            mutex.withLock {
+                val index = mutableState.value.indexOfFirst {
+                    it.packageName == identity.packageName
+                }
+                if (index < 0) return@withLock
+                val current = mutableState.value[index]
+                if (current.iconPng != null || current.iconIdentity() != identity) {
+                    return@withLock
+                }
+                val enriched = when (val persisted = iconEnricher.persist(current, iconPng)) {
+                    is IconPersistenceResult.Stored -> persisted.record
+                    IconPersistenceResult.WriteFailed -> current.copy(iconPng = iconPng)
+                    IconPersistenceResult.IdentityMismatch -> return@withLock
+                }
+                if (enriched.iconIdentity() == identity) {
+                    mutableState.value = mutableState.value.toMutableList().also { records ->
+                        records[index] = enriched
+                    }
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            // Icon discovery is best-effort and never blocks catalog publication.
+        } finally {
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    if (iconJobs[identity] === job) {
+                        iconJobs.remove(identity)
+                    }
+                }
+            }
+        }
+    }
+
+    private data class IconPublication(
+        val records: List<CatalogRecord>,
+        val cancelledJobs: List<Job>,
+    )
 }
 
 internal data class RetainedImportIo(

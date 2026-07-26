@@ -31,6 +31,9 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.manager.R
+import java.text.BreakIterator
+import java.util.Locale
+import java.util.concurrent.CancellationException
 
 @Composable
 fun HomeScreen(
@@ -190,7 +193,7 @@ private fun ExtensionIcon(item: ManagedExtensionItem) {
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Text(
-                    text = item.name.trim().firstOrNull()?.toString() ?: "?",
+                    text = firstGraphemeOrQuestionMark(item.name),
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
             }
@@ -201,12 +204,30 @@ private fun ExtensionIcon(item: ManagedExtensionItem) {
 private class IconPngSnapshot(source: ByteArray) {
     private val bytes = source.copyOf()
 
-    fun decode() = runCatching {
+    fun decode() = decodeIconOrNull {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-    }.getOrNull()
+    }
 
     override fun equals(other: Any?): Boolean =
         other is IconPngSnapshot && bytes.contentEquals(other.bytes)
 
     override fun hashCode(): Int = bytes.contentHashCode()
+}
+
+internal inline fun <T> decodeIconOrNull(decode: () -> T?): T? = try {
+    decode()
+} catch (error: CancellationException) {
+    throw error
+} catch (_: Exception) {
+    null
+}
+
+internal fun firstGraphemeOrQuestionMark(name: String): String {
+    val trimmed = name.trim()
+    if (trimmed.isEmpty()) return "?"
+    val boundaries = BreakIterator.getCharacterInstance(Locale.ROOT).apply {
+        setText(trimmed)
+    }
+    val end = boundaries.next()
+    return if (end == BreakIterator.DONE || end <= 0) "?" else trimmed.substring(0, end)
 }

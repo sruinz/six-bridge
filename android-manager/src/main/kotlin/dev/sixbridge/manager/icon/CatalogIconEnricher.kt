@@ -3,6 +3,8 @@ package dev.sixbridge.manager.icon
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal data class IconIdentity(
     val packageName: String,
@@ -11,41 +13,61 @@ internal data class IconIdentity(
     val signerSha256: String,
 )
 
+internal sealed interface IconPersistenceResult {
+    data class Stored(val record: CatalogRecord) : IconPersistenceResult
+    data object IdentityMismatch : IconPersistenceResult
+    data object WriteFailed : IconPersistenceResult
+}
+
 internal class CatalogIconEnricher(
     private val catalog: ManagerCatalog,
     private val source: InstalledExtensionIconSource,
 ) {
+    private val resultsMutex = Mutex()
     private val results = mutableMapOf<IconIdentity, ByteArray?>()
 
-    suspend fun enrich(records: List<CatalogRecord>): List<CatalogRecord> =
-        records.map { record ->
-            if (record.iconPng != null) {
-                return@map record
-            }
-            val identity = IconIdentity(
-                packageName = record.packageName,
-                extensionId = record.extensionId,
-                versionCode = record.installedVersionCode,
-                signerSha256 = record.signerSha256,
-            )
+    suspend fun load(record: CatalogRecord): ByteArray? {
+        record.iconPng?.let { return it }
+        val identity = record.iconIdentity()
+        val cached = resultsMutex.withLock {
             if (results.containsKey(identity)) {
-                return@map results.getValue(identity)
-                    ?.let { record.copy(iconPng = it) }
-                    ?: record
+                CachedIcon(results.getValue(identity))
+            } else {
+                null
             }
-            val bytes = source.load(record.packageName)
-            results[identity] = bytes
-            if (bytes == null) {
-                return@map record
-            }
-            val enriched = record.copy(iconPng = bytes)
-            try {
-                catalog.replaceVerified(enriched)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Exception) {
-                // 현재 process 목록은 양성 cache의 bytes를 계속 사용한다.
-            }
-            enriched
         }
+        if (cached != null) return cached.bytes
+
+        val loaded = source.load(record.packageName)
+        return resultsMutex.withLock {
+            if (results.containsKey(identity)) {
+                results.getValue(identity)
+            } else {
+                results[identity] = loaded
+                loaded
+            }
+        }
+    }
+
+    suspend fun persist(
+        current: CatalogRecord,
+        iconPng: ByteArray,
+    ): IconPersistenceResult = try {
+        catalog.persistIconIfIdentity(current, iconPng)
+            ?.let(IconPersistenceResult::Stored)
+            ?: IconPersistenceResult.IdentityMismatch
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        IconPersistenceResult.WriteFailed
+    }
+
+    private data class CachedIcon(val bytes: ByteArray?)
 }
+
+internal fun CatalogRecord.iconIdentity() = IconIdentity(
+    packageName = packageName,
+    extensionId = extensionId,
+    versionCode = installedVersionCode,
+    signerSha256 = signerSha256,
+)
