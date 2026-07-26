@@ -17,10 +17,13 @@
 - 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
 - 최종 수정 관리자 APK SHA-256:
-  `fa864eb00b4e201b3a4205733c6c2b94cb268f5045553527a41c6d703f78f627`
-- Task 5 검증 당시 관리자 APK SHA-256:
+  `c005580f1a69b28576ec6e9aa3f5ba483f50d5ee26d213b697d45260fc22977c`
+- 과거 2026-07-26 Task 5 관리자 APK SHA-256:
   `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`
-- 자동 검증 일자: 2026-07-26
+- 과거 자동 검증 일자: 2026-07-26
+- 아이콘 동시성 최종 자동 검증 일시: 2026-07-27 08:13~08:23 KST
+- 아이콘 동시성 최종 Fold7 serial:
+  `adb-DEVICE_SERIAL._adb-tls-connect._tcp`
 - 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
 - 개발용 증거:
   `.local/evidence/20260726-154314-android-manager-phase1.log`
@@ -41,25 +44,57 @@
   - 증거: Gradle 74 task 성공, Node 89/89 통과, 기존 shell/mobile conversion
     통과, Android manifest와 distribution 계약 `PASS`
 - [x] `./scripts/package-manager-debug.sh`
-  - 증거: Gradle 74/74 task, Android unit 269/269, Node 89/89,
-    shell·conversion·manifest·distribution 계약 통과 뒤
+  - 과거 2026-07-26 증거: Gradle 74/74 task, Android unit 269/269,
+    Node 89/89, shell·conversion·manifest·distribution 계약 통과 뒤
     `dist/sixbridge-manager-debug.apk` 패키징 완료
+  - 아이콘 동시성 최종 증거: 2026-07-27 fresh 실행에서 Gradle 74/74 task,
+    Android unit 291/291, Node 89/89, shell·conversion·manifest·verification
+    ·distribution 계약을 통과하고 같은 dist APK를 패키징했다.
+  - 첫 fresh 실행에서는 이전에도 관찰된
+    `StableAnalysisTest.all compatibility and mobile decisions read one stable source`
+    stack frame sampling 경합이 `StableAnalysisTest.kt:156`에서 한 번
+    발생했다. 해당 테스트만 정확히 격리한 fresh 재실행은 1/1 통과했다.
+    최종 전체 패키징은 코드 변경 없이 다시 fresh 실행해 2분 3초,
+    74/74 task로 완료했다.
+  - 최종 실행 중 `:core:test`가 오래 대기한 시점의 JVM thread dump는
+    `StableAnalysisTest`가 아니라 `WrapperApkBuilderTest`의 외부 process
+    종료 대기임을 가리켰고, 해당 process 종료 뒤 빌드가 정상 완료됐다.
 - [x] `shasum -a 256 dist/sixbridge-manager-debug.apk`
-  - Task 5 당시 증거: 패키징 출력과 독립 실행 hash가
+  - 과거 2026-07-26 Task 5 증거: 패키징 출력과 독립 실행 hash가
     `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`로
     일치하고 fresh build APK와 byte-for-byte 동일
-  - 최종 수정 증거: 전체 패키징 재실행 뒤 build와 dist APK가
-    `fa864eb00b4e201b3a4205733c6c2b94cb268f5045553527a41c6d703f78f627`로
-    일치하고 `cmp` 결과도 동일
+  - 아이콘 동시성 최종 증거: 전체 패키징 재실행 뒤 build와 dist APK가
+    `c005580f1a69b28576ec6e9aa3f5ba483f50d5ee26d213b697d45260fc22977c`로
+    일치하고 `cmp` exit code도 `0`
 - [x] Git 제외 경계
   - 증거: `git check-ignore -v`로 `dist/`, `**/build/`, Room 임시 schema,
     `local.properties`를 확인하고 canonical Room JSON schema가 계속 추적됨을
     확인
 - [x] `:android-manager:connectedDebugAndroidTest`
-  - 현재 최종 증거: 2026-07-26 19:43 KST에 debug test Activity를 비공개로
+  - 아이콘 동시성 최종 증거: 2026-07-27 08:14 KST에 지정 serial의
+    `SM-F966N`에서 fresh 전체 connected 28/28 통과,
+    failures/errors/skipped 0
+  - 이 28건에는 Room 9건, UI 15건과
+    `ContentResolverProviderStreamOpenerTest` 4건이 포함된다. Provider
+    `CancellationSignal` 전달, dispatch 전 취소, 늦게 반환된 stream 종료,
+    resume 직후 lease 취소 경합을 실기기에서 확인했다.
+  - test APK 설치와 계측만 수행했으며 실제 extension wrapper 제거는
+    실행하지 않았다.
+  - 과거 최종 증거: 2026-07-26 19:43 KST에 debug test Activity를 비공개로
     병합한 APK로 Fold7에서 16/16 통과, failures/errors/skipped 0
   - 과거 10/10 기록은 아이콘 UI 회귀 테스트가 추가되기 전 부분 실행이며,
     현재 최종 connected 결과를 의미하지 않는다.
+- [x] production source·schema·test 전용 Provider 경계
+  - `git diff 82236be..HEAD --check`가 통과했고, 같은 범위에서
+    `android-manager/src/main/AndroidManifest.xml`과 canonical Room schema
+    `android-manager/schemas/dev.sixbridge.manager.catalog.ManagerDatabase/1.json`
+    diff가 없었다. 데이터베이스 version은 계속 `1`이다.
+  - 사용자 승인으로 `TestBlockingIconProvider`는
+    `src/androidTest/java`의 Java 구현과 test manifest의
+    `android:exported="true"`로만 존재한다.
+  - `apkanalyzer manifest print dist/sixbridge-manager-debug.apk` 결과에는
+    위 test Provider class와 authority가 없었다. production manifest와
+    배포 APK에는 test-only Provider가 포함되지 않았다.
 
 ## Task 12 개발용 무선 ADB 확인
 
@@ -225,4 +260,9 @@ catalog 표시는 확인했다. 표준 Android 제거 자체도 실제 package �
 fallback, v2 package·관리자 카드·삼성 인터넷 Add-ons 항목 정리, 관리자
 재시작 뒤 package 정리 유지와 치명 오류 부재를 확인했다. 위에 체크하지 않은
 나머지 무ADB 설치·업데이트·차단·삼성 인터넷 재시작 항목은 미완료 상태로
-유지한다.
+유지한다. 2026-07-27 아이콘 동시성 최종 회귀에서는 production
+manifest·Room schema version `1` 유지, Android unit 291/291, Fold7
+connected 28/28, 전체 패키징 74/74와 Node 89/89, build/dist APK
+byte 동일성을 자동 검증했다. 이번 최종 회귀에서는 실제 wrapper 제거 또는
+새 UI 수동 캡처를 수행하지 않았으므로 기존 사용자 확인 범위를 확대해
+주장하지 않는다.
