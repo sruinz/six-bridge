@@ -452,25 +452,30 @@ internal class CatalogPublisher(
     }
 
     suspend fun remove(packageName: String) {
-        val cancelled = mutex.withLock {
-            val jobs = iconJobs
-                .filterKeys { it.packageName == packageName }
-                .values
-                .toList()
-            jobs.forEach(Job::cancel)
-            iconJobs.keys.removeAll { it.packageName == packageName }
-            iconEnricher.retainOnly(
-                mutableState.value
-                    .filterNot { it.packageName == packageName }
-                    .mapTo(mutableSetOf(), CatalogRecord::identity),
-            )
-            catalog.remove(packageName)
-            mutableState.value = mutableState.value.filterNot {
-                it.packageName == packageName
+        var cancelledJobs = emptyList<Job>()
+        try {
+            mutex.withLock {
+                cancelledJobs = iconJobs
+                    .filterKeys { it.packageName == packageName }
+                    .values
+                    .toList()
+                cancelledJobs.forEach(Job::cancel)
+                iconJobs.keys.removeAll { it.packageName == packageName }
+                iconEnricher.retainOnly(
+                    mutableState.value
+                        .filterNot { it.packageName == packageName }
+                        .mapTo(mutableSetOf(), CatalogRecord::identity),
+                )
+                catalog.remove(packageName)
+                mutableState.value = mutableState.value.filterNot {
+                    it.packageName == packageName
+                }
             }
-            jobs
+        } finally {
+            withContext(NonCancellable) {
+                cancelledJobs.forEach { job -> job.join() }
+            }
         }
-        cancelled.forEach { job -> job.join() }
     }
 
     private suspend fun reconcileLocked(

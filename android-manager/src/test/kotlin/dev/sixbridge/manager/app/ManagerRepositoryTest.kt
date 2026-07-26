@@ -66,12 +66,14 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertIs
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -86,6 +88,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -1421,23 +1424,8 @@ class ManagerRepositoryTest {
     fun `설치 확인 뒤 제거가 완료되면 늦은 icon 결과가 행과 UI를 재생성하지 않는다`() =
         runTest {
             val iconLoaded = CompletableDeferred<Unit>()
-            val findEntered = CompletableDeferred<Unit>()
-            val allowFindReturn = CompletableDeferred<Unit>()
-            val iconJobCompleted = CompletableDeferred<Unit>()
             val wrapper = installed(version = 1, signer = "same")
-            val installed = object : InstalledWrapperRepository {
-                override suspend fun findAll(): List<InstalledWrapper> = listOf(wrapper)
-
-                override suspend fun find(packageName: String): InstalledWrapper? {
-                    findEntered.complete(Unit)
-                    return try {
-                        allowFindReturn.await()
-                        wrapper.takeIf { it.packageName == packageName }
-                    } finally {
-                        iconJobCompleted.complete(Unit)
-                    }
-                }
-            }
+            val installed = LateReturningInstalledWrappers(wrapper)
             val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
             val publisher = catalogPublisher(
                 catalog = catalog,
@@ -1452,16 +1440,23 @@ class ManagerRepositoryTest {
             publisher.reconcile()
             runCurrent()
             iconLoaded.await()
-            findEntered.await()
+            installed.findEntered.await()
 
-            publisher.remove(PACKAGE)
-            allowFindReturn.complete(Unit)
-            advanceUntilIdle()
+            val removal = async { publisher.remove(PACKAGE) }
+            runCurrent()
 
             assertNull(catalog.get(PACKAGE))
             assertTrue(publisher.state.value.none { it.packageName == PACKAGE })
+            assertFalse(removal.isCompleted)
+            assertFalse(installed.findReturned.isCompleted)
+
+            installed.allowFindReturn.complete(Unit)
+            removal.await()
+            advanceUntilIdle()
+
+            assertTrue(installed.findReturned.isCompleted)
+            assertTrue(installed.findCompleted.isCompleted)
             assertEquals(0, catalog.iconInsertCount)
-            assertTrue(iconJobCompleted.isCompleted)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1550,7 +1545,7 @@ class ManagerRepositoryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun `제거 확인 뒤 Room 삭제 실패는 취소 결과와 기존 UI를 유지하고 cancellation은 재전파한다`() =
+    fun `Room 삭제 실패는 active icon job 정리 뒤 취소 결과와 기존 UI를 유지한다`() =
         runTest {
             val root = temporaryFolder.newFolder("uninstall-publisher-failure")
             val bundle = importedBundle(root)
@@ -1559,8 +1554,9 @@ class ManagerRepositoryTest {
             }
             val pendingStore = StartupPendingStore(null, root)
             val gateway = StartupGateway(emptyList())
-            val installed =
-                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val installed = LateReturningInstalledWrappers(
+                installed(version = 1, signer = "same"),
+            )
             val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
             val installCoordinator = InstallCoordinator(
                 InstallPolicy(),
@@ -1572,10 +1568,12 @@ class ManagerRepositoryTest {
             val publisher = catalogPublisher(
                 catalog = catalog,
                 installed = installed,
+                source = InstalledExtensionIconSource { PUBLISHER_PNG },
                 scope = backgroundScope,
             )
             publisher.reconcile()
             runCurrent()
+            installed.findEntered.await()
             val repository = managerRepository(
                 root = root,
                 retainedImports = retainedImports,
@@ -1595,17 +1593,23 @@ class ManagerRepositoryTest {
             )
 
             catalog.removeFailure = IllegalStateException("Room unavailable")
-            assertEquals(
-                UninstallOutcome.CancelledOrStillInstalled,
-                repository.reconcileUninstall(PACKAGE),
-            )
+            val reconciliation = async {
+                repository.reconcileUninstall(PACKAGE)
+            }
+            runCurrent()
+
+            assertFalse(reconciliation.isCompleted)
+            assertFalse(installed.findReturned.isCompleted)
             assertNotNull(catalog.get(PACKAGE))
             assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
 
-            catalog.removeFailure = CancellationException("cancelled")
-            assertFailsWith<CancellationException> {
-                repository.reconcileUninstall(PACKAGE)
-            }
+            installed.allowFindReturn.complete(Unit)
+            assertEquals(
+                UninstallOutcome.CancelledOrStillInstalled,
+                reconciliation.await(),
+            )
+            assertTrue(installed.findReturned.isCompleted)
+            assertTrue(installed.findCompleted.isCompleted)
             assertNotNull(catalog.get(PACKAGE))
             assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
 
@@ -1613,6 +1617,50 @@ class ManagerRepositoryTest {
             assertEquals(UninstallOutcome.Removed, repository.reconcileUninstall(PACKAGE))
             assertNull(catalog.get(PACKAGE))
             assertTrue(publisher.state.value.none { it.packageName == PACKAGE })
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `Room 삭제 cancellation은 active icon job 정리 뒤 원 cancellation을 재전파한다`() =
+        runTest {
+            val wrapper = installed(version = 1, signer = "same")
+            val installed = LateReturningInstalledWrappers(wrapper)
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource { PUBLISHER_PNG },
+                scope = backgroundScope,
+            )
+            publisher.reconcile()
+            runCurrent()
+            installed.findEntered.await()
+            val cancellation = CancellationException("cancelled")
+            catalog.removeFailure = cancellation
+
+            val thrownResult = CompletableDeferred<Throwable>()
+            val removal = launch {
+                try {
+                    publisher.remove(PACKAGE)
+                } catch (error: Throwable) {
+                    thrownResult.complete(error)
+                }
+            }
+            runCurrent()
+
+            assertFalse(removal.isCompleted)
+            assertFalse(installed.findReturned.isCompleted)
+            assertNotNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
+
+            installed.allowFindReturn.complete(Unit)
+            removal.join()
+
+            assertSame(cancellation, thrownResult.await())
+            assertTrue(installed.findReturned.isCompleted)
+            assertTrue(installed.findCompleted.isCompleted)
+            assertNotNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1742,7 +1790,7 @@ class ManagerRepositoryTest {
         retainedImports: RetainedImportStore,
         gateway: StartupGateway,
         pendingStore: StartupPendingStore,
-        installed: FakeInstalledWrappers,
+        installed: InstalledWrapperRepository,
         catalog: FakeCatalog,
         coordinator: InstallCoordinator,
         afterInstallRequest: suspend (InstallState) -> Unit = {},
@@ -1946,6 +1994,30 @@ private class FakeInstalledWrappers(
     override suspend fun find(packageName: String): InstalledWrapper? {
         findFailure?.let { throw it }
         return values.singleOrNull { it.packageName == packageName }
+    }
+}
+
+private class LateReturningInstalledWrappers(
+    private val wrapper: InstalledWrapper,
+) : InstalledWrapperRepository {
+    val findEntered = CompletableDeferred<Unit>()
+    val allowFindReturn = CompletableDeferred<Unit>()
+    val findReturned = CompletableDeferred<Unit>()
+    val findCompleted = CompletableDeferred<Unit>()
+
+    override suspend fun findAll(): List<InstalledWrapper> = listOf(wrapper)
+
+    override suspend fun find(packageName: String): InstalledWrapper? {
+        findEntered.complete(Unit)
+        return try {
+            withContext(NonCancellable) {
+                allowFindReturn.await()
+                findReturned.complete(Unit)
+                wrapper.takeIf { it.packageName == packageName }
+            }
+        } finally {
+            findCompleted.complete(Unit)
+        }
     }
 }
 
