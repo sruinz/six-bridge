@@ -26,6 +26,12 @@ else
   fail "JDK를 찾을 수 없습니다. JAVA_HOME에 JDK 17 이상 경로를 지정하세요."
 fi
 
+java_bin_dir=$(dirname -- "$java_command")
+for jdk_tool in java javac keytool; do
+  [ -x "$java_bin_dir/$jdk_tool" ] ||
+    fail "JDK bin/${jdk_tool}을(를) 찾을 수 없습니다. JAVA_HOME에 완전한 JDK 17 이상 경로를 지정하세요."
+done
+
 java_version_output=$("$java_command" -version 2>&1) ||
   fail "JDK를 실행할 수 없습니다. JAVA_HOME에 JDK 17 이상 경로를 지정하세요."
 java_major=$(printf '%s\n' "$java_version_output" |
@@ -48,10 +54,12 @@ else
   fail "Android SDK를 찾을 수 없습니다. ANDROID_HOME에 SDK 36 경로를 지정하세요."
 fi
 
-[ -d "$android_sdk_root/platforms/android-36" ] ||
-  fail "Android SDK platform 36이 없습니다. ANDROID_HOME을 확인하세요: $android_sdk_root"
-[ -x "$android_sdk_root/build-tools/36.0.0/aapt2" ] ||
-  fail "Android SDK build-tools 36.0.0이 없습니다. ANDROID_HOME을 확인하세요: $android_sdk_root"
+[ -f "$android_sdk_root/platforms/android-36/android.jar" ] ||
+  fail "Android SDK platform 36 android.jar가 없습니다. ANDROID_HOME을 확인하세요: $android_sdk_root"
+for sdk_tool in aapt2 d8 zipalign apksigner; do
+  [ -x "$android_sdk_root/build-tools/36.0.0/$sdk_tool" ] ||
+    fail "Android SDK build-tools 36.0.0 ${sdk_tool}을(를) 찾을 수 없습니다. ANDROID_HOME을 확인하세요: $android_sdk_root"
+done
 [ -x "$android_sdk_root/cmdline-tools/latest/bin/apkanalyzer" ] ||
   fail "Android SDK apkanalyzer가 없습니다. ANDROID_HOME/cmdline-tools/latest를 확인하세요: $android_sdk_root"
 

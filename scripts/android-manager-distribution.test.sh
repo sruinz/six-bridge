@@ -54,11 +54,27 @@ new_fixture() {
 
 apply_fixture_tools() {
     local fixture_dir="$1"
+    local executable_path
 
     printf '%s\n' \
         '#!/bin/sh' \
         'printf "openjdk version \"17.0.1\" 2026-01-01\n" >&2' \
         >"${fixture_dir}/jdk/bin/java"
+    for executable_path in \
+        "${fixture_dir}/jdk/bin/javac" \
+        "${fixture_dir}/jdk/bin/keytool" \
+        "${fixture_dir}/sdk/build-tools/36.0.0/aapt2" \
+        "${fixture_dir}/sdk/build-tools/36.0.0/d8" \
+        "${fixture_dir}/sdk/build-tools/36.0.0/zipalign" \
+        "${fixture_dir}/sdk/build-tools/36.0.0/apksigner" \
+        "${fixture_dir}/sdk/cmdline-tools/latest/bin/apkanalyzer"; do
+        printf '%s\n' \
+            '#!/bin/sh' \
+            'exit 0' \
+            >"${executable_path}"
+    done
+    printf 'fixture android.jar\n' \
+        >"${fixture_dir}/sdk/platforms/android-36/android.jar"
     printf '%s\n' \
         '#!/bin/sh' \
         'printf "gradle %s\n" "$*" >>"$COMMAND_LOG"' \
@@ -77,20 +93,12 @@ apply_fixture_tools() {
         '#!/bin/sh' \
         'printf "bash %s\n" "$*" >>"$COMMAND_LOG"' \
         >"${fixture_dir}/fake-bin/bash"
-    printf '%s\n' \
-        '#!/bin/sh' \
-        'exit 0' \
-        >"${fixture_dir}/sdk/build-tools/36.0.0/aapt2"
-    printf '%s\n' \
-        '#!/bin/sh' \
-        'exit 0' \
-        >"${fixture_dir}/sdk/cmdline-tools/latest/bin/apkanalyzer"
     chmod +x \
-        "${fixture_dir}/jdk/bin/java" \
+        "${fixture_dir}/jdk/bin/"* \
         "${fixture_dir}/fake-bin/gradle" \
         "${fixture_dir}/fake-bin/node" \
         "${fixture_dir}/fake-bin/bash" \
-        "${fixture_dir}/sdk/build-tools/36.0.0/aapt2" \
+        "${fixture_dir}/sdk/build-tools/36.0.0/"* \
         "${fixture_dir}/sdk/cmdline-tools/latest/bin/apkanalyzer"
 }
 
@@ -149,6 +157,59 @@ test_verify_rejects_missing_sdk() {
     assert_contains "${output_file}" "ANDROID_HOME" \
         "Android SDK 누락 안내에 설정할 환경 변수가 없습니다."
     rm -rf -- "${fixture_dir}"
+}
+
+test_verify_rejects_platform_without_android_jar() {
+    local fixture_dir
+    local output_file
+
+    fixture_dir="$(new_fixture)"
+    output_file="${fixture_dir}/missing-android-jar.txt"
+    rm -f -- "${fixture_dir}/sdk/platforms/android-36/android.jar"
+
+    if run_fixture_verify "${fixture_dir}" "${output_file}"; then
+        fail "platforms/android-36/android.jar 없이 verify.sh가 성공했습니다."
+    fi
+    assert_contains "${output_file}" "오류:" \
+        "android.jar 누락 오류가 한글로 안내되지 않았습니다."
+    assert_contains "${output_file}" "android.jar" \
+        "Android platform 누락 오류가 필요한 파일을 설명하지 않았습니다."
+    rm -rf -- "${fixture_dir}"
+}
+
+test_verify_rejects_missing_sdk_tools() {
+    local expected_tool
+    local fixture_dir
+    local output_file
+    local relative_path
+    local tool_case
+    local unexpected_successes=""
+
+    for tool_case in \
+        "build-tools/36.0.0/aapt2:aapt2" \
+        "build-tools/36.0.0/d8:d8" \
+        "build-tools/36.0.0/zipalign:zipalign" \
+        "build-tools/36.0.0/apksigner:apksigner" \
+        "cmdline-tools/latest/bin/apkanalyzer:apkanalyzer"; do
+        relative_path="${tool_case%%:*}"
+        expected_tool="${tool_case##*:}"
+        fixture_dir="$(new_fixture)"
+        output_file="${fixture_dir}/missing-${expected_tool}.txt"
+        rm -f -- "${fixture_dir}/sdk/${relative_path}"
+
+        if run_fixture_verify "${fixture_dir}" "${output_file}"; then
+            unexpected_successes="${unexpected_successes} ${expected_tool}"
+        else
+            assert_contains "${output_file}" "오류:" \
+                "${expected_tool} 누락 오류가 한글로 안내되지 않았습니다."
+            assert_contains "${output_file}" "Android SDK" \
+                "${expected_tool} 누락 오류가 SDK 문제를 설명하지 않았습니다."
+        fi
+        rm -rf -- "${fixture_dir}"
+    done
+
+    [[ -z "${unexpected_successes}" ]] ||
+        fail "필수 Android SDK 도구 없이 verify.sh가 성공했습니다:${unexpected_successes}"
 }
 
 test_verify_rejects_missing_jdk() {
@@ -216,6 +277,38 @@ test_verify_rejects_jdk_older_than_17() {
     rm -rf -- "${fixture_dir}"
 }
 
+test_verify_rejects_incomplete_jdk_tools() {
+    local expected
+    local fixture_dir
+    local jdk_tool
+    local output_file
+
+    for jdk_tool in java javac keytool; do
+        fixture_dir="$(new_fixture)"
+        output_file="${fixture_dir}/missing-${jdk_tool}.txt"
+        rm -f -- "${fixture_dir}/jdk/bin/${jdk_tool}"
+
+        if COMMAND_LOG="${fixture_dir}/commands.log" \
+            FIXTURE_ROOT="${fixture_dir}" \
+            JAVA_HOME="${fixture_dir}/jdk" \
+            SIXBRIDGE_DEFAULT_JAVA_HOME="${fixture_dir}/missing-default-jdk" \
+            ANDROID_HOME="${fixture_dir}/sdk" \
+            PATH="${fixture_dir}/fake-bin:/usr/bin:/bin" \
+            /bin/sh "${fixture_dir}/scripts/verify.sh" >"${output_file}" 2>&1; then
+            fail "JDK bin/${jdk_tool} 없이 verify.sh가 성공했습니다."
+        fi
+        expected="${jdk_tool}"
+        if [[ "${jdk_tool}" == "java" ]]; then
+            expected="JDK"
+        fi
+        assert_contains "${output_file}" "오류:" \
+            "JDK bin/${jdk_tool} 누락 오류가 한글로 안내되지 않았습니다."
+        assert_contains "${output_file}" "${expected}" \
+            "JDK bin/${jdk_tool} 누락 오류가 필요한 도구를 설명하지 않았습니다."
+        rm -rf -- "${fixture_dir}"
+    done
+}
+
 test_package_requires_fresh_verification() {
     local fixture_dir
     local output_file
@@ -261,6 +354,47 @@ test_package_requires_fresh_verification() {
     rm -rf -- "${fixture_dir}"
 }
 
+test_package_removes_stale_output_when_verify_is_unavailable() {
+    local fixture_dir
+    local mode
+    local output_file
+    local packaged_apk
+    local stale_modes=""
+
+    for mode in missing non-executable; do
+        fixture_dir="$(new_fixture)"
+        cp "${PACKAGE_SCRIPT}" "${fixture_dir}/scripts/package-manager-debug.sh"
+        chmod +x "${fixture_dir}/scripts/package-manager-debug.sh"
+        output_file="${fixture_dir}/package-${mode}.txt"
+        packaged_apk="${fixture_dir}/dist/sixbridge-manager-debug.apk"
+        mkdir -p "${fixture_dir}/dist"
+        printf 'stale-dist\n' >"${packaged_apk}"
+
+        case "${mode}" in
+            missing)
+                rm -f -- "${fixture_dir}/scripts/verify.sh"
+                ;;
+            non-executable)
+                chmod -x "${fixture_dir}/scripts/verify.sh"
+                ;;
+        esac
+
+        if /bin/bash "${fixture_dir}/scripts/package-manager-debug.sh" \
+            >"${output_file}" 2>&1; then
+            fail "verify.sh가 ${mode} 상태인데 패키징이 성공했습니다."
+        fi
+        assert_contains "${output_file}" "오류:" \
+            "verify.sh ${mode} 오류가 한글로 안내되지 않았습니다."
+        if [[ -e "${packaged_apk}" ]]; then
+            stale_modes="${stale_modes} ${mode}"
+        fi
+        rm -rf -- "${fixture_dir}"
+    done
+
+    [[ -z "${stale_modes}" ]] ||
+        fail "verify.sh를 실행할 수 없는데 stale dist APK가 남았습니다:${stale_modes}"
+}
+
 test_gitignore_excludes_local_release_outputs() {
     local ignored_path
 
@@ -280,10 +414,14 @@ test_gitignore_excludes_local_release_outputs() {
 
 test_verify_runs_android_contract
 test_verify_rejects_missing_sdk
+test_verify_rejects_platform_without_android_jar
+test_verify_rejects_missing_sdk_tools
 test_verify_rejects_missing_jdk
 test_verify_uses_installed_fallback_for_stale_java_home
 test_verify_rejects_jdk_older_than_17
+test_verify_rejects_incomplete_jdk_tools
 test_package_requires_fresh_verification
+test_package_removes_stale_output_when_verify_is_unavailable
 test_gitignore_excludes_local_release_outputs
 
 printf 'PASS: Android manager verification and packaging contracts\n'
