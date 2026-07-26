@@ -73,10 +73,20 @@ class AndroidPackageInstallGateway(
                 }
             }
         } catch (error: CancellationException) {
-            allocatedSessionId?.let { sessionId ->
-                runCatching { installer.abandonSession(sessionId) }
+            val sessionId = allocatedSessionId ?: throw error
+            val abandonConfirmed = try {
+                installer.abandonSession(sessionId)
+                true
+            } catch (_: Exception) {
+                runCatching {
+                    installer.mySessions.none { it.sessionId == sessionId }
+                }.getOrDefault(false)
             }
-            throw error
+            throw PackageInstallCancellationException(
+                sessionId = sessionId,
+                abandonConfirmed = abandonConfirmed,
+                cause = error,
+            )
         }
     }
 

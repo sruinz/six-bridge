@@ -26,6 +26,29 @@ object PackageInstallEvents {
     }
 }
 
+internal fun packageInstallResultFromStatus(
+    sessionId: Int,
+    status: Int,
+    statusMessage: String?,
+): PackageInstallResult? {
+    if (sessionId < 0) return null
+    return when (status) {
+        PackageInstaller.STATUS_SUCCESS -> PackageInstallResult.Success(sessionId)
+        PackageInstaller.STATUS_FAILURE_ABORTED -> PackageInstallResult.Cancelled(sessionId)
+        in KNOWN_FAILURE_STATUSES -> PackageInstallResult.Failure(
+            sessionId = sessionId,
+            code = "PACKAGE_INSTALLER_${status.toString().replace('-', 'N')}",
+            message = statusMessage
+                ?.takeIf(String::isNotBlank)
+                ?: "PackageInstaller가 설치를 완료하지 못했습니다.",
+        )
+        else -> null
+    }
+}
+
+internal fun matchesPendingInstallSession(pending: PendingInstall?, sessionId: Int): Boolean =
+    sessionId >= 0 && pending?.sessionId == sessionId
+
 class InstallResultReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_INSTALL_RESULT) return
@@ -36,16 +59,19 @@ class InstallResultReceiver : BroadcastReceiver() {
         if (sessionId < 0) return
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                val pending = runCatching {
+                    SharedPreferencesPendingInstallStore(context).load()
+                }.getOrNull()
+                if (!matchesPendingInstallSession(pending, sessionId)) return
                 val confirmation = confirmationIntent(intent)
                     ?.let { makeExplicitSystemIntent(context, it) }
                 if (confirmation == null) {
-                    PackageInstallEvents.dispatch(
-                        PackageInstallCallback(
-                            PackageInstallResult.Failure(
-                                sessionId = sessionId,
-                                code = "MISSING_USER_ACTION_INTENT",
-                                message = "설치 승인 화면을 확인할 수 없습니다.",
-                            ),
+                    persistAndNotify(
+                        context,
+                        PackageInstallResult.Failure(
+                            sessionId = sessionId,
+                            code = "MISSING_USER_ACTION_INTENT",
+                            message = "설치 승인 화면을 확인할 수 없습니다.",
                         ),
                     )
                 } else {
@@ -58,25 +84,23 @@ class InstallResultReceiver : BroadcastReceiver() {
                 }
             }
 
-            PackageInstaller.STATUS_SUCCESS -> PackageInstallEvents.dispatch(
-                PackageInstallCallback(PackageInstallResult.Success(sessionId)),
-            )
+            else -> packageInstallResultFromStatus(
+                sessionId = sessionId,
+                status = status,
+                statusMessage = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE),
+            )?.let { persistAndNotify(context, it) }
+        }
+    }
 
-            PackageInstaller.STATUS_FAILURE_ABORTED -> PackageInstallEvents.dispatch(
-                PackageInstallCallback(PackageInstallResult.Cancelled(sessionId)),
+    private fun persistAndNotify(context: Context, result: PackageInstallResult) {
+        val recorded = runCatching {
+            SharedPreferencesPendingInstallStore(context).recordTerminalResult(
+                result = result,
+                terminalAtEpochMillis = System.currentTimeMillis(),
             )
-
-            else -> PackageInstallEvents.dispatch(
-                PackageInstallCallback(
-                    PackageInstallResult.Failure(
-                        sessionId = sessionId,
-                        code = "PACKAGE_INSTALLER_$status",
-                        message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
-                            ?.takeIf(String::isNotBlank)
-                            ?: "PackageInstaller가 설치를 완료하지 못했습니다.",
-                    ),
-                ),
-            )
+        }.getOrDefault(false)
+        if (recorded) {
+            PackageInstallEvents.dispatch(PackageInstallCallback(result))
         }
     }
 
@@ -103,3 +127,13 @@ class InstallResultReceiver : BroadcastReceiver() {
         const val EXTRA_CALLBACK_SESSION_ID = "dev.sixbridge.manager.extra.CALLBACK_SESSION_ID"
     }
 }
+
+private val KNOWN_FAILURE_STATUSES = setOf(
+    PackageInstaller.STATUS_FAILURE,
+    PackageInstaller.STATUS_FAILURE_BLOCKED,
+    PackageInstaller.STATUS_FAILURE_INVALID,
+    PackageInstaller.STATUS_FAILURE_CONFLICT,
+    PackageInstaller.STATUS_FAILURE_STORAGE,
+    PackageInstaller.STATUS_FAILURE_INCOMPATIBLE,
+    PackageInstaller.STATUS_FAILURE_TIMEOUT,
+)

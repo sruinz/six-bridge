@@ -29,3 +29,9 @@ data class PendingInstall(
     val importToken: String,
     val startedAtEpochMillis: Long,
 )
+
+data class PendingInstallResult(
+    val result: PackageInstallResult,
+    val terminalAtEpochMillis: Long,
+    val packageName: String = "",
+)

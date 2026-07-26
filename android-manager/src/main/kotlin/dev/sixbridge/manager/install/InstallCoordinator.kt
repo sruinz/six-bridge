@@ -34,35 +34,32 @@ class InstallCoordinator(
     suspend fun request(bundle: ImportedBundle, partialConfirmed: Boolean) = mutex.withLock {
         val existing = pendingStore.load()
         if (activeBundle != null || existing != null) {
-            val activeToken = existing?.importToken ?: activeBundle?.token
-            if (bundle.token != activeToken) {
-                runCatching { pendingStore.discardImport(bundle.token) }
-            }
+            discardCompetingImport(bundle.token, existing?.importToken ?: activeBundle?.token)
             return@withLock
         }
-        val installed = runCatching {
+        val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
-        }.getOrElse {
-            finishWithoutSession(
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            finishUnclaimed(
                 bundle,
                 InstallState.Failed("INSTALLED_QUERY_FAILED", "설치 상태를 확인하지 못했습니다."),
             )
             return@withLock
         }
         when (val decision = policy.decide(bundle.report, bundle.verifiedApk, installed)) {
-            is InstallDecision.Denied -> {
-                finishWithoutSession(
-                    bundle,
-                    InstallState.Failed(
-                        code = decision.reason.name,
-                        message = "설치 정책이 래퍼를 거부했습니다.",
-                    ),
-                )
-            }
+            is InstallDecision.Denied -> finishUnclaimed(
+                bundle,
+                InstallState.Failed(
+                    code = decision.reason.name,
+                    message = "설치 정책이 래퍼를 거부했습니다.",
+                ),
+            )
 
             is InstallDecision.Allowed -> {
                 if (decision.requiresPartialConfirmation && !partialConfirmed) {
-                    finishWithoutSession(
+                    finishUnclaimed(
                         bundle,
                         InstallState.Failed(
                             code = "PARTIAL_CONFIRMATION_REQUIRED",
@@ -76,7 +73,12 @@ class InstallCoordinator(
                     mutableState.value = InstallState.UnknownSourcesPermissionRequired
                     return@withLock
                 }
-                createAndCommit(bundle)
+                try {
+                    createAndCommit(bundle)
+                } catch (error: CancellationException) {
+                    if (pendingStore.load() == null) activeBundle = null
+                    throw error
+                }
             }
         }
     }
@@ -91,49 +93,74 @@ class InstallCoordinator(
             return@withLock
         }
         if (!gateway.canRequestPackageInstalls()) return@withLock
-        createAndCommit(bundle)
-    }
-
-    suspend fun onPackageInstallerResult(result: PackageInstallResult) = mutex.withLock {
-        val pending = pendingStore.load() ?: return@withLock
-        if (pending.sessionId != result.sessionId) return@withLock
-        when (result) {
-            is PackageInstallResult.PendingUserAction -> {
-                mutableState.value = InstallState.AwaitingUserApproval(result.sessionId)
-            }
-
-            is PackageInstallResult.Cancelled -> {
-                finishSession(
-                    pending,
-                    InstallState.Cancelled,
-                    abandon = true,
-                )
-            }
-
-            is PackageInstallResult.Failure -> {
-                finishSession(
-                    pending,
-                    InstallState.Failed(result.code, result.message),
-                    abandon = true,
-                )
-            }
-
-            is PackageInstallResult.Success -> verifyAndRecord(pending)
+        try {
+            createAndCommit(bundle)
+        } catch (error: CancellationException) {
+            if (pendingStore.load() == null) activeBundle = null
+            throw error
         }
     }
 
-    suspend fun cancel() = mutex.withLock {
-        val pending = pendingStore.load()
-        if (pending != null) {
-            finishSession(pending, InstallState.Cancelled, abandon = true)
-        } else {
-            val bundle = activeBundle
-            activeBundle = null
-            mutableState.value = if (bundle == null || clearPending(bundle.token)) {
-                InstallState.Cancelled
-            } else {
-                cleanupFailed()
+    suspend fun restore() = mutex.withLock {
+        restoreTerminalResultLocked()
+        if (pendingStore.loadTerminalResult() == null) {
+            restoreMissingSessionLocked()
+        }
+    }
+
+    suspend fun onPackageInstallerResult(result: PackageInstallResult) = mutex.withLock {
+        if (result is PackageInstallResult.PendingUserAction) {
+            val pending = pendingStore.load()
+            if (pending?.sessionId == result.sessionId) {
+                mutableState.value = InstallState.AwaitingUserApproval(result.sessionId)
             }
+            return@withLock
+        }
+        runCatching { pendingStore.recordTerminalResult(result, clock()) }
+        restoreTerminalResultLocked()
+    }
+
+    suspend fun cancel() = mutex.withLock {
+        restoreTerminalResultLocked()
+        if (mutableState.value.isTerminal()) return@withLock
+        val pending = pendingStore.load()
+        if (pending != null && pending.sessionId >= 0) {
+            finishSession(
+                pending = pending,
+                next = InstallState.Cancelled,
+                abandon = true,
+                inbox = null,
+            )
+            return@withLock
+        }
+        if (pending != null) {
+            val owned = try {
+                gateway.ownedSessions()
+            } catch (_: Exception) {
+                mutableState.value = InstallState.Failed(
+                    "SESSION_OWNERSHIP_QUERY_FAILED",
+                    "설치 session 소유 상태를 확인하지 못했습니다.",
+                )
+                return@withLock
+            }
+            if (owned.isNotEmpty()) {
+                mutableState.value = abandonFailed()
+                return@withLock
+            }
+            finishSession(
+                pending = pending,
+                next = InstallState.Cancelled,
+                abandon = false,
+                inbox = null,
+            )
+            return@withLock
+        }
+        val bundle = activeBundle ?: return@withLock
+        activeBundle = null
+        mutableState.value = if (pendingStore.discardImportSafely(bundle.token)) {
+            InstallState.Cancelled
+        } else {
+            cleanupFailed()
         }
     }
 
@@ -141,7 +168,7 @@ class InstallCoordinator(
 
     private suspend fun createAndCommit(bundle: ImportedBundle) {
         if (!matchesRetainedWrapper(bundle)) {
-            finishWithoutSession(
+            finishUnclaimed(
                 bundle,
                 InstallState.Failed(
                     "WRAPPER_HASH_MISMATCH",
@@ -150,61 +177,223 @@ class InstallCoordinator(
             )
             return
         }
-        val sessionId = try {
-            gateway.createAndWrite(bundle.verifiedApk.packageName, bundle.wrapperFile)
-        } catch (error: PackageInstallSessionException) {
-            error.sessionId?.let(::abandonQuietly)
-            finishWithoutSession(
-                bundle,
-                InstallState.Failed(error.code, error.message),
-            )
-            return
-        } catch (error: CancellationException) {
-            finishWithoutSession(bundle, InstallState.Cancelled)
-            throw error
-        } catch (_: Exception) {
-            finishWithoutSession(
-                bundle,
-                InstallState.Failed("SESSION_CREATE_FAILED", "설치 session을 만들지 못했습니다."),
-            )
-            return
-        }
-        mutableState.value = InstallState.WritingSession(sessionId)
-        val pending = PendingInstall(
-            sessionId = sessionId,
+        val claim = pendingStore.tryClaim(
             packageName = bundle.verifiedApk.packageName,
             importToken = bundle.token,
             startedAtEpochMillis = clock(),
         )
+        if (claim == null) {
+            activeBundle = null
+            val existing = pendingStore.load()
+            discardCompetingImport(bundle.token, existing?.importToken)
+            mutableState.value = existing?.toState() ?: InstallState.Idle
+            return
+        }
+
+        val sessionId = try {
+            gateway.createAndWrite(bundle.verifiedApk.packageName, bundle.wrapperFile)
+        } catch (error: PackageInstallCancellationException) {
+            handleCreateCancellation(claim, error)
+            throw error
+        } catch (error: CancellationException) {
+            releaseClaim(claim, bundle.token, InstallState.Cancelled)
+            throw error
+        } catch (error: PackageInstallSessionException) {
+            handleCreateFailure(claim, bundle, error)
+            return
+        } catch (_: Exception) {
+            releaseClaim(
+                claim,
+                bundle.token,
+                InstallState.Failed("SESSION_CREATE_FAILED", "설치 session을 만들지 못했습니다."),
+            )
+            return
+        }
+
+        val pending = pendingStore.assignSession(claim, sessionId)
+        if (pending == null) {
+            val abandoned = abandonConfirmed(sessionId)
+            activeBundle = null
+            mutableState.value = if (abandoned) {
+                InstallState.Failed("INSTALL_CLAIM_LOST", "설치 claim을 확인하지 못했습니다.")
+            } else {
+                abandonFailed()
+            }
+            return
+        }
+        mutableState.value = InstallState.WritingSession(sessionId)
         try {
-            pendingStore.save(pending)
             gateway.commit(sessionId)
             mutableState.value = InstallState.AwaitingUserApproval(sessionId)
         } catch (error: CancellationException) {
-            finishSession(pending, InstallState.Cancelled, abandon = true)
+            finishSession(pending, InstallState.Cancelled, abandon = true, inbox = null)
             throw error
         } catch (_: Exception) {
             finishSession(
-                pending,
-                InstallState.Failed("SESSION_COMMIT_FAILED", "설치 session을 제출하지 못했습니다."),
+                pending = pending,
+                next = InstallState.Failed(
+                    "SESSION_COMMIT_FAILED",
+                    "설치 session을 제출하지 못했습니다.",
+                ),
                 abandon = true,
+                inbox = null,
             )
         }
     }
 
-    private suspend fun verifyAndRecord(pending: PendingInstall) {
-        val installed = runCatching {
+    private fun handleCreateCancellation(
+        claim: PendingInstall,
+        error: PackageInstallCancellationException,
+    ) {
+        val sessionId = error.sessionId
+        if (sessionId == null || error.abandonConfirmed) {
+            releaseClaim(claim, claim.importToken, InstallState.Cancelled)
+            return
+        }
+        pendingStore.assignSession(claim, sessionId)
+        mutableState.value = abandonFailed()
+    }
+
+    private fun handleCreateFailure(
+        claim: PendingInstall,
+        bundle: ImportedBundle,
+        error: PackageInstallSessionException,
+    ) {
+        val sessionId = error.sessionId
+        if (sessionId == null) {
+            releaseClaim(claim, bundle.token, InstallState.Failed(error.code, error.message))
+            return
+        }
+        val pending = pendingStore.assignSession(claim, sessionId)
+        if (pending == null) {
+            if (abandonConfirmed(sessionId)) {
+                releaseClaim(claim, bundle.token, InstallState.Failed(error.code, error.message))
+            } else {
+                mutableState.value = abandonFailed()
+            }
+            return
+        }
+        finishSession(
+            pending = pending,
+            next = InstallState.Failed(error.code, error.message),
+            abandon = true,
+            inbox = null,
+        )
+    }
+
+    private suspend fun restoreTerminalResultLocked() {
+        val inbox = pendingStore.loadTerminalResult() ?: return
+        val pending = pendingStore.load()
+        if (pending == null) {
+            finishCompletedTerminalCleanup(inbox)
+            return
+        }
+        if (pending.sessionId != inbox.result.sessionId) {
+            pendingStore.clearTerminalResult(inbox)
+            return
+        }
+        when (val result = inbox.result) {
+            is PackageInstallResult.Success -> verifyAndRecord(pending, inbox)
+            is PackageInstallResult.Cancelled -> finishSession(
+                pending = pending,
+                next = InstallState.Cancelled,
+                abandon = true,
+                inbox = inbox,
+            )
+            is PackageInstallResult.Failure -> finishSession(
+                pending = pending,
+                next = InstallState.Failed(result.code, result.message),
+                abandon = true,
+                inbox = inbox,
+            )
+            is PackageInstallResult.PendingUserAction -> Unit
+        }
+    }
+
+    private suspend fun restoreMissingSessionLocked() {
+        val pending = pendingStore.load() ?: return
+        if (pendingStore.loadTerminalResult() != null) return
+        val owned = try {
+            gateway.ownedSessions()
+        } catch (_: Exception) {
+            return
+        }
+        if (pending.isStillOwned(owned)) {
+            val reset = runCatching {
+                pendingStore.clearSessionMissingObservation(pending)
+            }.getOrDefault(false)
+            if (!reset) mutableState.value = missingObservationResetFailed()
+            return
+        }
+        val now = clock()
+        val missingSince = try {
+            pendingStore.firstSessionMissingAt(pending, now)
+        } catch (_: Exception) {
+            return
+        }
+        if (isWithinGrace(missingSince, now)) return
+        if (pendingStore.loadTerminalResult() != null) return
+        val stillOwned = try {
+            gateway.ownedSessions()
+        } catch (_: Exception) {
+            return
+        }
+        if (pending.isStillOwned(stillOwned)) return
+        val cleared = runCatching { pendingStore.clearStale(pending) }.getOrDefault(false)
+        if (cleared) {
+            activeBundle = null
+            mutableState.value = InstallState.Idle
+        } else if (pendingStore.loadTerminalResult() != null) {
+            restoreTerminalResultLocked()
+        } else {
+            mutableState.value = cleanupFailed()
+        }
+    }
+
+    private fun finishCompletedTerminalCleanup(inbox: PendingInstallResult) {
+        if (!pendingStore.clearTerminalResult(inbox)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        activeBundle = null
+        mutableState.value = when (val result = inbox.result) {
+            is PackageInstallResult.Success -> {
+                if (inbox.packageName.isBlank()) {
+                    InstallState.Failed(
+                        "TERMINAL_RECOVERY_FAILED",
+                        "완료된 설치 결과를 복구하지 못했습니다.",
+                    )
+                } else {
+                    InstallState.Installed(inbox.packageName)
+                }
+            }
+            is PackageInstallResult.Cancelled -> InstallState.Cancelled
+            is PackageInstallResult.Failure -> InstallState.Failed(result.code, result.message)
+            is PackageInstallResult.PendingUserAction -> return
+        }
+    }
+
+    private suspend fun verifyAndRecord(
+        pending: PendingInstall,
+        inbox: PendingInstallResult,
+    ) {
+        val installed = try {
             installedWrappers.find(pending.packageName)
-        }.getOrNull()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
         val bundle = activeBundle
         if (!isExpectedInstall(pending, installed, bundle)) {
             finishSession(
-                pending,
-                InstallState.Failed(
+                pending = pending,
+                next = InstallState.Failed(
                     "POST_INSTALL_VERIFICATION_FAILED",
                     "설치된 래퍼를 검증할 수 없습니다.",
                 ),
                 abandon = true,
+                inbox = inbox,
             )
             return
         }
@@ -216,24 +405,31 @@ class InstallCoordinator(
             iconPng = null,
             installedVersionCode = verified.versionCode,
             signerSha256 = verified.signerSha256,
-            compatibilityStatus = bundle?.report?.status?.name ?: "UNKNOWN",
-            reportJson = bundle?.report?.let(BundleJson::encodeCompatibility),
+            compatibilityStatus = requireNotNull(bundle).report.status.name,
+            reportJson = BundleJson.encodeCompatibility(bundle.report),
             lastVerifiedAtEpochMillis = clock(),
         )
         try {
             catalog.replaceVerified(record)
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Exception) {
             finishSession(
-                pending,
-                InstallState.Failed("CATALOG_UPDATE_FAILED", "설치 catalog를 갱신하지 못했습니다."),
+                pending = pending,
+                next = InstallState.Failed(
+                    "CATALOG_UPDATE_FAILED",
+                    "설치 catalog를 갱신하지 못했습니다.",
+                ),
                 abandon = true,
+                inbox = inbox,
             )
             return
         }
         finishSession(
-            pending,
-            InstallState.Installed(verified.packageName),
+            pending = pending,
+            next = InstallState.Installed(verified.packageName),
             abandon = false,
+            inbox = inbox,
         )
     }
 
@@ -243,24 +439,32 @@ class InstallCoordinator(
         bundle: ImportedBundle?,
     ): Boolean {
         if (installed == null ||
+            bundle == null ||
             installed.packageName != pending.packageName ||
             installed.versionCode <= 0 ||
             installed.signerSha256.isBlank()
         ) {
             return false
         }
-        if (bundle == null) return false
         return installed.extensionId == bundle.verifiedApk.extensionId &&
             installed.versionCode == bundle.verifiedApk.versionCode &&
             installed.signerSha256 == bundle.verifiedApk.signerSha256
     }
 
-    private suspend fun matchesRetainedWrapper(bundle: ImportedBundle): Boolean =
-        bundle.wrapperSha256 == bundle.verifiedApk.wrapperSha256 &&
-            bundle.wrapperSha256 == bundle.descriptor.wrapperSha256 &&
-            runCatching {
-                withContext(Dispatchers.IO) { sha256(bundle.wrapperFile) }
-            }.getOrNull() == bundle.wrapperSha256
+    private suspend fun matchesRetainedWrapper(bundle: ImportedBundle): Boolean {
+        if (bundle.wrapperSha256 != bundle.verifiedApk.wrapperSha256 ||
+            bundle.wrapperSha256 != bundle.descriptor.wrapperSha256
+        ) {
+            return false
+        }
+        return try {
+            withContext(Dispatchers.IO) { sha256(bundle.wrapperFile) } == bundle.wrapperSha256
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -276,53 +480,111 @@ class InstallCoordinator(
     }
 
     private fun restoreState(): InstallState {
-        val pending = pendingStore.load() ?: return InstallState.Idle
-        val owned = runCatching(gateway::ownedSessions).getOrNull()
-            ?: return InstallState.AwaitingUserApproval(pending.sessionId)
-        if (pending.sessionId in owned) {
-            return InstallState.AwaitingUserApproval(pending.sessionId)
-        }
-        val now = clock()
-        if (now < pending.startedAtEpochMillis ||
-            now - pending.startedAtEpochMillis <= COMPLETED_SESSION_GRACE_MILLIS
-        ) {
-            return InstallState.AwaitingUserApproval(pending.sessionId)
-        }
-        return if (clearPending(pending.importToken)) {
-            InstallState.Idle
-        } else {
-            cleanupFailed()
-        }
+        return pendingStore.load()?.toState() ?: InstallState.Idle
     }
 
-    private fun finishWithoutSession(bundle: ImportedBundle, next: InstallState) {
+    private fun finishUnclaimed(bundle: ImportedBundle, next: InstallState) {
         activeBundle = null
-        mutableState.value = if (clearPending(bundle.token)) next else cleanupFailed()
+        mutableState.value = if (pendingStore.discardImportSafely(bundle.token)) next else cleanupFailed()
+    }
+
+    private fun releaseClaim(
+        claim: PendingInstall,
+        importToken: String,
+        next: InstallState,
+    ) {
+        val importDiscarded = pendingStore.discardImportSafely(importToken)
+        val ledgerCleared = if (importDiscarded) {
+            runCatching { pendingStore.clear(claim) }.getOrDefault(false)
+        } else {
+            false
+        }
+        if (ledgerCleared && importDiscarded) activeBundle = null
+        mutableState.value = if (ledgerCleared && importDiscarded) next else cleanupFailed()
     }
 
     private fun finishSession(
         pending: PendingInstall,
         next: InstallState,
         abandon: Boolean,
+        inbox: PendingInstallResult?,
     ) {
-        if (abandon) abandonQuietly(pending.sessionId)
+        if (abandon && !abandonConfirmed(pending.sessionId)) {
+            mutableState.value = abandonFailed()
+            return
+        }
+        val importDiscarded = pendingStore.discardImportSafely(pending.importToken)
+        if (!importDiscarded) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        val ledgerCleared = runCatching { pendingStore.clear(pending) }.getOrDefault(false)
+        if (!ledgerCleared || !importDiscarded) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        if (inbox != null && !pendingStore.clearTerminalResult(inbox)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
         activeBundle = null
-        mutableState.value = if (clearPending(pending.importToken)) next else cleanupFailed()
+        mutableState.value = next
     }
 
-    private fun clearPending(importToken: String): Boolean {
-        val recordCleared = runCatching { pendingStore.clear() }.isSuccess
-        val importDiscarded = runCatching { pendingStore.discardImport(importToken) }.isSuccess
-        return recordCleared && importDiscarded
+    private fun abandonConfirmed(sessionId: Int): Boolean {
+        if (sessionId < 0) return true
+        try {
+            gateway.abandon(sessionId)
+            return true
+        } catch (_: Exception) {
+            return try {
+                sessionId !in gateway.ownedSessions()
+            } catch (_: Exception) {
+                false
+            }
+        }
     }
 
-    private fun abandonQuietly(sessionId: Int) {
-        runCatching { gateway.abandon(sessionId) }
+    private fun discardCompetingImport(importToken: String, activeToken: String?) {
+        if (importToken != activeToken) pendingStore.discardImportSafely(importToken)
     }
+
+    private fun PendingInstallStore.discardImportSafely(importToken: String): Boolean =
+        try {
+            discardImport(importToken)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+    private fun PendingInstall.toState(): InstallState =
+        if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)
+        else InstallState.WritingSession(sessionId)
+
+    private fun PendingInstall.isStillOwned(ownedSessions: List<Int>): Boolean =
+        if (sessionId < 0) ownedSessions.isNotEmpty() else sessionId in ownedSessions
+
+    private fun InstallState.isTerminal(): Boolean =
+        this is InstallState.Installed ||
+            this is InstallState.Cancelled ||
+            this is InstallState.Failed
+
+    private fun isWithinGrace(basis: Long, now: Long): Boolean =
+        now < basis || now - basis <= COMPLETED_SESSION_GRACE_MILLIS
 
     private fun cleanupFailed() = InstallState.Failed(
         "CLEANUP_FAILED",
         "설치 임시 데이터를 정리하지 못했습니다.",
+    )
+
+    private fun abandonFailed() = InstallState.Failed(
+        "ABANDON_FAILED",
+        "설치 session을 정리하지 못했습니다.",
+    )
+
+    private fun missingObservationResetFailed() = InstallState.Failed(
+        "MISSING_OBSERVATION_RESET_FAILED",
+        "session 복구 시각을 초기화하지 못했습니다.",
     )
 
     private companion object {

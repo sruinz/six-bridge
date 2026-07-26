@@ -2,6 +2,7 @@ package dev.sixbridge.manager.install
 
 import android.content.Intent
 import java.io.File
+import java.util.concurrent.CancellationException
 
 interface PackageInstallGateway {
     fun canRequestPackageInstalls(): Boolean
@@ -18,3 +19,13 @@ class PackageInstallSessionException(
     override val message: String,
     cause: Throwable? = null,
 ) : Exception(message, cause)
+
+class PackageInstallCancellationException(
+    val sessionId: Int?,
+    val abandonConfirmed: Boolean,
+    cause: CancellationException,
+) : CancellationException(cause.message) {
+    init {
+        initCause(cause)
+    }
+}
