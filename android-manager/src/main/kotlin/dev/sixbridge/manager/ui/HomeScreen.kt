@@ -26,8 +26,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.manager.R
 
@@ -159,13 +160,9 @@ private fun InstalledExtensionCard(
 
 @Composable
 private fun ExtensionIcon(item: ManagedExtensionItem) {
-    val iconPng = item.iconPng
-    val bitmap = remember(item.packageName, iconPng, iconPng?.contentHashCode()) {
-        iconPng?.let { bytes ->
-            runCatching {
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-            }.getOrNull()
-        }
+    val iconSnapshot = item.iconPng?.let(::IconPngSnapshot)
+    val bitmap = remember(item.packageName, iconSnapshot) {
+        iconSnapshot?.decode()
     }
     val accessibleName = item.name.trim().ifEmpty { item.packageName }
     val description = stringResource(R.string.extension_icon_description, accessibleName)
@@ -185,8 +182,11 @@ private fun ExtensionIcon(item: ManagedExtensionItem) {
             shape = RoundedCornerShape(8.dp),
             modifier = Modifier
                 .size(40.dp)
-                .semantics { contentDescription = description }
-                .testTag("extension:${item.packageName}:icon:fallback"),
+                .clearAndSetSemantics {
+                    contentDescription = description
+                    this[SemanticsProperties.TestTag] =
+                        "extension:${item.packageName}:icon:fallback"
+                },
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Text(
@@ -196,4 +196,17 @@ private fun ExtensionIcon(item: ManagedExtensionItem) {
             }
         }
     }
+}
+
+private class IconPngSnapshot(source: ByteArray) {
+    private val bytes = source.copyOf()
+
+    fun decode() = runCatching {
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }.getOrNull()
+
+    override fun equals(other: Any?): Boolean =
+        other is IconPngSnapshot && bytes.contentEquals(other.bytes)
+
+    override fun hashCode(): Int = bytes.contentHashCode()
 }

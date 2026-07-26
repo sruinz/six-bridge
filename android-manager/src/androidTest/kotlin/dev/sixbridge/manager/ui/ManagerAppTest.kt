@@ -4,15 +4,20 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -77,6 +82,7 @@ class ManagerAppTest {
 
         composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertIsDisplayed()
         composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("테스트 확장 아이콘").assertIsDisplayed()
     }
 
     @Test
@@ -84,7 +90,67 @@ class ManagerAppTest {
         setHome(iconPng = null)
 
         composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
-        composeRule.onNodeWithText("테").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("테스트 확장 아이콘").assertIsDisplayed()
+        composeRule.onAllNodes(hasContentDescription("테스트 확장 아이콘"))
+            .assertCountEquals(1)
+        composeRule.onNodeWithText("테").assertDoesNotExist()
+        composeRule.onNodeWithText("테", useUnmergedTree = true).assertIsDisplayed()
+    }
+
+    @Test
+    fun home_uses_fallback_for_malformed_icon() {
+        setHome(iconPng = byteArrayOf(0, 31))
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("테스트 확장 아이콘").assertIsDisplayed()
+    }
+
+    @Test
+    fun home_uses_question_mark_and_package_description_for_blank_name() {
+        setHome(iconPng = null, name = "   ")
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
+        composeRule.onNodeWithText("?", useUnmergedTree = true).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("$PACKAGE 아이콘").assertIsDisplayed()
+        composeRule.onAllNodes(hasContentDescription("$PACKAGE 아이콘"))
+            .assertCountEquals(1)
+    }
+
+    @Test
+    fun home_redecodes_same_reference_hash_collision_from_actual_to_fallback() {
+        val iconPng = pngBytes()
+        val originalHash = iconPng.contentHashCode()
+        val revision = setRecomposingHome(iconPng)
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertIsDisplayed()
+
+        composeRule.runOnIdle {
+            corruptPngSignatureWithoutChangingContentHash(iconPng)
+            assertEquals(originalHash, iconPng.contentHashCode())
+            revision.value += 1
+        }
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertDoesNotExist()
+    }
+
+    @Test
+    fun home_redecodes_same_reference_hash_collision_from_fallback_to_actual() {
+        val iconPng = pngBytes()
+        val validPng = iconPng.copyOf()
+        val originalHash = iconPng.contentHashCode()
+        corruptPngSignatureWithoutChangingContentHash(iconPng)
+        assertEquals(originalHash, iconPng.contentHashCode())
+        val revision = setRecomposingHome(iconPng)
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertIsDisplayed()
+
+        composeRule.runOnIdle {
+            validPng.copyInto(iconPng)
+            revision.value += 1
+        }
+
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:image").assertIsDisplayed()
+        composeRule.onNodeWithTag("extension:$PACKAGE:icon:fallback").assertDoesNotExist()
     }
 
     @Test
@@ -317,12 +383,13 @@ class ManagerAppTest {
 
     private fun installedItem(
         iconPng: ByteArray? = null,
+        name: String = "테스트 확장",
         report: ContractCompatibilityReport? = compatibilityReport(),
         reportAvailability: ReportAvailability = ReportAvailability.AVAILABLE,
     ) = ManagedExtensionItem(
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
-        name = "테스트 확장",
+        name = name,
         iconPng = iconPng,
         installedVersionCode = 7,
         compatibilityStatus = report?.status ?: ContractCompatibilityStatus.UNKNOWN,
@@ -369,7 +436,23 @@ class ManagerAppTest {
         output.toByteArray()
     }
 
-    private fun setHome(iconPng: ByteArray?) {
+    private fun setHome(
+        iconPng: ByteArray?,
+        name: String = "테스트 확장",
+    ) {
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    installed = listOf(installedItem(iconPng = iconPng, name = name)),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+    }
+
+    private fun setRecomposingHome(iconPng: ByteArray): MutableState<Int> {
+        val revision = mutableStateOf(0)
         composeRule.setContent {
             ManagerAppContent(
                 state = ManagerUiState(
@@ -377,8 +460,15 @@ class ManagerAppTest {
                 ),
                 onAction = {},
                 onAddSix = {},
+                modifier = Modifier.testTag("home:revision:${revision.value}"),
             )
         }
+        return revision
+    }
+
+    private fun corruptPngSignatureWithoutChangingContentHash(iconPng: ByteArray) {
+        iconPng[0] = (iconPng[0] + 1).toByte()
+        iconPng[1] = (iconPng[1] - 31).toByte()
     }
 
     private companion object {
