@@ -63,7 +63,7 @@ class ManagerDependencies private constructor(
                 verifier = verifier,
                 cacheDirectory = application.cacheDir,
             )
-            val uninstall = DefaultUninstallCoordinator(installedWrappers, catalog)
+            val uninstall = DefaultUninstallCoordinator(installedWrappers)
             val iconSource = ContentProviderInstalledExtensionIconSource(
                 application.contentResolver,
                 File(application.cacheDir, "extension-icons"),

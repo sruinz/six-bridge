@@ -58,6 +58,7 @@ import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.concurrent.CancellationException
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -68,6 +69,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -75,6 +77,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
@@ -1284,6 +1287,10 @@ class ManagerRepositoryTest {
             val actualOnly = publisher.state.value.single()
             assertEquals(SECOND_PACKAGE, actualOnly.packageName)
             assertEquals("UNKNOWN", actualOnly.compatibilityStatus)
+            assertEquals(
+                listOf(SECOND_PACKAGE),
+                catalog.records.map(CatalogRecord::packageName),
+            )
         }
 
     @Test
@@ -1303,7 +1310,7 @@ class ManagerRepositoryTest {
     }
 
     @Test
-    fun `Task 3 전 publish는 미저장 record의 icon을 반영하지 않는다`() = runBlocking {
+    fun `publish는 기준 행을 보장한 뒤 미저장 record의 icon을 반영한다`() = runBlocking {
         val catalog = FakeCatalog(emptyList())
         val installed = FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
         val publisher = catalogPublisher(
@@ -1314,11 +1321,8 @@ class ManagerRepositoryTest {
 
         publisher.publish(listOf(record(version = 1, signer = "same")))
 
-        assertNull(
-            publisher.state.value.single().iconPng,
-            "Task 3 전에는 기준 행이 없는 icon을 state에 반영하지 않는다.",
-        )
-        assertTrue(catalog.records.isEmpty())
+        assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+        assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
     }
 
     @Test
@@ -1410,6 +1414,205 @@ class ManagerRepositoryTest {
 
             assertEquals(changed, catalog.records.single())
             assertNull(publisher.state.value.single().iconPng)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `설치 확인 뒤 제거가 완료되면 늦은 icon 결과가 행과 UI를 재생성하지 않는다`() =
+        runTest {
+            val iconLoaded = CompletableDeferred<Unit>()
+            val findEntered = CompletableDeferred<Unit>()
+            val allowFindReturn = CompletableDeferred<Unit>()
+            val iconJobCompleted = CompletableDeferred<Unit>()
+            val wrapper = installed(version = 1, signer = "same")
+            val installed = object : InstalledWrapperRepository {
+                override suspend fun findAll(): List<InstalledWrapper> = listOf(wrapper)
+
+                override suspend fun find(packageName: String): InstalledWrapper? {
+                    findEntered.complete(Unit)
+                    return try {
+                        allowFindReturn.await()
+                        wrapper.takeIf { it.packageName == packageName }
+                    } finally {
+                        iconJobCompleted.complete(Unit)
+                    }
+                }
+            }
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    iconLoaded.complete(Unit)
+                    PUBLISHER_PNG
+                },
+                scope = backgroundScope,
+            )
+
+            publisher.reconcile()
+            runCurrent()
+            iconLoaded.await()
+            findEntered.await()
+
+            publisher.remove(PACKAGE)
+            allowFindReturn.complete(Unit)
+            advanceUntilIdle()
+
+            assertNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.none { it.packageName == PACKAGE })
+            assertEquals(0, catalog.iconInsertCount)
+            assertTrue(iconJobCompleted.isCompleted)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `Room icon 저장 실패 뒤 반복 reconcile은 저장을 반복하거나 icon을 지우지 않는다`() =
+        runTest {
+            var providerLoadCount = 0
+            val catalog = FakeCatalog(
+                listOf(record(version = 1, signer = "same")),
+            ).apply {
+                persistFailuresRemaining = 1
+            }
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    providerLoadCount += 1
+                    PUBLISHER_PNG
+                },
+                scope = backgroundScope,
+            )
+            val emissions = mutableListOf<ByteArray?>()
+            val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+                publisher.state.collect { records ->
+                    emissions += records.singleOrNull()?.iconPng
+                }
+            }
+
+            publisher.reconcile()
+            runCurrent()
+            assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+            publisher.publish(listOf(record(version = 1, signer = "same")))
+            assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+            runCurrent()
+            publisher.reconcile()
+            runCurrent()
+            collector.cancelAndJoin()
+
+            val firstPositive = emissions.indexOfFirst { it != null }
+            assertTrue(firstPositive >= 0)
+            assertTrue(
+                emissions.drop(firstPositive + 1).none { it == null },
+                "최초 양성 아이콘 표시 뒤 null emission이 없어야 합니다.",
+            )
+            assertEquals(1, providerLoadCount)
+            assertEquals(1, catalog.iconInsertCount)
+        }
+
+    @Test
+    fun `identity 변경은 이전 bytes와 저장 실패 상태를 재사용하지 않는다`() = runBlocking {
+        var providerLoadCount = 0
+        val firstPng = byteArrayOf(1, 2, 3)
+        val secondPng = byteArrayOf(4, 5, 6)
+        val catalog = FakeCatalog(
+            listOf(record(version = 1, signer = "same")),
+        ).apply {
+            persistFailuresRemaining = 1
+        }
+        val installed =
+            FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+        val publisher = catalogPublisher(
+            catalog = catalog,
+            installed = installed,
+            source = InstalledExtensionIconSource {
+                providerLoadCount += 1
+                if (providerLoadCount == 1) firstPng else secondPng
+            },
+        )
+
+        publisher.reconcile()
+        assertContentEquals(firstPng, publisher.state.value.single().iconPng)
+
+        installed.values = listOf(installed(version = 2, signer = "changed"))
+        publisher.reconcile()
+
+        val current = publisher.state.value.single()
+        assertEquals(2, current.installedVersionCode)
+        assertEquals("changed", current.signerSha256)
+        assertContentEquals(secondPng, current.iconPng)
+        assertContentEquals(secondPng, catalog.records.single().iconPng)
+        assertEquals(2, providerLoadCount)
+        assertEquals(2, catalog.iconInsertCount)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `제거 확인 뒤 Room 삭제 실패는 취소 결과와 기존 UI를 유지하고 cancellation은 재전파한다`() =
+        runTest {
+            val root = temporaryFolder.newFolder("uninstall-publisher-failure")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            val pendingStore = StartupPendingStore(null, root)
+            val gateway = StartupGateway(emptyList())
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+            val installCoordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                scope = backgroundScope,
+            )
+            publisher.reconcile()
+            runCurrent()
+            val repository = managerRepository(
+                root = root,
+                retainedImports = retainedImports,
+                gateway = gateway,
+                pendingStore = pendingStore,
+                installed = installed,
+                catalog = catalog,
+                coordinator = installCoordinator,
+                uninstallCoordinator = object : UninstallCoordinator {
+                    override fun intent(packageName: String) =
+                        error("이 테스트에서는 Intent를 만들지 않습니다.")
+
+                    override suspend fun reconcileAfterReturn(packageName: String) =
+                        UninstallOutcome.Removed
+                },
+                catalogPublisher = publisher,
+            )
+
+            catalog.removeFailure = IllegalStateException("Room unavailable")
+            assertEquals(
+                UninstallOutcome.CancelledOrStillInstalled,
+                repository.reconcileUninstall(PACKAGE),
+            )
+            assertNotNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
+
+            catalog.removeFailure = CancellationException("cancelled")
+            assertFailsWith<CancellationException> {
+                repository.reconcileUninstall(PACKAGE)
+            }
+            assertNotNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.any { it.packageName == PACKAGE })
+
+            catalog.removeFailure = null
+            assertEquals(UninstallOutcome.Removed, repository.reconcileUninstall(PACKAGE))
+            assertNull(catalog.get(PACKAGE))
+            assertTrue(publisher.state.value.none { it.packageName == PACKAGE })
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1543,6 +1746,12 @@ class ManagerRepositoryTest {
         catalog: FakeCatalog,
         coordinator: InstallCoordinator,
         afterInstallRequest: suspend (InstallState) -> Unit = {},
+        uninstallCoordinator: UninstallCoordinator = object : UninstallCoordinator {
+            override fun intent(packageName: String) = error("uninstall하지 않습니다.")
+            override suspend fun reconcileAfterReturn(packageName: String) =
+                UninstallOutcome.CancelledOrStillInstalled
+        },
+        catalogPublisher: CatalogPublisher = catalogPublisher(catalog, installed),
     ) = DefaultManagerRepository(
         importer = BundleImportService(
             BundleSource { error("직접 import하지 않습니다.") },
@@ -1559,16 +1768,12 @@ class ManagerRepositoryTest {
         ),
         installCoordinator = coordinator,
         pendingStore = pendingStore,
-        uninstallCoordinator = object : UninstallCoordinator {
-            override fun intent(packageName: String) = error("uninstall하지 않습니다.")
-            override suspend fun reconcileAfterReturn(packageName: String) =
-                UninstallOutcome.CancelledOrStillInstalled
-        },
+        uninstallCoordinator = uninstallCoordinator,
         samsungBrowserNavigator = object : SamsungBrowserNavigator {
             override fun addOnsIntent() = error("Add-ons를 열지 않습니다.")
             override fun availability() = SamsungBrowserAvailability.SamsungBrowserMissing
         },
-        catalogPublisher = catalogPublisher(catalog, installed),
+        catalogPublisher = catalogPublisher,
         installEvents = emptyFlow(),
         ioDispatcher = Dispatchers.Unconfined,
         afterInstallRequest = afterInstallRequest,
@@ -1686,6 +1891,9 @@ private class FakeCatalog(
     initial: List<CatalogRecord>,
 ) : ManagerCatalog {
     var records = initial
+    var iconInsertCount = 0
+    var persistFailuresRemaining = 0
+    var removeFailure: Throwable? = null
 
     override fun observe(): Flow<List<CatalogRecord>> = flowOf(records)
     override suspend fun replaceVerified(record: CatalogRecord) {
@@ -1701,6 +1909,11 @@ private class FakeCatalog(
         identity: CatalogIdentity,
         iconPng: ByteArray,
     ): CatalogRecord? {
+        iconInsertCount += 1
+        if (persistFailuresRemaining > 0) {
+            persistFailuresRemaining -= 1
+            error("transient icon write failure")
+        }
         val index = records.indexOfFirst { it.packageName == identity.packageName }
         val current = records.getOrNull(index) ?: return null
         if (current.extensionId != identity.extensionId ||
@@ -1714,6 +1927,7 @@ private class FakeCatalog(
         }
     }
     override suspend fun remove(packageName: String) {
+        removeFailure?.let { throw it }
         records = records.filterNot { it.packageName == packageName }
     }
     override suspend fun removeAll(packageNames: Set<String>) {

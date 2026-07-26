@@ -1,22 +1,16 @@
 package dev.sixbridge.manager.uninstall
 
 import android.content.Intent
-import dev.sixbridge.manager.catalog.CatalogIdentity
-import dev.sixbridge.manager.catalog.CatalogRecord
-import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Test
 
 class UninstallCoordinatorTest {
     @Test
     fun `system uninstall intent uses exact package URI`() {
-        val coordinator = DefaultUninstallCoordinator(FakeInstalledWrappers(), FakeCatalog())
+        val coordinator = DefaultUninstallCoordinator(FakeInstalledWrappers())
 
         val route = coordinator.uninstallRoute(PACKAGE_NAME)
 
@@ -25,42 +19,34 @@ class UninstallCoordinatorTest {
     }
 
     @Test
-    fun `return with installed package keeps catalog record`() = runTest {
-        val catalog = FakeCatalog()
+    fun `return with installed package reports cancellation without catalog side effect`() = runTest {
         val coordinator = DefaultUninstallCoordinator(
             FakeInstalledWrappers(installedPackage = PACKAGE_NAME),
-            catalog,
         )
 
         val outcome = coordinator.reconcileAfterReturn(PACKAGE_NAME)
 
         assertEquals(UninstallOutcome.CancelledOrStillInstalled, outcome)
-        assertNull(catalog.removedPackage)
     }
 
     @Test
-    fun `return after confirmed removal deletes catalog record`() = runTest {
-        val catalog = FakeCatalog()
-        val coordinator = DefaultUninstallCoordinator(FakeInstalledWrappers(), catalog)
+    fun `return after confirmed removal only reports Removed`() = runTest {
+        val coordinator = DefaultUninstallCoordinator(FakeInstalledWrappers())
 
         val outcome = coordinator.reconcileAfterReturn(PACKAGE_NAME)
 
         assertEquals(UninstallOutcome.Removed, outcome)
-        assertEquals(PACKAGE_NAME, catalog.removedPackage)
     }
 
     @Test
     fun `return while package state is propagating waits for confirmed removal`() = runTest {
-        val catalog = FakeCatalog()
         val coordinator = DefaultUninstallCoordinator(
             SequencedInstalledWrappers(listOf(true, false)),
-            catalog,
         )
 
         val outcome = coordinator.reconcileAfterReturn(PACKAGE_NAME)
 
         assertEquals(UninstallOutcome.Removed, outcome)
-        assertEquals(PACKAGE_NAME, catalog.removedPackage)
     }
 
     private class FakeInstalledWrappers(
@@ -72,24 +58,6 @@ class UninstallCoordinatorTest {
             installedPackage?.takeIf { it == packageName }?.let {
                 InstalledWrapper(it, "extension", "Example", 1, "signer")
             }
-    }
-
-    private class FakeCatalog : ManagerCatalog {
-        var removedPackage: String? = null
-
-        override fun observe(): Flow<List<CatalogRecord>> = emptyFlow()
-        override suspend fun replaceVerified(record: CatalogRecord) = Unit
-        override suspend fun ensureDiscoveredIdentity(discovered: CatalogRecord): CatalogRecord = discovered
-        override suspend fun persistIconIfIdentity(
-            identity: CatalogIdentity,
-            iconPng: ByteArray,
-        ): CatalogRecord? = null
-        override suspend fun remove(packageName: String) {
-            removedPackage = packageName
-        }
-
-        override suspend fun removeAll(packageNames: Set<String>) = Unit
-        override suspend fun get(packageName: String): CatalogRecord? = null
     }
 
     private class SequencedInstalledWrappers(

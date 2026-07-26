@@ -1,7 +1,6 @@
 package dev.sixbridge.manager.catalog
 
 import dev.sixbridge.manager.wrapper.InstalledWrapper
-import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import dev.sixbridge.manager.catalog.identity
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
@@ -122,34 +121,6 @@ class CatalogReconcilerTest {
     }
 
     @Test
-    fun `queries installed wrappers and removes all stale catalog entries in one batch`() = runBlocking {
-        val staleFirst = catalogRecord(packageName = "dev.sixbridge.ext.stale-first")
-        val staleSecond = catalogRecord(packageName = "dev.sixbridge.ext.stale-second")
-        val catalog = FakeCatalog(listOf(staleFirst, staleSecond))
-        val installed = installedWrapper(
-            packageName = "dev.sixbridge.ext.external",
-            versionCode = 3,
-            signerSha256 = "d".repeat(64),
-        )
-
-        val result = CatalogReconciler().reconcile(
-            catalog = catalog,
-            installedWrappers = object : InstalledWrapperRepository {
-                override suspend fun findAll(): List<InstalledWrapper> = listOf(installed)
-
-                override suspend fun find(packageName: String): InstalledWrapper? =
-                    installed.takeIf { it.packageName == packageName }
-            },
-        )
-
-        assertEquals(
-            listOf(setOf(staleFirst.packageName, staleSecond.packageName)),
-            catalog.removedPackageNameBatches,
-        )
-        assertEquals(listOf(installed.packageName), result.records.map(CatalogRecord::packageName))
-    }
-
-    @Test
     fun `fake catalog ensure는 변경된 identity를 unknown baseline으로 교체한다`() = runBlocking {
         val current = catalogRecord(packageName = "dev.sixbridge.ext.fake")
         val discovered = current.copy(
@@ -205,8 +176,6 @@ class CatalogReconcilerTest {
     private class FakeCatalog(
         private var records: List<CatalogRecord>,
     ) : ManagerCatalog {
-        val removedPackageNameBatches = mutableListOf<Set<String>>()
-
         override fun observe(): Flow<List<CatalogRecord>> = flowOf(records)
 
         override suspend fun replaceVerified(record: CatalogRecord) = Unit
@@ -223,13 +192,9 @@ class CatalogReconcilerTest {
             iconPng: ByteArray,
         ): CatalogRecord? = null
 
-        override suspend fun remove(packageName: String) {
-            throw AssertionError("CatalogReconciler must use removeAll instead of remove")
-        }
+        override suspend fun remove(packageName: String) = Unit
 
-        override suspend fun removeAll(packageNames: Set<String>) {
-            removedPackageNameBatches += packageNames
-        }
+        override suspend fun removeAll(packageNames: Set<String>) = Unit
 
         override suspend fun get(packageName: String): CatalogRecord? =
             records.singleOrNull { it.packageName == packageName }

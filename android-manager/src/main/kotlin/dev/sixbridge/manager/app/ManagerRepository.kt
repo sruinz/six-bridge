@@ -66,6 +66,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.job
@@ -274,8 +275,18 @@ internal class DefaultManagerRepository(
         intentFactory = { uninstallCoordinator.intent(packageName) },
     )
 
-    override suspend fun reconcileUninstall(packageName: String): UninstallOutcome =
-        uninstallCoordinator.reconcileAfterReturn(packageName)
+    override suspend fun reconcileUninstall(packageName: String): UninstallOutcome {
+        val outcome = uninstallCoordinator.reconcileAfterReturn(packageName)
+        if (outcome != UninstallOutcome.Removed) return outcome
+        return try {
+            catalogPublisher.remove(packageName)
+            UninstallOutcome.Removed
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            UninstallOutcome.CancelledOrStillInstalled
+        }
+    }
 
     override fun samsungAddOns(): RepositoryNavigationResult =
         when (samsungBrowserNavigator.availability()) {
@@ -426,9 +437,7 @@ internal class CatalogPublisher(
 
     suspend fun reconcile() {
         val publication = mutex.withLock {
-            publishFallbackLocked(
-                reconciler.reconcile(catalog, installedWrappers).records,
-            )
+            publishFallbackLocked(reconcileLocked(catalog.observe().first()))
         }
         publication.cancelledJobs.forEach(Job::cancel)
         scheduleIcons(publication.records)
@@ -436,12 +445,46 @@ internal class CatalogPublisher(
 
     suspend fun publish(records: List<CatalogRecord>) {
         val publication = mutex.withLock {
-            publishFallbackLocked(
-                reconciler.reconcile(records, installedWrappers.findAll()).records,
-            )
+            publishFallbackLocked(reconcileLocked(records))
         }
         publication.cancelledJobs.forEach(Job::cancel)
         scheduleIcons(publication.records)
+    }
+
+    suspend fun remove(packageName: String) {
+        val cancelled = mutex.withLock {
+            val jobs = iconJobs
+                .filterKeys { it.packageName == packageName }
+                .values
+                .toList()
+            jobs.forEach(Job::cancel)
+            iconJobs.keys.removeAll { it.packageName == packageName }
+            iconEnricher.retainOnly(
+                mutableState.value
+                    .filterNot { it.packageName == packageName }
+                    .mapTo(mutableSetOf(), CatalogRecord::identity),
+            )
+            catalog.remove(packageName)
+            mutableState.value = mutableState.value.filterNot {
+                it.packageName == packageName
+            }
+            jobs
+        }
+        cancelled.forEach { job -> job.join() }
+    }
+
+    private suspend fun reconcileLocked(
+        catalogRecords: List<CatalogRecord>,
+    ): List<CatalogRecord> {
+        val installed = installedWrappers.findAll()
+        val reconciliation = reconciler.reconcile(catalogRecords, installed)
+        catalog.removeAll(reconciliation.stalePackageNames.toSet())
+        val ensured = reconciliation.records.map { discovered ->
+            catalog.ensureDiscoveredIdentity(discovered)
+        }
+        val identities = ensured.mapTo(mutableSetOf(), CatalogRecord::identity)
+        iconEnricher.retainOnly(identities)
+        return ensured.map { iconEnricher.mergeCached(it) }
     }
 
     private fun publishFallbackLocked(records: List<CatalogRecord>): IconPublication {

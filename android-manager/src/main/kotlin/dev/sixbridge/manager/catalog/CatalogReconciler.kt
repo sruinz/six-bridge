@@ -1,8 +1,6 @@
 package dev.sixbridge.manager.catalog
 
 import dev.sixbridge.manager.wrapper.InstalledWrapper
-import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
-import kotlinx.coroutines.flow.first
 
 data class CatalogReconciliation(
     val records: List<CatalogRecord>,
@@ -57,17 +55,5 @@ class CatalogReconciler {
                 .filterNot(installedPackages::contains)
                 .toList(),
         )
-    }
-
-    suspend fun reconcile(
-        catalog: ManagerCatalog,
-        installedWrappers: InstalledWrapperRepository,
-    ): CatalogReconciliation {
-        val reconciliation = reconcile(
-            catalogRecords = catalog.observe().first(),
-            installedWrappers = installedWrappers.findAll(),
-        )
-        catalog.removeAll(reconciliation.stalePackageNames.toSet())
-        return reconciliation
     }
 }

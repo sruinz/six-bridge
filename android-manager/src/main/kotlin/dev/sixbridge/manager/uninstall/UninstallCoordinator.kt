@@ -2,7 +2,6 @@ package dev.sixbridge.manager.uninstall
 
 import android.content.Intent
 import android.net.Uri
-import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.delay
@@ -24,7 +23,6 @@ interface UninstallCoordinator {
 
 class DefaultUninstallCoordinator(
     private val installedWrappers: InstalledWrapperRepository,
-    private val catalog: ManagerCatalog,
 ) : UninstallCoordinator {
     override fun intent(packageName: String): Intent = uninstallRoute(packageName).toIntent()
 
@@ -41,7 +39,7 @@ class DefaultUninstallCoordinator(
                 return UninstallOutcome.CancelledOrStillInstalled
             }
             if (installed == null) {
-                return removeCatalogRecord(packageName)
+                return UninstallOutcome.Removed
             }
             if (index < PACKAGE_STATE_CHECK_COUNT - 1) {
                 delay(PACKAGE_STATE_CHECK_INTERVAL_MS)
@@ -49,17 +47,6 @@ class DefaultUninstallCoordinator(
         }
 
         return UninstallOutcome.CancelledOrStillInstalled
-    }
-
-    private suspend fun removeCatalogRecord(packageName: String): UninstallOutcome {
-        return try {
-            catalog.remove(packageName)
-            UninstallOutcome.Removed
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            UninstallOutcome.CancelledOrStillInstalled
-        }
     }
 
     private fun IntentRoute.toIntent(): Intent = Intent(action, Uri.parse(data))
