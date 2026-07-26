@@ -13,6 +13,7 @@ import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CyclicBarrier
 import kotlinx.coroutines.Dispatchers
@@ -790,6 +791,78 @@ class InstallCoordinatorTest {
             assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
             assertNull(fixture.pendingStore.record)
             assertNull(fixture.pendingStore.terminalResult)
+        }
+
+    @Test
+    fun `retained hash IO 실패는 restore를 중단하고 다음 시도에서 terminal을 처리한다`() =
+        runBlocking {
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Success(SESSION_ID),
+                terminalAtEpochMillis = FINISHED_AT,
+            )
+            val fixture = fixture(
+                pending = pendingInstall(),
+                terminalResult = terminal,
+            )
+            fixture.installedWrappers.installed = installedWrapper()
+            var hashAttempts = 0
+            val coordinator = InstallCoordinator(
+                policy = InstallPolicy(),
+                gateway = fixture.gateway,
+                pendingStore = fixture.pendingStore,
+                installedWrappers = fixture.installedWrappers,
+                catalog = fixture.catalog,
+                clock = { FINISHED_AT },
+                retainedWrapperSha256 = {
+                    hashAttempts += 1
+                    if (hashAttempts == 1) throw IOException("transient hash read")
+                    fixture.bundle.wrapperSha256
+                },
+            )
+
+            assertFailsWith<IOException> {
+                coordinator.restore(fixture.bundle)
+            }
+            assertEquals(pendingInstall(), fixture.pendingStore.record)
+            assertEquals(terminal, fixture.pendingStore.terminalResult)
+
+            coordinator.restore(fixture.bundle)
+
+            assertEquals(InstallState.Installed(PACKAGE_NAME), coordinator.state.value)
+            assertNull(fixture.pendingStore.record)
+            assertNull(fixture.pendingStore.terminalResult)
+        }
+
+    @Test
+    fun `첫 request hash IO 실패는 소유권을 풀어 다음 request가 성공한다`() =
+        runBlocking {
+            val fixture = fixture()
+            var hashAttempts = 0
+            val coordinator = InstallCoordinator(
+                policy = InstallPolicy(),
+                gateway = fixture.gateway,
+                pendingStore = fixture.pendingStore,
+                installedWrappers = fixture.installedWrappers,
+                catalog = fixture.catalog,
+                clock = { STARTED_AT },
+                retainedWrapperSha256 = {
+                    hashAttempts += 1
+                    if (hashAttempts == 1) throw IOException("transient hash read")
+                    fixture.bundle.wrapperSha256
+                },
+            )
+
+            assertFailsWith<IOException> {
+                coordinator.request(fixture.bundle, partialConfirmed = false)
+            }
+            assertNull(fixture.pendingStore.record)
+            assertTrue(fixture.gateway.createdPackages.isEmpty())
+
+            coordinator.request(fixture.bundle, partialConfirmed = false)
+
+            assertEquals(2, hashAttempts)
+            assertEquals(InstallState.AwaitingUserApproval(SESSION_ID), coordinator.state.value)
+            assertEquals(listOf(SESSION_ID), fixture.gateway.committedSessions)
         }
 
     @Test

@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.install
 
 import android.content.Intent
+import android.app.NotificationManager
 import android.content.pm.PackageInstaller
 import org.junit.Test
 import kotlin.test.assertEquals
@@ -171,6 +172,22 @@ class InstallResultReceiverTest {
         assertTrue(foregroundDeliveries.single() === foregroundIntent)
         assertEquals(listOf(42), backgroundDeliveries.map(Pair<Int, Intent>::first))
         assertTrue(backgroundDeliveries.single().second === backgroundIntent)
+    }
+
+    @Test
+    fun `app notification은 켜져 있어도 install channel이 꺼져 있으면 handoff 불가다`() {
+        assertFalse(
+            notificationHandoffAvailable(
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_NONE,
+            ),
+        )
+        assertTrue(
+            notificationHandoffAvailable(
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
     }
 
     @Test

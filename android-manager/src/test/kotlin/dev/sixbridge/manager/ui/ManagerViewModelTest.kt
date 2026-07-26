@@ -66,6 +66,30 @@ class ManagerViewModelTest {
     }
 
     @Test
+    fun `initialize transient 실패는 saved review token을 지우지 않고 재생성에서 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+            val repository = FakeManagerRepository().apply {
+                initializeException = IllegalStateException("transient retained load")
+            }
+
+            ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+            repository.initializeException = null
+            repository.restoreResult = ManagerRestoreResult(
+                review = review(ContractCompatibilityStatus.COMPATIBLE),
+            )
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+        }
+
+    @Test
     fun `가져오기 중 표시 후 compatible은 즉시 설치할 수 있다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository().apply {
             importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
@@ -611,6 +635,29 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `cleanup 계열 install failure는 review route와 saved token을 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            repository.installFlow.value = InstallState.Failed(
+                code = "CLEANUP_FAILED",
+                message = "cleanup retry required",
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+            assertEquals(TOKEN, savedState.get<String>("review_token"))
+        }
+
+    @Test
     fun `cleanup 실패 뒤 늦은 stale token은 현재 review 파일을 자동 또는 부분 삭제하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -846,6 +893,7 @@ private class FakeManagerRepository : ManagerRepository {
     var importResult: ManagerImportResult =
         ManagerImportResult.Failure(ImportFailure(ImportFailureCode.SOURCE_UNREADABLE))
     var initialized = false
+    var initializeException: RuntimeException? = null
     var suspendInitialize = false
     var ignoreInitializeCancellation = false
     var restoreArguments: Pair<String?, Int?>? = null
@@ -885,6 +933,7 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun initialize(reviewToken: String?, installSessionId: Int?): ManagerRestoreResult {
         initialized = true
         restoreArguments = reviewToken to installSessionId
+        initializeException?.let { throw it }
         if (suspendInitialize) {
             if (ignoreInitializeCancellation) {
                 withContext(NonCancellable) { initializeGate.first() }

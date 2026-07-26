@@ -12,6 +12,8 @@ import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.importer.ImportedBundle
+import dev.sixbridge.manager.importer.ImportFailure
+import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.BundleSource
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
@@ -41,11 +43,13 @@ import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.File
+import java.io.IOException
 import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -101,6 +105,82 @@ class ManagerRepositoryTest {
 
         bundle.wrapperFile.writeText("changed")
         assertNull(RetainedImportStore(root, verifier).load(TOKEN))
+    }
+
+    @Test
+    fun `retained sidecar IO는 transient로 전파되고 다음 load에서 복원한다`() {
+        val root = temporaryFolder.newFolder("sidecar-io-retry")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        RetainedImportStore(root, verifier).save(bundle)
+        var attempts = 0
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                openSidecar = { sidecar ->
+                    attempts += 1
+                    if (attempts == 1) throw IOException("transient sidecar read")
+                    sidecar.inputStream()
+                },
+            ),
+            verify = verifier,
+        )
+
+        assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
+        assertNotNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `retained verifier 예외는 transient로 전파되고 명시적 Failure만 invalid다`() {
+        val root = temporaryFolder.newFolder("verifier-retry")
+        val bundle = importedBundle(root)
+        val stableVerifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        RetainedImportStore(root, stableVerifier).save(bundle)
+        var attempts = 0
+        val retrying = RetainedImportStore(root) { _, _, _ ->
+            attempts += 1
+            if (attempts == 1) error("transient verifier")
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+
+        assertFailsWith<RetainedImportTransientException> { retrying.load(TOKEN) }
+        assertNotNull(retrying.load(TOKEN))
+        assertNull(
+            RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Failure(
+                    ImportFailure(ImportFailureCode.ARCHIVE_INVALID),
+                )
+            }.load(TOKEN),
+        )
+    }
+
+    @Test
+    fun `retained wrapper hash IO는 transient로 전파되고 다음 load에서 복원한다`() {
+        val root = temporaryFolder.newFolder("hash-retry")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        RetainedImportStore(root, verifier).save(bundle)
+        var attempts = 0
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                wrapperSha256 = {
+                    attempts += 1
+                    if (attempts == 1) throw IOException("transient wrapper read")
+                    bundle.wrapperSha256
+                },
+            ),
+            verify = verifier,
+        )
+
+        assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
+        assertNotNull(store.load(TOKEN))
     }
 
     @Test
@@ -327,13 +407,77 @@ class ManagerRepositoryTest {
             Unit
         }
 
+    @Test
+    fun `startup terminal cleanup 뒤 snapshot은 완료된 review와 session을 복원하지 않는다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("completed-startup-snapshot")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundle))
+            val pending = PendingInstall(41, PACKAGE, TOKEN, 1)
+            val pendingStore = StartupPendingStore(pending, root).apply {
+                terminal = PendingInstallResult(
+                    PackageInstallResult.Success(41),
+                    terminalAtEpochMillis = 2,
+                    packageName = PACKAGE,
+                )
+            }
+            val gateway = StartupGateway(listOf(41))
+            val installed = FakeInstalledWrappers(
+                listOf(
+                    InstalledWrapper(
+                        packageName = PACKAGE,
+                        extensionId = EXTENSION_ID,
+                        name = "Example",
+                        versionCode = 2,
+                        signerSha256 = "a".repeat(64),
+                    ),
+                ),
+            )
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            val startup = RepositoryStartup(
+                retainedImports,
+                StartupCleanup(
+                    root,
+                    gateway,
+                    pendingStore,
+                    Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+                ),
+                coordinator,
+                pendingStore,
+                CatalogPublisher(catalog, installed, CatalogReconciler()),
+                Dispatchers.Unconfined,
+            )
+
+            val snapshot = startup.ensureReady()
+
+            assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
+            assertNull(snapshot.pending)
+            assertNull(snapshot.restoredBundle)
+            assertNull(pendingStore.record)
+            assertFalse(File(root, TOKEN).exists())
+        }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `startup 첫 복원 예외는 readiness 전 terminal 소비를 막고 다음 시도에서 복원한다`() =
         runTest {
             val root = temporaryFolder.newFolder("retry-startup-import")
             val bundle = importedBundle(root)
+            var verifierCalls = 0
             val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+                verifierCalls += 1
                 WrapperVerificationResult.Success(bundle.verifiedApk)
             }
             val retainedImports = RetainedImportStore(root, verifier)
@@ -405,7 +549,10 @@ class ManagerRepositoryTest {
             assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
             assertNull(pendingStore.terminal)
             assertEquals(PACKAGE, catalog.records.single().packageName)
-            foregroundInitialization.await()
+            val snapshot = foregroundInitialization.await()
+            assertEquals(TOKEN, snapshot.pending?.importToken)
+            assertEquals(TOKEN, snapshot.restoredBundle?.token)
+            assertEquals(1, verifierCalls)
             scope.cancel()
         }
 
@@ -535,6 +682,130 @@ class ManagerRepositoryTest {
                     assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
                         .review.token,
                 )
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `committed cleanup 실패 뒤 새 repository와 ViewModel이 review를 복원해 재시도한다`() {
+        val dispatcher = StandardTestDispatcher()
+        Dispatchers.setMain(dispatcher)
+        try {
+            runTest(dispatcher.scheduler) {
+                val root = temporaryFolder.newFolder("committed-cleanup-recreation")
+                val bundle = importedBundle(root)
+                var retainedLoadCalls = 0
+                var verifierCalls = 0
+                val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+                    verifierCalls += 1
+                    WrapperVerificationResult.Success(bundle.verifiedApk)
+                }
+                val retainedImports = RetainedImportStore(
+                    root,
+                    RetainedImportIo(
+                        openSidecar = { sidecar ->
+                            retainedLoadCalls += 1
+                            sidecar.inputStream()
+                        },
+                    ),
+                    verifier,
+                )
+                retainedImports.save(bundle)
+                val pending = PendingInstall(41, PACKAGE, TOKEN, 1)
+                val pendingStore = StartupPendingStore(pending, root).apply {
+                    discardFailure = true
+                }
+                val gateway = StartupGateway(listOf(41))
+                val installed = FakeInstalledWrappers(emptyList())
+                val catalog = FakeCatalog(emptyList())
+                val firstCoordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    clock = { 2 },
+                    retainedWrapperSha256 = { sha256(it) },
+                )
+                firstCoordinator.restore(bundle)
+
+                assertFalse(firstCoordinator.cancel())
+                assertEquals(
+                    "CLEANUP_FAILED",
+                    assertIs<InstallState.Failed>(firstCoordinator.state.value).code,
+                )
+                assertEquals(pending, pendingStore.record)
+                assertTrue(File(root, TOKEN).exists())
+
+                val restoredCoordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    clock = { 2 },
+                    retainedWrapperSha256 = { sha256(it) },
+                )
+                val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+                val repository = DefaultManagerRepository(
+                    importer = BundleImportService(
+                        BundleSource { error("직접 import하지 않습니다.") },
+                        AndroidWrapperVerifier(ArchiveInspector { error("검증하지 않습니다.") }),
+                        root,
+                        ioDispatcher = dispatcher,
+                    ),
+                    retainedImports = retainedImports,
+                    startupCleanup = StartupCleanup(
+                        root,
+                        gateway,
+                        pendingStore,
+                        Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+                    ),
+                    installCoordinator = restoredCoordinator,
+                    pendingStore = pendingStore,
+                    uninstallCoordinator = object : UninstallCoordinator {
+                        override fun intent(packageName: String) =
+                            error("uninstall하지 않습니다.")
+                        override suspend fun reconcileAfterReturn(packageName: String) =
+                            UninstallOutcome.CancelledOrStillInstalled
+                    },
+                    samsungBrowserNavigator = object : SamsungBrowserNavigator {
+                        override fun addOnsIntent() = error("Add-ons를 열지 않습니다.")
+                        override fun availability() =
+                            SamsungBrowserAvailability.SamsungBrowserMissing
+                    },
+                    catalogPublisher = publisher,
+                    installEvents = emptyFlow(),
+                    ioDispatcher = dispatcher,
+                )
+                val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+                val recreated = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+
+                assertEquals(1, retainedLoadCalls)
+                assertEquals(1, verifierCalls)
+                assertEquals(
+                    InstallState.AwaitingUserApproval(41),
+                    restoredCoordinator.state.value,
+                )
+                assertEquals(pending, pendingStore.record)
+                assertTrue(File(root, TOKEN).exists())
+                assertEquals(TOKEN, savedState.get<String>("review_token"))
+                assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+                assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
+                assertEquals(TOKEN, savedState.get<String>("review_token"))
+
+                pendingStore.discardFailure = false
+                recreated.accept(ManagerAction.CancelReview)
+                advanceUntilIdle()
+
+                assertEquals(ManagerRoute.Home, recreated.state.value.route)
+                assertNull(savedState.get<String>("review_token"))
+                assertNull(pendingStore.record)
+                assertFalse(File(root, TOKEN).exists())
             }
         } finally {
             Dispatchers.resetMain()
@@ -741,8 +1012,16 @@ private class StartupPendingStore(
         record = null
         return true
     }
-    override fun clearWithoutTerminal(expected: PendingInstall): PendingCleanupResult =
-        PendingCleanupResult.Failed
+    override fun clearWithoutTerminal(expected: PendingInstall): PendingCleanupResult {
+        if (record != expected || discardFailure) return PendingCleanupResult.Failed
+        return try {
+            discardImport(expected.importToken)
+            record = null
+            PendingCleanupResult.Cleared
+        } catch (_: Exception) {
+            PendingCleanupResult.Failed
+        }
+    }
     override fun discardImport(importToken: String) {
         discardAttempts += 1
         if (discardFailure) error("discard failed")

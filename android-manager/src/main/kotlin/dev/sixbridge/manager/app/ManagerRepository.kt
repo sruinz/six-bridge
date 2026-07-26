@@ -21,6 +21,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.PackageInstallCallback
 import dev.sixbridge.manager.install.PackageInstallEvents
 import dev.sixbridge.manager.install.PackageInstallResult
+import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
@@ -32,7 +33,11 @@ import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.File
+import java.io.FileNotFoundException
+import java.io.InputStream
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
@@ -157,18 +162,23 @@ internal class DefaultManagerRepository(
         reviewToken: String?,
         installSessionId: Int?,
     ): ManagerRestoreResult {
-        startup.awaitReady()
-        val pending = pendingStore.load()
-        val retained = if (pending == null) {
-            reviewToken?.let { token ->
-                withContext(ioDispatcher) { retainedImports.load(token) }
+        val startupSnapshot = startup.awaitReady()
+        val pending = startupSnapshot.pending
+        val retained = reviewToken?.let { token ->
+            when {
+                pending?.importToken == token ->
+                    startupSnapshot.restoredBundle?.takeIf { it.token == token }
+                pending == null ->
+                    withContext(ioDispatcher) { retainedImports.load(token) }
+                else -> null
             }
-        } else {
-            null
         }
         val restoredSession = installSessionId?.takeIf { pending?.sessionId == it }
         val review = retained
-            ?.takeIf { it.token == reviewToken && pending == null }
+            ?.takeIf {
+                it.token == reviewToken &&
+                    (pending == null || pending.importToken == reviewToken)
+            }
             ?.toReview()
         return ManagerRestoreResult(review, restoredSession)
     }
@@ -251,7 +261,7 @@ internal class RepositoryStartup(
     private val retryDelayMillis: Long = 250,
 ) {
     private val mutex = Mutex()
-    private val ready = CompletableDeferred<Unit>()
+    private val ready = CompletableDeferred<StartupSnapshot>()
     private val started = AtomicBoolean()
 
     fun start(
@@ -266,7 +276,7 @@ internal class RepositoryStartup(
         }
     }
 
-    suspend fun awaitReady() {
+    suspend fun awaitReady(): StartupSnapshot {
         while (!ready.isCompleted) {
             try {
                 ensureReady()
@@ -276,10 +286,10 @@ internal class RepositoryStartup(
                 delay(retryDelayMillis)
             }
         }
-        ready.await()
+        return ready.await()
     }
 
-    suspend fun ensureReady() {
+    suspend fun ensureReady(): StartupSnapshot {
         if (!ready.isCompleted) {
             mutex.withLock {
                 if (!ready.isCompleted) {
@@ -289,12 +299,16 @@ internal class RepositoryStartup(
                         withContext(ioDispatcher) { retainedImports.load(token) }
                     }
                     installCoordinator.restore(retained)
+                    val restoredPending = pendingStore.load()
+                    val restoredBundle = retained?.takeIf { bundle ->
+                        restoredPending?.importToken == bundle.token
+                    }
                     runBestEffortStartupStep { catalogPublisher.reconcile() }
-                    ready.complete(Unit)
+                    ready.complete(StartupSnapshot(restoredPending, restoredBundle))
                 }
             }
         }
-        ready.await()
+        return ready.await()
     }
 
     private suspend fun runBestEffortStartupStep(step: suspend () -> Unit) {
@@ -307,6 +321,11 @@ internal class RepositoryStartup(
         }
     }
 }
+
+internal data class StartupSnapshot(
+    val pending: PendingInstall?,
+    val restoredBundle: ImportedBundle?,
+)
 
 internal suspend fun collectPackageInstallEvents(
     events: Flow<PackageInstallCallback>,
@@ -365,17 +384,32 @@ internal class CatalogPublisher(
     }
 }
 
+internal data class RetainedImportIo(
+    val openSidecar: (File) -> InputStream = File::inputStream,
+    val wrapperSha256: (File) -> String = ::retainedFileSha256,
+)
+
 internal class RetainedImportStore(
     private val importRoot: File,
+    private val io: RetainedImportIo = RetainedImportIo(),
     private val verify: (
         File,
         ContractExtensionDescriptor,
         ContractCompatibilityReport,
     ) -> WrapperVerificationResult,
 ) {
+    constructor(
+        importRoot: File,
+        verify: (
+            File,
+            ContractExtensionDescriptor,
+            ContractCompatibilityReport,
+        ) -> WrapperVerificationResult,
+    ) : this(importRoot, RetainedImportIo(), verify)
+
     constructor(importRoot: File, verifier: AndroidWrapperVerifier) : this(
-        importRoot,
-        verifier::verify,
+        importRoot = importRoot,
+        verify = verifier::verify,
     )
 
     fun save(bundle: ImportedBundle): Boolean {
@@ -383,7 +417,7 @@ internal class RetainedImportStore(
         val wrapper = wrapperFile(directory) ?: return false
         val importedWrapper = runCatching { bundle.wrapperFile.canonicalFile }.getOrNull()
             ?: return false
-        val currentSha256 = runCatching { sha256(wrapper) }.getOrNull() ?: return false
+        val currentSha256 = runCatching { io.wrapperSha256(wrapper) }.getOrNull() ?: return false
         if (wrapper != importedWrapper ||
             currentSha256 != bundle.wrapperSha256 ||
             bundle.wrapperSha256 != bundle.descriptor.wrapperSha256
@@ -441,20 +475,38 @@ internal class RetainedImportStore(
         ) {
             return null
         }
-        val metadata = runCatching {
-            DataInputStream(sidecar.inputStream().buffered()).use { input ->
+        val metadata = try {
+            DataInputStream(io.openSidecar(sidecar).buffered()).use { input ->
                 if (input.readInt() != MAGIC || input.readInt() != FORMAT_VERSION) return null
                 val extension = input.readBoundedBytes()
                 val compatibility = input.readBoundedBytes()
                 if (input.read() != -1) return null
                 extension.toString(Charsets.UTF_8) to compatibility.toString(Charsets.UTF_8)
             }
-        }.getOrNull() ?: return null
+        } catch (_: EOFException) {
+            return null
+        } catch (_: FileNotFoundException) {
+            return null
+        } catch (_: IllegalArgumentException) {
+            return null
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: IOException) {
+            throw RetainedImportTransientException(error)
+        } catch (error: Exception) {
+            throw RetainedImportTransientException(error)
+        }
         val descriptor = runCatching { BundleJson.decodeExtension(metadata.first) }.getOrNull()
             ?: return null
         val report = runCatching { BundleJson.decodeCompatibility(metadata.second) }.getOrNull()
             ?: return null
-        val currentSha256 = runCatching { sha256(wrapper) }.getOrNull() ?: return null
+        val currentSha256 = try {
+            io.wrapperSha256(wrapper)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw RetainedImportTransientException(error)
+        }
         if (report.schemaVersion != 3 ||
             report.convertedExtensionId != descriptor.extensionId ||
             report.extensionName != descriptor.name ||
@@ -463,8 +515,13 @@ internal class RetainedImportStore(
         ) {
             return null
         }
-        val verification = runCatching { verify(wrapper, descriptor, report) }.getOrNull()
-            ?: return null
+        val verification = try {
+            verify(wrapper, descriptor, report)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw RetainedImportTransientException(error)
+        }
         val verified = when (verification) {
             is WrapperVerificationResult.Success -> verification.value
             is WrapperVerificationResult.Failure -> return null
@@ -520,19 +577,6 @@ internal class RetainedImportStore(
     private fun isCanonicalToken(token: String): Boolean =
         runCatching { UUID.fromString(token).toString() == token }.getOrDefault(false)
 
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
     private companion object {
         const val MAGIC = 0x53495852
         const val FORMAT_VERSION = 1
@@ -542,6 +586,21 @@ internal class RetainedImportStore(
         const val SIDECAR_FILE = "review.bundle"
         const val WRAPPER_FILE = "wrapper.apk"
     }
+}
+
+internal class RetainedImportTransientException(cause: Throwable) : RuntimeException(cause)
+
+private fun retainedFileSha256(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            digest.update(buffer, 0, count)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
 private fun ImportedBundle.toReview() = ReviewBundle(

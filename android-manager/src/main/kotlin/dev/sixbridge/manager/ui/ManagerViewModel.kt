@@ -132,19 +132,19 @@ class ManagerViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
-                null
+                return@launch
             }
             initialized = true
             if (generation != operationGeneration) {
-                restored?.review?.token?.let(::queuePendingReviewDiscard)
+                restored.review?.token?.let(::queuePendingReviewDiscard)
                 return@launch
             }
-            if (restored?.review != null) {
+            if (restored.review != null) {
                 showReview(restored.review)
             } else {
                 savedStateHandle[REVIEW_TOKEN_KEY] = null
             }
-            if (restored?.installSessionId != null) {
+            if (restored.installSessionId != null) {
                 savedStateHandle[INSTALL_SESSION_ID_KEY] = restored.installSessionId
             } else {
                 savedStateHandle[INSTALL_SESSION_ID_KEY] = null
@@ -475,6 +475,12 @@ class ManagerViewModel(
     }
 
     private fun applyInstallTerminal(installState: InstallState) {
+        if (installState is InstallState.Failed &&
+            installState.code in CLEANUP_RETRYABLE_FAILURES &&
+            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
+        ) {
+            return
+        }
         clearSavedReviewAndSession()
         mutableState.update {
             when (installState) {
@@ -519,6 +525,12 @@ class ManagerViewModel(
     companion object {
         const val REVIEW_TOKEN_KEY = "review_token"
         const val INSTALL_SESSION_ID_KEY = "install_session_id"
+        private val CLEANUP_RETRYABLE_FAILURES = setOf(
+            "CLEANUP_FAILED",
+            "ABANDON_FAILED",
+            "SESSION_RECOVERY_FAILED",
+            "MISSING_OBSERVATION_RESET_FAILED",
+        )
     }
 }
 

@@ -58,6 +58,13 @@ internal fun matchesPendingInstallSession(pending: PendingInstall?, sessionId: I
 internal fun pendingConfirmationFlags(existingFlags: Int): Int =
     existingFlags or Intent.FLAG_ACTIVITY_NEW_TASK
 
+internal fun notificationHandoffAvailable(
+    appNotificationsEnabled: Boolean,
+    channelImportance: Int?,
+): Boolean = appNotificationsEnabled &&
+    channelImportance != null &&
+    channelImportance != NotificationManager.IMPORTANCE_NONE
+
 internal object ManagerAppVisibility {
     private val visibleActivities = AtomicInteger()
 
@@ -224,7 +231,6 @@ class InstallResultReceiver : BroadcastReceiver() {
     ) {
         val manager = context.getSystemService(NotificationManager::class.java)
             ?: error("notification service unavailable")
-        if (!manager.areNotificationsEnabled()) error("notifications disabled")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -238,6 +244,15 @@ class InstallResultReceiver : BroadcastReceiver() {
                 NotificationManager.IMPORTANCE_HIGH,
             ),
         )
+        if (!notificationHandoffAvailable(
+                appNotificationsEnabled = manager.areNotificationsEnabled(),
+                channelImportance = manager
+                    .getNotificationChannel(INSTALL_CONFIRMATION_CHANNEL)
+                    ?.importance,
+            )
+        ) {
+            error("notification handoff unavailable")
+        }
         val contentIntent = PendingIntent.getActivity(
             context,
             sessionId,

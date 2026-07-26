@@ -24,6 +24,9 @@ class InstallCoordinator(
     private val installedWrappers: InstalledWrapperRepository,
     private val catalog: ManagerCatalog,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val retainedWrapperSha256: suspend (File) -> String = { file ->
+        withContext(Dispatchers.IO) { sha256(file) }
+    },
 ) {
     private val mutex = Mutex()
     private var activeBundle: ImportedBundle? = null
@@ -78,6 +81,14 @@ class InstallCoordinator(
                     createAndCommit(bundle)
                 } catch (error: CancellationException) {
                     if (pendingStore.load() == null) activeBundle = null
+                    throw error
+                } catch (error: Exception) {
+                    val unclaimed = try {
+                        pendingStore.load() == null
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (unclaimed) activeBundle = null
                     throw error
                 }
             }
@@ -576,26 +587,7 @@ class InstallCoordinator(
         ) {
             return false
         }
-        return try {
-            withContext(Dispatchers.IO) { sha256(bundle.wrapperFile) } == bundle.wrapperSha256
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return retainedWrapperSha256(bundle.wrapperFile) == bundle.wrapperSha256
     }
 
     private fun restoreState(): InstallState {
@@ -752,5 +744,18 @@ class InstallCoordinator(
 
     private companion object {
         const val COMPLETED_SESSION_GRACE_MILLIS = 24 * 60 * 60 * 1_000L
+
+        fun sha256(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
     }
 }
