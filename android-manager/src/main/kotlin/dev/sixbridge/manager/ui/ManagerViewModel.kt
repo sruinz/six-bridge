@@ -36,7 +36,9 @@ class ManagerViewModel(
     private var routeOperation: Job? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
-    private var pendingUninstallPackage: String? = null
+    private var uninstallGeneration = 0L
+    private var pendingUninstallLaunch: PendingUninstallLaunch? = null
+    private var pendingUninstallReturn: PendingUninstallReturn? = null
     private var pendingRecovery: PendingRecovery? = null
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
@@ -62,10 +64,11 @@ class ManagerViewModel(
 
     fun accept(action: ManagerAction) {
         if (action != ManagerAction.RetryRecovery &&
+            action !is ManagerAction.LaunchSucceeded &&
             action !is ManagerAction.LaunchFailed &&
             action != ManagerAction.ReturnedToForeground
         ) {
-            clearRecoveryOwnership()
+            beginNewUserAction()
         }
         when (action) {
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
@@ -80,6 +83,7 @@ class ManagerViewModel(
             ManagerAction.ReturnedToForeground -> returnedToForeground()
             ManagerAction.DismissMessage -> mutableState.update { it.copy(message = null) }
             ManagerAction.RetryRecovery -> retryRecovery()
+            is ManagerAction.LaunchSucceeded -> recordLaunchSuccess(action.effect)
             is ManagerAction.LaunchFailed -> recordLaunchFailure(action.effect)
         }
     }
@@ -193,6 +197,12 @@ class ManagerViewModel(
                 val changed = installState != lastInstallState
                 lastInstallState = installState
                 mutableState.update { it.copy(installState = installState) }
+                if (installState.isTerminalState()) {
+                    clearLaunchRecovery(
+                        LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
+                        LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                    )
+                }
                 if (firstEmission &&
                     installState == installStateAtInitialization &&
                     installState.isTerminalState() &&
@@ -212,10 +222,12 @@ class ManagerViewModel(
                 when (installState) {
                     is InstallState.WritingSession -> {
                         saveSessionIfInitialized(installState.sessionId)
+                        clearLaunchRecovery(LaunchDestination.UNKNOWN_SOURCES_SETTINGS)
                         clearUnknownSourcesMessage()
                     }
                     is InstallState.AwaitingUserApproval -> {
                         saveSessionIfInitialized(installState.sessionId)
+                        clearLaunchRecovery(LaunchDestination.UNKNOWN_SOURCES_SETTINGS)
                         clearUnknownSourcesMessage()
                     }
                     InstallState.UnknownSourcesPermissionRequired -> if (changed) {
@@ -333,24 +345,28 @@ class ManagerViewModel(
     }
 
     private fun remove(packageName: String) {
-        pendingUninstallPackage = packageName
-        enqueueEffect(ManagerEffect.LaunchIntent(repository.uninstall(packageName)))
+        val effect = ManagerEffect.LaunchIntent(repository.uninstall(packageName))
+        pendingUninstallLaunch = PendingUninstallLaunch(
+            effect = effect,
+            packageName = packageName,
+            generation = uninstallGeneration,
+        )
+        enqueueEffect(effect)
     }
 
     private fun returnedToForeground() {
-        val uninstallPackage = pendingUninstallPackage
-        if (uninstallPackage != null) {
-            pendingUninstallPackage = null
-            val generation = operationGeneration
+        val pendingReturn = pendingUninstallReturn
+        if (pendingReturn != null && pendingReturn.generation == uninstallGeneration) {
+            pendingUninstallReturn = null
             viewModelScope.launch {
                 val outcome = try {
-                    repository.reconcileUninstall(uninstallPackage)
+                    repository.reconcileUninstall(pendingReturn.packageName)
                 } finally {
                     repository.reconcileCatalog()
                 }
-                if (generation != operationGeneration) return@launch
+                if (pendingReturn.generation != uninstallGeneration) return@launch
                 if (outcome == UninstallOutcome.CancelledOrStillInstalled) {
-                    pendingRecovery = PendingRecovery.Uninstall(uninstallPackage)
+                    pendingRecovery = PendingRecovery.Uninstall(pendingReturn.packageName)
                 }
                 mutableState.update {
                     it.copy(
@@ -421,7 +437,20 @@ class ManagerViewModel(
     }
 
     private fun recordLaunchFailure(effect: ManagerEffect.LaunchIntent) {
-        pendingRecovery = PendingRecovery.Launch(effect)
+        val uninstallPackage = if (effect.destination == LaunchDestination.UNINSTALL) {
+            val pendingLaunch = pendingUninstallLaunch
+                ?.takeIf {
+                    it.effect === effect &&
+                        it.generation == uninstallGeneration
+                }
+                ?: return
+            pendingUninstallLaunch = null
+            pendingUninstallReturn = null
+            pendingLaunch.packageName
+        } else {
+            null
+        }
+        pendingRecovery = PendingRecovery.Launch(effect, uninstallPackage)
         mutableState.update {
             it.copy(
                 message = UserMessage(
@@ -433,24 +462,59 @@ class ManagerViewModel(
         }
     }
 
+    private fun recordLaunchSuccess(effect: ManagerEffect.LaunchIntent) {
+        if (effect.destination != LaunchDestination.UNINSTALL) return
+        val pendingLaunch = pendingUninstallLaunch
+            ?.takeIf {
+                it.effect === effect &&
+                    it.generation == uninstallGeneration
+            }
+            ?: return
+        pendingUninstallLaunch = null
+        pendingUninstallReturn = PendingUninstallReturn(
+            packageName = pendingLaunch.packageName,
+            generation = pendingLaunch.generation,
+        )
+    }
+
     private fun retryRecovery() {
         val recovery = pendingRecovery ?: return
         pendingRecovery = null
+        invalidateUninstallAttempt()
         mutableState.update { it.copy(message = null) }
         when (recovery) {
             PendingRecovery.SamsungAddOns -> openSamsungAddOns()
             is PendingRecovery.Uninstall -> remove(recovery.packageName)
-            is PendingRecovery.Launch -> enqueueEffect(recovery.effect)
+            is PendingRecovery.Launch -> {
+                recovery.uninstallPackage?.let { packageName ->
+                    pendingUninstallLaunch = PendingUninstallLaunch(
+                        effect = recovery.effect,
+                        packageName = packageName,
+                        generation = uninstallGeneration,
+                    )
+                }
+                enqueueEffect(recovery.effect)
+            }
         }
     }
 
-    private fun clearRecoveryOwnership() {
-        val recovery = pendingRecovery
+    private fun beginNewUserAction() {
+        invalidateUninstallAttempt()
         pendingRecovery = null
-        if (recovery is PendingRecovery.Launch &&
-            recovery.effect.destination == LaunchDestination.UNINSTALL
-        ) {
-            pendingUninstallPackage = null
+    }
+
+    private fun invalidateUninstallAttempt() {
+        uninstallGeneration += 1
+        pendingUninstallLaunch = null
+        pendingUninstallReturn = null
+    }
+
+    private fun clearLaunchRecovery(vararg destinations: LaunchDestination) {
+        val recovery = pendingRecovery as? PendingRecovery.Launch ?: return
+        if (recovery.effect.destination !in destinations) return
+        pendingRecovery = null
+        if (mutableState.value.message?.kind == UserMessageKind.LAUNCH_FAILED) {
+            mutableState.update { it.copy(message = null) }
         }
     }
 
@@ -713,5 +777,19 @@ private fun installFailureMessage(code: String): UserMessage = when (code) {
 private sealed interface PendingRecovery {
     data object SamsungAddOns : PendingRecovery
     data class Uninstall(val packageName: String) : PendingRecovery
-    data class Launch(val effect: ManagerEffect.LaunchIntent) : PendingRecovery
+    data class Launch(
+        val effect: ManagerEffect.LaunchIntent,
+        val uninstallPackage: String? = null,
+    ) : PendingRecovery
 }
+
+private data class PendingUninstallLaunch(
+    val effect: ManagerEffect.LaunchIntent,
+    val packageName: String,
+    val generation: Long,
+)
+
+private data class PendingUninstallReturn(
+    val packageName: String,
+    val generation: Long,
+)

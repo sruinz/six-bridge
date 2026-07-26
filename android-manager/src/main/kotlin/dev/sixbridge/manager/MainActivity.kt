@@ -79,6 +79,9 @@ class MainActivity : ComponentActivity() {
                             effect = effect,
                             resolveIntent = { it.intentFactory() },
                             launchIntent = ::startActivity,
+                            onSuccess = {
+                                managerViewModel.accept(ManagerAction.LaunchSucceeded(it))
+                            },
                             onFailure = {
                                 managerViewModel.accept(ManagerAction.LaunchFailed(it))
                             },
@@ -135,13 +138,23 @@ internal fun <T> executeLaunch(
     effect: ManagerEffect.LaunchIntent,
     resolveIntent: (ManagerEffect.LaunchIntent) -> T,
     launchIntent: (T) -> Unit,
+    onSuccess: (ManagerEffect.LaunchIntent) -> Unit,
     onFailure: (ManagerEffect.LaunchIntent) -> Unit,
-): Boolean = try {
-    launchIntent(resolveIntent(effect))
-    true
-} catch (_: RuntimeException) {
-    onFailure(effect)
-    false
+): Boolean {
+    val intent = try {
+        resolveIntent(effect)
+    } catch (_: RuntimeException) {
+        onFailure(effect)
+        return false
+    }
+    try {
+        launchIntent(intent)
+    } catch (_: RuntimeException) {
+        onFailure(effect)
+        return false
+    }
+    onSuccess(effect)
+    return true
 }
 
 internal class NotificationPermissionInstallGate(

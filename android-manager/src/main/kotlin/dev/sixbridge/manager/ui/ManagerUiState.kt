@@ -101,6 +101,7 @@ sealed interface ManagerAction {
     data object ReturnedToForeground : ManagerAction
     data object DismissMessage : ManagerAction
     data object RetryRecovery : ManagerAction
+    data class LaunchSucceeded(val effect: ManagerEffect.LaunchIntent) : ManagerAction
     data class LaunchFailed(val effect: ManagerEffect.LaunchIntent) : ManagerAction
 }
 

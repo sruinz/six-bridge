@@ -23,6 +23,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
@@ -408,10 +409,12 @@ class ManagerViewModelTest {
         advanceUntilIdle()
         viewModel.accept(ManagerAction.Remove(PACKAGE))
         advanceUntilIdle()
+        val firstEffect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
         assertEquals(
             LaunchDestination.UNINSTALL,
-            assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
+            firstEffect.destination,
         )
+        viewModel.accept(ManagerAction.LaunchSucceeded(firstEffect))
 
         repository.uninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
         viewModel.accept(ManagerAction.ReturnedToForeground)
@@ -419,6 +422,8 @@ class ManagerViewModelTest {
         assertEquals(UserMessageKind.UNINSTALL_CANCELLED, viewModel.state.value.message?.kind)
 
         viewModel.accept(ManagerAction.Remove(PACKAGE))
+        val secondEffect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+        viewModel.accept(ManagerAction.LaunchSucceeded(secondEffect))
         repository.uninstallOutcome = UninstallOutcome.Removed
         viewModel.accept(ManagerAction.ReturnedToForeground)
         advanceUntilIdle()
@@ -435,7 +440,8 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.Remove(PACKAGE))
             assertEquals(PACKAGE, repository.uninstallPackages.single())
-            viewModel.effects.first()
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchSucceeded(effect))
             repository.uninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
             viewModel.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
@@ -448,6 +454,100 @@ class ManagerViewModelTest {
                 assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
             )
             assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `uninstall launch 실패와 즉시 foreground 복귀는 제거 취소로 오분류하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            val failed = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            assertTrue(repository.reconcileUninstallPackages.isEmpty())
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+            val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertTrue(failed === retried)
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+            assertTrue(repository.reconcileUninstallPackages.isEmpty())
+
+            repository.uninstallOutcome = UninstallOutcome.Removed
+            viewModel.accept(ManagerAction.LaunchSucceeded(retried))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            assertEquals(listOf(PACKAGE), repository.reconcileUninstallPackages)
+            assertEquals(UserMessageKind.UNINSTALLED, viewModel.state.value.message?.kind)
+        }
+
+    @Test
+    fun `uninstall success ACK는 pending effect identity가 정확히 일치할 때만 승격한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                uninstallOutcome = UninstallOutcome.Removed
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            val expected = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            val unrelated = ManagerEffect.LaunchIntent(
+                destination = LaunchDestination.UNINSTALL,
+                intentFactory = { error("unrelated") },
+            )
+
+            viewModel.accept(ManagerAction.LaunchSucceeded(unrelated))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+            assertTrue(repository.reconcileUninstallPackages.isEmpty())
+
+            viewModel.accept(ManagerAction.LaunchSucceeded(expected))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+            assertEquals(listOf(PACKAGE), repository.reconcileUninstallPackages)
+        }
+
+    @Test
+    fun `지연된 uninstall reconcile은 새 report action 뒤 메시지와 RETRY를 재생성하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+                suspendUninstallReconcile = true
+                ignoreUninstallReconcileCancellation = true
+                uninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchSucceeded(effect))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            dispatcher.scheduler.runCurrent()
+            assertEquals(listOf(PACKAGE), repository.reconcileUninstallPackages)
+
+            viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+            repository.completeUninstallReconcile()
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals(1, repository.reconcileRequests)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+            collector.cancel()
         }
 
     @Test
@@ -501,6 +601,90 @@ class ManagerViewModelTest {
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
             viewModel.accept(ManagerAction.RetryRecovery)
             assertTrue(retried === viewModel.effects.first())
+        }
+
+    @Test
+    fun `unknown sources launch 실패는 writing 또는 approval 진행 시 message와 RETRY를 지운다`() =
+        runTest(dispatcher.scheduler) {
+            for (progressed in listOf(
+                InstallState.WritingSession(40),
+                InstallState.AwaitingUserApproval(41),
+            )) {
+                val repository = FakeManagerRepository()
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+                advanceUntilIdle()
+                val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+                viewModel.accept(ManagerAction.LaunchFailed(effect))
+                assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+
+                viewModel.accept(ManagerAction.ReturnedToForeground)
+                repository.installFlow.value = progressed
+                advanceUntilIdle()
+
+                assertNull(viewModel.state.value.message)
+                val effects = mutableListOf<ManagerEffect>()
+                val collector = launch { viewModel.effects.collect(effects::add) }
+                dispatcher.scheduler.runCurrent()
+                viewModel.accept(ManagerAction.RetryRecovery)
+                dispatcher.scheduler.runCurrent()
+                assertTrue(effects.isEmpty())
+                collector.cancel()
+            }
+        }
+
+    @Test
+    fun `terminal install은 settings와 confirmation launch recovery만 제거한다`() =
+        runTest(dispatcher.scheduler) {
+            for (destination in listOf(
+                LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
+                LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+            )) {
+                val repository = FakeManagerRepository()
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                val effect = if (destination == LaunchDestination.UNKNOWN_SOURCES_SETTINGS) {
+                    repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+                    advanceUntilIdle()
+                    assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+                } else {
+                    repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+                    repository.emitLaunch(destination, 41)
+                    advanceUntilIdle()
+                    assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+                }
+                viewModel.accept(ManagerAction.LaunchFailed(effect))
+
+                repository.installFlow.value = InstallState.Cancelled
+                advanceUntilIdle()
+                assertEquals(UserMessageKind.INSTALL_CANCELLED, viewModel.state.value.message?.kind)
+                val effects = mutableListOf<ManagerEffect>()
+                val collector = launch { viewModel.effects.collect(effects::add) }
+                dispatcher.scheduler.runCurrent()
+                viewModel.accept(ManagerAction.RetryRecovery)
+                dispatcher.scheduler.runCurrent()
+                assertTrue(effects.isEmpty())
+                collector.cancel()
+            }
+        }
+
+    @Test
+    fun `다른 destination launch 실패는 install 진행 중에도 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(effect))
+
+            repository.installFlow.value = InstallState.WritingSession(40)
+            advanceUntilIdle()
+
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+            viewModel.accept(ManagerAction.RetryRecovery)
+            assertTrue(effect === viewModel.effects.first())
         }
 
     @Test
@@ -1235,6 +1419,9 @@ private class FakeManagerRepository : ManagerRepository {
     var reconcileRequests = 0
     var uninstallOutcome: UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
     val uninstallPackages = mutableListOf<String>()
+    val reconcileUninstallPackages = mutableListOf<String>()
+    var suspendUninstallReconcile = false
+    var ignoreUninstallReconcileCancellation = false
     var navigationResult: RepositoryNavigationResult = RepositoryNavigationResult.Launch(
         RepositoryLaunch(
             destination = LaunchDestination.SAMSUNG_ADD_ONS,
@@ -1255,6 +1442,7 @@ private class FakeManagerRepository : ManagerRepository {
     private val installGate = MutableSharedFlow<Unit>()
     private val cancelInstallGate = MutableSharedFlow<Unit>()
     private val initializeGate = MutableSharedFlow<Unit>()
+    private val uninstallReconcileGate = CompletableDeferred<Unit>()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
 
     override val catalog = catalogFlow
@@ -1352,7 +1540,21 @@ private class FakeManagerRepository : ManagerRepository {
         )
     }
 
-    override suspend fun reconcileUninstall(packageName: String): UninstallOutcome = uninstallOutcome
+    override suspend fun reconcileUninstall(packageName: String): UninstallOutcome {
+        reconcileUninstallPackages += packageName
+        if (suspendUninstallReconcile) {
+            if (ignoreUninstallReconcileCancellation) {
+                withContext(NonCancellable) { uninstallReconcileGate.await() }
+            } else {
+                uninstallReconcileGate.await()
+            }
+        }
+        return uninstallOutcome
+    }
+
+    fun completeUninstallReconcile() {
+        uninstallReconcileGate.complete(Unit)
+    }
 
     override fun samsungAddOns(): RepositoryNavigationResult = navigationResult
 

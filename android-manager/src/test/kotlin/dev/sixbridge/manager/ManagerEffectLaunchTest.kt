@@ -13,32 +13,38 @@ class ManagerEffectLaunchTest {
     fun `intent 생성 예외는 같은 effect를 실패 callback에 전달한다`() {
         val effect = launchEffect()
         var failed: ManagerEffect.LaunchIntent? = null
+        var succeeded: ManagerEffect.LaunchIntent? = null
 
         val launched = executeLaunch(
             effect = effect,
             resolveIntent = { throw IllegalStateException("factory failed") },
             launchIntent = { error("호출되면 안 됩니다.") },
+            onSuccess = { succeeded = it },
             onFailure = { failed = it },
         )
 
         assertFalse(launched)
         assertSame(effect, failed)
+        assertEquals(null, succeeded)
     }
 
     @Test
     fun `startActivity 예외는 같은 effect를 실패 callback에 전달한다`() {
         val effect = launchEffect()
         var failed: ManagerEffect.LaunchIntent? = null
+        var succeeded: ManagerEffect.LaunchIntent? = null
 
         val launched = executeLaunch(
             effect = effect,
             resolveIntent = { "resolved intent" },
             launchIntent = { throw SecurityException("launch denied") },
+            onSuccess = { succeeded = it },
             onFailure = { failed = it },
         )
 
         assertFalse(launched)
         assertSame(effect, failed)
+        assertEquals(null, succeeded)
     }
 
     @Test
@@ -46,16 +52,19 @@ class ManagerEffectLaunchTest {
         val effect = launchEffect()
         val launchedValues = mutableListOf<String>()
         var failures = 0
+        var succeeded: ManagerEffect.LaunchIntent? = null
 
         val launched = executeLaunch(
             effect = effect,
             resolveIntent = { "resolved intent" },
             launchIntent = { launchedValues += it },
+            onSuccess = { succeeded = it },
             onFailure = { failures += 1 },
         )
 
         assertTrue(launched)
         assertEquals(listOf("resolved intent"), launchedValues)
+        assertSame(effect, succeeded)
         assertEquals(0, failures)
     }
 
