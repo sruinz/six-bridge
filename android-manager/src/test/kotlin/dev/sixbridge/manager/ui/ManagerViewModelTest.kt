@@ -139,6 +139,32 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `install 반환 전에 observer가 적용한 다른 terminal route를 늦은 결과가 덮지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                suspendInstall = true
+                installResult = InstallState.Failed("WRITE_FAILED", "late B failure")
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            dispatcher.scheduler.runCurrent()
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+            launch { repository.completeInstall() }
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(ImportUiState.Idle, viewModel.state.value.importState)
+            assertNull(savedState.get<String>("review_token"))
+        }
+
+    @Test
     fun `가져오기 중 표시 후 compatible은 즉시 설치할 수 있다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository().apply {
             importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
@@ -951,6 +977,7 @@ private class FakeManagerRepository : ManagerRepository {
     var restoreArguments: Pair<String?, Int?>? = null
     var installRequests = 0
     var completedInstallRequests = 0
+    var installResult: InstallState = InstallState.Idle
     var cancelInstallRequests = 0
     var lastPartialConfirmed = false
     var resumeRequests = 0
@@ -1018,11 +1045,15 @@ private class FakeManagerRepository : ManagerRepository {
         importGate.emit(Unit)
     }
 
-    override suspend fun install(review: ReviewBundle, partialConfirmed: Boolean) {
+    override suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+    ): InstallState {
         installRequests += 1
         lastPartialConfirmed = partialConfirmed
         if (suspendInstall) installGate.first()
         completedInstallRequests += 1
+        return installResult
     }
 
     suspend fun completeInstall() {

@@ -103,7 +103,7 @@ interface ManagerRepository {
 
     suspend fun initialize(reviewToken: String?, installSessionId: Int?): ManagerRestoreResult
     suspend fun import(uri: Uri): ManagerImportResult
-    suspend fun install(review: ReviewBundle, partialConfirmed: Boolean)
+    suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
     suspend fun cancelInstall(): Boolean
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
@@ -226,9 +226,14 @@ internal class DefaultManagerRepository(
         }
     }
 
-    override suspend fun install(review: ReviewBundle, partialConfirmed: Boolean) {
-        val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) } ?: return
+    override suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+    ): InstallState {
+        val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) }
+            ?: return InstallState.Idle
         installCoordinator.request(bundle, partialConfirmed)
+        return installCoordinator.state.value
     }
 
     override suspend fun cancelInstall(): Boolean {

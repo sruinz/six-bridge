@@ -269,9 +269,17 @@ class ManagerViewModel(
         }
         if (installJob?.isActive == true) return
         val generation = operationGeneration
+        val reviewToken = ready.review.token
         installJob = viewModelScope.launch {
-            repository.install(ready.review, ready.partialConfirmed)
+            val attemptResult = repository.install(ready.review, ready.partialConfirmed)
             if (generation != operationGeneration) return@launch
+            if (attemptResult.isTerminalState() &&
+                ownedReviewToken == reviewToken &&
+                savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == reviewToken &&
+                mutableState.value.route == ManagerRoute.Review(reviewToken)
+            ) {
+                applyInstallTerminal(attemptResult)
+            }
         }
     }
 

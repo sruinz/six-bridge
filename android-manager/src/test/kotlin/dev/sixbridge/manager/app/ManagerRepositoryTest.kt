@@ -33,6 +33,7 @@ import dev.sixbridge.manager.ui.ImportUiState
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerViewModel
 import dev.sixbridge.manager.ui.ManagerRoute
+import dev.sixbridge.manager.ui.UserMessageKind
 import dev.sixbridge.manager.uninstall.UninstallCoordinator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
@@ -783,6 +784,74 @@ class ManagerRepositoryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun `동일한 pre-claim 실패도 이번 B attempt 결과로 review와 token을 정리한다`() {
+        val dispatcher = StandardTestDispatcher()
+        Dispatchers.setMain(dispatcher)
+        try {
+            runTest(dispatcher.scheduler) {
+                val root = temporaryFolder.newFolder("identical-attempt-failure")
+                val bundleA = importedBundle(root)
+                val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                    WrapperVerificationResult.Success(bundleA.verifiedApk)
+                }
+                assertTrue(retainedImports.save(bundleA))
+                val pendingStore = StartupPendingStore(null, root)
+                val gateway = StartupGateway(emptyList())
+                val installed = FakeInstalledWrappers(emptyList()).apply {
+                    findFailure = IllegalStateException("installed query failed")
+                }
+                val catalog = FakeCatalog(emptyList())
+                val coordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    clock = { 2 },
+                    retainedWrapperSha256 = { sha256(it) },
+                )
+                coordinator.request(bundleA, partialConfirmed = false)
+                val failure = assertIs<InstallState.Failed>(coordinator.state.value)
+                assertEquals("INSTALLED_QUERY_FAILED", failure.code)
+
+                val bundleB = importedBundle(root, SECOND_TOKEN)
+                assertTrue(retainedImports.save(bundleB))
+                val repository = managerRepository(
+                    root,
+                    retainedImports,
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    coordinator,
+                )
+                val savedState = SavedStateHandle(mapOf("review_token" to SECOND_TOKEN))
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+                val messages = mutableListOf<UserMessageKind?>()
+                val collector = launch {
+                    viewModel.state.collect { state -> messages += state.message?.kind }
+                }
+                runCurrent()
+
+                viewModel.accept(ManagerAction.InstallReviewedBundle)
+                advanceUntilIdle()
+
+                assertFalse(File(root, SECOND_TOKEN).exists())
+                assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+                assertNull(savedState.get<String>("review_token"))
+                assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+                assertEquals(1, messages.count { it == UserMessageKind.INSTALL_FAILED })
+                collector.cancel()
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun `startup 첫 복원 예외는 readiness 전 terminal 소비를 막고 다음 시도에서 복원한다`() =
         runTest {
             val root = temporaryFolder.newFolder("retry-startup-import")
@@ -1307,9 +1376,13 @@ private class FakeCatalog(
 private class FakeInstalledWrappers(
     var values: List<InstalledWrapper>,
 ) : InstalledWrapperRepository {
+    var findFailure: Throwable? = null
+
     override suspend fun findAll(): List<InstalledWrapper> = values
-    override suspend fun find(packageName: String): InstalledWrapper? =
-        values.singleOrNull { it.packageName == packageName }
+    override suspend fun find(packageName: String): InstalledWrapper? {
+        findFailure?.let { throw it }
+        return values.singleOrNull { it.packageName == packageName }
+    }
 }
 
 private class StartupGateway(
