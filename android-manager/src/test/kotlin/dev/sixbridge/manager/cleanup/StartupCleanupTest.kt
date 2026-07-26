@@ -12,7 +12,12 @@ import java.nio.file.Files
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlin.test.assertFailsWith
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -55,6 +60,21 @@ class StartupCleanupTest {
         assertTrue(outside.exists())
         assertTrue(File(outside, "keep.txt").exists())
         assertTrue(link.exists())
+    }
+
+    @Test
+    fun `does not traverse an import root symlink outside cache imports`() = runBlocking {
+        val outsideImports = File(root, "outside-imports").apply { mkdirs() }
+        val expired = File(outsideImports, EXPIRED_TOKEN).apply {
+            mkdirs()
+            setLastModified(now - DAY_MILLIS - 1)
+        }
+        val linkedImports = File(root, "linked-imports")
+        Files.createSymbolicLink(linkedImports.toPath(), outsideImports.toPath())
+
+        cleanup(importRoot = linkedImports).run()
+
+        assertTrue(expired.exists())
     }
 
     @Test
@@ -115,11 +135,103 @@ class StartupCleanupTest {
         assertNotNull(gateway.owned.singleOrNull { it == 41 })
     }
 
+    @Test
+    fun `cancellation while loading pending leaves terminal session and files untouched`() = runBlocking {
+        val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+        val store = FakePendingStore(loadFailure = CancellationException("pending cancelled"))
+        val gateway = FakeGateway(owned = mutableListOf(77))
+
+        assertFailsWith<CancellationException> { cleanup(gateway = gateway, store = store).run() }
+
+        assertEquals(0, store.terminalLoads)
+        assertEquals(0, gateway.ownedRequests)
+        assertTrue(expired.exists())
+        assertTrue(gateway.abandoned.isEmpty())
+    }
+
+    @Test
+    fun `cancellation while loading terminal result leaves pending session and files untouched`() = runBlocking {
+        val pending = pending(sessionId = 41, startedAt = now)
+        val expired = tokenDirectory(OTHER_TOKEN, now - DAY_MILLIS - 1)
+        val store = FakePendingStore(record = pending, terminalLoadFailure = CancellationException("terminal cancelled"))
+        val gateway = FakeGateway(owned = mutableListOf(41, 77))
+
+        assertFailsWith<CancellationException> { cleanup(gateway = gateway, store = store).run() }
+
+        assertEquals(pending, store.record)
+        assertEquals(0, gateway.ownedRequests)
+        assertTrue(expired.exists())
+        assertTrue(gateway.abandoned.isEmpty())
+    }
+
+    @Test
+    fun `cancellation while checking orphan pending leaves durable state untouched`() = runBlocking {
+        val pending = pending(sessionId = 41, startedAt = now - DAY_MILLIS - 1)
+        val pendingDirectory = tokenDirectory(pending.importToken, now - DAY_MILLIS - 1)
+        val store = FakePendingStore(
+            record = pending,
+            missingObservationFailure = CancellationException("missing observation cancelled"),
+        )
+
+        assertFailsWith<CancellationException> { cleanup(store = store).run() }
+
+        assertEquals(pending, store.record)
+        assertTrue(pendingDirectory.exists())
+        assertEquals(0, store.clearWithoutTerminalCalls)
+    }
+
+    @Test
+    fun `cancellation while querying owned sessions does not start file cleanup`() = runBlocking {
+        val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+        val gateway = FakeGateway(ownedFailure = CancellationException("owned sessions cancelled"))
+
+        assertFailsWith<CancellationException> { cleanup(gateway = gateway).run() }
+
+        assertTrue(expired.exists())
+        assertTrue(gateway.abandoned.isEmpty())
+    }
+
+    @Test
+    fun `cancellation while abandoning a session stops later session and file cleanup`() = runBlocking {
+        val pending = pending(sessionId = 41, startedAt = now)
+        val expired = tokenDirectory(OTHER_TOKEN, now - DAY_MILLIS - 1)
+        val gateway = FakeGateway(
+            owned = mutableListOf(41, 77, 78),
+            abandonFailure = CancellationException("abandon cancelled"),
+        )
+
+        assertFailsWith<CancellationException> {
+            cleanup(gateway = gateway, store = FakePendingStore(record = pending)).run()
+        }
+
+        assertEquals(listOf(77), gateway.abandoned)
+        assertTrue(gateway.owned.contains(78))
+        assertTrue(expired.exists())
+    }
+
+    @Test
+    fun `cancellation before expired file deletion leaves directory untouched`() = runBlocking {
+        val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+        lateinit var cleanupJob: Job
+        val cancellingCandidate = CancellingTimestampFile(expired.path) { cleanupJob.cancel() }
+        val cancellingRoot = ListedImportRoot(imports.canonicalPath, cancellingCandidate)
+        cleanupJob = launch(start = CoroutineStart.LAZY) {
+            cleanup(importRoot = cancellingRoot).run()
+        }
+
+        cleanupJob.start()
+        cleanupJob.join()
+
+        assertTrue(cleanupJob.isCancelled)
+        assertTrue(expired.exists())
+    }
+
     private fun cleanup(
         gateway: FakeGateway = FakeGateway(),
         store: FakePendingStore = FakePendingStore(),
+        importRoot: File = imports,
     ) = StartupCleanup(
-        importRoot = imports,
+        importRoot = importRoot,
         installGateway = gateway,
         pendingStore = store,
         clock = Clock.fixed(Instant.ofEpochMilli(now), ZoneOffset.UTC),
@@ -140,8 +252,11 @@ class StartupCleanupTest {
 
     private class FakeGateway(
         val owned: MutableList<Int> = mutableListOf(),
+        var ownedFailure: Throwable? = null,
+        var abandonFailure: Throwable? = null,
     ) : PackageInstallGateway {
         val abandoned = mutableListOf<Int>()
+        var ownedRequests = 0
 
         override fun canRequestPackageInstalls(): Boolean = true
         override fun unknownSourcesSettingsIntent(): Intent = Intent()
@@ -150,23 +265,38 @@ class StartupCleanupTest {
         override fun commit(sessionId: Int) = Unit
         override fun abandon(sessionId: Int) {
             abandoned += sessionId
+            abandonFailure?.let { throw it }
             owned -= sessionId
         }
 
-        override fun ownedSessions(): List<Int> = owned.toList()
+        override fun ownedSessions(): List<Int> {
+            ownedRequests += 1
+            ownedFailure?.let { throw it }
+            return owned.toList()
+        }
     }
 
     private class FakePendingStore(
         var record: PendingInstall? = null,
         var terminal: PendingInstallResult? = null,
         var missingObservedAt: Long? = null,
+        var loadFailure: Throwable? = null,
+        var terminalLoadFailure: Throwable? = null,
+        var missingObservationFailure: Throwable? = null,
     ) : PendingInstallStore {
-        override fun load(): PendingInstall? = record
+        var terminalLoads = 0
+        var clearWithoutTerminalCalls = 0
+
+        override fun load(): PendingInstall? {
+            loadFailure?.let { throw it }
+            return record
+        }
         override fun tryClaim(packageName: String, importToken: String, startedAtEpochMillis: Long): PendingInstall? = null
         override fun assignSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
         override fun recoverSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
         override fun clear(expected: PendingInstall): Boolean = false
         override fun clearWithoutTerminal(expected: PendingInstall): PendingCleanupResult {
+            clearWithoutTerminalCalls += 1
             if (record != expected) return PendingCleanupResult.Failed
             if (terminal != null) return PendingCleanupResult.TerminalAvailable
             record = null
@@ -174,12 +304,17 @@ class StartupCleanupTest {
         }
 
         override fun discardImport(importToken: String) = Unit
-        override fun loadTerminalResult(): PendingInstallResult? = terminal
+        override fun loadTerminalResult(): PendingInstallResult? {
+            terminalLoads += 1
+            terminalLoadFailure?.let { throw it }
+            return terminal
+        }
         override fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean = false
         override fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult? = null
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean = false
         override fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long =
-            missingObservedAt ?: observedAtEpochMillis.also { missingObservedAt = it }
+            missingObservationFailure?.let { throw it }
+                ?: missingObservedAt ?: observedAtEpochMillis.also { missingObservedAt = it }
 
         override fun clearSessionMissingObservation(pending: PendingInstall): Boolean {
             missingObservedAt = null
@@ -187,10 +322,29 @@ class StartupCleanupTest {
         }
     }
 
+    private class CancellingTimestampFile(
+        path: String,
+        private val cancel: () -> Unit,
+    ) : File(path) {
+        override fun lastModified(): Long {
+            cancel()
+            return super.lastModified()
+        }
+    }
+
+    private class ListedImportRoot(
+        path: String,
+        private val candidate: File,
+    ) : File(path) {
+        override fun getCanonicalFile(): File = this
+        override fun listFiles(): Array<File> = arrayOf(candidate)
+    }
+
     private companion object {
         const val DAY_MILLIS = 24 * 60 * 60 * 1_000L
         const val EXPIRED_TOKEN = "123e4567-e89b-12d3-a456-426614174000"
         const val RECENT_TOKEN = "123e4567-e89b-12d3-a456-426614174001"
+        const val OTHER_TOKEN = "123e4567-e89b-12d3-a456-426614174002"
         const val PACKAGE_NAME = "dev.sixbridge.ext.aabbccddeeffgghhiijjkkllmmnnoopp"
     }
 }
