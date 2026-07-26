@@ -69,15 +69,55 @@ class CatalogIconEnricherTest {
         )
         val enricher = CatalogIconEnricher(catalog, source)
 
-        val first = requireNotNull(enricher.load(record()))
-        val persistence = enricher.persist(record(), first)
-        val second = enricher.load(record())
+        val record = record()
+        val bytes = requireNotNull(enricher.load(record))
 
-        assertContentEquals(PNG, first)
-        assertEquals(IconPersistenceResult.WriteFailed, persistence)
-        assertContentEquals(PNG, second)
-        assertEquals(listOf(PACKAGE), source.packages)
+        assertEquals(IconPersistenceResult.WriteFailed, enricher.persist(record, bytes))
+        assertContentEquals(PNG, enricher.mergeCached(record).iconPng)
+        assertEquals(IconPersistenceResult.WriteFailed, enricher.persist(record, bytes))
         assertEquals(1, catalog.persistAttempts.size)
+        assertEquals(listOf(PACKAGE), source.packages)
+    }
+
+    @Test
+    fun `같은 identity 저장 성공도 process에서 다시 쓰지 않는다`() = runTest {
+        val source = RecordingIconSource { PNG }
+        val catalog = RecordingCatalog()
+        val enricher = CatalogIconEnricher(catalog, source)
+        val record = record()
+        val bytes = requireNotNull(enricher.load(record))
+
+        assertContentEquals(
+            PNG,
+            (enricher.persist(record, bytes) as IconPersistenceResult.Stored).record.iconPng,
+        )
+        assertContentEquals(
+            PNG,
+            (enricher.persist(record, bytes) as IconPersistenceResult.Stored).record.iconPng,
+        )
+        assertEquals(1, catalog.persistAttempts.size)
+        assertEquals(listOf(PACKAGE), source.packages)
+    }
+
+    @Test
+    fun `retainOnly는 제거되거나 바뀐 identity의 bytes와 실패 상태를 폐기한다`() = runTest {
+        val source = RecordingIconSource { PNG }
+        val catalog = RecordingCatalog(
+            persistFailure = IllegalStateException("Room unavailable"),
+        )
+        val enricher = CatalogIconEnricher(catalog, source)
+        val removed = record()
+        val changed = record(installedVersionCode = 2)
+        val bytes = requireNotNull(enricher.load(removed))
+
+        assertEquals(IconPersistenceResult.WriteFailed, enricher.persist(removed, bytes))
+        enricher.retainOnly(setOf(changed.identity()))
+
+        assertNull(enricher.mergeCached(removed).iconPng)
+        val reloaded = requireNotNull(enricher.load(removed))
+        assertEquals(IconPersistenceResult.WriteFailed, enricher.persist(removed, reloaded))
+        assertEquals(listOf(PACKAGE, PACKAGE), source.packages)
+        assertEquals(2, catalog.persistAttempts.size)
     }
 
     @Test
@@ -121,11 +161,21 @@ class CatalogIconEnricherTest {
             persistFailure = IllegalStateException("Room unavailable"),
         )
 
-        CatalogIconEnricher(catalog, source).load(record())
-        CatalogIconEnricher(catalog, source).load(record())
+        val firstEnricher = CatalogIconEnricher(catalog, source)
+        val firstBytes = requireNotNull(firstEnricher.load(record()))
+        assertEquals(
+            IconPersistenceResult.WriteFailed,
+            firstEnricher.persist(record(), firstBytes),
+        )
+        val secondEnricher = CatalogIconEnricher(catalog, source)
+        val secondBytes = requireNotNull(secondEnricher.load(record()))
+        assertEquals(
+            IconPersistenceResult.WriteFailed,
+            secondEnricher.persist(record(), secondBytes),
+        )
 
         assertEquals(listOf(PACKAGE, PACKAGE), source.packages)
-        assertEquals(0, catalog.persistAttempts.size)
+        assertEquals(2, catalog.persistAttempts.size)
     }
 
     @Test

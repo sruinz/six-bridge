@@ -10,12 +10,12 @@ import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.ManagerCatalog
+import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.icon.CatalogIconEnricher
-import dev.sixbridge.manager.icon.IconIdentity
 import dev.sixbridge.manager.icon.IconPersistenceResult
-import dev.sixbridge.manager.icon.iconIdentity
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -420,7 +420,7 @@ internal class CatalogPublisher(
     private val iconLoadTimeoutMillis: Long = 5_000,
 ) {
     private val mutex = Mutex()
-    private val iconJobs = mutableMapOf<IconIdentity, Job>()
+    private val iconJobs = mutableMapOf<CatalogIdentity, Job>()
     private val mutableState = MutableStateFlow<List<CatalogRecord>>(emptyList())
     val state: StateFlow<List<CatalogRecord>> = mutableState.asStateFlow()
 
@@ -449,7 +449,7 @@ internal class CatalogPublisher(
         val requiredIdentities = records
             .asSequence()
             .filter { it.iconPng == null }
-            .map(CatalogRecord::iconIdentity)
+            .map(CatalogRecord::identity)
             .toSet()
         val cancelled = iconJobs
             .filterKeys { it !in requiredIdentities }
@@ -462,12 +462,12 @@ internal class CatalogPublisher(
         records.asSequence()
             .filter { it.iconPng == null }
             .forEach { record ->
-                val identity = record.iconIdentity()
+                val identity = record.identity()
                 var job: Job? = null
                 mutex.withLock {
                     val current = mutableState.value
                         .singleOrNull { it.packageName == identity.packageName }
-                    if (current?.iconIdentity() == identity && iconJobs[identity] == null) {
+                    if (current?.identity() == identity && iconJobs[identity] == null) {
                         job = scope.launch(start = CoroutineStart.LAZY) {
                             loadAndPublishIcon(record)
                         }
@@ -486,7 +486,7 @@ internal class CatalogPublisher(
     }
 
     private suspend fun loadAndPublishIcon(discovered: CatalogRecord) {
-        val identity = discovered.iconIdentity()
+        val identity = discovered.identity()
         val job = currentCoroutineContext().job
         try {
             val iconPng = withTimeout(iconLoadTimeoutMillis) {
@@ -501,7 +501,7 @@ internal class CatalogPublisher(
             }
             if (installed == null ||
                 installed.extensionId != identity.extensionId ||
-                installed.versionCode != identity.versionCode ||
+                installed.versionCode != identity.installedVersionCode ||
                 installed.signerSha256 != identity.signerSha256
             ) {
                 return
@@ -512,7 +512,7 @@ internal class CatalogPublisher(
                 }
                 if (index < 0) return@withLock
                 val current = mutableState.value[index]
-                if (current.iconPng != null || current.iconIdentity() != identity) {
+                if (current.iconPng != null || current.identity() != identity) {
                     return@withLock
                 }
                 val enriched = when (val persisted = iconEnricher.persist(current, iconPng)) {
@@ -520,7 +520,7 @@ internal class CatalogPublisher(
                     IconPersistenceResult.WriteFailed -> current.copy(iconPng = iconPng)
                     IconPersistenceResult.IdentityMismatch -> return@withLock
                 }
-                if (enriched.iconIdentity() == identity) {
+                if (enriched.identity() == identity) {
                     mutableState.value = mutableState.value.toMutableList().also { records ->
                         records[index] = enriched
                     }

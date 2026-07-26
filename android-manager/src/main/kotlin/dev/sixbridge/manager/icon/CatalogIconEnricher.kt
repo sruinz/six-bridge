@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.icon
 
+import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.catalog.identity
@@ -7,12 +8,16 @@ import java.util.concurrent.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-internal data class IconIdentity(
-    val packageName: String,
-    val extensionId: String,
-    val versionCode: Long,
-    val signerSha256: String,
+internal data class IconProcessEntry(
+    val bytes: ByteArray?,
+    val persistence: IconPersistenceState,
 )
+
+internal enum class IconPersistenceState {
+    NOT_ATTEMPTED,
+    STORED,
+    FAILED_FOR_PROCESS,
+}
 
 internal sealed interface IconPersistenceResult {
     data class Stored(val record: CatalogRecord) : IconPersistenceResult
@@ -25,14 +30,14 @@ internal class CatalogIconEnricher(
     private val source: InstalledExtensionIconSource,
 ) {
     private val resultsMutex = Mutex()
-    private val results = mutableMapOf<IconIdentity, ByteArray?>()
+    private val results = mutableMapOf<CatalogIdentity, IconProcessEntry>()
 
     suspend fun load(record: CatalogRecord): ByteArray? {
         record.iconPng?.let { return it }
-        val identity = record.iconIdentity()
+        val identity = record.identity()
         val cached = resultsMutex.withLock {
             if (results.containsKey(identity)) {
-                CachedIcon(results.getValue(identity))
+                CachedIcon(results.getValue(identity).bytes)
             } else {
                 null
             }
@@ -42,9 +47,12 @@ internal class CatalogIconEnricher(
         val loaded = source.load(record.packageName)
         return resultsMutex.withLock {
             if (results.containsKey(identity)) {
-                results.getValue(identity)
+                results.getValue(identity).bytes
             } else {
-                results[identity] = loaded
+                results[identity] = IconProcessEntry(
+                    bytes = loaded,
+                    persistence = IconPersistenceState.NOT_ATTEMPTED,
+                )
                 loaded
             }
         }
@@ -53,22 +61,49 @@ internal class CatalogIconEnricher(
     suspend fun persist(
         current: CatalogRecord,
         iconPng: ByteArray,
-    ): IconPersistenceResult = try {
-        catalog.persistIconIfIdentity(current.identity(), iconPng)
-            ?.let(IconPersistenceResult::Stored)
-            ?: IconPersistenceResult.IdentityMismatch
-    } catch (error: CancellationException) {
-        throw error
-    } catch (_: Exception) {
-        IconPersistenceResult.WriteFailed
+    ): IconPersistenceResult = resultsMutex.withLock {
+        val identity = current.identity()
+        val entry = results[identity] ?: IconProcessEntry(
+            bytes = iconPng,
+            persistence = IconPersistenceState.NOT_ATTEMPTED,
+        )
+
+        when (entry.persistence) {
+            IconPersistenceState.STORED -> IconPersistenceResult.Stored(
+                current.copy(iconPng = iconPng),
+            )
+
+            IconPersistenceState.FAILED_FOR_PROCESS -> IconPersistenceResult.WriteFailed
+
+            IconPersistenceState.NOT_ATTEMPTED -> try {
+                catalog.persistIconIfIdentity(identity, iconPng)
+                    ?.also {
+                        results[identity] = entry.copy(
+                            persistence = IconPersistenceState.STORED,
+                        )
+                    }
+                    ?.let(IconPersistenceResult::Stored)
+                    ?: IconPersistenceResult.IdentityMismatch
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                results[identity] = entry.copy(
+                    persistence = IconPersistenceState.FAILED_FOR_PROCESS,
+                )
+                IconPersistenceResult.WriteFailed
+            }
+        }
+    }
+
+    suspend fun mergeCached(record: CatalogRecord): CatalogRecord = resultsMutex.withLock {
+        results[record.identity()]?.bytes?.let { bytes ->
+            record.copy(iconPng = bytes)
+        } ?: record
+    }
+
+    suspend fun retainOnly(identities: Set<CatalogIdentity>) = resultsMutex.withLock {
+        results.keys.retainAll(identities)
     }
 
     private data class CachedIcon(val bytes: ByteArray?)
 }
-
-internal fun CatalogRecord.iconIdentity() = IconIdentity(
-    packageName = packageName,
-    extensionId = extensionId,
-    versionCode = installedVersionCode,
-    signerSha256 = signerSha256,
-)
