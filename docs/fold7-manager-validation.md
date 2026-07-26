@@ -99,8 +99,9 @@
 
 ### 제거 권한 누락과 상태 전파 회귀
 
-- 최초 실기기 제거에서 Android 시스템 제거 화면과 실제 package 삭제는
-  정상 동작했다.
+- 최초 실기기 제거는 관리자 UI가 아니라 privileged ADB shell이 제거
+  intent를 시작한 경로였으며, Android 시스템 제거 화면과 실제 package
+  삭제는 정상 동작했다.
   - 대상: `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd`
   - 증거: `pm path` 결과가 비었고 관리자 목록에서도 카드가 사라졌다.
 - 제거 화면 실행 실패의 근본 원인은 관리자 manifest에
@@ -127,12 +128,17 @@
     `dev.sixbridge.ext.lneaoklobohnoncgckmbbjfiajgpbdde` versionCode 2
     카드가 유지됐다.
   - 읽기 전용 확인: 취소 뒤 v2 package와 기존 wrapper 5개가 모두 유지됐다.
+  - UI feedback 한계: 취소 안내의 exact 문구는 별도로 인용하거나 캡처하지
+    못했다. 표준 화면·취소 복귀·카드·package 유지의 기능 결과만 확인했다.
 - [x] 같은 v2의 제거를 승인했다.
   - 사용자 확인: 관리자에서 v2 카드가 사라졌고 삼성 인터넷 Add-ons에서도
     해당 항목이 사라졌다.
   - 읽기 전용 확인: v2 package는 없고 현재 스마트 컨텍스트 메뉴
     `dev.sixbridge.ext.dncifaeoabkkmddoeeccpjdkifeoemfd` versionCode 14는
     설치 상태로 유지됐다.
+  - UI feedback 한계: 제거 성공 안내의 exact 문구는 별도로 인용하거나
+    캡처하지 못했다. 카드·package·삼성 인터넷 Add-ons 항목 소멸의 기능
+    결과는 확인했다.
 - [x] Video Download to NAS의 표준 제거 화면에서 취소했다.
   - 사용자 확인: `dev.sixbridge.ext.iefgkdhgegchhlhcjfhcbbelkmpklmhd`
     versionCode 2 카드에서 표준 제거 화면이 표시됐고 취소 뒤 카드가 유지됐다.
