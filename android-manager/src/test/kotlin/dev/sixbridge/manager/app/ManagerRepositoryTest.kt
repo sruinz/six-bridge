@@ -850,6 +850,60 @@ class ManagerRepositoryTest {
         }
     }
 
+    @Test
+    fun `repository install은 mutex 뒤 callback보다 request 내부 결과를 반환한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("atomic-attempt-result")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundle))
+            val pendingStore = StartupPendingStore(null, root)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            var stateBeforeCallback: InstallState? = null
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+                afterInstallRequest = { requestState ->
+                    stateBeforeCallback = requestState
+                    coordinator.onPackageInstallerResult(
+                        PackageInstallResult.Failure(
+                            sessionId = 41,
+                            code = "CALLBACK_FAILURE",
+                            message = "callback terminal",
+                        ),
+                    )
+                },
+            )
+            val review = assertNotNull(repository.initialize(TOKEN, null).review)
+
+            val attemptResult = repository.install(review, partialConfirmed = false)
+
+            assertEquals(InstallState.AwaitingUserApproval(41), stateBeforeCallback)
+            assertEquals(InstallState.AwaitingUserApproval(41), attemptResult)
+            assertEquals(
+                "CALLBACK_FAILURE",
+                assertIs<InstallState.Failed>(coordinator.state.value).code,
+            )
+        }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `startup 첫 복원 예외는 readiness 전 terminal 소비를 막고 다음 시도에서 복원한다`() =
@@ -1234,6 +1288,7 @@ class ManagerRepositoryTest {
         installed: FakeInstalledWrappers,
         catalog: FakeCatalog,
         coordinator: InstallCoordinator,
+        afterInstallRequest: suspend (InstallState) -> Unit = {},
     ) = DefaultManagerRepository(
         importer = BundleImportService(
             BundleSource { error("직접 import하지 않습니다.") },
@@ -1262,6 +1317,7 @@ class ManagerRepositoryTest {
         catalogPublisher = CatalogPublisher(catalog, installed, CatalogReconciler()),
         installEvents = emptyFlow(),
         ioDispatcher = Dispatchers.Unconfined,
+        afterInstallRequest = afterInstallRequest,
     )
 
     private fun importedBundle(root: File, token: String = TOKEN): ImportedBundle {
@@ -1394,12 +1450,11 @@ private class StartupGateway(
     override fun canRequestPackageInstalls(): Boolean = canInstallPackages
     override fun unknownSourcesSettingsIntent() =
         error("startup test에서는 설정 Intent를 만들지 않습니다.")
-    override suspend fun createSession(packageName: String): Int =
-        error("startup test에서는 session을 만들지 않습니다.")
-    override suspend fun writeSession(sessionId: Int, apk: File) =
-        error("startup test에서는 session을 쓰지 않습니다.")
-    override fun commit(sessionId: Int) =
-        error("startup test에서는 session을 제출하지 않습니다.")
+    override suspend fun createSession(packageName: String): Int = 41.also { sessionId ->
+        if (sessionId !in sessions) sessions += sessionId
+    }
+    override suspend fun writeSession(sessionId: Int, apk: File) = Unit
+    override fun commit(sessionId: Int) = Unit
     override fun abandon(sessionId: Int) {
         sessions -= sessionId
     }
@@ -1431,9 +1486,19 @@ private class StartupPendingStore(
         packageName: String,
         importToken: String,
         startedAtEpochMillis: Long,
-    ): PendingInstall? = null
-    override fun assignSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
-    override fun recoverSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
+    ): PendingInstall? {
+        if (record != null) return null
+        return PendingInstall(-1, packageName, importToken, startedAtEpochMillis)
+            .also { record = it }
+    }
+    override fun assignSession(claim: PendingInstall, sessionId: Int): PendingInstall? {
+        if (record != claim) return null
+        return claim.copy(sessionId = sessionId).also { record = it }
+    }
+    override fun recoverSession(claim: PendingInstall, sessionId: Int): PendingInstall? {
+        if (record != claim) return null
+        return claim.copy(sessionId = sessionId).also { record = it }
+    }
     override fun clear(expected: PendingInstall): Boolean {
         if (record != expected) return false
         record = null

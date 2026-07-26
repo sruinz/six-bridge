@@ -124,6 +124,7 @@ internal class DefaultManagerRepository(
     private val samsungBrowserNavigator: SamsungBrowserNavigator,
     private val catalogPublisher: CatalogPublisher,
     private val installEvents: Flow<PackageInstallCallback> = PackageInstallEvents.events,
+    private val afterInstallRequest: suspend (InstallState) -> Unit = {},
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ManagerRepository {
     private val started = AtomicBoolean()
@@ -232,8 +233,9 @@ internal class DefaultManagerRepository(
     ): InstallState {
         val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) }
             ?: return InstallState.Idle
-        installCoordinator.request(bundle, partialConfirmed)
-        return installCoordinator.state.value
+        val requestState = installCoordinator.request(bundle, partialConfirmed)
+        afterInstallRequest(requestState)
+        return requestState
     }
 
     override suspend fun cancelInstall(): Boolean {

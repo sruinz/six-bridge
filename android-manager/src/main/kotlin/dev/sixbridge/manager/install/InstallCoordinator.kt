@@ -42,11 +42,14 @@ class InstallCoordinator(
         )
     }
 
-    suspend fun request(bundle: ImportedBundle, partialConfirmed: Boolean) = mutex.withLock {
+    suspend fun request(
+        bundle: ImportedBundle,
+        partialConfirmed: Boolean,
+    ): InstallState = mutex.withLock {
         val existing = pendingStore.load()
         if (activeBundle != null || existing != null) {
             discardCompetingImport(bundle.token, existing?.importToken ?: activeBundle?.token)
-            return@withLock
+            return@withLock mutableState.value
         }
         val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
@@ -57,16 +60,19 @@ class InstallCoordinator(
                 bundle,
                 InstallState.Failed("INSTALLED_QUERY_FAILED", "설치 상태를 확인하지 못했습니다."),
             )
-            return@withLock
+            return@withLock mutableState.value
         }
         when (val decision = policy.decide(bundle.report, bundle.verifiedApk, installed)) {
-            is InstallDecision.Denied -> finishUnclaimed(
-                bundle,
-                InstallState.Failed(
-                    code = decision.reason.name,
-                    message = "설치 정책이 래퍼를 거부했습니다.",
-                ),
-            )
+            is InstallDecision.Denied -> {
+                finishUnclaimed(
+                    bundle,
+                    InstallState.Failed(
+                        code = decision.reason.name,
+                        message = "설치 정책이 래퍼를 거부했습니다.",
+                    ),
+                )
+                mutableState.value
+            }
 
             is InstallDecision.Allowed -> {
                 if (decision.requiresPartialConfirmation && !partialConfirmed) {
@@ -77,12 +83,12 @@ class InstallCoordinator(
                             message = "부분 호환 설치 확인이 필요합니다.",
                         ),
                     )
-                    return@withLock
+                    return@withLock mutableState.value
                 }
                 activeBundle = bundle
                 if (!gateway.canRequestPackageInstalls()) {
                     mutableState.value = InstallState.UnknownSourcesPermissionRequired
-                    return@withLock
+                    return@withLock mutableState.value
                 }
                 try {
                     createAndCommit(bundle)
@@ -98,6 +104,7 @@ class InstallCoordinator(
                     if (unclaimed) activeBundle = null
                     throw error
                 }
+                mutableState.value
             }
         }
     }
