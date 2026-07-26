@@ -13,8 +13,8 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 
@@ -30,6 +30,102 @@ internal class ProviderStreamLease(
     override fun close() {
         if (closed.compareAndSet(false, true)) {
             stream.close()
+        }
+    }
+}
+
+internal class CleanupFailureCollector {
+    private val fatalFailures = mutableListOf<Throwable>()
+
+    fun recordFailure(error: Throwable) {
+        fatalFailures += error
+    }
+
+    fun attempt(action: () -> Unit) {
+        try {
+            action()
+        } catch (error: CancellationException) {
+            fatalFailures += error
+        } catch (_: Exception) {
+            // Provider icon cleanup is best-effort.
+        } catch (error: Throwable) {
+            fatalFailures += error
+        }
+    }
+
+    suspend fun attemptSuspend(action: suspend () -> Unit) {
+        try {
+            action()
+        } catch (error: CancellationException) {
+            fatalFailures += error
+        } catch (_: Exception) {
+            // Provider icon cleanup is best-effort.
+        } catch (error: Throwable) {
+            fatalFailures += error
+        }
+    }
+
+    fun throwWith(original: Throwable? = null) {
+        val failures = buildList {
+            original?.let(::add)
+            addAll(fatalFailures)
+        }
+        val primary = failures.firstOrNull { it is Error }
+            ?: failures.firstOrNull { it is CancellationException }
+            ?: failures.firstOrNull()
+            ?: return
+        failures.forEach { failure ->
+            if (failure !== primary &&
+                primary.suppressed.none { suppressed -> suppressed === failure }
+            ) {
+                primary.addSuppressed(failure)
+            }
+        }
+        throw primary
+    }
+}
+
+internal class OpeningThreadLifetime(
+    private val interruptThread: (Thread) -> Unit = Thread::interrupt,
+) {
+    constructor(
+        openingThread: Thread,
+        interruptThread: (Thread) -> Unit = Thread::interrupt,
+    ) : this(interruptThread) {
+        activate(openingThread)
+    }
+
+    private val lock = Any()
+    private var activeThread: Thread? = null
+    private var interruptRequested = false
+    private var interruptDelivered = false
+
+    fun activate(openingThread: Thread) {
+        synchronized(lock) {
+            activeThread = openingThread
+            deliverInterruptIfNeeded()
+        }
+    }
+
+    fun interruptIfActive() {
+        synchronized(lock) {
+            interruptRequested = true
+            deliverInterruptIfNeeded()
+        }
+    }
+
+    fun deactivate() {
+        synchronized(lock) {
+            activeThread = null
+            Thread.interrupted()
+        }
+    }
+
+    private fun deliverInterruptIfNeeded() {
+        val thread = activeThread
+        if (interruptRequested && !interruptDelivered && thread != null) {
+            interruptDelivered = true
+            interruptThread(thread)
         }
     }
 }
@@ -60,28 +156,51 @@ internal class ContentProviderInstalledExtensionIconSource(
 
     private suspend fun extractFromProvider(uri: String): ByteArray? {
         val lease = openLease(uri) ?: return null
+        var cleanupCompleted = false
+        var result: ByteArray? = null
+        var failure: Throwable? = null
+        val cleanup = CleanupFailureCollector()
         try {
-            return coroutineScope {
+            supervisorScope {
                 val extraction = async(extractionDispatcher) {
                     runInterruptible {
                         extract(lease.stream)
                     }
                 }
                 try {
-                    extraction.await()
-                } finally {
-                    extraction.cancel()
-                    withContext(NonCancellable) {
-                        closeLease(lease)
+                    result = extraction.await()
+                } catch (error: Throwable) {
+                    failure = error
+                }
+                withContext(NonCancellable) {
+                    cleanup.attempt {
+                        extraction.cancel()
+                    }
+                    cleanup.attempt {
+                        lease.close()
+                    }
+                    cleanup.attemptSuspend {
                         extraction.join()
                     }
                 }
+                cleanupCompleted = true
             }
-        } finally {
-            withContext(NonCancellable) {
-                closeLease(lease)
+        } catch (error: Throwable) {
+            if (failure == null) {
+                failure = error
+            } else if (failure !== error) {
+                cleanup.recordFailure(error)
             }
         }
+        if (!cleanupCompleted) {
+            withContext(NonCancellable) {
+                cleanup.attempt {
+                    lease.close()
+                }
+            }
+        }
+        cleanup.throwWith(failure)
+        return result
     }
 
     private companion object {
@@ -91,60 +210,81 @@ internal class ContentProviderInstalledExtensionIconSource(
 
 internal class AndroidProviderStreamOpener(
     private val contentResolver: ContentResolver,
+    private val openingDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val interruptThread: (Thread) -> Unit = Thread::interrupt,
+    private val leaseFactory: (InputStream) -> ProviderStreamLease = ::ProviderStreamLease,
+    private val afterOpeningThreadInactive: () -> Unit = {},
 ) {
-    suspend fun open(uri: String): ProviderStreamLease? = withContext(Dispatchers.IO) {
+    suspend fun open(uri: String): ProviderStreamLease? =
         suspendCancellableCoroutine { continuation ->
             val cancellationSignal = CancellationSignal()
             val leaseReference = AtomicReference<ProviderStreamLease?>()
-            val openingThread = Thread.currentThread()
+            val openingThread = OpeningThreadLifetime(
+                interruptThread = interruptThread,
+            )
             continuation.invokeOnCancellation {
-                cancelSignal(cancellationSignal)
-                closeLease(leaseReference.getAndSet(null))
-                openingThread.interrupt()
+                val cleanup = CleanupFailureCollector()
+                cleanup.attempt {
+                    cancellationSignal.cancel()
+                }
+                cleanup.attempt {
+                    leaseReference.getAndSet(null)?.close()
+                }
+                cleanup.attempt {
+                    openingThread.interruptIfActive()
+                }
+                cleanup.throwWith()
             }
             try {
-                val descriptor = contentResolver.openAssetFileDescriptor(
-                    Uri.parse(uri),
-                    "r",
-                    cancellationSignal,
-                )
-                val stream = try {
-                    descriptor?.createInputStream()
-                } catch (error: Throwable) {
-                    closeResource(descriptor)
-                    throw error
-                }
-                val lease = stream?.let(::ProviderStreamLease)
-                leaseReference.set(lease)
-                if (!continuation.isActive) {
-                    closeLease(leaseReference.getAndSet(null))
-                } else {
-                    continuation.resume(lease) { _, value, _ ->
-                        closeLease(value)
+                openingDispatcher.dispatch(
+                    continuation.context,
+                    Runnable {
+                        try {
+                            openingThread.activate(Thread.currentThread())
+                            val descriptor = contentResolver.openAssetFileDescriptor(
+                                Uri.parse(uri),
+                                "r",
+                                cancellationSignal,
+                            )
+                            val stream = try {
+                                descriptor?.createInputStream()
+                            } catch (error: Throwable) {
+                                closeResource(descriptor)
+                                throw error
+                            }
+                            val lease = stream?.let(leaseFactory)
+                            leaseReference.set(lease)
+                            if (!continuation.isActive) {
+                                closeLease(leaseReference.getAndSet(null))
+                            } else {
+                                continuation.resume(lease) { _, value, _ ->
+                                    closeLease(value)
+                                }
+                                leaseReference.compareAndSet(lease, null)
+                            }
+                        } catch (error: Throwable) {
+                            if (continuation.isActive) {
+                                continuation.resumeWith(Result.failure(error))
+                            } else if (
+                                error is CancellationException ||
+                                error is Error
+                            ) {
+                                throw error
+                            }
+                        } finally {
+                            openingThread.deactivate()
+                            afterOpeningThreadInactive()
+                        }
                     }
-                    leaseReference.compareAndSet(lease, null)
-                }
+                )
             } catch (error: Throwable) {
                 if (continuation.isActive) {
                     continuation.resumeWith(Result.failure(error))
-                } else if (error is Error) {
+                } else if (error is CancellationException || error is Error) {
                     throw error
                 }
-            } finally {
-                Thread.interrupted()
             }
         }
-    }
-}
-
-private fun cancelSignal(signal: CancellationSignal) {
-    try {
-        signal.cancel()
-    } catch (error: CancellationException) {
-        throw error
-    } catch (_: Exception) {
-        // Provider icon cleanup is best-effort.
-    }
 }
 
 private fun closeResource(resource: Closeable?) {

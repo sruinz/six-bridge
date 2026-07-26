@@ -6,6 +6,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -234,6 +235,176 @@ class InstalledExtensionIconSourceTest {
             source.load(PACKAGE)
         }
         assertEquals(1, stream.closeCount.get())
+    }
+
+    @Test
+    fun `cleanup Error는 extractor 실패를 suppressed로 보존한다`() = runTest {
+        val extractionFailure = IllegalArgumentException("extract failed")
+        val cleanupFailure = AssertionError("close invariant broken")
+        val stream = CloseFailureInputStream(cleanupFailure)
+        val source = ContentProviderInstalledExtensionIconSource(
+            extract = { throw extractionFailure },
+            openLease = { ProviderStreamLease(stream) },
+        )
+
+        val thrown = assertFailsWith<AssertionError> {
+            source.load(PACKAGE)
+        }
+
+        assertTrue(
+            thrown.suppressed.any {
+                it is IllegalArgumentException && it.message == "extract failed"
+            },
+        )
+        assertEquals(1, stream.closeCount.get())
+    }
+
+    @Test
+    fun `부모 취소 중 cleanup Error도 primary로 보존한다`() = runTest {
+        val cleanupFailure = AssertionError("close during cancellation")
+        val stream = CloseFailureInputStream(cleanupFailure)
+        val leaseOpened = CompletableDeferred<Unit>()
+        val extractionDispatcher = StandardTestDispatcher(testScheduler)
+        val source = ContentProviderInstalledExtensionIconSource(
+            extract = { PNG },
+            openLease = {
+                leaseOpened.complete(Unit)
+                ProviderStreamLease(stream)
+            },
+            extractionDispatcher = extractionDispatcher,
+        )
+        val observed = CompletableDeferred<Throwable>()
+        val load = launch {
+            try {
+                source.load(PACKAGE)
+            } catch (error: Throwable) {
+                observed.complete(error)
+            }
+        }
+        leaseOpened.await()
+
+        load.cancel()
+        val thrown = observed.await()
+        load.join()
+
+        assertTrue(thrown is AssertionError)
+        assertEquals("close during cancellation", thrown.message)
+        assertTrue(
+            thrown.suppressed.any { it is CancellationException },
+        )
+        assertEquals(1, stream.closeCount.get())
+    }
+
+    @Test
+    fun `cleanup collector는 모든 작업을 시도하고 Error를 우선한다`() {
+        val events = mutableListOf<String>()
+        val collector = CleanupFailureCollector()
+        collector.attempt {
+            events += "signal"
+            throw CancellationException("signal cancelled")
+        }
+        collector.attempt {
+            events += "lease"
+            throw IllegalStateException("best effort close")
+        }
+        collector.attempt {
+            events += "interrupt"
+            throw AssertionError("interrupt invariant")
+        }
+        collector.attempt {
+            events += "after"
+        }
+
+        val thrown = assertFailsWith<AssertionError> {
+            collector.throwWith(IllegalArgumentException("open failed"))
+        }
+
+        assertEquals(
+            listOf("signal", "lease", "interrupt", "after"),
+            events,
+        )
+        assertTrue(
+            thrown.suppressed.any {
+                it is CancellationException && it.message == "signal cancelled"
+            },
+        )
+        assertTrue(
+            thrown.suppressed.any {
+                it is IllegalArgumentException && it.message == "open failed"
+            },
+        )
+        assertFalse(
+            thrown.suppressed.any {
+                it is IllegalStateException && it.message == "best effort close"
+            },
+        )
+    }
+
+    @Test
+    fun `opening lifetime은 active thread만 실제 interrupt한다`() {
+        val ready = CountDownLatch(1)
+        val interrupted = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val lifetimeReference = AtomicReference<OpeningThreadLifetime>()
+        val worker = Thread {
+            val lifetime = OpeningThreadLifetime(Thread.currentThread())
+            lifetimeReference.set(lifetime)
+            ready.countDown()
+            try {
+                releaseWorker.await()
+            } catch (_: InterruptedException) {
+                interrupted.countDown()
+            } finally {
+                lifetime.deactivate()
+            }
+        }
+        worker.start()
+        try {
+            assertTrue(ready.await(1, TimeUnit.SECONDS))
+
+            lifetimeReference.get().interruptIfActive()
+
+            assertTrue(interrupted.await(1, TimeUnit.SECONDS))
+            worker.join(1_000)
+            assertFalse(worker.isAlive)
+        } finally {
+            releaseWorker.countDown()
+            worker.interrupt()
+            worker.join(1_000)
+        }
+
+        val lateInterrupts = AtomicInteger()
+        val inactive = OpeningThreadLifetime(
+            Thread.currentThread(),
+            interruptThread = { lateInterrupts.incrementAndGet() },
+        )
+        inactive.deactivate()
+        inactive.interruptIfActive()
+        assertEquals(0, lateInterrupts.get())
+    }
+
+    @Test
+    fun `opening lifetime은 시작 전 취소도 activate 시 정확히 한 번 interrupt한다`() {
+        val interruptCount = AtomicInteger()
+        val lifetime = OpeningThreadLifetime(
+            interruptThread = { thread ->
+                assertEquals(Thread.currentThread(), thread)
+                interruptCount.incrementAndGet()
+            },
+        )
+
+        lifetime.interruptIfActive()
+        lifetime.interruptIfActive()
+        assertEquals(0, interruptCount.get())
+
+        lifetime.activate(Thread.currentThread())
+        lifetime.interruptIfActive()
+        lifetime.interruptIfActive()
+        assertEquals(1, interruptCount.get())
+
+        lifetime.deactivate()
+        lifetime.interruptIfActive()
+        assertEquals(1, interruptCount.get())
     }
 
     private class CountingCloseInputStream : InputStream() {

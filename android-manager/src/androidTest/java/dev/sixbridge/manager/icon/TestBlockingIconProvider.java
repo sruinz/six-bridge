@@ -7,13 +7,14 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.CancellationSignal;
+import android.os.ParcelFileDescriptor;
+import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 public final class TestBlockingIconProvider extends ContentProvider {
-    public static volatile CountDownLatch openStarted = new CountDownLatch(1);
-    public static volatile CountDownLatch cancellationReceived = new CountDownLatch(1);
-    public static volatile CountDownLatch releaseOpen = new CountDownLatch(1);
+    private static final Object GENERATION_LOCK = new Object();
+    private static volatile Generation generation = new Generation();
 
     @Override
     public boolean onCreate() {
@@ -27,11 +28,11 @@ public final class TestBlockingIconProvider extends ContentProvider {
             reset();
             result.putBoolean("completed", true);
         } else if ("await-open".equals(method)) {
-            result.putBoolean("completed", await(openStarted));
+            result.putBoolean("completed", await(generation.openStarted));
         } else if ("await-cancellation".equals(method)) {
-            result.putBoolean("completed", await(cancellationReceived));
+            result.putBoolean("completed", await(generation.cancellationReceived));
         } else if ("release".equals(method)) {
-            releaseOpen.countDown();
+            generation.releaseOpen.countDown();
             result.putBoolean("completed", true);
         }
         return result;
@@ -55,15 +56,33 @@ public final class TestBlockingIconProvider extends ContentProvider {
     }
 
     private AssetFileDescriptor openBlocking(Uri uri, CancellationSignal signal) {
-        if (!"/cancel-aware".equals(uri.getPath())) {
+        String path = uri.getPath();
+        if (!"/cancel-aware".equals(path) && !"/late-return".equals(path)) {
             return null;
         }
+        Generation openingGeneration = generation;
         if (signal != null) {
-            signal.setOnCancelListener(() -> cancellationReceived.countDown());
+            signal.setOnCancelListener(
+                    () -> openingGeneration.cancellationReceived.countDown());
         }
-        openStarted.countDown();
-        awaitRelease();
-        return null;
+        ParcelFileDescriptor[] pipe = null;
+        if ("/late-return".equals(path)) {
+            try {
+                pipe = ParcelFileDescriptor.createPipe();
+            } catch (IOException error) {
+                throw new IllegalStateException("Could not create test pipe", error);
+            }
+        }
+        openingGeneration.openStarted.countDown();
+        awaitRelease(openingGeneration.releaseOpen);
+        if (pipe == null) {
+            return null;
+        }
+        closeQuietly(pipe[1]);
+        return new AssetFileDescriptor(
+                pipe[0],
+                0,
+                AssetFileDescriptor.UNKNOWN_LENGTH);
     }
 
     @Override
@@ -100,7 +119,7 @@ public final class TestBlockingIconProvider extends ContentProvider {
         return 0;
     }
 
-    private static void awaitRelease() {
+    private static void awaitRelease(CountDownLatch releaseOpen) {
         while (true) {
             try {
                 releaseOpen.await();
@@ -121,8 +140,23 @@ public final class TestBlockingIconProvider extends ContentProvider {
     }
 
     public static void reset() {
-        openStarted = new CountDownLatch(1);
-        cancellationReceived = new CountDownLatch(1);
-        releaseOpen = new CountDownLatch(1);
+        synchronized (GENERATION_LOCK) {
+            generation.releaseOpen.countDown();
+            generation = new Generation();
+        }
+    }
+
+    private static void closeQuietly(ParcelFileDescriptor descriptor) {
+        try {
+            descriptor.close();
+        } catch (IOException ignored) {
+            // Test cleanup is best-effort.
+        }
+    }
+
+    private static final class Generation {
+        final CountDownLatch openStarted = new CountDownLatch(1);
+        final CountDownLatch cancellationReceived = new CountDownLatch(1);
+        final CountDownLatch releaseOpen = new CountDownLatch(1);
     }
 }
