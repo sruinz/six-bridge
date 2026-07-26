@@ -448,12 +448,17 @@ class ManagerViewModel(
         } else {
             null
         }
+        val failureText = if (uninstallPackage != null) {
+            "시스템 제거 화면을 열 수 없습니다."
+        } else {
+            "시스템 화면을 열 수 없습니다."
+        }
         pendingRecovery = PendingRecovery.Launch(effect, uninstallPackage)
         mutableState.update {
             it.copy(
                 message = UserMessage(
                     UserMessageKind.LAUNCH_FAILED,
-                    "시스템 화면을 열 수 없습니다.",
+                    failureText,
                     RecoveryAction.RETRY,
                 ),
             )

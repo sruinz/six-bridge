@@ -420,6 +420,10 @@ class ManagerViewModelTest {
         viewModel.accept(ManagerAction.ReturnedToForeground)
         advanceUntilIdle()
         assertEquals(UserMessageKind.UNINSTALL_CANCELLED, viewModel.state.value.message?.kind)
+        assertEquals(
+            "제거가 취소되었거나 확장 래퍼가 아직 설치되어 있습니다.",
+            viewModel.state.value.message?.text,
+        )
 
         viewModel.accept(ManagerAction.Remove(PACKAGE))
         val secondEffect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
@@ -471,6 +475,10 @@ class ManagerViewModelTest {
 
             assertTrue(repository.reconcileUninstallPackages.isEmpty())
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+            assertEquals(
+                "시스템 제거 화면을 열 수 없습니다.",
+                viewModel.state.value.message?.text,
+            )
 
             viewModel.accept(ManagerAction.RetryRecovery)
             val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())

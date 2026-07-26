@@ -72,8 +72,10 @@ descriptor와 실제 APK signer가 일치해야 한다. 같은 package를 업데
 각 설치·업데이트의 Android 시스템 승인 화면에서 최종 결정을 내린다.
 root, Shizuku와 비공개 설치 API를 사용하지 않는다.
 
-제거도 표준 Android 제거 화면을 사용한다. 관리자 복귀 이벤트만으로 성공을
-가정하지 않고 실제 package 상태를 다시 조회한다.
+제거에는 일반 권한 `REQUEST_DELETE_PACKAGES`가 필요하지만 시스템 사용자 확인을
+우회하지 않는다. `DELETE_PACKAGES` 권한은 사용하지 않으며, 제거도 표준 Android
+제거 화면을 사용한다. 관리자 복귀 이벤트만으로 성공을 가정하지 않고 실제 package
+상태를 다시 조회한다.
 
 삼성 인터넷은 설치된 래퍼의 활성화·비활성화, 확장 권한, 비밀 모드 허용과
 상세 설정을 소유한다. 관리자는 Android package 설치 상태만 표시하며 삼성
