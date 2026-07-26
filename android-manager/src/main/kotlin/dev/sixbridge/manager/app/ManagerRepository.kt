@@ -40,7 +40,10 @@ import java.io.InputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -163,13 +166,31 @@ internal class DefaultManagerRepository(
         installSessionId: Int?,
     ): ManagerRestoreResult {
         val startupSnapshot = startup.awaitReady()
-        val pending = startupSnapshot.pending
+        val currentSnapshot = installCoordinator.currentRecoverySnapshot()
+        val pending = currentSnapshot.pending
         val retained = reviewToken?.let { token ->
             when {
+                pending?.importToken == token && pending == startupSnapshot.pending ->
+                    currentSnapshot.activeBundle
+                        ?.takeIf {
+                            it.token == token &&
+                                it.verifiedApk.packageName == pending.packageName
+                        }
+                        ?: startupSnapshot.restoredBundle
+                            ?.takeIf {
+                                it.token == token &&
+                                    it.verifiedApk.packageName == pending.packageName
+                            }
                 pending?.importToken == token ->
-                    startupSnapshot.restoredBundle?.takeIf { it.token == token }
-                pending == null ->
                     withContext(ioDispatcher) { retainedImports.load(token) }
+                        ?.takeIf { it.verifiedApk.packageName == pending.packageName }
+                pending == null -> currentSnapshot.activeBundle
+                    ?.takeIf { it.token == token }
+                    ?: if (startupSnapshot.pending?.importToken != token) {
+                        withContext(ioDispatcher) { retainedImports.load(token) }
+                    } else {
+                        null
+                    }
                 else -> null
             }
         }
@@ -177,7 +198,9 @@ internal class DefaultManagerRepository(
         val review = retained
             ?.takeIf {
                 it.token == reviewToken &&
-                    (pending == null || pending.importToken == reviewToken)
+                    (pending == null ||
+                        pending.importToken == reviewToken &&
+                        pending.packageName == it.verifiedApk.packageName)
             }
             ?.toReview()
         return ManagerRestoreResult(review, restoredSession)
@@ -387,6 +410,19 @@ internal class CatalogPublisher(
 internal data class RetainedImportIo(
     val openSidecar: (File) -> InputStream = File::inputStream,
     val wrapperSha256: (File) -> String = ::retainedFileSha256,
+    val readAttributes: (Path) -> BasicFileAttributes = { path ->
+        Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            LinkOption.NOFOLLOW_LINKS,
+        )
+    },
+    val toRealPath: (Path) -> Path = { path ->
+        path.toRealPath(LinkOption.NOFOLLOW_LINKS)
+    },
+    val notExists: (Path) -> Boolean = { path ->
+        Files.notExists(path, LinkOption.NOFOLLOW_LINKS)
+    },
 )
 
 internal class RetainedImportStore(
@@ -467,16 +503,14 @@ internal class RetainedImportStore(
     }
 
     fun load(token: String): ImportedBundle? {
-        val directory = tokenDirectory(token) ?: return null
-        val wrapper = wrapperFile(directory) ?: return null
-        val sidecar = File(directory, SIDECAR_FILE)
-        if (!isDirectFile(directory, sidecar) ||
-            sidecar.length() !in MIN_SIDECAR_BYTES..MAX_SIDECAR_BYTES
-        ) {
+        val directory = loadTokenDirectory(token) ?: return null
+        val wrapper = loadDirectFile(directory, WRAPPER_FILE)?.file ?: return null
+        val sidecar = loadDirectFile(directory, SIDECAR_FILE) ?: return null
+        if (sidecar.attributes.size() !in MIN_SIDECAR_BYTES..MAX_SIDECAR_BYTES) {
             return null
         }
         val metadata = try {
-            DataInputStream(io.openSidecar(sidecar).buffered()).use { input ->
+            DataInputStream(io.openSidecar(sidecar.file).buffered()).use { input ->
                 if (input.readInt() != MAGIC || input.readInt() != FORMAT_VERSION) return null
                 val extension = input.readBoundedBytes()
                 val compatibility = input.readBoundedBytes()
@@ -485,8 +519,11 @@ internal class RetainedImportStore(
             }
         } catch (_: EOFException) {
             return null
-        } catch (_: FileNotFoundException) {
+        } catch (_: NoSuchFileException) {
             return null
+        } catch (error: FileNotFoundException) {
+            if (confirmMissing(sidecar.file.toPath())) return null
+            throw RetainedImportTransientException(error)
         } catch (_: IllegalArgumentException) {
             return null
         } catch (error: CancellationException) {
@@ -502,6 +539,11 @@ internal class RetainedImportStore(
             ?: return null
         val currentSha256 = try {
             io.wrapperSha256(wrapper)
+        } catch (_: NoSuchFileException) {
+            return null
+        } catch (error: FileNotFoundException) {
+            if (confirmMissing(wrapper.toPath())) return null
+            throw RetainedImportTransientException(error)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
@@ -543,6 +585,61 @@ internal class RetainedImportStore(
         )
     }
 
+    private fun loadTokenDirectory(token: String): File? {
+        if (!isCanonicalToken(token)) return null
+        val rootPath = importRoot.toPath()
+        val rootAttributes = readAttributes(rootPath) ?: return null
+        if (!rootAttributes.isDirectory || rootAttributes.isSymbolicLink) return null
+        val root = realPath(rootPath) ?: return null
+        val directoryPath = root.resolve(token)
+        val directoryAttributes = readAttributes(directoryPath) ?: return null
+        if (!directoryAttributes.isDirectory || directoryAttributes.isSymbolicLink) return null
+        val directory = realPath(directoryPath) ?: return null
+        return directory.takeIf { it.parent == root }?.toFile()
+    }
+
+    private fun loadDirectFile(directory: File, name: String): ResolvedRetainedFile? {
+        val directoryPath = directory.toPath()
+        val path = directoryPath.resolve(name)
+        val attributes = readAttributes(path) ?: return null
+        if (!attributes.isRegularFile || attributes.isSymbolicLink) return null
+        val realPath = realPath(path) ?: return null
+        if (realPath.parent != directoryPath) return null
+        return ResolvedRetainedFile(realPath.toFile(), attributes)
+    }
+
+    private fun readAttributes(path: Path): BasicFileAttributes? = try {
+        io.readAttributes(path)
+    } catch (_: NoSuchFileException) {
+        null
+    } catch (error: FileNotFoundException) {
+        if (confirmMissing(path)) null else throw RetainedImportTransientException(error)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        throw RetainedImportTransientException(error)
+    }
+
+    private fun realPath(path: Path): Path? = try {
+        io.toRealPath(path)
+    } catch (_: NoSuchFileException) {
+        null
+    } catch (error: FileNotFoundException) {
+        if (confirmMissing(path)) null else throw RetainedImportTransientException(error)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        throw RetainedImportTransientException(error)
+    }
+
+    private fun confirmMissing(path: Path): Boolean = try {
+        io.notExists(path)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        throw RetainedImportTransientException(error)
+    }
+
     private fun tokenDirectory(token: String): File? {
         if (!isCanonicalToken(token) ||
             Files.isSymbolicLink(importRoot.toPath()) ||
@@ -576,6 +673,11 @@ internal class RetainedImportStore(
 
     private fun isCanonicalToken(token: String): Boolean =
         runCatching { UUID.fromString(token).toString() == token }.getOrDefault(false)
+
+    private data class ResolvedRetainedFile(
+        val file: File,
+        val attributes: BasicFileAttributes,
+    )
 
     private companion object {
         const val MAGIC = 0x53495852

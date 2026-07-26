@@ -90,6 +90,55 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `늦은 initialize review는 먼저 도착한 terminal install 상태를 덮지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
+            val repository = FakeManagerRepository().apply {
+                suspendInitialize = true
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            dispatcher.scheduler.runCurrent()
+            launch { repository.completeInitialize() }
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(ImportUiState.Idle, viewModel.state.value.importState)
+            assertNull(savedState.get<String>("review_token"))
+        }
+
+    @Test
+    fun `이전 terminal 상태는 새 B review의 ViewModel 재생성을 지우지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(mapOf("review_token" to SECOND_TOKEN))
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.Installed(PACKAGE)
+                restoreResult = ManagerRestoreResult(
+                    review = review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                )
+            }
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), recreated.state.value.route)
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
+                    .review.token,
+            )
+            assertEquals(SECOND_TOKEN, savedState.get<String>("review_token"))
+        }
+
+    @Test
     fun `가져오기 중 표시 후 compatible은 즉시 설치할 수 있다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository().apply {
             importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
@@ -856,8 +905,11 @@ class ManagerViewModelTest {
             assertTrue(viewModel.state.value.message?.text.orEmpty().any { it.code in 0xAC00..0xD7A3 })
         }
 
-    private fun review(status: ContractCompatibilityStatus) = ReviewBundle(
-        token = TOKEN,
+    private fun review(
+        status: ContractCompatibilityStatus,
+        token: String = TOKEN,
+    ) = ReviewBundle(
+        token = token,
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
         name = "확장",

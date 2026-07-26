@@ -866,6 +866,22 @@ class InstallCoordinatorTest {
         }
 
     @Test
+    fun `current recovery snapshot은 pending load 오류를 전파하고 다음 조회에서 복원한다`() =
+        runBlocking {
+            val pending = pendingInstall()
+            val fixture = fixture(pending = pending, ownedSessions = listOf(SESSION_ID))
+            fixture.pendingStore.loadFailure = IOException("transient pending read")
+
+            assertFailsWith<IOException> {
+                fixture.coordinator.currentRecoverySnapshot()
+            }
+
+            val snapshot = fixture.coordinator.currentRecoverySnapshot()
+            assertEquals(pending, snapshot.pending)
+            assertNull(snapshot.activeBundle)
+        }
+
+    @Test
     fun `keeps a recently completed session pending until its result can be delivered`() {
         val pending = PendingInstall(
             sessionId = SESSION_ID,
@@ -1435,9 +1451,14 @@ class InstallCoordinatorTest {
         var loadBarrier: CyclicBarrier? = null
         var confirmationDeliveredSessionId: Int? = null
         var confirmationMarkFailure = false
+        var loadFailure: Throwable? = null
         private var barrierLoadsRemaining = 2
 
         override fun load(): PendingInstall? {
+            loadFailure?.let { error ->
+                loadFailure = null
+                throw error
+            }
             val barrier = synchronized(this) {
                 loadBarrier?.takeIf { barrierLoadsRemaining-- > 0 }
             }

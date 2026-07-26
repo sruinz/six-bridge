@@ -37,6 +37,9 @@ class ManagerViewModel(
     private var operationGeneration = 0L
     private var pendingUninstallPackage: String? = null
     private var initialized = false
+    private val installStateAtInitialization = repository.installState.value
+    private var firstInstallStateObserved = false
+    private var deferredInitialTerminal: InstallState? = null
     private var lastInstallState: InstallState? = null
     private var ownedReviewToken: String? = null
     private val pendingReviewDiscards = linkedSetOf<String>()
@@ -136,7 +139,12 @@ class ManagerViewModel(
             }
             initialized = true
             if (generation != operationGeneration) {
+                deferredInitialTerminal = null
                 restored.review?.token?.let(::queuePendingReviewDiscard)
+                return@launch
+            }
+            if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
+                deferredInitialTerminal = null
                 return@launch
             }
             if (restored.review != null) {
@@ -148,6 +156,11 @@ class ManagerViewModel(
                 savedStateHandle[INSTALL_SESSION_ID_KEY] = restored.installSessionId
             } else {
                 savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+            }
+            val deferredTerminal = deferredInitialTerminal
+            deferredInitialTerminal = null
+            if (restored.review == null && deferredTerminal != null) {
+                applyInstallTerminal(deferredTerminal)
             }
         }
     }
@@ -163,9 +176,19 @@ class ManagerViewModel(
     private fun observeInstallState() {
         viewModelScope.launch {
             repository.installState.collect { installState ->
+                val firstEmission = !firstInstallStateObserved
+                firstInstallStateObserved = true
                 val changed = installState != lastInstallState
                 lastInstallState = installState
                 mutableState.update { it.copy(installState = installState) }
+                if (firstEmission &&
+                    installState == installStateAtInitialization &&
+                    installState.isTerminalState() &&
+                    savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
+                ) {
+                    if (!initialized) deferredInitialTerminal = installState
+                    if (!initialized || ownedReviewToken != null) return@collect
+                }
                 if (installState.isTerminalState()) {
                     replacementCancelGeneration?.let { generation ->
                         deferredReplacementTerminal = generation to installState

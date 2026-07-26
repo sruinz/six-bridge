@@ -182,6 +182,12 @@ class InstallResultReceiverTest {
                 channelImportance = NotificationManager.IMPORTANCE_NONE,
             ),
         )
+        assertFalse(
+            notificationHandoffAvailable(
+                appNotificationsEnabled = true,
+                channelImportance = null,
+            ),
+        )
         assertTrue(
             notificationHandoffAvailable(
                 appNotificationsEnabled = true,

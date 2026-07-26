@@ -43,7 +43,12 @@ import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
@@ -181,6 +186,125 @@ class ManagerRepositoryTest {
 
         assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
         assertNotNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `존재하는 sidecar의 FileNotFoundException은 transient이고 다음 load가 성공한다`() {
+        val root = temporaryFolder.newFolder("sidecar-resource-retry")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(RetainedImportStore(root, verifier).save(bundle))
+        var attempts = 0
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                openSidecar = { sidecar ->
+                    attempts += 1
+                    if (attempts == 1) throw FileNotFoundException("resource exhausted")
+                    sidecar.inputStream()
+                },
+                notExists = { false },
+            ),
+            verify = verifier,
+        )
+
+        assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
+        assertNotNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `metadata IO 실패는 transient이고 다음 load에서 복원한다`() {
+        val root = temporaryFolder.newFolder("metadata-retry")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(RetainedImportStore(root, verifier).save(bundle))
+        var attempts = 0
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                readAttributes = { path ->
+                    attempts += 1
+                    if (attempts == 1) throw IOException("transient metadata")
+                    Files.readAttributes(
+                        path,
+                        BasicFileAttributes::class.java,
+                        LinkOption.NOFOLLOW_LINKS,
+                    )
+                },
+            ),
+            verify = verifier,
+        )
+
+        assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
+        assertNotNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `real path IO 실패는 transient이고 다음 load에서 복원한다`() {
+        val root = temporaryFolder.newFolder("real-path-retry")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(RetainedImportStore(root, verifier).save(bundle))
+        var attempts = 0
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                toRealPath = { path ->
+                    attempts += 1
+                    if (attempts == 1) throw IOException("transient real path")
+                    path.toRealPath(LinkOption.NOFOLLOW_LINKS)
+                },
+            ),
+            verify = verifier,
+        )
+
+        assertFailsWith<RetainedImportTransientException> { store.load(TOKEN) }
+        assertNotNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `open 중 실제 sidecar 누락은 definitive null이다`() {
+        val root = temporaryFolder.newFolder("sidecar-open-missing")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(RetainedImportStore(root, verifier).save(bundle))
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                openSidecar = { throw NoSuchFileException(it.path) },
+            ),
+            verify = verifier,
+        )
+
+        assertNull(store.load(TOKEN))
+    }
+
+    @Test
+    fun `hash 중 실제 wrapper 누락이 확인되면 definitive null이다`() {
+        val root = temporaryFolder.newFolder("wrapper-hash-missing")
+        val bundle = importedBundle(root)
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(RetainedImportStore(root, verifier).save(bundle))
+        val store = RetainedImportStore(
+            importRoot = root,
+            io = RetainedImportIo(
+                wrapperSha256 = { throw FileNotFoundException("missing wrapper") },
+                notExists = { path -> path.fileName.toString() == "wrapper.apk" },
+            ),
+            verify = verifier,
+        )
+
+        assertNull(store.load(TOKEN))
     }
 
     @Test
@@ -467,6 +591,194 @@ class ManagerRepositoryTest {
             assertNull(snapshot.restoredBundle)
             assertNull(pendingStore.record)
             assertFalse(File(root, TOKEN).exists())
+        }
+
+    @Test
+    fun `readiness 뒤 terminal cleanup은 이전 review와 session을 다시 복원하지 않는다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("current-recovery-after-terminal")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundle))
+            val pendingStore = StartupPendingStore(
+                PendingInstall(41, PACKAGE, TOKEN, 1),
+                root,
+            )
+            val gateway = StartupGateway(listOf(41))
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+
+            assertEquals(TOKEN, repository.initialize(TOKEN, 41).review?.token)
+            installed.values = listOf(installed(version = 2, signer = "a".repeat(64)))
+            coordinator.onPackageInstallerResult(PackageInstallResult.Success(41))
+
+            val restored = repository.initialize(TOKEN, 41)
+
+            assertNull(restored.review)
+            assertNull(restored.installSessionId)
+            assertNull(pendingStore.record)
+        }
+
+    @Test
+    fun `readiness가 비어 있던 뒤 시작한 install은 현재 B review와 session을 복원한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("current-recovery-late-b")
+            val bundleB = importedBundle(root, SECOND_TOKEN)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundleB.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundleB))
+            val pendingStore = StartupPendingStore(null, root)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            repository.initialize(null, null)
+            val pendingB = PendingInstall(42, PACKAGE, SECOND_TOKEN, 2)
+            pendingStore.record = pendingB
+            gateway.replaceOwnedSessions(42)
+            coordinator.restore(bundleB)
+
+            val restored = repository.initialize(SECOND_TOKEN, 42)
+
+            assertEquals(SECOND_TOKEN, restored.review?.token)
+            assertEquals(42, restored.installSessionId)
+        }
+
+    @Test
+    fun `readiness A 뒤 ownership이 B로 바뀌면 B sidecar와 session을 복원한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("current-recovery-a-to-b")
+            val bundleA = importedBundle(root)
+            val bundleB = importedBundle(root, SECOND_TOKEN)
+            val retainedImports = RetainedImportStore(root) { _, descriptor, _ ->
+                WrapperVerificationResult.Success(
+                    if (descriptor.wrapperSha256 == bundleA.wrapperSha256) {
+                        bundleA.verifiedApk
+                    } else {
+                        bundleB.verifiedApk
+                    },
+                )
+            }
+            assertTrue(retainedImports.save(bundleA))
+            assertTrue(retainedImports.save(bundleB))
+            val pendingStore = StartupPendingStore(
+                PendingInstall(41, PACKAGE, TOKEN, 1),
+                root,
+            )
+            val gateway = StartupGateway(listOf(41))
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            assertEquals(TOKEN, repository.initialize(TOKEN, 41).review?.token)
+            val pendingB = PendingInstall(42, PACKAGE, SECOND_TOKEN, 2)
+            pendingStore.record = pendingB
+            gateway.replaceOwnedSessions(42)
+            coordinator.restore(bundleB)
+
+            val restored = repository.initialize(SECOND_TOKEN, 42)
+
+            assertEquals(SECOND_TOKEN, restored.review?.token)
+            assertEquals(42, restored.installSessionId)
+        }
+
+    @Test
+    fun `readiness A cleanup 뒤 새 review-only B는 typed sidecar로 복원한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("current-recovery-review-only-b")
+            val bundleA = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundleA.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundleA))
+            val pendingStore = StartupPendingStore(
+                PendingInstall(41, PACKAGE, TOKEN, 1),
+                root,
+            )
+            val gateway = StartupGateway(listOf(41))
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                clock = { 2 },
+                retainedWrapperSha256 = { sha256(it) },
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            assertEquals(TOKEN, repository.initialize(TOKEN, 41).review?.token)
+            assertTrue(coordinator.cancel())
+            val bundleB = importedBundle(root, SECOND_TOKEN)
+            assertTrue(retainedImports.save(bundleB))
+
+            val restored = repository.initialize(SECOND_TOKEN, null)
+
+            assertEquals(SECOND_TOKEN, restored.review?.token)
+            assertNull(restored.installSessionId)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -845,8 +1157,46 @@ class ManagerRepositoryTest {
             assertEquals("UNKNOWN", actualOnly.compatibilityStatus)
         }
 
-    private fun importedBundle(root: File): ImportedBundle {
-        val directory = File(root, TOKEN).apply { mkdir() }
+    private fun managerRepository(
+        root: File,
+        retainedImports: RetainedImportStore,
+        gateway: StartupGateway,
+        pendingStore: StartupPendingStore,
+        installed: FakeInstalledWrappers,
+        catalog: FakeCatalog,
+        coordinator: InstallCoordinator,
+    ) = DefaultManagerRepository(
+        importer = BundleImportService(
+            BundleSource { error("직접 import하지 않습니다.") },
+            AndroidWrapperVerifier(ArchiveInspector { error("검증하지 않습니다.") }),
+            root,
+            ioDispatcher = Dispatchers.Unconfined,
+        ),
+        retainedImports = retainedImports,
+        startupCleanup = StartupCleanup(
+            root,
+            gateway,
+            pendingStore,
+            Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+        ),
+        installCoordinator = coordinator,
+        pendingStore = pendingStore,
+        uninstallCoordinator = object : UninstallCoordinator {
+            override fun intent(packageName: String) = error("uninstall하지 않습니다.")
+            override suspend fun reconcileAfterReturn(packageName: String) =
+                UninstallOutcome.CancelledOrStillInstalled
+        },
+        samsungBrowserNavigator = object : SamsungBrowserNavigator {
+            override fun addOnsIntent() = error("Add-ons를 열지 않습니다.")
+            override fun availability() = SamsungBrowserAvailability.SamsungBrowserMissing
+        },
+        catalogPublisher = CatalogPublisher(catalog, installed, CatalogReconciler()),
+        installEvents = emptyFlow(),
+        ioDispatcher = Dispatchers.Unconfined,
+    )
+
+    private fun importedBundle(root: File, token: String = TOKEN): ImportedBundle {
+        val directory = File(root, token).apply { mkdir() }
         val wrapper = File(directory, "wrapper.apk").apply { writeText("verified apk") }
         val hash = sha256(wrapper)
         val descriptor = ContractExtensionDescriptor(
@@ -895,7 +1245,7 @@ class ManagerRepositoryTest {
                 zipLength = 0,
             ),
         )
-        return ImportedBundle(TOKEN, descriptor, report, verified, wrapper, hash)
+        return ImportedBundle(token, descriptor, report, verified, wrapper, hash)
     }
 
     private fun record(version: Long, signer: String) = CatalogRecord(
@@ -981,6 +1331,10 @@ private class StartupGateway(
         sessions -= sessionId
     }
     override fun ownedSessions(): List<Int> = sessions.toList()
+    fun replaceOwnedSessions(vararg sessionIds: Int) {
+        sessions.clear()
+        sessions += sessionIds.toList()
+    }
 }
 
 private class StartupPendingStore(

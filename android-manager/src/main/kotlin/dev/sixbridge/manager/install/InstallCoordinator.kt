@@ -35,6 +35,13 @@ class InstallCoordinator(
 
     val state: StateFlow<InstallState> = mutableState.asStateFlow()
 
+    internal suspend fun currentRecoverySnapshot(): InstallRecoverySnapshot = mutex.withLock {
+        InstallRecoverySnapshot(
+            pending = pendingStore.load(),
+            activeBundle = activeBundle,
+        )
+    }
+
     suspend fun request(bundle: ImportedBundle, partialConfirmed: Boolean) = mutex.withLock {
         val existing = pendingStore.load()
         if (activeBundle != null || existing != null) {
@@ -759,3 +766,8 @@ class InstallCoordinator(
         }
     }
 }
+
+internal data class InstallRecoverySnapshot(
+    val pending: PendingInstall?,
+    val activeBundle: ImportedBundle?,
+)
