@@ -5,8 +5,11 @@ import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.catalog.identity
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 internal data class IconProcessEntry(
     val bytes: ByteArray?,
@@ -17,6 +20,7 @@ internal enum class IconPersistenceState {
     NOT_ATTEMPTED,
     STORED,
     FAILED_FOR_PROCESS,
+    STALE_FOR_PROCESS,
 }
 
 internal sealed interface IconPersistenceResult {
@@ -31,31 +35,60 @@ internal class CatalogIconEnricher(
 ) {
     private val resultsMutex = Mutex()
     private val results = mutableMapOf<CatalogIdentity, IconProcessEntry>()
+    private val inFlight = mutableMapOf<CatalogIdentity, CompletableDeferred<ByteArray?>>()
 
     suspend fun load(record: CatalogRecord): ByteArray? {
         record.iconPng?.let { return it }
         val identity = record.identity()
-        val cached = resultsMutex.withLock {
-            if (results.containsKey(identity)) {
-                CachedIcon(results.getValue(identity).bytes)
-            } else {
-                null
+        val request = resultsMutex.withLock {
+            results[identity]?.let { entry ->
+                return@withLock LoadRequest.Cached(entry.bytes)
             }
+            inFlight[identity]?.let { deferred ->
+                return@withLock LoadRequest.Waiting(deferred)
+            }
+            CompletableDeferred<ByteArray?>().also { deferred ->
+                inFlight[identity] = deferred
+            }.let(LoadRequest::Owner)
         }
-        if (cached != null) return cached.bytes
 
-        val loaded = source.load(record.packageName)
-        return resultsMutex.withLock {
-            if (results.containsKey(identity)) {
-                results.getValue(identity).bytes
-            } else {
-                results[identity] = IconProcessEntry(
-                    bytes = loaded,
-                    persistence = IconPersistenceState.NOT_ATTEMPTED,
+        return when (request) {
+            is LoadRequest.Cached -> request.bytes
+            is LoadRequest.Waiting -> request.deferred.await()
+            is LoadRequest.Owner -> loadOwner(identity, record.packageName, request.deferred)
+        }
+    }
+
+    private suspend fun loadOwner(
+        identity: CatalogIdentity,
+        packageName: String,
+        ownDeferred: CompletableDeferred<ByteArray?>,
+    ): ByteArray? = try {
+        val loaded = source.load(packageName)
+        resultsMutex.withLock {
+            if (inFlight[identity] === ownDeferred) {
+                results.putIfAbsent(
+                    identity,
+                    IconProcessEntry(
+                        bytes = loaded,
+                        persistence = IconPersistenceState.NOT_ATTEMPTED,
+                    ),
                 )
-                loaded
+                inFlight.remove(identity)
+            }
+            ownDeferred.complete(loaded)
+        }
+        loaded
+    } catch (error: Throwable) {
+        withContext(NonCancellable) {
+            resultsMutex.withLock {
+                if (inFlight[identity] === ownDeferred) {
+                    inFlight.remove(identity)
+                }
+                ownDeferred.completeExceptionally(error)
             }
         }
+        throw error
     }
 
     suspend fun persist(
@@ -75,6 +108,8 @@ internal class CatalogIconEnricher(
 
             IconPersistenceState.FAILED_FOR_PROCESS -> IconPersistenceResult.WriteFailed
 
+            IconPersistenceState.STALE_FOR_PROCESS -> IconPersistenceResult.IdentityMismatch
+
             IconPersistenceState.NOT_ATTEMPTED -> try {
                 catalog.persistIconIfIdentity(identity, iconPng)
                     ?.also {
@@ -83,7 +118,12 @@ internal class CatalogIconEnricher(
                         )
                     }
                     ?.let(IconPersistenceResult::Stored)
-                    ?: IconPersistenceResult.IdentityMismatch
+                    ?: run {
+                        results[identity] = entry.copy(
+                            persistence = IconPersistenceState.STALE_FOR_PROCESS,
+                        )
+                        IconPersistenceResult.IdentityMismatch
+                    }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -96,14 +136,22 @@ internal class CatalogIconEnricher(
     }
 
     suspend fun mergeCached(record: CatalogRecord): CatalogRecord = resultsMutex.withLock {
-        results[record.identity()]?.bytes?.let { bytes ->
-            record.copy(iconPng = bytes)
-        } ?: record
+        results[record.identity()]
+            ?.takeIf { it.persistence != IconPersistenceState.STALE_FOR_PROCESS }
+            ?.bytes
+            ?.let { bytes ->
+                record.copy(iconPng = bytes)
+            } ?: record
     }
 
     suspend fun retainOnly(identities: Set<CatalogIdentity>) = resultsMutex.withLock {
         results.keys.retainAll(identities)
+        inFlight.keys.retainAll(identities)
     }
 
-    private data class CachedIcon(val bytes: ByteArray?)
+    private sealed interface LoadRequest {
+        data class Cached(val bytes: ByteArray?) : LoadRequest
+        data class Waiting(val deferred: CompletableDeferred<ByteArray?>) : LoadRequest
+        data class Owner(val deferred: CompletableDeferred<ByteArray?>) : LoadRequest
+    }
 }

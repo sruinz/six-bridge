@@ -9,6 +9,8 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
@@ -59,6 +61,61 @@ class CatalogIconEnricherTest {
         assertNull(second)
         assertEquals(listOf(PACKAGE), source.packages)
         assertEquals(emptyList(), catalog.persistAttempts)
+    }
+
+    @Test
+    fun `동시 cache miss는 같은 provider load 한 번을 공유한다`() = runTest {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<ByteArray?>()
+        val source = RecordingIconSource {
+            started.complete(Unit)
+            release.await()
+        }
+        val enricher = CatalogIconEnricher(RecordingCatalog(), source)
+        val record = record()
+
+        val first = async { enricher.load(record) }
+        started.await()
+        val second = async { enricher.load(record) }
+        testScheduler.runCurrent()
+
+        assertEquals(listOf(PACKAGE), source.packages)
+        release.complete(PNG)
+        assertContentEquals(PNG, first.await())
+        assertContentEquals(PNG, second.await())
+    }
+
+    @Test
+    fun `retainOnly 뒤 늦은 load 결과는 cache를 되살리지 않는다`() = runTest {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<ByteArray?>()
+        val source = RecordingIconSource {
+            started.complete(Unit)
+            release.await()
+        }
+        val enricher = CatalogIconEnricher(RecordingCatalog(), source)
+        val record = record()
+
+        val loading = async { enricher.load(record) }
+        started.await()
+        enricher.retainOnly(emptySet())
+        release.complete(PNG)
+
+        assertContentEquals(PNG, loading.await())
+        assertNull(enricher.mergeCached(record).iconPng)
+    }
+
+    @Test
+    fun `identity mismatch는 stale 상태로 한 번만 저장하고 UI에 병합하지 않는다`() = runTest {
+        val catalog = RecordingCatalog(persistReturnsNull = true)
+        val enricher = CatalogIconEnricher(catalog, RecordingIconSource { PNG })
+        val record = record()
+        val bytes = requireNotNull(enricher.load(record))
+
+        assertEquals(IconPersistenceResult.IdentityMismatch, enricher.persist(record, bytes))
+        assertEquals(IconPersistenceResult.IdentityMismatch, enricher.persist(record, bytes))
+        assertNull(enricher.mergeCached(record).iconPng)
+        assertEquals(1, catalog.persistAttempts.size)
     }
 
     @Test
@@ -218,7 +275,7 @@ class CatalogIconEnricherTest {
     )
 
     private class RecordingIconSource(
-        private val loadResult: RecordingIconSource.() -> ByteArray?,
+        private val loadResult: suspend RecordingIconSource.() -> ByteArray?,
     ) : InstalledExtensionIconSource {
         val packages = mutableListOf<String>()
 
@@ -230,6 +287,7 @@ class CatalogIconEnricherTest {
 
     private class RecordingCatalog(
         private val persistFailure: Exception? = null,
+        private val persistReturnsNull: Boolean = false,
     ) : ManagerCatalog {
         val persistAttempts = mutableListOf<CatalogIdentity>()
         val persisted = mutableListOf<CatalogIdentity>()
@@ -243,9 +301,10 @@ class CatalogIconEnricherTest {
         override suspend fun persistIconIfIdentity(
             identity: CatalogIdentity,
             iconPng: ByteArray,
-        ): CatalogRecord {
+        ): CatalogRecord? {
             persistAttempts += identity
             persistFailure?.let { throw it }
+            if (persistReturnsNull) return null
             return CatalogRecord(
                 packageName = identity.packageName,
                 extensionId = identity.extensionId,
