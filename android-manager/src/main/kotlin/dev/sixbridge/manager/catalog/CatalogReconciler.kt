@@ -28,6 +28,7 @@ class CatalogReconciler {
                 existing?.copy(
                     extensionId = installed.extensionId,
                     name = installed.name,
+                    iconPng = existing.iconPng.takeUnless { identityChanged },
                     installedVersionCode = installed.versionCode,
                     signerSha256 = installed.signerSha256,
                     compatibilityStatus = if (identityChanged) {

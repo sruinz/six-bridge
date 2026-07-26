@@ -12,6 +12,7 @@ import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -405,17 +406,20 @@ internal class CatalogPublisher(
     private val catalog: ManagerCatalog,
     private val installedWrappers: InstalledWrapperRepository,
     private val reconciler: CatalogReconciler,
+    private val iconEnricher: CatalogIconEnricher,
 ) {
     private val mutex = Mutex()
     private val mutableState = MutableStateFlow<List<CatalogRecord>>(emptyList())
     val state: StateFlow<List<CatalogRecord>> = mutableState.asStateFlow()
 
     suspend fun reconcile() = mutex.withLock {
-        mutableState.value = reconciler.reconcile(catalog, installedWrappers).records
+        val reconciled = reconciler.reconcile(catalog, installedWrappers).records
+        mutableState.value = iconEnricher.enrich(reconciled)
     }
 
     suspend fun publish(records: List<CatalogRecord>) = mutex.withLock {
-        mutableState.value = reconciler.reconcile(records, installedWrappers.findAll()).records
+        val reconciled = reconciler.reconcile(records, installedWrappers.findAll()).records
+        mutableState.value = iconEnricher.enrich(reconciled)
     }
 }
 

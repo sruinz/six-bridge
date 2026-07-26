@@ -11,6 +11,8 @@ import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.icon.CatalogIconEnricher
+import dev.sixbridge.manager.icon.InstalledExtensionIconSource
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -54,6 +56,7 @@ import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -439,7 +442,7 @@ class ManagerRepositoryTest {
                 ),
             )
             val catalog = FakeCatalog(emptyList())
-            val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+            val publisher = catalogPublisher(catalog, installed)
             val coordinator = InstallCoordinator(
                 InstallPolicy(),
                 gateway,
@@ -497,7 +500,7 @@ class ManagerRepositoryTest {
             val gateway = StartupGateway(listOf(41))
             val installed = FakeInstalledWrappers(emptyList())
             val catalog = FakeCatalog(emptyList())
-            val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+            val publisher = catalogPublisher(catalog, installed)
             val coordinator = InstallCoordinator(
                 InstallPolicy(),
                 gateway,
@@ -581,7 +584,7 @@ class ManagerRepositoryTest {
                 ),
                 coordinator,
                 pendingStore,
-                CatalogPublisher(catalog, installed, CatalogReconciler()),
+                catalogPublisher(catalog, installed),
                 Dispatchers.Unconfined,
             )
 
@@ -933,7 +936,7 @@ class ManagerRepositoryTest {
                 ),
             )
             val catalog = FakeCatalog(emptyList())
-            val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+            val publisher = catalogPublisher(catalog, installed)
             val coordinator = InstallCoordinator(
                 InstallPolicy(),
                 gateway,
@@ -1011,7 +1014,7 @@ class ManagerRepositoryTest {
                 }
                 val installed = FakeInstalledWrappers(emptyList())
                 val catalog = FakeCatalog(emptyList())
-                val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+                val publisher = catalogPublisher(catalog, installed)
                 val coordinator = InstallCoordinator(
                     InstallPolicy(),
                     gateway,
@@ -1184,7 +1187,7 @@ class ManagerRepositoryTest {
                     clock = { 2 },
                     retainedWrapperSha256 = { sha256(it) },
                 )
-                val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+                val publisher = catalogPublisher(catalog, installed)
                 val repository = DefaultManagerRepository(
                     importer = BundleImportService(
                         BundleSource { error("직접 import하지 않습니다.") },
@@ -1256,7 +1259,7 @@ class ManagerRepositoryTest {
             val installed = FakeInstalledWrappers(
                 listOf(installed(version = 2, signer = "new")),
             )
-            val publisher = CatalogPublisher(catalog, installed, CatalogReconciler())
+            val publisher = catalogPublisher(catalog, installed)
 
             publisher.reconcile()
 
@@ -1279,6 +1282,38 @@ class ManagerRepositoryTest {
             assertEquals(SECOND_PACKAGE, actualOnly.packageName)
             assertEquals("UNKNOWN", actualOnly.compatibilityStatus)
         }
+
+    @Test
+    fun `catalog publisher reconcile 경로는 설치 record icon을 보강한다`() = runBlocking {
+        val catalog = FakeCatalog(listOf(record(version = 1, signer = "same")))
+        val installed = FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+        val publisher = catalogPublisher(
+            catalog,
+            installed,
+            InstalledExtensionIconSource { PUBLISHER_PNG },
+        )
+
+        publisher.reconcile()
+
+        assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+        assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
+    }
+
+    @Test
+    fun `catalog publisher publish 경로는 전달 record icon을 보강한다`() = runBlocking {
+        val catalog = FakeCatalog(emptyList())
+        val installed = FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+        val publisher = catalogPublisher(
+            catalog,
+            installed,
+            InstalledExtensionIconSource { PUBLISHER_PNG },
+        )
+
+        publisher.publish(listOf(record(version = 1, signer = "same")))
+
+        assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+        assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
+    }
 
     private fun managerRepository(
         root: File,
@@ -1314,10 +1349,21 @@ class ManagerRepositoryTest {
             override fun addOnsIntent() = error("Add-ons를 열지 않습니다.")
             override fun availability() = SamsungBrowserAvailability.SamsungBrowserMissing
         },
-        catalogPublisher = CatalogPublisher(catalog, installed, CatalogReconciler()),
+        catalogPublisher = catalogPublisher(catalog, installed),
         installEvents = emptyFlow(),
         ioDispatcher = Dispatchers.Unconfined,
         afterInstallRequest = afterInstallRequest,
+    )
+
+    private fun catalogPublisher(
+        catalog: ManagerCatalog,
+        installed: InstalledWrapperRepository,
+        source: InstalledExtensionIconSource = InstalledExtensionIconSource { null },
+    ) = CatalogPublisher(
+        catalog = catalog,
+        installedWrappers = installed,
+        reconciler = CatalogReconciler(),
+        iconEnricher = CatalogIconEnricher(catalog, source),
     )
 
     private fun importedBundle(root: File, token: String = TOKEN): ImportedBundle {
@@ -1409,6 +1455,7 @@ class ManagerRepositoryTest {
         val SECOND_EXTENSION_ID = "b".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
         val SECOND_PACKAGE = "dev.sixbridge.ext.$SECOND_EXTENSION_ID"
+        val PUBLISHER_PNG = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47)
     }
 }
 

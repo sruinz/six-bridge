@@ -6,6 +6,8 @@ import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.catalog.RoomManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.icon.CatalogIconEnricher
+import dev.sixbridge.manager.icon.ContentProviderInstalledExtensionIconSource
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.ContentResolverBundleSource
 import dev.sixbridge.manager.install.AndroidPackageInstallGateway
@@ -62,10 +64,16 @@ class ManagerDependencies private constructor(
                 cacheDirectory = application.cacheDir,
             )
             val uninstall = DefaultUninstallCoordinator(installedWrappers, catalog)
+            val iconSource = ContentProviderInstalledExtensionIconSource(
+                application.contentResolver,
+                File(application.cacheDir, "extension-icons"),
+            )
+            val iconEnricher = CatalogIconEnricher(catalog, iconSource)
             val catalogPublisher = CatalogPublisher(
                 catalog = catalog,
                 installedWrappers = installedWrappers,
                 reconciler = CatalogReconciler(),
+                iconEnricher = iconEnricher,
             )
             val repository = DefaultManagerRepository(
                 importer = importer,

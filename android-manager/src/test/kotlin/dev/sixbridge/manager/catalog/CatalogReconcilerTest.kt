@@ -40,6 +40,7 @@ class CatalogReconcilerTest {
             listOf(
                 matching.copy(
                     name = "matching name",
+                    iconPng = null,
                     installedVersionCode = 2,
                     signerSha256 = "c".repeat(64),
                     compatibilityStatus = "UNKNOWN",
@@ -59,6 +60,7 @@ class CatalogReconcilerTest {
                 ),
                 changed.copy(
                     name = "changed name",
+                    iconPng = null,
                     installedVersionCode = 5,
                     signerSha256 = "e".repeat(64),
                     compatibilityStatus = "UNKNOWN",
@@ -69,6 +71,53 @@ class CatalogReconcilerTest {
             result.records,
         )
         assertNull(result.records.single { it.packageName == "dev.sixbridge.ext.external" }.reportJson)
+    }
+
+    @Test
+    fun `extension ID versionCode signer 중 하나가 바뀌면 기존 icon을 무효화한다`() {
+        val extensionChangedPackage = "dev.sixbridge.ext.extension-changed"
+        val versionChangedPackage = "dev.sixbridge.ext.version-changed"
+        val signerChangedPackage = "dev.sixbridge.ext.signer-changed"
+        val catalogRecords = listOf(
+            catalogRecord(
+                packageName = extensionChangedPackage,
+                extensionId = "old-extension-id",
+            ),
+            catalogRecord(
+                packageName = versionChangedPackage,
+                installedVersionCode = 1,
+            ),
+            catalogRecord(
+                packageName = signerChangedPackage,
+                signerSha256 = "a".repeat(64),
+            ),
+        )
+
+        val result = CatalogReconciler().reconcile(
+            catalogRecords = catalogRecords,
+            installedWrappers = listOf(
+                installedWrapper(
+                    packageName = extensionChangedPackage,
+                    extensionId = "new-extension-id",
+                    versionCode = 1,
+                    signerSha256 = "a".repeat(64),
+                ),
+                installedWrapper(
+                    packageName = versionChangedPackage,
+                    versionCode = 2,
+                    signerSha256 = "a".repeat(64),
+                ),
+                installedWrapper(
+                    packageName = signerChangedPackage,
+                    versionCode = 1,
+                    signerSha256 = "b".repeat(64),
+                ),
+            ),
+        )
+
+        result.records.forEach { record ->
+            assertNull(record.iconPng, "${record.packageName} icon은 무효화되어야 합니다.")
+        }
     }
 
     @Test
@@ -123,11 +172,12 @@ class CatalogReconcilerTest {
 
     private fun installedWrapper(
         packageName: String,
+        extensionId: String = packageName.substringAfterLast('.'),
         versionCode: Long,
         signerSha256: String,
     ) = InstalledWrapper(
         packageName = packageName,
-        extensionId = packageName.substringAfterLast('.'),
+        extensionId = extensionId,
         name = "${packageName.substringAfterLast('.')} name",
         versionCode = versionCode,
         signerSha256 = signerSha256,
