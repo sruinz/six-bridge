@@ -20,16 +20,18 @@ abstract class ConversionJobDao {
         val currentGeneration = current?.generation ?: 0L
         check(currentGeneration < Long.MAX_VALUE) { "작업 generation이 범위를 초과했습니다." }
         val inheritedCleanup = buildSet {
-            decodeCleanupTokens(candidate.cleanupTokensJson)?.let(::addAll)
+            decodeCleanupTokens(candidate.cleanupTokensJson)
+                ?.filter(::isCanonicalConversionToken)
+                ?.let(::addAll)
                 ?: throw IllegalArgumentException("cleanup token 목록이 올바르지 않습니다.")
             current?.let { row ->
                 require(row.singletonId == ConversionJobEntity.SINGLETON_ID) {
                     "singleton 작업 행이 올바르지 않습니다."
                 }
-                requireNotNull(decodeCleanupTokens(row.cleanupTokensJson)) {
-                    "저장된 cleanup token 목록이 올바르지 않습니다."
-                }.let(::addAll)
-                add(row.token)
+                decodeCleanupTokens(row.cleanupTokensJson)
+                    ?.filter(::isCanonicalConversionToken)
+                    ?.let(::addAll)
+                if (isCanonicalConversionToken(row.token)) add(row.token)
             }
             remove(candidate.token)
         }
@@ -98,3 +100,6 @@ abstract class ConversionJobDao {
     )
     abstract suspend fun delete(token: String, expectedGeneration: Long): Int
 }
+
+private fun isCanonicalConversionToken(value: String): Boolean =
+    runCatching { java.util.UUID.fromString(value).toString() == value }.getOrDefault(false)

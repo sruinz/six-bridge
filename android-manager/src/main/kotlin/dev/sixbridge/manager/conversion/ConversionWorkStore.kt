@@ -52,6 +52,7 @@ internal data class ConversionWorkStoreHooks(
     val afterBundleTransition: () -> Unit = {},
     val afterInputSnapshot: () -> Unit = {},
     val afterInputCopied: () -> Unit = {},
+    val afterCopyChunk: (File) -> Unit = {},
     val afterBundleVerified: () -> Unit = {},
 )
 
@@ -107,17 +108,18 @@ class ConversionWorkStore internal constructor(
                 throw IllegalStateException("private 작업 directory를 만들 수 없습니다.")
             }
             val inputFile = directChild(tokenDirectory, inputFileName)
-            val copiedInputState = copyStableNew(
+            copyStableNew(
                 source = artifact.privateFile,
                 destination = inputFile,
                 expectedSha256 = artifact.sha256,
                 label = "Task 6 입력",
             )
             hooks.afterInputCopied()
+            val verifiedInputState = verifyFileHash(inputFile, artifact.sha256)
             require(inputFile.setReadOnly()) {
                 "private 입력을 불변 상태로 고정할 수 없습니다."
             }
-            requireStableFile(inputFile, copiedInputState, "입력 고정")
+            requireStableFile(inputFile, verifiedInputState, "입력 고정")
             val current = dao.get()
             check(current?.token == token && current.generation == claimed.generation) {
                 "활성 작업이 바뀌었습니다."
@@ -220,6 +222,7 @@ class ConversionWorkStore internal constructor(
         withContext(Dispatchers.IO) {
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext null
             var row = dao.get() ?: return@withContext null
+            row = reconcileCleanupTokens(root, row) ?: return@withContext null
             if (isInvalidTimestamp(row.updatedAtEpochMillis)) {
                 discardInvalid(root, row)
                 return@withContext null
@@ -273,8 +276,9 @@ class ConversionWorkStore internal constructor(
             val row = dao.get()
             if (row?.token != token) return@withContext false
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext false
-            if (!deleteOwnedTokenDirectories(root, row)) return@withContext false
-            dao.delete(token, row.generation) == 1
+            val reconciled = reconcileCleanupTokens(root, row) ?: return@withContext false
+            if (!deleteOwnedTokenDirectories(root, reconciled)) return@withContext false
+            dao.delete(token, reconciled.generation) == 1
         }
     }
 
@@ -499,14 +503,17 @@ class ConversionWorkStore internal constructor(
         return DirectFileState(fileKey, attributes.size(), attributes.lastModifiedTime().toMillis())
     }
 
-    private fun verifyFileHash(file: File, expectedSha256: String) {
+    private fun verifyFileHash(
+        file: File,
+        expectedSha256: String,
+    ): DirectFileState =
         withStableFile(file) { channel, state ->
             require(hashChannel(channel) == expectedSha256) {
                 "private 파일 hash가 일치하지 않습니다."
             }
             requireStableFile(file, state, "hash 검증")
+            state
         }
-    }
 
     private fun verifyBundleFile(file: File, expectedSha256: String) {
         withStableFile(file) { channel, state ->
@@ -653,6 +660,7 @@ class ConversionWorkStore internal constructor(
                             "$label private 복사가 진행되지 않습니다."
                         }
                     }
+                    hooks.afterCopyChunk(destination)
                     buffer.clear()
                 }
                 output.force(true)
@@ -702,6 +710,31 @@ class ConversionWorkStore internal constructor(
             if (changed != 1) return null
             row = dao.get() ?: return null
         }
+    }
+
+    private suspend fun reconcileCleanupTokens(
+        root: File,
+        row: ConversionJobEntity,
+    ): ConversionJobEntity? {
+        val decoded = decodeCleanupTokens(row.cleanupTokensJson)
+        val canonical = if (decoded == null) {
+            val children = listFiles(root) ?: return null
+            children.map(File::getName)
+                .filter(::isCanonicalUuid)
+                .filterTo(sortedSetOf()) { it != row.token }
+        } else {
+            decoded.filterTo(sortedSetOf()) {
+                isCanonicalUuid(it) && it != row.token
+            }
+        }
+        if (decoded != null && decoded == canonical) return row
+        val changed = dao.updateCleanupTokens(
+            token = row.token,
+            expectedGeneration = row.generation,
+            cleanupTokensJson = encodeCleanupTokens(canonical),
+            updatedAtEpochMillis = row.updatedAtEpochMillis,
+        )
+        return if (changed == 1) dao.get() else null
     }
 
     private suspend fun discardInvalid(root: File, row: ConversionJobEntity) {

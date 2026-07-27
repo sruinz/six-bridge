@@ -5,10 +5,14 @@ import androidx.room.testing.MigrationTestHelper
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionIdentityEntity
 import dev.sixbridge.manager.conversion.ConversionJobEntity
 import dev.sixbridge.manager.conversion.ConversionJobStage
+import dev.sixbridge.manager.conversion.ConversionWorkStore
 import dev.sixbridge.manager.conversion.encodeCleanupTokens
+import java.io.File
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executor
@@ -22,6 +26,7 @@ import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -587,6 +592,131 @@ class ManagerDatabaseTest {
     }
 
     @Test
+    fun migration_2_to_3_first_restore_preserves_input_for_every_old_job_stage() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val now = System.currentTimeMillis()
+        val inputBytes = "old v2 private input".encodeToByteArray()
+        val inputSha256 = sha256(inputBytes)
+        val fixtures = listOf(
+            OldJobFixture(
+                stage = ConversionJobStage.INPUT_READY,
+                approvedAdapterIdsJson = null,
+                profileSha256 = null,
+                bundleFileName = null,
+                expectedRestoredStage = ConversionJobStage.INPUT_READY,
+            ),
+            OldJobFixture(
+                stage = ConversionJobStage.AWAITING_APPROVAL,
+                approvedAdapterIdsJson = null,
+                profileSha256 = "4".repeat(64),
+                bundleFileName = null,
+                expectedRestoredStage = ConversionJobStage.AWAITING_APPROVAL,
+            ),
+            OldJobFixture(
+                stage = ConversionJobStage.BUILDING,
+                approvedAdapterIdsJson = "[]",
+                profileSha256 = "4".repeat(64),
+                bundleFileName = null,
+                expectedRestoredStage = ConversionJobStage.INPUT_READY,
+            ),
+            OldJobFixture(
+                stage = ConversionJobStage.BUNDLE_READY,
+                approvedAdapterIdsJson = "[]",
+                profileSha256 = "4".repeat(64),
+                bundleFileName = "00000000-0000-0000-0000-000000000020.six",
+                expectedRestoredStage = ConversionJobStage.INPUT_READY,
+            ),
+        )
+
+        fixtures.forEachIndexed { index, fixture ->
+            val databaseName = "manager-migration-stage-$index.db"
+            val workRoot = File(context.cacheDir, "manager-migration-stage-$index").apply {
+                deleteRecursively()
+                check(mkdir())
+            }
+            val token = "00000000-0000-0000-0000-00000000000${index + 1}"
+            val inputFileName = "00000000-0000-0000-0000-000000000010.input"
+            val tokenDirectory = File(workRoot, token).apply { check(mkdir()) }
+            val inputFile = File(tokenDirectory, inputFileName).apply {
+                writeBytes(inputBytes)
+            }
+            fixture.bundleFileName?.let { name ->
+                File(tokenDirectory, name).writeText("old v2 completed bundle")
+            }
+            context.deleteDatabase(databaseName)
+            migrationHelper.createDatabase(databaseName, 2).apply {
+                execSQL(
+                    """
+                    INSERT INTO conversion_job (
+                        singletonId, token, inputKind, inputSha256, inputFileName, stage,
+                        approvedAdapterIdsJson, profileSha256, bundleFileName,
+                        updatedAtEpochMillis
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                    arrayOf<Any?>(
+                        1,
+                        token,
+                        "ZIP",
+                        inputSha256,
+                        inputFileName,
+                        fixture.stage.name,
+                        fixture.approvedAdapterIdsJson,
+                        fixture.profileSha256,
+                        fixture.bundleFileName,
+                        if (fixture.stage == ConversionJobStage.BUNDLE_READY) 1L else now,
+                    ),
+                )
+                close()
+            }
+            migrationHelper.runMigrationsAndValidate(
+                databaseName,
+                3,
+                true,
+                ManagerDatabase.MIGRATION_2_3,
+            ).close()
+            val migratedDatabase = Room.databaseBuilder(
+                context,
+                ManagerDatabase::class.java,
+                databaseName,
+            ).addMigrations(ManagerDatabase.MIGRATION_2_3)
+                .allowMainThreadQueries()
+                .build()
+            try {
+                val restored = ConversionWorkStore(
+                    privateRoot = workRoot,
+                    dao = migratedDatabase.conversionJobDao(),
+                    bundleVerifier = ConversionBundleVerifier { input ->
+                        input.readBytes()
+                        true
+                    },
+                    clock = { now },
+                ).restore()
+
+                assertNotNull("old ${fixture.stage} restore", restored)
+                assertEquals(fixture.expectedRestoredStage, requireNotNull(restored).stage)
+                assertTrue(inputFile.isFile)
+                assertArrayEquals(inputBytes, inputFile.readBytes())
+                val row = requireNotNull(migratedDatabase.conversionJobDao().get())
+                assertNull(row.bundleFileName)
+                assertNull(row.bundleSha256)
+                if (fixture.expectedRestoredStage == ConversionJobStage.INPUT_READY) {
+                    assertNull(row.approvedAdapterIdsJson)
+                    assertNull(row.profileSha256)
+                } else {
+                    assertEquals("4".repeat(64), row.profileSha256)
+                }
+                fixture.bundleFileName?.let { name ->
+                    assertFalse(File(tokenDirectory, name).exists())
+                }
+            } finally {
+                migratedDatabase.close()
+                workRoot.deleteRecursively()
+                context.deleteDatabase(databaseName)
+            }
+        }
+    }
+
+    @Test
     fun migration_2_to_3_fails_closed_when_old_bindings_collide() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         context.deleteDatabase(MIGRATION_V2_COLLISION_DATABASE)
@@ -678,6 +808,19 @@ class ManagerDatabaseTest {
         bundleSha256 = null,
         cleanupTokensJson = encodeCleanupTokens(emptySet()),
         updatedAtEpochMillis = 1,
+    )
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private data class OldJobFixture(
+        val stage: ConversionJobStage,
+        val approvedAdapterIdsJson: String?,
+        val profileSha256: String?,
+        val bundleFileName: String?,
+        val expectedRestoredStage: ConversionJobStage,
     )
 
     private companion object {

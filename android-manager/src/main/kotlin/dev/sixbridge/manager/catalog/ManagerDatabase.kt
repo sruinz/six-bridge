@@ -127,9 +127,22 @@ abstract class ManagerDatabase : RoomDatabase() {
                     )
                     SELECT
                         `singletonId`, `token`, 1, `inputKind`,
-                        `inputSha256`, `inputFileName`, `stage`,
+                        `inputSha256`, `inputFileName`,
+                        CASE
+                            WHEN `stage` = 'BUNDLE_READY' THEN 'BUILDING'
+                            ELSE `stage`
+                        END,
                         `approvedAdapterIdsJson`, `profileSha256`,
-                        `bundleFileName`, NULL, '[]', `updatedAtEpochMillis`
+                        CASE
+                            WHEN `stage` = 'BUNDLE_READY' THEN NULL
+                            ELSE `bundleFileName`
+                        END,
+                        NULL, '[]',
+                        CASE
+                            WHEN `stage` = 'BUNDLE_READY'
+                                THEN CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                            ELSE `updatedAtEpochMillis`
+                        END
                     FROM `conversion_job`
                     """.trimIndent(),
                 )

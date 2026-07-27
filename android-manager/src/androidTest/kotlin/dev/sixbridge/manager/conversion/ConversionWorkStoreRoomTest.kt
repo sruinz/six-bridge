@@ -14,6 +14,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -106,6 +107,33 @@ class ConversionWorkStoreRoomTest {
         assertEquals(listOf(false, true), discards.sorted())
         assertEquals(null, database.conversionJobDao().get())
         assertTrue(workRoot.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun room_claim_recovers_malformed_previous_ledger_from_root_owners() = runBlocking {
+        val first = store(
+            token = "00000000-0000-0000-0000-000000000001",
+            file = "00000000-0000-0000-0000-000000000011",
+        ).create(artifact("first".encodeToByteArray()))
+        database.openHelper.writableDatabase.execSQL(
+            """
+            UPDATE conversion_job
+            SET token = ?, cleanupTokensJson = ?
+            WHERE singletonId = 1
+            """.trimIndent(),
+            arrayOf("not-a-canonical-token", "{broken"),
+        )
+
+        val second = store(
+            token = "00000000-0000-0000-0000-000000000002",
+            file = "00000000-0000-0000-0000-000000000012",
+        ).create(artifact("second".encodeToByteArray()))
+
+        val active = requireNotNull(database.conversionJobDao().get())
+        assertEquals(second.token, active.token)
+        assertTrue(requireNotNull(decodeCleanupTokens(active.cleanupTokensJson)).isEmpty())
+        assertFalse(File(workRoot, first.token).exists())
+        assertEquals(listOf(second.token), workRoot.listFiles().orEmpty().map(File::getName))
     }
 
     private fun store(

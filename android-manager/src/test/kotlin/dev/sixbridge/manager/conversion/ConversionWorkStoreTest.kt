@@ -122,6 +122,65 @@ class ConversionWorkStoreTest {
     }
 
     @Test
+    fun `입력 복사 뒤 same inode same size 변조는 create 반환 전에 막는다`() = runTest {
+        val expected = "verified input content".encodeToByteArray()
+        val attacker = "attacker input content".encodeToByteArray()
+        assertEquals(expected.size, attacker.size)
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                afterInputCopied = {
+                    val copied = requireNotNull(
+                        root.walkTopDown().firstOrNull { it.name.endsWith(".input") },
+                    )
+                    val modifiedAt = Files.getLastModifiedTime(copied.toPath())
+                    FileChannel.open(copied.toPath(), WRITE).use { channel ->
+                        val bytes = ByteBuffer.wrap(attacker)
+                        while (bytes.hasRemaining()) channel.write(bytes)
+                        channel.force(true)
+                    }
+                    Files.setLastModifiedTime(copied.toPath(), modifiedAt)
+                },
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            store.create(artifact(expected))
+        }
+
+        assertEquals(attacker.decodeToString(), privateInput(requireNotNull(dao.get())).readText())
+    }
+
+    @Test
+    fun `입력 streaming 복사 중 same inode 앞부분 변조는 create 반환 전에 막는다`() =
+        runTest {
+            val expected = ByteArray(192 * 1024) { index -> (index % 251).toByte() }
+            var mutated = false
+            val store = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterCopyChunk = { destination ->
+                        if (!mutated && destination.name.endsWith(".input")) {
+                            val modifiedAt = Files.getLastModifiedTime(destination.toPath())
+                            FileChannel.open(destination.toPath(), WRITE).use { attacker ->
+                                val bytes = ByteBuffer.wrap(ByteArray(4096) { 0x5a })
+                                while (bytes.hasRemaining()) attacker.write(bytes)
+                                attacker.force(true)
+                            }
+                            Files.setLastModifiedTime(destination.toPath(), modifiedAt)
+                            mutated = true
+                        }
+                    },
+                ),
+            )
+
+            assertFailsWith<IllegalArgumentException> {
+                store.create(artifact(expected))
+            }
+
+            assertTrue(mutated)
+            assertFalse(privateInput(requireNotNull(dao.get())).readBytes().contentEquals(expected))
+        }
+
+    @Test
     fun `승인 profile과 다른 profile로 BUILDING 전환하지 않고 기존 승인을 보존한다`() =
         runTest {
             val store = store()
@@ -207,6 +266,98 @@ class ConversionWorkStoreTest {
         assertNull(dao.get())
         assertFalse(ownedDirectory.exists())
     }
+
+    @Test
+    fun `decode 가능한 noncanonical cleanup 항목은 격리하고 canonical owner를 계속 정리한다`() =
+        runTest {
+            val store = store()
+            val created = store.create(artifact("active".encodeToByteArray()))
+            val ownedToken = "00000000-0000-0000-0000-000000000099"
+            val ownedDirectory = File(root, ownedToken).apply {
+                check(mkdir())
+                File(this, "owned").writeText("owned")
+            }
+            val corrupted = requireNotNull(dao.get()).copy(
+                cleanupTokensJson = encodeCleanupTokens(
+                    listOf("not-a-canonical-token", ownedToken),
+                ),
+            )
+            dao.force(corrupted)
+
+            val restored = requireNotNull(store.restore())
+
+            assertEquals(created.token, restored.token)
+            assertFalse(ownedDirectory.exists())
+            assertTrue(
+                requireNotNull(
+                    decodeCleanupTokens(requireNotNull(dao.get()).cleanupTokensJson),
+                ).isEmpty(),
+            )
+        }
+
+    @Test
+    fun `malformed cleanup JSON은 root canonical owner로 복구하고 active 작업을 유지한다`() =
+        runTest {
+            val store = store()
+            val created = store.create(artifact("active".encodeToByteArray()))
+            val orphanToken = "00000000-0000-0000-0000-000000000098"
+            val orphan = File(root, orphanToken).apply {
+                check(mkdir())
+                File(this, "owned").writeText("owned")
+            }
+            dao.force(requireNotNull(dao.get()).copy(cleanupTokensJson = "{broken"))
+
+            val restored = requireNotNull(store.restore())
+
+            assertEquals(created.token, restored.token)
+            assertFalse(orphan.exists())
+            assertTrue(
+                requireNotNull(
+                    decodeCleanupTokens(requireNotNull(dao.get()).cleanupTokensJson),
+                ).isEmpty(),
+            )
+        }
+
+    @Test
+    fun `malformed cleanup 정규화는 만료 시각을 갱신해 작업을 되살리지 않는다`() = runTest {
+        val store = store()
+        val created = store.create(artifact("expired".encodeToByteArray()))
+        dao.force(
+            requireNotNull(dao.get()).copy(
+                cleanupTokensJson = "{broken",
+                updatedAtEpochMillis = now - ConversionWorkStore.INCOMPLETE_RETENTION_MILLIS,
+            ),
+        )
+
+        assertNull(store.restore())
+
+        assertNull(dao.get())
+        assertFalse(File(root, created.token).exists())
+    }
+
+    @Test
+    fun `malformed 이전 행 뒤 반복 create는 root owner를 인계하고 invalid token을 전파하지 않는다`() =
+        runTest {
+            val firstStore = store()
+            val first = firstStore.create(artifact("first".encodeToByteArray()))
+            dao.force(
+                requireNotNull(dao.get()).copy(
+                    token = "not-a-canonical-token",
+                    cleanupTokensJson = "{broken",
+                ),
+            )
+
+            val second = store().create(artifact("second".encodeToByteArray()))
+            val secondRow = requireNotNull(dao.get())
+            assertEquals(second.token, secondRow.token)
+            assertTrue(requireNotNull(decodeCleanupTokens(secondRow.cleanupTokensJson)).isEmpty())
+            assertFalse(File(root, first.token).exists())
+            assertEquals(listOf(second.token), root.listFiles().orEmpty().map(File::getName))
+
+            val third = store().create(artifact("third".encodeToByteArray()))
+            assertEquals(third.token, requireNotNull(firstStore.restore()).token)
+            assertEquals(listOf(third.token), root.listFiles().orEmpty().map(File::getName))
+        }
 
     @Test
     fun `root directory 열거 실패는 새 DB claim 전에 중단한다`() = runTest {
@@ -682,10 +833,15 @@ class ConversionWorkStoreTest {
             synchronized(this) {
                 val previous = row
                 val cleanup = buildSet {
-                    addAll(requireNotNull(decodeCleanupTokens(candidate.cleanupTokensJson)))
+                    addAll(
+                        requireNotNull(decodeCleanupTokens(candidate.cleanupTokensJson))
+                            .filter(::isUuid),
+                    )
                     previous?.let {
-                        addAll(requireNotNull(decodeCleanupTokens(it.cleanupTokensJson)))
-                        add(it.token)
+                        decodeCleanupTokens(it.cleanupTokensJson)
+                            ?.filter(::isUuid)
+                            ?.let(::addAll)
+                        if (isUuid(it.token)) add(it.token)
                     }
                     remove(candidate.token)
                 }
