@@ -15,7 +15,7 @@ import dev.sixbridge.manager.conversion.ConversionJobEntity
         ConversionIdentityEntity::class,
         ConversionJobEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class ManagerDatabase : RoomDatabase() {
@@ -47,6 +47,36 @@ abstract class ManagerDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     """
+                    CREATE TABLE IF NOT EXISTS `conversion_job` (
+                        `singletonId` INTEGER NOT NULL,
+                        `token` TEXT NOT NULL,
+                        `inputKind` TEXT NOT NULL,
+                        `inputSha256` TEXT NOT NULL,
+                        `inputFileName` TEXT NOT NULL,
+                        `stage` TEXT NOT NULL,
+                        `approvedAdapterIdsJson` TEXT,
+                        `profileSha256` TEXT,
+                        `bundleFileName` TEXT,
+                        `updatedAtEpochMillis` INTEGER NOT NULL,
+                        PRIMARY KEY(`singletonId`)
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                requireNoDuplicateBinding(db, "extensionId")
+                requireNoDuplicateBinding(db, "packageName")
+                requireNoDuplicateBinding(
+                    db,
+                    column = "crxKeyAlias",
+                    whereClause = "WHERE `crxKeyAlias` IS NOT NULL",
+                )
+
+                db.execSQL(
+                    """
                     CREATE UNIQUE INDEX IF NOT EXISTS
                     `index_conversion_identities_extensionId`
                     ON `conversion_identities` (`extensionId`)
@@ -68,7 +98,7 @@ abstract class ManagerDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     """
-                    CREATE TABLE IF NOT EXISTS `conversion_job` (
+                    CREATE TABLE `conversion_job_v3` (
                         `singletonId` INTEGER NOT NULL,
                         `token` TEXT NOT NULL,
                         `generation` INTEGER NOT NULL,
@@ -86,6 +116,48 @@ abstract class ManagerDatabase : RoomDatabase() {
                     )
                     """.trimIndent(),
                 )
+                db.execSQL(
+                    """
+                    INSERT INTO `conversion_job_v3` (
+                        `singletonId`, `token`, `generation`, `inputKind`,
+                        `inputSha256`, `inputFileName`, `stage`,
+                        `approvedAdapterIdsJson`, `profileSha256`,
+                        `bundleFileName`, `bundleSha256`, `cleanupTokensJson`,
+                        `updatedAtEpochMillis`
+                    )
+                    SELECT
+                        `singletonId`, `token`, 1, `inputKind`,
+                        `inputSha256`, `inputFileName`, `stage`,
+                        `approvedAdapterIdsJson`, `profileSha256`,
+                        `bundleFileName`, NULL, '[]', `updatedAtEpochMillis`
+                    FROM `conversion_job`
+                    """.trimIndent(),
+                )
+                db.execSQL("DROP TABLE `conversion_job`")
+                db.execSQL("ALTER TABLE `conversion_job_v3` RENAME TO `conversion_job`")
+            }
+        }
+
+        private fun requireNoDuplicateBinding(
+            db: SupportSQLiteDatabase,
+            column: String,
+            whereClause: String = "",
+        ) {
+            db.query(
+                """
+                SELECT 1
+                FROM `conversion_identities`
+                $whereClause
+                GROUP BY `$column`
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """.trimIndent(),
+            ).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    throw IllegalStateException(
+                        "기존 conversion identity의 $column binding이 충돌합니다.",
+                    )
+                }
             }
         }
     }

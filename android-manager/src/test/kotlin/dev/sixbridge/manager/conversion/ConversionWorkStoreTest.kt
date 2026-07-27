@@ -1,8 +1,13 @@
 package dev.sixbridge.manager.conversion
 
 import java.io.File
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.nio.file.StandardOpenOption.CREATE_NEW
+import java.nio.file.StandardOpenOption.WRITE
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -63,9 +68,10 @@ class ConversionWorkStoreTest {
         }
 
     @Test
-    fun `검증 snapshot 뒤 path가 교체돼도 caller는 검증한 동일 bytes만 소비한다`() = runTest {
+    fun `입력 hash 뒤 path 교체는 caller 전에 fail closed 한다`() = runTest {
         lateinit var row: ConversionJobEntity
         val expected = "verified input".encodeToByteArray()
+        var consumed = false
         val store = store(
             hooks = ConversionWorkStoreHooks(
                 afterInputSnapshot = {
@@ -79,9 +85,39 @@ class ConversionWorkStoreTest {
         val created = store.create(artifact(expected))
         row = requireNotNull(dao.get())
 
-        val consumed = store.openVerifiedInput(created.token, InputStreamReader::read)
+        assertFailsWith<IllegalArgumentException> {
+            store.openVerifiedInput(created.token) {
+                consumed = true
+                it.readBytes()
+            }
+        }
 
-        assertArrayEquals(expected, consumed)
+        assertFalse(consumed)
+        assertEquals("attacker replacement", privateInput(row).readText())
+    }
+
+    @Test
+    fun `입력 streaming 복사 뒤 path 교체는 create 반환 전에 막는다`() = runTest {
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                afterInputCopied = {
+                    val copied = requireNotNull(
+                        root.walkTopDown().firstOrNull { it.name.endsWith(".input") },
+                    )
+                    val replacement = File(sourceRoot, "attacker-input").apply {
+                        writeText("attacker replacement")
+                    }
+                    Files.move(replacement.toPath(), copied.toPath(), REPLACE_EXISTING)
+                },
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            store.create(artifact("verified input".encodeToByteArray()))
+        }
+
+        val row = requireNotNull(dao.get())
+        assertEquals(ConversionJobStage.INPUT_READY.name, row.stage)
         assertEquals("attacker replacement", privateInput(row).readText())
     }
 
@@ -149,6 +185,49 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `비정상 active token도 cleanup owner 삭제 실패 전에는 DB 행을 유지한다`() = runTest {
+        val created = store().create(artifact("owned secret".encodeToByteArray()))
+        val ownedDirectory = File(root, created.token)
+        val corrupted = requireNotNull(dao.get()).copy(
+            token = "not-a-safe-token",
+            cleanupTokensJson = encodeCleanupTokens(setOf(created.token)),
+        )
+        dao.force(corrupted)
+        val failing = store(
+            hooks = ConversionWorkStoreHooks(
+                deleteTree = { path -> path.fileName.toString() != created.token },
+            ),
+        )
+
+        assertNull(failing.restore())
+        assertEquals(corrupted, dao.get())
+        assertTrue(ownedDirectory.isDirectory)
+
+        assertNull(store().restore())
+        assertNull(dao.get())
+        assertFalse(ownedDirectory.exists())
+    }
+
+    @Test
+    fun `root directory 열거 실패는 새 DB claim 전에 중단한다`() = runTest {
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                listFiles = { directory ->
+                    if (directory.canonicalFile == root.canonicalFile) null
+                    else directory.listFiles()
+                },
+            ),
+        )
+
+        assertFailsWith<IllegalStateException> {
+            store.create(artifact("input".encodeToByteArray()))
+        }
+
+        assertNull(dao.get())
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
     fun `DAO create commit 직후 cancellation은 active owner row를 잃지 않는다`() = runTest {
         val store = store(
             hooks = ConversionWorkStoreHooks(
@@ -189,6 +268,29 @@ class ConversionWorkStoreTest {
             assertEquals(ConversionJobStage.INPUT_READY, recovered.stage)
             assertFalse(orphan.exists())
         }
+
+    @Test
+    fun `BUILDING child 열거 실패는 stage와 orphan owner를 그대로 보존한다`() = runTest {
+        val base = store()
+        val created = base.create(artifact("input".encodeToByteArray()))
+        base.markAwaitingApproval(created.token, PROFILE_SHA)
+        base.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val tokenDirectory = File(root, created.token)
+        val orphan = File(tokenDirectory, "orphan.six").apply { writeText("orphan") }
+        val failing = store(
+            hooks = ConversionWorkStoreHooks(
+                listFiles = { directory ->
+                    if (directory.canonicalFile == tokenDirectory.canonicalFile) null
+                    else directory.listFiles()
+                },
+            ),
+        )
+
+        assertNull(failing.restore())
+
+        assertEquals(ConversionJobStage.BUILDING.name, requireNotNull(dao.get()).stage)
+        assertTrue(orphan.isFile)
+    }
 
     @Test
     fun `bundle source가 open 전에 다른 valid bytes로 바뀌면 expected hash가 차단한다`() =
@@ -267,6 +369,119 @@ class ConversionWorkStoreTest {
         val consumed = store.openVerifiedBundle(token, InputStreamReader::read)
 
         assertArrayEquals(expected, consumed)
+    }
+
+    @Test
+    fun `bundle verifier 뒤 path 교체는 caller 전에 막고 verifier는 no-follow handle만 읽는다`() =
+        runTest {
+            var swapAfterVerification = false
+            var verified = byteArrayOf()
+            var consumed = false
+            lateinit var row: ConversionJobEntity
+            val store = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterBundleVerified = {
+                        if (swapAfterVerification) {
+                            val replacement = File(sourceRoot, "attacker-bundle").apply {
+                                writeText("attacker bundle")
+                            }
+                            Files.move(
+                                replacement.toPath(),
+                                privateBundle(row).toPath(),
+                                REPLACE_EXISTING,
+                            )
+                        }
+                    },
+                ),
+                bundleVerifier = ConversionBundleVerifier { input ->
+                    assertTrue(input.markSupported().not())
+                    verified = input.readBytes()
+                    verified.decodeToString().startsWith("verified bundle")
+                },
+            )
+            val created = store.create(artifact("input".encodeToByteArray()))
+            store.markAwaitingApproval(created.token, PROFILE_SHA)
+            store.markBuilding(created.token, emptySet(), PROFILE_SHA)
+            val bundle = File(sourceRoot, "bundle.six").apply {
+                writeText("verified bundle from stable handle")
+            }
+            store.markBundleReady(created.token, bundle, sha256(bundle.readBytes()))
+            row = requireNotNull(dao.get())
+            swapAfterVerification = true
+
+            assertFailsWith<IllegalArgumentException> {
+                store.openVerifiedBundle(created.token) {
+                    consumed = true
+                    it.readBytes()
+                }
+            }
+
+            assertEquals("verified bundle from stable handle", verified.decodeToString())
+            assertFalse(consumed)
+        }
+
+    @Test
+    fun `bundle verifier 뒤 임시 path 교체는 publish와 DB 전환 전에 막는다`() = runTest {
+        var replaceTemporary = false
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                afterBundleVerified = {
+                    if (replaceTemporary) {
+                        val temporary = requireNotNull(
+                            root.walkTopDown().firstOrNull { it.name.endsWith(".tmp") },
+                        )
+                        val replacement = File(sourceRoot, "attacker-temporary").apply {
+                            writeText("attacker bundle")
+                        }
+                        Files.move(
+                            replacement.toPath(),
+                            temporary.toPath(),
+                            REPLACE_EXISTING,
+                        )
+                    }
+                },
+            ),
+        )
+        val created = store.create(artifact("input".encodeToByteArray()))
+        store.markAwaitingApproval(created.token, PROFILE_SHA)
+        store.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "bundle.six").apply {
+            writeText("verified bundle before publish")
+        }
+        replaceTemporary = true
+
+        assertFailsWith<IllegalArgumentException> {
+            store.markBundleReady(created.token, bundle, sha256(bundle.readBytes()))
+        }
+
+        assertEquals(ConversionJobStage.BUILDING.name, requireNotNull(dao.get()).stage)
+        assertFalse(File(root, created.token).listFiles().orEmpty().any {
+            it.name.endsWith(".six")
+        })
+    }
+
+    @Test
+    fun `128 MiB 입력은 전체 ByteArray 없이 streaming 인수하고 소비한다`() = runTest {
+        val baseline = usedHeap()
+        var heapAtCopy = Long.MAX_VALUE
+        val artifact = largeZeroArtifact(OnDeviceInputService.MAX_INPUT_BYTES)
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                afterInputCopied = { heapAtCopy = usedHeap() },
+            ),
+        )
+
+        val created = store.create(artifact)
+        val consumed = store.openVerifiedInput(created.token) { input ->
+            streamingDigest(input)
+        }
+
+        assertEquals(artifact.sha256, consumed.first)
+        assertEquals(OnDeviceInputService.MAX_INPUT_BYTES, consumed.second)
+        assertTrue(
+            "streaming copy 중 heap 증가가 64 MiB를 넘었습니다: ${heapAtCopy - baseline}",
+            heapAtCopy - baseline < 64L * 1024 * 1024,
+        )
     }
 
     @Test
@@ -374,12 +589,13 @@ class ConversionWorkStoreTest {
 
     private fun store(
         hooks: ConversionWorkStoreHooks = ConversionWorkStoreHooks(),
+        bundleVerifier: ConversionBundleVerifier = ConversionBundleVerifier { input ->
+            input.bufferedReader().readText().startsWith("verified bundle")
+        },
     ) = ConversionWorkStore(
         privateRoot = root,
         dao = dao,
-        bundleVerifier = ConversionBundleVerifier { file ->
-            file.isFile && file.readText().startsWith("verified bundle")
-        },
+        bundleVerifier = bundleVerifier,
         clock = { now },
         tokenFactory = {
             tokenSequence += 1
@@ -404,6 +620,48 @@ class ConversionWorkStoreTest {
             expectedExtensionId = null,
         )
     }
+
+    private fun largeZeroArtifact(size: Long): OnDeviceInputArtifact {
+        val token = UUID.randomUUID().toString()
+        val directory = File(sourceRoot, token).apply { check(mkdir()) }
+        val input = File(directory, "input.bin")
+        val digest = MessageDigest.getInstance("SHA-256")
+        val block = ByteArray(64 * 1024)
+        FileChannel.open(input.toPath(), CREATE_NEW, WRITE).use { channel ->
+            var remaining = size
+            while (remaining > 0) {
+                val count = minOf(block.size.toLong(), remaining).toInt()
+                val buffer = ByteBuffer.wrap(block, 0, count)
+                while (buffer.hasRemaining()) channel.write(buffer)
+                digest.update(block, 0, count)
+                remaining -= count
+            }
+            channel.force(true)
+        }
+        return OnDeviceInputArtifact(
+            token = token,
+            kind = OnDeviceInputKind.ZIP,
+            privateFile = input,
+            sha256 = digest.digest().toHex(),
+            expectedExtensionId = null,
+        )
+    }
+
+    private fun streamingDigest(input: InputStream): Pair<String, Long> {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            digest.update(buffer, 0, count)
+            total += count
+        }
+        return digest.digest().toHex() to total
+    }
+
+    private fun usedHeap(): Long =
+        Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
 
     private fun privateInput(row: ConversionJobEntity): File =
         File(File(root, row.token), row.inputFileName)
@@ -527,3 +785,6 @@ class ConversionWorkStoreTest {
             runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
     }
 }
+
+private fun ByteArray.toHex(): String =
+    joinToString("") { "%02x".format(it) }

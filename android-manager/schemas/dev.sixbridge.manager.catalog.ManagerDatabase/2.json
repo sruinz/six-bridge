@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 2,
-    "identityHash": "1f1eba44a85c230e67bbbf61a410517d",
+    "identityHash": "4200fca6f0d19c73cab8e1062fe0e496",
     "entities": [
       {
         "tableName": "catalog_entries",
@@ -137,40 +137,11 @@
           "columnNames": [
             "identitySha256"
           ]
-        },
-        "indices": [
-          {
-            "name": "index_conversion_identities_extensionId",
-            "unique": true,
-            "columnNames": [
-              "extensionId"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_identities_extensionId` ON `${TABLE_NAME}` (`extensionId`)"
-          },
-          {
-            "name": "index_conversion_identities_packageName",
-            "unique": true,
-            "columnNames": [
-              "packageName"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_identities_packageName` ON `${TABLE_NAME}` (`packageName`)"
-          },
-          {
-            "name": "index_conversion_identities_crxKeyAlias",
-            "unique": true,
-            "columnNames": [
-              "crxKeyAlias"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_identities_crxKeyAlias` ON `${TABLE_NAME}` (`crxKeyAlias`)"
-          }
-        ]
+        }
       },
       {
         "tableName": "conversion_job",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`singletonId` INTEGER NOT NULL, `token` TEXT NOT NULL, `generation` INTEGER NOT NULL, `inputKind` TEXT NOT NULL, `inputSha256` TEXT NOT NULL, `inputFileName` TEXT NOT NULL, `stage` TEXT NOT NULL, `approvedAdapterIdsJson` TEXT, `profileSha256` TEXT, `bundleFileName` TEXT, `bundleSha256` TEXT, `cleanupTokensJson` TEXT NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`singletonId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`singletonId` INTEGER NOT NULL, `token` TEXT NOT NULL, `inputKind` TEXT NOT NULL, `inputSha256` TEXT NOT NULL, `inputFileName` TEXT NOT NULL, `stage` TEXT NOT NULL, `approvedAdapterIdsJson` TEXT, `profileSha256` TEXT, `bundleFileName` TEXT, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`singletonId`))",
         "fields": [
           {
             "fieldPath": "singletonId",
@@ -182,12 +153,6 @@
             "fieldPath": "token",
             "columnName": "token",
             "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "generation",
-            "columnName": "generation",
-            "affinity": "INTEGER",
             "notNull": true
           },
           {
@@ -230,17 +195,6 @@
             "affinity": "TEXT"
           },
           {
-            "fieldPath": "bundleSha256",
-            "columnName": "bundleSha256",
-            "affinity": "TEXT"
-          },
-          {
-            "fieldPath": "cleanupTokensJson",
-            "columnName": "cleanupTokensJson",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
             "fieldPath": "updatedAtEpochMillis",
             "columnName": "updatedAtEpochMillis",
             "affinity": "INTEGER",
@@ -257,7 +211,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '1f1eba44a85c230e67bbbf61a410517d')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '4200fca6f0d19c73cab8e1062fe0e496')"
     ]
   }
 }

@@ -1,7 +1,5 @@
 package dev.sixbridge.manager.conversion
 
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -32,7 +30,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 
 fun interface ConversionBundleVerifier {
-    fun verify(bundle: File): Boolean
+    fun verify(bundle: InputStream): Boolean
 }
 
 data class RestoredConversionJob(
@@ -47,11 +45,14 @@ data class RestoredConversionJob(
 
 internal data class ConversionWorkStoreHooks(
     val deleteTree: ((Path) -> Boolean)? = null,
+    val listFiles: ((File) -> Array<File>?)? = null,
     val afterCreateClaim: () -> Unit = {},
     val beforeBundleSourceOpen: () -> Unit = {},
     val afterBundlePublished: () -> Unit = {},
     val afterBundleTransition: () -> Unit = {},
     val afterInputSnapshot: () -> Unit = {},
+    val afterInputCopied: () -> Unit = {},
+    val afterBundleVerified: () -> Unit = {},
 )
 
 class ConversionWorkStore internal constructor(
@@ -71,11 +72,14 @@ class ConversionWorkStore internal constructor(
         artifact: OnDeviceInputArtifact,
     ): RestoredConversionJob = mutex.withLock {
         withContext(Dispatchers.IO) {
-            val inputBytes = validateAndReadArtifact(artifact)
+            validateArtifactBoundary(artifact)
             val root = requirePrivateRoot()
             val token = requireCanonicalUuid(tokenFactory(), "작업 token")
             val inputFileName = "${requireCanonicalUuid(fileNameFactory(), "입력 파일명")}.input"
-            val discoveredCleanup = root.listFiles().orEmpty()
+            val discoveredCleanup = (
+                listFiles(root)
+                    ?: throw IllegalStateException("private 작업 저장소를 열거할 수 없습니다.")
+                )
                 .map(File::getName)
                 .filter(::isCanonicalUuid)
                 .toSet()
@@ -103,20 +107,24 @@ class ConversionWorkStore internal constructor(
                 throw IllegalStateException("private 작업 directory를 만들 수 없습니다.")
             }
             val inputFile = directChild(tokenDirectory, inputFileName)
-            writeNew(inputBytes, inputFile)
-            require(readVerifiedBytes(inputFile, artifact.sha256).contentEquals(inputBytes)) {
-                "복사한 private 입력 hash가 일치하지 않습니다."
-            }
+            val copiedInputState = copyStableNew(
+                source = artifact.privateFile,
+                destination = inputFile,
+                expectedSha256 = artifact.sha256,
+                label = "Task 6 입력",
+            )
+            hooks.afterInputCopied()
             require(inputFile.setReadOnly()) {
                 "private 입력을 불변 상태로 고정할 수 없습니다."
             }
+            requireStableFile(inputFile, copiedInputState, "입력 고정")
             val current = dao.get()
             check(current?.token == token && current.generation == claimed.generation) {
                 "활성 작업이 바뀌었습니다."
             }
             claimed = drainCleanupTokens(root, claimed)
                 ?: throw IllegalStateException("이전 private 작업 cleanup을 완료하지 못했습니다.")
-            claimed.toRestored(tokenDirectory)
+            claimed.toRestored(tokenDirectory, inputAlreadyVerified = true)
                 ?: throw IllegalStateException("새 작업을 복구할 수 없습니다.")
         }
     }
@@ -173,20 +181,13 @@ class ConversionWorkStore internal constructor(
             var databaseCommitted = false
             try {
                 hooks.beforeBundleSourceOpen()
-                val copiedSha256 = copyAndHashNew(bundle, temporary)
-                require(copiedSha256 == expectedSha256) {
-                    "생성 bundle hash가 예상값과 일치하지 않습니다."
-                }
-                require(bundleVerifier.verify(temporary)) {
-                    "복사한 private bundle 재검증에 실패했습니다."
-                }
-                require(readVerifiedBytes(temporary, expectedSha256).isNotEmpty()) {
-                    "복사한 private bundle이 비어 있습니다."
-                }
-                Files.move(temporary.toPath(), published.toPath(), ATOMIC_MOVE)
-                require(published.setReadOnly()) {
-                    "private bundle을 불변 상태로 고정할 수 없습니다."
-                }
+                copyStableNew(
+                    source = bundle,
+                    destination = temporary,
+                    expectedSha256 = expectedSha256,
+                    label = "생성 bundle",
+                )
+                publishVerifiedBundle(temporary, published, expectedSha256)
                 hooks.afterBundlePublished()
                 val updated = dao.transition(
                     token = token,
@@ -286,9 +287,12 @@ class ConversionWorkStore internal constructor(
             val root = requirePrivateRoot()
             val tokenDirectory = requireTokenDirectory(root, token)
             val input = directChild(tokenDirectory, row.inputFileName)
-            val bytes = readVerifiedBytes(input, row.inputSha256)
-            hooks.afterInputSnapshot()
-            ByteArrayInputStream(bytes).use(consume)
+            consumeVerifiedFile(
+                file = input,
+                expectedSha256 = row.inputSha256,
+                beforeConsume = hooks.afterInputSnapshot,
+                consume = consume,
+            )
         }
     }
 
@@ -305,9 +309,7 @@ class ConversionWorkStore internal constructor(
             val root = requirePrivateRoot()
             val tokenDirectory = requireTokenDirectory(root, token)
             val bundle = directChild(tokenDirectory, name)
-            require(bundleVerifier.verify(bundle)) { "완료 bundle 재검증에 실패했습니다." }
-            val bytes = readVerifiedBytes(bundle, expectedSha256)
-            ByteArrayInputStream(bytes).use(consume)
+            consumeVerifiedBundle(bundle, expectedSha256, consume)
         }
     }
 
@@ -361,6 +363,7 @@ class ConversionWorkStore internal constructor(
 
     private fun ConversionJobEntity.toRestored(
         tokenDirectory: File,
+        inputAlreadyVerified: Boolean = false,
     ): RestoredConversionJob? {
         if (singletonId != ConversionJobEntity.SINGLETON_ID ||
             generation <= 0 ||
@@ -377,7 +380,8 @@ class ConversionWorkStore internal constructor(
         val input = runCatching { directChild(tokenDirectory, inputFileName) }.getOrNull()
             ?: return null
         if (!isRegularDirectFile(tokenDirectory, input) ||
-            runCatching { readVerifiedBytes(input, inputSha256) }.isFailure
+            !inputAlreadyVerified &&
+            runCatching { verifyFileHash(input, inputSha256) }.isFailure
         ) {
             return null
         }
@@ -418,10 +422,10 @@ class ConversionWorkStore internal constructor(
                 val file = runCatching { directChild(tokenDirectory, name) }.getOrNull()
                     ?: return null
                 if (!isRegularDirectFile(tokenDirectory, file)) return null
-                if (runCatching { readVerifiedBytes(file, requireNotNull(bundleSha256)) }.isFailure) {
-                    return null
-                }
-                if (!runCatching { bundleVerifier.verify(file) }.getOrDefault(false)) return null
+                if (runCatching {
+                        verifyBundleFile(file, requireNotNull(bundleSha256))
+                    }.isFailure
+                ) return null
                 bundleSha256
             }
         }
@@ -436,7 +440,7 @@ class ConversionWorkStore internal constructor(
         )
     }
 
-    private fun validateAndReadArtifact(artifact: OnDeviceInputArtifact): ByteArray {
+    private fun validateArtifactBoundary(artifact: OnDeviceInputArtifact) {
         requireCanonicalUuid(artifact.token, "입력 token")
         require(isLowerHexSha256(artifact.sha256)) { "입력 SHA-256이 올바르지 않습니다." }
         val input = artifact.privateFile
@@ -447,7 +451,6 @@ class ConversionWorkStore internal constructor(
             "입력 경계에 symbolic link가 있습니다."
         }
         require(isRegularDirectFile(directory, input)) { "입력이 token의 direct child가 아닙니다." }
-        return readVerifiedBytes(input, artifact.sha256)
     }
 
     private fun requirePrivateRoot(): File {
@@ -496,76 +499,187 @@ class ConversionWorkStore internal constructor(
         return DirectFileState(fileKey, attributes.size(), attributes.lastModifiedTime().toMillis())
     }
 
-    private fun readVerifiedBytes(file: File, expectedSha256: String): ByteArray {
-        requireSafeSha256(expectedSha256, "private 파일")
-        val before = requireNotNull(captureDirectFileState(file)) {
-            "private 파일이 regular 단일 link가 아닙니다."
-        }
-        val bytes = FileChannel.open(file.toPath(), READ, NOFOLLOW_LINKS).use { channel ->
-            require(captureDirectFileState(file) == before) {
-                "private 파일 identity가 open 중 변경되었습니다."
+    private fun verifyFileHash(file: File, expectedSha256: String) {
+        withStableFile(file) { channel, state ->
+            require(hashChannel(channel) == expectedSha256) {
+                "private 파일 hash가 일치하지 않습니다."
             }
-            val output = ByteArrayOutputStream()
-            val buffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = channel.read(buffer)
-                if (count < 0) break
-                require(count > 0) { "private 파일 읽기가 진행되지 않습니다." }
-                output.write(buffer.array(), 0, count)
-                buffer.clear()
+            requireStableFile(file, state, "hash 검증")
+        }
+    }
+
+    private fun verifyBundleFile(file: File, expectedSha256: String) {
+        withStableFile(file) { channel, state ->
+            verifyHashAndBundle(channel, file, state, expectedSha256)
+        }
+    }
+
+    private fun publishVerifiedBundle(
+        temporary: File,
+        published: File,
+        expectedSha256: String,
+    ) {
+        withStableFile(temporary) { channel, state ->
+            verifyHashAndBundle(channel, temporary, state, expectedSha256)
+            Files.move(temporary.toPath(), published.toPath(), ATOMIC_MOVE)
+            requireStableFile(published, state, "bundle publish")
+            require(published.setReadOnly()) {
+                "private bundle을 불변 상태로 고정할 수 없습니다."
             }
-            output.toByteArray()
+            requireStableFile(published, state, "bundle 고정")
         }
-        require(captureDirectFileState(file) == before) {
-            "private 파일 identity가 검증 중 변경되었습니다."
-        }
-        require(sha256(bytes) == expectedSha256) {
+    }
+
+    private fun <T> consumeVerifiedFile(
+        file: File,
+        expectedSha256: String,
+        beforeConsume: () -> Unit = {},
+        consume: (InputStream) -> T,
+    ): T = withStableFile(file) { channel, state ->
+        require(hashChannel(channel) == expectedSha256) {
             "private 파일 hash가 일치하지 않습니다."
         }
-        return bytes
+        requireStableFile(file, state, "hash 검증")
+        beforeConsume()
+        requireStableFile(file, state, "소비 직전")
+        channel.position(0)
+        val result = consume(BoundedChannelInputStream(channel, state.size))
+        requireStableFile(file, state, "소비")
+        result
     }
 
-    private fun writeNew(bytes: ByteArray, destination: File) {
-        FileChannel.open(destination.toPath(), CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { output ->
-            val buffer = ByteBuffer.wrap(bytes)
-            while (buffer.hasRemaining()) {
-                require(output.write(buffer) > 0) { "private 파일 쓰기가 진행되지 않습니다." }
-            }
-            output.force(true)
+    private fun <T> consumeVerifiedBundle(
+        file: File,
+        expectedSha256: String,
+        consume: (InputStream) -> T,
+    ): T = withStableFile(file) { channel, state ->
+        verifyHashAndBundle(channel, file, state, expectedSha256)
+        requireStableFile(file, state, "bundle 소비 직전")
+        channel.position(0)
+        val result = consume(BoundedChannelInputStream(channel, state.size))
+        requireStableFile(file, state, "bundle 소비")
+        result
+    }
+
+    private fun verifyHashAndBundle(
+        channel: FileChannel,
+        file: File,
+        state: DirectFileState,
+        expectedSha256: String,
+    ) {
+        requireSafeSha256(expectedSha256, "private bundle")
+        require(hashChannel(channel) == expectedSha256) {
+            "private bundle hash가 일치하지 않습니다."
+        }
+        requireStableFile(file, state, "bundle hash 검증")
+        channel.position(0)
+        val stream = BoundedChannelInputStream(channel, state.size)
+        require(bundleVerifier.verify(stream)) {
+            "private bundle 재검증에 실패했습니다."
+        }
+        require(stream.remainingBytes == 0L) {
+            "bundle verifier가 전체 snapshot을 소비하지 않았습니다."
+        }
+        hooks.afterBundleVerified()
+        requireStableFile(file, state, "bundle 검증")
+    }
+
+    private inline fun <T> withStableFile(
+        file: File,
+        operation: (FileChannel, DirectFileState) -> T,
+    ): T {
+        val state = requireNotNull(captureDirectFileState(file)) {
+            "private 파일이 regular 단일 link가 아닙니다."
+        }
+        return FileChannel.open(file.toPath(), READ, NOFOLLOW_LINKS).use { channel ->
+            requireStableFile(file, state, "open")
+            operation(channel, state)
         }
     }
 
-    private fun copyAndHashNew(source: File, destination: File): String {
+    private fun requireStableFile(
+        file: File,
+        expected: DirectFileState,
+        operation: String,
+    ) {
+        require(captureDirectFileState(file) == expected) {
+            "private 파일 identity가 $operation 중 변경되었습니다."
+        }
+    }
+
+    private fun hashChannel(channel: FileChannel): String {
+        channel.position(0)
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteBuffer.allocate(STREAM_BUFFER_SIZE)
+        while (true) {
+            val count = channel.read(buffer)
+            if (count < 0) break
+            require(count > 0) { "private hash 읽기가 진행되지 않습니다." }
+            digest.update(buffer.array(), 0, count)
+            buffer.clear()
+        }
+        return digest.digest().toHex()
+    }
+
+    private fun copyStableNew(
+        source: File,
+        destination: File,
+        expectedSha256: String,
+        label: String,
+    ): DirectFileState {
+        requireSafeSha256(expectedSha256, label)
         val before = requireNotNull(captureDirectFileState(source)) {
-            "생성 bundle이 regular 단일 link가 아닙니다."
+            "$label 파일이 regular 단일 link가 아닙니다."
         }
         val digest = MessageDigest.getInstance("SHA-256")
+        var copiedState: DirectFileState? = null
         FileChannel.open(source.toPath(), READ, NOFOLLOW_LINKS).use { input ->
             require(captureDirectFileState(source) == before) {
-                "생성 bundle identity가 open 중 변경되었습니다."
+                "$label identity가 open 중 변경되었습니다."
             }
             FileChannel.open(destination.toPath(), CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { output ->
-                val buffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE)
+                val openedDestination = requireNotNull(captureDirectFileState(destination)) {
+                    "$label private 복사가 regular 단일 link가 아닙니다."
+                }
+                val buffer = ByteBuffer.allocate(STREAM_BUFFER_SIZE)
                 while (true) {
                     val count = input.read(buffer)
                     if (count < 0) break
-                    require(count > 0) { "생성 bundle 읽기가 진행되지 않습니다." }
+                    require(count > 0) { "$label 읽기가 진행되지 않습니다." }
                     digest.update(buffer.array(), 0, count)
                     buffer.flip()
                     while (buffer.hasRemaining()) {
                         require(output.write(buffer) > 0) {
-                            "private bundle 복사가 진행되지 않습니다."
+                            "$label private 복사가 진행되지 않습니다."
                         }
                     }
                     buffer.clear()
                 }
                 output.force(true)
+                val finalizedDestination =
+                    requireNotNull(captureDirectFileState(destination)) {
+                        "$label private 복사가 regular 단일 link가 아닙니다."
+                    }
+                require(finalizedDestination.fileKey == openedDestination.fileKey) {
+                    "$label private 복사 identity가 변경되었습니다."
+                }
+                copiedState = finalizedDestination
             }
         }
         require(captureDirectFileState(source) == before) {
-            "생성 bundle identity가 복사 중 변경되었습니다."
+            "$label identity가 복사 중 변경되었습니다."
         }
-        return digest.digest().toHex()
+        val copied = requireNotNull(copiedState)
+        require(captureDirectFileState(destination) == copied) {
+            "$label private 복사 identity가 close 중 변경되었습니다."
+        }
+        require(copied.size == before.size) {
+            "$label private 복사 크기가 일치하지 않습니다."
+        }
+        require(digest.digest().toHex() == expectedSha256) {
+            "$label hash가 예상값과 일치하지 않습니다."
+        }
+        return copied
     }
 
     private suspend fun drainCleanupTokens(
@@ -591,10 +705,6 @@ class ConversionWorkStore internal constructor(
     }
 
     private suspend fun discardInvalid(root: File, row: ConversionJobEntity) {
-        if (!isCanonicalUuid(row.token)) {
-            dao.delete(row.token, row.generation)
-            return
-        }
         if (deleteOwnedTokenDirectories(root, row)) {
             dao.delete(row.token, row.generation)
         }
@@ -602,7 +712,8 @@ class ConversionWorkStore internal constructor(
 
     private fun deleteOwnedTokenDirectories(root: File, row: ConversionJobEntity): Boolean {
         val cleanup = decodeCleanupTokens(row.cleanupTokensJson) ?: return false
-        val tokens = cleanup + row.token
+        if (cleanup.any { !isCanonicalUuid(it) }) return false
+        val tokens = if (isCanonicalUuid(row.token)) cleanup + row.token else cleanup
         if (tokens.any { !isCanonicalUuid(it) }) return false
         return tokens.all { deleteTokenDirectory(root, it) }
     }
@@ -610,9 +721,19 @@ class ConversionWorkStore internal constructor(
     private fun deleteUnreferencedChildren(
         tokenDirectory: File,
         inputFileName: String,
-    ): Boolean = tokenDirectory.listFiles().orEmpty()
-        .filter { it.name != inputFileName }
-        .all { deleteTree(it.toPath()) }
+    ): Boolean {
+        val children = listFiles(tokenDirectory) ?: return false
+        return children
+            .filter { it.name != inputFileName }
+            .all { deleteTree(it.toPath()) }
+    }
+
+    private fun listFiles(directory: File): Array<File>? =
+        hooks.listFiles?.invoke(directory) ?: if (hooks.listFiles == null) {
+            directory.listFiles()
+        } else {
+            null
+        }
 
     private fun deleteTokenDirectory(root: File, token: String): Boolean {
         if (!isCanonicalUuid(token)) return false
@@ -691,6 +812,7 @@ class ConversionWorkStore internal constructor(
         private const val TASK6_INPUT_FILE_NAME = "input.bin"
         private const val INPUT_SUFFIX = ".input"
         private const val BUNDLE_SUFFIX = ".six"
+        private const val STREAM_BUFFER_SIZE = 64 * 1024
         private val ROOT_MUTEXES = ConcurrentHashMap<String, Mutex>()
 
         private fun rootMutex(path: String): Mutex =
@@ -720,7 +842,38 @@ private fun isPrivateFileName(value: String, suffix: String): Boolean =
 private inline fun <reified T : Enum<T>> enumValueOrNull(value: String): T? =
     enumValues<T>().firstOrNull { it.name == value }
 
-private fun sha256(bytes: ByteArray): String =
-    MessageDigest.getInstance("SHA-256").digest(bytes).toHex()
-
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+private class BoundedChannelInputStream(
+    private val channel: FileChannel,
+    size: Long,
+) : InputStream() {
+    private val singleByte = ByteArray(1)
+    var remainingBytes: Long = size
+        private set
+
+    override fun read(): Int {
+        val count = read(singleByte, 0, 1)
+        return if (count < 0) -1 else singleByte[0].toInt() and 0xff
+    }
+
+    override fun read(
+        buffer: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Int {
+        require(offset >= 0 && length >= 0 && offset + length <= buffer.size) {
+            "stream buffer 범위가 올바르지 않습니다."
+        }
+        if (length == 0) return 0
+        if (remainingBytes == 0L) return -1
+        val requested = minOf(length.toLong(), remainingBytes).toInt()
+        val count = channel.read(ByteBuffer.wrap(buffer, offset, requested))
+        if (count < 0) return -1
+        require(count > 0) { "private stream 읽기가 진행되지 않습니다." }
+        remainingBytes -= count
+        return count
+    }
+
+    override fun close() = Unit
+}

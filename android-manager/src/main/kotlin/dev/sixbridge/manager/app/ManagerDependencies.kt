@@ -43,7 +43,10 @@ class ManagerDependencies private constructor(
                 application,
                 ManagerDatabase::class.java,
                 "six-bridge-manager.db",
-            ).addMigrations(ManagerDatabase.MIGRATION_1_2)
+            ).addMigrations(
+                ManagerDatabase.MIGRATION_1_2,
+                ManagerDatabase.MIGRATION_2_3,
+            )
                 .build()
             val catalog = RoomManagerCatalog(database.catalogEntryDao())
             val installedWrappers = PackageManagerInstalledWrapperRepository(application.packageManager)

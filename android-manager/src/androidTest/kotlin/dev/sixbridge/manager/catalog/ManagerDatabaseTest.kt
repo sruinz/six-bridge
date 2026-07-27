@@ -23,6 +23,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -427,7 +428,7 @@ class ManagerDatabaseTest {
                     lastVerifiedAtEpochMillis
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.trimIndent(),
-                arrayOf(
+                arrayOf<Any?>(
                     "dev.sixbridge.ext.migrated",
                     "migrated",
                     "Migrated extension",
@@ -473,6 +474,177 @@ class ManagerDatabaseTest {
         context.deleteDatabase(MIGRATION_DATABASE)
     }
 
+    @Test
+    fun migration_2_to_3_preserves_old_catalog_identity_and_job_with_safe_defaults() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(MIGRATION_V2_DATABASE)
+        migrationHelper.createDatabase(MIGRATION_V2_DATABASE, 2).apply {
+            execSQL(
+                """
+                INSERT INTO catalog_entries (
+                    packageName, extensionId, name, iconPng, installedVersionCode,
+                    signerSha256, compatibilityStatus, reportJson,
+                    lastVerifiedAtEpochMillis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "dev.sixbridge.ext.oldv2",
+                    "oldv2",
+                    "Old v2",
+                    byteArrayOf(7, 8, 9),
+                    12L,
+                    "a".repeat(64),
+                    "PARTIAL",
+                    """{"status":"PARTIAL"}""",
+                    5678L,
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO conversion_identities (
+                    identitySha256, logicalSourceIdentity, profileMajorVersion, mode,
+                    displayName, extensionId, packageName, wrapperSignerSha256,
+                    crxKeyAlias, lastReservedVersionCode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "1".repeat(64),
+                    "project:${"1".repeat(32)}",
+                    30,
+                    "CONVERTED",
+                    "Old identity",
+                    "a".repeat(32),
+                    "dev.sixbridge.ext.${"a".repeat(32)}",
+                    "2".repeat(64),
+                    "sixbridge-crx-old-v2",
+                    9,
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO conversion_job (
+                    singletonId, token, inputKind, inputSha256, inputFileName, stage,
+                    approvedAdapterIdsJson, profileSha256, bundleFileName,
+                    updatedAtEpochMillis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    1,
+                    "00000000-0000-0000-0000-000000000001",
+                    "ZIP",
+                    "3".repeat(64),
+                    "00000000-0000-0000-0000-000000000010.input",
+                    "AWAITING_APPROVAL",
+                    null,
+                    "4".repeat(64),
+                    null,
+                    9999L,
+                ),
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_V2_DATABASE,
+            3,
+            true,
+            ManagerDatabase.MIGRATION_2_3,
+        )
+        migrated.query(
+            "SELECT name, installedVersionCode FROM catalog_entries WHERE packageName = ?",
+            arrayOf("dev.sixbridge.ext.oldv2"),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("Old v2", cursor.getString(0))
+            assertEquals(12L, cursor.getLong(1))
+        }
+        migrated.query(
+            """
+            SELECT logicalSourceIdentity, lastReservedVersionCode
+            FROM conversion_identities WHERE identitySha256 = ?
+            """.trimIndent(),
+            arrayOf("1".repeat(64)),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("project:${"1".repeat(32)}", cursor.getString(0))
+            assertEquals(9, cursor.getInt(1))
+        }
+        migrated.query(
+            """
+            SELECT token, generation, stage, bundleSha256, cleanupTokensJson
+            FROM conversion_job WHERE singletonId = 1
+            """.trimIndent(),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("00000000-0000-0000-0000-000000000001", cursor.getString(0))
+            assertEquals(1L, cursor.getLong(1))
+            assertEquals("AWAITING_APPROVAL", cursor.getString(2))
+            assertTrue(cursor.isNull(3))
+            assertEquals("[]", cursor.getString(4))
+        }
+        migrated.close()
+        context.deleteDatabase(MIGRATION_V2_DATABASE)
+    }
+
+    @Test
+    fun migration_2_to_3_fails_closed_when_old_bindings_collide() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(MIGRATION_V2_COLLISION_DATABASE)
+        migrationHelper.createDatabase(MIGRATION_V2_COLLISION_DATABASE, 2).apply {
+            repeat(2) { index ->
+                execSQL(
+                    """
+                    INSERT INTO conversion_identities (
+                        identitySha256, logicalSourceIdentity, profileMajorVersion, mode,
+                        displayName, extensionId, packageName, wrapperSignerSha256,
+                        crxKeyAlias, lastReservedVersionCode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                    arrayOf<Any?>(
+                        (index + 1).toString().repeat(64),
+                        "project:${(index + 1).toString().repeat(32)}",
+                        30 + index,
+                        "CONVERTED",
+                        "Collision $index",
+                        "a".repeat(32),
+                        "dev.sixbridge.ext.${"a".repeat(32)}",
+                        "2".repeat(64),
+                        "sixbridge-crx-collision",
+                        index,
+                    ),
+                )
+            }
+            close()
+        }
+
+        assertThrows(IllegalStateException::class.java) {
+            migrationHelper.runMigrationsAndValidate(
+                MIGRATION_V2_COLLISION_DATABASE,
+                3,
+                true,
+                ManagerDatabase.MIGRATION_2_3,
+            )
+        }
+        android.database.sqlite.SQLiteDatabase.openDatabase(
+            context.getDatabasePath(MIGRATION_V2_COLLISION_DATABASE).path,
+            null,
+            android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
+        ).use { unchanged ->
+            unchanged.rawQuery("PRAGMA user_version", null).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(2, cursor.getInt(0))
+            }
+            unchanged.rawQuery(
+                "SELECT COUNT(*) FROM conversion_identities",
+                null,
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(2, cursor.getInt(0))
+            }
+        }
+        context.deleteDatabase(MIGRATION_V2_COLLISION_DATABASE)
+    }
+
     private fun record(
         packageName: String,
         iconPng: ByteArray? = byteArrayOf(4, 5, 6),
@@ -510,5 +682,7 @@ class ManagerDatabaseTest {
 
     private companion object {
         const val MIGRATION_DATABASE = "manager-migration-1-2.db"
+        const val MIGRATION_V2_DATABASE = "manager-migration-2-3.db"
+        const val MIGRATION_V2_COLLISION_DATABASE = "manager-migration-2-3-collision.db"
     }
 }
