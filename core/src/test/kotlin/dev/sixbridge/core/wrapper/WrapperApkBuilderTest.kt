@@ -16,6 +16,24 @@ import kotlin.test.fail
 
 class WrapperApkBuilderTest {
     @Test
+    fun `generates an atomically published runtime provider`() {
+        val source = WrapperApkBuilder::class.java
+            .getDeclaredField("PROVIDER_SOURCE")
+            .apply { isAccessible = true }
+            .get(null) as String
+
+        assertTrue(
+            "File.createTempFile(\"extension.crx.\", \".tmp\", target.getParentFile())" in source,
+        )
+        assertTrue("output.getFD().sync();" in source)
+        assertTrue("Files.move(" in source)
+        assertTrue("StandardCopyOption.ATOMIC_MOVE" in source)
+        assertTrue("StandardCopyOption.REPLACE_EXISTING" in source)
+        assertTrue("Files.deleteIfExists(temporary.toPath());" in source)
+        assertTrue("target.delete()" !in source)
+    }
+
+    @Test
     fun `builds a signed wrapper with the Samsung discovery contract`() {
         val sdk = AndroidToolchain.locateOrNull()
             ?: fail("Android SDK 도구가 없어 wrapper 배포 검증을 실행할 수 없습니다.")
