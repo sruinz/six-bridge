@@ -11,6 +11,15 @@ interface ConversionIdentityDao {
     @Query("SELECT * FROM conversion_identities WHERE identitySha256 = :identitySha256")
     suspend fun get(identitySha256: String): ConversionIdentityEntity?
 
+    @Query("SELECT * FROM conversion_identities WHERE extensionId = :extensionId LIMIT 1")
+    suspend fun findByExtensionId(extensionId: String): ConversionIdentityEntity?
+
+    @Query("SELECT * FROM conversion_identities WHERE packageName = :packageName LIMIT 1")
+    suspend fun findByPackageName(packageName: String): ConversionIdentityEntity?
+
+    @Query("SELECT * FROM conversion_identities WHERE crxKeyAlias = :crxKeyAlias LIMIT 1")
+    suspend fun findByCrxKeyAlias(crxKeyAlias: String): ConversionIdentityEntity?
+
     @Insert
     suspend fun insert(entity: ConversionIdentityEntity)
 
@@ -42,6 +51,23 @@ interface ConversionIdentityDao {
         }
         val current = get(requested.identitySha256)
         if (current != null) requireIdentityFieldsMatch(current, requested)
+        requireNoCrossIdentityBindingCollision(
+            requested,
+            findByExtensionId(requested.extensionId),
+            "extension ID",
+        )
+        requireNoCrossIdentityBindingCollision(
+            requested,
+            findByPackageName(requested.packageName),
+            "package",
+        )
+        requested.crxKeyAlias?.let { alias ->
+            requireNoCrossIdentityBindingCollision(
+                requested,
+                findByCrxKeyAlias(alias),
+                "CRX key alias",
+            )
+        }
         val lastReserved = current?.lastReservedVersionCode ?: 0
         if (lastReserved == Int.MAX_VALUE) {
             throw IllegalStateException("versionCode 예약값이 범위를 초과했습니다.")
@@ -61,6 +87,16 @@ interface ConversionIdentityDao {
             update(stored)
         }
         return stored
+    }
+}
+
+private fun requireNoCrossIdentityBindingCollision(
+    requested: ConversionIdentityEntity,
+    owner: ConversionIdentityEntity?,
+    label: String,
+) {
+    require(owner == null || owner.identitySha256 == requested.identitySha256) {
+        "$label binding이 다른 설치 신원과 충돌합니다."
     }
 }
 

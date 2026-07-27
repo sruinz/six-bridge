@@ -1,9 +1,17 @@
 package dev.sixbridge.manager.conversion
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "conversion_identities")
+@Entity(
+    tableName = "conversion_identities",
+    indices = [
+        Index(value = ["extensionId"], unique = true),
+        Index(value = ["packageName"], unique = true),
+        Index(value = ["crxKeyAlias"], unique = true),
+    ],
+)
 data class ConversionIdentityEntity(
     @PrimaryKey val identitySha256: String,
     val logicalSourceIdentity: String,

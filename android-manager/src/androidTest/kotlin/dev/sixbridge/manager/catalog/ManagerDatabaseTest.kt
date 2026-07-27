@@ -6,6 +6,9 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.manager.conversion.ConversionIdentityEntity
+import dev.sixbridge.manager.conversion.ConversionJobEntity
+import dev.sixbridge.manager.conversion.ConversionJobStage
+import dev.sixbridge.manager.conversion.encodeCleanupTokens
 import java.util.Collections
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executor
@@ -300,7 +303,7 @@ class ManagerDatabaseTest {
             val dao = database.conversionIdentityDao()
             val entity = ConversionIdentityEntity(
                 identitySha256 = "1".repeat(64),
-                logicalSourceIdentity = "project:room-transaction",
+                logicalSourceIdentity = "project:${"1".repeat(32)}",
                 profileMajorVersion = 30,
                 mode = "CONVERTED",
                 displayName = "Room transaction",
@@ -321,6 +324,94 @@ class ManagerDatabaseTest {
             }
 
             assertEquals((1..8).toSet(), reserved.toSet())
+        }
+
+    @Test
+    fun conversion_identity_unique_binding_rejects_cross_profile_and_mode_races() =
+        runBlocking {
+            val dao = database.conversionIdentityDao()
+            val base = ConversionIdentityEntity(
+                identitySha256 = "1".repeat(64),
+                logicalSourceIdentity = "project:${"1".repeat(32)}",
+                profileMajorVersion = 30,
+                mode = "CONVERTED",
+                displayName = "First",
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "2".repeat(64),
+                crxKeyAlias = "sixbridge-crx-room-unique",
+                lastReservedVersionCode = 0,
+            )
+            val competing = base.copy(
+                identitySha256 = "3".repeat(64),
+                logicalSourceIdentity = "project:${"3".repeat(32)}",
+                profileMajorVersion = 31,
+                displayName = "Competing",
+            )
+
+            val results = coroutineScope {
+                listOf(base, competing).map { candidate ->
+                    async(Dispatchers.Default) {
+                        runCatching { dao.reserve(candidate, null) }
+                    }
+                }.awaitAll()
+            }
+
+            assertEquals(1, results.count { it.isSuccess })
+            val winner = results.firstNotNullOfOrNull { it.getOrNull() }
+            assertTrue(winner == base.copy(lastReservedVersionCode = 1) ||
+                winner == competing.copy(lastReservedVersionCode = 1))
+
+            val passthrough = base.copy(
+                identitySha256 = "4".repeat(64),
+                logicalSourceIdentity = "store:${"b".repeat(32)}",
+                mode = "PASSTHROUGH",
+                crxKeyAlias = null,
+            )
+            assertTrue(runCatching { dao.reserve(passthrough, null) }.isFailure)
+        }
+
+    @Test
+    fun conversion_job_generation_CAS_and_singleton_claim_survive_multi_dao_races() =
+        runBlocking {
+            val firstDao = database.conversionJobDao()
+            val secondDao = database.conversionJobDao()
+            val candidate = conversionJob(
+                token = "00000000-0000-0000-0000-000000000001",
+                singletonId = 99,
+            )
+            val claimed = firstDao.claimCreate(candidate)
+            assertEquals(1, claimed.singletonId)
+            assertEquals(1L, claimed.generation)
+
+            val transitions = coroutineScope {
+                listOf("a".repeat(64), "b".repeat(64)).mapIndexed { index, profile ->
+                    async(Dispatchers.Default) {
+                        (if (index == 0) firstDao else secondDao).transition(
+                            token = claimed.token,
+                            expectedStage = ConversionJobStage.INPUT_READY.name,
+                            expectedGeneration = claimed.generation,
+                            expectedProfileSha256 = null,
+                            nextStage = ConversionJobStage.AWAITING_APPROVAL.name,
+                            approvedAdapterIdsJson = null,
+                            profileSha256 = profile,
+                            bundleFileName = null,
+                            bundleSha256 = null,
+                            updatedAtEpochMillis = 2,
+                        )
+                    }
+                }.awaitAll()
+            }
+
+            assertEquals(listOf(0, 1), transitions.sorted())
+            assertEquals(2L, requireNotNull(firstDao.get()).generation)
+
+            val replacement = conversionJob(
+                token = "00000000-0000-0000-0000-000000000002",
+            )
+            val secondClaim = secondDao.claimCreate(replacement)
+            assertEquals(3L, secondClaim.generation)
+            assertTrue(secondClaim.cleanupTokensJson.contains(claimed.token))
         }
 
     @Test
@@ -396,6 +487,25 @@ class ManagerDatabaseTest {
         compatibilityStatus = "PARTIAL",
         reportJson = reportJson,
         lastVerifiedAtEpochMillis = 1234,
+    )
+
+    private fun conversionJob(
+        token: String,
+        singletonId: Int = 1,
+    ) = ConversionJobEntity(
+        singletonId = singletonId,
+        token = token,
+        generation = 0,
+        inputKind = "ZIP",
+        inputSha256 = "a".repeat(64),
+        inputFileName = "00000000-0000-0000-0000-000000000010.input",
+        stage = ConversionJobStage.INPUT_READY.name,
+        approvedAdapterIdsJson = null,
+        profileSha256 = null,
+        bundleFileName = null,
+        bundleSha256 = null,
+        cleanupTokensJson = encodeCleanupTokens(emptySet()),
+        updatedAtEpochMillis = 1,
     )
 
     private companion object {

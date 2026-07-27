@@ -47,9 +47,31 @@ abstract class ManagerDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_extensionId`
+                    ON `conversion_identities` (`extensionId`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_packageName`
+                    ON `conversion_identities` (`packageName`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_crxKeyAlias`
+                    ON `conversion_identities` (`crxKeyAlias`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
                     CREATE TABLE IF NOT EXISTS `conversion_job` (
                         `singletonId` INTEGER NOT NULL,
                         `token` TEXT NOT NULL,
+                        `generation` INTEGER NOT NULL,
                         `inputKind` TEXT NOT NULL,
                         `inputSha256` TEXT NOT NULL,
                         `inputFileName` TEXT NOT NULL,
@@ -57,6 +79,8 @@ abstract class ManagerDatabase : RoomDatabase() {
                         `approvedAdapterIdsJson` TEXT,
                         `profileSha256` TEXT,
                         `bundleFileName` TEXT,
+                        `bundleSha256` TEXT,
+                        `cleanupTokensJson` TEXT NOT NULL,
                         `updatedAtEpochMillis` INTEGER NOT NULL,
                         PRIMARY KEY(`singletonId`)
                     )

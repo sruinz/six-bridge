@@ -2,12 +2,19 @@ package dev.sixbridge.manager.conversion
 
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -37,212 +44,342 @@ class ConversionWorkStoreTest {
     }
 
     @Test
-    fun `create는 Task6 artifact를 private UUID 파일로 인수하고 외부 경로를 저장하지 않는다`() =
+    fun `create는 외부 경로 없이 private 입력을 인수하고 verified bytes로만 소비시킨다`() =
         runTest {
-            val artifact = artifact("private input".encodeToByteArray())
+            val bytes = "private input".encodeToByteArray()
+            val artifact = artifact(bytes)
             val sourcePath = artifact.privateFile.absolutePath
             val store = store()
 
             val created = store.create(artifact)
             val row = requireNotNull(dao.get())
+            val consumed = store.openVerifiedInput(created.token, InputStreamReader::read)
 
             assertEquals(ConversionJobStage.INPUT_READY, created.stage)
-            assertEquals(artifact.sha256, created.inputSha256)
-            assertTrue(created.inputFile.isFile)
-            assertTrue(
-                requireNotNull(created.inputFile.parentFile).canonicalFile.parentFile ==
-                    root.canonicalFile,
-            )
-            assertTrue(created.inputFile.name.endsWith(".input"))
-            UUID.fromString(created.inputFile.name.removeSuffix(".input"))
+            assertArrayEquals(bytes, consumed)
             assertFalse(row.toString().contains(sourcePath))
-            assertFalse(row.toString().contains("content://"))
-            assertFalse(row.inputFileName == artifact.privateFile.name)
+            assertFalse(row.toString().contains("content:"))
+            assertTrue(privateInput(row).isFile)
         }
 
     @Test
-    fun `INPUT_READY와 AWAITING_APPROVAL을 hash 재검증 후 복구한다`() = runTest {
-        val store = store()
-        val input = store.create(artifact("input".encodeToByteArray()))
-
-        assertEquals(
-            ConversionJobStage.INPUT_READY,
-            requireNotNull(store.restore()).stage,
-        )
-
-        store.markAwaitingApproval(input.token, PROFILE_SHA)
-        val approval = requireNotNull(store.restore())
-        assertEquals(ConversionJobStage.AWAITING_APPROVAL, approval.stage)
-        assertEquals(PROFILE_SHA, approval.profileSha256)
-    }
-
-    @Test
-    fun `process death 뒤 BUILDING은 INPUT_READY로 내리고 자동 서명 상태를 지운다`() =
-        runTest {
-            val store = store()
-            val input = store.create(artifact("input".encodeToByteArray()))
-            store.markAwaitingApproval(input.token, PROFILE_SHA)
-            store.markBuilding(
-                token = input.token,
-                approvedAdapterIds = setOf("adapter-b", "adapter-a"),
-                profileSha256 = PROFILE_SHA,
-            )
-
-            val restored = requireNotNull(store.restore())
-            val row = requireNotNull(dao.get())
-
-            assertEquals(ConversionJobStage.INPUT_READY, restored.stage)
-            assertTrue(restored.approvedAdapterIds.isEmpty())
-            assertNull(restored.profileSha256)
-            assertNull(restored.bundleFile)
-            assertNull(row.approvedAdapterIdsJson)
-            assertNull(row.profileSha256)
-            assertNull(row.bundleFileName)
-        }
-
-    @Test
-    fun `BUNDLE_READY는 bundle verifier를 다시 통과해야 복구한다`() = runTest {
-        var verifierCalls = 0
+    fun `검증 snapshot 뒤 path가 교체돼도 caller는 검증한 동일 bytes만 소비한다`() = runTest {
+        lateinit var row: ConversionJobEntity
+        val expected = "verified input".encodeToByteArray()
         val store = store(
-            bundleVerifier = ConversionBundleVerifier { file ->
-                verifierCalls += 1
-                file.readText() == "verified bundle"
-            },
+            hooks = ConversionWorkStoreHooks(
+                afterInputSnapshot = {
+                    val replacement = File(sourceRoot, "replacement").apply {
+                        writeText("attacker replacement")
+                    }
+                    Files.move(replacement.toPath(), privateInput(row).toPath(), REPLACE_EXISTING)
+                },
+            ),
         )
-        val input = store.create(artifact("input".encodeToByteArray()))
-        store.markAwaitingApproval(input.token, PROFILE_SHA)
-        store.markBuilding(input.token, emptySet(), PROFILE_SHA)
-        val candidate = File(sourceRoot, "outside-user-name.six").apply {
-            writeText("verified bundle")
-        }
+        val created = store.create(artifact(expected))
+        row = requireNotNull(dao.get())
 
-        val ready = store.markBundleReady(input.token, candidate)
-        val restored = requireNotNull(store.restore())
+        val consumed = store.openVerifiedInput(created.token, InputStreamReader::read)
 
-        assertEquals(ConversionJobStage.BUNDLE_READY, ready.stage)
-        assertEquals(ConversionJobStage.BUNDLE_READY, restored.stage)
-        assertTrue(requireNotNull(restored.bundleFile).name.endsWith(".six"))
-        assertTrue(verifierCalls >= 2)
-        assertFalse(requireNotNull(dao.get()).toString().contains(candidate.absolutePath))
+        assertArrayEquals(expected, consumed)
+        assertEquals("attacker replacement", privateInput(row).readText())
     }
 
     @Test
-    fun `BUNDLE_READY 재검증 실패는 작업과 private 파일을 폐기한다`() = runTest {
-        var valid = true
-        val store = store(
-            bundleVerifier = ConversionBundleVerifier { valid },
-        )
-        val input = store.create(artifact("input".encodeToByteArray()))
-        store.markAwaitingApproval(input.token, PROFILE_SHA)
-        store.markBuilding(input.token, emptySet(), PROFILE_SHA)
-        val candidate = File(sourceRoot, "bundle.six").apply { writeText("bundle") }
-        val ready = store.markBundleReady(input.token, candidate)
-        val tokenDirectory = requireNotNull(ready.inputFile.parentFile)
-        valid = false
-
-        assertNull(store.restore())
-        assertNull(dao.get())
-        assertFalse(tokenDirectory.exists())
-    }
-
-    @Test
-    fun `input hash가 바뀌면 작업과 token 전체를 폐기한다`() = runTest {
-        val store = store()
-        val created = store.create(artifact("input".encodeToByteArray()))
-        created.inputFile.setWritable(true)
-        created.inputFile.writeText("tampered")
-        val tokenDirectory = requireNotNull(created.inputFile.parentFile)
-
-        assertNull(store.restore())
-        assertNull(dao.get())
-        assertFalse(tokenDirectory.exists())
-    }
-
-    @Test
-    fun `direct child를 symlink로 바꾸면 외부 파일을 따라가지 않고 폐기한다`() =
+    fun `승인 profile과 다른 profile로 BUILDING 전환하지 않고 기존 승인을 보존한다`() =
         runTest {
             val store = store()
             val created = store.create(artifact("input".encodeToByteArray()))
-            val outside = File(sourceRoot, "outside").apply { writeText("input") }
-            val inputPath = created.inputFile.toPath()
-            Files.delete(inputPath)
-            Files.createSymbolicLink(inputPath, outside.toPath())
+            store.markAwaitingApproval(created.token, PROFILE_SHA)
 
-            assertNull(store.restore())
-            assertTrue(outside.isFile)
-            assertEquals("input", outside.readText())
+            assertFailsWith<IllegalStateException> {
+                store.markBuilding(created.token, setOf("adapter"), OTHER_PROFILE_SHA)
+            }
+
+            val row = requireNotNull(dao.get())
+            assertEquals(ConversionJobStage.AWAITING_APPROVAL.name, row.stage)
+            assertEquals(PROFILE_SHA, row.profileSha256)
         }
 
     @Test
-    fun `경로를 포함한 DB 파일명은 외부 파일을 삭제하지 않고 fail closed 한다`() =
+    fun `서로 다른 store의 stale transition은 stage generation CAS에서 하나만 성공한다`() =
         runTest {
-            val outside = File(root.parentFile, "conversion-work-outside").apply {
-                writeText("keep")
-            }
-            try {
-                dao.replace(
-                    ConversionJobEntity(
-                        token = UUID.randomUUID().toString(),
-                        inputKind = OnDeviceInputKind.ZIP.name,
-                        inputSha256 = sha256("keep".encodeToByteArray()),
-                        inputFileName = "../${outside.name}",
-                        stage = ConversionJobStage.INPUT_READY.name,
-                        approvedAdapterIdsJson = null,
-                        profileSha256 = null,
-                        bundleFileName = null,
-                        updatedAtEpochMillis = now,
-                    ),
-                )
+            val creator = store()
+            val created = creator.create(artifact("input".encodeToByteArray()))
+            val stores = listOf(store(), store())
 
-                assertNull(store().restore())
-                assertEquals("keep", outside.readText())
-            } finally {
-                outside.delete()
+            val results = coroutineScope {
+                stores.mapIndexed { index, candidate ->
+                    async {
+                        runCatching {
+                            candidate.markAwaitingApproval(
+                                created.token,
+                                if (index == 0) PROFILE_SHA else OTHER_PROFILE_SHA,
+                            )
+                        }
+                    }
+                }.awaitAll()
             }
+
+            assertEquals(1, results.count(Result<RestoredConversionJob>::isSuccess))
+            assertEquals(2L, requireNotNull(dao.get()).generation)
         }
 
     @Test
-    fun `24시간 지난 미완료 작업과 파일을 정리한다`() = runTest {
-        val store = store()
-        val created = store.create(artifact("input".encodeToByteArray()))
-        val tokenDirectory = requireNotNull(created.inputFile.parentFile)
-        now += ConversionWorkStore.INCOMPLETE_RETENTION_MILLIS + 1
+    fun `create handoff cleanup 실패는 cleanup owner를 DB에 남겨 다음 restore가 재시도한다`() =
+        runTest {
+            val first = store().create(artifact("first".encodeToByteArray()))
+            val failing = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path -> path.fileName.toString() != first.token },
+                ),
+            )
 
-        assertNull(store.restore())
-        assertNull(dao.get())
-        assertFalse(tokenDirectory.exists())
+            assertFailsWith<IllegalStateException> {
+                failing.create(artifact("second".encodeToByteArray()))
+            }
+            val pending = requireNotNull(dao.get())
+            assertTrue(requireNotNull(decodeCleanupTokens(pending.cleanupTokensJson)).contains(first.token))
+            assertTrue(File(root, first.token).exists())
+
+            val restored = requireNotNull(store().restore())
+            assertEquals(pending.token, restored.token)
+            assertFalse(File(root, first.token).exists())
+            assertTrue(requireNotNull(decodeCleanupTokens(requireNotNull(dao.get()).cleanupTokensJson)).isEmpty())
+        }
+
+    @Test
+    fun `DAO create commit 직후 cancellation은 active owner row를 잃지 않는다`() = runTest {
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                afterCreateClaim = { throw CancellationException("simulated death") },
+            ),
+        )
+
+        assertFailsWith<CancellationException> {
+            store.create(artifact("input".encodeToByteArray()))
+        }
+
+        val row = requireNotNull(dao.get())
+        assertTrue(isUuid(row.token))
+        assertEquals(1L, row.generation)
     }
 
     @Test
-    fun `새 create는 이전 활성 작업을 폐기하고 하나만 유지한다`() = runTest {
-        val store = store()
-        val first = store.create(artifact("first".encodeToByteArray()))
-        val firstDirectory = requireNotNull(first.inputFile.parentFile)
-        val second = store.create(artifact("second".encodeToByteArray()))
+    fun `BUILDING crash artifact cleanup 실패는 stage를 내리지 않고 재시도 가능하게 둔다`() =
+        runTest {
+            val base = store()
+            val created = base.create(artifact("input".encodeToByteArray()))
+            base.markAwaitingApproval(created.token, PROFILE_SHA)
+            base.markBuilding(created.token, emptySet(), PROFILE_SHA)
+            val orphan = File(File(root, created.token), "orphan.six").apply {
+                writeText("orphan")
+            }
+            val failing = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path -> path.fileName.toString() != orphan.name },
+                ),
+            )
 
-        assertFalse(firstDirectory.exists())
-        assertEquals(second.token, requireNotNull(dao.get()).token)
-        assertEquals(1, root.listFiles().orEmpty().count(File::isDirectory))
-    }
+            assertNull(failing.restore())
+            assertEquals(ConversionJobStage.BUILDING.name, requireNotNull(dao.get()).stage)
+            assertTrue(orphan.exists())
+
+            val recovered = requireNotNull(store().restore())
+            assertEquals(ConversionJobStage.INPUT_READY, recovered.stage)
+            assertFalse(orphan.exists())
+        }
 
     @Test
-    fun `다른 token으로 stage를 바꾸거나 discard할 수 없다`() = runTest {
-        val store = store()
-        val created = store.create(artifact("input".encodeToByteArray()))
+    fun `bundle source가 open 전에 다른 valid bytes로 바뀌면 expected hash가 차단한다`() =
+        runTest {
+            val original = File(sourceRoot, "bundle.six").apply { writeText("bundle-a") }
+            val expected = sha256(original.readBytes())
+            val replacement = File(sourceRoot, "replacement.six").apply { writeText("bundle-b") }
+            val store = readyToBuildStore(
+                hooks = ConversionWorkStoreHooks(
+                    beforeBundleSourceOpen = {
+                        Files.move(replacement.toPath(), original.toPath(), REPLACE_EXISTING)
+                    },
+                ),
+            )
+            val token = requireNotNull(dao.get()).token
+
+            assertFailsWith<IllegalArgumentException> {
+                store.markBundleReady(token, original, expected)
+            }
+
+            assertEquals(ConversionJobStage.BUILDING.name, requireNotNull(dao.get()).stage)
+        }
+
+    @Test
+    fun `bundle publish 직후 crash는 BUILDING 복구가 모든 미참조 child를 지운다`() = runTest {
+        val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
+        val store = readyToBuildStore(
+            hooks = ConversionWorkStoreHooks(
+                afterBundlePublished = { throw IllegalStateException("simulated crash") },
+            ),
+        )
+        val token = requireNotNull(dao.get()).token
 
         assertFailsWith<IllegalStateException> {
-            store.markAwaitingApproval(UUID.randomUUID().toString(), PROFILE_SHA)
+            store.markBundleReady(token, bundle, sha256(bundle.readBytes()))
         }
-        assertFalse(store.discard(UUID.randomUUID().toString()))
-        assertEquals(created.token, requireNotNull(store.restore()).token)
+        assertEquals(2, File(root, token).listFiles().orEmpty().size)
+
+        val restored = requireNotNull(this@ConversionWorkStoreTest.store().restore())
+        assertEquals(ConversionJobStage.INPUT_READY, restored.stage)
+        assertEquals(1, File(root, token).listFiles().orEmpty().size)
+    }
+
+    @Test
+    fun `BUNDLE_READY DB commit 뒤 cancellation은 published file과 row를 유지한다`() = runTest {
+        val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
+        val expected = sha256(bundle.readBytes())
+        val store = readyToBuildStore(
+            hooks = ConversionWorkStoreHooks(
+                afterBundleTransition = { throw CancellationException("simulated cancellation") },
+            ),
+        )
+        val token = requireNotNull(dao.get()).token
+
+        assertFailsWith<CancellationException> {
+            store.markBundleReady(token, bundle, expected)
+        }
+
+        val row = requireNotNull(dao.get())
+        assertEquals(ConversionJobStage.BUNDLE_READY.name, row.stage)
+        assertEquals(expected, row.bundleSha256)
+        assertTrue(privateBundle(row).isFile)
+        val restored = requireNotNull(this@ConversionWorkStoreTest.store().restore())
+        assertEquals(ConversionJobStage.BUNDLE_READY, restored.stage)
+        assertEquals(expected, restored.bundleSha256)
+    }
+
+    @Test
+    fun `verified bundle open은 DB hash에 묶인 bytes를 반환한다`() = runTest {
+        val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
+        val expected = bundle.readBytes()
+        val store = readyToBuildStore()
+        val token = requireNotNull(dao.get()).token
+        store.markBundleReady(token, bundle, sha256(expected))
+
+        val consumed = store.openVerifiedBundle(token, InputStreamReader::read)
+
+        assertArrayEquals(expected, consumed)
+    }
+
+    @Test
+    fun `hard link input과 bundle은 private 경계에 들어오지 못한다`() = runTest {
+        val artifact = artifact("input".encodeToByteArray())
+        val artifactAlias = File(sourceRoot, "artifact-alias")
+        Files.createLink(artifactAlias.toPath(), artifact.privateFile.toPath())
+        assertFailsWith<IllegalArgumentException> {
+            store().create(artifact)
+        }
+
+        artifactAlias.delete()
+        val buildStore = readyToBuildStore()
+        val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
+        val bundleAlias = File(sourceRoot, "bundle-alias.six")
+        Files.createLink(bundleAlias.toPath(), bundle.toPath())
+        assertFailsWith<IllegalArgumentException> {
+            buildStore.markBundleReady(
+                requireNotNull(dao.get()).token,
+                bundle,
+                sha256(bundle.readBytes()),
+            )
+        }
+    }
+
+    @Test
+    fun `private input 또는 bundle에 hard link가 생기면 restore가 fail closed 한다`() = runTest {
+        val inputStore = store()
+        inputStore.create(artifact("input".encodeToByteArray()))
+        var row = requireNotNull(dao.get())
+        Files.createLink(File(sourceRoot, "input-leak").toPath(), privateInput(row).toPath())
+        assertNull(inputStore.restore())
+
+        dao = FakeConversionJobDao()
+        root.deleteRecursively()
+        assertTrue(root.mkdirs())
+        val bundleStore = readyToBuildStore()
+        val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
+        bundleStore.markBundleReady(
+            requireNotNull(dao.get()).token,
+            bundle,
+            sha256(bundle.readBytes()),
+        )
+        row = requireNotNull(dao.get())
+        Files.createLink(File(sourceRoot, "bundle-leak").toPath(), privateBundle(row).toPath())
+        assertNull(bundleStore.restore())
+    }
+
+    @Test
+    fun `delete 실패는 discard와 invalid restore에서 owner row를 보존한다`() = runTest {
+        val base = store()
+        val created = base.create(artifact("input".encodeToByteArray()))
+        val failing = store(
+            hooks = ConversionWorkStoreHooks(deleteTree = { false }),
+        )
+
+        assertFalse(failing.discard(created.token))
+        assertNotNull(dao.get())
+        privateInput(requireNotNull(dao.get())).apply {
+            setWritable(true)
+            writeText("tampered")
+        }
+        assertNull(failing.restore())
+        assertNotNull(dao.get())
+    }
+
+    @Test
+    fun `미래 음수 retention 경계와 작은 clock rollback을 구분한다`() = runTest {
+        val base = store()
+        val created = base.create(artifact("input".encodeToByteArray()))
+        val original = requireNotNull(dao.get())
+
+        dao.force(original.copy(updatedAtEpochMillis = now + 1))
+        assertEquals(created.token, requireNotNull(base.restore()).token)
+
+        dao.force(requireNotNull(dao.get()).copy(updatedAtEpochMillis = Long.MAX_VALUE))
+        assertNull(base.restore())
+        assertNull(dao.get())
+
+        val second = store().create(artifact("second".encodeToByteArray()))
+        dao.force(requireNotNull(dao.get()).copy(updatedAtEpochMillis = -1))
+        assertNull(store().restore())
+        assertNull(dao.get())
+
+        val third = store().create(artifact("third".encodeToByteArray()))
+        dao.force(
+            requireNotNull(dao.get()).copy(
+                updatedAtEpochMillis = now - ConversionWorkStore.INCOMPLETE_RETENTION_MILLIS,
+            ),
+        )
+        assertNull(store().restore())
+        assertNull(dao.get())
+        assertTrue(second.token != third.token)
+    }
+
+    private suspend fun readyToBuildStore(
+        hooks: ConversionWorkStoreHooks = ConversionWorkStoreHooks(),
+    ): ConversionWorkStore {
+        val store = store(hooks = hooks)
+        val created = store.create(artifact("input".encodeToByteArray()))
+        store.markAwaitingApproval(created.token, PROFILE_SHA)
+        store.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        return store
     }
 
     private fun store(
-        bundleVerifier: ConversionBundleVerifier = ConversionBundleVerifier { true },
+        hooks: ConversionWorkStoreHooks = ConversionWorkStoreHooks(),
     ) = ConversionWorkStore(
         privateRoot = root,
         dao = dao,
-        bundleVerifier = bundleVerifier,
+        bundleVerifier = ConversionBundleVerifier { file ->
+            file.isFile && file.readText().startsWith("verified bundle")
+        },
         clock = { now },
         tokenFactory = {
             tokenSequence += 1
@@ -252,66 +389,141 @@ class ConversionWorkStoreTest {
             fileSequence += 1
             UUID(1, fileSequence.toLong()).toString()
         },
+        hooks = hooks,
     )
 
     private fun artifact(bytes: ByteArray): OnDeviceInputArtifact {
         val token = UUID.randomUUID().toString()
-        val directory = File(sourceRoot, token).apply { check(mkdir()) }
-        val file = File(directory, "input.bin").apply {
-            writeBytes(bytes)
-            setReadOnly()
-        }
+        val directory = File(sourceRoot, token).apply { mkdir() }
+        val input = File(directory, "input.bin").apply { writeBytes(bytes) }
         return OnDeviceInputArtifact(
             token = token,
             kind = OnDeviceInputKind.ZIP,
-            privateFile = file,
             sha256 = sha256(bytes),
+            privateFile = input,
             expectedExtensionId = null,
         )
     }
 
-    private fun sha256(bytes: ByteArray): String =
-        MessageDigest.getInstance("SHA-256")
-            .digest(bytes)
-            .joinToString("") { "%02x".format(it) }
+    private fun privateInput(row: ConversionJobEntity): File =
+        File(File(root, row.token), row.inputFileName)
 
-    private class FakeConversionJobDao : ConversionJobDao {
+    private fun privateBundle(row: ConversionJobEntity): File =
+        File(File(root, row.token), requireNotNull(row.bundleFileName))
+
+    private class FakeConversionJobDao : ConversionJobDao() {
         private var row: ConversionJobEntity? = null
 
-        override suspend fun get(): ConversionJobEntity? = row
+        override suspend fun get(): ConversionJobEntity? = synchronized(this) { row }
 
-        override suspend fun replace(entity: ConversionJobEntity) {
-            row = entity
+        protected override suspend fun replaceSingletonInternal(entity: ConversionJobEntity) {
+            synchronized(this) { row = entity.copy(singletonId = 1) }
         }
+
+        override suspend fun claimCreate(candidate: ConversionJobEntity): ConversionJobEntity =
+            synchronized(this) {
+                val previous = row
+                val cleanup = buildSet {
+                    addAll(requireNotNull(decodeCleanupTokens(candidate.cleanupTokensJson)))
+                    previous?.let {
+                        addAll(requireNotNull(decodeCleanupTokens(it.cleanupTokensJson)))
+                        add(it.token)
+                    }
+                    remove(candidate.token)
+                }
+                candidate.copy(
+                    singletonId = 1,
+                    generation = (previous?.generation ?: 0) + 1,
+                    cleanupTokensJson = encodeCleanupTokens(cleanup),
+                ).also { row = it }
+            }
 
         override suspend fun transition(
             token: String,
-            stage: String,
+            expectedStage: String,
+            expectedGeneration: Long,
+            expectedProfileSha256: String?,
+            nextStage: String,
             approvedAdapterIdsJson: String?,
             profileSha256: String?,
             bundleFileName: String?,
+            bundleSha256: String?,
             updatedAtEpochMillis: Long,
-        ): Int {
-            val current = row
-            if (current == null || current.token != token) return 0
+        ): Int = synchronized(this) {
+            val current = row ?: return@synchronized 0
+            if (current.token != token ||
+                current.stage != expectedStage ||
+                current.generation != expectedGeneration ||
+                expectedProfileSha256 != null &&
+                current.profileSha256 != expectedProfileSha256
+            ) {
+                return@synchronized 0
+            }
             row = current.copy(
-                stage = stage,
+                stage = nextStage,
                 approvedAdapterIdsJson = approvedAdapterIdsJson,
                 profileSha256 = profileSha256,
                 bundleFileName = bundleFileName,
+                bundleSha256 = bundleSha256,
                 updatedAtEpochMillis = updatedAtEpochMillis,
+                generation = current.generation + 1,
             )
-            return 1
+            1
         }
 
-        override suspend fun delete(token: String): Int {
-            if (row?.token != token) return 0
-            row = null
-            return 1
+        override suspend fun updateCleanupTokens(
+            token: String,
+            expectedGeneration: Long,
+            cleanupTokensJson: String,
+            updatedAtEpochMillis: Long,
+        ): Int = synchronized(this) {
+            val current = row ?: return@synchronized 0
+            if (current.token != token || current.generation != expectedGeneration) {
+                return@synchronized 0
+            }
+            row = current.copy(
+                cleanupTokensJson = cleanupTokensJson,
+                updatedAtEpochMillis = updatedAtEpochMillis,
+                generation = current.generation + 1,
+            )
+            1
+        }
+
+        override suspend fun delete(token: String, expectedGeneration: Long): Int =
+            synchronized(this) {
+                val current = row ?: return@synchronized 0
+                if (current.token != token || current.generation != expectedGeneration) {
+                    return@synchronized 0
+                }
+                row = null
+                1
+            }
+
+        fun force(entity: ConversionJobEntity) {
+            synchronized(this) { row = entity }
+        }
+    }
+
+    private fun interface InputStreamReader {
+        fun read(input: java.io.InputStream): ByteArray
+
+        companion object {
+            fun read(input: java.io.InputStream): ByteArray = input.readBytes()
         }
     }
 
     private companion object {
-        val PROFILE_SHA = "a".repeat(64)
+        const val PROFILE_SHA =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val OTHER_PROFILE_SHA =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+        fun sha256(bytes: ByteArray): String =
+            MessageDigest.getInstance("SHA-256")
+                .digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+
+        fun isUuid(value: String): Boolean =
+            runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
     }
 }
