@@ -58,6 +58,7 @@ configurations.configureEach {
 
 dependencies {
     implementation(project(":bundle-contract"))
+    implementation("com.android.tools.build:apksig:9.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
     implementation(platform("androidx.compose:compose-bom:2026.06.00"))
