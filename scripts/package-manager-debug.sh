@@ -31,11 +31,10 @@ rm -f -- "${OUTPUT_APK}"
 
 [[ -x "${VERIFY_SCRIPT}" ]] ||
     fail "전체 검증 스크립트를 실행할 수 없습니다: ${VERIFY_SCRIPT}"
+[[ -x "${TEMPLATE_TEST_SCRIPT}" ]] ||
+    fail "템플릿 계약 스크립트를 실행할 수 없습니다: ${TEMPLATE_TEST_SCRIPT}"
 
-if [[ -x "${TEMPLATE_TEST_SCRIPT}" ]]; then
-    "${TEMPLATE_TEST_SCRIPT}"
-fi
-
+"${TEMPLATE_TEST_SCRIPT}"
 "${VERIFY_SCRIPT}"
 
 [[ -f "${SOURCE_APK}" ]] ||

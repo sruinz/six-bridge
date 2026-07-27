@@ -10,6 +10,8 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 public final class ExtensionProvider extends ContentProvider {
     @Override
@@ -32,21 +34,24 @@ public final class ExtensionProvider extends ContentProvider {
     }
 
     private void copyAsset(File target) throws IOException {
-        File temporary = new File(target.getParentFile(), "extension.crx.tmp");
-        try (InputStream input = getContext().getAssets().open("extension.crx");
-             FileOutputStream output = new FileOutputStream(temporary)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                output.write(buffer, 0, read);
+        File temporary = File.createTempFile("extension.crx.", ".tmp", target.getParentFile());
+        try {
+            try (InputStream input = getContext().getAssets().open("extension.crx");
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                }
+                output.getFD().sync();
             }
-            output.getFD().sync();
-        }
-        if (target.exists() && !target.delete()) {
-            throw new IOException("Unable to replace extension.crx");
-        }
-        if (!temporary.renameTo(target)) {
-            throw new IOException("Unable to publish extension.crx");
+            Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary.toPath());
         }
     }
 

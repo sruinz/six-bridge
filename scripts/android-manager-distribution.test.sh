@@ -32,6 +32,9 @@ new_fixture() {
         "${fixture_dir}/sdk/cmdline-tools/latest/bin"
     cp "${VERIFY_SCRIPT}" "${fixture_dir}/scripts/verify.sh"
     chmod +x "${fixture_dir}/scripts/verify.sh"
+    printf '#!/bin/sh\nexit 0\n' \
+        >"${fixture_dir}/scripts/android-wrapper-template.test.sh"
+    chmod +x "${fixture_dir}/scripts/android-wrapper-template.test.sh"
 
     for script_name in \
         fold7-gate.sh \

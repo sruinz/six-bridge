@@ -5,6 +5,8 @@ readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly DEFAULT_TEMPLATE="${ROOT_DIR}/android-manager/src/main/assets/wrapper-template.apk"
 readonly HASH_FILE="${ROOT_DIR}/android-manager/src/main/assets/wrapper-template.sha256"
 readonly GENERATOR="${ROOT_DIR}/scripts/generate-android-wrapper-template.sh"
+readonly PACKAGE_SCRIPT="${ROOT_DIR}/scripts/package-manager-debug.sh"
+readonly PROVIDER_SOURCE="${ROOT_DIR}/android-wrapper-template/src/main/java/dev/sixbridge/runtime/ExtensionProvider.java"
 readonly SDK_ROOT="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
 readonly AAPT2="${SDK_ROOT}/build-tools/36.0.0/aapt2"
 readonly APKSIGNER="${SDK_ROOT}/build-tools/36.0.0/apksigner"
@@ -41,6 +43,150 @@ assert_runtime_entries() {
         fail "템플릿 runtime entry 순서 또는 구성이 올바르지 않습니다: ${actual}"
 }
 
+assert_component_block() {
+    local xmltree="$1"
+    local element="$2"
+    local component_name="$3"
+    local output="$4"
+
+    awk -v element="$element" -v component_name="$component_name" '
+        function indentation(line, first) {
+            first = match(line, /[^[:space:]]/)
+            return first == 0 ? length(line) : first - 1
+        }
+        function emit_if_requested() {
+            if (capturing && !emitted && index(block, "\"" component_name "\"")) {
+                printf "%s", block
+                emitted = 1
+            }
+        }
+        /^[[:space:]]*E: / {
+            current_indentation = indentation($0)
+            if (capturing && current_indentation <= component_indentation) {
+                emit_if_requested()
+                capturing = 0
+                block = ""
+            }
+            if ($0 ~ "E: " element " ") {
+                capturing = 1
+                component_indentation = current_indentation
+                block = $0 "\n"
+                next
+            }
+        }
+        capturing {
+            block = block $0 "\n"
+        }
+        END {
+            emit_if_requested()
+        }
+    ' "$xmltree" >"$output"
+
+    [[ -s "$output" ]] || fail "${element} component를 찾을 수 없습니다: ${component_name}"
+}
+
+assert_component_attribute() {
+    local block="$1"
+    local attribute="$2"
+    local expected="$3"
+    local message="$4"
+
+    component_attribute_matches "$block" "$attribute" "$expected" ||
+        fail "$message"
+}
+
+component_attribute_matches() {
+    local block="$1"
+    local attribute="$2"
+    local expected="$3"
+
+    grep -Eq ":${attribute}\\([^)]*\\)=${expected}([[:space:]]|$)" "$block"
+}
+
+assert_template_component_contract() {
+    local xmltree="$1"
+    local temp_dir="$2"
+    local activity_block="${temp_dir}/activity.txt"
+    local provider_block="${temp_dir}/provider.txt"
+    local exported_mutation="${temp_dir}/activity-exported-false.txt"
+
+    assert_component_block "$xmltree" activity \
+        "dev.sixbridge.runtime.SixDiscoveryActivity" "$activity_block"
+    assert_component_attribute "$activity_block" exported true \
+        "discovery Activity는 exported=true여야 합니다."
+    assert_component_attribute "$activity_block" excludeFromRecents true \
+        "discovery Activity는 excludeFromRecents=true여야 합니다."
+    assert_component_attribute "$activity_block" theme '@0x01030055' \
+        "discovery Activity theme은 Theme.NoDisplay여야 합니다."
+    assert_component_block "$xmltree" provider \
+        "dev.sixbridge.runtime.ExtensionProvider" "$provider_block"
+    assert_component_attribute "$provider_block" exported true \
+        "ExtensionProvider는 exported=true여야 합니다."
+    assert_component_attribute "$provider_block" enabled true \
+        "ExtensionProvider는 enabled=true여야 합니다."
+    assert_component_attribute "$provider_block" grantUriPermissions false \
+        "ExtensionProvider는 grantUriPermissions=false여야 합니다."
+
+    awk '
+        !changed && /:exported\([^)]*\)=true$/ {
+            sub(/=true$/, "=false")
+            changed = 1
+        }
+        { print }
+    ' "$activity_block" >"$exported_mutation"
+    if ! component_attribute_matches "$exported_mutation" exported false; then
+        fail "exported=false 변이를 만들지 못했습니다."
+    fi
+    if component_attribute_matches "$exported_mutation" exported true; then
+        fail "exported=false Activity 변이가 허용되었습니다."
+    fi
+}
+
+assert_atomic_provider_source() {
+    [[ -f "$PROVIDER_SOURCE" ]] || fail "ExtensionProvider source를 찾을 수 없습니다: $PROVIDER_SOURCE"
+    assert_contains "$PROVIDER_SOURCE" \
+        'File.createTempFile("extension.crx.", ".tmp", target.getParentFile())' \
+        "ExtensionProvider는 고유한 같은 디렉터리 temporary file을 만들어야 합니다."
+    assert_contains "$PROVIDER_SOURCE" 'Files.move(' \
+        "ExtensionProvider는 Files.move로 CRX를 게시해야 합니다."
+    assert_contains "$PROVIDER_SOURCE" 'StandardCopyOption.ATOMIC_MOVE' \
+        "ExtensionProvider는 ATOMIC_MOVE를 사용해야 합니다."
+    assert_contains "$PROVIDER_SOURCE" 'StandardCopyOption.REPLACE_EXISTING' \
+        "ExtensionProvider는 REPLACE_EXISTING을 사용해야 합니다."
+    assert_contains "$PROVIDER_SOURCE" 'Files.deleteIfExists(temporary.toPath())' \
+        "ExtensionProvider는 finally에서 temporary file을 정리해야 합니다."
+    if grep -Fq 'target.delete()' "$PROVIDER_SOURCE"; then
+        fail "ExtensionProvider는 기존 CRX를 먼저 삭제하면 안 됩니다."
+    fi
+}
+
+assert_package_script_contract() {
+    [[ -f "$PACKAGE_SCRIPT" ]] || fail "패키징 스크립트를 찾을 수 없습니다: $PACKAGE_SCRIPT"
+    assert_contains "$PACKAGE_SCRIPT" \
+        '[[ -x "${TEMPLATE_TEST_SCRIPT}" ]] ||' \
+        "패키징은 template 계약 스크립트 누락을 fail-closed로 처리해야 합니다."
+    assert_contains "$PACKAGE_SCRIPT" '"${TEMPLATE_TEST_SCRIPT}"' \
+        "패키징은 template 계약 스크립트를 무조건 실행해야 합니다."
+}
+
+assert_package_script_fail_closed() {
+    local temp_dir="$1"
+    local fixture_dir="${temp_dir}/package-fixture"
+    local output_file="${temp_dir}/package-fixture-output.txt"
+
+    mkdir -p "${fixture_dir}/scripts"
+    cp "$PACKAGE_SCRIPT" "${fixture_dir}/scripts/package-manager-debug.sh"
+    printf '#!/bin/sh\nexit 0\n' >"${fixture_dir}/scripts/verify.sh"
+    chmod +x \
+        "${fixture_dir}/scripts/package-manager-debug.sh" \
+        "${fixture_dir}/scripts/verify.sh"
+    if bash "${fixture_dir}/scripts/package-manager-debug.sh" >"$output_file" 2>&1; then
+        fail "template 계약 스크립트가 없는 패키징 fixture가 성공했습니다."
+    fi
+    assert_contains "$output_file" "템플릿 계약 스크립트를 실행할 수 없습니다" \
+        "패키징 fixture가 template 계약 스크립트 누락을 fail-closed로 처리하지 않았습니다."
+}
+
 assert_unsigned() {
     local template="$1"
     local entries_file="$2"
@@ -73,6 +219,8 @@ main() {
     require_tool "$ZIPALIGN"
     [[ -x "$GENERATOR" ]] || fail "템플릿 생성 스크립트를 찾을 수 없습니다: $GENERATOR"
     [[ -f "$template" ]] || fail "래퍼 템플릿 APK를 찾을 수 없습니다: $template"
+    assert_atomic_provider_source
+    assert_package_script_contract
 
     if [[ "$template" == "$DEFAULT_TEMPLATE" ]]; then
         "$GENERATOR" --check
@@ -93,11 +241,12 @@ main() {
     resources_info="${temp_dir}/resources.txt"
     placeholder_crx="${temp_dir}/extension.crx"
 
+    assert_package_script_fail_closed "$temp_dir"
+
     "$AAPT2" dump badging "$template" >"$badging"
     "$AAPT2" dump xmltree "$template" --file AndroidManifest.xml >"$xmltree"
     zipinfo -1 "$template" >"$entries"
     zipinfo -v "$template" resources.arsc >"$resources_info"
-    unzip -p "$template" assets/extension.crx >"$placeholder_crx"
 
     assert_contains "$badging" "package: name='${PACKAGE_NAME}' versionCode='1'" \
         "템플릿 package 또는 versionCode가 올바르지 않습니다."
@@ -113,8 +262,10 @@ main() {
         "BROWSABLE Activity contract가 없습니다."
     assert_contains "$xmltree" "\"six\"" "six://ex scheme contract가 없습니다."
     assert_contains "$xmltree" "\"ex\"" "six://ex host contract가 없습니다."
+    assert_template_component_contract "$xmltree" "$temp_dir"
     assert_unsigned "$template" "$entries"
     assert_runtime_entries "$entries"
+    unzip -p "$template" assets/extension.crx >"$placeholder_crx"
     printf 'SIXBRIDGE-CRX-PLACEHOLDER\n' >"${temp_dir}/expected-extension.crx"
     cmp -s "$placeholder_crx" "${temp_dir}/expected-extension.crx" ||
         fail "템플릿 extension.crx placeholder 내용이 올바르지 않습니다."
