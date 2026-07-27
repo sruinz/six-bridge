@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
+import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
@@ -133,6 +134,145 @@ class BrowserArchiveEvidenceScannerTest {
         assertEquals(BrowserProfile.BASELINE_APIS, profile.detectedApis)
         assertTrue("extension.options-page.user-accessible" in profile.supportedFeatures)
         assertEquals(ProfileSupport.SUPPORTED, profile.support)
+    }
+
+    @Test
+    fun `installation digest도 filename과 canonical collision을 먼저 검증한다`() {
+        listOf("", ".", "..", "dir/base.apk", "dir\\base.apk", "base\u0000.apk")
+            .forEach { invalidName ->
+                val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+                    evidence(baseApk = archive(invalidName)).installationApkSetSha256()
+                }
+                assertEquals(
+                    BrowserArchiveEvidenceFailure.INVALID_EVIDENCE,
+                    failure.failure,
+                )
+            }
+
+        listOf(
+            archive("Base.apk") to archive("base.apk"),
+            archive("É.apk") to archive("e\u0301.apk"),
+            archive("straße.apk") to archive("STRASSE.apk"),
+        ).forEach { (base, split) ->
+            val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+                evidence(baseApk = base, splitApks = listOf(split))
+                    .installationApkSetSha256()
+            }
+            assertEquals(
+                BrowserArchiveEvidenceFailure.INVALID_EVIDENCE,
+                failure.failure,
+            )
+        }
+    }
+
+    @Test
+    fun `exact baseline base에 split 추가 또는 변경은 Unknown이고 제거는 복구된다`() {
+        val baseOnly = scanner.scan(
+            evidence(versionName = BrowserProfile.BASELINE_VERSION),
+        ).copy(sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256)
+        val added = scanner.scan(
+            evidence(
+                versionName = BrowserProfile.BASELINE_VERSION,
+                splitApks = listOf(archive("feature.apk", padding = "first")),
+            ),
+        ).copy(sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256)
+        val changed = scanner.scan(
+            evidence(
+                versionName = BrowserProfile.BASELINE_VERSION,
+                splitApks = listOf(archive("feature.apk", padding = "second")),
+            ),
+        ).copy(sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256)
+
+        assertEquals(ProfileSupport.SUPPORTED, baseOnly.support)
+        assertEquals(ProfileSupport.UNKNOWN, added.support)
+        assertEquals(ProfileSupport.UNKNOWN, changed.support)
+        assertTrue(added.profileDifferences.any { it.startsWith("unexpected_split:") })
+        assertNotEquals(
+            added.installationApkSetSha256,
+            changed.installationApkSetSha256,
+        )
+        assertNotEquals(
+            added.installationApkSetSha256,
+            baseOnly.installationApkSetSha256,
+        )
+    }
+
+    @Test
+    fun `raw entry total inflate와 ratio budget 초과를 구분해 거부한다`() {
+        val bytes = apkBytes()
+        val cases = listOf(
+            BrowserArchiveScanLimits(maxRawBytesPerArchive = bytes.size.toLong() - 1) to
+                evidence(baseApk = archive("base.apk", bytes)),
+            BrowserArchiveScanLimits(maxTotalRawBytes = bytes.size.toLong() * 2 - 1) to
+                evidence(
+                    baseApk = archive("base.apk", bytes),
+                    splitApks = listOf(archive("feature.apk", bytes)),
+                ),
+            BrowserArchiveScanLimits(maxArchiveCount = 1) to
+                evidence(
+                    baseApk = archive("base.apk", bytes),
+                    splitApks = listOf(archive("feature.apk", bytes)),
+                ),
+            BrowserArchiveScanLimits(maxEntryCountPerArchive = 1) to
+                evidence(baseApk = archive("base.apk", bytes)),
+            BrowserArchiveScanLimits(maxInflatedBytesPerEntry = 8) to
+                evidence(baseApk = archive("base.apk", bytes)),
+            BrowserArchiveScanLimits(maxTotalInflatedBytesPerArchive = 8) to
+                evidence(baseApk = archive("base.apk", bytes)),
+            BrowserArchiveScanLimits(maxInflateRatio = 2) to
+                evidence(
+                    baseApk = archive(
+                        "base.apk",
+                        apkBytes(padding = "0".repeat(64 * 1024)),
+                    ),
+                ),
+        )
+        cases.forEach { (limits, evidence) ->
+            val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+                BrowserArchiveEvidenceScanner(limits = limits)
+                    .scan(evidence)
+            }
+            assertEquals(
+                BrowserArchiveEvidenceFailure.RESOURCE_LIMIT_EXCEEDED,
+                failure.failure,
+            )
+        }
+    }
+
+    @Test
+    fun `scanner cancellation은 evidence 실패로 감싸지 않고 전파한다`() {
+        var checks = 0
+        val scanner = BrowserArchiveEvidenceScanner(
+            checkCancelled = {
+                checks += 1
+                if (checks == 3) throw CancellationException("cancelled")
+            },
+        )
+
+        assertFailsWith<CancellationException> {
+            scanner.scan(evidence())
+        }
+    }
+
+    @Test
+    fun `archive close 실패도 read 실패로 닫는다`() {
+        val bytes = apkBytes()
+        val input = object : BrowserArchiveInput {
+            override val name = "base.apk"
+            override val sha256 = sha256(bytes)
+            override fun openStream(): InputStream = object : ByteArrayInputStream(bytes) {
+                override fun close() {
+                    super.close()
+                    throw IOException("close failed")
+                }
+            }
+        }
+
+        val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+            scanner.scan(evidence(baseApk = input))
+        }
+
+        assertEquals(BrowserArchiveEvidenceFailure.READ_FAILED, failure.failure)
     }
 
     private fun evidence(

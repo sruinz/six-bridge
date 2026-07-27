@@ -11,6 +11,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
+import java.util.zip.ZipInputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -31,12 +32,29 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
             .map { sha256(it.toByteArray()) }
         val base = File(requireNotNull(applicationInfo.sourceDir))
         val splits = applicationInfo.splitSourceDirs.orEmpty().map(::File)
-        val archiveHashes = (listOf(base) + splits).map { archive ->
-            archive.name to archive.inputStream().use(::sha256)
+        assertEquals("검증 기준 설치는 base-only여야 합니다.", 0, splits.size)
+        val archiveHashes = (listOf(base) + splits).mapIndexed { index, archive ->
+            val logicalName = if (index == 0) "base.apk" else archive.name
+            logicalName to archive.inputStream().use(::sha256)
         }
         val expectedInstallationSha256 = installationApkSetSha256(archiveHashes)
+        val oracle = inspectArchives(listOf(base) + splits)
+        val expectedSupport = (
+            packageInfo.packageName == SAMSUNG_BROWSER_PACKAGE &&
+                signerSha256 == listOf(BrowserProfile.SAMSUNG_SIGNER_SHA256) &&
+                packageInfo.versionName.orEmpty().substringBefore('.').toIntOrNull() == 30 &&
+                oracle.wrapperContractComplete &&
+                oracle.namespaces == BrowserProfile.BASELINE_APIS
+            )
 
+        assertTrue(
+            context.getSharedPreferences(
+                AndroidSamsungBrowserProfileProvider.CACHE_PREFERENCES,
+                android.content.Context.MODE_PRIVATE,
+            ).edit().clear().commit(),
+        )
         val result = AndroidSamsungBrowserProfileProvider(context).load()
+        assertEquals(true, expectedSupport)
         assertTrue(result is SamsungBrowserProfileResult.Supported)
         val supported = result as SamsungBrowserProfileResult.Supported
         val profile = supported.profile
@@ -51,7 +69,12 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
         assertEquals(signerSha256.single(), profile.sourceApkSignerSha256)
         assertEquals(archiveHashes.first().second, profile.sourceApkSha256)
         assertEquals(expectedInstallationSha256, profile.installationApkSetSha256)
-        assertTrue(profile.wrapperContract.isComplete)
+        assertEquals(oracle.discoveryUri, profile.wrapperContract.discoveryUri)
+        assertEquals(oracle.extensionMetadata, profile.wrapperContract.extensionMetadata)
+        assertEquals(oracle.contentProvider, profile.wrapperContract.contentProvider)
+        assertEquals(oracle.devExtensionPath, profile.wrapperContract.devExtensionPath)
+        assertEquals(oracle.namespaces, profile.detectedApis)
+        assertEquals(oracle.wrapperContractComplete, profile.wrapperContract.isComplete)
         assertEquals(ProfileSupport.SUPPORTED, profile.support)
 
         val marker = buildString {
@@ -104,6 +127,64 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    private fun inspectArchives(archives: List<File>): IndependentOracle {
+        val markers = mutableSetOf<String>()
+        val namespaces = mutableSetOf<String>()
+        archives.forEach { archive ->
+            ZipInputStream(archive.inputStream().buffered()).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    if (
+                        entry.name.endsWith(".dex") ||
+                        entry.name.endsWith("/libterrace.so")
+                    ) {
+                        scanText(zip) { text ->
+                            ORACLE_MARKERS.filterTo(markers) { it in text }
+                            NAMESPACE_REGEX.findAll(text).forEach {
+                                namespaces += it.groupValues[1]
+                            }
+                        }
+                    }
+                    zip.closeEntry()
+                }
+            }
+        }
+        return IndependentOracle(
+            discoveryUri = "six://ex" in markers,
+            extensionMetadata = "extension-id" in markers,
+            contentProvider = ".contentprovider" in markers,
+            devExtensionPath = "dev_ext" in markers,
+            namespaces = namespaces,
+        )
+    }
+
+    private fun scanText(input: java.io.InputStream, consume: (String) -> Unit) {
+        val buffer = ByteArray(64 * 1024)
+        var tail = ""
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            check(read > 0)
+            val text = tail + buffer.decodeToString(endIndex = read)
+            consume(text)
+            tail = text.takeLast(512)
+        }
+    }
+
+    private data class IndependentOracle(
+        val discoveryUri: Boolean,
+        val extensionMetadata: Boolean,
+        val contentProvider: Boolean,
+        val devExtensionPath: Boolean,
+        val namespaces: Set<String>,
+    ) {
+        val wrapperContractComplete: Boolean
+            get() = discoveryUri &&
+                extensionMetadata &&
+                contentProvider &&
+                devExtensionPath
+    }
+
     private fun MessageDigest.bytes(value: ByteArray) {
         update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(value.size).array())
         update(value)
@@ -130,5 +211,13 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
         const val SAMSUNG_BROWSER_PACKAGE = "com.sec.android.app.sbrowser"
         const val INSTALLATION_DIGEST_DOMAIN =
             "sixbridge-browser-installation-apk-set-v1"
+        val ORACLE_MARKERS = setOf(
+            "six://ex",
+            "extension-id",
+            ".contentprovider",
+            "dev_ext",
+        )
+        val NAMESPACE_REGEX =
+            Regex("""["']namespace["']\s*:\s*["']([A-Za-z][A-Za-z0-9_.]*)["']""")
     }
 }

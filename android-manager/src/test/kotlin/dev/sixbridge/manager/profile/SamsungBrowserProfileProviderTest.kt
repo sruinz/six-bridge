@@ -4,16 +4,26 @@ import dev.sixbridge.core.profile.BrowserArchiveInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.ProfileSupport
+import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
+import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SamsungBrowserProfileProviderTest {
@@ -186,6 +196,172 @@ class SamsungBrowserProfileProviderTest {
     }
 
     @Test
+    fun `구문상 유효한 cache facts 변조도 profile digest 불일치로 재검사한다`(): Unit =
+        runBlocking {
+            val cache = MemoryCache()
+            val incomplete = CountingArchive(
+                "base.apk",
+                apk(dex = "extension-id"),
+            )
+            assertIs<SamsungBrowserProfileResult.Unknown>(
+                provider(found(baseApk = incomplete), cache).load(),
+            )
+            val forged = BrowserProfileJson.decode(cache.value!!.encodedProfile)
+                .copy(
+                    wrapperContract = WrapperContract.complete(),
+                    profileDifferences = emptyList(),
+                )
+            cache.value = cache.value?.copy(
+                encodedProfile = BrowserProfileJson.encode(forged),
+            )
+
+            val result = provider(found(baseApk = incomplete), cache).load()
+
+            assertIs<SamsungBrowserProfileResult.Unknown>(result)
+            assertEquals(4, incomplete.openCount)
+
+            val invalidFacts = Json.parseToJsonElement(cache.value!!.encodedProfile)
+                .jsonObject
+                .toMutableMap()
+                .apply {
+                    val feature = JsonArray(listOf(JsonPrimitive("same-feature")))
+                    this["supportedFeatures"] = feature
+                    this["unavailableFeatures"] = feature
+                }
+            cache.value = cache.value?.copy(
+                encodedProfile = JsonObject(invalidFacts).toString(),
+            )
+
+            assertIs<SamsungBrowserProfileResult.Unknown>(
+                provider(found(baseApk = incomplete), cache).load(),
+            )
+            assertEquals(6, incomplete.openCount)
+        }
+
+    @Test
+    fun `legacy domain 또는 profile digest가 다른 cache는 재검사한다`(): Unit =
+        runBlocking {
+            listOf<(CachedSamsungBrowserProfile) -> CachedSamsungBrowserProfile>(
+                { it.copy(domain = "legacy") },
+                { it.copy(profileDigest = "0".repeat(64)) },
+            ).forEach { corrupt ->
+                val cache = MemoryCache()
+                assertIs<SamsungBrowserProfileResult.Supported>(
+                    provider(found(), cache).load(),
+                )
+                cache.value = corrupt(cache.value!!)
+                val archive = CountingArchive("base.apk", completeApk())
+
+                assertIs<SamsungBrowserProfileResult.Supported>(
+                    provider(found(baseApk = archive), cache).load(),
+                )
+                assertEquals(2, archive.openCount)
+            }
+        }
+
+    @Test
+    fun `cache hit 직전과 직후 설치 snapshot이 바뀌면 stale 결과를 거부한다`(): Unit =
+        runBlocking {
+            val cache = MemoryCache()
+            val stable = found()
+            assertIs<SamsungBrowserProfileResult.Supported>(
+                provider(stable, cache).load(),
+            )
+            val changed = found(
+                baseApk = archive("base.apk", apk(padding = "changed")),
+            )
+
+            val result = provider(listOf(stable, changed), cache).load()
+
+            val unknown = assertIs<SamsungBrowserProfileResult.Unknown>(result)
+            assertTrue("package_changed" in unknown.reasons)
+        }
+
+    @Test
+    fun `full scan 직전과 직후 설치 snapshot이 바뀌면 cache하지 않는다`(): Unit =
+        runBlocking {
+            val cache = MemoryCache()
+            val initial = found()
+            val changed = found(versionCode = initial.versionCode + 1)
+
+            val result = provider(listOf(initial, changed), cache).load()
+
+            val unknown = assertIs<SamsungBrowserProfileResult.Unknown>(result)
+            assertTrue("package_changed" in unknown.reasons)
+            assertNull(cache.value)
+        }
+
+    @Test
+    fun `cache 저장 commit 실패는 안전한 현재 결과를 반환하고 다음 load에서 재검사한다`(): Unit =
+        runBlocking {
+            val cache = MemoryCache(saveSucceeds = false)
+            val archive = CountingArchive("base.apk", completeApk())
+
+            assertIs<SamsungBrowserProfileResult.Supported>(
+                provider(found(baseApk = archive), cache).load(),
+            )
+            assertIs<SamsungBrowserProfileResult.Supported>(
+                provider(found(baseApk = archive), cache).load(),
+            )
+
+            assertNull(cache.value)
+            assertEquals(4, archive.openCount)
+        }
+
+    @Test
+    fun `coroutine cancellation은 Unknown으로 감싸지 않고 전파한다`() {
+        val provider = AndroidSamsungBrowserProfileProvider(
+            packageLookup = SamsungBrowserPackageLookup { checkCancelled ->
+                checkCancelled()
+                throw CancellationException("cancelled")
+            },
+            cache = MemoryCache(),
+        )
+
+        assertFailsWith<CancellationException> {
+            runBlocking { provider.load() }
+        }
+    }
+
+    @Test
+    fun `Android splitNames와 splitSourceDirs를 1대1 logical archive로 전달한다`() {
+        val base = File.createTempFile("sixbridge-base", ".apk")
+        val split = File.createTempFile("sixbridge-split", ".apk")
+        try {
+            base.writeBytes(byteArrayOf(1, 2, 3))
+            split.writeBytes(byteArrayOf(4, 5, 6))
+
+            val archives = androidArchiveInputs(
+                sourceDir = base.absolutePath,
+                splitNames = listOf("config.arm64_v8a"),
+                splitSourceDirs = listOf(split.absolutePath),
+                checkCancelled = {},
+            )
+
+            assertEquals("base.apk", archives.baseApk.name)
+            assertEquals(listOf("split_config.arm64_v8a.apk"), archives.splitApks.map { it.name })
+            assertEquals(sha256(base.readBytes()), archives.baseApk.sha256)
+            assertEquals(sha256(split.readBytes()), archives.splitApks.single().sha256)
+            assertEquals(
+                listOf(4, 5, 6),
+                archives.splitApks.single().openStream().use { it.readBytes() }
+                    .map(Byte::toInt),
+            )
+            assertFailsWith<IllegalArgumentException> {
+                androidArchiveInputs(
+                    sourceDir = base.absolutePath,
+                    splitNames = emptyList(),
+                    splitSourceDirs = listOf(split.absolutePath),
+                    checkCancelled = {},
+                )
+            }
+        } finally {
+            base.delete()
+            split.delete()
+        }
+    }
+
+    @Test
     fun `archive read 실패와 두 번 open 내용 변경은 Unknown이다`(): Unit = runBlocking {
         val failing = object : BrowserArchiveInput {
             override val name = "base.apk"
@@ -216,9 +392,22 @@ class SamsungBrowserProfileProviderTest {
         lookup: SamsungBrowserPackageLookupResult,
         cache: SamsungBrowserProfileCache = MemoryCache(),
     ) = AndroidSamsungBrowserProfileProvider(
-        packageLookup = SamsungBrowserPackageLookup { lookup },
+        packageLookup = SamsungBrowserPackageLookup { _ -> lookup },
         cache = cache,
     )
+
+    private fun provider(
+        lookups: List<SamsungBrowserPackageLookupResult>,
+        cache: SamsungBrowserProfileCache = MemoryCache(),
+    ): AndroidSamsungBrowserProfileProvider {
+        val remaining = ArrayDeque(lookups)
+        return AndroidSamsungBrowserProfileProvider(
+            packageLookup = SamsungBrowserPackageLookup {
+                remaining.removeFirstOrNull() ?: lookups.last()
+            },
+            cache = cache,
+        )
+    }
 
     private fun found(
         versionName: String = "30.1.0.1",
@@ -279,13 +468,16 @@ class SamsungBrowserProfileProviderTest {
         }
     }
 
-    private class MemoryCache : SamsungBrowserProfileCache {
+    private class MemoryCache(
+        private val saveSucceeds: Boolean = true,
+    ) : SamsungBrowserProfileCache {
         var value: CachedSamsungBrowserProfile? = null
 
         override fun load(): CachedSamsungBrowserProfile? = value
 
-        override fun save(value: CachedSamsungBrowserProfile) {
-            this.value = value
+        override fun save(value: CachedSamsungBrowserProfile): Boolean {
+            if (saveSucceeds) this.value = value
+            return saveSucceeds
         }
     }
 
