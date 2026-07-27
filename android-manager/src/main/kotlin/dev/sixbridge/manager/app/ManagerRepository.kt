@@ -16,9 +16,9 @@ import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionCoordinatorPort
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
-import dev.sixbridge.manager.conversion.OnDeviceConversionCoordinator
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.icon.CatalogIconEnricher
@@ -167,7 +167,9 @@ internal class DefaultManagerRepository(
     private val installEvents: Flow<PackageInstallCallback> = PackageInstallEvents.events,
     private val afterInstallRequest: suspend (InstallState) -> Unit = {},
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val conversionCoordinator: OnDeviceConversionCoordinator? = null,
+    private val conversionCoordinator: ConversionCoordinatorPort? = null,
+    private val generatedImporter: suspend (GeneratedBundle) -> ImportResult =
+        importer::importGenerated,
 ) : ManagerRepository {
     private val started = AtomicBoolean()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
@@ -254,7 +256,7 @@ internal class DefaultManagerRepository(
     }
 
     override suspend fun importGenerated(bundle: GeneratedBundle): ManagerImportResult =
-        retainImport(importer.importGenerated(bundle))
+        retainImport(generatedImporter(bundle))
 
     override suspend fun beginConversion(
         request: OnDeviceInputRequest,

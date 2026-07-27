@@ -13,11 +13,20 @@ import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.conversion.ConversionBeginResult
+import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionCoordinatorPort
+import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.OnDeviceInputRequest
+import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.InstalledExtensionIconSource
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
+import dev.sixbridge.manager.importer.ImportResult
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.BundleSource
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
@@ -50,6 +59,8 @@ import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.NoSuchFileException
@@ -319,6 +330,109 @@ class ManagerRepositoryTest {
 
         assertNull(store.load(TOKEN))
     }
+
+    @Test
+    fun `repository는 generated import를 보존하고 conversion 복원 취소 저장을 위임한다`() =
+        runBlocking {
+            val retainedRoot = temporaryFolder.newFolder("generated-repository-retained")
+            val imported = importedBundle(retainedRoot)
+            val retainedImports = RetainedImportStore(retainedRoot) { _, _, _ ->
+                WrapperVerificationResult.Success(imported.verifiedApk)
+            }
+            val generatedFile = temporaryFolder.newFile("repository-generated.six")
+                .apply { writeText("bundle") }
+            val generated = GeneratedBundle(
+                token = TOKEN,
+                file = generatedFile,
+                sha256 = "f".repeat(64),
+                suggestedFileName = "$TOKEN.six",
+            )
+            val beginFailure =
+                ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            val buildFailure =
+                ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            val restored = RestoredConversion.GeneratedPending(generated)
+            val calls = mutableListOf<String>()
+            val conversion = object : ConversionCoordinatorPort {
+                override suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
+                    calls += "begin"
+                    return beginFailure
+                }
+
+                override suspend fun build(
+                    token: String,
+                    approvedAdapterIds: Set<String>,
+                    partialConfirmed: Boolean,
+                    identitySelection: InstallationIdentitySelection?,
+                ): ConversionBuildResult {
+                    calls += "build"
+                    return buildFailure
+                }
+
+                override suspend fun restore(): RestoredConversion {
+                    calls += "restore"
+                    return restored
+                }
+
+                override suspend fun discard(token: String): Boolean {
+                    calls += "discard"
+                    return true
+                }
+
+                override fun copyGenerated(token: String, output: OutputStream): String {
+                    calls += "copy"
+                    output.write("bundle".encodeToByteArray())
+                    return generated.sha256
+                }
+            }
+            val pendingStore = StartupPendingStore(null, retainedRoot)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val install = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root = retainedRoot,
+                retainedImports = retainedImports,
+                gateway = gateway,
+                pendingStore = pendingStore,
+                installed = installed,
+                catalog = catalog,
+                coordinator = install,
+                conversionCoordinator = conversion,
+                generatedImporter = {
+                    calls += "import-generated"
+                    assertEquals(generated, it)
+                    ImportResult.Success(imported)
+                },
+            )
+
+            val importedResult =
+                assertIs<ManagerImportResult.Success>(repository.importGenerated(generated))
+            assertEquals(TOKEN, importedResult.review.token)
+            assertNotNull(retainedImports.load(TOKEN))
+            assertSame(
+                beginFailure,
+                repository.beginConversion(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+            assertSame(buildFailure, repository.approveConversion(TOKEN, emptySet(), true, null))
+            assertSame(restored, repository.restoreConversion())
+            val copied = ByteArrayOutputStream()
+            assertEquals(generated.sha256, repository.copyGeneratedConversion(TOKEN, copied))
+            assertEquals("bundle", copied.toString(Charsets.UTF_8.name()))
+            assertTrue(repository.discardConversion(TOKEN))
+            assertEquals(
+                listOf("import-generated", "begin", "build", "restore", "copy", "discard"),
+                calls,
+            )
+        }
 
     @Test
     fun `callback router는 confirmation을 launch하지 않고 terminal result만 전달한다`() =
@@ -2156,6 +2270,10 @@ class ManagerRepositoryTest {
                 UninstallOutcome.CancelledOrStillInstalled
         },
         catalogPublisher: CatalogPublisher = catalogPublisher(catalog, installed),
+        conversionCoordinator: ConversionCoordinatorPort? = null,
+        generatedImporter: suspend (GeneratedBundle) -> ImportResult = {
+            ImportResult.Failure(ImportFailure(ImportFailureCode.CACHE_IO))
+        },
     ) = DefaultManagerRepository(
         importer = BundleImportService(
             BundleSource { error("직접 import하지 않습니다.") },
@@ -2181,6 +2299,8 @@ class ManagerRepositoryTest {
         installEvents = emptyFlow(),
         ioDispatcher = Dispatchers.Unconfined,
         afterInstallRequest = afterInstallRequest,
+        conversionCoordinator = conversionCoordinator,
+        generatedImporter = generatedImporter,
     )
 
     private fun catalogPublisher(

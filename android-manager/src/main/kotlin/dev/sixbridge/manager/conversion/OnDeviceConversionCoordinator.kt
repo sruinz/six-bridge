@@ -18,10 +18,10 @@ internal class OnDeviceConversionCoordinator(
     private val packages: ConversionPackagePort,
     private val bundles: ConversionBundlePort,
     private val imports: ConversionGeneratedImportPort,
-) {
+) : ConversionCoordinatorPort {
     private val buildMutex = Mutex()
 
-    suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
+    override suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
         val artifact = try {
             input.acquire(request)
         } catch (error: CancellationException) {
@@ -51,7 +51,7 @@ internal class OnDeviceConversionCoordinator(
         )
     }
 
-    suspend fun build(
+    override suspend fun build(
         token: String,
         approvedAdapterIds: Set<String>,
         partialConfirmed: Boolean,
@@ -146,12 +146,26 @@ internal class OnDeviceConversionCoordinator(
         var generated: GeneratedBundle? = null
         var building = false
         try {
-            val resolved = identities.resolve(
-                prepared,
-                profile,
-                identitySelection,
-                token,
-            )
+            val resolved = try {
+                identities.resolve(
+                    prepared,
+                    profile,
+                    identitySelection,
+                    token,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: IllegalArgumentException) {
+                abortOwner(token)
+                return@withLock ConversionBuildResult.Failure(
+                    ConversionFailureCode.IDENTITY_MISMATCH,
+                )
+            } catch (_: Throwable) {
+                abortOwner(token)
+                return@withLock ConversionBuildResult.Failure(
+                    ConversionFailureCode.KEYSTORE,
+                )
+            }
             val installedWrapper = installed.find(resolved.identity.packageName)
             if (
                 installedWrapper != null &&
@@ -204,7 +218,7 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 
-    suspend fun restore(): RestoredConversion? {
+    override suspend fun restore(): RestoredConversion? {
         val job = work.restoreBuildAware() ?: return null
         if (job.stage == ConversionJobStage.BUILDING) {
             val generated = bundles.recover(job.token)
@@ -238,7 +252,7 @@ internal class OnDeviceConversionCoordinator(
             ?.let(RestoredConversion::Analysis)
     }
 
-    suspend fun discard(token: String): Boolean {
+    override suspend fun discard(token: String): Boolean {
         abortOwner(token)
         bundles.recover(token)?.let {
             if (!bundles.discard(token)) return false
@@ -246,7 +260,7 @@ internal class OnDeviceConversionCoordinator(
         return work.discard(token)
     }
 
-    fun copyGenerated(token: String, output: OutputStream): String? =
+    override fun copyGenerated(token: String, output: OutputStream): String? =
         bundles.recover(token)?.let { bundles.copyTo(token, output) }
 
     private suspend fun analyzeJob(

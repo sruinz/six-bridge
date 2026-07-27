@@ -227,3 +227,16 @@ internal interface ConversionBundlePort {
 internal fun interface ConversionGeneratedImportPort {
     suspend fun importGenerated(generated: GeneratedBundle): ReviewBundle?
 }
+
+internal interface ConversionCoordinatorPort {
+    suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult
+    suspend fun build(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+    ): ConversionBuildResult
+    suspend fun restore(): RestoredConversion?
+    suspend fun discard(token: String): Boolean
+    fun copyGenerated(token: String, output: OutputStream): String?
+}
