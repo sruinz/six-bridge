@@ -1,5 +1,7 @@
 package dev.sixbridge.core.draft
 
+import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.conversion.WorkspaceAccessState
@@ -13,6 +15,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
 import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
@@ -44,6 +47,7 @@ class SixDraftPayload private constructor(
     val plan: DraftConversionPlan,
     compatibilityBefore: dev.sixbridge.core.compat.CompatibilityReport,
     compatibilityAfter: dev.sixbridge.core.compat.CompatibilityReport,
+    val expected: DraftExpected,
     copySource: Boolean,
 ) {
     val compatibilityBefore = compatibilityBefore.deepImmutableCopy()
@@ -57,11 +61,8 @@ class SixDraftPayload private constructor(
     private val stableCompatibilityAfterJson =
         SixDraftJson.encodeCompatibility(compatibilityAfter)
     private val stableExpectedJson = SixDraftJson.encodeExpected(
-        DraftExpected(
-            sourceSha256 = requireNotNull(compatibilityAfter.sourceSha256),
-            reportSha256 = DraftSignature.sha256(stableCompatibilityAfterJson),
-            planSha256 = plan.planSha256,
-        ),
+        expected,
+        draft.schemaVersion,
     )
 
     val draftJson: ByteArray
@@ -111,6 +112,12 @@ class SixDraftPayload private constructor(
                 compatibilityBefore,
                 compatibilityAfter,
             )
+            val expected = expectedFor(
+                draft,
+                input,
+                plan,
+                compatibilityAfter,
+            )
             SixDraftPayload(
                 draft,
                 input,
@@ -119,6 +126,7 @@ class SixDraftPayload private constructor(
                 plan,
                 compatibilityBefore,
                 compatibilityAfter,
+                expected,
                 copySource = true,
             )
         } catch (error: InvalidSixDraftException) {
@@ -152,15 +160,13 @@ class SixDraftPayload private constructor(
                 "compatibility-after.json",
                 compatibilityAfterJson,
             )
-            val expected = SixDraftJson.decodeExpected(expectedJson)
+            val expected = SixDraftJson.decodeExpected(
+                expectedJson,
+                draft.schemaVersion,
+                input.originalSourceSha256,
+            )
             validateSemantics(draft, input, sourceKind, source, plan, before, after)
-            require(expected == DraftExpected(
-                sourceSha256 = requireNotNull(after.sourceSha256),
-                reportSha256 = DraftSignature.sha256(
-                    SixDraftJson.encodeCompatibility(after),
-                ),
-                planSha256 = plan.planSha256,
-            )) {
+            require(expected == expectedFor(draft, input, plan, after)) {
                 "expected.json 의미 결합이 일치하지 않습니다."
             }
             return SixDraftPayload(
@@ -171,11 +177,71 @@ class SixDraftPayload private constructor(
                 plan,
                 before,
                 after,
+                expected,
                 copySource = false,
             )
         }
 
+        private fun expectedFor(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            plan: DraftConversionPlan,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ): DraftExpected {
+            val transformed = requireNotNull(after.sourceSha256)
+            val report = when (draft.schemaVersion) {
+                1 -> DraftSignature.sha256(
+                    SixDraftJson.encodeCompatibility(after),
+                )
+                2 -> DraftSignature.sha256(
+                    BundleJson.encodeCompatibility(
+                        after.toContractV4(
+                            originalSourceSha256 = input.originalSourceSha256,
+                            planSha256 = plan.planSha256,
+                        ),
+                    ).toByteArray(UTF_8),
+                )
+                else -> error("지원하지 않는 draft schemaVersion입니다.")
+            }
+            return DraftExpected(
+                originalSourceSha256 = input.originalSourceSha256,
+                transformedSourceSha256 = transformed,
+                reportSha256 = report,
+                planSha256 = plan.planSha256,
+            )
+        }
+
         private fun validateSemantics(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            sourceKind: DraftSourceKind,
+            source: ByteArray,
+            plan: DraftConversionPlan,
+            before: dev.sixbridge.core.compat.CompatibilityReport,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ) = when (draft.schemaVersion) {
+            1 -> validateV1Semantics(
+                draft,
+                input,
+                sourceKind,
+                source,
+                plan,
+                before,
+                after,
+            )
+            2 -> validateV2Semantics(
+                draft,
+                input,
+                sourceKind,
+                source,
+                plan,
+                before,
+                after,
+            )
+            else -> error("지원하지 않는 draft schemaVersion입니다.")
+        }
+
+        private fun validateV1Semantics(
             draft: DraftMetadata,
             input: DraftInputMetadata,
             sourceKind: DraftSourceKind,
@@ -296,6 +362,145 @@ class SixDraftPayload private constructor(
             }
         }
 
+        private fun validateV2Semantics(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            sourceKind: DraftSourceKind,
+            source: ByteArray,
+            plan: DraftConversionPlan,
+            before: dev.sixbridge.core.compat.CompatibilityReport,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ) {
+            before.validate()
+            after.validate()
+            require(draft.sourceIdentity == input.sourceIdentity) {
+                "draft와 input sourceIdentity가 일치하지 않습니다."
+            }
+            val actualOriginalSha256 = actualSourceSha256(sourceKind, source)
+            require(
+                input.originalSourceSha256 == actualOriginalSha256 &&
+                    before.sourceSha256 == actualOriginalSha256,
+            ) {
+                "schema v2 source entry와 원본 provenance가 일치하지 않습니다."
+            }
+            require(before.browserProfileSha256 == input.browserProfileSha256) {
+                "변환 전 보고서가 browser profile과 일치하지 않습니다."
+            }
+            require(before.extensionVersion == input.originalExtensionVersion) {
+                "변환 전 보고서가 원본 extension version과 일치하지 않습니다."
+            }
+            require(before.originalExtensionId == input.originalExtensionId) {
+                "변환 전 보고서가 원본 extension ID와 일치하지 않습니다."
+            }
+            require(after.browserProfileSha256 == input.browserProfileSha256) {
+                "변환 후 보고서가 browser profile과 일치하지 않습니다."
+            }
+            require(after.originalExtensionId == input.originalExtensionId) {
+                "변환 후 보고서가 원본 extension ID와 일치하지 않습니다."
+            }
+            require(
+                plan.reportSourceSha256 == before.sourceSha256 &&
+                    plan.browserProfileSha256 == before.browserProfileSha256 &&
+                    plan.reportSha256 == SixDraftJson.compatibilitySha256(before),
+            ) {
+                "변환 계획 provenance가 변환 전 보고서와 일치하지 않습니다."
+            }
+            val beforeDecisions = before.adapterDecisions.associateBy {
+                it.id to it.version
+            }
+            val selectedDecisions = plan.selectedAdapters.map { selected ->
+                requireNotNull(beforeDecisions[selected.id to selected.version]) {
+                    "변환 계획 어댑터가 변환 전 보고서에 없습니다."
+                }
+            }
+            require(
+                plan.planSha256 ==
+                    dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
+                        before,
+                        selectedDecisions,
+                    ),
+            ) {
+                "변환 계획 proof가 보고서와 일치하지 않습니다."
+            }
+            require(
+                draft.adapterVersions ==
+                    plan.selectedAdapters.associate { it.id to it.version },
+            ) {
+                "draft adapter version 집합이 계획과 일치하지 않습니다."
+            }
+            val selected = plan.selectedAdapters.map { it.id to it.version }
+            val applied = after.adapterDecisions
+                .filter { it.applied }
+                .map { it.id to it.version }
+            require(
+                applied.sortedWith(ADAPTER_KEY_ORDER) ==
+                    selected.sortedWith(ADAPTER_KEY_ORDER),
+            ) {
+                "변환 후 적용 어댑터가 계획과 일치하지 않습니다."
+            }
+            val expectedState = if (selected.isEmpty()) {
+                dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH
+            } else {
+                dev.sixbridge.core.conversion.ConversionState.CONVERTED
+            }
+            require(after.conversionState == expectedState) {
+                "변환 후 conversionState가 계획과 일치하지 않습니다."
+            }
+            if (selected.isEmpty()) {
+                require(after.sourceSha256 == actualOriginalSha256) {
+                    "schema v2 passthrough 결과가 원본 source와 다릅니다."
+                }
+                require(
+                    before.conversionState ==
+                        dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH &&
+                        before.convertedExtensionId == null,
+                ) {
+                    "passthrough 변환 전 보고서는 미변환 상태여야 합니다."
+                }
+                require(after.extensionVersion == input.originalExtensionVersion) {
+                    "passthrough 결과 version이 원본과 일치하지 않습니다."
+                }
+                val passthroughExtensionId = input.originalExtensionId
+                    .takeIf { sourceKind == DraftSourceKind.CRX }
+                require(
+                    before.copy(
+                        originalExtensionId = input.originalExtensionId,
+                        convertedExtensionId = passthroughExtensionId,
+                    ) ==
+                        after,
+                ) {
+                    "passthrough 전후 보고서의 분석 의미가 일치하지 않습니다."
+                }
+            } else {
+                require(after.convertedExtensionId == null) {
+                    "schema v2 key-neutral 변환 결과에는 최종 extension ID가 없습니다."
+                }
+            }
+            if (sourceKind == DraftSourceKind.CRX) {
+                require(
+                    input.inputKind in setOf(
+                        dev.sixbridge.core.input.ExtensionInputKind.CRX3,
+                        dev.sixbridge.core.input.ExtensionInputKind.CHROME_WEB_STORE,
+                    ),
+                ) {
+                    "source.crx input kind가 올바르지 않습니다."
+                }
+                val proofId = dev.sixbridge.core.crx.Crx3.parse(source).extensionId
+                require(input.originalExtensionId == proofId) {
+                    "source.crx proof ID가 원본 extension ID와 다릅니다."
+                }
+            } else {
+                require(
+                    input.inputKind in setOf(
+                        dev.sixbridge.core.input.ExtensionInputKind.ZIP,
+                        dev.sixbridge.core.input.ExtensionInputKind.SOURCE_DIRECTORY,
+                    ),
+                ) {
+                    "source.zip input kind가 올바르지 않습니다."
+                }
+            }
+        }
+
         private fun actualSourceSha256(
             sourceKind: DraftSourceKind,
             source: ByteArray,
@@ -304,6 +509,9 @@ class SixDraftPayload private constructor(
         } else {
             DraftSignature.sha256(source)
         }
+
+        private val ADAPTER_KEY_ORDER =
+            compareBy<Pair<String, Int>> { it.first }.thenBy { it.second }
     }
 }
 

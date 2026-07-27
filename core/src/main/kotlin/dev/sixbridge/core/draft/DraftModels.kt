@@ -17,7 +17,46 @@ class DraftMetadata private constructor(
             coreVersion: String,
             adapterVersions: Map<String, Int>,
             sourceIdentity: String,
+        ): DraftMetadata = create(
+            schemaVersion = 1,
+            coreVersion = coreVersion,
+            adapterVersions = adapterVersions,
+            sourceIdentity = sourceIdentity,
+        )
+
+        fun createV2(
+            coreVersion: String,
+            adapterVersions: Map<String, Int>,
+            sourceIdentity: String,
+        ): DraftMetadata = create(
+            schemaVersion = 2,
+            coreVersion = coreVersion,
+            adapterVersions = adapterVersions,
+            sourceIdentity = sourceIdentity,
+        )
+
+        @JvmSynthetic
+        internal fun decoded(
+            schemaVersion: Int,
+            coreVersion: String,
+            adapterVersions: Map<String, Int>,
+            sourceIdentity: String,
+        ): DraftMetadata = create(
+            schemaVersion = schemaVersion,
+            coreVersion = coreVersion,
+            adapterVersions = adapterVersions,
+            sourceIdentity = sourceIdentity,
+        )
+
+        private fun create(
+            schemaVersion: Int,
+            coreVersion: String,
+            adapterVersions: Map<String, Int>,
+            sourceIdentity: String,
         ): DraftMetadata {
+            require(schemaVersion == 1 || schemaVersion == 2) {
+                "지원하지 않는 draft schemaVersion입니다."
+            }
             require(coreVersion.isNotBlank()) { "coreVersion은 비어 있을 수 없습니다." }
             require(SOURCE_IDENTITY.matches(sourceIdentity)) {
                 "sourceIdentity 형식이 올바르지 않습니다."
@@ -28,7 +67,7 @@ class DraftMetadata private constructor(
                 "adapterVersions 항목이 올바르지 않습니다."
             }
             return DraftMetadata(
-                schemaVersion = 1,
+                schemaVersion = schemaVersion,
                 coreVersion = coreVersion,
                 adapterVersions = Collections.unmodifiableMap(
                     adapterVersions.toSortedMap(),
@@ -142,11 +181,25 @@ class DraftConversionPlan private constructor(
     }
 }
 
-internal data class DraftExpected(
-    val sourceSha256: String,
+data class DraftExpected(
+    val originalSourceSha256: String,
+    val transformedSourceSha256: String,
     val reportSha256: String,
     val planSha256: String,
-)
+) {
+    init {
+        require(
+            listOf(
+                originalSourceSha256,
+                transformedSourceSha256,
+                reportSha256,
+                planSha256,
+            ).all(SHA256::matches),
+        ) {
+            "DraftExpected hash 형식이 올바르지 않습니다."
+        }
+    }
+}
 
 internal val SHA256 = Regex("[0-9a-f]{64}")
 internal val EXTENSION_ID = Regex("[a-p]{32}")

@@ -134,6 +134,91 @@ class SixDraftTest {
     }
 
     @Test
+    fun `schema v2 writer separates original and transformed expected hashes`() {
+        val original = "original-v2-source".encodeToByteArray()
+        val transformed = "transformed-v2-source".encodeToByteArray()
+        val profile = "5".repeat(64)
+        val decision = AdapterDecision(
+            id = "desktop-selection-event-bridge",
+            version = 1,
+            risk = AdapterRisk.SAFE,
+            disposition = AdapterDisposition.AUTOMATIC,
+            applied = false,
+            evidence = emptyList(),
+            changes = listOf("selection event bridge"),
+            remainingLimitations = emptyList(),
+        )
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Draft v2",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.AUTOMATIC,
+            adapterDecisions = listOf(decision),
+            sourceSha256 = sha256(original),
+            browserProfileSha256 = profile,
+        )
+        val after = before.copy(
+            status = CompatibilityStatus.COMPATIBLE,
+            conversionState = ConversionState.CONVERTED,
+            adapterDecisions = listOf(decision.copy(applied = true)),
+            sourceSha256 = sha256(transformed),
+        )
+        val identity = "project:0123456789abcdef0123456789abcdef"
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                coreVersion = "test",
+                adapterVersions = mapOf(decision.id to decision.version),
+                sourceIdentity = identity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = sha256(original),
+                browserProfileSha256 = profile,
+                originalExtensionId = null,
+                originalExtensionVersion = "1",
+                sourceIdentity = identity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = original,
+            plan = DraftConversionPlan.create(
+                before,
+                listOf(DraftSelectedAdapter(decision.id, decision.version)),
+            ),
+            compatibilityBefore = before,
+            compatibilityAfter = after,
+        )
+
+        val verified = SixDraft.read(SixDraft.createBytes(payload, keyPair()))
+        val expected = verified.payload.expected
+        val expectedKeys = (
+            Json.parseToJsonElement(
+                verified.payload.expectedJson.decodeToString(),
+            ) as JsonObject
+            ).keys
+
+        assertEquals(2, verified.payload.draft.schemaVersion)
+        assertContentEquals(original, verified.payload.source)
+        assertEquals(sha256(original), expected.originalSourceSha256)
+        assertEquals(sha256(transformed), expected.transformedSourceSha256)
+        assertEquals(verified.payload.plan.planSha256, expected.planSha256)
+        assertEquals(
+            setOf(
+                "originalSourceSha256",
+                "planSha256",
+                "reportSha256",
+                "schemaVersion",
+                "transformedSourceSha256",
+            ),
+            expectedKeys,
+        )
+    }
+
+    @Test
     fun `every signed entry rejects a one byte change`() {
         val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
         val signedNames = setOf(
@@ -186,14 +271,14 @@ class SixDraftTest {
     }
 
     @Test
-    fun `non Ed25519 algorithm and schema two are rejected`() {
+    fun `non Ed25519 algorithm and unsupported draft schema are rejected`() {
         val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
         assertSignatureMutationRejected(bytes, "algorithm", "SHA256withRSA")
 
         val entries = readEntries(bytes).toMutableMap()
         entries["draft.json"] = entries.getValue("draft.json")
             .decodeToString()
-            .replace("\"schemaVersion\":1", "\"schemaVersion\":2")
+            .replace("\"schemaVersion\":1", "\"schemaVersion\":3")
             .encodeToByteArray()
         entries.remove("draft-signature.json")
         entries["draft-signature.json"] = SixDraftJson.encodeSignature(

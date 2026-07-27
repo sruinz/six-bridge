@@ -6,7 +6,9 @@ import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.SourceEvidence
+import dev.sixbridge.core.draft.DraftReplayResult
 import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.draft.SixDraftReplay
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ChromeWebStoreAddress
 import dev.sixbridge.core.input.ExtensionZip
@@ -31,6 +33,8 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SixBridgeCommandTest {
@@ -265,7 +269,24 @@ class SixBridgeCommandTest {
         }
         assertEquals("converted", field(result.output, "conversion"))
         assertPopupDecision(popupBefore, applied = false)
-        assertEquals(popupBefore.copy(applied = true), popupAfter)
+        assertPopupDecision(popupAfter, applied = true, evidenceLine = 1)
+        assertEquals(2, verified.payload.draft.schemaVersion)
+        assertEquals(
+            verified.payload.input.originalSourceSha256,
+            verified.payload.expected.originalSourceSha256,
+        )
+        assertEquals(
+            sha256(verified.payload.source),
+            verified.payload.expected.originalSourceSha256,
+        )
+        assertEquals(
+            verified.payload.compatibilityAfter.sourceSha256,
+            verified.payload.expected.transformedSourceSha256,
+        )
+        assertNotEquals(
+            verified.payload.expected.originalSourceSha256,
+            verified.payload.expected.transformedSourceSha256,
+        )
         assertEquals(
             listOf(
                 "action-popup-entry",
@@ -410,6 +431,75 @@ class SixBridgeCommandTest {
         assertEquals(
             "store:${packed.extensionId}",
             verified.payload.draft.sourceIdentity,
+        )
+    }
+
+    @Test
+    fun `converted CRX draft stores the original CRX and key neutral expected proof`() {
+        val workspace = Files.createTempDirectory("six-cli-crx-converted-v2")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("content.js").writeText(
+            """
+            document.addEventListener("mouseup", (event) => {
+              const value = getSelection()?.toString();
+              if (value) console.log(value);
+            });
+            """.trimIndent(),
+        )
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Converted CRX",
+              "version": "1",
+              "content_scripts": [{
+                "matches": ["https://example.com/*"],
+                "js": ["content.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val input = workspace.resolve("converted.crx").also {
+            it.writeBytes(packed.bytes)
+        }
+        val profile = writeProfile(workspace)
+        val output = workspace.resolve("converted.sixdraft")
+
+        val result = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", input.toString(),
+            "--profile", profile.toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        val verified = SixDraft.read(output)
+        val replayed = assertIs<DraftReplayResult.Ready>(
+            SixDraftReplay().replay(
+                verified,
+                BrowserProfileJson.decode(profile.readText()),
+                emptySet(),
+            ),
+        ).prepared
+        assertEquals(2, verified.payload.draft.schemaVersion)
+        assertContentEquals(packed.bytes, verified.payload.source)
+        assertEquals(
+            sha256(packed.zipBytes),
+            verified.payload.expected.originalSourceSha256,
+        )
+        assertEquals(
+            verified.payload.expected.transformedSourceSha256,
+            replayed.transformedSourceSha256,
+        )
+        assertNotEquals(
+            verified.payload.expected.originalSourceSha256,
+            verified.payload.expected.transformedSourceSha256,
         )
     }
 
@@ -630,7 +720,7 @@ class SixBridgeCommandTest {
     }
 
     @Test
-    fun `build accepts popup approval and uses the draft transformed source hash`() {
+    fun `build accepts popup approval while draft keeps key neutral replay proof`() {
         val workspace = Files.createTempDirectory("six-cli-build-conversion")
         val profile = writeProfile(workspace)
         val draft = workspace.resolve("fixture.sixdraft")
@@ -655,7 +745,23 @@ class SixBridgeCommandTest {
 
         assertEquals(0, draftResult.exitCode, draftResult.error)
         assertEquals(0, buildResult.exitCode, buildResult.error)
+        val verified = SixDraft.read(draft)
+        val replayed = assertIs<DraftReplayResult.Ready>(
+            SixDraftReplay().replay(
+                draft = verified,
+                profile = BrowserProfileJson.decode(profile.readText()),
+                approvedAdapterIds = setOf("action-popup-entry"),
+            ),
+        ).prepared
         assertEquals(
+            field(draftResult.output, "transformedSha256"),
+            verified.payload.expected.transformedSourceSha256,
+        )
+        assertEquals(
+            verified.payload.expected.transformedSourceSha256,
+            replayed.transformedSourceSha256,
+        )
+        assertNotEquals(
             field(draftResult.output, "transformedSha256"),
             field(buildResult.output, "transformedSha256"),
         )
@@ -761,6 +867,7 @@ class SixBridgeCommandTest {
     private fun assertPopupDecision(
         actual: AdapterDecision,
         applied: Boolean,
+        evidenceLine: Int = 6,
     ) {
         assertEquals(
             AdapterDecision(
@@ -772,7 +879,7 @@ class SixBridgeCommandTest {
                 evidence = listOf(
                     SourceEvidence(
                         relativePath = "manifest.json",
-                        line = 6,
+                        line = evidenceLine,
                         detail = "action.default_popup=popup.html",
                     ),
                 ),

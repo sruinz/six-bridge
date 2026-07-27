@@ -35,7 +35,7 @@ internal object SixDraftJson {
                 value.adapterVersions.mapValues { JsonPrimitive(it.value) },
             ),
             "coreVersion" to JsonPrimitive(value.coreVersion),
-            "schemaVersion" to JsonPrimitive(1),
+            "schemaVersion" to JsonPrimitive(value.schemaVersion),
             "sourceIdentity" to JsonPrimitive(value.sourceIdentity),
         ),
     )
@@ -43,7 +43,7 @@ internal object SixDraftJson {
     fun decodeDraft(bytes: ByteArray): DraftMetadata {
         val value = parseCanonicalObject("draft.json", bytes)
         value.requireKeys(DRAFT_KEYS, "draft.json")
-        value.requireSchema("draft.json", 1)
+        val schemaVersion = value.supportedDraftSchema()
         val versions = value.getValue("adapterVersions").jsonObject.also {
             require(it.keys.all(ID::matches)) {
                 "draft.json adapterVersions ID가 올바르지 않습니다."
@@ -53,7 +53,8 @@ internal object SixDraftJson {
                 require(it > 0) { "adapter version은 양수여야 합니다." }
             }
         }
-        return DraftMetadata.create(
+        return DraftMetadata.decoded(
+            schemaVersion = schemaVersion,
             coreVersion = value.strictString("coreVersion"),
             adapterVersions = versions,
             sourceIdentity = value.strictString("sourceIdentity"),
@@ -211,25 +212,70 @@ internal object SixDraftJson {
     fun compatibilitySha256(value: CompatibilityReport): String =
         DraftSignature.sha256(encodeCompatibility(value))
 
-    fun encodeExpected(value: DraftExpected): ByteArray = encodeCanonicalObject(
+    fun encodeExpected(
+        value: DraftExpected,
+        draftSchemaVersion: Int,
+    ): ByteArray = encodeCanonicalObject(
         "expected.json",
-        objectOf(
-            "planSha256" to JsonPrimitive(value.planSha256),
-            "reportSha256" to JsonPrimitive(value.reportSha256),
-            "schemaVersion" to JsonPrimitive(1),
-            "sourceSha256" to JsonPrimitive(value.sourceSha256),
-        ),
+        when (draftSchemaVersion) {
+            1 -> objectOf(
+                "planSha256" to JsonPrimitive(value.planSha256),
+                "reportSha256" to JsonPrimitive(value.reportSha256),
+                "schemaVersion" to JsonPrimitive(1),
+                "sourceSha256" to JsonPrimitive(value.transformedSourceSha256),
+            )
+            2 -> objectOf(
+                "originalSourceSha256" to JsonPrimitive(
+                    value.originalSourceSha256,
+                ),
+                "planSha256" to JsonPrimitive(value.planSha256),
+                "reportSha256" to JsonPrimitive(value.reportSha256),
+                "schemaVersion" to JsonPrimitive(2),
+                "transformedSourceSha256" to JsonPrimitive(
+                    value.transformedSourceSha256,
+                ),
+            )
+            else -> throw IllegalArgumentException(
+                "지원하지 않는 expected.json schemaVersion입니다.",
+            )
+        },
     )
 
-    fun decodeExpected(bytes: ByteArray): DraftExpected {
+    fun decodeExpected(
+        bytes: ByteArray,
+        draftSchemaVersion: Int,
+        originalSourceSha256: String,
+    ): DraftExpected {
         val value = parseCanonicalObject("expected.json", bytes)
-        value.requireKeys(EXPECTED_KEYS, "expected.json")
-        value.requireSchema("expected.json", 1)
-        return DraftExpected(
-            sourceSha256 = value.strictSha256("sourceSha256"),
-            reportSha256 = value.strictSha256("reportSha256"),
-            planSha256 = value.strictSha256("planSha256"),
-        )
+        return when (draftSchemaVersion) {
+            1 -> {
+                value.requireKeys(EXPECTED_V1_KEYS, "expected.json")
+                value.requireSchema("expected.json", 1)
+                DraftExpected(
+                    originalSourceSha256 = originalSourceSha256,
+                    transformedSourceSha256 = value.strictSha256("sourceSha256"),
+                    reportSha256 = value.strictSha256("reportSha256"),
+                    planSha256 = value.strictSha256("planSha256"),
+                )
+            }
+            2 -> {
+                value.requireKeys(EXPECTED_V2_KEYS, "expected.json")
+                value.requireSchema("expected.json", 2)
+                DraftExpected(
+                    originalSourceSha256 = value.strictSha256(
+                        "originalSourceSha256",
+                    ),
+                    transformedSourceSha256 = value.strictSha256(
+                        "transformedSourceSha256",
+                    ),
+                    reportSha256 = value.strictSha256("reportSha256"),
+                    planSha256 = value.strictSha256("planSha256"),
+                )
+            }
+            else -> throw IllegalArgumentException(
+                "지원하지 않는 expected.json schemaVersion입니다.",
+            )
+        }
     }
 
     fun encodeSignature(value: DraftSignatureRecord): ByteArray = encodeCanonicalObject(
@@ -489,6 +535,13 @@ internal object SixDraftJson {
         }
     }
 
+    private fun JsonObject.supportedDraftSchema(): Int =
+        getValue("schemaVersion").strictInt("schemaVersion").also {
+            require(it == 1 || it == 2) {
+                "지원하지 않는 draft.json schemaVersion입니다."
+            }
+        }
+
     private fun JsonObject.strictString(name: String): String =
         getValue(name).jsonPrimitive.also {
             require(it.isString) { "$name 값은 JSON 문자열이어야 합니다." }
@@ -700,8 +753,12 @@ internal object SixDraftJson {
         "browserProfileSha256", "reportSha256", "planSha256",
     )
     private val SELECTED_ADAPTER_KEYS = setOf("id", "version")
-    private val EXPECTED_KEYS = setOf(
+    private val EXPECTED_V1_KEYS = setOf(
         "schemaVersion", "sourceSha256", "reportSha256", "planSha256",
+    )
+    private val EXPECTED_V2_KEYS = setOf(
+        "schemaVersion", "originalSourceSha256", "transformedSourceSha256",
+        "reportSha256", "planSha256",
     )
     private val SIGNATURE_KEYS = setOf(
         "schemaVersion", "algorithm", "keyId", "publicKey", "signature",

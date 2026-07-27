@@ -113,7 +113,11 @@ class SixBridgeService(
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
-            val prepared = pipeline.prepare(resolved, profile, approvedAdapterIds)
+            val prepared = pipeline.preflightPreparation(
+                resolved,
+                profile,
+                approvedAdapterIds,
+            )
             check(prepared.logicalSourceIdentity == preflightIdentity) {
                 "draft 준비 사이에 논리 원본 신원이 달라졌습니다."
             }
@@ -122,40 +126,25 @@ class SixBridgeService(
             val applied = prepared.compatibilityAfter.adapterDecisions
                 .filter { it.applied }
                 .sortedWith(compareBy({ it.id }, { it.version }))
-            val originalExtensionId = authoritativeOriginalExtensionId(
-                resolved,
-                prepared.compatibilityBefore,
-                prepared.compatibilityAfter,
-            )
             val before = prepared.compatibilityBefore.copy(
-                originalExtensionId = originalExtensionId,
+                originalExtensionId = prepared.originalExtensionId,
             )
-            val after = if (applied.isEmpty()) {
-                before.copy(convertedExtensionId = before.originalExtensionId)
-            } else {
-                prepared.compatibilityAfter.also {
-                    check(it.originalExtensionId == originalExtensionId) {
-                        "변환 결과의 원본 extension ID가 authoritative ID와 다릅니다."
-                    }
-                }
-            }
-            val sourceKind = if (applied.isEmpty() && resolved.crxBytes != null) {
+            val after = prepared.compatibilityAfter
+            val sourceKind = if (resolved.crxBytes != null) {
                 DraftSourceKind.CRX
             } else {
                 DraftSourceKind.ZIP
             }
             val source = if (sourceKind == DraftSourceKind.CRX) {
                 requireNotNull(resolved.crxBytes).copyOf()
-            } else if (applied.isEmpty()) {
+            } else {
                 ExtensionZip.createBytes(
                     requireNotNull(resolved.sourceRoot),
                     includeProjectMarker = true,
                 )
-            } else {
-                prepared.sourceZip
             }
             val payload = SixDraftPayload.create(
-                draft = DraftMetadata.create(
+                draft = DraftMetadata.createV2(
                     coreVersion = CORE_VERSION,
                     adapterVersions = applied.associate { it.id to it.version },
                     sourceIdentity = sourceIdentity,
@@ -168,7 +157,7 @@ class SixBridgeService(
                     browserProfileSha256 = requireNotNull(
                         before.browserProfileSha256,
                     ),
-                    originalExtensionId = before.originalExtensionId,
+                    originalExtensionId = prepared.originalExtensionId,
                     originalExtensionVersion = requireNotNull(
                         before.extensionVersion,
                     ),
@@ -381,23 +370,6 @@ class SixBridgeService(
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
-
-    private fun authoritativeOriginalExtensionId(
-        resolved: ResolvedExtensionInput,
-        before: CompatibilityReport,
-        after: CompatibilityReport,
-    ): String? {
-        val candidates = listOfNotNull(
-            resolved.expectedExtensionId,
-            after.originalExtensionId,
-            before.originalExtensionId,
-            before.manifestKeyExtensionId,
-        ).distinct()
-        check(candidates.size <= 1) {
-            "입력, 변환 결과와 manifest key의 원본 extension ID가 서로 다릅니다."
-        }
-        return candidates.singleOrNull()
-    }
 
     private fun verifyWrittenDraft(
         expected: SixDraftPayload,
