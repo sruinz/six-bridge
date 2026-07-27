@@ -3,6 +3,7 @@ package dev.sixbridge.manager.conversion
 import android.content.ContentResolver
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.draft.SixDraftProbe
 import dev.sixbridge.core.input.ChromeWebStoreAddress
 import dev.sixbridge.core.input.ExtensionZip
 import java.io.File
@@ -21,7 +22,7 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.UUID
-import java.util.zip.ZipFile
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -36,14 +37,14 @@ private val NOFOLLOW_LINKS = LinkOption.NOFOLLOW_LINKS
 class OnDeviceInputService(
     private val privateRoot: File,
     private val safInputOpener: SafInputOpener,
-    private val chromeDownloader: AndroidChromeCrxDownloader = AndroidChromeCrxDownloader(),
+    private val chromeDownloader: ChromeCrxDownloader = AndroidChromeCrxDownloader(),
     private val tokenFactory: () -> String = { UUID.randomUUID().toString() },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     constructor(
         privateRoot: File,
         contentResolver: ContentResolver,
-        chromeDownloader: AndroidChromeCrxDownloader = AndroidChromeCrxDownloader(),
+        chromeDownloader: ChromeCrxDownloader = AndroidChromeCrxDownloader(),
     ) : this(
         privateRoot = privateRoot,
         safInputOpener = SafInputOpener { request ->
@@ -52,17 +53,36 @@ class OnDeviceInputService(
         chromeDownloader = chromeDownloader,
     )
 
-    suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact =
-        withContext(ioDispatcher) {
-            acquireOnIo(request)
+    suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact {
+        val ownedWorkspace = AtomicReference<Path?>()
+        return try {
+            val artifact = withContext(ioDispatcher) {
+                currentCoroutineContext().ensureActive()
+                val workspace = createWorkspace()
+                ownedWorkspace.set(workspace)
+                acquireOnIo(request, workspace)
+            }
+            ownedWorkspace.set(null)
+            artifact
+        } finally {
+            ownedWorkspace.getAndSet(null)?.let { workspace ->
+                val cleaned = withContext(NonCancellable + ioDispatcher) {
+                    deleteTree(workspace)
+                }
+                if (!cleaned) {
+                    inputFailure(
+                        OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
+                        "private 입력 artifact를 정리할 수 없습니다.",
+                    )
+                }
+            }
         }
+    }
 
     private suspend fun acquireOnIo(
         request: OnDeviceInputRequest,
+        workspace: Path,
     ): OnDeviceInputArtifact {
-        currentCoroutineContext().ensureActive()
-        val workspace = createWorkspace()
-        var completed = false
         return try {
             val privateFile = workspace.resolve(INPUT_FILE_NAME).toFile()
             val acquisition = when (request) {
@@ -82,7 +102,7 @@ class OnDeviceInputService(
                 privateFile = privateFile,
                 sha256 = acquisition.sha256,
                 expectedExtensionId = classified.extensionId,
-            ).also { completed = true }
+            )
         } catch (error: CancellationException) {
             throw error
         } catch (error: OnDeviceInputException) {
@@ -92,18 +112,6 @@ class OnDeviceInputService(
                 OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
                 "private 입력 artifact를 만들 수 없습니다.",
             )
-        } finally {
-            if (!completed) {
-                val cleaned = withContext(NonCancellable + ioDispatcher) {
-                    deleteTree(workspace)
-                }
-                if (!cleaned) {
-                    inputFailure(
-                        OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
-                        "실패한 private 입력 artifact를 정리할 수 없습니다.",
-                    )
-                }
-            }
         }
     }
 
@@ -170,9 +178,28 @@ class OnDeviceInputService(
             OnDeviceInputErrorCode.SOURCE_UNAVAILABLE,
             "선택한 SAF 입력을 열 수 없습니다.",
         )
-        val acquired = input.use {
+        var primaryFailure: Throwable? = null
+        val acquired = try {
             writeNew(destination) { channel ->
                 copyBounded(input, channel)
+            }
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            try {
+                input.close()
+            } catch (error: CancellationException) {
+                if (primaryFailure == null) throw error
+            } catch (error: Error) {
+                throw error
+            } catch (_: Exception) {
+                if (primaryFailure == null) {
+                    inputFailure(
+                        OnDeviceInputErrorCode.SOURCE_READ_FAILED,
+                        "SAF 입력을 닫을 수 없습니다.",
+                    )
+                }
             }
         }
         if (sha256(destination.toPath()) != acquired.sha256) {
@@ -192,29 +219,30 @@ class OnDeviceInputService(
             ChromeWebStoreAddress.parse(request.pageUrl)
         } catch (_: Exception) {
             inputFailure(
-                OnDeviceInputErrorCode.DOWNLOAD_FAILED,
+                OnDeviceInputErrorCode.URL,
                 "Chrome 웹 스토어 상세 주소를 확인할 수 없습니다.",
             )
         }
         val proof = try {
-            writeNew(destination) { channel ->
-                val output = Channels.newOutputStream(channel)
-                val result = chromeDownloader.download(address, output)
-                channel.force(true)
-                result
-            }
+            chromeDownloader.download(address, destination.toPath())
         } catch (error: CancellationException) {
             throw error
-        } catch (_: ChromeDownloadException) {
+        } catch (error: ChromeDownloadException) {
             inputFailure(
-                OnDeviceInputErrorCode.DOWNLOAD_FAILED,
+                error.code.toInputErrorCode(),
                 "Chrome CRX3를 다운로드하거나 검증할 수 없습니다.",
+                error.code,
+            )
+        } catch (_: Exception) {
+            inputFailure(
+                OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
+                "Chrome CRX3 private 파일을 만들 수 없습니다.",
             )
         }
         val actualHash = sha256(destination.toPath())
         if (proof.byteCount != destination.length() || proof.sha256 != actualHash) {
             inputFailure(
-                OnDeviceInputErrorCode.DOWNLOAD_FAILED,
+                OnDeviceInputErrorCode.INPUT_INVALID,
                 "Chrome CRX3 artifact proof가 일치하지 않습니다.",
             )
         }
@@ -319,16 +347,8 @@ class OnDeviceInputService(
             )
         }
         if (magic.contentEquals(CRX3_MAGIC)) {
-            val bytes = try {
-                Files.readAllBytes(file.toPath())
-            } catch (_: Exception) {
-                inputFailure(
-                    OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
-                    "private CRX3 파일을 검증할 수 없습니다.",
-                )
-            }
             val verified = try {
-                Crx3Verifier.verify(bytes)
+                Crx3Verifier.verify(file.toPath(), MAX_INPUT_BYTES)
             } catch (_: IllegalArgumentException) {
                 inputFailure(
                     OnDeviceInputErrorCode.INVALID_CRX3,
@@ -355,33 +375,26 @@ class OnDeviceInputService(
                 "지원하지 않는 입력 형식입니다.",
             )
         }
-        if (hasDraftMarker(file)) {
-            val bytes = try {
-                Files.readAllBytes(file.toPath())
-            } catch (_: Exception) {
-                inputFailure(
-                    OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
-                    "private SixDraft 파일을 검증할 수 없습니다.",
-                )
-            }
-            val draft = try {
-                SixDraft.read(bytes)
-            } catch (_: IllegalArgumentException) {
+        when (val probe = SixDraft.probe(file.toPath(), MAX_INPUT_BYTES)) {
+            SixDraftProbe.MalformedDraft -> {
                 inputFailure(
                     OnDeviceInputErrorCode.INVALID_DRAFT,
                     "SixDraft 서명 또는 구조가 올바르지 않습니다.",
                 )
             }
-            if (draft.payload.draft.schemaVersion != 2) {
-                inputFailure(
-                    OnDeviceInputErrorCode.INVALID_DRAFT,
-                    "지원하지 않는 SixDraft schema입니다.",
+            SixDraftProbe.NotDraft -> Unit
+            is SixDraftProbe.Valid -> {
+                if (probe.schemaVersion != 2) {
+                    inputFailure(
+                        OnDeviceInputErrorCode.INVALID_DRAFT,
+                        "지원하지 않는 SixDraft schema입니다.",
+                    )
+                }
+                return ClassifiedInput(
+                    OnDeviceInputKind.SIX_DRAFT,
+                    probe.originalExtensionId,
                 )
             }
-            return ClassifiedInput(
-                OnDeviceInputKind.SIX_DRAFT,
-                draft.payload.input.originalExtensionId,
-            )
         }
         validateExtensionZip(
             file.toPath(),
@@ -389,17 +402,6 @@ class OnDeviceInputService(
             OnDeviceInputErrorCode.INVALID_ZIP,
         )
         return ClassifiedInput(OnDeviceInputKind.ZIP, null)
-    }
-
-    private fun hasDraftMarker(file: File): Boolean = try {
-        ZipFile(file).use { zip ->
-            zip.entries().asSequence().any { it.name in DRAFT_MARKERS }
-        }
-    } catch (_: Exception) {
-        inputFailure(
-            OnDeviceInputErrorCode.INVALID_ZIP,
-            "ZIP 구조가 올바르지 않습니다.",
-        )
     }
 
     private fun validateExtensionZip(
@@ -537,10 +539,29 @@ class OnDeviceInputService(
     private fun ByteArray.toHex(): String =
         joinToString("") { "%02x".format(it) }
 
+    private fun ChromeDownloadErrorCode.toInputErrorCode(): OnDeviceInputErrorCode =
+        when (this) {
+            ChromeDownloadErrorCode.NETWORK_FAILED,
+            ChromeDownloadErrorCode.HTTP_FAILED,
+            ChromeDownloadErrorCode.REDIRECT_REJECTED,
+            ChromeDownloadErrorCode.TOO_MANY_REDIRECTS,
+            -> OnDeviceInputErrorCode.NETWORK
+            ChromeDownloadErrorCode.HTML_RESPONSE,
+            ChromeDownloadErrorCode.RESPONSE_TOO_LARGE,
+            ChromeDownloadErrorCode.INVALID_CRX3,
+            ChromeDownloadErrorCode.EXTENSION_ID_MISMATCH,
+            -> OnDeviceInputErrorCode.INPUT_INVALID
+        }
+
     private fun inputFailure(
         code: OnDeviceInputErrorCode,
         message: String,
-    ): Nothing = throw OnDeviceInputException(code, message)
+        chromeDownloadErrorCode: ChromeDownloadErrorCode? = null,
+    ): Nothing = throw OnDeviceInputException(
+        code,
+        message,
+        chromeDownloadErrorCode,
+    )
 
     private data class AcquiredBytes(
         val sha256: String,
@@ -560,13 +581,5 @@ class OnDeviceInputService(
         private const val BUFFER_SIZE = 64 * 1024
         private val CRX3_MAGIC = "Cr24".encodeToByteArray()
         private val ZIP_MAGIC = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4)
-        private val DRAFT_MARKERS = setOf(
-            "draft.json",
-            "conversion-plan.json",
-            "compatibility-before.json",
-            "compatibility-after.json",
-            "expected.json",
-            "draft-signature.json",
-        )
     }
 }

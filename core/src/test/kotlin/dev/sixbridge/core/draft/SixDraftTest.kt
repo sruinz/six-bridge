@@ -1,5 +1,6 @@
 package dev.sixbridge.core.draft
 
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -7,16 +8,19 @@ import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.input.ExtensionInputKind
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.lang.management.ManagementFactory
 import java.nio.file.Files
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.Signature
 import java.util.Base64
 import java.util.zip.CRC32
 import java.util.zip.Deflater
@@ -444,6 +448,87 @@ class SixDraftTest {
         assertContentEquals(publicBefore, store.getOrCreate().public.encoded)
     }
 
+    @Test
+    fun `bounded path probe returns metadata without materializing source payload`() {
+        val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        val path = Files.createTempFile("six-draft-probe", ".sixdraft")
+        Files.write(path, bytes)
+
+        val result = SixDraft.probe(path, bytes.size.toLong())
+        val valid = result as SixDraftProbe.Valid
+
+        assertEquals(1, valid.schemaVersion)
+        assertEquals(null, valid.originalExtensionId)
+    }
+
+    @Test
+    fun `bounded path probe rejects an archive above the caller limit`() {
+        val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        val path = Files.createTempFile("six-draft-probe-limit", ".sixdraft")
+        Files.write(path, bytes)
+
+        assertEquals(
+            SixDraftProbe.MalformedDraft,
+            SixDraft.probe(path, bytes.size.toLong() - 1),
+        )
+    }
+
+    @Test
+    fun `draft source signature and one metadata marker classify malformed draft`() {
+        val valid = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        val entries = readEntries(valid).filterKeys {
+            it in setOf(
+                DraftSourceKind.ZIP.entryName,
+                DraftSignature.ENTRY_NAME,
+                "draft.json",
+            )
+        }
+        val malformed = storedArchive(entries)
+        val path = Files.createTempFile("six-draft-probe-markers", ".sixdraft")
+        Files.write(path, malformed)
+
+        assertEquals(
+            SixDraftProbe.MalformedDraft,
+            SixDraft.probe(path, malformed.size.toLong()),
+        )
+    }
+
+    @Test
+    fun `bounded path probe rejects same size mutation before returning`() {
+        val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
+        val path = Files.createTempFile("six-draft-probe-mutation", ".sixdraft")
+        Files.write(path, bytes)
+
+        val result = StrictDraftPathProbe.probe(
+            path = path,
+            maximumBytes = bytes.size.toLong(),
+            afterValidation = {
+                val mutated = bytes.copyOf()
+                mutated[mutated.lastIndex] =
+                    (mutated.last().toInt() xor 1).toByte()
+                Files.write(path, mutated)
+            },
+        )
+
+        assertEquals(SixDraftProbe.MalformedDraft, result)
+    }
+
+    @Test
+    fun `near 128 MiB valid draft probe stays below a fixed heap allocation ceiling`() {
+        val path = largeValidDraftPath(127L * 1024 * 1024)
+        val allocation = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        assertTrue(allocation.isThreadAllocatedMemorySupported)
+        allocation.isThreadAllocatedMemoryEnabled = true
+        val before = allocation.currentThreadAllocatedBytes
+
+        val result = SixDraft.probe(path, 128L * 1024 * 1024)
+
+        val allocated = allocation.currentThreadAllocatedBytes - before
+        assertTrue(result is SixDraftProbe.Valid)
+        assertEquals(2, result.schemaVersion)
+        assertTrue(allocated < 32L * 1024 * 1024, "allocated=$allocated")
+    }
+
     private fun assertSignatureMutationRejected(
         bytes: ByteArray,
         field: String,
@@ -580,6 +665,146 @@ class SixDraftTest {
 
     private fun keyPair(): KeyPair =
         KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+
+    private fun largeValidDraftPath(sourceSize: Long): java.nio.file.Path {
+        val sourceHash = hashRepeatedZeroes(sourceSize)
+        val profileHash = "2".repeat(64)
+        val identity = "large-draft-path-test"
+        val draft = DraftMetadata.createV2("test", emptyMap(), identity)
+        val input = DraftInputMetadata(
+            inputKind = ExtensionInputKind.ZIP,
+            originalSourceSha256 = sourceHash,
+            browserProfileSha256 = profileHash,
+            originalExtensionId = null,
+            originalExtensionVersion = "1",
+            sourceIdentity = identity,
+        )
+        val report = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "Large Draft",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.PASSTHROUGH,
+            sourceSha256 = sourceHash,
+            browserProfileSha256 = profileHash,
+        )
+        val plan = DraftConversionPlan.create(report, emptyList())
+        val expected = DraftExpected(
+            originalSourceSha256 = sourceHash,
+            transformedSourceSha256 = sourceHash,
+            reportSha256 = DraftSignature.sha256(
+                BundleJson.encodeCompatibility(
+                    report.toContractV4(
+                        originalSourceSha256 = sourceHash,
+                        planSha256 = plan.planSha256,
+                    ),
+                ).toByteArray(Charsets.UTF_8),
+            ),
+            planSha256 = plan.planSha256,
+        )
+        val metadata = linkedMapOf(
+            "draft.json" to SixDraftJson.encodeDraft(draft),
+            "input.json" to SixDraftJson.encodeInput(input),
+            "conversion-plan.json" to SixDraftJson.encodePlan(plan),
+            "compatibility-before.json" to SixDraftJson.encodeCompatibility(report),
+            "compatibility-after.json" to SixDraftJson.encodeCompatibility(report),
+            "expected.json" to SixDraftJson.encodeExpected(expected, 2),
+        )
+        val digests = metadata.mapValuesTo(linkedMapOf()) { (_, bytes) ->
+            DraftEntryDigest(bytes.size.toLong(), DraftSignature.sha256(bytes))
+        }
+        digests["source.zip"] = DraftEntryDigest(sourceSize, sourceHash)
+        val signingKey = keyPair()
+        val canonical = buildString {
+            digests.toSortedMap().forEach { (name, digest) ->
+                append(name)
+                append('\t')
+                append(digest.size)
+                append('\t')
+                append(digest.sha256)
+                append('\n')
+            }
+        }.toByteArray(Charsets.UTF_8)
+        val signature = Signature.getInstance(DraftSignature.ALGORITHM).run {
+            initSign(signingKey.private)
+            update(canonical)
+            sign()
+        }
+        metadata[DraftSignature.ENTRY_NAME] = SixDraftJson.encodeSignature(
+            DraftSignatureRecord.create(
+                schemaVersion = DraftSignature.SCHEMA_VERSION,
+                algorithm = DraftSignature.ALGORITHM,
+                keyId = DraftSignature.fingerprint(signingKey.public.encoded),
+                publicKey = signingKey.public.encoded,
+                signature = signature,
+            ),
+        )
+
+        val path = Files.createTempFile("large-valid-draft", ".sixdraft")
+        ZipOutputStream(Files.newOutputStream(path)).use { zip ->
+            (metadata.keys + "source.zip").sorted().forEach { name ->
+                if (name == "source.zip") {
+                    zip.putNextEntry(
+                        ZipEntry(name).apply {
+                            time = 0L
+                            method = ZipEntry.STORED
+                            size = sourceSize
+                            compressedSize = sourceSize
+                            crc = crcRepeatedZeroes(sourceSize)
+                        },
+                    )
+                    writeRepeatedZeroes(zip, sourceSize)
+                } else {
+                    val bytes = metadata.getValue(name)
+                    zip.putNextEntry(
+                        ZipEntry(name).apply {
+                            time = 0L
+                            method = ZipEntry.STORED
+                            size = bytes.size.toLong()
+                            compressedSize = size
+                            crc = CRC32().apply { update(bytes) }.value
+                        },
+                    )
+                    zip.write(bytes)
+                }
+                zip.closeEntry()
+            }
+        }
+        return path
+    }
+
+    private fun hashRepeatedZeroes(size: Long): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        repeatZeroChunks(size) { bytes, count -> digest.update(bytes, 0, count) }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun crcRepeatedZeroes(size: Long): Long {
+        val crc = CRC32()
+        repeatZeroChunks(size) { bytes, count -> crc.update(bytes, 0, count) }
+        return crc.value
+    }
+
+    private fun writeRepeatedZeroes(output: java.io.OutputStream, size: Long) {
+        repeatZeroChunks(size) { bytes, count -> output.write(bytes, 0, count) }
+    }
+
+    private fun repeatZeroChunks(
+        size: Long,
+        consume: (ByteArray, Int) -> Unit,
+    ) {
+        val bytes = ByteArray(64 * 1024)
+        var remaining = size
+        while (remaining > 0L) {
+            val count = minOf(bytes.size.toLong(), remaining).toInt()
+            consume(bytes, count)
+            remaining -= count
+        }
+    }
 
     private fun readEntries(bytes: ByteArray): LinkedHashMap<String, ByteArray> {
         val result = linkedMapOf<String, ByteArray>()

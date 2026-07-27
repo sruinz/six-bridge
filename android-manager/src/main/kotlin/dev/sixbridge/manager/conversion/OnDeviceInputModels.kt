@@ -39,13 +39,16 @@ enum class OnDeviceInputErrorCode {
     INVALID_CRX3,
     INVALID_DRAFT,
     UNSUPPORTED_FORMAT,
-    DOWNLOAD_FAILED,
+    URL,
+    NETWORK,
+    INPUT_INVALID,
     PRIVATE_STORAGE_FAILED,
 }
 
 class OnDeviceInputException(
     val code: OnDeviceInputErrorCode,
     message: String,
+    val chromeDownloadErrorCode: ChromeDownloadErrorCode? = null,
 ) : IllegalArgumentException(message)
 
 fun interface SafInputOpener {

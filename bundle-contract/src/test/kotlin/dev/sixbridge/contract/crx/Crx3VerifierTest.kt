@@ -1,8 +1,10 @@
 package dev.sixbridge.contract.crx
 
 import java.io.ByteArrayOutputStream
+import java.lang.management.ManagementFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.Files
 import java.nio.charset.StandardCharsets
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -12,6 +14,7 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class Crx3VerifierTest {
     @Test
@@ -54,6 +57,77 @@ class Crx3VerifierTest {
         assertEquals(packed.zipBytes.size, verified.zipLength)
         assertEquals(sha256(packed.bytes), verified.crxSha256)
         assertEquals(sha256(packed.zipBytes), verified.zipSha256)
+    }
+
+    @Test
+    fun `bounded path verifier streams a CRX range without a whole file byte array`() {
+        val packed = crx3("RSA")
+        val prefix = ByteArray(7) { 9 }
+        val container = prefix + packed.bytes + ByteArray(5) { 8 }
+        val path = Files.createTempFile("crx3-path-verifier", ".bin")
+        Files.write(path, container)
+
+        val verified = Crx3Verifier.verify(
+            path = path,
+            offset = prefix.size.toLong(),
+            length = packed.bytes.size.toLong(),
+            maximumBytes = packed.bytes.size.toLong(),
+        )
+
+        assertEquals(extensionId(packed.keyPair), verified.extensionId)
+        assertEquals(prefix.size + packed.zipOffset, verified.zipOffset)
+        assertEquals(packed.zipBytes.size, verified.zipLength)
+        assertEquals(sha256(packed.bytes), verified.crxSha256)
+        assertEquals(sha256(packed.zipBytes), verified.zipSha256)
+    }
+
+    @Test
+    fun `bounded path verifier rejects a range above the caller limit`() {
+        val packed = crx3("RSA")
+        val path = Files.createTempFile("crx3-path-limit", ".crx")
+        Files.write(path, packed.bytes)
+
+        assertFailsWith<IllegalArgumentException> {
+            Crx3Verifier.verify(
+                path = path,
+                maximumBytes = packed.bytes.size.toLong() - 1,
+            )
+        }
+    }
+
+    @Test
+    fun `bounded path verifier rejects same size mutation before returning`() {
+        val packed = crx3("RSA")
+        val path = Files.createTempFile("crx3-path-mutation", ".crx")
+        Files.write(path, packed.bytes)
+
+        assertFailsWith<IllegalArgumentException> {
+            Crx3Verifier.verify(
+                path = path,
+                maximumBytes = packed.bytes.size.toLong(),
+                afterVerification = {
+                    val mutated = packed.bytes.copyOf()
+                    mutated[mutated.lastIndex] =
+                        (mutated.last().toInt() xor 1).toByte()
+                    Files.write(path, mutated)
+                },
+            )
+        }
+    }
+
+    @Test
+    fun `near 128 MiB valid CRX path verification stays below a fixed heap allocation ceiling`() {
+        val fixture = largeCrxPath(127L * 1024 * 1024)
+        val allocation = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        assertTrue(allocation.isThreadAllocatedMemorySupported)
+        allocation.isThreadAllocatedMemoryEnabled = true
+        val before = allocation.currentThreadAllocatedBytes
+
+        val verified = Crx3Verifier.verify(fixture.path, 128L * 1024 * 1024)
+
+        val allocated = allocation.currentThreadAllocatedBytes - before
+        assertEquals(extensionId(fixture.keyPair), verified.extensionId)
+        assertTrue(allocated < 32L * 1024 * 1024, "allocated=$allocated")
     }
 
     @Test
@@ -250,6 +324,70 @@ class Crx3VerifierTest {
         )
     }
 
+    private fun largeCrxPath(payloadSize: Long): LargePathFixture {
+        require(payloadSize >= 4L)
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply {
+            initialize(2048)
+        }.generateKeyPair()
+        val crxId = MessageDigest.getInstance("SHA-256")
+            .digest(keyPair.public.encoded)
+            .copyOfRange(0, 16)
+        val signedHeaderData = Proto.message(Proto.bytes(1, crxId))
+        val signer = Signature.getInstance("SHA256withRSA").apply {
+            initSign(keyPair.private)
+            update("CRX3 SignedData\u0000".toByteArray(StandardCharsets.US_ASCII))
+            update(uint32(signedHeaderData.size))
+            update(signedHeaderData)
+        }
+        forEachLargePayloadChunk(payloadSize, signer::update)
+        val proof = Proto.message(
+            Proto.bytes(1, keyPair.public.encoded),
+            Proto.bytes(2, signer.sign()),
+        )
+        val header = Proto.message(
+            Proto.bytes(2, proof),
+            Proto.bytes(10_000, signedHeaderData),
+        )
+        val path = Files.createTempFile("large-streaming", ".crx")
+        Files.newOutputStream(path).use { output ->
+            output.write(
+                byteArrayOf(
+                    'C'.code.toByte(),
+                    'r'.code.toByte(),
+                    '2'.code.toByte(),
+                    '4'.code.toByte(),
+                ),
+            )
+            output.write(uint32(3))
+            output.write(uint32(header.size))
+            output.write(header)
+            forEachLargePayloadChunk(payloadSize) { output.write(it) }
+        }
+        return LargePathFixture(path, keyPair)
+    }
+
+    private fun forEachLargePayloadChunk(
+        payloadSize: Long,
+        consume: (ByteArray) -> Unit,
+    ) {
+        val buffer = ByteArray(64 * 1024)
+        buffer[0] = 'P'.code.toByte()
+        buffer[1] = 'K'.code.toByte()
+        buffer[2] = 3
+        buffer[3] = 4
+        var remaining = payloadSize
+        var first = true
+        while (remaining > 0L) {
+            val count = minOf(buffer.size.toLong(), remaining).toInt()
+            consume(if (count == buffer.size) buffer else buffer.copyOf(count))
+            if (first) {
+                buffer.fill(0, 0, 4)
+                first = false
+            }
+            remaining -= count
+        }
+    }
+
     private fun zipBytes(): ByteArray = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4)
 
     private fun crx(header: ByteArray, zipBytes: ByteArray): ByteArray =
@@ -283,6 +421,11 @@ class Crx3VerifierTest {
         val zipBytes: ByteArray,
         val bytes: ByteArray,
         val zipOffset: Int,
+    )
+
+    private data class LargePathFixture(
+        val path: java.nio.file.Path,
+        val keyPair: KeyPair,
     )
 
     private object Proto {

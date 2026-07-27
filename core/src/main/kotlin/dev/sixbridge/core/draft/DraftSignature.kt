@@ -41,6 +41,11 @@ class DraftSignatureRecord private constructor(
     }
 }
 
+internal data class DraftEntryDigest(
+    val size: Long,
+    val sha256: String,
+)
+
 object DraftSignature {
     const val ENTRY_NAME = "draft-signature.json"
     const val ALGORITHM = "Ed25519"
@@ -127,6 +132,35 @@ object DraftSignature {
         }
     }
 
+    internal fun verifyDigests(
+        entries: Map<String, DraftEntryDigest>,
+        record: DraftSignatureRecord,
+    ): Boolean {
+        if (record.schemaVersion != SCHEMA_VERSION ||
+            record.algorithm != ALGORITHM ||
+            !SHA256.matches(record.keyId)
+        ) {
+            return false
+        }
+        val publicKeyBytes = record.publicKey
+        if (record.keyId != fingerprint(publicKeyBytes)) return false
+        val publicKey = try {
+            KeyFactory.getInstance(ALGORITHM)
+                .generatePublic(X509EncodedKeySpec(publicKeyBytes))
+        } catch (_: Exception) {
+            return false
+        }
+        return try {
+            Signature.getInstance(ALGORITHM).run {
+                initVerify(publicKey)
+                update(canonicalDigestPayload(entries))
+                verify(record.signature)
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun fingerprint(publicKey: ByteArray): String {
         validateEd25519PublicKey(publicKey)
         return sha256(publicKey)
@@ -156,6 +190,28 @@ object DraftSignature {
             '\u0000' !in name &&
             name != "." &&
             name != ".."
+
+    private fun canonicalDigestPayload(
+        entries: Map<String, DraftEntryDigest>,
+    ): ByteArray = ByteArrayOutputStream().run {
+        entries.entries
+            .asSequence()
+            .filter { it.key != ENTRY_NAME }
+            .sortedBy(Map.Entry<String, DraftEntryDigest>::key)
+            .forEach { (name, digest) ->
+                require(isCanonicalEntryName(name)) {
+                    "서명 대상 entry 이름이 canonical하지 않습니다: $name"
+                }
+                require(digest.size >= 0L && SHA256.matches(digest.sha256)) {
+                    "서명 대상 entry digest가 올바르지 않습니다: $name"
+                }
+                write(
+                    "$name\t${digest.size}\t${digest.sha256}\n"
+                        .toByteArray(Charsets.UTF_8),
+                )
+            }
+        toByteArray()
+    }
 
     private val SHA256 = Regex("[0-9a-f]{64}")
 }

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.draft
 
 import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
@@ -38,6 +39,17 @@ enum class DraftSourceKind(
     ZIP("source.zip"),
     CRX("source.crx"),
 }
+
+internal data class DraftSourceEvidence(
+    val actualSha256: String,
+    val crxExtensionId: String?,
+)
+
+internal data class DecodedSixDraftMetadata(
+    val draft: DraftMetadata,
+    val input: DraftInputMetadata,
+    val signerIndependentExpected: DraftExpected,
+)
 
 class SixDraftPayload private constructor(
     val draft: DraftMetadata,
@@ -107,7 +119,7 @@ class SixDraftPayload private constructor(
                 draft,
                 input,
                 sourceKind,
-                source,
+                sourceEvidence(sourceKind, source),
                 plan,
                 compatibilityBefore,
                 compatibilityAfter,
@@ -149,6 +161,66 @@ class SixDraftPayload private constructor(
             compatibilityAfterJson: ByteArray,
             expectedJson: ByteArray,
         ): SixDraftPayload {
+            val decoded = decodeAndValidate(
+                draftJson = draftJson,
+                inputJson = inputJson,
+                sourceKind = sourceKind,
+                sourceEvidence = sourceEvidence(sourceKind, source),
+                conversionPlanJson = conversionPlanJson,
+                compatibilityBeforeJson = compatibilityBeforeJson,
+                compatibilityAfterJson = compatibilityAfterJson,
+                expectedJson = expectedJson,
+            )
+            return SixDraftPayload(
+                decoded.draft,
+                decoded.input,
+                sourceKind,
+                source,
+                SixDraftJson.decodePlan(conversionPlanJson),
+                SixDraftJson.decodeCompatibility(
+                    "compatibility-before.json",
+                    compatibilityBeforeJson,
+                ),
+                SixDraftJson.decodeCompatibility(
+                    "compatibility-after.json",
+                    compatibilityAfterJson,
+                ),
+                decoded.signerIndependentExpected,
+                copySource = false,
+            )
+        }
+
+        @JvmSynthetic
+        internal fun inspect(
+            draftJson: ByteArray,
+            inputJson: ByteArray,
+            sourceKind: DraftSourceKind,
+            sourceEvidence: DraftSourceEvidence,
+            conversionPlanJson: ByteArray,
+            compatibilityBeforeJson: ByteArray,
+            compatibilityAfterJson: ByteArray,
+            expectedJson: ByteArray,
+        ): DecodedSixDraftMetadata = decodeAndValidate(
+            draftJson,
+            inputJson,
+            sourceKind,
+            sourceEvidence,
+            conversionPlanJson,
+            compatibilityBeforeJson,
+            compatibilityAfterJson,
+            expectedJson,
+        )
+
+        private fun decodeAndValidate(
+            draftJson: ByteArray,
+            inputJson: ByteArray,
+            sourceKind: DraftSourceKind,
+            sourceEvidence: DraftSourceEvidence,
+            conversionPlanJson: ByteArray,
+            compatibilityBeforeJson: ByteArray,
+            compatibilityAfterJson: ByteArray,
+            expectedJson: ByteArray,
+        ): DecodedSixDraftMetadata {
             val draft = SixDraftJson.decodeDraft(draftJson)
             val input = SixDraftJson.decodeInput(inputJson)
             val plan = SixDraftJson.decodePlan(conversionPlanJson)
@@ -165,20 +237,22 @@ class SixDraftPayload private constructor(
                 draft.schemaVersion,
                 input.originalSourceSha256,
             )
-            validateSemantics(draft, input, sourceKind, source, plan, before, after)
-            require(expected == expectedFor(draft, input, plan, after)) {
-                "expected.json 의미 결합이 일치하지 않습니다."
-            }
-            return SixDraftPayload(
+            validateSemantics(
                 draft,
                 input,
                 sourceKind,
-                source,
+                sourceEvidence,
                 plan,
                 before,
                 after,
-                expected,
-                copySource = false,
+            )
+            require(expected == expectedFor(draft, input, plan, after)) {
+                "expected.json 의미 결합이 일치하지 않습니다."
+            }
+            return DecodedSixDraftMetadata(
+                draft = draft,
+                input = input,
+                signerIndependentExpected = expected,
             )
         }
 
@@ -215,7 +289,7 @@ class SixDraftPayload private constructor(
             draft: DraftMetadata,
             input: DraftInputMetadata,
             sourceKind: DraftSourceKind,
-            source: ByteArray,
+            sourceEvidence: DraftSourceEvidence,
             plan: DraftConversionPlan,
             before: dev.sixbridge.core.compat.CompatibilityReport,
             after: dev.sixbridge.core.compat.CompatibilityReport,
@@ -224,7 +298,7 @@ class SixDraftPayload private constructor(
                 draft,
                 input,
                 sourceKind,
-                source,
+                sourceEvidence,
                 plan,
                 before,
                 after,
@@ -233,7 +307,7 @@ class SixDraftPayload private constructor(
                 draft,
                 input,
                 sourceKind,
-                source,
+                sourceEvidence,
                 plan,
                 before,
                 after,
@@ -245,7 +319,7 @@ class SixDraftPayload private constructor(
             draft: DraftMetadata,
             input: DraftInputMetadata,
             sourceKind: DraftSourceKind,
-            source: ByteArray,
+            sourceEvidence: DraftSourceEvidence,
             plan: DraftConversionPlan,
             before: dev.sixbridge.core.compat.CompatibilityReport,
             after: dev.sixbridge.core.compat.CompatibilityReport,
@@ -315,7 +389,7 @@ class SixDraftPayload private constructor(
             require(after.conversionState == expectedState) {
                 "변환 후 conversionState가 계획과 일치하지 않습니다."
             }
-            val actualSourceSha256 = actualSourceSha256(sourceKind, source)
+            val actualSourceSha256 = sourceEvidence.actualSha256
             if (selected.isEmpty()) {
                 require(
                     before.sourceSha256 == actualSourceSha256 &&
@@ -366,7 +440,7 @@ class SixDraftPayload private constructor(
             draft: DraftMetadata,
             input: DraftInputMetadata,
             sourceKind: DraftSourceKind,
-            source: ByteArray,
+            sourceEvidence: DraftSourceEvidence,
             plan: DraftConversionPlan,
             before: dev.sixbridge.core.compat.CompatibilityReport,
             after: dev.sixbridge.core.compat.CompatibilityReport,
@@ -376,7 +450,7 @@ class SixDraftPayload private constructor(
             require(draft.sourceIdentity == input.sourceIdentity) {
                 "draft와 input sourceIdentity가 일치하지 않습니다."
             }
-            val actualOriginalSha256 = actualSourceSha256(sourceKind, source)
+            val actualOriginalSha256 = sourceEvidence.actualSha256
             require(
                 input.originalSourceSha256 == actualOriginalSha256 &&
                     before.sourceSha256 == actualOriginalSha256,
@@ -485,7 +559,9 @@ class SixDraftPayload private constructor(
                 ) {
                     "source.crx input kind가 올바르지 않습니다."
                 }
-                val proofId = dev.sixbridge.core.crx.Crx3.parse(source).extensionId
+                val proofId = requireNotNull(sourceEvidence.crxExtensionId) {
+                    "source.crx proof ID가 없습니다."
+                }
                 require(input.originalExtensionId == proofId) {
                     "source.crx proof ID가 원본 extension ID와 다릅니다."
                 }
@@ -501,13 +577,20 @@ class SixDraftPayload private constructor(
             }
         }
 
-        private fun actualSourceSha256(
+        private fun sourceEvidence(
             sourceKind: DraftSourceKind,
             source: ByteArray,
-        ): String = if (sourceKind == DraftSourceKind.CRX) {
-            dev.sixbridge.core.crx.Crx3.verifiedPayloadSha256(source)
+        ): DraftSourceEvidence = if (sourceKind == DraftSourceKind.CRX) {
+            val verified = Crx3Verifier.verify(source)
+            DraftSourceEvidence(
+                actualSha256 = verified.zipSha256,
+                crxExtensionId = verified.extensionId,
+            )
         } else {
-            DraftSignature.sha256(source)
+            DraftSourceEvidence(
+                actualSha256 = DraftSignature.sha256(source),
+                crxExtensionId = null,
+            )
         }
 
         private val ADAPTER_KEY_ORDER =
@@ -688,6 +771,9 @@ object SixDraft {
             }
             readVerified(bytes)
         }
+
+    fun probe(input: Path, maximumBytes: Long): SixDraftProbe =
+        StrictDraftPathProbe.probe(input, maximumBytes)
 
     private fun readVerified(bytes: ByteArray): VerifiedSixDraft {
         require(bytes.size.toLong() <= MAX_ARCHIVE_SIZE) {
@@ -891,8 +977,8 @@ object SixDraft {
         throw InvalidSixDraftException("$message ${error.message}", error)
     }
 
-    private val SOURCE_ENTRIES = setOf("source.zip", "source.crx")
-    private val METADATA_ENTRIES = setOf(
+    internal val SOURCE_ENTRIES = setOf("source.zip", "source.crx")
+    internal val METADATA_ENTRIES = setOf(
         "compatibility-after.json",
         "compatibility-before.json",
         "conversion-plan.json",
@@ -905,7 +991,7 @@ object SixDraft {
     internal const val MAX_METADATA_SIZE = 1L * 1024 * 1024
     internal const val MAX_SOURCE_SIZE = 512L * 1024 * 1024
     internal const val MAX_TOTAL_SIZE = 520L * 1024 * 1024
-    private const val MAX_ARCHIVE_SIZE = MAX_TOTAL_SIZE + 16L * 1024 * 1024
+    internal const val MAX_ARCHIVE_SIZE = MAX_TOTAL_SIZE + 16L * 1024 * 1024
 
     private data class DraftPathState(
         val fileKey: Any,

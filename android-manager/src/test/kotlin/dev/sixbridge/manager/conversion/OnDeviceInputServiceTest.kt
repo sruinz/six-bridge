@@ -18,6 +18,9 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -28,6 +31,12 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Test
@@ -80,22 +89,32 @@ class OnDeviceInputServiceTest {
     }
 
     @Test
-    fun `draft와 겹치는 일반 확장 resource 이름은 ZIP으로 판별한다`() = runTest {
-        val source = Files.createTempDirectory("on-device-overlap-extension")
-        val zip = try {
-            source.resolve("manifest.json").writeText(
-                """{"manifest_version":3,"name":"Overlap","version":"1"}""",
-            )
-            source.resolve("input.json").writeText("""{"ordinary":true}""")
-            source.resolve("source.zip").writeText("ordinary resource")
-            ExtensionZip.createBytes(source)
-        } finally {
-            source.toFile().deleteRecursively()
+    fun `각 draft marker 하나만 가진 정상 extension은 ZIP으로 판별한다`() = runTest {
+        val markers = listOf(
+            "draft.json",
+            "conversion-plan.json",
+            "compatibility-before.json",
+            "compatibility-after.json",
+            "expected.json",
+            "draft-signature.json",
+        )
+
+        markers.forEach { marker ->
+            val source = Files.createTempDirectory("on-device-overlap-extension")
+            val zip = try {
+                source.resolve("manifest.json").writeText(
+                    """{"manifest_version":3,"name":"Overlap","version":"1"}""",
+                )
+                source.resolve(marker).writeText("""{"ordinary":true}""")
+                ExtensionZip.createBytes(source)
+            } finally {
+                source.toFile().deleteRecursively()
+            }
+
+            val artifact = service(ByteArrayInputStream(zip)).acquire(safRequest())
+            assertEquals(OnDeviceInputKind.ZIP, artifact.kind, marker)
+            artifact.privateFile.parentFile?.deleteRecursively()
         }
-
-        val artifact = service(ByteArrayInputStream(zip)).acquire(safRequest())
-
-        assertEquals(OnDeviceInputKind.ZIP, artifact.kind)
     }
 
     @Test
@@ -138,6 +157,34 @@ class OnDeviceInputServiceTest {
     }
 
     @Test
+    fun `SAF read와 close 실패의 raw secret을 cause와 suppressed에 남기지 않는다`() = runTest {
+        val readSecret = "content://private.provider/read-secret.zip"
+        val closeSecret = "content://private.provider/close-secret.zip"
+        val service = service(
+            object : InputStream() {
+                override fun read(): Int = throw IOException(readSecret)
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                    throw IOException(readSecret)
+
+                override fun close() {
+                    throw IOException(closeSecret)
+                }
+            },
+        )
+
+        val error = assertFailsWith<OnDeviceInputException> {
+            service.acquire(safRequest())
+        }
+
+        assertEquals(OnDeviceInputErrorCode.SOURCE_READ_FAILED, error.code)
+        assertNull(error.cause)
+        assertTrue(error.suppressed.isEmpty())
+        assertFalse(error.stackTraceToString().contains(readSecret))
+        assertFalse(error.stackTraceToString().contains(closeSecret))
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
     fun `진행 없는 0 byte SAF stream을 거부하고 부분 파일을 정리한다`() = runTest {
         val service = service(
             object : InputStream() {
@@ -168,6 +215,54 @@ class OnDeviceInputServiceTest {
             service.acquire(safRequest())
         }
         assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `IO 성공 뒤 caller resume 전 취소하면 전달되지 않은 token을 정리한다`() = runBlocking {
+        val callerExecutor = Executors.newSingleThreadExecutor()
+        val ioExecutor = Executors.newSingleThreadExecutor()
+        val caller = callerExecutor.asCoroutineDispatcher()
+        val io = ioExecutor.asCoroutineDispatcher()
+        val ioEntered = CountDownLatch(1)
+        val allowIo = CountDownLatch(1)
+        val blockerEntered = CountDownLatch(1)
+        val releaseCaller = CountDownLatch(1)
+        val token = "01234567-89ab-cdef-0123-456789abcdef"
+        try {
+            val zip = extensionZip()
+            val service = OnDeviceInputService(
+                privateRoot = root,
+                safInputOpener = SafInputOpener {
+                    ioEntered.countDown()
+                    check(allowIo.await(5, TimeUnit.SECONDS))
+                    ByteArrayInputStream(zip)
+                },
+                tokenFactory = { token },
+                ioDispatcher = io,
+            )
+            val scope = CoroutineScope(SupervisorJob() + caller)
+            val deferred = scope.async {
+                service.acquire(safRequest())
+            }
+            assertTrue(ioEntered.await(5, TimeUnit.SECONDS))
+            callerExecutor.execute {
+                blockerEntered.countDown()
+                releaseCaller.await(5, TimeUnit.SECONDS)
+            }
+            assertTrue(blockerEntered.await(5, TimeUnit.SECONDS))
+            allowIo.countDown()
+            ioExecutor.submit {}.get(5, TimeUnit.SECONDS)
+
+            deferred.cancel()
+            releaseCaller.countDown()
+            deferred.cancelAndJoin()
+
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        } finally {
+            releaseCaller.countDown()
+            caller.close()
+            io.close()
+        }
     }
 
     @Test
@@ -260,8 +355,68 @@ class OnDeviceInputServiceTest {
             service.acquire(OnDeviceInputRequest.ChromeStore(pageUrl))
         }
 
-        assertEquals(OnDeviceInputErrorCode.DOWNLOAD_FAILED, error.code)
+        assertEquals(OnDeviceInputErrorCode.INPUT_INVALID, error.code)
+        assertEquals(
+            ChromeDownloadErrorCode.EXTENSION_ID_MISMATCH,
+            error.chromeDownloadErrorCode,
+        )
         assertFalse(error.toString().contains(pageUrl))
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `모든 structured Chrome code를 URL NETWORK INPUT_INVALID로 결정 매핑한다`() = runTest {
+        val mappings = mapOf(
+            ChromeDownloadErrorCode.NETWORK_FAILED to OnDeviceInputErrorCode.NETWORK,
+            ChromeDownloadErrorCode.HTTP_FAILED to OnDeviceInputErrorCode.NETWORK,
+            ChromeDownloadErrorCode.REDIRECT_REJECTED to OnDeviceInputErrorCode.NETWORK,
+            ChromeDownloadErrorCode.TOO_MANY_REDIRECTS to OnDeviceInputErrorCode.NETWORK,
+            ChromeDownloadErrorCode.HTML_RESPONSE to OnDeviceInputErrorCode.INPUT_INVALID,
+            ChromeDownloadErrorCode.RESPONSE_TOO_LARGE to OnDeviceInputErrorCode.INPUT_INVALID,
+            ChromeDownloadErrorCode.INVALID_CRX3 to OnDeviceInputErrorCode.INPUT_INVALID,
+            ChromeDownloadErrorCode.EXTENSION_ID_MISMATCH to OnDeviceInputErrorCode.INPUT_INVALID,
+        )
+        val pageUrl =
+            "https://chromewebstore.google.com/detail/name/${"a".repeat(32)}"
+
+        mappings.forEach { (downloadCode, expectedCode) ->
+            val service = OnDeviceInputService(
+                privateRoot = root,
+                safInputOpener = SafInputOpener { null },
+                chromeDownloader = ChromeCrxDownloader { _, _ ->
+                    throw ChromeDownloadException(downloadCode, "safe")
+                },
+            )
+
+            val error = assertFailsWith<OnDeviceInputException> {
+                service.acquire(OnDeviceInputRequest.ChromeStore(pageUrl))
+            }
+
+            assertEquals(expectedCode, error.code, downloadCode.name)
+            assertEquals(downloadCode, error.chromeDownloadErrorCode)
+            assertNull(error.cause)
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        }
+    }
+
+    @Test
+    fun `잘못된 Chrome 상세 주소는 URL code로 분류하고 원문을 숨긴다`() = runTest {
+        val secret = "https://evil.example/customer-secret"
+        val service = OnDeviceInputService(
+            privateRoot = root,
+            safInputOpener = SafInputOpener { null },
+            chromeDownloader = ChromeCrxDownloader { _, _ ->
+                error("호출되면 안 됩니다.")
+            },
+        )
+
+        val error = assertFailsWith<OnDeviceInputException> {
+            service.acquire(OnDeviceInputRequest.ChromeStore(secret))
+        }
+
+        assertEquals(OnDeviceInputErrorCode.URL, error.code)
+        assertNull(error.chromeDownloadErrorCode)
+        assertFalse(error.stackTraceToString().contains(secret))
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
 

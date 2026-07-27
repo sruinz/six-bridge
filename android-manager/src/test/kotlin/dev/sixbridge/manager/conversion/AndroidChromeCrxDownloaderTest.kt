@@ -1,16 +1,20 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ChromeWebStoreAddress
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.io.OutputStream
+import java.net.URL
 import java.nio.file.Files
 import java.security.KeyPairGenerator
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.locks.LockSupport
+import javax.net.ssl.HttpsURLConnection
 import kotlin.io.path.writeText
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -19,6 +23,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import org.junit.Test
@@ -43,12 +48,12 @@ class AndroidChromeCrxDownloaderTest {
         val transport = FakeTransport(
             response(200, packed.bytes, "application/x-chrome-extension"),
         )
-        val output = ByteArrayOutputStream()
+        val output = destination()
         val address = address(packed.extensionId)
 
         val proof = AndroidChromeCrxDownloader(transport).download(address, output)
 
-        assertContentEquals(packed.bytes, output.toByteArray())
+        assertContentEquals(packed.bytes, Files.readAllBytes(output))
         assertEquals(packed.extensionId, proof.extensionId)
         assertEquals(packed.bytes.size.toLong(), proof.byteCount)
         assertEquals(sha256(packed.bytes), proof.sha256)
@@ -56,6 +61,25 @@ class AndroidChromeCrxDownloaderTest {
         assertEquals(60_000, transport.requests.single().readTimeoutMillis)
         assertEquals("https", transport.requests.single().uri.scheme)
         assertEquals("clients2.google.com", transport.requests.single().uri.host)
+    }
+
+    @Test
+    fun `기존 OutputStream 공개 API도 검증된 CRX와 증명을 반환한다`() = runTest {
+        val packed = validCrx()
+        val transport = FakeTransport(
+            response(200, packed.bytes, "application/x-chrome-extension"),
+        )
+        val output = ByteArrayOutputStream()
+
+        val proof = AndroidChromeCrxDownloader(transport).download(
+            address(packed.extensionId),
+            output,
+        )
+
+        assertContentEquals(packed.bytes, output.toByteArray())
+        assertEquals(packed.extensionId, proof.extensionId)
+        assertEquals(packed.bytes.size.toLong(), proof.byteCount)
+        assertEquals(sha256(packed.bytes), proof.sha256)
     }
 
     @Test
@@ -68,7 +92,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address("a".repeat(32)),
-                ByteArrayOutputStream(),
+                destination(),
             )
         }
 
@@ -83,7 +107,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address("a".repeat(32)),
-                ByteArrayOutputStream(),
+                destination(),
             )
         }
 
@@ -99,7 +123,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address("a".repeat(32)),
-                ByteArrayOutputStream(),
+                destination(),
             )
         }
 
@@ -108,7 +132,7 @@ class AndroidChromeCrxDownloaderTest {
 
     @Test
     fun `HTML 응답을 CRX로 저장하지 않는다`() = runTest {
-        val output = ByteArrayOutputStream()
+        val output = destination()
         val transport = FakeTransport(
             response(200, "<html>login</html>".encodeToByteArray(), "text/html"),
         )
@@ -121,7 +145,7 @@ class AndroidChromeCrxDownloaderTest {
         }
 
         assertEquals(ChromeDownloadErrorCode.HTML_RESPONSE, error.code)
-        assertEquals(0, output.size())
+        assertFalse(Files.exists(output))
     }
 
     @Test
@@ -138,7 +162,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address("a".repeat(32)),
-                OutputStream.nullOutputStream(),
+                destination(),
             )
         }
 
@@ -159,7 +183,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address("a".repeat(32)),
-                OutputStream.nullOutputStream(),
+                destination(),
             )
         }
 
@@ -181,7 +205,7 @@ class AndroidChromeCrxDownloaderTest {
         val error = assertFailsWith<ChromeDownloadException> {
             AndroidChromeCrxDownloader(transport).download(
                 address(requestedId),
-                ByteArrayOutputStream(),
+                destination(),
             )
         }
 
@@ -204,13 +228,83 @@ class AndroidChromeCrxDownloaderTest {
             ),
         )
         val job = launch {
-            downloader.download(address("a".repeat(32)), OutputStream.nullOutputStream())
+            downloader.download(address("a".repeat(32)), destination())
         }
         body.started.await()
 
         job.cancelAndJoin()
 
         assertTrue(body.closed.get())
+    }
+
+    @Test
+    fun `public downloader transport copy verification close는 주입 IO dispatcher에서만 실행한다`() = runTest {
+        val packed = validCrx()
+        val threads = CopyOnWriteArrayList<String>()
+        val io = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "chrome-download-io")
+        }.asCoroutineDispatcher()
+        try {
+            val body = object : ByteArrayInputStream(packed.bytes) {
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    threads += Thread.currentThread().name
+                    return super.read(buffer, offset, length)
+                }
+            }
+            val transport = ChromeDownloadTransport {
+                threads += Thread.currentThread().name
+                ChromeDownloadResponse(
+                    statusCode = 200,
+                    contentType = "application/x-chrome-extension",
+                    location = null,
+                    body = body,
+                    closeAction = { threads += Thread.currentThread().name },
+                )
+            }
+            val downloader = AndroidChromeCrxDownloader(
+                transport = transport,
+                ioDispatcher = io,
+                crxVerifier = CrxPathVerifier { path, maximumBytes ->
+                    threads += Thread.currentThread().name
+                    Crx3Verifier.verify(path, maximumBytes)
+                },
+            )
+
+            downloader.download(address(packed.extensionId), destination())
+
+            assertTrue(threads.isNotEmpty())
+            assertTrue(threads.all { it == "chrome-download-io" })
+        } finally {
+            io.close()
+        }
+    }
+
+    @Test
+    fun `HTTPS header 대기 취소는 connection과 cancelled response body를 닫는다`() = runTest {
+        val connection = HeaderBlockingHttpsConnection()
+        val transport = HttpsChromeDownloadTransport(
+            HttpsConnectionFactory { connection },
+        )
+        val io = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "https-header-io")
+        }.asCoroutineDispatcher()
+        val downloader = AndroidChromeCrxDownloader(
+            transport = transport,
+            ioDispatcher = io,
+        )
+        try {
+            val job = launch {
+                downloader.download(address("a".repeat(32)), destination())
+            }
+            connection.started.await()
+
+            job.cancelAndJoin()
+
+            assertTrue(connection.disconnected.get())
+            assertTrue(connection.bodyClosed.get())
+        } finally {
+            io.close()
+        }
     }
 
     private fun validCrx() = Crx3.pack(
@@ -226,6 +320,9 @@ class AndroidChromeCrxDownloaderTest {
         ChromeWebStoreAddress.parse(
             "https://chromewebstore.google.com/detail/name/$extensionId",
         )
+
+    private fun destination() =
+        Files.createTempDirectory("chrome-download-output").resolve("input.crx")
 
     private fun redirect(location: String) = ChromeDownloadResponse(
         statusCode = 302,
@@ -296,5 +393,44 @@ class AndroidChromeCrxDownloaderTest {
         override fun close() {
             closed.set(true)
         }
+    }
+
+    private class HeaderBlockingHttpsConnection :
+        HttpsURLConnection(URL("https://clients2.google.com/test")) {
+        val started = CompletableDeferred<Unit>()
+        val disconnected = AtomicBoolean()
+        val bodyClosed = AtomicBoolean()
+        private val body = object : ByteArrayInputStream(ByteArray(0)) {
+            override fun close() {
+                bodyClosed.set(true)
+                super.close()
+            }
+        }
+
+        override fun getResponseCode(): Int {
+            started.complete(Unit)
+            while (!disconnected.get()) {
+                LockSupport.parkNanos(1_000_000)
+            }
+            return 200
+        }
+
+        override fun getInputStream(): InputStream = body
+
+        override fun getContentType(): String = "application/x-chrome-extension"
+
+        override fun disconnect() {
+            disconnected.set(true)
+        }
+
+        override fun usingProxy(): Boolean = false
+
+        override fun connect() = Unit
+
+        override fun getCipherSuite(): String = "TLS_TEST"
+
+        override fun getLocalCertificates(): Array<java.security.cert.Certificate>? = null
+
+        override fun getServerCertificates(): Array<java.security.cert.Certificate> = emptyArray()
     }
 }
