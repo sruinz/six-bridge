@@ -132,12 +132,16 @@ class AndroidChromeCrxDownloader(
     ): DownloadProof {
         val created = AtomicBoolean()
         var delivered = false
+        var primaryFailure: Throwable? = null
         return try {
             val proof = withContext(ioDispatcher) {
                 downloadOnIo(address, destination, created)
             }
             delivered = true
             proof
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
         } finally {
             if (!delivered && created.get()) {
                 val cleanupError = withContext(NonCancellable + ioDispatcher) {
@@ -157,7 +161,11 @@ class AndroidChromeCrxDownloader(
                     }
                     cleanupError
                 }
-                if (cleanupError != null) throw cleanupError
+                if (cleanupError != null &&
+                    primaryFailure !is CancellationException
+                ) {
+                    throw cleanupError
+                }
             }
         }
     }

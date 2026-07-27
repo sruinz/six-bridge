@@ -299,15 +299,18 @@ class AndroidChromeCrxDownloaderTest {
     }
 
     @Test
-    fun `cancel 뒤 destination 삭제 실패도 structured cleanup 오류다`() = runBlocking {
+    fun `같은 IO dispatcher cancel은 cleanup 실패에도 cancellation이다`() = runBlocking {
         val secret = "customer-secret-cancel-cleanup"
         val parent = Files.createTempDirectory(secret)
         val destination = parent.resolve("input.crx")
         val body = CancellationDeleteFailureInputStream(destination)
         val reports = CopyOnWriteArrayList<ChromeDownloadException>()
+        val io = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "chrome-download-shared-io")
+        }.asCoroutineDispatcher()
         try {
             val completion = CompletableDeferred<Throwable?>()
-            val job = launch {
+            val job = launch(io) {
                 AndroidChromeCrxDownloader(
                     transport = FakeTransport(
                         ChromeDownloadResponse(
@@ -317,6 +320,7 @@ class AndroidChromeCrxDownloaderTest {
                             body = body,
                         ),
                     ),
+                    ioDispatcher = io,
                     cleanupFailureReporter =
                         ChromeDownloadCleanupFailureReporter {
                             reports += it
@@ -332,6 +336,8 @@ class AndroidChromeCrxDownloaderTest {
 
             assertTrue(cancellation is CancellationException)
             assertTrue(cancellation.suppressed.isEmpty())
+            assertFalse(cancellation.message.orEmpty().contains(secret))
+            assertFalse(cancellation.stackTraceToString().contains(secret))
             assertTrue(Files.exists(destination))
             assertEquals(1, reports.size)
             val cleanup = reports.single()
@@ -341,6 +347,7 @@ class AndroidChromeCrxDownloaderTest {
             assertFalse(cleanup.message.orEmpty().contains(destination.toString()))
             assertFalse(cleanup.stackTraceToString().contains(secret))
         } finally {
+            io.close()
             Files.deleteIfExists(destination.resolve("blocker"))
             Files.deleteIfExists(destination)
             Files.deleteIfExists(parent)
