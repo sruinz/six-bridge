@@ -17,11 +17,13 @@
 - 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
 - 최종 수정 관리자 APK SHA-256:
+  `0b77f88516f58d3153a9769e459e6afba4b243160f16dc987571fad3db37c905`
+- 과거 2026-07-27 1차 아이콘 동시성 관리자 APK SHA-256:
   `c005580f1a69b28576ec6e9aa3f5ba483f50d5ee26d213b697d45260fc22977c`
 - 과거 2026-07-26 Task 5 관리자 APK SHA-256:
   `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`
 - 과거 자동 검증 일자: 2026-07-26
-- 아이콘 동시성 최종 자동 검증 일시: 2026-07-27 08:13~08:23 KST
+- 아이콘 동시성 최종 자동 검증 일시: 2026-07-27 09:18~09:22 KST
 - 아이콘 동시성 최종 Fold7 serial:
   `adb-DEVICE_SERIAL._adb-tls-connect._tcp`
 - 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
@@ -43,20 +45,31 @@
 - [x] `./scripts/verify.sh`
   - 증거: Gradle 74 task 성공, Node 89/89 통과, 기존 shell/mobile conversion
     통과, Android manifest와 distribution 계약 `PASS`
+- [x] 아이콘 동시성 지정 회귀
+  - 명령 범위: `:android-manager:testDebugUnitTest --rerun-tasks`에
+    `ManagerRepositoryTest`, `CatalogReconcilerTest`,
+    `CatalogIconEnricherTest`, `UninstallCoordinatorTest`,
+    `ManagerViewModelTest` 다섯 class를 `--tests`로 지정했다.
+  - 최종 결과: 118/118 통과, failures/errors/skipped 0
 - [x] `./scripts/package-manager-debug.sh`
   - 과거 2026-07-26 증거: Gradle 74/74 task, Android unit 269/269,
     Node 89/89, shell·conversion·manifest·distribution 계약 통과 뒤
     `dist/sixbridge-manager-debug.apk` 패키징 완료
-  - 아이콘 동시성 최종 증거: 2026-07-27 fresh 실행에서 Gradle 74/74 task,
+  - 과거 2026-07-27 1차 아이콘 동시성 증거: fresh 실행에서 Gradle 74/74
+    task,
     Android unit 291/291, Node 89/89, shell·conversion·manifest·verification
     ·distribution 계약을 통과하고 같은 dist APK를 패키징했다.
-  - 첫 fresh 실행에서는 이전에도 관찰된
+  - 교차 검토 수정 뒤 최종 fresh 증거: 2026-07-27 09:18 KST부터 실행해
+    Gradle 74/74 task, Android unit 297/297, Node 89/89,
+    shell·conversion·manifest·verification·distribution 계약을 모두
+    통과하고 1분 49초에 dist APK 패키징을 완료했다.
+  - 위 1차 검증의 첫 fresh 실행에서는 이전에도 관찰된
     `StableAnalysisTest.all compatibility and mobile decisions read one stable source`
     stack frame sampling 경합이 `StableAnalysisTest.kt:156`에서 한 번
     발생했다. 해당 테스트만 정확히 격리한 fresh 재실행은 1/1 통과했다.
-    최종 전체 패키징은 코드 변경 없이 다시 fresh 실행해 2분 3초,
+    1차 전체 패키징은 코드 변경 없이 다시 fresh 실행해 2분 3초,
     74/74 task로 완료했다.
-  - 최종 실행 중 `:core:test`가 오래 대기한 시점의 JVM thread dump는
+  - 위 1차 전체 실행 중 `:core:test`가 오래 대기한 시점의 JVM thread dump는
     `StableAnalysisTest`가 아니라 `WrapperApkBuilderTest`의 외부 process
     종료 대기임을 가리켰고, 해당 process 종료 뒤 빌드가 정상 완료됐다.
 - [x] `shasum -a 256 dist/sixbridge-manager-debug.apk`
@@ -64,14 +77,14 @@
     `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`로
     일치하고 fresh build APK와 byte-for-byte 동일
   - 아이콘 동시성 최종 증거: 전체 패키징 재실행 뒤 build와 dist APK가
-    `c005580f1a69b28576ec6e9aa3f5ba483f50d5ee26d213b697d45260fc22977c`로
+    `0b77f88516f58d3153a9769e459e6afba4b243160f16dc987571fad3db37c905`로
     일치하고 `cmp` exit code도 `0`
 - [x] Git 제외 경계
   - 증거: `git check-ignore -v`로 `dist/`, `**/build/`, Room 임시 schema,
     `local.properties`를 확인하고 canonical Room JSON schema가 계속 추적됨을
     확인
 - [x] `:android-manager:connectedDebugAndroidTest`
-  - 아이콘 동시성 최종 증거: 2026-07-27 08:14 KST에 지정 serial의
+  - 아이콘 동시성 최종 증거: 2026-07-27 09:21 KST에 지정 serial의
     `SM-F966N`에서 fresh 전체 connected 28/28 통과,
     failures/errors/skipped 0
   - 이 28건에는 Room 9건, UI 15건과
@@ -261,7 +274,7 @@ fallback, v2 package·관리자 카드·삼성 인터넷 Add-ons 항목 정리, 
 재시작 뒤 package 정리 유지와 치명 오류 부재를 확인했다. 위에 체크하지 않은
 나머지 무ADB 설치·업데이트·차단·삼성 인터넷 재시작 항목은 미완료 상태로
 유지한다. 2026-07-27 아이콘 동시성 최종 회귀에서는 production
-manifest·Room schema version `1` 유지, Android unit 291/291, Fold7
+manifest·Room schema version `1` 유지, Android unit 297/297, Fold7
 connected 28/28, 전체 패키징 74/74와 Node 89/89, build/dist APK
 byte 동일성을 자동 검증했다. 이번 최종 회귀에서는 실제 wrapper 제거 또는
 새 UI 수동 캡처를 수행하지 않았으므로 기존 사용자 확인 범위를 확대해
