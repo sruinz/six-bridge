@@ -35,6 +35,9 @@ new_fixture() {
     printf '#!/bin/sh\nexit 0\n' \
         >"${fixture_dir}/scripts/android-wrapper-template.test.sh"
     chmod +x "${fixture_dir}/scripts/android-wrapper-template.test.sh"
+    printf '#!/bin/sh\nexit 0\n' \
+        >"${fixture_dir}/scripts/fold7-ondevice-packager-gate.test.sh"
+    chmod +x "${fixture_dir}/scripts/fold7-ondevice-packager-gate.test.sh"
 
     for script_name in \
         fold7-gate.sh \
@@ -398,6 +401,31 @@ test_package_removes_stale_output_when_verify_is_unavailable() {
         fail "verify.sh를 실행할 수 없는데 stale dist APK가 남았습니다:${stale_modes}"
 }
 
+test_package_removes_stale_output_when_ondevice_gate_is_unavailable() {
+    local fixture_dir
+    local output_file
+    local packaged_apk
+
+    fixture_dir="$(new_fixture)"
+    cp "${PACKAGE_SCRIPT}" "${fixture_dir}/scripts/package-manager-debug.sh"
+    chmod +x "${fixture_dir}/scripts/package-manager-debug.sh"
+    output_file="${fixture_dir}/package-missing-ondevice-gate.txt"
+    packaged_apk="${fixture_dir}/dist/sixbridge-manager-debug.apk"
+    mkdir -p "${fixture_dir}/dist"
+    printf 'stale-dist\n' >"${packaged_apk}"
+    rm -f -- "${fixture_dir}/scripts/fold7-ondevice-packager-gate.test.sh"
+
+    if /bin/bash "${fixture_dir}/scripts/package-manager-debug.sh" \
+        >"${output_file}" 2>&1; then
+        fail "온디바이스 gate 계약 스크립트가 없는데 패키징이 성공했습니다."
+    fi
+    assert_contains "${output_file}" "온디바이스 packager gate 계약" \
+        "온디바이스 gate 계약 스크립트 누락 오류가 명확하지 않습니다."
+    [[ ! -e "${packaged_apk}" ]] ||
+        fail "온디바이스 gate 계약 스크립트를 실행할 수 없는데 stale dist APK가 남았습니다."
+    rm -rf -- "${fixture_dir}"
+}
+
 test_gitignore_excludes_local_release_outputs() {
     local ignored_path
 
@@ -425,6 +453,7 @@ test_verify_rejects_jdk_older_than_17
 test_verify_rejects_incomplete_jdk_tools
 test_package_requires_fresh_verification
 test_package_removes_stale_output_when_verify_is_unavailable
+test_package_removes_stale_output_when_ondevice_gate_is_unavailable
 test_gitignore_excludes_local_release_outputs
 
 printf 'PASS: Android manager verification and packaging contracts\n'
