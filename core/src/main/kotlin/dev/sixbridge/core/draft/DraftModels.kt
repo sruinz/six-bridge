@@ -150,5 +150,5 @@ internal data class DraftExpected(
 
 internal val SHA256 = Regex("[0-9a-f]{64}")
 internal val EXTENSION_ID = Regex("[a-p]{32}")
-internal val SOURCE_IDENTITY = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+internal val SOURCE_IDENTITY = Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 internal val ID = Regex("[a-z0-9][a-z0-9._-]{0,127}")

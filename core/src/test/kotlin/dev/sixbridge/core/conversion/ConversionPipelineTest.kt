@@ -134,7 +134,7 @@ class ConversionPipelineTest {
         assertEquals(original.extensionId, result.extensionId)
         assertEquals(original.extensionId, result.compatibilityAfter.originalExtensionId)
         assertEquals(original.extensionId, result.compatibilityAfter.convertedExtensionId)
-        assertEquals(null, result.logicalIdentity)
+        assertEquals("store:${original.extensionId}", result.logicalIdentity)
         assertTrue(result.passthrough)
     }
 
@@ -158,7 +158,7 @@ class ConversionPipelineTest {
             it.prepare(resolved, profile(), emptyList())
         }
 
-        assertEquals("store:${original.extensionId}:profile-30", first.logicalIdentity)
+        assertEquals("store:${original.extensionId}", first.logicalIdentity)
         assertNotEquals(original.extensionId, first.extensionId)
         assertEquals(first.extensionId, second.extensionId)
         val parsed = Crx3.parse(first.crxBytes)
@@ -175,6 +175,7 @@ class ConversionPipelineTest {
         assertEquals(first.extensionId, Crx3.extensionId(publicKey))
         assertEquals(original.extensionId, first.compatibilityAfter.originalExtensionId)
         assertEquals(first.extensionId, first.compatibilityAfter.convertedExtensionId)
+        assertFalse(first.crxBytes.contentEquals(original.bytes))
     }
 
     @Test

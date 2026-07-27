@@ -10,6 +10,7 @@ import dev.sixbridge.core.crx.InvalidCrxException
 import dev.sixbridge.core.device.AdbDeviceClient
 import dev.sixbridge.core.device.BuildArtifactVerifier
 import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.UnsupportedInputException
 import dev.sixbridge.core.profile.BrowserProfileExtractor
 import dev.sixbridge.core.profile.BrowserProfileJson
@@ -30,7 +31,7 @@ fun main(args: Array<String>) {
 }
 
 fun createCommandLine(
-    serviceFactory: (Path) -> SixBridgeService = ::SixBridgeService,
+    serviceFactory: (Path) -> SixBridgeService = ::createDesktopService,
 ): CommandLine {
     val command = CommandLine(SixBridgeCommand(serviceFactory))
     command.executionExceptionHandler = CommandLine.IExecutionExceptionHandler { error, line, _ ->
@@ -67,7 +68,7 @@ fun createCommandLine(
     ],
 )
 class SixBridgeCommand(
-    private val serviceFactory: (Path) -> SixBridgeService = ::SixBridgeService,
+    private val serviceFactory: (Path) -> SixBridgeService = ::createDesktopService,
 ) : Runnable {
     @Option(
         names = ["--workspace"],
@@ -81,6 +82,12 @@ class SixBridgeCommand(
 
     fun service(): SixBridgeService = serviceFactory(workspace)
 }
+
+internal fun createDesktopService(workspace: Path): SixBridgeService =
+    SixBridgeService(
+        workspaceRoot = workspace,
+        inputResolver = ExtensionInputResolver(DesktopChromeCrxDownloader()),
+    )
 
 @Command(
     name = "profile",

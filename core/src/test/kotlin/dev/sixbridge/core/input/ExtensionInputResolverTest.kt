@@ -40,22 +40,79 @@ class ExtensionInputResolverTest {
     }
 
     @Test
-    fun `recognizes a Chrome Web Store extension id and rejects Edge store automation`() {
-        val resolver = ExtensionInputResolver { _, expectedId ->
-            byteArrayOf(1, 2, 3).also {
-                assertEquals("fchehlladkkanoekpjffcfffpfbdaalj", expectedId)
+    fun `injected downloader receives parsed Chrome ID and rejects mismatched CRX`() {
+        val source = Files.createTempDirectory("six-input-store")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Store","version":"1"}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA")
+                .apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val resolver = ExtensionInputResolver { address ->
+            packed.bytes.also {
+                assertEquals(packed.extensionId, address.extensionId)
             }
         }
 
         val chrome = resolver.resolve(
             "https://chromewebstore.google.com/detail/video-download-to-nas/" +
-                "fchehlladkkanoekpjffcfffpfbdaalj?hl=ko",
+                "${packed.extensionId}?hl=ko",
         )
 
         assertEquals(ExtensionInputKind.CHROME_WEB_STORE, chrome.kind)
-        assertEquals("fchehlladkkanoekpjffcfffpfbdaalj", chrome.expectedExtensionId)
+        assertEquals(packed.extensionId, chrome.expectedExtensionId)
+        assertContentEquals(packed.bytes, chrome.crxBytes)
+
+        val mismatch = ExtensionInputResolver {
+            val otherSource = Files.createTempDirectory("six-input-other-store")
+            otherSource.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Other","version":"1"}""",
+            )
+            Crx3.pack(
+                otherSource,
+                KeyPairGenerator.getInstance("RSA")
+                    .apply { initialize(2048) }
+                    .generateKeyPair(),
+            ).bytes
+        }
+        assertFailsWith<UnsupportedInputException> {
+            mismatch.resolve(
+                "https://chromewebstore.google.com/detail/video-download-to-nas/" +
+                    "${packed.extensionId}?hl=ko",
+            )
+        }
         assertFailsWith<UnsupportedInputException> {
             resolver.resolve("https://microsoftedge.microsoft.com/addons/detail/example/abcdefghijkl")
+        }
+    }
+
+    @Test
+    fun `downloader가 없으면 URL만 거부하고 로컬 ZIP과 CRX는 처리한다`() {
+        val source = Files.createTempDirectory("six-input-local-only")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Local","version":"1"}""",
+        )
+        val zip = source.parent.resolve("local-only.zip")
+        ExtensionZip.create(source, zip)
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA")
+                .apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val crx = source.parent.resolve("local-only.crx")
+        crx.writeBytes(packed.bytes)
+        val resolver = ExtensionInputResolver()
+
+        assertEquals(ExtensionInputKind.ZIP, resolver.resolve(zip.toString()).kind)
+        assertEquals(ExtensionInputKind.CRX3, resolver.resolve(crx.toString()).kind)
+        assertFailsWith<UnsupportedInputException> {
+            resolver.resolve(
+                "https://chromewebstore.google.com/detail/name/${packed.extensionId}",
+            )
         }
     }
 

@@ -67,6 +67,21 @@ class ConversionWorkspace : AutoCloseable {
     private var closeFailures = 0
 
     @Synchronized
+    @JvmSynthetic
+    internal fun snapshot(sourceZip: ByteArray): ExtensionSnapshot {
+        val portableOwner = OwnedTempTree.create("sixbridge-portable-input-")
+        return try {
+            val source = ExtensionZip.extractInto(
+                sourceZip,
+                portableOwner.rootPath,
+            )
+            snapshot(source, requireOwnerOnlyMarker = false)
+        } finally {
+            OwnedTempTree.delete(portableOwner)
+        }
+    }
+
+    @Synchronized
     fun snapshot(
         source: Path,
         requireOwnerOnlyMarker: Boolean = true,

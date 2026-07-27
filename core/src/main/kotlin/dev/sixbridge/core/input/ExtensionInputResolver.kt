@@ -1,10 +1,6 @@
 package dev.sixbridge.core.input
 
 import dev.sixbridge.core.crx.Crx3
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.extension
@@ -30,12 +26,16 @@ data class ResolvedExtensionInput(
 
 class UnsupportedInputException(message: String) : IllegalArgumentException(message)
 
+fun interface ChromeCrxDownloader {
+    fun download(address: ChromeWebStoreAddress): ByteArray
+}
+
 class ExtensionInputResolver(
-    private val chromeDownloader: (URI, String) -> ByteArray = ::downloadChromeCrx,
+    private val chromeDownloader: ChromeCrxDownloader? = null,
 ) {
     fun resolve(input: String): ResolvedExtensionInput {
         if (input.startsWith("http://") || input.startsWith("https://")) {
-            return resolveUrl(URI(input))
+            return resolveUrl(input)
         }
 
         val path = Path.of(input).toAbsolutePath().normalize()
@@ -72,65 +72,27 @@ class ExtensionInputResolver(
         }
     }
 
-    private fun resolveUrl(uri: URI): ResolvedExtensionInput {
-        if (uri.host.equals("microsoftedge.microsoft.com", ignoreCase = true)) {
+    private fun resolveUrl(input: String): ResolvedExtensionInput {
+        val address = ChromeWebStoreAddress.parse(input)
+        val downloader = chromeDownloader ?: throw UnsupportedInputException(
+            "Chrome 웹 스토어 URL 다운로드 기능이 주입되지 않았습니다.",
+        )
+        val bytes = downloader.download(address)
+        val parsed = Crx3.parse(bytes)
+        if (parsed.extensionId != address.extensionId) {
             throw UnsupportedInputException(
-                "Edge 스토어 URL 자동 다운로드는 후속 단계입니다. 소스, ZIP 또는 CRX3를 사용하세요.",
+                "다운로드한 CRX ID(${parsed.extensionId})가 요청 ID(${address.extensionId})와 다릅니다.",
             )
-        }
-        if (!uri.host.equals("chromewebstore.google.com", ignoreCase = true)) {
-            throw UnsupportedInputException("Chrome 웹 스토어 URL만 자동 다운로드할 수 있습니다.")
-        }
-        val extensionId = CHROME_EXTENSION_ID.find(uri.path)?.value
-            ?: throw UnsupportedInputException("Chrome 확장 ID를 URL에서 찾지 못했습니다.")
-        val bytes = chromeDownloader(uri, extensionId)
-        if (bytes.size > 3) {
-            val parsed = Crx3.parse(bytes)
-            if (parsed.extensionId != extensionId) {
-                throw UnsupportedInputException(
-                    "다운로드한 CRX ID(${parsed.extensionId})가 요청 ID($extensionId)와 다릅니다.",
-                )
-            }
         }
         return ResolvedExtensionInput(
             kind = ExtensionInputKind.CHROME_WEB_STORE,
-            originalInput = uri.toString(),
-            sourceRoot = if (bytes.size > 3) {
-                ExtensionZip.extract(
-                    Crx3.parse(bytes).zipBytes,
-                    Files.createTempDirectory("sixbridge-extension-"),
-                )
-            } else {
-                null
-            },
+            originalInput = input,
+            sourceRoot = ExtensionZip.extract(
+                parsed.zipBytes,
+                Files.createTempDirectory("sixbridge-extension-"),
+            ),
             crxBytes = bytes,
-            expectedExtensionId = extensionId,
+            expectedExtensionId = address.extensionId,
         )
-    }
-
-    companion object {
-        private val CHROME_EXTENSION_ID = Regex("""[a-p]{32}""")
-
-        private fun downloadChromeCrx(@Suppress("UNUSED_PARAMETER") pageUri: URI, id: String): ByteArray {
-            val downloadUri = URI(
-                "https://clients2.google.com/service/update2/crx" +
-                    "?response=redirect&prodversion=130.0&acceptformat=crx3" +
-                    "&x=id%3D$id%26uc",
-            )
-            val request = HttpRequest.newBuilder(downloadUri)
-                .header("User-Agent", "SIX-Bridge/0.1")
-                .GET()
-                .build()
-            val response = HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.ALWAYS)
-                .build()
-                .send(request, HttpResponse.BodyHandlers.ofByteArray())
-            if (response.statusCode() !in 200..299) {
-                throw UnsupportedInputException(
-                    "Chrome 웹 스토어 CRX 다운로드 실패: HTTP ${response.statusCode()}",
-                )
-            }
-            return response.body()
-        }
     }
 }

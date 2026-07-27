@@ -70,6 +70,12 @@ object Crx3 {
         }
     }
 
+    @JvmSynthetic
+    internal fun packCanonicalZip(
+        zipBytes: ByteArray,
+        keyPair: KeyPair,
+    ): PackedCrx = packZip(zipBytes.copyOf(), keyPair)
+
     private fun packZip(zipBytes: ByteArray, keyPair: KeyPair): PackedCrx {
         val created = Crx3Writer.create(zipBytes, KeyPairCrx3SigningKey(keyPair))
         return PackedCrx(

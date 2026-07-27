@@ -128,6 +128,7 @@ class SixBridgeService(
                 }
             }
             val sourceIdentity = prepared.logicalIdentity
+                ?: projectIdentity?.let { "project:$it" }
                 ?: resolved.expectedExtensionId
                 ?: prepared.extensionId
             val sourceKind = if (applied.isEmpty() && resolved.crxBytes != null) {

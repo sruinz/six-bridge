@@ -8,6 +8,7 @@ import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.SourceEvidence
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.core.input.ChromeWebStoreAddress
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
@@ -32,6 +33,21 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SixBridgeCommandTest {
+    @Test
+    fun `desktop downloader는 사용자 상세 URL 대신 고정 update endpoint를 구성한다`() {
+        val address = ChromeWebStoreAddress.parse(
+            "https://chromewebstore.google.com/detail/display-name/" +
+                "fchehlladkkanoekpjffcfffpfbdaalj?hl=ko",
+        )
+
+        assertEquals(
+            "https://clients2.google.com/service/update2/crx" +
+                "?response=redirect&prodversion=130.0&acceptformat=crx3" +
+                "&x=id%3Dfchehlladkkanoekpjffcfffpfbdaalj%26uc",
+            DesktopChromeCrxDownloader.updateUri(address).toString(),
+        )
+    }
+
     @Test
     fun `shows the fixed command surface`() {
         val output = StringWriter()
@@ -341,6 +357,10 @@ class SixBridgeCommandTest {
         assertEquals("passthrough", field(result.output, "conversion"))
         assertEquals(packed.extensionId, verified.payload.input.originalExtensionId)
         assertEquals(packed.extensionId, verified.payload.compatibilityAfter.convertedExtensionId)
+        assertEquals(
+            "store:${packed.extensionId}",
+            verified.payload.draft.sourceIdentity,
+        )
     }
 
     @Test

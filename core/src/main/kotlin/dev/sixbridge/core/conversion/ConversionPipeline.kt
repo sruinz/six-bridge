@@ -2,13 +2,13 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
-import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.input.ResolvedExtensionInput
 import dev.sixbridge.core.input.SourceProjectIdentityStore
 import dev.sixbridge.core.profile.BrowserProfile
@@ -26,9 +26,8 @@ class ConversionPipeline private constructor(
     localRoot: Path,
     compatibilityAnalyzer: CompatibilityAnalyzer,
 ) : AutoCloseable {
-    private val workspace = ConversionWorkspace()
-    private val analyzer = MobilePatternAnalyzer(compatibilityAnalyzer)
-    private val planner = ConversionPlanner()
+    private val engine = ConversionPreparationEngine.create(compatibilityAnalyzer)
+    private val materialization = ConversionWorkspace()
     private val packaging = CrxIdentityPolicy.create(localRoot)
 
     constructor(localRoot: Path) : this(localRoot, CompatibilityAnalyzer())
@@ -36,26 +35,19 @@ class ConversionPipeline private constructor(
     fun analyze(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
-    ): CompatibilityReport {
-        val source = requireNotNull(resolved.sourceRoot) {
-            "분석할 확장 소스를 입력에서 추출하지 못했습니다."
-        }
-        val snapshot = workspace.snapshot(
-            source,
-            requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
-        )
-        requireCrxSourceBinding(resolved, snapshot)
-        return analyzer.analyzeArchive(snapshot.sourceZip, profile)
-    }
+    ): CompatibilityReport = engine.analyze(portableInput(resolved), profile)
 
     fun preflight(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
     ): CompatibilityReport {
-        val report = analyze(resolved, profile)
-        plan(report, approvedAdapterIds.toSet())
-        return report
+        val prepared = engine.prepare(
+            portableInput(resolved),
+            profile,
+            approvedAdapterIds,
+        )
+        return prepared.compatibilityBefore
     }
 
     fun prepare(
@@ -66,210 +58,103 @@ class ConversionPipeline private constructor(
         val source = requireNotNull(resolved.sourceRoot) {
             "빌드할 확장 소스를 입력에서 추출하지 못했습니다."
         }
-        val approvals = approvedAdapterIds.toSet()
-        val snapshot = workspace.snapshot(
+        val prepared = engine.prepare(
+            portableInput(resolved),
+            profile,
+            approvedAdapterIds,
+        )
+        val verifiedMarker = SourceProjectIdentityStore.readSourceMarker(
             source,
-            requireOwnerOnlyMarker = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
+            requireOwnerOnly = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
         )
-        requireCrxSourceBinding(resolved, snapshot)
-        val before = analyzer.analyzeArchive(snapshot.sourceZip, profile)
-        val plan = plan(before, approvals)
-        val transformed = plan.selectedAdapters.isNotEmpty()
-
-        val applied = if (transformed) {
-            workspace.transform(snapshot, profile, plan)
-        } else {
-            emptyList()
-        }
-        requireAllApplied(plan, applied)
-
-        val transformedArchive = ExtensionZip.createBytes(
-            snapshot.workingRoot,
-            includeProjectMarker = true,
-        )
-        val applicationProof = if (transformed) {
-            workspace.verifyApplied(
-                snapshot,
-                profile,
-                plan,
-                applied,
-                transformedArchive,
-            )
-        } else {
-            null
-        }
         val identity = packaging.select(
             resolved = resolved,
-            source = snapshot.workingRoot,
-            identitySource = snapshot.originalRoot,
-            sourceProjectIdentity = snapshot.sourceProjectIdentity,
+            source = source,
+            identitySource = source,
+            sourceProjectIdentity = verifiedMarker,
             markerVerified = true,
-            transformed = transformed,
+            transformed = resolved.crxBytes != null && prepared.passthroughCrx == null,
             profileMajorVersion = profile.majorVersion,
         )
-        val sourceZip = if (identity.passthrough) {
-            requireNotNull(identity.originalCrxZip).copyOf()
-        } else {
-            ExtensionZip.createBytes(
-                snapshot.workingRoot,
-                requireNotNull(identity.keyPair).public.encoded,
-                includeProjectMarker = false,
-            )
-        }
-        val sealedPayload = if (identity.passthrough) {
-            null
-        } else {
-            workspace.sealArchive(
-                snapshot = snapshot,
-                publicKey = requireNotNull(identity.keyPair).public.encoded,
-                includeProjectMarker = false,
-                expectedArchive = sourceZip,
-                applicationProof = applicationProof,
-            )
-        }
-        val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
-        validateCompatibility(before, rawAfter)
-
-        val afterWithAdapters = conversionReport(
-            rawAfter = rawAfter,
-            applicationProof = applicationProof,
-            transformed = transformed,
-            beforeDecisions = before.adapterDecisions,
+        val bound = engine.bindIdentity(
+            prepared = prepared,
+            profile = profile,
+            publicKeyDer = identity.keyPair?.public?.encoded,
         )
-        val after = afterWithAdapters.copy(
-            originalExtensionId = identity.originalExtensionId,
-            convertedExtensionId = identity.extensionId,
-        ).also(CompatibilityReport::validate)
-        val verificationPlan = plan(after, approvals)
-        if (transformed &&
-            verificationPlan.selectedAdapters.any { !it.applied }
-        ) {
-            throw ConversionValidationException(
-                "변환본 재계획에 미적용 adapter가 남았습니다.",
-            )
-        }
         val reportSha256 = sha256(
-            SixBundle.encodeCompatibility(after).toByteArray(UTF_8),
+            SixBundle.encodeCompatibility(bound.compatibility).toByteArray(UTF_8),
         )
-        val crxBytes = if (identity.passthrough) {
-            requireNotNull(identity.originalCrxBytes).copyOf()
+        val crxBytes = if (bound.passthroughCrx != null) {
+            requireNotNull(bound.passthroughCrx)
         } else {
-            packaging.packVerified(identity, requireNotNull(sealedPayload))
+            Crx3.packCanonicalZip(
+                bound.sourceZip,
+                requireNotNull(identity.keyPair),
+            ).bytes
         }
-        check(Crx3.parse(crxBytes).zipBytes.contentEquals(sourceZip)) {
+        check(Crx3.parse(crxBytes).zipBytes.contentEquals(bound.sourceZip)) {
             "최종 CRX payload가 sealed canonical sourceZip과 다릅니다."
         }
+        val convertedSourceRoot = materialization.snapshot(bound.sourceZip).workingRoot
+        val logicalIdentity = (
+            prepared.logicalSourceIdentity as? LogicalSourceIdentityResult.Stable
+        )?.value
         return ConversionPipelineResult.create(
-            sourceZip = sourceZip,
-            compatibilityBefore = before,
-            compatibilityAfter = after,
-            planSha256 = plan.proofSha256,
+            sourceZip = bound.sourceZip,
+            compatibilityBefore = prepared.compatibilityBefore,
+            compatibilityAfter = bound.compatibility,
+            planSha256 = prepared.planSha256,
             reportSha256 = reportSha256,
-            extensionId = identity.extensionId,
+            extensionId = bound.extensionId,
             crxBytes = crxBytes,
-            logicalIdentity = identity.logicalIdentity,
-            passthrough = identity.passthrough,
-            convertedSourceRoot = snapshot.workingRoot,
-            artifactDirectory = snapshot.workingRoot.parent.resolve("artifacts").also {
+            logicalIdentity = logicalIdentity,
+            passthrough = bound.passthroughCrx != null,
+            convertedSourceRoot = convertedSourceRoot,
+            artifactDirectory = convertedSourceRoot.parent.resolve("artifacts").also {
                 java.nio.file.Files.createDirectory(it)
             },
         )
     }
 
     override fun close() {
-        workspace.close()
-    }
-
-    private fun plan(
-        report: CompatibilityReport,
-        approvals: Set<String>,
-    ): ConversionPlan = try {
-        planner.plan(report, approvals)
-    } catch (error: ConversionPlanningException) {
-        when (error.failure) {
-            ConversionPlanningFailure.MISSING_REQUIRED_APPROVAL ->
-                throw MissingAdapterApprovalException(error.adapterIds)
-            ConversionPlanningFailure.UNKNOWN_APPROVAL ->
-                throw UnknownAdapterApprovalException(error.adapterIds)
-            ConversionPlanningFailure.UNDETECTED_APPROVAL ->
-                throw InapplicableAdapterApprovalException(error.adapterIds)
-            ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
-            ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
-            -> throw ConversionUnavailableException()
+        try {
+            materialization.close()
+        } finally {
+            engine.close()
         }
     }
 
-    private fun requireAllApplied(
-        plan: ConversionPlan,
-        applied: List<AdapterDecision>,
-    ) {
-        if (applied.size != plan.selectedAdapters.size ||
-            applied.map { it.id to it.version } !=
-            plan.selectedAdapters.map { it.id to it.version } ||
-            applied.any { !it.applied }
-        ) {
-            throw ConversionValidationException(
-                "선택한 adapter가 모두 적용되지 않았습니다.",
-            )
+    private fun portableInput(
+        resolved: ResolvedExtensionInput,
+    ): PortableExtensionInput {
+        val source = requireNotNull(resolved.sourceRoot) {
+            "확장 소스를 입력에서 추출하지 못했습니다."
         }
-    }
-
-    private fun validateCompatibility(
-        before: CompatibilityReport,
-        after: CompatibilityReport,
-    ) {
-        if (statusRank(after.status) > statusRank(before.status)) {
-            throw ConversionValidationException(
-                "변환 후 호환성 상태가 ${before.status}에서 ${after.status}로 악화되었습니다.",
-            )
-        }
-        if (after.issues.any { it.blocking }) {
-            throw ConversionValidationException(
-                "변환본 재분석에서 blocking issue가 발견되었습니다.",
-            )
-        }
-        val newUnsupported = after.unsupportedApis - before.unsupportedApis
-        if (newUnsupported.isNotEmpty()) {
-            throw ConversionValidationException(
-                "변환으로 새 unsupported API가 생겼습니다: ${newUnsupported.sorted()}",
-            )
-        }
-    }
-
-    private fun conversionReport(
-        rawAfter: CompatibilityReport,
-        applicationProof: VerifiedAdapterApplication?,
-        transformed: Boolean,
-        beforeDecisions: List<AdapterDecision>,
-    ): CompatibilityReport {
-        if (!transformed) {
-            return rawAfter.copy(conversionState = ConversionState.PASSTHROUGH)
-        }
-        val applied = requireNotNull(applicationProof).decisions
-        check(applied.all(AdapterDecision::applied)) {
-            "sealed adapter application proof가 완전하지 않습니다."
-        }
-        val decisions = reconcileAdapterDecisions(
-            beforeDecisions,
-            applied,
-            rawAfter.adapterDecisions,
+        SourceProjectIdentityStore.readSourceMarker(
+            source,
+            requireOwnerOnly = resolved.kind == ExtensionInputKind.SOURCE_DIRECTORY,
         )
-        return rawAfter.copy(
-            conversionState = ConversionState.CONVERTED,
-            adapterDecisions = decisions,
+        val crx = resolved.crxBytes
+        if (crx != null) {
+            requireCrxSourceBinding(resolved, source)
+            return PortableExtensionInput.fromCrx(
+                kind = resolved.kind,
+                crxBytes = crx,
+                expectedExtensionId = resolved.expectedExtensionId,
+            )
+        }
+        return PortableExtensionInput.fromZip(
+            kind = resolved.kind,
+            zipBytes = ExtensionZip.createBytes(
+                source,
+                includeProjectMarker = true,
+            ),
         )
-    }
-
-    private fun statusRank(status: CompatibilityStatus): Int = when (status) {
-        CompatibilityStatus.COMPATIBLE -> 0
-        CompatibilityStatus.PARTIAL -> 1
-        CompatibilityStatus.BLOCKED -> 2
-        CompatibilityStatus.UNKNOWN -> 3
     }
 
     private fun requireCrxSourceBinding(
         resolved: ResolvedExtensionInput,
-        snapshot: ExtensionSnapshot,
+        source: Path,
     ) {
         val crxBytes = resolved.crxBytes ?: return
         val parsed = Crx3.parse(crxBytes)
@@ -295,7 +180,7 @@ class ConversionPipeline private constructor(
         }
         val expected = try {
             ExtensionZip.createCanonicalManifestBytes(
-                snapshot.originalRoot,
+                source,
                 publicKey,
                 includeProjectMarker = true,
             )
