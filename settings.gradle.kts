@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "six-bridge"
-include("android-manager", "bundle-contract", "core", "cli")
+include("android-manager", "android-wrapper-template", "bundle-contract", "core", "cli")

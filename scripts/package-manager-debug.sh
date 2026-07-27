@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly VERIFY_SCRIPT="${ROOT_DIR}/scripts/verify.sh"
+readonly TEMPLATE_TEST_SCRIPT="${ROOT_DIR}/scripts/android-wrapper-template.test.sh"
 readonly SOURCE_APK="${ROOT_DIR}/android-manager/build/outputs/apk/debug/android-manager-debug.apk"
 readonly DIST_DIR="${ROOT_DIR}/dist"
 readonly OUTPUT_APK="${DIST_DIR}/sixbridge-manager-debug.apk"
@@ -30,6 +31,10 @@ rm -f -- "${OUTPUT_APK}"
 
 [[ -x "${VERIFY_SCRIPT}" ]] ||
     fail "전체 검증 스크립트를 실행할 수 없습니다: ${VERIFY_SCRIPT}"
+
+if [[ -x "${TEMPLATE_TEST_SCRIPT}" ]]; then
+    "${TEMPLATE_TEST_SCRIPT}"
+fi
 
 "${VERIFY_SCRIPT}"
 
