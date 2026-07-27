@@ -90,6 +90,77 @@ class BrowserArchiveEvidenceScannerTest {
     }
 
     @Test
+    fun `declared hash getter는 canonicalization에서 한 번만 snapshot한다`() {
+        val bytes = apkBytes()
+        val expectedSha256 = sha256(bytes)
+        var hashReads = 0
+        val dynamic = object : BrowserArchiveInput {
+            override val name = "base.apk"
+            override val sha256: String
+                get() {
+                    hashReads += 1
+                    return if (hashReads == 1) expectedSha256 else "0".repeat(64)
+                }
+
+            override fun openStream(): InputStream = ByteArrayInputStream(bytes)
+        }
+
+        val profile = scanner.scan(evidence(baseApk = dynamic))
+
+        assertEquals(expectedSha256, profile.sourceApkSha256)
+        assertTrue(profile.installationApkSetSha256.matches(Regex("[0-9a-f]{64}")))
+        assertEquals(1, hashReads)
+    }
+
+    @Test
+    fun `archive name getter는 scan facts와 profile tuple 사이에 다시 읽지 않는다`() {
+        val bytes = apkBytes()
+        var nameReads = 0
+        val dynamic = object : BrowserArchiveInput {
+            override val name: String
+                get() {
+                    nameReads += 1
+                    return if (nameReads == 1) "base.apk" else "changed/base.apk"
+                }
+            override val sha256 = sha256(bytes)
+
+            override fun openStream(): InputStream = ByteArrayInputStream(bytes)
+        }
+
+        val profile = scanner.scan(evidence(baseApk = dynamic))
+
+        assertEquals(sha256(bytes), profile.sourceApkSha256)
+        assertEquals(1, nameReads)
+    }
+
+    @Test
+    fun `public installation digest도 canonical getter를 각각 한 번만 읽는다`() {
+        val bytes = apkBytes()
+        var nameReads = 0
+        var hashReads = 0
+        val dynamic = object : BrowserArchiveInput {
+            override val name: String
+                get() {
+                    nameReads += 1
+                    return if (nameReads == 1) "base.apk" else "changed/base.apk"
+                }
+            override val sha256: String
+                get() {
+                    hashReads += 1
+                    return if (hashReads == 1) sha256(bytes) else "not-a-sha"
+                }
+
+            override fun openStream(): InputStream = ByteArrayInputStream(bytes)
+        }
+
+        val digest = evidence(baseApk = dynamic).installationApkSetSha256()
+
+        assertTrue(digest.matches(Regex("[0-9a-f]{64}")))
+        assertEquals(1, nameReads)
+        assertEquals(1, hashReads)
+    }
+
+    @Test
     fun `APK stream read 실패를 명시적으로 거부한다`() {
         val failing = object : BrowserArchiveInput {
             override val name = "base.apk"
@@ -240,6 +311,111 @@ class BrowserArchiveEvidenceScannerTest {
     }
 
     @Test
+    fun `64개 archive entry 작업량도 installation 전체 상한을 즉시 적용한다`() {
+        val bytes = apkBytes(dex = "", terrace = "", padding = "x")
+        val base = archive("base.apk", bytes)
+        val splits = (1..63).map {
+            archive("split_${it.toString().padStart(2, '0')}.apk", bytes)
+        }
+
+        val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+            BrowserArchiveEvidenceScanner(
+                limits = BrowserArchiveScanLimits(
+                    maxArchiveCount = 64,
+                    maxEntryCountPerArchive = 1,
+                    maxTotalEntryCount = 63,
+                ),
+            ).scan(evidence(baseApk = base, splitApks = splits))
+        }
+
+        assertEquals(
+            BrowserArchiveEvidenceFailure.RESOURCE_LIMIT_EXCEEDED,
+            failure.failure,
+        )
+    }
+
+    @Test
+    fun `64개 archive inflate 작업량도 installation 전체 상한을 즉시 적용한다`() {
+        val bytes = apkBytes(dex = "", terrace = "", padding = "x".repeat(64))
+        val base = archive("base.apk", bytes)
+        val splits = (1..63).map {
+            archive("split_${it.toString().padStart(2, '0')}.apk", bytes)
+        }
+
+        val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+            BrowserArchiveEvidenceScanner(
+                limits = BrowserArchiveScanLimits(
+                    maxArchiveCount = 64,
+                    maxInflatedBytesPerEntry = 64,
+                    maxTotalInflatedBytesPerArchive = 64,
+                    maxTotalInflatedBytes = 64L * 64 - 1,
+                ),
+            ).scan(evidence(baseApk = base, splitApks = splits))
+        }
+
+        assertEquals(
+            BrowserArchiveEvidenceFailure.RESOURCE_LIMIT_EXCEEDED,
+            failure.failure,
+        )
+    }
+
+    @Test
+    fun `64개 archive raw 작업량은 초과 archive 두 번째 pass 전에 중단한다`() {
+        val bytes = apkBytes(dex = "", terrace = "", padding = "x")
+        val base = CountingArchive("base.apk", bytes)
+        val splits = (1..63).map {
+            CountingArchive("split_${it.toString().padStart(2, '0')}.apk", bytes)
+        }
+        val workBeforeLastSecondPass = bytes.size.toLong() * (2L * 63 + 1)
+
+        val failure = assertFailsWith<BrowserArchiveEvidenceException> {
+            BrowserArchiveEvidenceScanner(
+                limits = BrowserArchiveScanLimits(
+                    maxArchiveCount = 64,
+                    maxEntryCountPerArchive = 1,
+                    maxTotalEntryCount = 64,
+                    maxTotalRawBytes = workBeforeLastSecondPass - 1,
+                ),
+            ).scan(evidence(baseApk = base, splitApks = splits))
+        }
+
+        assertEquals(
+            BrowserArchiveEvidenceFailure.RESOURCE_LIMIT_EXCEEDED,
+            failure.failure,
+        )
+        assertEquals(1, splits.last().openCount)
+    }
+
+    @Test
+    fun `안전한 custom 65 archive limit은 default public digest cap 없이 동작한다`() {
+        val bytes = apkBytes(dex = "", terrace = "", padding = "x")
+        val base = archive("base.apk", bytes)
+        val splits = (1..64).map {
+            archive("split_${it.toString().padStart(2, '0')}.apk", bytes)
+        }
+
+        val profile = BrowserArchiveEvidenceScanner(
+            limits = BrowserArchiveScanLimits(
+                maxArchiveCount = 65,
+                maxEntryCountPerArchive = 1,
+                maxTotalEntryCount = 65,
+            ),
+        ).scan(evidence(baseApk = base, splitApks = splits))
+
+        assertTrue(profile.installationApkSetSha256.matches(Regex("[0-9a-f]{64}")))
+    }
+
+    @Test
+    fun `ratio 곱셈이 overflow 가능한 custom limit은 생성 시 거부한다`() {
+        assertFailsWith<IllegalArgumentException> {
+            BrowserArchiveScanLimits(
+                maxRawBytesPerArchive = Long.MAX_VALUE,
+                maxInflateRatio = 2,
+            )
+        }
+    }
+
+    @Test
     fun `scanner cancellation은 evidence 실패로 감싸지 않고 전파한다`() {
         var checks = 0
         val scanner = BrowserArchiveEvidenceScanner(
@@ -342,5 +518,19 @@ class BrowserArchiveEvidenceScannerTest {
         override fun openStream(): InputStream = ByteArrayInputStream(bytes)
 
         fun copyWithSha256(value: String): ByteArrayArchiveInput = copy(sha256 = value)
+    }
+
+    private inner class CountingArchive(
+        override val name: String,
+        private val bytes: ByteArray,
+    ) : BrowserArchiveInput {
+        override val sha256 = sha256(bytes)
+        var openCount = 0
+            private set
+
+        override fun openStream(): InputStream {
+            openCount += 1
+            return ByteArrayInputStream(bytes)
+        }
     }
 }

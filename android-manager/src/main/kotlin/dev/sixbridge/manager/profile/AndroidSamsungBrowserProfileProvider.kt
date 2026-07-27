@@ -7,7 +7,6 @@ import android.os.Build
 import dev.sixbridge.core.profile.BrowserArchiveEvidenceException
 import dev.sixbridge.core.profile.BrowserArchiveEvidenceScanner
 import dev.sixbridge.core.profile.BrowserArchiveInput
-import dev.sixbridge.core.profile.BrowserArchiveScanLimits
 import dev.sixbridge.core.profile.BrowserPackageEvidence
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
@@ -379,24 +378,25 @@ internal fun androidArchiveInputs(
 ): AndroidArchiveInputs {
     require(sourceDir.isNotBlank())
     require(splitNames.size == splitSourceDirs.size)
-    val limits = BrowserArchiveScanLimits()
     return AndroidArchiveInputs(
         baseApk = FileBrowserArchiveInput(
             file = File(sourceDir),
             name = "base.apk",
             checkCancelled = checkCancelled,
-            maxBytes = limits.maxRawBytesPerArchive,
+            maxBytes = MAX_ARCHIVE_RAW_BYTES,
         ),
         splitApks = splitNames.zip(splitSourceDirs).map { (splitName, splitSourceDir) ->
             FileBrowserArchiveInput(
                 file = File(splitSourceDir),
                 name = "split_$splitName.apk",
                 checkCancelled = checkCancelled,
-                maxBytes = limits.maxRawBytesPerArchive,
+                maxBytes = MAX_ARCHIVE_RAW_BYTES,
             )
         },
     )
 }
+
+private const val MAX_ARCHIVE_RAW_BYTES = 512L * 1024 * 1024
 
 private class FileBrowserArchiveInput(
     private val file: File,
