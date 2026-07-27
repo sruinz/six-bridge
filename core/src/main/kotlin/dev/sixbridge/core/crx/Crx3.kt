@@ -1,13 +1,14 @@
 package dev.sixbridge.core.crx
 
 import dev.sixbridge.contract.crx.Crx3Verifier
+import dev.sixbridge.contract.crx.Crx3SigningKey
+import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.conversion.VerifiedCrxPayload
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPair
@@ -17,6 +18,16 @@ import java.util.Base64
 import kotlin.jvm.JvmSynthetic
 
 class InvalidCrxException(message: String) : IllegalArgumentException(message)
+
+class KeyPairCrx3SigningKey(private val keyPair: KeyPair) : Crx3SigningKey {
+    override fun publicKeyDer(): ByteArray = keyPair.public.encoded.copyOf()
+
+    override fun signSha256Rsa(payload: ByteArray): ByteArray = Signature.getInstance("SHA256withRSA").run {
+        initSign(keyPair.private)
+        update(payload)
+        sign()
+    }
+}
 
 data class PackedCrx(
     val extensionId: String,
@@ -41,9 +52,6 @@ class ParsedCrx internal constructor(
 }
 
 object Crx3 {
-    private val SIGNED_DATA_CONTEXT =
-        "CRX3 SignedData\u0000".toByteArray(StandardCharsets.US_ASCII)
-
     fun pack(sourceRoot: Path, keyPair: KeyPair): PackedCrx {
         val zipBytes = ExtensionZip.createBytes(sourceRoot, keyPair.public.encoded)
         return packZip(zipBytes, keyPair)
@@ -63,36 +71,11 @@ object Crx3 {
     }
 
     private fun packZip(zipBytes: ByteArray, keyPair: KeyPair): PackedCrx {
-        val crxIdBytes = MessageDigest.getInstance("SHA-256")
-            .digest(keyPair.public.encoded)
-            .copyOfRange(0, 16)
-        val signedHeaderData = Proto.message(
-            Proto.bytes(field = 1, value = crxIdBytes),
-        )
-        val signature = Signature.getInstance("SHA256withRSA").run {
-            initSign(keyPair.private)
-            updateSignedPayload(signedHeaderData, zipBytes, 0, zipBytes.size)
-            sign()
-        }
-        val proof = Proto.message(
-            Proto.bytes(field = 1, value = keyPair.public.encoded),
-            Proto.bytes(field = 2, value = signature),
-        )
-        val header = Proto.message(
-            Proto.bytes(field = 2, value = proof),
-            Proto.bytes(field = 10_000, value = signedHeaderData),
-        )
-        val output = ByteArrayOutputStream()
-        output.write(MAGIC)
-        output.write(uint32(VERSION))
-        output.write(uint32(header.size))
-        output.write(header)
-        output.write(zipBytes)
-
+        val created = Crx3Writer.create(zipBytes, KeyPairCrx3SigningKey(keyPair))
         return PackedCrx(
-            extensionId = extensionId(keyPair.public.encoded),
-            bytes = output.toByteArray(),
-            zipBytes = zipBytes,
+            extensionId = created.extensionId,
+            bytes = created.bytes,
+            zipBytes = created.zipBytes,
         )
     }
 
@@ -172,39 +155,10 @@ object Crx3 {
         }
     }
 
-    private fun Signature.updateSignedPayload(
-        signedHeaderData: ByteArray,
-        source: ByteArray,
-        offset: Int,
-        length: Int,
-    ) {
-        update(SIGNED_DATA_CONTEXT)
-        update(uint32(signedHeaderData.size))
-        update(signedHeaderData)
-        update(source, offset, length)
-    }
-
-    private fun uint32(value: Int): ByteArray =
-        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
-
     private fun readUInt32(bytes: ByteArray, offset: Int): Int =
         ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int
 
     private object Proto {
-        fun bytes(field: Int, value: ByteArray): ByteArray {
-            val output = ByteArrayOutputStream()
-            writeVarInt(output, (field.toLong() shl 3) or 2)
-            writeVarInt(output, value.size.toLong())
-            output.write(value)
-            return output.toByteArray()
-        }
-
-        fun message(vararg fields: ByteArray): ByteArray =
-            ByteArrayOutputStream().run {
-                fields.forEach(::write)
-                toByteArray()
-            }
-
         fun parse(message: ByteArray): Map<Int, List<ByteArray>> {
             val result = linkedMapOf<Int, MutableList<ByteArray>>()
             var offset = 0
@@ -277,6 +231,4 @@ object Crx3 {
             }
     }
 
-    private val MAGIC = byteArrayOf('C'.code.toByte(), 'r'.code.toByte(), '2'.code.toByte(), '4'.code.toByte())
-    private const val VERSION = 3
 }

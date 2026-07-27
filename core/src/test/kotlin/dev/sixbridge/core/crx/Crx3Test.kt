@@ -1,5 +1,7 @@
 package dev.sixbridge.core.crx
 
+import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.core.input.ExtensionZip
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
 import java.security.KeyPairGenerator
@@ -13,6 +15,21 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class Crx3Test {
+    @Test
+    fun `desktop pack은 공용 writer와 동일한 CRX3를 만든다`() {
+        val source = Files.createTempDirectory("six-crx-shared-writer")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Tiny","version":"1.0.0"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+
+        val packed = Crx3.pack(source, keyPair)
+        val zip = ExtensionZip.createBytes(source, keyPair.public.encoded)
+        val shared = Crx3Writer.create(zip, KeyPairCrx3SigningKey(keyPair))
+
+        assertContentEquals(shared.bytes, packed.bytes)
+    }
+
     @Test
     fun `packs verifies and parses a CRX3 archive`() {
         val source = Files.createTempDirectory("six-crx-source")
