@@ -512,7 +512,7 @@ class CompatibilityAnalyzer(
             )
         private val DESTRUCTURING_REGEX =
             Regex(
-                """(?:const|let|var)\s*\{([^}]*)}\s*=\s*""" +
+                """(?:const|let|var)\s*\{([^}]*)\}\s*=\s*""" +
                     """(?:(?:globalThis|window|self)\s*\.\s*)?(?:chrome|browser)\b""",
             )
         private val DYNAMIC_BRACKET_REGEX =
