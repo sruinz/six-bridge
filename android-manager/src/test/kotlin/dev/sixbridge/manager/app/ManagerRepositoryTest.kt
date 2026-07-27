@@ -1646,6 +1646,65 @@ class ManagerRepositoryTest {
             assertContentEquals(durablePng, publisher.state.value.single().iconPng)
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `이전 null publication의 늦은 schedule은 최신 durable Room icon을 덮어쓰지 않는다`() =
+        runTest {
+            val loadedPng = byteArrayOf(1, 2, 3)
+            val durablePng = byteArrayOf(4, 5, 6)
+            val firstCandidateCaptured = CompletableDeferred<Unit>()
+            val allowFirstPublication = CompletableDeferred<Unit>()
+            val withoutIcon = record(version = 1, signer = "same")
+            val withDurableIcon = withoutIcon.copy(iconPng = durablePng)
+            val backingCatalog = FakeCatalog(listOf(withoutIcon))
+            var ensureCount = 0
+            val catalog = object : ManagerCatalog by backingCatalog {
+                override suspend fun ensureDiscoveredIdentity(
+                    discovered: CatalogRecord,
+                ): CatalogRecord {
+                    val ensured = backingCatalog.ensureDiscoveredIdentity(discovered)
+                    ensureCount += 1
+                    if (ensureCount == 1) {
+                        firstCandidateCaptured.complete(Unit)
+                        allowFirstPublication.await()
+                    }
+                    return ensured
+                }
+            }
+            var providerLoadCount = 0
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    providerLoadCount += 1
+                    loadedPng
+                },
+                scope = backgroundScope,
+            )
+
+            val firstPublish = async { publisher.publish(listOf(withoutIcon)) }
+            runCurrent()
+            firstCandidateCaptured.await()
+
+            backingCatalog.records = listOf(withDurableIcon)
+            val secondPublish = async { publisher.publish(listOf(withDurableIcon)) }
+            runCurrent()
+            assertFalse(secondPublish.isCompleted)
+
+            allowFirstPublication.complete(Unit)
+            runCurrent()
+            firstPublish.await()
+            secondPublish.await()
+            runCurrent()
+
+            assertEquals(0, providerLoadCount)
+            assertEquals(0, backingCatalog.iconInsertCount)
+            assertContentEquals(durablePng, backingCatalog.records.single().iconPng)
+            assertContentEquals(durablePng, publisher.state.value.single().iconPng)
+        }
+
     @Test
     fun `identity 변경은 이전 bytes와 저장 실패 상태를 재사용하지 않는다`() = runBlocking {
         var providerLoadCount = 0

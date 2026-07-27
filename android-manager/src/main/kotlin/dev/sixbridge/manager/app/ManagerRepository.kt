@@ -433,6 +433,7 @@ internal class CatalogPublisher(
     private val mutex = Mutex()
     private val iconJobs = mutableMapOf<CatalogIdentity, Job>()
     private val mutableState = MutableStateFlow<List<CatalogRecord>>(emptyList())
+    private var publicationGeneration = 0L
     val state: StateFlow<List<CatalogRecord>> = mutableState.asStateFlow()
 
     suspend fun reconcile() {
@@ -440,7 +441,7 @@ internal class CatalogPublisher(
             publishFallbackLocked(reconcileLocked(catalog.observe().first()))
         }
         publication.cancelledJobs.forEach(Job::cancel)
-        scheduleIcons(publication.iconCandidates)
+        scheduleIcons(publication.iconCandidates, publication.generation)
     }
 
     suspend fun publish(records: List<CatalogRecord>) {
@@ -448,7 +449,7 @@ internal class CatalogPublisher(
             publishFallbackLocked(reconcileLocked(records))
         }
         publication.cancelledJobs.forEach(Job::cancel)
-        scheduleIcons(publication.iconCandidates)
+        scheduleIcons(publication.iconCandidates, publication.generation)
     }
 
     suspend fun remove(packageName: String) {
@@ -513,6 +514,7 @@ internal class CatalogPublisher(
     }
 
     private fun publishFallbackLocked(records: CatalogDisplayRecords): IconPublication {
+        publicationGeneration += 1
         mutableState.value = records.displayRecords
         val requiredIdentities = records.iconCandidates
             .asSequence()
@@ -523,16 +525,24 @@ internal class CatalogPublisher(
             .filterKeys { it !in requiredIdentities }
             .toList()
         cancelled.forEach { (identity, _) -> iconJobs.remove(identity) }
-        return IconPublication(records.iconCandidates, cancelled.map { it.second })
+        return IconPublication(
+            iconCandidates = records.iconCandidates,
+            cancelledJobs = cancelled.map { it.second },
+            generation = publicationGeneration,
+        )
     }
 
-    private suspend fun scheduleIcons(records: List<CatalogRecord>) {
+    private suspend fun scheduleIcons(
+        records: List<CatalogRecord>,
+        generation: Long,
+    ) {
         records.asSequence()
             .filter { it.iconPng == null }
             .forEach { record ->
                 val identity = record.identity()
                 var job: Job? = null
                 mutex.withLock {
+                    if (generation != publicationGeneration) return@withLock
                     val current = mutableState.value
                         .singleOrNull { it.packageName == identity.packageName }
                     if (current?.identity() == identity && iconJobs[identity] == null) {
@@ -613,6 +623,7 @@ internal class CatalogPublisher(
     private data class IconPublication(
         val iconCandidates: List<CatalogRecord>,
         val cancelledJobs: List<Job>,
+        val generation: Long,
     )
 
     private data class CatalogDisplayRecords(
