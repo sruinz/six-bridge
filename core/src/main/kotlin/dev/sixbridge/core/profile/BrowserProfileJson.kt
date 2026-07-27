@@ -20,37 +20,40 @@ object BrowserProfileJson {
             JsonObject.serializer(),
             JsonObject(
                 linkedMapOf(
-                    "schemaVersion" to JsonPrimitive(2),
-                "browserPackage" to JsonPrimitive(profile.browserPackage),
-                "versionName" to JsonPrimitive(profile.versionName),
-                "versionCode" to JsonPrimitive(profile.versionCode),
-                "majorVersion" to JsonPrimitive(profile.majorVersion),
-                "detectedApis" to JsonArray(
-                    profile.detectedApis.sorted().map(::JsonPrimitive),
-                ),
-                "supportedApis" to JsonArray(
-                    profile.supportedApis.sorted().map(::JsonPrimitive),
-                ),
-                "wrapperContract" to JsonObject(
-                    linkedMapOf(
-                        "discoveryUri" to JsonPrimitive(
-                            profile.wrapperContract.discoveryUri,
-                        ),
-                        "extensionMetadata" to JsonPrimitive(
-                            profile.wrapperContract.extensionMetadata,
-                        ),
-                        "contentProvider" to JsonPrimitive(
-                            profile.wrapperContract.contentProvider,
-                        ),
-                        "devExtensionPath" to JsonPrimitive(
-                            profile.wrapperContract.devExtensionPath,
+                    "schemaVersion" to JsonPrimitive(3),
+                    "browserPackage" to JsonPrimitive(profile.browserPackage),
+                    "versionName" to JsonPrimitive(profile.versionName),
+                    "versionCode" to JsonPrimitive(profile.versionCode),
+                    "majorVersion" to JsonPrimitive(profile.majorVersion),
+                    "detectedApis" to JsonArray(
+                        profile.detectedApis.sorted().map(::JsonPrimitive),
+                    ),
+                    "supportedApis" to JsonArray(
+                        profile.supportedApis.sorted().map(::JsonPrimitive),
+                    ),
+                    "wrapperContract" to JsonObject(
+                        linkedMapOf(
+                            "discoveryUri" to JsonPrimitive(
+                                profile.wrapperContract.discoveryUri,
+                            ),
+                            "extensionMetadata" to JsonPrimitive(
+                                profile.wrapperContract.extensionMetadata,
+                            ),
+                            "contentProvider" to JsonPrimitive(
+                                profile.wrapperContract.contentProvider,
+                            ),
+                            "devExtensionPath" to JsonPrimitive(
+                                profile.wrapperContract.devExtensionPath,
+                            ),
                         ),
                     ),
-                ),
-                "sourceApkSha256" to JsonPrimitive(profile.sourceApkSha256),
-                "sourceApkSignerSha256" to JsonPrimitive(
-                    profile.sourceApkSignerSha256,
-                ),
+                    "sourceApkSha256" to JsonPrimitive(profile.sourceApkSha256),
+                    "installationApkSetSha256" to JsonPrimitive(
+                        profile.installationApkSetSha256,
+                    ),
+                    "sourceApkSignerSha256" to JsonPrimitive(
+                        profile.sourceApkSignerSha256,
+                    ),
                     "profileDifferences" to JsonArray(
                         profile.profileDifferences.map(::JsonPrimitive),
                     ),
@@ -69,7 +72,7 @@ object BrowserProfileJson {
     fun decode(value: String): BrowserProfile {
         val root = json.parseToJsonElement(value).jsonObject
         val schemaVersion = root.getValue("schemaVersion").jsonPrimitive.int
-        require(schemaVersion in 1..2) {
+        require(schemaVersion in 1..3) {
             "지원하지 않는 browser profile schemaVersion입니다."
         }
         val contract = root.getValue("wrapperContract").jsonObject
@@ -95,6 +98,11 @@ object BrowserProfileJson {
                 devExtensionPath = contract.boolean("devExtensionPath"),
             ),
             sourceApkSha256 = root.string("sourceApkSha256"),
+            installationApkSetSha256 = if (schemaVersion < 3) {
+                root.string("sourceApkSha256")
+            } else {
+                root.string("installationApkSetSha256")
+            },
             sourceApkSignerSha256 = root["sourceApkSignerSha256"]
                 ?.jsonPrimitive
                 ?.content

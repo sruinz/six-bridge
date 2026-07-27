@@ -33,6 +33,7 @@ data class BrowserProfile(
     val detectedApis: Set<String> = supportedApis,
     val wrapperContract: WrapperContract,
     val sourceApkSha256: String = "",
+    val installationApkSetSha256: String = sourceApkSha256,
     val sourceApkSignerSha256: String = "",
     val profileDifferences: List<String> = emptyList(),
     val supportedFeatures: Set<String> = emptySet(),

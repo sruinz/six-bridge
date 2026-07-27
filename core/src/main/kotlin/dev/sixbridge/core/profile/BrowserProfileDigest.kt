@@ -30,6 +30,7 @@ internal object BrowserProfileDigest {
             profile.wrapperContract.devExtensionPath.toString(),
         )
         digest.field("sourceApkSha256", profile.sourceApkSha256)
+        digest.field("installationApkSetSha256", profile.installationApkSetSha256)
         digest.field("sourceApkSignerSha256", profile.sourceApkSignerSha256)
         digest.list("profileDifferences", profile.profileDifferences)
         digest.set("supportedFeatures", profile.supportedFeatures)
