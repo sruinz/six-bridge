@@ -29,6 +29,10 @@ class PreparedConversion internal constructor(
 ) {
     private val stableTransformedSourceZip = transformedSourceZip.copyOf()
     private val stablePassthroughCrx = passthroughCrx?.copyOf()
+    val browserProfileSha256: String =
+        requireNotNull(compatibilityBefore.browserProfileSha256) {
+            "준비 결과에 browser profile provenance가 없습니다."
+        }
 
     val compatibilityBefore: CompatibilityReport =
         compatibilityBefore.deepImmutableCopy()
@@ -148,6 +152,9 @@ class ConversionPreparationEngine private constructor(
         profile: BrowserProfile,
         publicKeyDer: ByteArray?,
     ): BoundConversion {
+        require(profile.canonicalSha256() == prepared.browserProfileSha256) {
+            "prepare와 bindIdentity의 browser profile provenance가 다릅니다."
+        }
         val passthrough = prepared.passthroughCrx
         if (passthrough != null) {
             require(publicKeyDer == null) {
@@ -158,6 +165,7 @@ class ConversionPreparationEngine private constructor(
                 "passthrough CRX proof ID가 준비 결과와 다릅니다."
             }
             val raw = analyzer.analyzeArchive(parsed.zipBytes, profile)
+            requirePreparedProfile(prepared, raw)
             validateCompatibility(prepared.compatibilityBefore, raw)
             val compatibility = raw.copy(
                 conversionState = ConversionState.PASSTHROUGH,
@@ -185,6 +193,7 @@ class ConversionPreparationEngine private constructor(
             includeProjectMarker = false,
         )
         val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
+        requirePreparedProfile(prepared, rawAfter)
         validateCompatibility(prepared.compatibilityBefore, rawAfter)
         val applied = prepared.compatibilityAfter.adapterDecisions
             .filter(AdapterDecision::applied)
@@ -238,6 +247,15 @@ class ConversionPreparationEngine private constructor(
             report.manifestKeyExtensionId != proofId
         ) {
             throw CrxSourceBindingException()
+        }
+    }
+
+    private fun requirePreparedProfile(
+        prepared: PreparedConversion,
+        report: CompatibilityReport,
+    ) {
+        require(report.browserProfileSha256 == prepared.browserProfileSha256) {
+            "bindIdentity 재분석의 browser profile provenance가 준비 결과와 다릅니다."
         }
     }
 

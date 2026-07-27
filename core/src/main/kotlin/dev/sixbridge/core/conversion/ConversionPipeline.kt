@@ -41,14 +41,21 @@ class ConversionPipeline private constructor(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
-    ): CompatibilityReport {
-        val prepared = engine.prepare(
+    ): CompatibilityReport =
+        preflightPreparation(resolved, profile, approvedAdapterIds)
+            .compatibilityBefore
+
+    @JvmSynthetic
+    internal fun preflightPreparation(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        approvedAdapterIds: Iterable<String>,
+    ): PreparedConversion =
+        engine.prepare(
             portableInput(resolved),
             profile,
             approvedAdapterIds,
         )
-        return prepared.compatibilityBefore
-    }
 
     fun prepare(
         resolved: ResolvedExtensionInput,
@@ -96,9 +103,6 @@ class ConversionPipeline private constructor(
             "최종 CRX payload가 sealed canonical sourceZip과 다릅니다."
         }
         val convertedSourceRoot = materialization.snapshot(bound.sourceZip).workingRoot
-        val logicalIdentity = (
-            prepared.logicalSourceIdentity as? LogicalSourceIdentityResult.Stable
-        )?.value
         return ConversionPipelineResult.create(
             sourceZip = bound.sourceZip,
             compatibilityBefore = prepared.compatibilityBefore,
@@ -107,7 +111,7 @@ class ConversionPipeline private constructor(
             reportSha256 = reportSha256,
             extensionId = bound.extensionId,
             crxBytes = crxBytes,
-            logicalIdentity = logicalIdentity,
+            logicalSourceIdentity = prepared.logicalSourceIdentity,
             passthrough = bound.passthroughCrx != null,
             convertedSourceRoot = convertedSourceRoot,
             artifactDirectory = convertedSourceRoot.parent.resolve("artifacts").also {
@@ -289,7 +293,7 @@ class ConversionPipelineResult private constructor(
     val reportSha256: String,
     val extensionId: String,
     crxBytes: ByteArray,
-    val logicalIdentity: String?,
+    val logicalSourceIdentity: LogicalSourceIdentityResult,
     val passthrough: Boolean,
     @get:kotlin.jvm.JvmSynthetic
     internal val convertedSourceRoot: Path,
@@ -309,6 +313,11 @@ class ConversionPipelineResult private constructor(
     val crxBytes: ByteArray
         get() = stableCrxBytes.copyOf()
 
+    val logicalIdentity: String?
+        get() = (
+            logicalSourceIdentity as? LogicalSourceIdentityResult.Stable
+        )?.value
+
     companion object {
         @JvmSynthetic
         internal fun create(
@@ -319,7 +328,7 @@ class ConversionPipelineResult private constructor(
             reportSha256: String,
             extensionId: String,
             crxBytes: ByteArray,
-            logicalIdentity: String?,
+            logicalSourceIdentity: LogicalSourceIdentityResult,
             passthrough: Boolean,
             convertedSourceRoot: Path,
             artifactDirectory: Path,
@@ -331,7 +340,7 @@ class ConversionPipelineResult private constructor(
             reportSha256,
             extensionId,
             crxBytes,
-            logicalIdentity,
+            logicalSourceIdentity,
             passthrough,
             convertedSourceRoot,
             artifactDirectory,

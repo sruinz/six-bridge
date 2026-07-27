@@ -9,6 +9,7 @@ import dev.sixbridge.core.conversion.SourceEvidence
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ChromeWebStoreAddress
+import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
@@ -33,6 +34,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SixBridgeCommandTest {
+    private val projectIdentity = "0123456789abcdef0123456789abcdef"
+
     @Test
     fun `desktop downloader는 사용자 상세 URL 대신 고정 update endpoint를 구성한다`() {
         val address = ChromeWebStoreAddress.parse(
@@ -246,6 +249,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", goldenFixture().toString(),
             "--profile", writeProfile(workspace).toString(),
+            "--identity", projectIdentity,
             "--approve-adapter", "action-popup-entry",
             "--output", output.toString(),
         )
@@ -318,6 +322,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", source.toString(),
             "--profile", writeProfile(workspace).toString(),
+            "--identity", projectIdentity,
             "--output", output.toString(),
         )
 
@@ -326,6 +331,51 @@ class SixBridgeCommandTest {
         assertEquals(
             SixDraft.read(output).payload.input.originalSourceSha256,
             field(result.output, "transformedSha256"),
+        )
+    }
+
+    @Test
+    fun `표식 없는 ZIP draft는 명시적 project identity가 있어야 연결된다`() {
+        val workspace = Files.createTempDirectory("six-cli-markerless-zip")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Plain ZIP","version":"1"}""",
+        )
+        val input = workspace.resolve("plain.zip")
+        ExtensionZip.create(source, input)
+        val profile = writeProfile(workspace)
+        val output = workspace.resolve("plain.sixdraft")
+
+        val missingIdentity = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", input.toString(),
+            "--profile", profile.toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(2, missingIdentity.exitCode, missingIdentity.error)
+        assertFalse(output.exists())
+        assertFalse(workspace.resolve(".local").exists())
+
+        val explicitIdentity = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", input.toString(),
+            "--profile", profile.toString(),
+            "--identity", projectIdentity,
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, explicitIdentity.exitCode, explicitIdentity.error)
+        val verified = SixDraft.read(output)
+        assertEquals(
+            "project:$projectIdentity",
+            verified.payload.draft.sourceIdentity,
+        )
+        assertEquals(
+            "project:$projectIdentity",
+            verified.payload.input.sourceIdentity,
         )
     }
 
@@ -401,6 +451,7 @@ class SixBridgeCommandTest {
                 "draft",
                 "--input", source.toString(),
                 "--profile", profile.toString(),
+                "--identity", projectIdentity,
                 "--output", output.toString(),
             ).exitCode,
         )
@@ -438,6 +489,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", source.toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--output", workspace.resolve("first.sixdraft").toString(),
         )
         assertEquals(0, first.exitCode, first.error)
@@ -450,6 +502,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", source.toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--output", workspace.resolve("second.sixdraft").toString(),
         )
         assertEquals(1, unsafe.exitCode, unsafe.error)
@@ -485,6 +538,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", source.toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--output", workspace.resolve("replaced.sixdraft").toString(),
         )
 
@@ -531,6 +585,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", goldenFixture().toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--approve-adapter", "action-popup-entry",
             "--approve-adapter", "desktop-selection-event-bridge",
             "--output", first.toString(),
@@ -540,6 +595,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", goldenFixture().toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--approve-adapter", "desktop-selection-event-bridge",
             "--approve-adapter", "action-popup-entry",
             "--output", second.toString(),
@@ -584,6 +640,7 @@ class SixBridgeCommandTest {
             "draft",
             "--input", goldenFixture().toString(),
             "--profile", profile.toString(),
+            "--identity", projectIdentity,
             "--approve-adapter", "action-popup-entry",
             "--output", draft.toString(),
         )

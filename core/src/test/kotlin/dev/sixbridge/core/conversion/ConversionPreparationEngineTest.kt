@@ -242,6 +242,33 @@ class ConversionPreparationEngineTest {
     }
 
     @Test
+    fun `bindIdentity는 prepare와 다른 browser profile을 거부한다`() {
+        val preparedProfile = profile()
+        val bindingProfile = preparedProfile.copy(
+            versionCode = preparedProfile.versionCode + 1,
+        )
+
+        ConversionPreparationEngine().use { engine ->
+            val prepared = engine.prepare(
+                PortableExtensionInput.fromZip(
+                    ExtensionInputKind.ZIP,
+                    plainFixtureZip(),
+                ),
+                preparedProfile,
+                emptySet(),
+            )
+
+            assertFailsWith<IllegalArgumentException> {
+                engine.bindIdentity(
+                    prepared,
+                    bindingProfile,
+                    keyPair().public.encoded,
+                )
+            }
+        }
+    }
+
+    @Test
     fun `passthrough는 원본 CRX 바이트 ZIP과 ID를 그대로 반환한다`() {
         val packed = packedCrx()
         ConversionPreparationEngine().use { engine ->

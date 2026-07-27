@@ -21,6 +21,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -72,6 +73,10 @@ class ConversionPipelineTest {
         assertNotEquals(first.extensionId, independent.extensionId)
         assertNotEquals(first.reportSha256, independent.reportSha256)
         assertEquals(first.extensionId, second.extensionId)
+        assertIs<LogicalSourceIdentityResult.NeedsUserSelection>(
+            first.logicalSourceIdentity,
+        )
+        assertEquals(null, first.logicalIdentity)
         assertEquals(ConversionState.CONVERTED, first.compatibilityAfter.conversionState)
         assertTrue(first.compatibilityAfter.adapterDecisions.all(AdapterDecision::applied))
     }

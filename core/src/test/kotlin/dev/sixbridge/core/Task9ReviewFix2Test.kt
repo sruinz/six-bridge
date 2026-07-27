@@ -149,6 +149,7 @@ class Task9ReviewFix2Test {
             input = source(workspace.resolve("source")).toString(),
             profile = profile(),
             outputDraft = workspace.resolve("result.sixdraft"),
+            projectIdentity = "0123456789abcdef0123456789abcdef",
         )
 
         assertEquals(1, streamCalls)

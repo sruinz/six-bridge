@@ -60,6 +60,7 @@ class Task9ReviewFixTest {
             source.toString(),
             profile(),
             workspace.resolve("seed.sixdraft"),
+            projectIdentity = "0123456789abcdef0123456789abcdef",
         )
         val privateKey = workspace.resolve(
             ".local/keystore/draft-transfer/draft-transfer.pk8",
@@ -119,6 +120,7 @@ class Task9ReviewFixTest {
                 source(workspace.resolve("source"), popup = false).toString(),
                 profile(),
                 workspace.resolve("replaced.sixdraft"),
+                projectIdentity = "0123456789abcdef0123456789abcdef",
             )
         }
     }

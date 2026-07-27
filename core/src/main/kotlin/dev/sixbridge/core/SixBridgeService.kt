@@ -9,6 +9,7 @@ import dev.sixbridge.core.conversion.ConversionPipeline
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.CrxIdentityPolicy
 import dev.sixbridge.core.conversion.LocalSourcePublication
+import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.conversion.WorkspacePathIdentity
@@ -100,11 +101,22 @@ class SixBridgeService(
         )
         outputGuardHook()
         outputGuard.requireCurrent()
-        preflightAnalyze(resolved, profile, approvedAdapterIds)
+        val preflightIdentity = preflightAnalyze(
+            resolved,
+            profile,
+            approvedAdapterIds,
+        )
+        val sourceIdentity = resolveDraftSourceIdentity(
+            preflightIdentity,
+            projectIdentity,
+        )
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
             val prepared = pipeline.prepare(resolved, profile, approvedAdapterIds)
+            check(prepared.logicalSourceIdentity == preflightIdentity) {
+                "draft 준비 사이에 논리 원본 신원이 달라졌습니다."
+            }
             outputGuard.requireCurrent()
             val targetGuard = outputGuard.captureTargets(listOf(target))
             val applied = prepared.compatibilityAfter.adapterDecisions
@@ -127,10 +139,6 @@ class SixBridgeService(
                     }
                 }
             }
-            val sourceIdentity = prepared.logicalIdentity
-                ?: projectIdentity?.let { "project:$it" }
-                ?: resolved.expectedExtensionId
-                ?: prepared.extensionId
             val sourceKind = if (applied.isEmpty() && resolved.crxBytes != null) {
                 DraftSourceKind.CRX
             } else {
@@ -425,12 +433,27 @@ class SixBridgeService(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
-    ) {
+    ): LogicalSourceIdentityResult =
         ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             userInputBoundary("확장 입력을 분석할 수 없습니다.") {
-                pipeline.preflight(resolved, profile, approvedAdapterIds)
+                pipeline.preflightPreparation(
+                    resolved,
+                    profile,
+                    approvedAdapterIds,
+                ).logicalSourceIdentity
             }
         }
+
+    private fun resolveDraftSourceIdentity(
+        logicalSourceIdentity: LogicalSourceIdentityResult,
+        projectIdentity: String?,
+    ): String = when (logicalSourceIdentity) {
+        is LogicalSourceIdentityResult.Stable -> logicalSourceIdentity.value
+        LogicalSourceIdentityResult.NeedsUserSelection ->
+            projectIdentity?.let { "project:$it" }
+                ?: throw SixBridgeUserInputException(
+                    "표식 없는 확장 소스에는 source project identity가 필요합니다.",
+                )
     }
 
     private fun validateProjectIdentity(value: String?) {
