@@ -1507,6 +1507,145 @@ class ManagerRepositoryTest {
             assertEquals(1, catalog.iconInsertCount)
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `source load 뒤 null Room publish는 진행 중 persist job을 취소하지 않는다`() =
+        runTest {
+            val sourceLoaded = CompletableDeferred<Unit>()
+            val findEntered = CompletableDeferred<Unit>()
+            val allowFindReturn = CompletableDeferred<Unit>()
+            val findCancelled = CompletableDeferred<Unit>()
+            var providerLoadCount = 0
+            val wrapper = installed(version = 1, signer = "same")
+            val installed = object : InstalledWrapperRepository {
+                override suspend fun findAll(): List<InstalledWrapper> = listOf(wrapper)
+
+                override suspend fun find(packageName: String): InstalledWrapper? {
+                    findEntered.complete(Unit)
+                    return try {
+                        allowFindReturn.await()
+                        wrapper.takeIf { it.packageName == packageName }
+                    } catch (error: CancellationException) {
+                        findCancelled.complete(Unit)
+                        throw error
+                    }
+                }
+            }
+            val nullIcon = record(version = 1, signer = "same")
+            val catalog = FakeCatalog(listOf(nullIcon))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    providerLoadCount += 1
+                    sourceLoaded.complete(Unit)
+                    PUBLISHER_PNG
+                },
+                scope = backgroundScope,
+            )
+
+            publisher.reconcile()
+            runCurrent()
+            sourceLoaded.await()
+            findEntered.await()
+
+            publisher.publish(listOf(nullIcon))
+            runCurrent()
+
+            assertFalse(findCancelled.isCompleted)
+            assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+
+            allowFindReturn.complete(Unit)
+            runCurrent()
+
+            assertEquals(1, providerLoadCount)
+            assertEquals(1, catalog.iconInsertCount)
+            assertContentEquals(PUBLISHER_PNG, catalog.records.single().iconPng)
+            assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `새 publisher의 동일 identity null Room emission은 현재 UI icon을 유지한다`() =
+        runTest {
+            var providerLoadCount = 0
+            val withIcon = record(version = 1, signer = "same").copy(
+                iconPng = PUBLISHER_PNG,
+            )
+            val withoutIcon = withIcon.copy(iconPng = null)
+            val catalog = FakeCatalog(listOf(withIcon))
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    providerLoadCount += 1
+                    null
+                },
+                scope = backgroundScope,
+            )
+            val emissions = mutableListOf<ByteArray?>()
+            val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+                publisher.state.collect { records ->
+                    emissions += records.singleOrNull()?.iconPng
+                }
+            }
+
+            publisher.publish(listOf(withIcon))
+            runCurrent()
+            catalog.records = listOf(withoutIcon)
+            publisher.publish(listOf(withoutIcon))
+            runCurrent()
+            collector.cancelAndJoin()
+
+            val firstPositive = emissions.indexOfFirst { it != null }
+            assertTrue(firstPositive >= 0)
+            assertTrue(
+                emissions.drop(firstPositive + 1).none { it == null },
+                "같은 full identity의 현재 UI icon 뒤 null state를 방출하지 않아야 합니다.",
+            )
+            assertContentEquals(PUBLISHER_PNG, publisher.state.value.single().iconPng)
+            assertEquals(1, providerLoadCount)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `durable Room icon publish는 취소를 무시한 이전 find 결과로 덮어쓰지 않는다`() =
+        runTest {
+            val loadedPng = byteArrayOf(1, 2, 3)
+            val durablePng = byteArrayOf(4, 5, 6)
+            val wrapper = installed(version = 1, signer = "same")
+            val installed = LateReturningInstalledWrappers(wrapper)
+            val withoutIcon = record(version = 1, signer = "same")
+            val withDurableIcon = withoutIcon.copy(iconPng = durablePng)
+            val catalog = FakeCatalog(listOf(withoutIcon))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource { loadedPng },
+                scope = backgroundScope,
+            )
+
+            publisher.reconcile()
+            runCurrent()
+            installed.findEntered.await()
+
+            catalog.records = listOf(withDurableIcon)
+            publisher.publish(listOf(withDurableIcon))
+            runCurrent()
+            assertContentEquals(durablePng, publisher.state.value.single().iconPng)
+
+            installed.allowFindReturn.complete(Unit)
+            runCurrent()
+
+            assertTrue(installed.findReturned.isCompleted)
+            assertTrue(installed.findCompleted.isCompleted)
+            assertEquals(0, catalog.iconInsertCount)
+            assertContentEquals(durablePng, catalog.records.single().iconPng)
+            assertContentEquals(durablePng, publisher.state.value.single().iconPng)
+        }
+
     @Test
     fun `identity 변경은 이전 bytes와 저장 실패 상태를 재사용하지 않는다`() = runBlocking {
         var providerLoadCount = 0

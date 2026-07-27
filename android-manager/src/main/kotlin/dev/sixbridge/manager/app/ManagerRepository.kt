@@ -440,7 +440,7 @@ internal class CatalogPublisher(
             publishFallbackLocked(reconcileLocked(catalog.observe().first()))
         }
         publication.cancelledJobs.forEach(Job::cancel)
-        scheduleIcons(publication.records)
+        scheduleIcons(publication.iconCandidates)
     }
 
     suspend fun publish(records: List<CatalogRecord>) {
@@ -448,7 +448,7 @@ internal class CatalogPublisher(
             publishFallbackLocked(reconcileLocked(records))
         }
         publication.cancelledJobs.forEach(Job::cancel)
-        scheduleIcons(publication.records)
+        scheduleIcons(publication.iconCandidates)
     }
 
     suspend fun remove(packageName: String) {
@@ -480,7 +480,7 @@ internal class CatalogPublisher(
 
     private suspend fun reconcileLocked(
         catalogRecords: List<CatalogRecord>,
-    ): List<CatalogRecord> {
+    ): CatalogDisplayRecords {
         val installed = installedWrappers.findAll()
         val reconciliation = reconciler.reconcile(catalogRecords, installed)
         catalog.removeAll(reconciliation.stalePackageNames.toSet())
@@ -489,12 +489,32 @@ internal class CatalogPublisher(
         }
         val identities = ensured.mapTo(mutableSetOf(), CatalogRecord::identity)
         iconEnricher.retainOnly(identities)
-        return ensured.map { iconEnricher.mergeCached(it) }
+        val currentByPackage = mutableState.value.associateBy(CatalogRecord::packageName)
+        val displayRecords = ensured.map { candidate ->
+            val cached = if (candidate.iconPng == null) {
+                iconEnricher.mergeCached(candidate)
+            } else {
+                candidate
+            }
+            if (cached.iconPng != null) {
+                cached
+            } else {
+                currentByPackage[candidate.packageName]
+                    ?.takeIf { current -> current.identity() == candidate.identity() }
+                    ?.iconPng
+                    ?.let { currentIcon -> candidate.copy(iconPng = currentIcon) }
+                    ?: candidate
+            }
+        }
+        return CatalogDisplayRecords(
+            iconCandidates = ensured,
+            displayRecords = displayRecords,
+        )
     }
 
-    private fun publishFallbackLocked(records: List<CatalogRecord>): IconPublication {
-        mutableState.value = records
-        val requiredIdentities = records
+    private fun publishFallbackLocked(records: CatalogDisplayRecords): IconPublication {
+        mutableState.value = records.displayRecords
+        val requiredIdentities = records.iconCandidates
             .asSequence()
             .filter { it.iconPng == null }
             .map(CatalogRecord::identity)
@@ -503,7 +523,7 @@ internal class CatalogPublisher(
             .filterKeys { it !in requiredIdentities }
             .toList()
         cancelled.forEach { (identity, _) -> iconJobs.remove(identity) }
-        return IconPublication(records, cancelled.map { it.second })
+        return IconPublication(records.iconCandidates, cancelled.map { it.second })
     }
 
     private suspend fun scheduleIcons(records: List<CatalogRecord>) {
@@ -555,12 +575,13 @@ internal class CatalogPublisher(
                 return
             }
             mutex.withLock {
+                if (iconJobs[identity] !== job) return@withLock
                 val index = mutableState.value.indexOfFirst {
                     it.packageName == identity.packageName
                 }
                 if (index < 0) return@withLock
                 val current = mutableState.value[index]
-                if (current.iconPng != null || current.identity() != identity) {
+                if (current.identity() != identity) {
                     return@withLock
                 }
                 val enriched = when (val persisted = iconEnricher.persist(current, iconPng)) {
@@ -590,8 +611,13 @@ internal class CatalogPublisher(
     }
 
     private data class IconPublication(
-        val records: List<CatalogRecord>,
+        val iconCandidates: List<CatalogRecord>,
         val cancelledJobs: List<Job>,
+    )
+
+    private data class CatalogDisplayRecords(
+        val iconCandidates: List<CatalogRecord>,
+        val displayRecords: List<CatalogRecord>,
     )
 }
 
