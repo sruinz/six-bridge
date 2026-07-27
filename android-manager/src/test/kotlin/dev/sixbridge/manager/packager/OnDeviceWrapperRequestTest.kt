@@ -7,11 +7,16 @@ import dev.sixbridge.contract.bundle.ContractSourceEvidence
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.manager.conversion.ConversionIdentityDao
+import dev.sixbridge.manager.conversion.ConversionIdentityEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityLeaseEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityReservation
+import dev.sixbridge.manager.conversion.ConversionJobEntity
+import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
-import dev.sixbridge.manager.conversion.PackagingConversionIdentity
-import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.KeyPairGenerator
@@ -19,6 +24,7 @@ import java.security.MessageDigest
 import java.security.Signature
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.runBlocking
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotSame
@@ -145,7 +151,7 @@ class OnDeviceWrapperRequestTest {
     }
 
     @Test
-    fun `예약 신원의 alias extension package signer가 하나라도 다르면 거부한다`() {
+    fun `ledger가 발급한 예약 신원의 extension 또는 signer가 다르면 거부한다`() {
         val identity = packageIdentity(passthroughProof.extensionId)
         val request = passthroughRequest()
         listOf(
@@ -156,14 +162,8 @@ class OnDeviceWrapperRequestTest {
             reservation(
                 passthroughKey,
                 passthroughProof.extensionId,
-                packageName = "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
-            ),
-            reservation(
-                passthroughKey,
-                passthroughProof.extensionId,
                 wrapperSignerSha256 = "0".repeat(64),
             ),
-            reservation(passthroughKey, passthroughProof.extensionId, alias = "unexpected"),
         ).forEach { changed ->
             assertFailsWith<IllegalArgumentException> {
                 request.copy(reservation = changed).validateFor(identity, passthroughCrx)
@@ -237,18 +237,86 @@ class OnDeviceWrapperRequestTest {
         alias: String? = null,
         packageName: String = "dev.sixbridge.ext.$extensionId",
         wrapperSignerSha256: String = "f".repeat(64),
-    ) = PackagingConversionIdentity(
-        ReservedConversionIdentity(
-            identityKey = key,
-            extensionId = extensionId,
-            packageName = packageName,
-            wrapperSignerSha256 = wrapperSignerSha256,
-            crxKeyAlias = alias,
-            crxPublicKeySha256 = if (alias == null) null else "e".repeat(64),
-            versionCode = 1,
-            ownerToken = "unit-owner",
-        ),
-    )
+    ): ConversionIdentityLedger.Reservation = runBlocking {
+        ConversionIdentityLedger(ReservationIssuingDao()).reserve(
+            request = ConversionIdentityReservation(
+                identityKey = key,
+                displayName = "SIX 테스트",
+                packageBinding = ConversionPackageBinding(
+                    extensionId = extensionId,
+                    packageName = packageName,
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxKeyAlias = alias,
+                    crxPublicKeySha256 = if (alias == null) null else "e".repeat(64),
+                ),
+                installedVersionCode = null,
+            ),
+            ownerToken = JOB_TOKEN,
+        )
+    }
+
+    private class ReservationIssuingDao : ConversionIdentityDao {
+        override suspend fun get(identitySha256: String): ConversionIdentityEntity? = null
+        override suspend fun findByExtensionId(extensionId: String): ConversionIdentityEntity? = null
+        override suspend fun findByPackageName(packageName: String): ConversionIdentityEntity? = null
+        override suspend fun findByCrxKeyAlias(crxKeyAlias: String): ConversionIdentityEntity? = null
+        override suspend fun insert(entity: ConversionIdentityEntity) = error("unused")
+        override suspend fun update(entity: ConversionIdentityEntity) = error("unused")
+        override suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity? = null
+        override suspend fun getLeaseByOwnerToken(ownerToken: String): ConversionIdentityLeaseEntity? = null
+        override suspend fun getJobForIdentityFinalization(): ConversionJobEntity? = null
+        override suspend fun insertLease(entity: ConversionIdentityLeaseEntity) = error("unused")
+        override suspend fun markLeaseReady(
+            identitySha256: String,
+            ownerToken: String,
+            extensionId: String,
+            packageName: String,
+            wrapperSignerSha256: String,
+            crxPublicKeySha256: String,
+        ): Int = error("unused")
+
+        override suspend fun transitionLease(
+            identitySha256: String,
+            ownerToken: String,
+            expectedState: String,
+            nextState: String,
+        ): Int = error("unused")
+
+        override suspend fun consumeReadyLease(
+            identitySha256: String,
+            readyOwnerToken: String,
+            reservationOwnerToken: String,
+            reservedVersionCode: Int,
+        ): Int = error("unused")
+
+        override suspend fun deleteLease(
+            identitySha256: String,
+            ownerToken: String,
+            state: String,
+        ): Int = error("unused")
+
+        override suspend fun reserve(
+            requested: ConversionIdentityEntity,
+            installedVersionCode: Long?,
+            readyOwnerToken: String?,
+            reservationOwnerToken: String,
+            createdAtEpochMillis: Long,
+            crxPublicKeySha256: String?,
+        ): ConversionIdentityEntity = requested.copy(lastReservedVersionCode = 1)
+
+        override suspend fun listByModeAndProfile(
+            mode: String,
+            profileMajorVersion: Int,
+        ): List<ConversionIdentityEntity> = emptyList()
+
+        override suspend fun claimForPackaging(
+            requested: ConversionIdentityEntity,
+            versionCode: Int,
+            ownerToken: String,
+            crxPublicKeySha256: String?,
+            packagingState: String,
+        ) = error("unused")
+    }
 
     private fun identityKey(mode: InstallationIdentityMode) = InstallationIdentityKey.create(
         LogicalSourceIdentity.storeExtensionId("abcdefghijklmnopabcdefghijklmnop"),
@@ -324,4 +392,8 @@ class OnDeviceWrapperRequestTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        const val JOB_TOKEN = "00000000-0000-4000-8000-000000000001"
+    }
 }

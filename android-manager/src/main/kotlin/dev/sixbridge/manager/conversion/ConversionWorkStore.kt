@@ -54,12 +54,14 @@ internal data class ConversionWorkStoreHooks(
     val afterInputCopied: () -> Unit = {},
     val afterCopyChunk: (File) -> Unit = {},
     val afterBundleVerified: () -> Unit = {},
+    val afterDiscardClaim: () -> Unit = {},
 )
 
 class ConversionWorkStore internal constructor(
     private val privateRoot: File,
     private val dao: ConversionJobDao,
     private val bundleVerifier: ConversionBundleVerifier,
+    private val identityOwnerLifecycle: ConversionIdentityOwnerLifecycle,
     private val clock: () -> Long = { Clock.systemUTC().millis() },
     private val tokenFactory: () -> String = { UUID.randomUUID().toString() },
     private val fileNameFactory: () -> String = { UUID.randomUUID().toString() },
@@ -207,8 +209,14 @@ class ConversionWorkStore internal constructor(
                 databaseCommitted = true
                 hooks.afterBundleTransition()
                 val stored = requireNotNull(dao.get())
-                stored.toRestored(tokenDirectory)
+                val restored = stored.toRestored(tokenDirectory)
                     ?: throw IllegalStateException("완료 작업을 복구할 수 없습니다.")
+                identityOwnerLifecycle.finalizeBundleReady(
+                    restored.token,
+                    stored.generation,
+                    requireNotNull(restored.bundleSha256),
+                )
+                restored
             } catch (error: Throwable) {
                 if (!databaseCommitted) {
                     Files.deleteIfExists(temporary.toPath())
@@ -230,6 +238,10 @@ class ConversionWorkStore internal constructor(
             val stage = enumValueOrNull<ConversionJobStage>(row.stage)
             if (stage == null || !isCanonicalUuid(row.token)) {
                 discardInvalid(root, row)
+                return@withContext null
+            }
+            if (stage == ConversionJobStage.DISCARDING) {
+                discardClaimed(root, row)
                 return@withContext null
             }
             if (stage != ConversionJobStage.BUNDLE_READY && isExpired(row.updatedAtEpochMillis)) {
@@ -266,6 +278,13 @@ class ConversionWorkStore internal constructor(
                 discardInvalid(root, row)
                 return@withContext null
             }
+            if (restored.stage == ConversionJobStage.BUNDLE_READY) {
+                identityOwnerLifecycle.finalizeBundleReady(
+                    restored.token,
+                    row.generation,
+                    requireNotNull(restored.bundleSha256),
+                )
+            }
             restored
         }
     }
@@ -277,8 +296,9 @@ class ConversionWorkStore internal constructor(
             if (row?.token != token) return@withContext false
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext false
             val reconciled = reconcileCleanupTokens(root, row) ?: return@withContext false
-            if (!deleteOwnedTokenDirectories(root, reconciled)) return@withContext false
-            dao.delete(token, reconciled.generation) == 1
+            val claimed = claimDiscarding(reconciled) ?: return@withContext false
+            hooks.afterDiscardClaim()
+            discardClaimed(root, claimed)
         }
     }
 
@@ -451,6 +471,7 @@ class ConversionWorkStore internal constructor(
                 ) return null
                 bundleSha256
             }
+            ConversionJobStage.DISCARDING -> return null
         }
         return RestoredConversionJob(
             token = token,
@@ -718,6 +739,7 @@ class ConversionWorkStore internal constructor(
             val pending = decodeCleanupTokens(row.cleanupTokensJson) ?: return null
             val token = pending.firstOrNull() ?: return row
             if (!isCanonicalUuid(token) || token == row.token) return null
+            identityOwnerLifecycle.abort(token)
             if (!deleteTokenDirectory(root, token)) return null
             val remaining = pending - token
             val changed = dao.updateCleanupTokens(
@@ -757,17 +779,46 @@ class ConversionWorkStore internal constructor(
     }
 
     private suspend fun discardInvalid(root: File, row: ConversionJobEntity) {
-        if (deleteOwnedTokenDirectories(root, row)) {
-            dao.delete(row.token, row.generation)
-        }
+        val claimed = claimDiscarding(row) ?: return
+        hooks.afterDiscardClaim()
+        discardClaimed(root, claimed)
     }
 
-    private fun deleteOwnedTokenDirectories(root: File, row: ConversionJobEntity): Boolean {
+    private suspend fun claimDiscarding(row: ConversionJobEntity): ConversionJobEntity? {
+        if (row.stage == ConversionJobStage.DISCARDING.name) return row
+        val changed = dao.transition(
+            token = row.token,
+            expectedStage = row.stage,
+            expectedGeneration = row.generation,
+            expectedProfileSha256 = null,
+            nextStage = ConversionJobStage.DISCARDING.name,
+            approvedAdapterIdsJson = row.approvedAdapterIdsJson,
+            profileSha256 = row.profileSha256,
+            bundleFileName = row.bundleFileName,
+            bundleSha256 = row.bundleSha256,
+            updatedAtEpochMillis = row.updatedAtEpochMillis,
+        )
+        return if (changed == 1) dao.get() else null
+    }
+
+    private suspend fun discardClaimed(root: File, row: ConversionJobEntity): Boolean {
+        require(row.stage == ConversionJobStage.DISCARDING.name) {
+            "외부 작업 cleanup은 DISCARDING claim 뒤에만 실행할 수 있습니다."
+        }
+        if (!deleteOwnedTokenDirectories(root, row)) return false
+        return dao.delete(row.token, row.generation) == 1
+    }
+
+    private suspend fun deleteOwnedTokenDirectories(root: File, row: ConversionJobEntity): Boolean {
         val cleanup = decodeCleanupTokens(row.cleanupTokensJson) ?: return false
         if (cleanup.any { !isCanonicalUuid(it) }) return false
         val tokens = if (isCanonicalUuid(row.token)) cleanup + row.token else cleanup
         if (tokens.any { !isCanonicalUuid(it) }) return false
-        return tokens.all { deleteTokenDirectory(root, it) }
+        for (token in tokens) {
+            identityOwnerLifecycle.abort(token)
+            if (!deleteTokenDirectory(root, token)) return false
+        }
+        return true
     }
 
     private fun deleteUnreferencedChildren(

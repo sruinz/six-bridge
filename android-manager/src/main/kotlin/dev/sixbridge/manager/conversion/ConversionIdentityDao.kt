@@ -29,6 +29,12 @@ interface ConversionIdentityDao {
     @Query("SELECT * FROM conversion_identity_leases WHERE identitySha256 = :identitySha256")
     suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity?
 
+    @Query("SELECT * FROM conversion_identity_leases WHERE ownerToken = :ownerToken LIMIT 1")
+    suspend fun getLeaseByOwnerToken(ownerToken: String): ConversionIdentityLeaseEntity?
+
+    @Query("SELECT * FROM conversion_job WHERE singletonId = 1")
+    suspend fun getJobForIdentityFinalization(): ConversionJobEntity?
+
     @Insert
     suspend fun insertLease(entity: ConversionIdentityLeaseEntity)
 
@@ -254,7 +260,14 @@ interface ConversionIdentityDao {
         versionCode: Int,
         ownerToken: String,
         crxPublicKeySha256: String?,
+        packagingState: String,
     ) {
+        require(
+            Regex("PACKAGING:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+                .matches(packagingState),
+        ) {
+            "package claim state가 올바르지 않습니다."
+        }
         val current = get(requested.identitySha256)
             ?: throw IllegalArgumentException("예약된 설치 신원을 찾을 수 없습니다.")
         requireIdentityFieldsMatch(current, requested)
@@ -275,11 +288,41 @@ interface ConversionIdentityDao {
                 identitySha256 = requested.identitySha256,
                 ownerToken = ownerToken,
                 expectedState = ConversionIdentityLeaseState.RESERVED.name,
-                nextState = ConversionIdentityLeaseState.PACKAGING.name,
+                nextState = packagingState,
             ) == 1,
         ) {
             "package 예약을 원자적으로 소비하지 못했습니다."
         }
+    }
+
+    @Transaction
+    suspend fun finalizePackagedForBundleReady(
+        ownerToken: String,
+        expectedGeneration: Long,
+        bundleSha256: String,
+    ): Boolean {
+        val job = getJobForIdentityFinalization()
+            ?: throw IllegalArgumentException("BUNDLE_READY 작업을 찾을 수 없습니다.")
+        require(
+            job.token == ownerToken &&
+                job.stage == ConversionJobStage.BUNDLE_READY.name &&
+                job.generation == expectedGeneration &&
+                job.bundleSha256 == bundleSha256,
+        ) {
+            "identity finalize proof가 committed BUNDLE_READY 작업과 일치하지 않습니다."
+        }
+        val lease = getLeaseByOwnerToken(ownerToken) ?: return true
+        requireValidPackagedLeaseState(lease.state)
+        check(
+            deleteLease(
+                identitySha256 = lease.identitySha256,
+                ownerToken = ownerToken,
+                state = lease.state,
+            ) == 1,
+        ) {
+            "BUNDLE_READY identity lease finalize에 실패했습니다."
+        }
+        return true
     }
 }
 

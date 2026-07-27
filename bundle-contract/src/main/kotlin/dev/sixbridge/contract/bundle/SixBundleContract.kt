@@ -200,8 +200,8 @@ object SixBundleContract {
         validateContents(contents.wrapperApk, contents.extension, contents.compatibility)
         ZipOutputStream(output).use { zip ->
             addStored(zip, WRAPPER_ENTRY, contents.wrapperApk)
-            add(zip, EXTENSION_ENTRY, extension)
-            add(zip, COMPATIBILITY_ENTRY, compatibility)
+            addStored(zip, EXTENSION_ENTRY, extension)
+            addStored(zip, COMPATIBILITY_ENTRY, compatibility)
         }
     }
 
@@ -246,8 +246,8 @@ object SixBundleContract {
             require(copiedSha256 == extension.wrapperSha256) {
                 "기록한 wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
             }
-            add(zip, EXTENSION_ENTRY, extensionBytes)
-            add(zip, COMPATIBILITY_ENTRY, compatibilityBytes)
+            addStored(zip, EXTENSION_ENTRY, extensionBytes)
+            addStored(zip, COMPATIBILITY_ENTRY, compatibilityBytes)
         }
         val after = Files.readAttributes(
             wrapperApk,
@@ -557,12 +557,6 @@ object SixBundleContract {
         WRAPPER_ENTRY -> MAX_WRAPPER_SIZE
         EXTENSION_ENTRY, COMPATIBILITY_ENTRY -> MAX_METADATA_SIZE
         else -> throw IllegalArgumentException("SixBundle에 허용되지 않은 항목이 있습니다: $name")
-    }
-
-    private fun add(zip: ZipOutputStream, name: String, bytes: ByteArray) {
-        zip.putNextEntry(ZipEntry(name).apply { time = 0L })
-        zip.write(bytes)
-        zip.closeEntry()
     }
 
     private fun addStored(zip: ZipOutputStream, name: String, bytes: ByteArray) {

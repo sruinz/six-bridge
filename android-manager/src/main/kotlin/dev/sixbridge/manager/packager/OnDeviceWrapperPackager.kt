@@ -7,9 +7,9 @@ import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.manager.conversion.ConversionIdentityLedger
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
-import dev.sixbridge.manager.conversion.PackagingConversionIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -22,16 +22,20 @@ import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.nio.file.StandardOpenOption.CREATE
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 import java.util.UUID
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class OnDeviceWrapperRequest(
-    val reservation: PackagingConversionIdentity,
+    val reservation: ConversionIdentityLedger.Reservation,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
     val descriptorName: String,
@@ -42,7 +46,7 @@ data class OnDeviceWrapperRequest(
 )
 
 data class OnDeviceWrapperPathRequest(
-    val reservation: PackagingConversionIdentity,
+    val reservation: ConversionIdentityLedger.Reservation,
     val canonicalSourceZip: File?,
     val passthroughCrx: File?,
     val descriptorName: String,
@@ -69,7 +73,8 @@ class UnreservedIdentityLease internal constructor(
         get() = ownerToken.toString()
 }
 
-data class OnDeviceWrapperResult(
+@ConsistentCopyVisibility
+data class OnDeviceWrapperResult internal constructor(
     val extensionId: String,
     val packageName: String,
     val versionCode: Int,
@@ -79,10 +84,17 @@ data class OnDeviceWrapperResult(
     val descriptor: ContractExtensionDescriptor,
     val compatibility: ContractCompatibilityReport,
     val outputApk: File,
+    internal val publishedOutputProof: PublishedOutputProof? = null,
+)
+
+internal data class PublishedOutputProof(
+    val fileKey: Any,
+    val size: Long,
+    val lastModifiedEpochMillis: Long,
 )
 
 internal data class ValidatedOnDeviceWrapperRequest(
-    val reservation: PackagingConversionIdentity,
+    val reservation: ConversionIdentityLedger.Reservation,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
     val descriptorName: String,
@@ -93,7 +105,7 @@ internal data class ValidatedOnDeviceWrapperRequest(
 )
 
 private data class ValidatedPathWrapperRequest(
-    val reservation: PackagingConversionIdentity,
+    val reservation: ConversionIdentityLedger.Reservation,
     val canonicalSourceZip: Path?,
     val passthroughCrx: Path?,
     val descriptorName: String,
@@ -203,7 +215,7 @@ class OnDeviceWrapperPackager(context: Context) {
     }
 
     private fun resolveReservedIdentity(
-        reservation: PackagingConversionIdentity,
+        reservation: ConversionIdentityLedger.Reservation,
         passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
     ): OnDevicePackageIdentity {
         val wrapperIdentity = identityStore.existingWrapperIdentity()
@@ -268,6 +280,7 @@ class OnDeviceWrapperPackager(context: Context) {
             crxKeyAlias = crxIdentity.alias,
             crxPublicKeyDer = publicKey,
         )
+        testHooks?.afterUnreservedIdentityCreated?.invoke()
         return UnreservedIdentityLease(identityKey.identitySha256, identity, ownerToken)
     }
 
@@ -291,9 +304,22 @@ class OnDeviceWrapperPackager(context: Context) {
         return identityStore.deleteCrxIdentity(identitySha256, expectedAlias)
     }
 
-    @Synchronized
-    fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
-        request.reservation.consume()
+    suspend fun packageWrapper(
+        ledger: ConversionIdentityLedger,
+        request: OnDeviceWrapperRequest,
+    ): OnDeviceWrapperResult = ledger.packageWrapper(this, request)
+
+    suspend fun packageWrapper(
+        ledger: ConversionIdentityLedger,
+        request: OnDeviceWrapperPathRequest,
+    ): OnDeviceWrapperResult = ledger.packageWrapper(this, request)
+
+    internal suspend fun packageClaimed(
+        ledger: ConversionIdentityLedger,
+        receipt: ConversionIdentityLedger.PackagingReceipt,
+        request: OnDeviceWrapperRequest,
+    ): OnDeviceWrapperResult {
+        ledger.requirePackagingReceipt(receipt, request.reservation)
         val snapshot = request.snapshot()
         validateBasicRequest(snapshot)
         val stagedSource = createTemporaryFile(".source.", ".bin")
@@ -301,7 +327,9 @@ class OnDeviceWrapperPackager(context: Context) {
             val sourceBytes = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
             writeSourceBytes(stagedSource, sourceBytes)
             return packageStaged(
-                ValidatedPathWrapperRequest(
+                ledger = ledger,
+                receipt = receipt,
+                request = ValidatedPathWrapperRequest(
                     reservation = snapshot.reservation,
                     canonicalSourceZip =
                         stagedSource.takeIf { snapshot.canonicalSourceZip != null },
@@ -319,9 +347,12 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
-    @Synchronized
-    fun packageWrapper(request: OnDeviceWrapperPathRequest): OnDeviceWrapperResult {
-        request.reservation.consume()
+    internal suspend fun packageClaimed(
+        ledger: ConversionIdentityLedger,
+        receipt: ConversionIdentityLedger.PackagingReceipt,
+        request: OnDeviceWrapperPathRequest,
+    ): OnDeviceWrapperResult {
+        ledger.requirePackagingReceipt(receipt, request.reservation)
         val snapshot = request.snapshot()
         validatePathRequest(snapshot)
         val source = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
@@ -329,7 +360,9 @@ class OnDeviceWrapperPackager(context: Context) {
         try {
             copyStableSource(source, stagedSource)
             return packageStaged(
-                snapshot.copy(
+                ledger = ledger,
+                receipt = receipt,
+                request = snapshot.copy(
                     canonicalSourceZip =
                         stagedSource.takeIf { snapshot.canonicalSourceZip != null },
                     passthroughCrx =
@@ -341,7 +374,9 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
-    private fun packageStaged(
+    private suspend fun packageStaged(
+        ledger: ConversionIdentityLedger,
+        receipt: ConversionIdentityLedger.PackagingReceipt,
         request: ValidatedPathWrapperRequest,
     ): OnDeviceWrapperResult {
         val passthroughProof = request.passthroughCrx?.let {
@@ -424,13 +459,22 @@ class OnDeviceWrapperPackager(context: Context) {
                 testHooks?.beforeFinalPublish?.invoke()
                 verifyPublishTarget(output)
                 forceFile(signed)
+                ledger.markPublishing(
+                    receipt = receipt,
+                    reservation = request.reservation,
+                    wrapperSha256 = descriptor.wrapperSha256,
+                    outputFileName = output.fileName.toString(),
+                )
                 verifyPublishTarget(output)
                 Files.move(signed, output, ATOMIC_MOVE, REPLACE_EXISTING)
+                testHooks?.afterFinalPublish?.invoke()
                 forceDirectory(workingDirectory.path)
                 verifyPublishTarget(output)
-                require(sha256(output) == descriptor.wrapperSha256) {
-                    "publish된 wrapper APK hash가 검증 결과와 일치하지 않습니다."
-                }
+                val publishedOutputProof = verifyPublishedOutputIdentity(
+                    output = output,
+                    expectedSha256 = descriptor.wrapperSha256,
+                    label = "publish된 wrapper APK",
+                )
                 return OnDeviceWrapperResult(
                     extensionId = identity.extensionId,
                     packageName = identity.packageName,
@@ -441,6 +485,7 @@ class OnDeviceWrapperPackager(context: Context) {
                     descriptor = descriptor,
                     compatibility = request.compatibility,
                     outputApk = output.toFile(),
+                    publishedOutputProof = publishedOutputProof,
                 )
             } finally {
                 Files.deleteIfExists(temporaryTemplate)
@@ -683,6 +728,208 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
+    internal suspend fun discardPublishedResult(
+        result: OnDeviceWrapperResult,
+        identitySha256: String,
+        claimUuid: UUID,
+    ) {
+        require(SHA256.matches(identitySha256)) {
+            "identity SHA-256이 올바르지 않습니다."
+        }
+        discardPublishedOutputLocked(
+            claimUuid = claimUuid,
+            outputFileName = result.outputApk.name,
+            wrapperSha256 = result.wrapperSha256,
+            expectedProof = requireNotNull(result.publishedOutputProof) {
+                "정리할 published wrapper의 publish proof가 없습니다."
+            },
+        )
+    }
+
+    internal suspend fun verifyPublishedOutput(
+        identitySha256: String,
+        outputFileName: String,
+        wrapperSha256: String,
+    ): Boolean = withIdentityMutationLock(identitySha256) {
+        require(SHA256.matches(wrapperSha256)) {
+            "복구할 published wrapper SHA-256이 올바르지 않습니다."
+        }
+        val output = validatedOutput(File(workingDirectory.path.toFile(), outputFileName))
+        if (!Files.exists(output, NOFOLLOW_LINKS)) return@withIdentityMutationLock false
+        val before = Files.readAttributes(output, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            before.fileKey() != null &&
+                before.isRegularFile &&
+                !before.isSymbolicLink &&
+                unixLinkCount(output) == 1,
+        ) {
+            "복구할 published wrapper identity가 올바르지 않습니다."
+        }
+        val actualSha256 = sha256(output)
+        val after = Files.readAttributes(output, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            after.fileKey() == before.fileKey() &&
+                after.size() == before.size() &&
+                after.lastModifiedTime() == before.lastModifiedTime() &&
+                unixLinkCount(output) == 1 &&
+                actualSha256 == wrapperSha256,
+        ) {
+            "복구할 published wrapper proof가 원장과 일치하지 않습니다."
+        }
+        true
+    }
+
+    internal suspend fun discardPublishedOutput(
+        identitySha256: String,
+        claimUuid: UUID,
+        outputFileName: String,
+        wrapperSha256: String,
+    ) {
+        discardPublishedOutput(
+            identitySha256 = identitySha256,
+            claimUuid = claimUuid,
+            outputFileName = outputFileName,
+            wrapperSha256 = wrapperSha256,
+            expectedProof = null,
+        )
+    }
+
+    private suspend fun discardPublishedOutput(
+        identitySha256: String,
+        claimUuid: UUID,
+        outputFileName: String,
+        wrapperSha256: String,
+        expectedProof: PublishedOutputProof?,
+    ) = withIdentityMutationLock(identitySha256) {
+        discardPublishedOutputLocked(
+            claimUuid = claimUuid,
+            outputFileName = outputFileName,
+            wrapperSha256 = wrapperSha256,
+            expectedProof = expectedProof,
+        )
+    }
+
+    private fun discardPublishedOutputLocked(
+        claimUuid: UUID,
+        outputFileName: String,
+        wrapperSha256: String,
+        expectedProof: PublishedOutputProof?,
+    ) {
+        require(SHA256.matches(wrapperSha256)) {
+            "정리할 published wrapper SHA-256이 올바르지 않습니다."
+        }
+        val output = validatedOutput(File(workingDirectory.path.toFile(), outputFileName))
+        val quarantine = temporaryDirectory.path.resolve(".published-cleanup.$claimUuid.apk")
+        testHooks?.beforePublishedCleanupMove?.invoke(output.toFile())
+        if (!Files.exists(output, NOFOLLOW_LINKS)) {
+            if (!Files.exists(quarantine, NOFOLLOW_LINKS)) {
+                require(expectedProof == null) {
+                    "해당 package claim이 publish한 wrapper가 정리 전에 유실되었습니다."
+                }
+                return
+            }
+            verifyAndDeletePublishedQuarantine(quarantine, wrapperSha256)
+            return
+        }
+        require(!Files.exists(quarantine, NOFOLLOW_LINKS)) {
+            "동일 package claim의 output과 cleanup quarantine이 동시에 존재합니다."
+        }
+        val before = Files.readAttributes(output, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(!before.isSymbolicLink && before.isRegularFile && unixLinkCount(output) == 1) {
+            "정리할 published wrapper identity가 올바르지 않습니다."
+        }
+        val fileKey = before.fileKey()
+            ?: throw IllegalArgumentException("정리할 published wrapper fileKey가 없습니다.")
+        require(
+            expectedProof == null ||
+                (
+                    expectedProof.fileKey == fileKey &&
+                        expectedProof.size == before.size() &&
+                        expectedProof.lastModifiedEpochMillis ==
+                        before.lastModifiedTime().toMillis()
+                    )
+        ) {
+            "정리할 published wrapper가 해당 package claim이 publish한 파일이 아닙니다."
+        }
+        Files.move(output, quarantine, ATOMIC_MOVE)
+        forceDirectory(workingDirectory.path)
+        try {
+            verifyAndDeletePublishedQuarantine(quarantine, wrapperSha256, fileKey)
+        } catch (error: Throwable) {
+            if (!Files.exists(output, NOFOLLOW_LINKS) && Files.exists(quarantine, NOFOLLOW_LINKS)) {
+                Files.move(quarantine, output, ATOMIC_MOVE)
+                forceDirectory(workingDirectory.path)
+            }
+            throw error
+        }
+    }
+
+    private fun verifyAndDeletePublishedQuarantine(
+        quarantine: Path,
+        wrapperSha256: String,
+        expectedFileKey: Any? = null,
+    ) {
+        val before = Files.readAttributes(quarantine, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        val fileKey = before.fileKey()
+            ?: throw IllegalArgumentException("cleanup quarantine fileKey가 없습니다.")
+        require(
+            (expectedFileKey == null || expectedFileKey == fileKey) &&
+                before.isRegularFile &&
+                !before.isSymbolicLink &&
+                unixLinkCount(quarantine) == 1,
+        ) {
+            "cleanup quarantine identity가 claim proof와 일치하지 않습니다."
+        }
+        val actualSha256 = sha256(quarantine)
+        val after = Files.readAttributes(quarantine, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            after.fileKey() == fileKey &&
+                after.size() == before.size() &&
+                after.lastModifiedTime() == before.lastModifiedTime() &&
+                unixLinkCount(quarantine) == 1 &&
+                actualSha256 == wrapperSha256,
+        ) {
+            "cleanup quarantine가 claim-owned wrapper와 일치하지 않습니다."
+        }
+        check(Files.deleteIfExists(quarantine)) {
+            "claim-owned published wrapper를 정리하지 못했습니다."
+        }
+        forceDirectory(temporaryDirectory.path)
+    }
+
+    private fun verifyPublishedOutputIdentity(
+        output: Path,
+        expectedSha256: String,
+        label: String,
+    ): PublishedOutputProof {
+        val before = Files.readAttributes(output, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        val fileKey = before.fileKey()
+            ?: throw IllegalArgumentException("$label fileKey가 없습니다.")
+        require(
+            before.isRegularFile &&
+                !before.isSymbolicLink &&
+                unixLinkCount(output) == 1,
+        ) {
+            "$label identity가 올바르지 않습니다."
+        }
+        val actualSha256 = sha256(output)
+        val after = Files.readAttributes(output, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            after.fileKey() == fileKey &&
+                after.size() == before.size() &&
+                after.lastModifiedTime() == before.lastModifiedTime() &&
+                unixLinkCount(output) == 1 &&
+                actualSha256 == expectedSha256,
+        ) {
+            "$label proof가 일치하지 않습니다."
+        }
+        return PublishedOutputProof(
+            fileKey = fileKey,
+            size = before.size(),
+            lastModifiedEpochMillis = before.lastModifiedTime().toMillis(),
+        )
+    }
+
     private fun readVerifiedTemplate(destination: Path): Path {
         val expected = appContext.assets.open(TEMPLATE_SHA256_ASSET).bufferedReader().use { it.readText().trim() }
         require(SHA256.matches(expected)) { "래퍼 template SHA-256 asset이 올바르지 않습니다." }
@@ -707,6 +954,57 @@ class OnDeviceWrapperPackager(context: Context) {
         }
         digest.digest().joinToString("") { "%02x".format(it) }
     }
+
+    private suspend fun <T> withIdentityMutationLock(
+        identitySha256: String,
+        block: suspend () -> T,
+    ): T {
+        require(SHA256.matches(identitySha256)) {
+            "identity SHA-256이 올바르지 않습니다."
+        }
+        val key = "${workingDirectory.path}:$identitySha256"
+        return IDENTITY_MUTEXES.computeIfAbsent(key) { Mutex() }.withLock {
+            workingDirectory.verifyUnchanged()
+            val lockPath = workingDirectory.path.resolve(".identity-lock.$identitySha256.lck")
+            require(
+                !Files.exists(lockPath, NOFOLLOW_LINKS) ||
+                    (
+                        Files.isRegularFile(lockPath, NOFOLLOW_LINKS) &&
+                            !Files.isSymbolicLink(lockPath) &&
+                            unixLinkCount(lockPath) == 1
+                        ),
+            ) {
+                "identity mutation lock 파일이 올바르지 않습니다."
+            }
+            FileChannel.open(lockPath, CREATE, WRITE, NOFOLLOW_LINKS).use { channel ->
+                val attributes = Files.readAttributes(
+                    lockPath,
+                    BasicFileAttributes::class.java,
+                    NOFOLLOW_LINKS,
+                )
+                require(
+                    attributes.isRegularFile &&
+                        !attributes.isSymbolicLink &&
+                        unixLinkCount(lockPath) == 1,
+                ) {
+                    "identity mutation lock 파일이 단일 regular file이 아닙니다."
+                }
+                channel.lock().use {
+                    block()
+                }
+            }
+        }
+    }
+
+    internal suspend fun <T> withIdentityMutationLockForTest(
+        identitySha256: String,
+        block: suspend () -> T,
+    ): T = withIdentityMutationLock(identitySha256, block)
+
+    internal suspend fun <T> withIdentityMutationLockForLedger(
+        identitySha256: String,
+        block: suspend () -> T,
+    ): T = withIdentityMutationLock(identitySha256, block)
 
     private fun forceFile(file: Path) {
         FileChannel.open(file, WRITE).use { it.force(true) }
@@ -749,6 +1047,7 @@ class OnDeviceWrapperPackager(context: Context) {
     }
 
     private companion object {
+        val IDENTITY_MUTEXES = ConcurrentHashMap<String, Mutex>()
         const val WORKING_DIRECTORY = "ondevice-packager-gate"
         const val TEMPORARY_DIRECTORY = "tmp"
         const val TEMPLATE_ASSET = "wrapper-template.apk"
@@ -925,6 +1224,9 @@ private const val ON_DEVICE_MAX_CRX_BYTES = ON_DEVICE_MAX_SOURCE_BYTES + 1024L *
 private const val STREAM_BUFFER_SIZE = 64 * 1024
 
 internal data class OnDevicePackagerTestHooks(
+    val afterUnreservedIdentityCreated: (() -> Unit)? = null,
     val afterRequestValidated: (() -> Unit)? = null,
     val beforeFinalPublish: (() -> Unit)? = null,
+    val afterFinalPublish: (() -> Unit)? = null,
+    val beforePublishedCleanupMove: ((File) -> Unit)? = null,
 )

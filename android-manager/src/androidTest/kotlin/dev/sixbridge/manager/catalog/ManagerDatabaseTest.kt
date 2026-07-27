@@ -17,8 +17,8 @@ import dev.sixbridge.manager.conversion.ConversionWorkStore
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
-import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import dev.sixbridge.manager.conversion.encodeCleanupTokens
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import java.io.File
 import java.security.MessageDigest
 import java.util.Collections
@@ -416,16 +416,9 @@ class ManagerDatabaseTest {
 
     @Test
     fun conversion_identity_claim_rejects_old_version_and_forged_owner() = runBlocking {
-        val owners = ArrayDeque(
-            listOf(
-                java.util.UUID.fromString("00000000-0000-4000-8000-000000000001"),
-                java.util.UUID.fromString("00000000-0000-4000-8000-000000000002"),
-            ),
-        )
-        val ledger = ConversionIdentityLedger(
-            dao = database.conversionIdentityDao(),
-            ownerTokenFactory = { owners.removeFirst() },
-        )
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val firstOwner = "00000000-0000-4000-8000-000000000001"
+        val secondOwner = "00000000-0000-4000-8000-000000000002"
         val key = InstallationIdentityKey.create(
             LogicalSourceIdentity.storeExtensionId("a".repeat(32)),
             30,
@@ -444,25 +437,49 @@ class ManagerDatabaseTest {
             installedVersionCode = null,
         )
 
-        val first = ledger.reserve(request)
-        val firstClaim = ledger.claimForPackaging(first)
-        ledger.finishPackaging(firstClaim, succeeded = true)
-        val second = ledger.reserve(request)
+        val dao = database.conversionIdentityDao()
+        val first = ledger.reserve(request, firstOwner)
+        assertTrue(ledger.abortReservationByOwnerToken(firstOwner))
+        val second = ledger.reserve(request, secondOwner)
+        val stored = requireNotNull(dao.get(key.identitySha256))
 
-        assertTrue(runCatching { ledger.claimForPackaging(first) }.isFailure)
-        val forged = ReservedConversionIdentity(
-            identityKey = second.identityKey,
-            extensionId = second.extensionId,
-            packageName = second.packageName,
-            wrapperSignerSha256 = second.wrapperSignerSha256,
-            crxKeyAlias = second.crxKeyAlias,
-            crxPublicKeySha256 = second.crxPublicKeySha256,
-            versionCode = second.versionCode,
-            ownerToken = "00000000-0000-4000-8000-000000000099",
+        assertTrue(
+            runCatching {
+                dao.claimForPackaging(
+                    requested = stored,
+                    versionCode = first.versionCode,
+                    ownerToken = firstOwner,
+                    crxPublicKeySha256 = null,
+                    packagingState = "PACKAGING:11111111-1111-4111-8111-111111111111",
+                )
+            }.isFailure,
         )
-        assertTrue(runCatching { ledger.claimForPackaging(forged) }.isFailure)
-        val secondClaim = ledger.claimForPackaging(second)
-        ledger.finishPackaging(secondClaim, succeeded = true)
+        assertTrue(
+            runCatching {
+                dao.claimForPackaging(
+                    requested = stored,
+                    versionCode = second.versionCode,
+                    ownerToken = firstOwner,
+                    crxPublicKeySha256 = null,
+                    packagingState = "PACKAGING:22222222-2222-4222-8222-222222222222",
+                )
+            }.isFailure,
+        )
+        assertTrue(
+            runCatching {
+                ledger.recoverNonPublishedByOwnerTokenForTests(
+                    "00000000-0000-4000-8000-000000000099",
+                )
+            }.isFailure,
+        )
+        dao.claimForPackaging(
+            requested = stored,
+            versionCode = second.versionCode,
+            ownerToken = secondOwner,
+            crxPublicKeySha256 = null,
+            packagingState = "PACKAGING:33333333-3333-4333-8333-333333333333",
+        )
+        assertTrue(ledger.abortReservationByOwnerToken(secondOwner))
     }
 
     @Test
@@ -907,6 +924,9 @@ class ManagerDatabaseTest {
                         input.readBytes()
                         true
                     },
+                    identityOwnerLifecycle =
+                        ConversionIdentityLedger(migratedDatabase.conversionIdentityDao())
+                            .ownerLifecycle(OnDeviceWrapperPackager(context)),
                     clock = { now },
                 ).restore()
 

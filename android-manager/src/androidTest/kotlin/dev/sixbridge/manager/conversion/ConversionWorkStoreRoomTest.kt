@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.sixbridge.manager.catalog.ManagerDatabase
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
@@ -136,6 +137,69 @@ class ConversionWorkStoreRoomTest {
         assertEquals(listOf(second.token), workRoot.listFiles().orEmpty().map(File::getName))
     }
 
+    @Test
+    fun room_cross_instance_expiry_invalid_and_discard_races_preserve_replacement_owner() =
+        runBlocking {
+            var active = store(
+                token = "00000000-0000-0000-0000-000000000021",
+                file = "00000000-0000-0000-0000-000000000031",
+            ).create(artifact("expiry-old".encodeToByteArray()))
+            database.openHelper.writableDatabase.execSQL(
+                "UPDATE conversion_job SET updatedAtEpochMillis = 1 WHERE singletonId = 1",
+            )
+            val expiryReplacement = store(
+                token = "00000000-0000-0000-0000-000000000022",
+                file = "00000000-0000-0000-0000-000000000032",
+            )
+            coroutineScope {
+                listOf(
+                    async(Dispatchers.Default) { store(active.token, UUID.randomUUID().toString()).restore() },
+                    async(Dispatchers.Default) {
+                        expiryReplacement.create(artifact("expiry-new".encodeToByteArray()))
+                    },
+                ).awaitAll()
+            }
+            active = requireNotNull(expiryReplacement.restore())
+            assertEquals("00000000-0000-0000-0000-000000000022", active.token)
+
+            database.openHelper.writableDatabase.execSQL(
+                "UPDATE conversion_job SET stage = 'BROKEN' WHERE singletonId = 1",
+            )
+            val invalidReplacement = store(
+                token = "00000000-0000-0000-0000-000000000023",
+                file = "00000000-0000-0000-0000-000000000033",
+            )
+            coroutineScope {
+                listOf(
+                    async(Dispatchers.Default) { expiryReplacement.restore() },
+                    async(Dispatchers.Default) {
+                        invalidReplacement.create(artifact("invalid-new".encodeToByteArray()))
+                    },
+                ).awaitAll()
+            }
+            active = requireNotNull(invalidReplacement.restore())
+            assertEquals("00000000-0000-0000-0000-000000000023", active.token)
+
+            val discardReplacement = store(
+                token = "00000000-0000-0000-0000-000000000024",
+                file = "00000000-0000-0000-0000-000000000034",
+            )
+            coroutineScope {
+                listOf(
+                    async(Dispatchers.Default) { invalidReplacement.discard(active.token) },
+                    async(Dispatchers.Default) {
+                        discardReplacement.create(artifact("discard-new".encodeToByteArray()))
+                    },
+                ).awaitAll()
+            }
+            active = requireNotNull(discardReplacement.restore())
+            assertEquals("00000000-0000-0000-0000-000000000024", active.token)
+            assertEquals(
+                listOf(active.token),
+                workRoot.listFiles().orEmpty().filter(File::isDirectory).map(File::getName),
+            )
+        }
+
     private fun store(
         token: String,
         file: String,
@@ -143,6 +207,9 @@ class ConversionWorkStoreRoomTest {
         privateRoot = workRoot,
         dao = database.conversionJobDao(),
         bundleVerifier = ConversionBundleVerifier { true },
+        identityOwnerLifecycle =
+            ConversionIdentityLedger(database.conversionIdentityDao())
+                .ownerLifecycle(OnDeviceWrapperPackager(ApplicationProvider.getApplicationContext())),
         clock = { 1_800_000_000_000L },
         tokenFactory = { token },
         fileNameFactory = { file },

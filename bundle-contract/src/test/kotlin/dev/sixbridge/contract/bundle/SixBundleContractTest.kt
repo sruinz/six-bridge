@@ -35,6 +35,49 @@ class SixBundleContractTest {
             val wrapper = requireNotNull(zip.getEntry(SixBundleContract.WRAPPER_ENTRY))
             assertEquals(ZipEntry.STORED, wrapper.method)
             assertEquals(wrapper.size, wrapper.compressedSize)
+            val extension = requireNotNull(zip.getEntry(SixBundleContract.EXTENSION_ENTRY))
+            assertEquals(ZipEntry.STORED, extension.method)
+            assertEquals(extension.size, extension.compressedSize)
+            val compatibility = requireNotNull(zip.getEntry(SixBundleContract.COMPATIBILITY_ENTRY))
+            assertEquals(ZipEntry.STORED, compatibility.method)
+            assertEquals(compatibility.size, compatibility.compressedSize)
+        }
+    }
+
+    @Test
+    fun `byte array writer round trips highly compressible near-limit metadata as stored`() {
+        val contents = nearLimitMetadataContents()
+        val output = ByteArrayOutputStream()
+
+        SixBundleContract.write(output, contents)
+        val read = SixBundleContract.read(ByteArrayInputStream(output.toByteArray()))
+
+        assertEquals(contents.extension, read.extension)
+        assertEquals(contents.compatibility, read.compatibility)
+        assertAllEntriesStored(output.toByteArray())
+    }
+
+    @Test
+    fun `path writer round trips highly compressible near-limit metadata as stored`() {
+        val contents = nearLimitMetadataContents()
+        val wrapper = Files.createTempFile("six-bundle-near-limit", ".apk")
+        val output = ByteArrayOutputStream()
+        try {
+            Files.write(wrapper, contents.wrapperApk)
+
+            SixBundleContract.write(
+                output,
+                wrapper,
+                contents.extension,
+                contents.compatibility,
+            )
+            val read = SixBundleContract.read(ByteArrayInputStream(output.toByteArray()))
+
+            assertEquals(contents.extension, read.extension)
+            assertEquals(contents.compatibility, read.compatibility)
+            assertAllEntriesStored(output.toByteArray())
+        } finally {
+            Files.deleteIfExists(wrapper)
         }
     }
 
@@ -351,6 +394,37 @@ class SixBundleContractTest {
                 browserProfileSha256 = "d".repeat(64),
             ),
         )
+    }
+
+    private fun nearLimitMetadataContents(): ContractBundleContents {
+        val contents = validContents()
+        return contents.copy(
+            extension = contents.extension.copy(name = "E".repeat(900_000)),
+            compatibility = contents.compatibility.copy(
+                extensionName = null,
+                issues = listOf(
+                    ContractIssue(
+                        code = "near-limit",
+                        message = "R".repeat(900_000),
+                        blocking = false,
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private fun assertAllEntriesStored(archive: ByteArray) {
+        ZipFile(writeTempBundle(archive).toFile()).use { zip ->
+            listOf(
+                SixBundleContract.WRAPPER_ENTRY,
+                SixBundleContract.EXTENSION_ENTRY,
+                SixBundleContract.COMPATIBILITY_ENTRY,
+            ).forEach { name ->
+                val entry = requireNotNull(zip.getEntry(name))
+                assertEquals(ZipEntry.STORED, entry.method, name)
+                assertEquals(entry.size, entry.compressedSize, name)
+            }
+        }
     }
 
     private fun encoded(contents: ContractBundleContents): ByteArray {

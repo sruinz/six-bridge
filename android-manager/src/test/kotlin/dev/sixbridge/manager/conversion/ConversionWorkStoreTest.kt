@@ -31,6 +31,7 @@ class ConversionWorkStoreTest {
     private lateinit var root: File
     private lateinit var sourceRoot: File
     private lateinit var dao: FakeConversionJobDao
+    private lateinit var identityDao: FakeOwnerIdentityDao
     private var now = 1_800_000_000_000L
     private var tokenSequence = 0
     private var fileSequence = 0
@@ -40,6 +41,7 @@ class ConversionWorkStoreTest {
         root = createTempDirectory("conversion-work-store").toFile()
         sourceRoot = createTempDirectory("conversion-input-source").toFile()
         dao = FakeConversionJobDao()
+        identityDao = FakeOwnerIdentityDao(dao)
     }
 
     @After
@@ -259,6 +261,35 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `create handoff는 이전 identity owner를 abort한 뒤 token directory를 지운다`() =
+        runTest {
+            val first = store().create(artifact("first".encodeToByteArray()))
+            identityDao.addReserved(first.token)
+
+            store().create(artifact("second".encodeToByteArray()))
+
+            assertEquals(listOf("abort:${first.token}"), identityDao.events)
+            assertFalse(File(root, first.token).exists())
+        }
+
+    @Test
+    fun `identity abort 실패는 cleanup token과 directory를 보존한다`() = runTest {
+        val first = store().create(artifact("first".encodeToByteArray()))
+        identityDao.addReserved(first.token)
+        identityDao.failDeleteOwner = first.token
+
+        assertFailsWith<IllegalStateException> {
+            store().create(artifact("second".encodeToByteArray()))
+        }
+
+        val row = requireNotNull(dao.get())
+        assertTrue(
+            requireNotNull(decodeCleanupTokens(row.cleanupTokensJson)).contains(first.token),
+        )
+        assertTrue(File(root, first.token).isDirectory)
+    }
+
+    @Test
     fun `비정상 active token도 cleanup owner 삭제 실패 전에는 DB 행을 유지한다`() = runTest {
         val created = store().create(artifact("owned secret".encodeToByteArray()))
         val ownedDirectory = File(root, created.token)
@@ -274,12 +305,63 @@ class ConversionWorkStoreTest {
         )
 
         assertNull(failing.restore())
-        assertEquals(corrupted, dao.get())
+        val discarding = requireNotNull(dao.get())
+        assertEquals(corrupted.copy(
+            generation = corrupted.generation + 1,
+            stage = ConversionJobStage.DISCARDING.name,
+        ), discarding)
         assertTrue(ownedDirectory.isDirectory)
 
         assertNull(store().restore())
         assertNull(dao.get())
         assertFalse(ownedDirectory.exists())
+    }
+
+    @Test
+    fun `DISCARDING claim 뒤 사망하면 외부 cleanup 전 상태를 남기고 restore가 재개한다`() =
+        runTest {
+            val created = store().create(artifact("discard-owned".encodeToByteArray()))
+            identityDao.addReserved(created.token)
+            val interrupted = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterDiscardClaim = { error("simulated process death") },
+                ),
+            )
+
+            assertFailsWith<IllegalStateException> {
+                interrupted.discard(created.token)
+            }
+
+            val claimed = requireNotNull(dao.get())
+            assertEquals(ConversionJobStage.DISCARDING.name, claimed.stage)
+            assertTrue(File(root, created.token).isDirectory)
+            assertTrue(identityDao.events.isEmpty())
+
+            assertNull(store().restore())
+            assertNull(dao.get())
+            assertFalse(File(root, created.token).exists())
+            assertEquals(listOf("abort:${created.token}"), identityDao.events)
+        }
+
+    @Test
+    fun `DISCARDING claim은 stale BUILDING bundle publish를 차단한다`() = runTest {
+        val buildStore = readyToBuildStore()
+        val token = requireNotNull(dao.get()).token
+        val interrupted = store(
+            hooks = ConversionWorkStoreHooks(
+                afterDiscardClaim = { error("simulated process death") },
+            ),
+        )
+        assertFailsWith<IllegalStateException> {
+            interrupted.discard(token)
+        }
+        val bundle = File(sourceRoot, "stale.six").apply { writeText("verified bundle stale") }
+
+        assertFailsWith<IllegalStateException> {
+            buildStore.markBundleReady(token, bundle, sha256(bundle.readBytes()))
+        }
+        assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
+        assertNull(dao.get()?.bundleFileName)
     }
 
     @Test
@@ -525,6 +607,24 @@ class ConversionWorkStoreTest {
     }
 
     @Test
+    fun `identity lease finalize는 durable BUNDLE_READY 뒤에만 호출한다`() = runTest {
+        val store = store()
+        val created = store.create(artifact("input".encodeToByteArray()))
+        identityDao.addPackaged(created.token)
+        store.markAwaitingApproval(created.token, PROFILE_SHA)
+        store.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        assertTrue(identityDao.events.isEmpty())
+        val bundle = File(sourceRoot, "owned-ready.six").apply {
+            writeText("verified bundle identity lifecycle")
+        }
+        val expected = sha256(bundle.readBytes())
+
+        store.markBundleReady(created.token, bundle, expected)
+
+        assertEquals(listOf("finalize:${created.token}:$expected"), identityDao.events)
+    }
+
+    @Test
     fun `verified bundle open은 DB hash에 묶인 bytes를 반환한다`() = runTest {
         val bundle = File(sourceRoot, "bundle.six").apply { writeText("verified bundle") }
         val expected = bundle.readBytes()
@@ -682,6 +782,7 @@ class ConversionWorkStoreTest {
         assertNull(inputStore.restore())
 
         dao = FakeConversionJobDao()
+        identityDao = FakeOwnerIdentityDao(dao)
         root.deleteRecursively()
         assertTrue(root.mkdirs())
         val bundleStore = readyToBuildStore()
@@ -762,6 +863,8 @@ class ConversionWorkStoreTest {
         privateRoot = root,
         dao = dao,
         bundleVerifier = bundleVerifier,
+        identityOwnerLifecycle =
+            ConversionIdentityLedger(identityDao).ownerLifecycleForReservationTests(),
         clock = { now },
         tokenFactory = {
             tokenSequence += 1
@@ -834,6 +937,108 @@ class ConversionWorkStoreTest {
 
     private fun privateBundle(row: ConversionJobEntity): File =
         File(File(root, row.token), requireNotNull(row.bundleFileName))
+
+    private class FakeOwnerIdentityDao(
+        private val jobDao: ConversionJobDao,
+    ) : ConversionIdentityDao {
+        private val identities = linkedMapOf<String, ConversionIdentityEntity>()
+        private val leases = linkedMapOf<String, ConversionIdentityLeaseEntity>()
+        val events = mutableListOf<String>()
+        var failDeleteOwner: String? = null
+
+        fun addReserved(ownerToken: String) =
+            addLease(ownerToken, ConversionIdentityLeaseState.RESERVED.name)
+
+        fun addPackaged(ownerToken: String) = addLease(
+            ownerToken,
+            "PACKAGED:11111111-1111-4111-8111-111111111111:" +
+                "${"c".repeat(64)}:777261707065722e61706b",
+        )
+
+        private fun addLease(ownerToken: String, state: String) {
+            val identitySha256 = MessageDigest.getInstance("SHA-256")
+                .digest(ownerToken.encodeToByteArray())
+                .joinToString("") { "%02x".format(it) }
+            leases[identitySha256] = ConversionIdentityLeaseEntity(
+                identitySha256 = identitySha256,
+                crxKeyAlias = null,
+                ownerToken = ownerToken,
+                state = state,
+                createdAtEpochMillis = 1,
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "b".repeat(64),
+                crxPublicKeySha256 = null,
+                reservedVersionCode = 1,
+            )
+        }
+
+        override suspend fun get(identitySha256: String) = identities[identitySha256]
+        override suspend fun findByExtensionId(extensionId: String) =
+            identities.values.firstOrNull { it.extensionId == extensionId }
+        override suspend fun findByPackageName(packageName: String) =
+            identities.values.firstOrNull { it.packageName == packageName }
+        override suspend fun findByCrxKeyAlias(crxKeyAlias: String) =
+            identities.values.firstOrNull { it.crxKeyAlias == crxKeyAlias }
+        override suspend fun insert(entity: ConversionIdentityEntity) {
+            identities[entity.identitySha256] = entity
+        }
+        override suspend fun update(entity: ConversionIdentityEntity) {
+            identities[entity.identitySha256] = entity
+        }
+        override suspend fun getLease(identitySha256: String) = leases[identitySha256]
+        override suspend fun getLeaseByOwnerToken(ownerToken: String) =
+            leases.values.singleOrNull { it.ownerToken == ownerToken }
+        override suspend fun getJobForIdentityFinalization() = jobDao.get()
+        override suspend fun insertLease(entity: ConversionIdentityLeaseEntity) {
+            leases[entity.identitySha256] = entity
+        }
+        override suspend fun markLeaseReady(
+            identitySha256: String,
+            ownerToken: String,
+            extensionId: String,
+            packageName: String,
+            wrapperSignerSha256: String,
+            crxPublicKeySha256: String,
+        ): Int = 0
+        override suspend fun transitionLease(
+            identitySha256: String,
+            ownerToken: String,
+            expectedState: String,
+            nextState: String,
+        ): Int {
+            val current = leases[identitySha256]
+            if (current?.ownerToken != ownerToken || current.state != expectedState) return 0
+            leases[identitySha256] = current.copy(state = nextState)
+            return 1
+        }
+        override suspend fun consumeReadyLease(
+            identitySha256: String,
+            readyOwnerToken: String,
+            reservationOwnerToken: String,
+            reservedVersionCode: Int,
+        ): Int = 0
+        override suspend fun deleteLease(
+            identitySha256: String,
+            ownerToken: String,
+            state: String,
+        ): Int {
+            if (failDeleteOwner == ownerToken) error("abort failure")
+            val current = leases[identitySha256]
+            if (current?.ownerToken != ownerToken || current.state != state) return 0
+            leases.remove(identitySha256)
+            events += if (state.startsWith("PACKAGED:")) {
+                "finalize:$ownerToken:${jobDao.get()?.bundleSha256}"
+            } else {
+                "abort:$ownerToken"
+            }
+            return 1
+        }
+        override suspend fun listByModeAndProfile(
+            mode: String,
+            profileMajorVersion: Int,
+        ): List<ConversionIdentityEntity> = emptyList()
+    }
 
     private class FakeConversionJobDao : ConversionJobDao() {
         private var row: ConversionJobEntity? = null

@@ -13,6 +13,7 @@ enum class ConversionJobStage {
     AWAITING_APPROVAL,
     BUILDING,
     BUNDLE_READY,
+    DISCARDING,
 }
 
 @Entity(tableName = "conversion_job")

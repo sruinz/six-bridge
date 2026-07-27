@@ -8,17 +8,22 @@ import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractSourceEvidence
+import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.manager.catalog.ManagerDatabase
+import dev.sixbridge.manager.conversion.ConversionBundleVerifier
+import dev.sixbridge.manager.conversion.ConversionIdentityDao
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
 import dev.sixbridge.manager.conversion.ConversionIdentityReservation
 import dev.sixbridge.manager.conversion.ConversionPackageBinding
+import dev.sixbridge.manager.conversion.ConversionWorkStore
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
-import dev.sixbridge.manager.conversion.PackagingConversionIdentity
+import dev.sixbridge.manager.conversion.OnDeviceInputArtifact
+import dev.sixbridge.manager.conversion.OnDeviceInputKind
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -31,8 +36,15 @@ import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.Signature
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -199,6 +211,233 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
+    fun packagingErrorRestoresExactClaimToReserved() {
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterRequestValidated = {
+                    throw AssertionError("test package Error")
+                },
+            ),
+        )
+        val claimed = request(
+            packager,
+            canonicalSourceZip(),
+            43,
+            File(root, "error-failure.apk"),
+        )
+        try {
+            assertThrows(AssertionError::class.java) {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+            }
+            assertEquals(
+                "RESERVED",
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state,
+            )
+            assertTrue(
+                runBlocking {
+                    claimed.ledger.recoverByOwnerToken(
+                        claimed.ownerToken,
+                        OnDeviceWrapperPackager(context),
+                    )
+                } is ConversionIdentityLedger.Reservation,
+            )
+        } finally {
+            claimed.database.close()
+        }
+    }
+
+    @Test
+    fun packagingCancellationRestoresExactClaimToReserved() {
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterRequestValidated = {
+                    throw CancellationException("test package cancellation")
+                },
+            ),
+        )
+        val claimed = request(
+            packager,
+            canonicalSourceZip(),
+            44,
+            File(root, "cancellation-failure.apk"),
+        )
+        try {
+            assertThrows(CancellationException::class.java) {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+            }
+            assertEquals(
+                "RESERVED",
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state,
+            )
+        } finally {
+            claimed.database.close()
+        }
+    }
+
+    @Test
+    fun packagingFinishFailureCleansPublishedOutputAndLeavesOwnerRecoverable() {
+        val output = File(root, "finish-failure.apk")
+        val packager = OnDeviceWrapperPackager(context)
+        val claimed = request(
+            packager = packager,
+            source = canonicalSourceZip(),
+            versionCode = 42,
+            output = output,
+            failPackagingFinish = true,
+        )
+        try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+            }
+
+            assertFalse(output.exists())
+            val lease = runBlocking {
+                claimed.database.conversionIdentityDao()
+                    .getLease(claimed.request.reservation.identitySha256)
+            }
+            assertTrue(requireNotNull(lease).state.startsWith("PUBLISHING:"))
+            val recovered = runBlocking {
+                ConversionIdentityLedger(claimed.database.conversionIdentityDao())
+                    .recoverByOwnerToken(claimed.ownerToken, OnDeviceWrapperPackager(context))
+            }
+            assertTrue(recovered is ConversionIdentityLedger.Reservation)
+            assertEquals(
+                "RESERVED",
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state,
+            )
+        } finally {
+            claimed.database.close()
+        }
+    }
+
+    @Test
+    fun publishingLeaseRecoversOutputAfterProcessDeathWindow() {
+        val output = File(root, "publishing-recovery.apk")
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterFinalPublish = { error("simulated process death after publish") },
+            ),
+        )
+        val claimed = request(
+            packager = packager,
+            source = canonicalSourceZip(),
+            versionCode = 46,
+            output = output,
+        )
+        try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+            }
+            assertTrue(output.isFile)
+            assertTrue(
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state?.startsWith("PUBLISHING:") == true,
+            )
+
+            val restartedPackager = OnDeviceWrapperPackager(context)
+            val recovered = runBlocking {
+                ConversionIdentityLedger(claimed.database.conversionIdentityDao())
+                    .recoverByOwnerToken(claimed.ownerToken, restartedPackager)
+            }
+            assertTrue(recovered is ConversionIdentityLedger.PackagedRecovery)
+            assertTrue(
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state?.startsWith("PACKAGED:") == true,
+            )
+            assertTrue(
+                runBlocking {
+                    ConversionIdentityLedger(claimed.database.conversionIdentityDao())
+                        .abortByOwnerToken(claimed.ownerToken, restartedPackager)
+                },
+            )
+            assertFalse(output.exists())
+        } finally {
+            output.delete()
+            claimed.database.close()
+        }
+    }
+
+    @Test
+    fun staleFinishCleanupDoesNotDeleteSameHashReplacement() {
+        val output = File(root, "finish-replaced.apk")
+        var replacementInstalled = false
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                beforePublishedCleanupMove = { published ->
+                    val replacement = File(root, ".same-hash-replacement.apk")
+                    published.copyTo(replacement, overwrite = true)
+                    Files.move(
+                        replacement.toPath(),
+                        published.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                    replacementInstalled = true
+                },
+            ),
+        )
+        val claimed = request(
+            packager = packager,
+            source = canonicalSourceZip(),
+            versionCode = 45,
+            output = output,
+            failPackagingFinish = true,
+        )
+        try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+            }
+
+            assertTrue(replacementInstalled)
+            assertTrue(output.isFile)
+            assertTrue(
+                runBlocking {
+                    claimed.database.conversionIdentityDao()
+                        .getLease(claimed.request.reservation.identitySha256)
+                }?.state?.startsWith("PUBLISHING:") == true,
+            )
+            val recovered = runBlocking {
+                claimed.ledger.recoverByOwnerToken(
+                    claimed.ownerToken,
+                    OnDeviceWrapperPackager(context),
+                )
+            }
+            assertTrue(recovered is ConversionIdentityLedger.PackagedRecovery)
+            assertTrue(output.isFile)
+        } finally {
+            output.delete()
+            claimed.database.close()
+        }
+    }
+
+    @Test
     fun passthroughPreservesOriginalCrxIdentityBytesAndDoesNotCreateCrxKey() {
         val originalCrx = externalSignedCrx(canonicalSourceZip())
         val proof = Crx3Verifier.verify(originalCrx)
@@ -259,17 +498,22 @@ class OnDevicePackagerGateInstrumentedTest {
             .build()
         val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
         val packager = OnDeviceWrapperPackager(context)
-        val lease = runBlocking { ledger.resolveUnreservedIdentity(identityKey, packager) }
+        val source = canonicalSourceZip()
+        val workScope = "unreserved-${UUID.randomUUID()}"
+        val job = runBlocking { conversionJob(database, source, workScope) }
+        val jobToken = job.token
+        val lease = runBlocking {
+            ledger.resolveUnreservedIdentity(identityKey, jobToken, packager)
+        }
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val alias = requireNotNull(lease.identity.crxKeyAlias)
         assertTrue(keyStore.containsAlias(alias))
 
         val restartedPackager = OnDeviceWrapperPackager(context)
         val recovered = runBlocking {
-            ledger.resolveUnreservedIdentity(identityKey, restartedPackager)
+            ledger.resolveUnreservedIdentity(identityKey, jobToken, restartedPackager)
         }
         assertEquals(lease.identitySha256, recovered.identitySha256)
-        val source = canonicalSourceZip()
         val reserved = runBlocking {
             ledger.reserve(
                 ConversionIdentityReservation(
@@ -278,37 +522,151 @@ class OnDevicePackagerGateInstrumentedTest {
                     packageBinding = binding(recovered.identity),
                     installedVersionCode = null,
                 ),
-                recovered,
+                ownerToken = jobToken,
+                unreservedLease = recovered,
             )
         }
-        val capability = runBlocking { ledger.claimForPackaging(reserved) }
-        var succeeded = false
-        try {
+        runBlocking {
             restartedPackager.packageWrapper(
-            OnDeviceWrapperRequest(
-                reservation = capability,
-                canonicalSourceZip = source,
-                passthroughCrx = null,
-                descriptorName = "SIX Bridge On-Device Gate",
-                descriptorVersion = "1.0",
-                sourceKind = "ZIP",
-                compatibility = compatibility(
-                    extensionId = recovered.identity.extensionId,
-                    sourceSha256 = sha256(source),
-                    conversionState = "converted",
-                    originalExtensionId = ORIGINAL_EXTENSION_ID,
+                ledger,
+                OnDeviceWrapperRequest(
+                    reservation = reserved,
+                    canonicalSourceZip = source,
+                    passthroughCrx = null,
+                    descriptorName = "SIX Bridge On-Device Gate",
+                    descriptorVersion = "1.0",
+                    sourceKind = "ZIP",
+                    compatibility = compatibility(
+                        extensionId = recovered.identity.extensionId,
+                        sourceSha256 = sha256(source),
+                        conversionState = "converted",
+                        originalExtensionId = ORIGINAL_EXTENSION_ID,
+                    ),
+                    outputApk = File(root, "lease-reserved.apk"),
                 ),
-                outputApk = File(root, "lease-reserved.apk"),
-            ),
-            ).also { succeeded = true }
-        } finally {
-            runBlocking { ledger.finishPackaging(capability, succeeded) }
+            )
         }
         assertTrue(keyStore.containsAlias(alias))
         assertThrows(IllegalArgumentException::class.java) {
-            runBlocking { ledger.resolveUnreservedIdentity(identityKey, restartedPackager) }
+            runBlocking {
+                ledger.resolveUnreservedIdentity(identityKey, jobToken, restartedPackager)
+            }
         }
         database.close()
+    }
+
+    @Test
+    fun unreservedAbortUsesDurableJobOwnerAndDeletesOnlyOwnedKeystoreIdentity() {
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(
+                UUID.randomUUID().toString().replace("-", ""),
+            ),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
+        val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val source = canonicalSourceZip()
+            val jobToken = runBlocking {
+                conversionJob(
+                    database,
+                    source,
+                    "abort-${UUID.randomUUID()}",
+                ).token
+            }
+            val firstLedger = ConversionIdentityLedger(database.conversionIdentityDao())
+            val firstPackager = OnDeviceWrapperPackager(context)
+            val lease = runBlocking {
+                firstLedger.resolveUnreservedIdentity(identityKey, jobToken, firstPackager)
+            }
+            val alias = requireNotNull(lease.identity.crxKeyAlias)
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            assertTrue(keyStore.containsAlias(alias))
+
+            val restartedLedger = ConversionIdentityLedger(database.conversionIdentityDao())
+            assertTrue(
+                runBlocking {
+                    restartedLedger.abortByOwnerToken(
+                        jobToken,
+                        OnDeviceWrapperPackager(context),
+                    )
+                },
+            )
+
+            assertFalse(keyStore.containsAlias(alias))
+            assertNull(
+                runBlocking {
+                    database.conversionIdentityDao().getLease(identityKey.identitySha256)
+                },
+            )
+            assertFalse(
+                runBlocking {
+                    restartedLedger.abortByOwnerToken(
+                        jobToken,
+                        OnDeviceWrapperPackager(context),
+                    )
+                },
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
+    fun unreservedResolveAndAbortSerializeKeyCreationWithIdentityFileLock() = runBlocking {
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(
+                UUID.randomUUID().toString().replace("-", ""),
+            ),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
+        val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val jobToken = conversionJob(
+                database,
+                canonicalSourceZip(),
+                "identity-lock-${UUID.randomUUID()}",
+            ).token
+            val keyCreated = CountDownLatch(1)
+            val releaseResolve = CountDownLatch(1)
+            val firstPackager = OnDeviceWrapperPackager(
+                context,
+                OnDevicePackagerTestHooks(
+                    afterUnreservedIdentityCreated = {
+                        keyCreated.countDown()
+                        check(releaseResolve.await(5, TimeUnit.SECONDS))
+                    },
+                ),
+            )
+            val resolving = async(Dispatchers.Default) {
+                ConversionIdentityLedger(database.conversionIdentityDao())
+                    .resolveUnreservedIdentity(identityKey, jobToken, firstPackager)
+            }
+            assertTrue(keyCreated.await(5, TimeUnit.SECONDS))
+            val aborting = async(Dispatchers.Default) {
+                ConversionIdentityLedger(database.conversionIdentityDao())
+                    .abortByOwnerToken(jobToken, OnDeviceWrapperPackager(context))
+            }
+            delay(100)
+            assertFalse(aborting.isCompleted)
+            releaseResolve.countDown()
+            val lease = resolving.await()
+            assertTrue(aborting.await())
+
+            val alias = requireNotNull(lease.identity.crxKeyAlias)
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            assertFalse(keyStore.containsAlias(alias))
+            assertNull(
+                database.conversionIdentityDao().getLease(identityKey.identitySha256),
+            )
+        } finally {
+            database.close()
+        }
     }
 
     @Test
@@ -327,8 +685,15 @@ class OnDevicePackagerGateInstrumentedTest {
                 .build()
             val firstLedger = ConversionIdentityLedger(database.conversionIdentityDao())
             val firstPackager = OnDeviceWrapperPackager(context)
+            val jobToken = runBlocking {
+                conversionJob(
+                    database,
+                    canonicalSourceZip(),
+                    "cleanup-$iteration-${UUID.randomUUID()}",
+                ).token
+            }
             val lease = runBlocking {
-                firstLedger.resolveUnreservedIdentity(identityKey, firstPackager)
+                firstLedger.resolveUnreservedIdentity(identityKey, jobToken, firstPackager)
             }
             val alias = requireNotNull(lease.identity.crxKeyAlias)
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -354,8 +719,8 @@ class OnDevicePackagerGateInstrumentedTest {
             val restartedPackager = OnDeviceWrapperPackager(context)
             assertTrue(
                 runBlocking {
-                    restartedLedger.resumeUnreservedIdentityCleanup(
-                        identityKey,
+                    restartedLedger.abortByOwnerToken(
+                        jobToken,
                         restartedPackager,
                     )
                 },
@@ -368,6 +733,94 @@ class OnDevicePackagerGateInstrumentedTest {
             )
             database.close()
         }
+    }
+
+    @Test
+    fun cleaningPackagedLeaseRecoversBeforeAndAfterQuarantineDeletion() {
+        repeat(2) { iteration ->
+            val output = File(root, "cleaning-packaged-$iteration.apk")
+            val packager = OnDeviceWrapperPackager(context)
+            val claimed = request(
+                packager,
+                canonicalSourceZip(),
+                60 + iteration,
+                output,
+            )
+            try {
+                runBlocking {
+                    packager.packageWrapper(claimed.ledger, claimed.request)
+                }
+                val dao = claimed.database.conversionIdentityDao()
+                val packaged = runBlocking {
+                    requireNotNull(dao.getLease(claimed.request.reservation.identitySha256))
+                }
+                assertTrue(packaged.state.startsWith("PACKAGED:"))
+                val cleaning = "CLEANING_PACKAGED:${packaged.state.substringAfter(':')}"
+                assertEquals(
+                    1,
+                    runBlocking {
+                        dao.transitionLease(
+                            packaged.identitySha256,
+                            claimed.ownerToken,
+                            packaged.state,
+                            cleaning,
+                        )
+                    },
+                )
+                val claimUuid = packaged.state.split(':')[1]
+                val quarantine = File(File(root, "tmp"), ".published-cleanup.$claimUuid.apk")
+                if (iteration == 0) {
+                    assertTrue(output.delete())
+                } else {
+                    Files.move(output.toPath(), quarantine.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                }
+
+                assertTrue(
+                    runBlocking {
+                        ConversionIdentityLedger(dao).abortByOwnerToken(
+                            claimed.ownerToken,
+                            OnDeviceWrapperPackager(context),
+                        )
+                    },
+                )
+                assertNull(runBlocking { dao.getLease(packaged.identitySha256) })
+                assertFalse(output.exists())
+                assertFalse(quarantine.exists())
+            } finally {
+                output.delete()
+                claimed.database.close()
+            }
+        }
+    }
+
+    @Test
+    fun packagerInstancesSerializeSameIdentityMutationWithSharedFileLock() = runBlocking {
+        val identitySha256 = "a".repeat(64)
+        val firstPackager = OnDeviceWrapperPackager(context)
+        val secondPackager = OnDeviceWrapperPackager(context)
+        val firstEntered = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val secondEntered = CompletableDeferred<Unit>()
+
+        val first = async(Dispatchers.Default) {
+            firstPackager.withIdentityMutationLockForTest(identitySha256) {
+                firstEntered.complete(Unit)
+                releaseFirst.await()
+            }
+        }
+        firstEntered.await()
+        val second = async(Dispatchers.Default) {
+            secondPackager.withIdentityMutationLockForTest(identitySha256) {
+                secondEntered.complete(Unit)
+            }
+        }
+        delay(100)
+        assertFalse(secondEntered.isCompleted)
+        releaseFirst.complete(Unit)
+        first.await()
+        second.await()
+        assertTrue(secondEntered.isCompleted)
+        assertTrue(File(root, ".identity-lock.$identitySha256.lck").isFile)
     }
 
     @Test
@@ -501,6 +954,7 @@ class OnDevicePackagerGateInstrumentedTest {
         versionCode: Int,
         output: File,
         persistentDatabaseName: String? = null,
+        failPackagingFinish: Boolean = false,
     ): ClaimedRequest {
         val database = if (persistentDatabaseName == null) {
             Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
@@ -516,9 +970,22 @@ class OnDevicePackagerGateInstrumentedTest {
                 .allowMainThreadQueries()
                 .build()
         }
-        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val identityDao = database.conversionIdentityDao()
+        val ledger = ConversionIdentityLedger(
+            if (failPackagingFinish) {
+                FailPackagingFinishDao(identityDao)
+            } else {
+                identityDao
+            },
+        )
         return try {
             runBlocking {
+                val job = conversionJob(
+                    database = database,
+                    source = source,
+                    scope = persistentDatabaseName ?: "request-${UUID.randomUUID()}",
+                )
+                val jobToken = job.token
                 val selected = ledger.resolveSelection(
                     logicalSourceIdentity = CONVERTED_KEY.logicalSourceIdentity,
                     profileMajorVersion = CONVERTED_KEY.profileMajorVersion,
@@ -527,7 +994,7 @@ class OnDevicePackagerGateInstrumentedTest {
                 )
                 val existing = database.conversionIdentityDao().get(selected.identitySha256)
                 val lease = if (existing == null) {
-                    ledger.resolveUnreservedIdentity(selected, packager)
+                    ledger.resolveUnreservedIdentity(selected, jobToken, packager)
                 } else {
                     null
                 }
@@ -546,13 +1013,13 @@ class OnDevicePackagerGateInstrumentedTest {
                         ),
                         installedVersionCode = (versionCode - 1).toLong(),
                     ),
+                    ownerToken = jobToken,
                     unreservedLease = lease,
                 )
                 assertEquals(versionCode, reserved.versionCode)
-                val capability = ledger.claimForPackaging(reserved)
                 ClaimedRequest(
                     request = OnDeviceWrapperRequest(
-                        reservation = capability,
+                        reservation = reserved,
                         canonicalSourceZip = source,
                         passthroughCrx = null,
                         descriptorName = "SIX Bridge On-Device Gate",
@@ -567,7 +1034,8 @@ class OnDevicePackagerGateInstrumentedTest {
                         outputApk = output,
                     ),
                     ledger = ledger,
-                    capability = capability,
+                    ownerToken = jobToken,
+                    workStore = job.store,
                     database = database,
                 )
             }
@@ -590,6 +1058,13 @@ class OnDevicePackagerGateInstrumentedTest {
         val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
         return try {
             runBlocking {
+                val job = conversionJob(
+                    database = database,
+                    source = originalCrx,
+                    scope = "passthrough-${UUID.randomUUID()}",
+                    kind = OnDeviceInputKind.CRX3,
+                )
+                val jobToken = job.token
                 val selected = ledger.resolveSelection(
                     logicalSourceIdentity = identityKey.logicalSourceIdentity,
                     profileMajorVersion = identityKey.profileMajorVersion,
@@ -603,11 +1078,11 @@ class OnDevicePackagerGateInstrumentedTest {
                         packageBinding = binding(identity),
                         installedVersionCode = null,
                     ),
+                    ownerToken = jobToken,
                 )
-                val capability = ledger.claimForPackaging(reserved)
                 ClaimedRequest(
                     request = OnDeviceWrapperRequest(
-                        reservation = capability,
+                        reservation = reserved,
                         canonicalSourceZip = null,
                         passthroughCrx = originalCrx,
                         descriptorName = "SIX Bridge On-Device Gate",
@@ -617,7 +1092,8 @@ class OnDevicePackagerGateInstrumentedTest {
                         outputApk = output,
                     ),
                     ledger = ledger,
-                    capability = capability,
+                    ownerToken = jobToken,
+                    workStore = job.store,
                     database = database,
                 )
             }
@@ -625,6 +1101,47 @@ class OnDevicePackagerGateInstrumentedTest {
             database.close()
             throw error
         }
+    }
+
+    private suspend fun conversionJob(
+        database: ManagerDatabase,
+        source: ByteArray,
+        scope: String,
+        kind: OnDeviceInputKind = OnDeviceInputKind.ZIP,
+    ): ConversionJobOwner {
+        val store = ConversionWorkStore(
+            privateRoot = File(root, "conversion-work/$scope"),
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { input ->
+                input.readBytes()
+                true
+            },
+            identityOwnerLifecycle =
+                ConversionIdentityLedger(database.conversionIdentityDao())
+                    .ownerLifecycle(OnDeviceWrapperPackager(context)),
+        )
+        if (database.conversionJobDao().get() != null) {
+            return ConversionJobOwner(requireNotNull(store.restore()).token, store)
+        }
+        val artifactToken = UUID.randomUUID().toString()
+        val input = File(root, "task6-inputs/$artifactToken/input.bin").apply {
+            requireNotNull(parentFile).mkdirs()
+            writeBytes(source)
+        }
+        val created = store.create(
+            OnDeviceInputArtifact(
+                token = artifactToken,
+                kind = kind,
+                privateFile = input,
+                sha256 = sha256(source),
+                expectedExtensionId = if (kind == OnDeviceInputKind.CRX3) {
+                    Crx3Verifier.verify(source).extensionId
+                } else {
+                    null
+                },
+            ),
+        )
+        return ConversionJobOwner(created.token, store)
     }
 
     private fun binding(identity: OnDevicePackageIdentity) = ConversionPackageBinding(
@@ -639,21 +1156,95 @@ class OnDevicePackagerGateInstrumentedTest {
         packager: OnDeviceWrapperPackager,
         claimed: ClaimedRequest,
     ): OnDeviceWrapperResult {
-        var succeeded = false
         return try {
-            packager.packageWrapper(claimed.request).also { succeeded = true }
+            runBlocking {
+                packager.packageWrapper(claimed.ledger, claimed.request).also { result ->
+                    completeConversionJob(claimed, result)
+                }
+            }
         } finally {
-            runBlocking { claimed.ledger.finishPackaging(claimed.capability, succeeded) }
             claimed.database.close()
+        }
+    }
+
+    private suspend fun completeConversionJob(
+        claimed: ClaimedRequest,
+        result: OnDeviceWrapperResult,
+    ) {
+        assertTrue(
+            claimed.ledger.recoverByOwnerToken(
+                claimed.ownerToken,
+                OnDeviceWrapperPackager(context),
+            ) is ConversionIdentityLedger.PackagedRecovery,
+        )
+        val bundle = File(root, ".completed-${UUID.randomUUID()}.six")
+        try {
+            bundle.outputStream().use { output ->
+                SixBundleContract.write(
+                    output = output,
+                    wrapperApk = result.outputApk.toPath(),
+                    extension = result.descriptor,
+                    compatibility = result.compatibility,
+                )
+            }
+            val bundleSha256 = sha256(bundle.readBytes())
+            claimed.workStore.markAwaitingApproval(claimed.ownerToken, PROFILE_SHA256)
+            claimed.workStore.markBuilding(
+                claimed.ownerToken,
+                emptySet(),
+                PROFILE_SHA256,
+            )
+            claimed.workStore.markBundleReady(
+                claimed.ownerToken,
+                bundle,
+                bundleSha256,
+            )
+            assertTrue(claimed.workStore.discard(claimed.ownerToken))
+        } finally {
+            bundle.delete()
         }
     }
 
     private data class ClaimedRequest(
         val request: OnDeviceWrapperRequest,
         val ledger: ConversionIdentityLedger,
-        val capability: PackagingConversionIdentity,
+        val ownerToken: String,
+        val workStore: ConversionWorkStore,
         val database: ManagerDatabase,
     )
+
+    private data class ConversionJobOwner(
+        val token: String,
+        val store: ConversionWorkStore,
+    )
+
+    private class FailPackagingFinishDao(
+        private val delegate: ConversionIdentityDao,
+    ) : ConversionIdentityDao by delegate {
+        private var shouldFail = true
+
+        override suspend fun transitionLease(
+            identitySha256: String,
+            ownerToken: String,
+            expectedState: String,
+            nextState: String,
+        ): Int {
+            if (
+                expectedState.startsWith("PUBLISHING:") &&
+                nextState.startsWith("PACKAGED:") &&
+                shouldFail
+            ) {
+                shouldFail = false
+                return 0
+            }
+            return delegate.transitionLease(
+                identitySha256,
+                ownerToken,
+                expectedState,
+                nextState,
+            )
+        }
+    }
 
     private fun compatibility(
         extensionId: String,

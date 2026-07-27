@@ -3,6 +3,7 @@ package dev.sixbridge.manager.conversion
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.manager.packager.OnDeviceWrapperResult
@@ -14,6 +15,8 @@ import java.nio.file.attribute.FileTime
 import java.lang.management.ManagementFactory
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -75,6 +78,41 @@ class GeneratedBundleStoreTest {
         assertEquals(expectedJson, BundleJson.encodeCompatibility(reopened.compatibility))
         assertEquals(listOf("a.permission", "z.permission"), reopened.compatibility.declaredPermissions)
         assertEquals(listOf("chrome.a", "chrome.z"), reopened.compatibility.usedApis)
+    }
+
+    @Test
+    fun `고압축 near-limit metadata는 publish restart에서도 STORED로 왕복한다`() {
+        val original = result()
+        val nearLimit = original.copy(
+            descriptor = original.descriptor.copy(name = "E".repeat(900_000)),
+            compatibility = original.compatibility.copy(
+                extensionName = null,
+                issues = listOf(
+                    ContractIssue(
+                        code = "near-limit",
+                        message = "R".repeat(900_000),
+                        blocking = false,
+                    ),
+                ),
+            ),
+        )
+
+        val generated = store().publish(token, nearLimit)
+        val reopened = store().open(token).use(SixBundleContract::read)
+
+        assertEquals(nearLimit.descriptor, reopened.extension)
+        assertEquals(nearLimit.compatibility, reopened.compatibility)
+        ZipFile(generated.file).use { archive ->
+            listOf(
+                SixBundleContract.WRAPPER_ENTRY,
+                SixBundleContract.EXTENSION_ENTRY,
+                SixBundleContract.COMPATIBILITY_ENTRY,
+            ).forEach { name ->
+                val entry = requireNotNull(archive.getEntry(name))
+                assertEquals(ZipEntry.STORED, entry.method, name)
+                assertEquals(entry.size, entry.compressedSize, name)
+            }
+        }
     }
 
     @Test
