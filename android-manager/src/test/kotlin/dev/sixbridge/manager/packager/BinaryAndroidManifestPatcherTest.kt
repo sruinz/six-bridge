@@ -180,10 +180,33 @@ class BinaryAndroidManifestPatcherTest {
         }
     }
 
+    @Test
+    fun `서로 다른 UTF 8 string offset의 payload byte interval 겹침을 거부한다`() {
+        val mutated = stringPoolWithOverlappingUtf8Payloads(templateManifest)
+
+        assertRejectedByReaderAndPatcher(mutated)
+    }
+
+    @Test
+    fun `누적 decoded string bytes가 4 MiB를 한 byte 초과하면 거부한다`() {
+        val mutated = stringPoolOneByteOverDecodedLimit(templateManifest)
+
+        assertRejectedByReaderAndPatcher(mutated)
+    }
+
     private fun request() = WrapperManifestRequest(
         extensionId = "bcdefghijklmnopabcdefghijklmnopa",
         versionCode = 42,
     )
+
+    private fun assertRejectedByReaderAndPatcher(bytes: ByteArray) {
+        assertFailsWith<IllegalArgumentException> {
+            BinaryAndroidManifestReader().read(bytes)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BinaryAndroidManifestPatcher().patch(bytes, request())
+        }
+    }
 
     private fun replaceString(bytes: ByteArray, from: String, to: String) {
         val slot = stringSlots(bytes).single { it.value == from }
@@ -227,6 +250,99 @@ class BinaryAndroidManifestPatcherTest {
         }
         chunks[stringPoolIndex] = chunks[stringPoolIndex].copy(bytes = rebuilt)
         return rebuildXml(bytes, chunks)
+    }
+
+    private fun stringPoolWithOverlappingUtf8Payloads(bytes: ByteArray): ByteArray =
+        rebuildStringPoolWithUtf8Tail(
+            bytes = bytes,
+            tailData = byteArrayOf(3, 3, 3, 'a'.code.toByte(), 'b'.code.toByte(), 0, 0),
+            tailOffsets = listOf(0, 1),
+        )
+
+    private fun stringPoolOneByteOverDecodedLimit(bytes: ByteArray): ByteArray {
+        val sourceDecodedBytes = stringSlots(bytes).sumOf { it.value.encodeToByteArray().size }
+        var remaining = MAX_DECODED_STRING_BYTES - sourceDecodedBytes + 1
+        require(remaining > 0)
+        var appendedDecodedBytes = 0
+        val tail = ByteArrayOutputStream()
+        val offsets = mutableListOf<Int>()
+        while (remaining > 0) {
+            val byteLength = minOf(remaining, MAX_UTF8_STRING_BYTES)
+            offsets += tail.size()
+            tail.write(repeatedAsciiUtf8String(byteLength))
+            remaining -= byteLength
+            appendedDecodedBytes += byteLength
+        }
+        check(sourceDecodedBytes + appendedDecodedBytes == MAX_DECODED_STRING_BYTES + 1)
+        return rebuildStringPoolWithUtf8Tail(bytes, tail.toByteArray(), offsets)
+    }
+
+    private fun rebuildStringPoolWithUtf8Tail(
+        bytes: ByteArray,
+        tailData: ByteArray,
+        tailOffsets: List<Int>,
+    ): ByteArray {
+        val chunks = xmlChunks(bytes).toMutableList()
+        val stringPoolIndex = chunks.indexOfFirst { it.type == STRING_POOL_TYPE }
+        require(stringPoolIndex >= 0)
+        val original = chunks[stringPoolIndex].bytes
+        val headerSize = original.u16(2)
+        require(original.u32(12) == 0)
+        val sourceEntries = stringSlots(bytes).map { utf8String(it.value) }
+        val stringCount = sourceEntries.size + tailOffsets.size
+        val stringsStart = headerSize + stringCount * Int.SIZE_BYTES
+        val sourceDataSize = sourceEntries.sumOf { it.size }
+        val rebuilt = ByteArray(stringsStart + sourceDataSize + tailData.size)
+        original.copyInto(rebuilt, endIndex = headerSize)
+        rebuilt.writeInt(4, rebuilt.size)
+        rebuilt.writeInt(8, stringCount)
+        rebuilt.writeInt(12, 0)
+        rebuilt.writeInt(16, UTF8_FLAG)
+        rebuilt.writeInt(20, stringsStart)
+
+        var relativeOffset = 0
+        sourceEntries.forEachIndexed { index, entry ->
+            rebuilt.writeInt(headerSize + index * Int.SIZE_BYTES, relativeOffset)
+            entry.copyInto(rebuilt, stringsStart + relativeOffset)
+            relativeOffset += entry.size
+        }
+        tailOffsets.forEachIndexed { index, tailOffset ->
+            require(tailOffset in 0 until tailData.size)
+            rebuilt.writeInt(
+                headerSize + (sourceEntries.size + index) * Int.SIZE_BYTES,
+                relativeOffset + tailOffset,
+            )
+        }
+        tailData.copyInto(rebuilt, stringsStart + relativeOffset)
+        chunks[stringPoolIndex] = chunks[stringPoolIndex].copy(bytes = rebuilt)
+        return rebuildXml(bytes, chunks)
+    }
+
+    private fun utf8String(value: String): ByteArray {
+        val payload = value.encodeToByteArray()
+        return utf8String(payload, value.length)
+    }
+
+    private fun repeatedAsciiUtf8String(byteLength: Int): ByteArray =
+        utf8String(ByteArray(byteLength) { 'x'.code.toByte() }, byteLength)
+
+    private fun utf8String(payload: ByteArray, utf16Length: Int): ByteArray {
+        val utf16LengthPrefix = utf8LengthPrefix(utf16Length)
+        val byteLengthPrefix = utf8LengthPrefix(payload.size)
+        return ByteArray(utf16LengthPrefix.size + byteLengthPrefix.size + payload.size + 1).also { encoded ->
+            utf16LengthPrefix.copyInto(encoded)
+            byteLengthPrefix.copyInto(encoded, utf16LengthPrefix.size)
+            payload.copyInto(encoded, utf16LengthPrefix.size + byteLengthPrefix.size)
+        }
+    }
+
+    private fun utf8LengthPrefix(length: Int): ByteArray {
+        require(length in 0..MAX_UTF8_STRING_BYTES)
+        return if (length < 0x80) {
+            byteArrayOf(length.toByte())
+        } else {
+            byteArrayOf((0x80 or (length shr 8)).toByte(), length.toByte())
+        }
     }
 
     private fun insertUnknownComponent(bytes: ByteArray, component: String, sourceName: String): ByteArray {
@@ -478,6 +594,8 @@ class BinaryAndroidManifestPatcherTest {
         const val START_ELEMENT_TYPE = 0x0102
         const val END_ELEMENT_TYPE = 0x0103
         const val UTF8_FLAG = 0x00000100
+        const val MAX_DECODED_STRING_BYTES = 4 * 1024 * 1024
+        const val MAX_UTF8_STRING_BYTES = 0x7fff
         const val ATTRIBUTE_RAW_VALUE_OFFSET = 8
         const val ATTRIBUTE_TYPED_DATA_OFFSET = 16
     }
