@@ -7,6 +7,7 @@ import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import java.io.File
+import java.io.OutputStream
 
 sealed interface IdentityRequirement {
     data class Stable(
@@ -45,6 +46,7 @@ sealed interface ConversionBeginResult {
         val selectedAutomaticAdapters: Set<String>,
         val requiredApprovals: Set<String>,
         val identityRequirement: IdentityRequirement,
+        val profileChanged: Boolean = false,
     ) : ConversionBeginResult
 
     data class Failure(
@@ -91,6 +93,7 @@ internal data class ConversionAnalysisSnapshot(
     val selectedAutomaticAdapters: Set<String>,
     val requiredApprovals: Set<String>,
     val logicalSourceIdentity: LogicalSourceIdentity?,
+    val profileChanged: Boolean = false,
 )
 
 internal data class PreparedConversionSnapshot(
@@ -111,6 +114,7 @@ internal data class BoundConversionSnapshot(
     val passthroughCrx: ByteArray?,
     val compatibility: ContractCompatibilityReport,
     val extensionId: String,
+    val sourceKind: String,
 )
 
 internal data class ResolvedPackageIdentity(
@@ -217,6 +221,7 @@ internal interface ConversionBundlePort {
     fun publish(token: String, packaged: PackagedConversion): GeneratedBundle
     fun recover(token: String): GeneratedBundle?
     fun discard(token: String): Boolean
+    fun copyTo(token: String, output: OutputStream): String
 }
 
 internal fun interface ConversionGeneratedImportPort {

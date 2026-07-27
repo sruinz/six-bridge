@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
+import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
@@ -81,7 +82,7 @@ internal class OnDeviceConversionCoordinator(
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
-            return@withLock ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            return@withLock ConversionBuildResult.Failure(job.inputKind.readFailureCode())
         }
         val profileSha256 = profile.canonicalSha256()
         if (job.profileSha256 != profileSha256) {
@@ -118,7 +119,11 @@ internal class OnDeviceConversionCoordinator(
             throw error
         } catch (_: Throwable) {
             return@withLock ConversionBuildResult.Failure(
-                ConversionFailureCode.TRANSFORM_MISMATCH,
+                if (job.inputKind == OnDeviceInputKind.SIX_DRAFT) {
+                    ConversionFailureCode.DRAFT_INVALID
+                } else {
+                    ConversionFailureCode.TRANSFORM_MISMATCH
+                },
             )
         }
         if (
@@ -183,6 +188,7 @@ internal class OnDeviceConversionCoordinator(
                     ConversionFailureCode.BUNDLE_IO,
                     generated,
                 )
+            abortOwner(token)
             work.markBundleReady(token, generated.file, generated.sha256)
             ConversionBuildResult.BundleReady(review, generated)
         } catch (error: CancellationException) {
@@ -205,6 +211,7 @@ internal class OnDeviceConversionCoordinator(
             if (generated != null) {
                 val review = imports.importGenerated(generated)
                     ?: return RestoredConversion.GeneratedPending(generated)
+                abortOwner(job.token)
                 work.markBundleReady(job.token, generated.file, generated.sha256)
                 return RestoredConversion.BundleReady(review, generated)
             }
@@ -232,11 +239,15 @@ internal class OnDeviceConversionCoordinator(
     }
 
     suspend fun discard(token: String): Boolean {
+        abortOwner(token)
         bundles.recover(token)?.let {
             if (!bundles.discard(token)) return false
         }
         return work.discard(token)
     }
+
+    fun copyGenerated(token: String, output: OutputStream): String? =
+        bundles.recover(token)?.let { bundles.copyTo(token, output) }
 
     private suspend fun analyzeJob(
         job: RestoredConversionJob,
@@ -263,7 +274,7 @@ internal class OnDeviceConversionCoordinator(
             throw error
         } catch (_: Throwable) {
             return ConversionBeginResult.Failure(
-                ConversionFailureCode.INPUT_INVALID,
+                job.inputKind.readFailureCode(),
                 job.token,
             )
         }
@@ -282,7 +293,10 @@ internal class OnDeviceConversionCoordinator(
         }
         val identityRequirement = analysis.logicalSourceIdentity?.let {
             val mode = if (
-                job.inputKind == OnDeviceInputKind.CRX3 &&
+                job.inputKind in setOf(
+                    OnDeviceInputKind.CRX3,
+                    OnDeviceInputKind.CHROME_WEB_STORE,
+                ) &&
                 analysis.report.conversionState.name == "PASSTHROUGH"
             ) {
                 InstallationIdentityMode.PASSTHROUGH
@@ -306,6 +320,7 @@ internal class OnDeviceConversionCoordinator(
             selectedAutomaticAdapters = analysis.selectedAutomaticAdapters,
             requiredApprovals = analysis.requiredApprovals,
             identityRequirement = identityRequirement,
+            profileChanged = analysis.profileChanged,
         )
     }
 
@@ -343,6 +358,13 @@ internal class OnDeviceConversionCoordinator(
         is IllegalArgumentException -> ConversionFailureCode.IDENTITY_MISMATCH
         else -> ConversionFailureCode.PACKAGE
     }
+
+    private fun OnDeviceInputKind.readFailureCode(): ConversionFailureCode =
+        if (this == OnDeviceInputKind.SIX_DRAFT) {
+            ConversionFailureCode.DRAFT_INVALID
+        } else {
+            ConversionFailureCode.INPUT_INVALID
+        }
 
     private suspend fun abortOwner(token: String) {
         withContext(NonCancellable) {

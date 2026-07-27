@@ -20,6 +20,7 @@ sealed interface OnDeviceInputRequest {
 enum class OnDeviceInputKind {
     ZIP,
     CRX3,
+    CHROME_WEB_STORE,
     SIX_DRAFT,
 }
 

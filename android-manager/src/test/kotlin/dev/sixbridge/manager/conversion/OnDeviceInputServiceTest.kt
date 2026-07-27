@@ -334,7 +334,7 @@ class OnDeviceInputServiceTest {
 
         val artifact = service.acquire(OnDeviceInputRequest.ChromeStore(pageUrl))
 
-        assertEquals(OnDeviceInputKind.CRX3, artifact.kind)
+        assertEquals(OnDeviceInputKind.CHROME_WEB_STORE, artifact.kind)
         assertEquals(crx.extensionId, artifact.expectedExtensionId)
         assertEquals(sha256(crx.bytes), artifact.sha256)
         assertFalse(artifact.toString().contains(pageUrl))

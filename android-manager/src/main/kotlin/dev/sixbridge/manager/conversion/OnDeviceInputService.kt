@@ -98,7 +98,14 @@ class OnDeviceInputService(
             }
             OnDeviceInputArtifact(
                 token = workspace.fileName.toString(),
-                kind = classified.kind,
+                kind = if (
+                    request is OnDeviceInputRequest.ChromeStore &&
+                    classified.kind == OnDeviceInputKind.CRX3
+                ) {
+                    OnDeviceInputKind.CHROME_WEB_STORE
+                } else {
+                    classified.kind
+                },
                 privateFile = privateFile,
                 sha256 = acquisition.sha256,
                 expectedExtensionId = classified.extensionId,

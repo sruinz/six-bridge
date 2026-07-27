@@ -106,6 +106,7 @@ class OnDevicePackagerGateInstrumentedTest {
                     passthroughCrx = null,
                     compatibility = claimed.request.compatibility,
                     extensionId = identity.extensionId,
+                    sourceKind = "ZIP",
                 ),
                 token = claimed.ownerToken,
             )
@@ -120,6 +121,11 @@ class OnDevicePackagerGateInstrumentedTest {
             assertTrue(packaged.outputApk.isFile)
             assertTrue(generated.file.isFile)
             assertEquals(claimed.ownerToken, generated.token)
+            assertTrue(
+                claimed.ledger.abortByOwnerToken(claimed.ownerToken, packager),
+            )
+            assertFalse(packaged.outputApk.exists())
+            assertTrue(generated.file.isFile)
         } finally {
             runCatching {
                 claimed.ledger.abortByOwnerToken(claimed.ownerToken, packager)

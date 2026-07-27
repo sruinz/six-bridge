@@ -65,9 +65,26 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
         profile: BrowserProfile,
     ): ConversionAnalysisSnapshot {
         if (kind == OnDeviceInputKind.SIX_DRAFT) {
-            val payload = SixDraft.read(input.toPath()).payload
-            val report = payload.compatibilityBefore
-            return snapshot(report, logicalIdentity(payload.draft.sourceIdentity))
+            val draft = SixDraft.read(input.toPath())
+            val payload = draft.payload
+            val signedApprovals = payload.plan.selectedAdapters.mapTo(sortedSetOf()) { it.id }
+            return when (
+                val replay = SixDraftReplay().replay(
+                    draft,
+                    profile,
+                    signedApprovals,
+                )
+            ) {
+                is DraftReplayResult.Ready -> snapshot(
+                    replay.prepared.compatibilityBefore,
+                    replay.prepared.logicalSourceIdentity.toManagerIdentity(),
+                )
+                is DraftReplayResult.ProfileChanged -> snapshot(
+                    replay.currentAnalysis,
+                    logicalIdentity(payload.draft.sourceIdentity),
+                    profileChanged = true,
+                )
+            }
         }
         val portable = portable(input, kind)
         return ConversionPreparationEngine().use { engine ->
@@ -92,16 +109,22 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
         approvedAdapterIds: Set<String>,
     ): PreparedConversionSnapshot {
         val prepared = if (kind == OnDeviceInputKind.SIX_DRAFT) {
-            when (
-                val replayed = SixDraftReplay().replay(
-                    SixDraft.read(input.toPath()),
+            val draft = SixDraft.read(input.toPath())
+            if (draft.payload.input.browserProfileSha256 == profile.canonicalSha256()) {
+                when (
+                    val replayed = SixDraftReplay().replay(
+                    draft,
                     profile,
                     approvedAdapterIds,
-                )
-            ) {
-                is DraftReplayResult.Ready -> replayed.prepared
-                is DraftReplayResult.ProfileChanged ->
-                    throw IllegalArgumentException("signed draft profile이 변경되었습니다.")
+                    )
+                ) {
+                    is DraftReplayResult.Ready -> replayed.prepared
+                    is DraftReplayResult.ProfileChanged -> error("profile proof race")
+                }
+            } else {
+                ConversionPreparationEngine().use {
+                    it.prepare(portableDraft(draft), profile, approvedAdapterIds)
+                }
             }
         } else {
             ConversionPreparationEngine().use {
@@ -144,6 +167,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
                 prepared.planSha256,
             ),
             extensionId = bound.extensionId,
+            sourceKind = prepared.sourceKind,
         )
     }
 
@@ -157,12 +181,40 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
                 ExtensionInputKind.CRX3,
                 file.readBytes(),
             )
+            OnDeviceInputKind.CHROME_WEB_STORE -> PortableExtensionInput.fromCrx(
+                ExtensionInputKind.CHROME_WEB_STORE,
+                file.readBytes(),
+            )
             OnDeviceInputKind.SIX_DRAFT -> error("draft는 replay 경로를 사용해야 합니다.")
         }
+
+    private fun portableDraft(
+        draft: dev.sixbridge.core.draft.VerifiedSixDraft,
+    ): PortableExtensionInput {
+        val payload = draft.payload
+        val signedIdentity = payload.draft.sourceIdentity
+            .takeIf { payload.draft.schemaVersion == 2 }
+        return when (payload.sourceKind) {
+            dev.sixbridge.core.draft.DraftSourceKind.ZIP ->
+                PortableExtensionInput.fromZip(
+                    payload.input.inputKind,
+                    payload.source,
+                    signedIdentity,
+                )
+            dev.sixbridge.core.draft.DraftSourceKind.CRX ->
+                PortableExtensionInput.fromCrx(
+                    payload.input.inputKind,
+                    payload.source,
+                    payload.input.originalExtensionId,
+                    signedIdentity,
+                )
+        }
+    }
 
     private fun snapshot(
         report: dev.sixbridge.core.compat.CompatibilityReport,
         logicalIdentity: LogicalSourceIdentity?,
+        profileChanged: Boolean = false,
     ) = ConversionAnalysisSnapshot(
         report = report,
         selectedAutomaticAdapters = report.adapterDecisions
@@ -172,6 +224,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
             .mapTo(sortedSetOf()) { it.id },
         logicalSourceIdentity = logicalIdentity,
+        profileChanged = profileChanged,
     )
 
     private fun logicalIdentity(value: String?): LogicalSourceIdentity? =
@@ -287,7 +340,7 @@ internal class DefaultConversionPackagePort(
                     passthroughCrx = source.takeIf { bound.passthroughCrx != null },
                     descriptorName = bound.compatibility.extensionName.orEmpty(),
                     descriptorVersion = bound.compatibility.extensionVersion.orEmpty(),
-                    sourceKind = if (bound.passthroughCrx == null) "ZIP" else "CRX3",
+                    sourceKind = bound.sourceKind,
                     compatibility = bound.compatibility,
                     outputApk = output,
                 ),
@@ -317,6 +370,8 @@ internal class DefaultConversionBundlePort(
     override fun recover(token: String): GeneratedBundle? =
         runCatching { store.recover(token) }.getOrNull()
     override fun discard(token: String): Boolean = store.discard(token)
+    override fun copyTo(token: String, output: java.io.OutputStream): String =
+        store.copyTo(token, output)
 }
 
 private fun sha256(bytes: ByteArray): String =

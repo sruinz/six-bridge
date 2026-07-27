@@ -49,6 +49,7 @@ import java.io.EOFException
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.InputStream
+import java.io.OutputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -142,6 +143,7 @@ interface ManagerRepository {
     )
     suspend fun restoreConversion(): RestoredConversion? = null
     suspend fun discardConversion(token: String): Boolean = false
+    fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
     suspend fun cancelInstall(): Boolean
     fun discardReview(token: String): Boolean
@@ -274,6 +276,9 @@ internal class DefaultManagerRepository(
 
     override suspend fun discardConversion(token: String): Boolean =
         conversionCoordinator?.discard(token) ?: false
+
+    override fun copyGeneratedConversion(token: String, output: OutputStream): String? =
+        conversionCoordinator?.copyGenerated(token, output)
 
     private suspend fun retainImport(result: ImportResult): ManagerImportResult {
         return when (result) {

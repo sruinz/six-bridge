@@ -10,6 +10,7 @@ import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
 import dev.sixbridge.manager.wrapper.InstalledWrapper
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
 import kotlin.test.assertEquals
@@ -64,12 +65,14 @@ class OnDeviceConversionCoordinatorTest {
                 "package",
                 "publish",
                 "import",
+                "abort",
                 "bundle-ready",
             ),
             events,
         )
         assertEquals(fixture.token, ready.generated.token)
         assertEquals("Example", ready.review.name)
+        assertNull(fixture.activeOwner)
     }
 
     @Test
@@ -325,6 +328,38 @@ class OnDeviceConversionCoordinatorTest {
         assertNull(fixture.activeOwner)
     }
 
+    @Test
+    fun `import 실패 결과를 취소하면 owner generated work를 함께 정리한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            importFailuresRemaining = 1
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+        val failed = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        assertTrue(requireNotNull(failed.generated).file.isFile)
+        val saved = ByteArrayOutputStream()
+
+        assertEquals("2".repeat(64), coordinator.copyGenerated(analysis.token, saved))
+        assertEquals("bundle", saved.toString(Charsets.UTF_8.name()))
+        assertTrue(failed.generated.file.isFile)
+
+        assertTrue(coordinator.discard(analysis.token))
+
+        assertTrue(fixture.ownerAborted)
+        assertNull(fixture.activeOwner)
+        assertTrue(!failed.generated.file.exists())
+        assertTrue(fixture.workDiscarded)
+    }
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
@@ -348,6 +383,7 @@ class OnDeviceConversionCoordinatorTest {
         var importFailuresRemaining = 0
         var activeOwner: String? = null
         var ownerAborted = false
+        var workDiscarded = false
 
         fun coordinator() = OnDeviceConversionCoordinator(
             input = ConversionInputPort {
@@ -407,7 +443,10 @@ class OnDeviceConversionCoordinatorTest {
                     activeOwner = null
                 }
 
-                override suspend fun discard(token: String): Boolean = true
+                override suspend fun discard(token: String): Boolean {
+                    workDiscarded = true
+                    return true
+                }
 
                 override suspend fun resetAwaitingApproval(
                     token: String,
@@ -496,6 +535,7 @@ class OnDeviceConversionCoordinatorTest {
                 }
 
                 override suspend fun abort(ownerToken: String) {
+                    events += "abort"
                     ownerAborted = true
                     activeOwner = null
                 }
@@ -531,6 +571,11 @@ class OnDeviceConversionCoordinatorTest {
                     GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
 
                 override fun discard(token: String): Boolean = generatedFile.delete()
+
+                override fun copyTo(token: String, output: java.io.OutputStream): String {
+                    generatedFile.inputStream().use { it.copyTo(output) }
+                    return "2".repeat(64)
+                }
             },
             imports = ConversionGeneratedImportPort {
                 events += "import"
@@ -585,6 +630,7 @@ class OnDeviceConversionCoordinatorTest {
             passthroughCrx = "crx".encodeToByteArray(),
             compatibility = contractReport(profile),
             extensionId = EXTENSION_ID,
+            sourceKind = "CRX3",
         )
     }
 

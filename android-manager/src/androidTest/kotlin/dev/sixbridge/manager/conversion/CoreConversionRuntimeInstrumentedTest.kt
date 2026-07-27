@@ -19,6 +19,7 @@ import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -26,6 +27,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -69,7 +71,7 @@ class CoreConversionRuntimeInstrumentedTest {
 
     @Test
     fun schemaV2Ed25519DraftReadAndReplayOnAndroid() {
-        val sourceIdentity = "project:android-core-conversion-gate"
+        val sourceIdentity = "project:${"1".repeat(32)}"
         val source = canonicalAssetZip("ondevice-conversion")
         val profile = profile()
         val prepared = ConversionPreparationEngine().use {
@@ -134,6 +136,42 @@ class CoreConversionRuntimeInstrumentedTest {
             setOf("desktop-selection-event-bridge"),
             replayed.appliedAdapterIds,
         )
+
+        val draftFile = File(targetContext.cacheDir, "runtime-profile-change.six")
+        draftFile.writeBytes(SixDraft.createBytes(payload, signingKey))
+        try {
+            val runtime = DefaultConversionRuntime()
+            val same = runtime.analyze(
+                draftFile,
+                OnDeviceInputKind.SIX_DRAFT,
+                profile,
+            )
+            assertFalse(same.profileChanged)
+
+            val changedProfile = profile.copy(versionCode = profile.versionCode + 1)
+            val changed = runtime.analyze(
+                draftFile,
+                OnDeviceInputKind.SIX_DRAFT,
+                changedProfile,
+            )
+            assertTrue(changed.profileChanged)
+            assertEquals(
+                changedProfile.canonicalSha256(),
+                changed.report.browserProfileSha256,
+            )
+            val newlyApproved = runtime.prepare(
+                draftFile,
+                OnDeviceInputKind.SIX_DRAFT,
+                changedProfile,
+                changed.requiredApprovals,
+            )
+            assertEquals(
+                changedProfile.canonicalSha256(),
+                newlyApproved.reportBefore.browserProfileSha256,
+            )
+        } finally {
+            draftFile.delete()
+        }
 
         reportMarker(
             "SIXBRIDGE_DRAFT_REPLAY_OK " +
