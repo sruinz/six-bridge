@@ -124,7 +124,65 @@ class AlignedApkAssemblerTest {
         assertEquals("keep-this-output", output.readText())
     }
 
-    private fun assembler() = AlignedApkAssembler()
+    @Test
+    fun `local record gap overlap EOCD comment CRC mismatch malformed extra와 invalid UTF 8을 거부한다`() {
+        val entries = templateEntries().map { it.first to byteArrayOf(1) }
+        val leadingGap = storedZip(entries, leadingGap = 1)
+        val middleGap = storedZip(entries, gaps = listOf(0, 1, 0))
+        val trailingGap = storedZip(entries, trailingGap = 1)
+        val overlap = storedZip(entries).also { bytes ->
+            val central = bytes.leInt(bytes.size - 22 + 16).toInt()
+            bytes.putLeInt(central + 46 + entries.first().first.encodeToByteArray().size + 42, 0)
+        }
+        val comment = storedZip(entries).also { it.putLeShort(it.size - 2, 1) }
+        val centralCrcMismatch = storedZip(entries).also { bytes ->
+            val central = bytes.leInt(bytes.size - 22 + 16).toInt()
+            bytes[central + 16] = (bytes[central + 16].toInt() xor 1).toByte()
+        }
+        val localCrcMismatch = storedZip(entries).also { bytes -> bytes[14] = (bytes[14].toInt() xor 1).toByte() }
+        val malformedExtra = storedZip(entries, localExtra = byteArrayOf(1, 0, 4))
+        val invalidUtf8 = storedZip(entries).also { bytes ->
+            val central = bytes.leInt(bytes.size - 22 + 16).toInt()
+            bytes[central + 46] = 0xff.toByte()
+        }
+
+        listOf(leadingGap, middleGap, trailingGap, overlap, comment, centralCrcMismatch, localCrcMismatch, malformedExtra, invalidUtf8)
+            .forEachIndexed { index, bytes ->
+                val file = File(work, "structure-$index.apk").apply { writeBytes(bytes) }
+                assertFailsWith<IllegalArgumentException> { ApkZipStructureVerifier.inspect(file) }
+            }
+    }
+
+    @Test
+    fun `최대 합계 출력은 temp 생성 전에 거부하고 기존 output을 보존한다`() {
+        val output = File(work, "size-boundary.apk").apply { writeText("keep") }
+        val oversizedManifest = ByteArray(MAX_CRX_BYTES)
+        val maximumCrx = ByteArray(MAX_CRX_BYTES)
+
+        assertFailsWith<IllegalArgumentException> {
+            assembler().assemble(ApkAssemblyRequest(template, oversizedManifest, maximumCrx, output))
+        }
+        assertEquals("keep", output.readText())
+        assertTrue(work.listFiles().orEmpty().none { it.name.startsWith(".size-boundary.apk.") })
+    }
+
+    @Test
+    fun `신뢰 작업 디렉터리 교체는 publish를 거부하고 기존 output을 보존한다`() {
+        val trusted = Files.createTempDirectory("six-trusted-parent")
+        val output = trusted.resolve("output.apk").toFile().apply { writeText("keep") }
+        val assembler = AlignedApkAssembler(trusted)
+        val original = trusted.resolveSibling("original-${System.nanoTime()}")
+        val replacement = trusted.resolveSibling("replacement-${System.nanoTime()}")
+        Files.move(trusted, original)
+        Files.createDirectory(replacement)
+        Files.move(replacement, trusted)
+        trusted.resolve("output.apk").toFile().writeText("keep")
+
+        assertFailsWith<IllegalArgumentException> { assembler.assemble(request(output)) }
+        assertEquals("keep", output.readText())
+    }
+
+    private fun assembler() = AlignedApkAssembler(work.toPath())
 
     private fun request(output: File, source: File = template) = ApkAssemblyRequest(
         templateApk = source,
@@ -165,10 +223,16 @@ class AlignedApkAssemblerTest {
         entries: List<Pair<String, ByteArray>>,
         flags: Int = 0,
         zip64: Boolean = false,
+        leadingGap: Int = 0,
+        gaps: List<Int> = emptyList(),
+        trailingGap: Int = 0,
+        localExtra: ByteArray = ByteArray(0),
     ): ByteArray {
         val local = ByteArrayOutputStream()
         val central = ByteArrayOutputStream()
-        entries.forEach { (name, bytes) ->
+        local.write(ByteArray(leadingGap))
+        entries.forEachIndexed { index, (name, bytes) ->
+            if (index > 0) local.write(ByteArray(gaps.getOrElse(index - 1) { 0 }))
             val nameBytes = name.encodeToByteArray()
             val crc = CRC32().apply { update(bytes) }.value
             val offset = local.size()
@@ -182,8 +246,9 @@ class AlignedApkAssemblerTest {
             local.writeLeInt(bytes.size.toLong())
             local.writeLeInt(bytes.size.toLong())
             local.writeLeShort(nameBytes.size)
-            local.writeLeShort(0)
+            local.writeLeShort(localExtra.size)
             local.write(nameBytes)
+            local.write(localExtra)
             local.write(bytes)
 
             central.writeLeInt(0x02014b50)
@@ -208,6 +273,8 @@ class AlignedApkAssemblerTest {
         return ByteArrayOutputStream().use { out ->
             val centralOffset = local.size()
             out.write(local.toByteArray())
+            out.write(ByteArray(trailingGap))
+            val adjustedCentralOffset = centralOffset + trailingGap
             out.write(central.toByteArray())
             out.writeLeInt(0x06054b50)
             out.writeLeShort(0)
@@ -215,7 +282,7 @@ class AlignedApkAssemblerTest {
             out.writeLeShort(if (zip64) 0xffff else entries.size)
             out.writeLeShort(if (zip64) 0xffff else entries.size)
             out.writeLeInt(central.size().toLong())
-            out.writeLeInt(centralOffset.toLong())
+            out.writeLeInt(adjustedCentralOffset.toLong())
             out.writeLeShort(0)
             out.toByteArray()
         }
@@ -262,3 +329,11 @@ class AlignedApkAssemblerTest {
         const val MAX_CRX_BYTES = 128 * 1024 * 1024
     }
 }
+    private fun ByteArray.putLeInt(offset: Int, value: Int) {
+        repeat(4) { shift -> this[offset + shift] = (value ushr (shift * 8)).toByte() }
+    }
+
+    private fun ByteArray.putLeShort(offset: Int, value: Int) {
+        this[offset] = value.toByte()
+        this[offset + 1] = (value ushr 8).toByte()
+    }

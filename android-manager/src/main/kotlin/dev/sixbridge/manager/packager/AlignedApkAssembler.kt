@@ -6,9 +6,11 @@ import java.io.OutputStream
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.zip.CRC32
 
 data class ApkAssemblyRequest(
@@ -18,49 +20,49 @@ data class ApkAssemblyRequest(
     val outputApk: File,
 )
 
-class AlignedApkAssembler {
+/**
+ * 앱 전용 작업 디렉터리만 publish 대상으로 허용하는 unsigned wrapper APK 조립기다.
+ * Task 6은 `context.filesDir` 아래의 private working directory를 이 생성자에 전달한다.
+ */
+class AlignedApkAssembler(trustedOutputDirectory: Path) {
+    private val trustedDirectory = TrustedDirectory.capture(trustedOutputDirectory)
+
     fun assemble(request: ApkAssemblyRequest) {
         val template = request.templateApk.toPath().toAbsolutePath().normalize()
         val output = request.outputApk.toPath().toAbsolutePath().normalize()
+        trustedDirectory.verifyUnchanged()
+        require(output.parent == trustedDirectory.path) { "output APK는 신뢰된 작업 디렉터리에 있어야 합니다." }
         require(Files.isRegularFile(template, NOFOLLOW_LINKS) && !Files.isSymbolicLink(template)) {
             "래퍼 template APK가 올바르지 않습니다."
         }
-        val outputParent = output.parent ?: throw IllegalArgumentException("output APK 경로가 올바르지 않습니다.")
-        require(Files.isDirectory(outputParent, NOFOLLOW_LINKS) && !Files.isSymbolicLink(outputParent)) {
-            "output APK 디렉터리가 올바르지 않습니다."
-        }
         rejectUnsafeOutput(template, output)
 
-        val manifest = request.manifestBytes.copyOf()
-        val crx = request.crxBytes.copyOf()
+        val manifest = request.manifestBytes
+        val crx = request.crxBytes
         require(manifest.isNotEmpty() && manifest.size.toLong() <= MAX_ENTRY_SIZE) { "AndroidManifest.xml 크기가 올바르지 않습니다." }
         require(crx.isNotEmpty() && crx.size.toLong() <= MAX_CRX_SIZE) { "CRX3 크기가 올바르지 않습니다." }
 
-        val templateEntries = ApkZipStructureVerifier.entries(template.toFile())
+        val templateEntries = ApkZipStructureVerifier.templateEntries(template.toFile())
         val byName = templateEntries.associateBy { it.fact.name }
         require(templateEntries.size == REQUIRED_ENTRY_NAMES.size && byName.keys == REQUIRED_ENTRY_NAMES.toSet()) {
             "래퍼 template APK entry 계약이 올바르지 않습니다."
         }
-        require(byName.getValue("resources.arsc").fact.method == STORED) { "template resources.arsc는 STORED여야 합니다." }
-
-        val entries = listOf(
-            OutputEntry("AndroidManifest.xml", manifest),
-            OutputEntry("classes.dex", byName.getValue("classes.dex").bytes),
-            OutputEntry("resources.arsc", byName.getValue("resources.arsc").bytes),
-            OutputEntry("assets/extension.crx", crx),
+        val prepared = listOf(
+            PreparedEntry.bytes("AndroidManifest.xml", manifest),
+            PreparedEntry.template("classes.dex", byName.getValue("classes.dex")),
+            PreparedEntry.template("resources.arsc", byName.getValue("resources.arsc")),
+            PreparedEntry.bytes("assets/extension.crx", crx),
         )
-        entries.forEach { entry ->
-            require(entry.bytes.isNotEmpty() && entry.bytes.size.toLong() <= MAX_ENTRY_SIZE) {
-                "래퍼 APK entry 크기가 올바르지 않습니다: ${entry.name}"
-            }
-        }
+        require(byName.getValue("resources.arsc").fact.method == STORED) { "template resources.arsc는 STORED여야 합니다." }
+        prepared.forEach { entry -> require(entry.size in 1L..MAX_ENTRY_SIZE) { "래퍼 APK entry 크기가 올바르지 않습니다: ${entry.name}" } }
+        require(calculateOutputSize(prepared) <= MAX_OUTPUT_SIZE) { "래퍼 APK 출력 크기가 제한을 초과합니다." }
 
-        val temp = Files.createTempFile(outputParent, ".${output.fileName}.", ".tmp")
+        val temp = Files.createTempFile(trustedDirectory.path, ".${output.fileName}.", ".tmp")
         try {
-            writeArchive(temp.toFile(), entries)
-            require(Files.size(temp) <= MAX_OUTPUT_SIZE) { "래퍼 APK 출력 크기가 제한을 초과합니다." }
+            writeArchive(temp.toFile(), template.toFile(), prepared)
             FileChannel.open(temp, WRITE).use { it.force(true) }
             verifyAssembly(temp.toFile(), crx.size.toLong())
+            trustedDirectory.verifyUnchanged()
             rejectUnsafeOutput(template, output)
             Files.move(temp, output, ATOMIC_MOVE, REPLACE_EXISTING)
         } finally {
@@ -68,10 +70,8 @@ class AlignedApkAssembler {
         }
     }
 
-    private fun rejectUnsafeOutput(template: java.nio.file.Path, output: java.nio.file.Path) {
-        require(!Files.exists(output, NOFOLLOW_LINKS) || !Files.isSymbolicLink(output)) {
-            "output APK symlink는 허용하지 않습니다."
-        }
+    private fun rejectUnsafeOutput(template: Path, output: Path) {
+        require(!Files.exists(output, NOFOLLOW_LINKS) || !Files.isSymbolicLink(output)) { "output APK symlink는 허용하지 않습니다." }
         if (Files.exists(output, NOFOLLOW_LINKS)) {
             require(!Files.isDirectory(output, NOFOLLOW_LINKS) && !Files.isSameFile(template, output)) {
                 "template APK와 output APK는 서로 달라야 합니다."
@@ -79,58 +79,77 @@ class AlignedApkAssembler {
         }
     }
 
-    private fun writeArchive(output: File, entries: List<OutputEntry>) {
+    private fun calculateOutputSize(entries: List<PreparedEntry>): Long {
+        var offset = 0L
+        entries.forEach { entry ->
+            val extraSize = if (entry.name == "resources.arsc") alignmentExtraSize(offset, entry.name.encodeToByteArray().size) else 0
+            offset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + entry.name.encodeToByteArray().size + extraSize + entry.size)
+        }
+        val centralSize = entries.sumOf { CENTRAL_HEADER_SIZE.toLong() + it.name.encodeToByteArray().size }
+        return checkedAdd(checkedAdd(offset, centralSize), EOCD_SIZE.toLong())
+    }
+
+    private fun writeArchive(output: File, template: File, entries: List<PreparedEntry>) {
         val records = ArrayList<WrittenEntry>(entries.size)
         var offset = 0L
         BufferedOutputStream(Files.newOutputStream(output.toPath(), WRITE)).use { stream ->
             entries.forEach { entry ->
-                val written = writeLocalEntry(stream, offset, entry)
+                val written = writeLocalEntry(stream, template, offset, entry)
                 records += written
                 offset = checkedAdd(offset, written.localLength)
             }
             val centralOffset = offset
             val central = java.io.ByteArrayOutputStream()
-            records.forEach { record -> writeCentralEntry(central, record) }
+            records.forEach { writeCentralEntry(central, it) }
             val centralBytes = central.toByteArray()
             stream.write(centralBytes)
-            offset = checkedAdd(offset, centralBytes.size.toLong())
             writeEndOfCentralDirectory(stream, records.size, centralBytes.size.toLong(), centralOffset)
             stream.flush()
-            require(checkedAdd(offset, EOCD_SIZE.toLong()) <= MAX_OUTPUT_SIZE) { "래퍼 APK 출력 크기가 제한을 초과합니다." }
         }
     }
 
-    private fun writeLocalEntry(stream: OutputStream, offset: Long, entry: OutputEntry): WrittenEntry {
+    private fun writeLocalEntry(stream: OutputStream, template: File, offset: Long, entry: PreparedEntry): WrittenEntry {
         val name = entry.name.encodeToByteArray()
         val extra = if (entry.name == "resources.arsc") alignmentExtra(offset, name.size) else ByteArray(0)
-        val crc = CRC32().apply { update(entry.bytes) }.value
         stream.writeLeInt(LOCAL_MAGIC)
         stream.writeLeShort(VERSION_NEEDED)
         stream.writeLeShort(0)
         stream.writeLeShort(STORED)
         stream.writeLeShort(DOS_TIME)
         stream.writeLeShort(DOS_DATE)
-        stream.writeLeInt(crc)
-        stream.writeLeInt(entry.bytes.size.toLong())
-        stream.writeLeInt(entry.bytes.size.toLong())
+        stream.writeLeInt(entry.crc32)
+        stream.writeLeInt(entry.size)
+        stream.writeLeInt(entry.size)
         stream.writeLeShort(name.size)
         stream.writeLeShort(extra.size)
         stream.write(name)
         stream.write(extra)
         val dataOffset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + name.size + extra.size)
         require(entry.name != "resources.arsc" || dataOffset % 4L == 0L) { "resources.arsc 정렬 계산이 올바르지 않습니다." }
-        stream.write(entry.bytes)
-        return WrittenEntry(entry.name, entry.bytes, crc, extra, offset, dataOffset)
+        when (val source = entry.source) {
+            is EntrySource.Bytes -> writeBytesAndVerify(stream, source.bytes, entry.crc32)
+            is EntrySource.Template -> ApkZipStructureVerifier.copyEntryData(template, source.entry, stream)
+        }
+        return WrittenEntry(entry.name, entry.size, entry.crc32, extra, offset)
+    }
+
+    private fun writeBytesAndVerify(stream: OutputStream, bytes: ByteArray, expectedCrc: Long) {
+        stream.write(bytes)
+        require(CRC32().apply { update(bytes) }.value == expectedCrc) { "래퍼 APK entry가 조립 중 변경되었습니다." }
     }
 
     private fun alignmentExtra(offset: Long, nameSize: Int): ByteArray {
-        val baseDataOffset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + nameSize)
-        val payloadSize = ((4L - ((baseDataOffset + EXTRA_HEADER_SIZE) % 4L)) % 4L).toInt()
-        return java.io.ByteArrayOutputStream(EXTRA_HEADER_SIZE.toInt() + payloadSize).apply {
+        val payloadSize = alignmentExtraSize(offset, nameSize) - EXTRA_HEADER_SIZE
+        return java.io.ByteArrayOutputStream(EXTRA_HEADER_SIZE + payloadSize).apply {
             writeLeShort(ALIGNMENT_EXTRA_ID)
             writeLeShort(payloadSize)
             write(ByteArray(payloadSize))
         }.toByteArray()
+    }
+
+    private fun alignmentExtraSize(offset: Long, nameSize: Int): Int {
+        val baseDataOffset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + nameSize)
+        return EXTRA_HEADER_SIZE + ((4L - ((baseDataOffset + EXTRA_HEADER_SIZE) % 4L)) % 4L).toInt()
     }
 
     private fun writeCentralEntry(stream: OutputStream, record: WrittenEntry) {
@@ -142,9 +161,9 @@ class AlignedApkAssembler {
         stream.writeLeShort(STORED)
         stream.writeLeShort(DOS_TIME)
         stream.writeLeShort(DOS_DATE)
-        stream.writeLeInt(record.crc)
-        stream.writeLeInt(record.bytes.size.toLong())
-        stream.writeLeInt(record.bytes.size.toLong())
+        stream.writeLeInt(record.crc32)
+        stream.writeLeInt(record.size)
+        stream.writeLeInt(record.size)
         stream.writeLeShort(name.size)
         stream.writeLeShort(0)
         stream.writeLeShort(0)
@@ -155,17 +174,12 @@ class AlignedApkAssembler {
         stream.write(name)
     }
 
-    private fun writeEndOfCentralDirectory(
-        stream: OutputStream,
-        entryCount: Int,
-        centralSize: Long,
-        centralOffset: Long,
-    ) {
+    private fun writeEndOfCentralDirectory(stream: OutputStream, count: Int, centralSize: Long, centralOffset: Long) {
         stream.writeLeInt(EOCD_MAGIC)
         stream.writeLeShort(0)
         stream.writeLeShort(0)
-        stream.writeLeShort(entryCount)
-        stream.writeLeShort(entryCount)
+        stream.writeLeShort(count)
+        stream.writeLeShort(count)
         stream.writeLeInt(centralSize)
         stream.writeLeInt(centralOffset)
         stream.writeLeShort(0)
@@ -173,13 +187,9 @@ class AlignedApkAssembler {
 
     private fun verifyAssembly(apk: File, expectedCrxSize: Long) {
         val facts = ApkZipStructureVerifier.inspect(apk)
-        require(facts.map { it.name } == REQUIRED_ENTRY_NAMES) { "래퍼 APK entry 순서가 올바르지 않습니다." }
-        require(facts.all { it.method == STORED }) { "래퍼 APK entry는 모두 STORED여야 합니다." }
-        val resources = facts.single { it.name == "resources.arsc" }
-        require(resources.dataOffset % 4L == 0L) { "resources.arsc가 4-byte 정렬되지 않았습니다." }
-        require(facts.single { it.name == "assets/extension.crx" }.size == expectedCrxSize) {
-            "래퍼 APK CRX3 크기가 올바르지 않습니다."
-        }
+        require(facts.map { it.name } == REQUIRED_ENTRY_NAMES && facts.all { it.method == STORED }) { "래퍼 APK entry 계약이 올바르지 않습니다." }
+        require(facts.single { it.name == "resources.arsc" }.dataOffset % 4L == 0L) { "resources.arsc가 4-byte 정렬되지 않았습니다." }
+        require(facts.single { it.name == "assets/extension.crx" }.size == expectedCrxSize) { "래퍼 APK CRX3 크기가 올바르지 않습니다." }
     }
 
     private fun OutputStream.writeLeShort(value: Int) {
@@ -190,10 +200,8 @@ class AlignedApkAssembler {
 
     private fun OutputStream.writeLeInt(value: Long) {
         require(value in 0..UINT32_MAX) { "ZIP 32-bit 값이 범위를 벗어났습니다." }
-        write((value and 0xff).toInt())
-        write((value ushr 8 and 0xff).toInt())
-        write((value ushr 16 and 0xff).toInt())
-        write((value ushr 24 and 0xff).toInt())
+        write((value and 0xff).toInt()); write((value ushr 8 and 0xff).toInt())
+        write((value ushr 16 and 0xff).toInt()); write((value ushr 24 and 0xff).toInt())
     }
 
     private fun checkedAdd(left: Long, right: Long): Long {
@@ -201,34 +209,56 @@ class AlignedApkAssembler {
         return left + right
     }
 
-    private data class OutputEntry(val name: String, val bytes: ByteArray)
+    private sealed interface EntrySource {
+        data class Bytes(val bytes: ByteArray) : EntrySource
+        data class Template(val entry: ApkZipEntryData) : EntrySource
+    }
 
-    private data class WrittenEntry(
-        val name: String,
-        val bytes: ByteArray,
-        val crc: Long,
-        val extra: ByteArray,
-        val localOffset: Long,
-        val dataOffset: Long,
-    ) {
-        val localLength: Long
-            get() = LOCAL_HEADER_SIZE.toLong() + name.encodeToByteArray().size + extra.size + bytes.size
+    private data class PreparedEntry(val name: String, val size: Long, val crc32: Long, val source: EntrySource) {
+        companion object {
+            fun bytes(name: String, bytes: ByteArray): PreparedEntry = PreparedEntry(
+                name, bytes.size.toLong(), CRC32().apply { update(bytes) }.value, EntrySource.Bytes(bytes),
+            )
+
+            fun template(name: String, entry: ApkZipEntryData): PreparedEntry =
+                PreparedEntry(name, entry.fact.size, entry.crc32, EntrySource.Template(entry))
+        }
+    }
+
+    private data class WrittenEntry(val name: String, val size: Long, val crc32: Long, val extra: ByteArray, val localOffset: Long) {
+        val localLength: Long get() = LOCAL_HEADER_SIZE.toLong() + name.encodeToByteArray().size + extra.size + size
+    }
+
+    private data class TrustedDirectory(val path: Path, val realPath: Path, val fileKey: Any) {
+        fun verifyUnchanged() {
+            require(Files.isDirectory(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) { "신뢰된 작업 디렉터리가 변경되었습니다." }
+            val current = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+            require(current.fileKey() == fileKey && path.toRealPath(NOFOLLOW_LINKS) == realPath) {
+                "신뢰된 작업 디렉터리가 변경되었습니다."
+            }
+        }
+
+        companion object {
+            fun capture(directory: Path): TrustedDirectory {
+                val path = directory.toAbsolutePath().normalize()
+                require(Files.isDirectory(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) { "신뢰된 작업 디렉터리가 올바르지 않습니다." }
+                val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+                val fileKey = attributes.fileKey() ?: throw IllegalArgumentException("신뢰된 작업 디렉터리 fileKey가 없습니다.")
+                return TrustedDirectory(path, path.toRealPath(NOFOLLOW_LINKS), fileKey)
+            }
+        }
     }
 
     private companion object {
-        val REQUIRED_ENTRY_NAMES = listOf(
-            "AndroidManifest.xml",
-            "classes.dex",
-            "resources.arsc",
-            "assets/extension.crx",
-        )
+        val REQUIRED_ENTRY_NAMES = listOf("AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/extension.crx")
         const val MAX_CRX_SIZE = 128L * 1024L * 1024L
         const val MAX_ENTRY_SIZE = 128L * 1024L * 1024L
         const val MAX_OUTPUT_SIZE = 256L * 1024L * 1024L
         const val STORED = 0
         const val LOCAL_HEADER_SIZE = 30
+        const val CENTRAL_HEADER_SIZE = 46
         const val EOCD_SIZE = 22
-        const val EXTRA_HEADER_SIZE = 4L
+        const val EXTRA_HEADER_SIZE = 4
         const val ALIGNMENT_EXTRA_ID = 0xd935
         const val VERSION_MADE_BY = 20
         const val VERSION_NEEDED = 20
