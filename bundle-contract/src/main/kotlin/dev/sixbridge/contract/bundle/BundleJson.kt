@@ -54,9 +54,15 @@ object BundleJson {
             1 -> COMPATIBILITY_V1_KEYS
             2 -> COMPATIBILITY_V2_KEYS
             3 -> COMPATIBILITY_V3_KEYS
+            4 -> COMPATIBILITY_V4_KEYS
             else -> throw IllegalArgumentException("지원하지 않는 compatibility.json schemaVersion입니다.")
         }
-        requireExactKeys(objectValue, keys, COMPATIBILITY_BASE_REQUIRED_KEYS, "compatibility.json")
+        requireExactKeys(
+            objectValue,
+            keys,
+            if (schemaVersion == 4) COMPATIBILITY_V4_REQUIRED_KEYS else COMPATIBILITY_BASE_REQUIRED_KEYS,
+            "compatibility.json",
+        )
         val report = ContractCompatibilityReport(
             schemaVersion = schemaVersion,
             status = compatibilityStatus(objectValue.requiredString("status")),
@@ -83,6 +89,8 @@ object BundleJson {
             convertedExtensionId = if (schemaVersion == 1) null else objectValue.nullableString("convertedExtensionId"),
             sourceSha256 = if (schemaVersion < 3) null else objectValue.requiredSha256("sourceSha256"),
             browserProfileSha256 = if (schemaVersion < 3) null else objectValue.requiredSha256("browserProfileSha256"),
+            originalSourceSha256 = if (schemaVersion < 4) null else objectValue.requiredSha256("originalSourceSha256"),
+            planSha256 = if (schemaVersion < 4) null else objectValue.requiredSha256("planSha256"),
         )
         validateCompatibility(report)
         return report
@@ -105,7 +113,7 @@ object BundleJson {
     }
 
     fun validateCompatibility(value: ContractCompatibilityReport) {
-        require(value.schemaVersion in 1..3) { "지원하지 않는 compatibility.json schemaVersion입니다." }
+        require(value.schemaVersion in 1..4) { "지원하지 않는 compatibility.json schemaVersion입니다." }
         require(value.conversionState in CONVERSION_STATES) { "지원하지 않는 conversionState입니다." }
         require(value.adapterDecisions.map { it.id to it.version }.toSet().size == value.adapterDecisions.size) {
             "어댑터 결정 ID와 version 조합은 중복될 수 없습니다."
@@ -118,19 +126,41 @@ object BundleJson {
             require(value.originalExtensionId == null && value.convertedExtensionId == null) {
                 "schema v1 compatibility에는 extension ID 변환 정보가 있을 수 없습니다."
             }
-            require(value.sourceSha256 == null && value.browserProfileSha256 == null) {
+            require(
+                value.sourceSha256 == null && value.browserProfileSha256 == null &&
+                    value.originalSourceSha256 == null && value.planSha256 == null,
+            ) {
                 "schema v1 compatibility에는 provenance proof가 있을 수 없습니다."
             }
         } else if (value.schemaVersion == 2) {
-            require(value.sourceSha256 == null && value.browserProfileSha256 == null) {
+            require(
+                value.sourceSha256 == null && value.browserProfileSha256 == null &&
+                    value.originalSourceSha256 == null && value.planSha256 == null,
+            ) {
                 "schema v2 compatibility에는 provenance proof가 있을 수 없습니다."
             }
-        } else {
+        } else if (value.schemaVersion == 3) {
             require(value.sourceSha256 != null && SHA256.matches(value.sourceSha256)) {
                 "schema v3 compatibility에는 올바른 sourceSha256이 필요합니다."
             }
             require(value.browserProfileSha256 != null && SHA256.matches(value.browserProfileSha256)) {
                 "schema v3 compatibility에는 올바른 browserProfileSha256이 필요합니다."
+            }
+            require(value.originalSourceSha256 == null && value.planSha256 == null) {
+                "schema v3 compatibility에는 on-device provenance proof가 있을 수 없습니다."
+            }
+        } else {
+            require(value.sourceSha256 != null && SHA256.matches(value.sourceSha256)) {
+                "schema v4 compatibility에는 올바른 sourceSha256이 필요합니다."
+            }
+            require(value.browserProfileSha256 != null && SHA256.matches(value.browserProfileSha256)) {
+                "schema v4 compatibility에는 올바른 browserProfileSha256이 필요합니다."
+            }
+            require(value.originalSourceSha256 != null && SHA256.matches(value.originalSourceSha256)) {
+                "schema v4 compatibility에는 올바른 originalSourceSha256이 필요합니다."
+            }
+            require(value.planSha256 != null && SHA256.matches(value.planSha256)) {
+                "schema v4 compatibility에는 올바른 planSha256이 필요합니다."
             }
         }
     }
@@ -174,9 +204,13 @@ object BundleJson {
             fields.putNullable("originalExtensionId", value.originalExtensionId?.let(::JsonPrimitive))
             fields.putNullable("convertedExtensionId", value.convertedExtensionId?.let(::JsonPrimitive))
         }
-        if (value.schemaVersion == 3) {
+        if (value.schemaVersion >= 3) {
             fields["sourceSha256"] = JsonPrimitive(requireNotNull(value.sourceSha256))
             fields["browserProfileSha256"] = JsonPrimitive(requireNotNull(value.browserProfileSha256))
+        }
+        if (value.schemaVersion == 4) {
+            fields["originalSourceSha256"] = JsonPrimitive(requireNotNull(value.originalSourceSha256))
+            fields["planSha256"] = JsonPrimitive(requireNotNull(value.planSha256))
         }
         return JsonObject(fields)
     }
@@ -348,6 +382,12 @@ object BundleJson {
     )
     private val COMPATIBILITY_V3_KEYS = COMPATIBILITY_V2_KEYS + setOf(
         "sourceSha256", "browserProfileSha256",
+    )
+    private val COMPATIBILITY_V4_KEYS = COMPATIBILITY_V3_KEYS + setOf(
+        "originalSourceSha256", "planSha256",
+    )
+    private val COMPATIBILITY_V4_REQUIRED_KEYS = COMPATIBILITY_BASE_REQUIRED_KEYS + setOf(
+        "sourceSha256", "browserProfileSha256", "originalSourceSha256", "planSha256",
     )
     private val ISSUE_KEYS = setOf("code", "message", "blocking")
     private val ADAPTER_KEYS = setOf(

@@ -93,7 +93,7 @@ class AndroidWrapperVerifier(
         if (crx.extensionId != descriptor.extensionId) {
             return failure(ImportFailureCode.CRX_ID_MISMATCH)
         }
-        if (report.schemaVersion != REQUIRED_REPORT_SCHEMA) {
+        if (report.schemaVersion !in SUPPORTED_REPORT_SCHEMAS) {
             return failure(ImportFailureCode.REPORT_SCHEMA_UNSUPPORTED)
         }
         if (report.convertedExtensionId != descriptor.extensionId ||
@@ -102,8 +102,12 @@ class AndroidWrapperVerifier(
         ) {
             return failure(ImportFailureCode.REPORT_IDENTITY_MISMATCH)
         }
-        if (!SHA256.matches(report.sourceSha256.orEmpty()) ||
-            !SHA256.matches(report.browserProfileSha256.orEmpty())
+        if (report.sourceSha256 != crx.zipSha256 ||
+            !SHA256.matches(report.sourceSha256.orEmpty()) ||
+            !SHA256.matches(report.browserProfileSha256.orEmpty()) ||
+            (report.schemaVersion == 4 &&
+                (!SHA256.matches(report.originalSourceSha256.orEmpty()) ||
+                    !SHA256.matches(report.planSha256.orEmpty())))
         ) {
             return failure(ImportFailureCode.REPORT_PROOF_INVALID)
         }
@@ -137,7 +141,7 @@ class AndroidWrapperVerifier(
         WrapperVerificationResult.Failure(ImportFailure(code))
 
     private companion object {
-        const val REQUIRED_REPORT_SCHEMA = 3
+        val SUPPORTED_REPORT_SCHEMAS = setOf(3, 4)
         const val EXTENSION_ID_METADATA = "extension-id"
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"

@@ -38,6 +38,8 @@ data class ContractCompatibilityReport(
     val convertedExtensionId: String?,
     val sourceSha256: String?,
     val browserProfileSha256: String?,
+    val originalSourceSha256: String? = null,
+    val planSha256: String? = null,
 )
 
 data class ContractIssue(

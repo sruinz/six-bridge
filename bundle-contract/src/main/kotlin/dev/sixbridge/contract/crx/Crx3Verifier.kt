@@ -21,6 +21,7 @@ data class VerifiedCrx3(
     val crxSha256: String,
     val zipOffset: Int,
     val zipLength: Int,
+    val zipSha256: String = "",
 )
 
 object Crx3Verifier {
@@ -77,6 +78,7 @@ object Crx3Verifier {
             crxSha256 = sha256(bytes, offset, length),
             zipOffset = headerEnd,
             zipLength = end - headerEnd,
+            zipSha256 = sha256(bytes, headerEnd, end - headerEnd),
         )
     }
 

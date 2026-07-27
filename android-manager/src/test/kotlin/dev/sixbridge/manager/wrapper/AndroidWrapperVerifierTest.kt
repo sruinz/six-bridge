@@ -52,6 +52,23 @@ class AndroidWrapperVerifierTest {
     }
 
     @Test
+    fun `accepts v4 report when all provenance proofs are valid`() {
+        val fixture = fixture()
+
+        val result = verifier(fixture.facts).verify(
+            fixture.wrapperFile,
+            fixture.descriptor,
+            fixture.report.copy(
+                schemaVersion = 4,
+                originalSourceSha256 = "4".repeat(64),
+                planSha256 = "5".repeat(64),
+            ),
+        )
+
+        assertIs<WrapperVerificationResult.Success>(result)
+    }
+
+    @Test
     fun `rejects a staged APK mutated while archive inspection is running`() {
         val fixture = fixture()
         val verifier = AndroidWrapperVerifier(
@@ -166,6 +183,18 @@ class AndroidWrapperVerifierTest {
             Case(
                 ImportFailureCode.REPORT_PROOF_INVALID,
                 report = base.report.copy(sourceSha256 = "A".repeat(64)),
+            ),
+            Case(
+                ImportFailureCode.REPORT_PROOF_INVALID,
+                report = base.report.copy(sourceSha256 = "2".repeat(64)),
+            ),
+            Case(
+                ImportFailureCode.REPORT_PROOF_INVALID,
+                report = base.report.copy(
+                    schemaVersion = 4,
+                    originalSourceSha256 = "A".repeat(64),
+                    planSha256 = "4".repeat(64),
+                ),
             ),
             Case(
                 ImportFailureCode.CRX_INVALID,
@@ -555,7 +584,7 @@ class AndroidWrapperVerifierTest {
             adapterDecisions = emptyList(),
             originalExtensionId = null,
             convertedExtensionId = descriptor.extensionId,
-            sourceSha256 = "2".repeat(64),
+            sourceSha256 = crx.zipSha256,
             browserProfileSha256 = "3".repeat(64),
         )
         val facts = ArchiveFacts(

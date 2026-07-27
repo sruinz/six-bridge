@@ -212,6 +212,20 @@ class SixBundleTest {
     }
 
     @Test
+    fun `maps explicit on-device proofs to a v4 contract report`() {
+        val converted = compatibilityWithProofs().toContractV4(
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+        )
+
+        assertEquals(4, converted.schemaVersion)
+        assertEquals("a".repeat(64), converted.originalSourceSha256)
+        assertEquals("b".repeat(64), converted.planSha256)
+        assertEquals("c".repeat(64), converted.sourceSha256)
+        assertEquals("d".repeat(64), converted.browserProfileSha256)
+    }
+
+    @Test
     fun `schema v3 provenance cannot be downgraded to schema v2`() {
         val bundle = bundleWithCompatibility(compatibilityWithProofs())
         rewrite(bundle) { name, bytes ->

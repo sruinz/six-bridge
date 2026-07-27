@@ -35,6 +35,76 @@ class SixBundleContractTest {
     }
 
     @Test
+    fun `v4 compatibility preserves original plan and result proofs`() {
+        val report = validContents().compatibility.copy(
+            schemaVersion = 4,
+            originalSourceSha256 = "e".repeat(64),
+            planSha256 = "f".repeat(64),
+        )
+
+        val decoded = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(report))
+
+        assertEquals(report, decoded)
+    }
+
+    @Test
+    fun `v4 compatibility rejects missing provenance proofs`() {
+        val encoded = BundleJson.encodeCompatibility(
+            validContents().compatibility.copy(
+                schemaVersion = 4,
+                originalSourceSha256 = "e".repeat(64),
+                planSha256 = "f".repeat(64),
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(
+                encoded.replace(",\"originalSourceSha256\":\"${"e".repeat(64)}\"", ""),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(
+                encoded.replace(",\"planSha256\":\"${"f".repeat(64)}\"", ""),
+            )
+        }
+    }
+
+    @Test
+    fun `v4 compatibility rejects malformed and unknown provenance fields`() {
+        val encoded = BundleJson.encodeCompatibility(
+            validContents().compatibility.copy(
+                schemaVersion = 4,
+                originalSourceSha256 = "e".repeat(64),
+                planSha256 = "f".repeat(64),
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(
+                encoded.replace("\"planSha256\":\"${"f".repeat(64)}\"", "\"planSha256\":\"${"F".repeat(64)}\""),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(encoded.dropLast(1) + ",\"unexpected\":true}")
+        }
+    }
+
+    @Test
+    fun `writer only records compatibility schemas three and four`() {
+        val legacy = validContents().copy(
+            compatibility = validContents().compatibility.copy(
+                schemaVersion = 2,
+                sourceSha256 = null,
+                browserProfileSha256 = null,
+            ),
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SixBundleContract.write(ByteArrayOutputStream(), legacy)
+        }
+    }
+
+    @Test
     fun `rejects unknown extension metadata keys`() {
         val malformed = rewrite(encoded(validContents())) { name, bytes ->
             if (name == SixBundleContract.EXTENSION_ENTRY) {

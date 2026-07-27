@@ -346,7 +346,7 @@ class BundleImportServiceTest {
             adapterDecisions = emptyList<ContractAdapterDecision>(),
             originalExtensionId = null,
             convertedExtensionId = descriptor.extensionId,
-            sourceSha256 = "2".repeat(64),
+            sourceSha256 = crx.zipSha256,
             browserProfileSha256 = "3".repeat(64),
         )
         val filter = ArchiveIntentFilter(

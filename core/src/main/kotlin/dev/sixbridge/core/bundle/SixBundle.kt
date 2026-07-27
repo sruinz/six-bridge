@@ -79,6 +79,16 @@ object SixBundle {
     fun encodeCompatibility(value: CompatibilityReport): String =
         BundleJson.encodeCompatibility(value.toContract()).prettyJson()
 
+    internal fun toContractV4(
+        compatibility: CompatibilityReport,
+        originalSourceSha256: String,
+        planSha256: String,
+    ): ContractCompatibilityReport = compatibility.toContract().copy(
+        schemaVersion = 4,
+        originalSourceSha256 = originalSourceSha256,
+        planSha256 = planSha256,
+    )
+
     private fun ExtensionDescriptor.toContract() = ContractExtensionDescriptor(
         schemaVersion = 1,
         extensionId = extensionId,
@@ -197,3 +207,12 @@ object SixBundle {
 
     private val presentationJson = Json { prettyPrint = true }
 }
+
+fun CompatibilityReport.toContractV4(
+    originalSourceSha256: String,
+    planSha256: String,
+): ContractCompatibilityReport = SixBundle.toContractV4(
+    this,
+    originalSourceSha256,
+    planSha256,
+)

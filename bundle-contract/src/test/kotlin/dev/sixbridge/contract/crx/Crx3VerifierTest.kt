@@ -25,6 +25,7 @@ class Crx3VerifierTest {
         assertEquals(sha256(packed.bytes), verified.crxSha256)
         assertEquals(packed.zipOffset, verified.zipOffset)
         assertEquals(packed.zipBytes.size, verified.zipLength)
+        assertEquals(sha256(packed.zipBytes), verified.zipSha256)
     }
 
     @Test
@@ -52,6 +53,7 @@ class Crx3VerifierTest {
         assertEquals(prefix.size + packed.zipOffset, verified.zipOffset)
         assertEquals(packed.zipBytes.size, verified.zipLength)
         assertEquals(sha256(packed.bytes), verified.crxSha256)
+        assertEquals(sha256(packed.zipBytes), verified.zipSha256)
     }
 
     @Test
