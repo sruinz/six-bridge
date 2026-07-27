@@ -6,6 +6,7 @@ class PortableExtensionInput private constructor(
     val kind: ExtensionInputKind,
     canonicalOriginalZip: ByteArray,
     originalCrx: ByteArray?,
+    internal val verifiedCrxPayloadSha256: String?,
     val expectedExtensionId: String?,
     val signedDraftSourceIdentity: String?,
 ) {
@@ -43,6 +44,7 @@ class PortableExtensionInput private constructor(
                 kind = kind,
                 canonicalOriginalZip = zipBytes,
                 originalCrx = null,
+                verifiedCrxPayloadSha256 = null,
                 expectedExtensionId = null,
                 signedDraftSourceIdentity = signedDraftSourceIdentity,
             )
@@ -77,6 +79,7 @@ class PortableExtensionInput private constructor(
                 kind = kind,
                 canonicalOriginalZip = parsed.zipBytes,
                 originalCrx = crxBytes,
+                verifiedCrxPayloadSha256 = Crx3.verifiedPayloadSha256(crxBytes),
                 expectedExtensionId = parsed.extensionId,
                 signedDraftSourceIdentity = signedDraftSourceIdentity,
             )

@@ -76,10 +76,26 @@ class ConversionPreparationEngine private constructor(
         val snapshot = workspace.snapshot(input.canonicalOriginalZip)
         val beforeRaw = analyzer.analyzeArchive(snapshot.sourceZip, profile)
         requireCrxManifestBinding(input, beforeRaw)
+        val originalSourceSha256 =
+            input.verifiedCrxPayloadSha256 ?: snapshot.sourceSha256
+        val before = beforeRaw.copy(
+            sourceSha256 = originalSourceSha256,
+        ).also(CompatibilityReport::validate)
         val originalExtensionId =
             input.expectedExtensionId ?: beforeRaw.manifestKeyExtensionId
         val plan = plan(beforeRaw, approvals)
-        val before = beforeRaw
+        val proofPlan = if (before == beforeRaw) {
+            plan
+        } else {
+            plan(before, approvals).also {
+                check(
+                    it.selectedAdapters.map(SelectedAdapter::toDecision) ==
+                        plan.selectedAdapters.map(SelectedAdapter::toDecision),
+                ) {
+                    "CRX payload provenance 정규화로 adapter 선택이 달라졌습니다."
+                }
+            }
+        }
         val transformed = plan.selectedAdapters.isNotEmpty()
         val applied = if (transformed) {
             workspace.transform(snapshot, profile, plan)
@@ -117,13 +133,18 @@ class ConversionPreparationEngine private constructor(
             } else {
                 null
             },
+            sourceSha256 = if (input.originalCrx != null && !transformed) {
+                originalSourceSha256
+            } else {
+                rawAfter.sourceSha256
+            },
         ).also(CompatibilityReport::validate)
         requireStableReplan(after, approvals, transformed)
         val reportSha256 = sha256(
             BundleJson.encodeCompatibility(
                 after.toContractV4(
-                    originalSourceSha256 = snapshot.sourceSha256,
-                    planSha256 = plan.proofSha256,
+                    originalSourceSha256 = originalSourceSha256,
+                    planSha256 = proofPlan.proofSha256,
                 ),
             ).toByteArray(UTF_8),
         )
@@ -131,9 +152,13 @@ class ConversionPreparationEngine private constructor(
         return PreparedConversion(
             compatibilityBefore = before,
             compatibilityAfter = after,
-            originalSourceSha256 = snapshot.sourceSha256,
-            transformedSourceSha256 = sha256(transformedArchive),
-            planSha256 = plan.proofSha256,
+            originalSourceSha256 = originalSourceSha256,
+            transformedSourceSha256 = if (passthrough != null) {
+                originalSourceSha256
+            } else {
+                sha256(transformedArchive)
+            },
+            planSha256 = proofPlan.proofSha256,
             reportSha256 = reportSha256,
             appliedAdapterIds = applied.mapTo(sortedSetOf()) { it.id },
             transformedSourceZip = transformedArchive,
