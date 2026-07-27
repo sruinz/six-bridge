@@ -108,8 +108,10 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
     ): PreparedConversionSnapshot {
+        var sourceKind = kind.name
         val prepared = if (kind == OnDeviceInputKind.SIX_DRAFT) {
             val draft = SixDraft.read(input.toPath())
+            sourceKind = draft.payload.input.inputKind.name
             if (draft.payload.input.browserProfileSha256 == profile.canonicalSha256()) {
                 when (
                     val replayed = SixDraftReplay().replay(
@@ -141,7 +143,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             logicalSourceIdentity = prepared.logicalSourceIdentity.toManagerIdentity(),
             descriptorName = requireNotNull(after.extensionName),
             descriptorVersion = requireNotNull(after.extensionVersion),
-            sourceKind = kind.name,
+            sourceKind = sourceKind,
             opaque = prepared,
         )
     }

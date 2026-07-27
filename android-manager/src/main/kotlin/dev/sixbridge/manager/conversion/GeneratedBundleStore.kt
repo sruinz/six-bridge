@@ -224,14 +224,20 @@ class GeneratedBundleStore internal constructor(
     }
 
     fun recover(token: String): GeneratedBundle = synchronized(lock) {
-        val canonicalToken = requireToken(token)
-        val (file, record) = requirePublished(canonicalToken)
-        GeneratedBundle(
-            token = canonicalToken,
-            file = file,
-            sha256 = record.sha256,
-            suggestedFileName = record.suggestedFileName,
-        )
+        try {
+            val canonicalToken = requireToken(token)
+            val (file, record) = requirePublished(canonicalToken)
+            GeneratedBundle(
+                token = canonicalToken,
+                file = file,
+                sha256 = record.sha256,
+                suggestedFileName = record.suggestedFileName,
+            )
+        } catch (error: GeneratedBundleStoreException) {
+            throw error
+        } catch (error: Throwable) {
+            throw error.asStoreFailure(GeneratedBundleStoreErrorCode.VERIFY_FAILED)
+        }
     }
 
     fun copyTo(token: String, output: OutputStream): String = synchronized(lock) {

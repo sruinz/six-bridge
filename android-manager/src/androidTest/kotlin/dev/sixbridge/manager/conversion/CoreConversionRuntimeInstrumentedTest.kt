@@ -1,8 +1,19 @@
 package dev.sixbridge.manager.conversion
 
 import android.os.Bundle
+import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.manager.app.RetainedImportStore
+import dev.sixbridge.manager.app.toReview
+import dev.sixbridge.manager.catalog.ManagerDatabase
+import dev.sixbridge.manager.importer.BundleImportService
+import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
+import dev.sixbridge.manager.importer.ImportResult
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
+import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
+import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.draft.DraftConversionPlan
 import dev.sixbridge.core.draft.DraftInputMetadata
@@ -23,11 +34,14 @@ import java.io.File
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -147,6 +161,13 @@ class CoreConversionRuntimeInstrumentedTest {
                 profile,
             )
             assertFalse(same.profileChanged)
+            val samePrepared = runtime.prepare(
+                draftFile,
+                OnDeviceInputKind.SIX_DRAFT,
+                profile,
+                same.requiredApprovals,
+            )
+            assertEquals("ZIP", samePrepared.sourceKind)
 
             val changedProfile = profile.copy(versionCode = profile.versionCode + 1)
             val changed = runtime.analyze(
@@ -168,6 +189,12 @@ class CoreConversionRuntimeInstrumentedTest {
             assertEquals(
                 changedProfile.canonicalSha256(),
                 newlyApproved.reportBefore.browserProfileSha256,
+            )
+            assertEquals("ZIP", newlyApproved.sourceKind)
+
+            packageDraftThroughDefaultPorts(
+                draftFile = draftFile,
+                profile = profile,
             )
         } finally {
             draftFile.delete()
@@ -222,6 +249,237 @@ class CoreConversionRuntimeInstrumentedTest {
             0,
             Bundle().apply { putString("stream", "$marker\n") },
         )
+    }
+
+    private fun packageDraftThroughDefaultPorts(
+        draftFile: File,
+        profile: BrowserProfile,
+    ) {
+        val database = Room.inMemoryDatabaseBuilder(
+            targetContext,
+            ManagerDatabase::class.java,
+        ).allowMainThreadQueries().build()
+        val artifactToken = UUID.randomUUID().toString()
+        val input = File(
+            targetContext.filesDir,
+            "draft-package-input/$artifactToken/input.bin",
+        ).apply {
+            requireNotNull(parentFile).mkdirs()
+            writeBytes(draftFile.readBytes())
+        }
+        val workRoot = File(
+            targetContext.filesDir,
+            "draft-package-work/${UUID.randomUUID()}",
+        )
+        val importCache = File(
+            targetContext.cacheDir,
+            "draft-package-import/${UUID.randomUUID()}",
+        )
+        val packager = OnDeviceWrapperPackager(targetContext)
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val generatedStore = GeneratedBundleStore(targetContext)
+        var failBeforeBundlePublish = true
+        var failAfterBundleTransition = true
+        val workStore = ConversionWorkStore(
+            privateRoot = workRoot,
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { stream ->
+                SixBundleContract.read(stream)
+                true
+            },
+            identityOwnerLifecycle = ledger.ownerLifecycle(packager),
+            hooks = ConversionWorkStoreHooks(
+                beforeBundleSourceOpen = {
+                    if (failBeforeBundlePublish) {
+                        failBeforeBundlePublish = false
+                        error("simulated process death before bundle publish")
+                    }
+                },
+                afterBundleTransition = {
+                    if (failAfterBundleTransition) {
+                        failAfterBundleTransition = false
+                        error("simulated process death after BUNDLE_READY commit")
+                    }
+                },
+            ),
+        )
+        val verifier = AndroidWrapperVerifier(
+            AndroidArchiveInspector(targetContext.packageManager),
+        )
+        val importer = BundleImportService(
+            source = GeneratedBundleStoreSource(generatedStore),
+            verifier = verifier,
+            cacheDirectory = importCache,
+        )
+        val retained = RetainedImportStore(File(importCache, "imports"), verifier)
+        val artifact = OnDeviceInputArtifact(
+            token = artifactToken,
+            kind = OnDeviceInputKind.SIX_DRAFT,
+            privateFile = input,
+            sha256 = sha256(input.readBytes()),
+            expectedExtensionId = null,
+        )
+        var importFailuresRemaining = 3
+        fun coordinator() = OnDeviceConversionCoordinator(
+            input = ConversionInputPort { artifact },
+            work = DefaultConversionWorkPort(workStore),
+            profiles = ConversionProfilePort {
+                SamsungProfileSnapshot.Supported(profile)
+            },
+            runtime = DefaultConversionRuntime(),
+            identities = DefaultConversionIdentityPort(ledger, packager),
+            installed = ConversionInstalledPort { null },
+            packages = DefaultConversionPackagePort(ledger, packager),
+            bundles = DefaultConversionBundlePort(generatedStore),
+            imports = ConversionGeneratedImportPort { generated ->
+                if (importFailuresRemaining-- > 0) {
+                    null
+                } else {
+                    when (val imported = importer.importGenerated(generated)) {
+                        is ImportResult.Failure -> null
+                        is ImportResult.Success -> {
+                            if (retained.save(imported.value)) {
+                                imported.value.toReview()
+                            } else {
+                                importer.discard(imported.value.token)
+                                null
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        var conversionToken: String? = null
+        try {
+            kotlinx.coroutines.runBlocking {
+                val firstCoordinator = coordinator()
+                val analysis = firstCoordinator.begin(
+                    OnDeviceInputRequest.Saf(
+                        android.net.Uri.fromFile(draftFile),
+                    ),
+                )
+                check(analysis is ConversionBeginResult.AnalysisReady)
+                conversionToken = analysis.token
+                val importFailed = firstCoordinator.build(
+                    token = analysis.token,
+                    approvedAdapterIds = analysis.requiredApprovals,
+                    partialConfirmed = true,
+                    identitySelection = null,
+                )
+                check(importFailed is ConversionBuildResult.Failure)
+                assertEquals(ConversionFailureCode.BUNDLE_IO, importFailed.code)
+                val building = requireNotNull(database.conversionJobDao().get())
+                assertEquals(ConversionJobStage.BUILDING.name, building.stage)
+                assertNotNull(
+                    database.conversionIdentityDao().getLeaseByOwnerToken(analysis.token),
+                )
+                assertTrue(
+                    File(
+                        targetContext.filesDir,
+                        "ondevice-packager-gate/${analysis.token}.apk",
+                    ).isFile,
+                )
+                assertTrue(requireNotNull(importFailed.generated).file.isFile)
+
+                val analyzed = firstCoordinator.analyze(analysis.token)
+                check(analyzed is ConversionBeginResult.Failure)
+                assertEquals(ConversionFailureCode.BUNDLE_IO, analyzed.code)
+                assertEquals(
+                    ConversionJobStage.BUILDING.name,
+                    requireNotNull(database.conversionJobDao().get()).stage,
+                )
+
+                val rebuilt = firstCoordinator.build(
+                    token = analysis.token,
+                    approvedAdapterIds = analysis.requiredApprovals,
+                    partialConfirmed = true,
+                    identitySelection = null,
+                )
+                check(rebuilt is ConversionBuildResult.Failure)
+                assertEquals(ConversionFailureCode.BUNDLE_IO, rebuilt.code)
+                assertEquals(
+                    ConversionJobStage.BUILDING.name,
+                    requireNotNull(database.conversionJobDao().get()).stage,
+                )
+
+                assertTrue(
+                    runCatching {
+                        coordinator().build(
+                            token = analysis.token,
+                            approvedAdapterIds = analysis.requiredApprovals,
+                            partialConfirmed = true,
+                            identitySelection = null,
+                        )
+                    }.isFailure,
+                )
+                assertEquals(
+                    ConversionJobStage.BUILDING.name,
+                    requireNotNull(database.conversionJobDao().get()).stage,
+                )
+                assertNull(
+                    database.conversionIdentityDao().getLeaseByOwnerToken(analysis.token),
+                )
+
+                assertTrue(
+                    runCatching {
+                        coordinator().build(
+                            token = analysis.token,
+                            approvedAdapterIds = analysis.requiredApprovals,
+                            partialConfirmed = true,
+                            identitySelection = null,
+                        )
+                    }.isFailure,
+                )
+                assertEquals(
+                    ConversionJobStage.BUNDLE_READY.name,
+                    requireNotNull(database.conversionJobDao().get()).stage,
+                )
+                val restored = coordinator().restore()
+                check(restored is RestoredConversion.BundleReady)
+                val ready = restored
+
+                val row = requireNotNull(database.conversionJobDao().get())
+                assertEquals(ConversionJobStage.BUNDLE_READY.name, row.stage)
+                assertEquals(analysis.token, row.token)
+                assertEquals(
+                    ConversionJobStage.BUNDLE_READY,
+                    requireNotNull(workStore.restorePreservingBuilding()).stage,
+                )
+                assertNull(
+                    database.conversionIdentityDao().getLeaseByOwnerToken(analysis.token),
+                )
+                assertFalse(
+                    File(
+                        targetContext.filesDir,
+                        "ondevice-packager-gate/${analysis.token}.apk",
+                    ).exists(),
+                )
+                assertTrue(ready.generated.file.isFile)
+                val contents =
+                    ready.generated.file.inputStream().use(SixBundleContract::read)
+                assertEquals("ZIP", contents.extension.sourceKind)
+                assertTrue(
+                    File(
+                        workRoot,
+                        "${analysis.token}/${requireNotNull(row.bundleFileName)}",
+                    ).isFile,
+                )
+                val retainedReview = retained.load(ready.review.token)
+                assertNotNull(retainedReview)
+                assertTrue(requireNotNull(retainedReview).wrapperFile.isFile)
+            }
+        } finally {
+            kotlinx.coroutines.runBlocking {
+                conversionToken?.let {
+                    runCatching { ledger.abortByOwnerToken(it, packager) }
+                    runCatching { coordinator().discard(it) }
+                }
+            }
+            database.close()
+            input.parentFile?.deleteRecursively()
+            workRoot.deleteRecursively()
+            importCache.deleteRecursively()
+        }
     }
 
     private fun profile() = BrowserProfile(

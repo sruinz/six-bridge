@@ -40,9 +40,23 @@ internal class OnDeviceConversionCoordinator(
     }
 
     suspend fun analyze(token: String): ConversionBeginResult {
-        val job = work.restore()
+        val job = work.restoreBuildAware()
             ?: return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
-        if (job.token != token || job.stage == ConversionJobStage.BUNDLE_READY) {
+        if (job.token != token) {
+            return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+        }
+        if (job.stage == ConversionJobStage.BUILDING) {
+            return when (val reconciled = reconcileBuilding(job)) {
+                is RestoredConversion.Analysis -> reconciled.value
+                is RestoredConversion.GeneratedPending ->
+                    ConversionBeginResult.Failure(ConversionFailureCode.BUNDLE_IO, job.token)
+                is RestoredConversion.BundleReady ->
+                    ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, job.token)
+                null ->
+                    ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, job.token)
+            }
+        }
+        if (job.stage == ConversionJobStage.BUNDLE_READY) {
             return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
         return analyzeJob(
@@ -57,10 +71,34 @@ internal class OnDeviceConversionCoordinator(
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
     ): ConversionBuildResult = buildMutex.withLock {
-        val job = work.restore()
+        var job = work.restoreBuildAware()
             ?: return@withLock ConversionBuildResult.Failure(
                 ConversionFailureCode.INPUT_INVALID,
             )
+        if (job.token == token && job.stage == ConversionJobStage.BUILDING) {
+            when (val reconciled = reconcileBuilding(job)) {
+                is RestoredConversion.BundleReady ->
+                    return@withLock ConversionBuildResult.BundleReady(
+                        reconciled.review,
+                        reconciled.generated,
+                    )
+                is RestoredConversion.GeneratedPending ->
+                    return@withLock ConversionBuildResult.Failure(
+                        ConversionFailureCode.BUNDLE_IO,
+                        reconciled.generated,
+                    )
+                is RestoredConversion.Analysis -> {
+                    job = work.restoreBuildAware()
+                        ?: return@withLock ConversionBuildResult.Failure(
+                            ConversionFailureCode.INPUT_INVALID,
+                        )
+                }
+                null ->
+                    return@withLock ConversionBuildResult.Failure(
+                        ConversionFailureCode.INPUT_INVALID,
+                    )
+            }
+        }
         if (job.token != token || job.stage != ConversionJobStage.AWAITING_APPROVAL) {
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
@@ -221,23 +259,7 @@ internal class OnDeviceConversionCoordinator(
     override suspend fun restore(): RestoredConversion? {
         val job = work.restoreBuildAware() ?: return null
         if (job.stage == ConversionJobStage.BUILDING) {
-            val generated = bundles.recover(job.token)
-            if (generated != null) {
-                val review = imports.importGenerated(generated)
-                    ?: return RestoredConversion.GeneratedPending(generated)
-                abortOwner(job.token)
-                work.markBundleReady(job.token, generated.file, generated.sha256)
-                return RestoredConversion.BundleReady(review, generated)
-            }
-            val profileSha256 = requireNotNull(job.profileSha256)
-            recoverFailedBuild(job.token, profileSha256)
-            return analyzeJob(
-                job.copy(stage = ConversionJobStage.AWAITING_APPROVAL),
-                markAwaiting = false,
-            ).let {
-                (it as? ConversionBeginResult.AnalysisReady)
-                    ?.let(RestoredConversion::Analysis)
-            }
+            return reconcileBuilding(job)
         }
         if (job.stage == ConversionJobStage.BUNDLE_READY) {
             val generated = bundles.recover(job.token) ?: return null
@@ -254,14 +276,32 @@ internal class OnDeviceConversionCoordinator(
 
     override suspend fun discard(token: String): Boolean {
         abortOwner(token)
-        bundles.recover(token)?.let {
-            if (!bundles.discard(token)) return false
-        }
+        bundles.discard(token)
         return work.discard(token)
     }
 
     override fun copyGenerated(token: String, output: OutputStream): String? =
         bundles.recover(token)?.let { bundles.copyTo(token, output) }
+
+    private suspend fun reconcileBuilding(job: RestoredConversionJob): RestoredConversion? {
+        val generated = bundles.recover(job.token)
+        if (generated != null) {
+            val review = imports.importGenerated(generated)
+                ?: return RestoredConversion.GeneratedPending(generated)
+            abortOwner(job.token)
+            work.markBundleReady(job.token, generated.file, generated.sha256)
+            return RestoredConversion.BundleReady(review, generated)
+        }
+        val profileSha256 = requireNotNull(job.profileSha256)
+        recoverFailedBuild(job.token, profileSha256)
+        return analyzeJob(
+            job.copy(stage = ConversionJobStage.AWAITING_APPROVAL),
+            markAwaiting = false,
+        ).let {
+            (it as? ConversionBeginResult.AnalysisReady)
+                ?.let(RestoredConversion::Analysis)
+        }
+    }
 
     private suspend fun analyzeJob(
         job: RestoredConversionJob,

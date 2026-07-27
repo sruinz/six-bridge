@@ -55,7 +55,7 @@ class OnDeviceConversionCoordinatorTest {
                 "profile",
                 "analyze",
                 "awaiting",
-                "restore",
+                "restore-build-aware",
                 "profile",
                 "analyze",
                 "prepare",
@@ -388,6 +388,59 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `import 실패 직후 build 재호출은 normal restore로 BUILDING을 파괴하지 않는다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                importFailuresRemaining = 1
+                normalRestoreDestroysBuilding = true
+            }
+            val coordinator = fixture.coordinator()
+            val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+            )
+            assertIs<ConversionBuildResult.Failure>(
+                coordinator.build(analysis.token, analysis.requiredApprovals, true, null),
+            )
+
+            val retried = assertIs<ConversionBuildResult.BundleReady>(
+                coordinator.build(analysis.token, analysis.requiredApprovals, true, null),
+            )
+
+            assertEquals(fixture.token, retried.generated.token)
+            assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
+            assertTrue(!fixture.normalRestoreDestroyedBuilding)
+        }
+
+    @Test
+    fun `import 실패 직후 analyze와 재생성 build도 BUILDING generated를 조정한다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                importFailuresRemaining = 2
+                normalRestoreDestroysBuilding = true
+            }
+            val first = fixture.coordinator()
+            val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                first.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+            )
+            assertIs<ConversionBuildResult.Failure>(
+                first.build(analysis.token, analysis.requiredApprovals, true, null),
+            )
+
+            val analyzed = assertIs<ConversionBeginResult.Failure>(
+                first.analyze(analysis.token),
+            )
+            assertEquals(ConversionFailureCode.BUNDLE_IO, analyzed.code)
+            assertEquals(ConversionJobStage.BUILDING, fixture.stage)
+            assertTrue(!fixture.normalRestoreDestroyedBuilding)
+
+            val recreated = fixture.coordinator()
+            assertIs<ConversionBuildResult.BundleReady>(
+                recreated.build(analysis.token, analysis.requiredApprovals, true, null),
+            )
+            assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
+        }
+
+    @Test
     fun `begin 뒤 원본 변이는 재분석에서 차단하고 reserve하지 않는다`() = runTest {
         val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
             verifiedInputFailureCall = 2
@@ -595,6 +648,22 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue(fixture.workDiscarded)
     }
 
+    @Test
+    fun `손상 generated는 recover되지 않아도 명시적 discard가 제거한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            bundleRecoverReturnsNull = true
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        assertTrue(coordinator.discard(analysis.token))
+
+        assertTrue(!fixture.generatedFile.isFile)
+        assertTrue(fixture.workDiscarded)
+    }
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
@@ -602,7 +671,7 @@ class OnDeviceConversionCoordinatorTest {
         val token = "11111111-1111-4111-8111-111111111111"
         val inputFile = folder.newFile("${UUID.randomUUID()}.input")
             .apply { writeText("input") }
-        private val generatedFile = folder.newFile("${UUID.randomUUID()}.six")
+        val generatedFile = folder.newFile("${UUID.randomUUID()}.six")
             .apply { writeText("bundle") }
         var currentProfile = profile()
         var profileResult: SamsungProfileSnapshot = SamsungProfileSnapshot.Supported(currentProfile)
@@ -631,6 +700,9 @@ class OnDeviceConversionCoordinatorTest {
         private var concurrentPackages = 0
         var maximumConcurrentPackages = 0
             private set
+        var normalRestoreDestroysBuilding = false
+        var normalRestoreDestroyedBuilding = false
+        var bundleRecoverReturnsNull = false
         var activeOwner: String? = null
         var ownerAborted = false
         var workDiscarded = false
@@ -655,6 +727,19 @@ class OnDeviceConversionCoordinatorTest {
 
                 override suspend fun restore(): RestoredConversionJob? {
                     events += "restore"
+                    if (
+                        normalRestoreDestroysBuilding &&
+                        stage == ConversionJobStage.BUILDING
+                    ) {
+                        normalRestoreDestroyedBuilding = true
+                        stage = ConversionJobStage.INPUT_READY
+                        storedProfile = null
+                    }
+                    return job()
+                }
+
+                override suspend fun restoreBuildAware(): RestoredConversionJob {
+                    events += "restore-build-aware"
                     return job()
                 }
 
@@ -841,7 +926,11 @@ class OnDeviceConversionCoordinatorTest {
                 }
 
                 override fun recover(token: String): GeneratedBundle? =
-                    GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
+                    if (bundleRecoverReturnsNull) {
+                        null
+                    } else {
+                        GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
+                    }
 
                 override fun discard(token: String): Boolean = generatedFile.delete()
 

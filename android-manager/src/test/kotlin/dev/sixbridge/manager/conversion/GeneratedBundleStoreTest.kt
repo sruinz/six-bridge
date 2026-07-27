@@ -72,6 +72,22 @@ class GeneratedBundleStoreTest {
     }
 
     @Test
+    fun `손상되거나 부분 기록된 owned bundle도 recover 없이 discard한다`() {
+        val root = File(filesDir, "generated-bundles").apply { mkdirs() }
+        val corrupt = File(root, "$token.six").apply {
+            writeText("partial bundle")
+        }
+        val store = store()
+
+        assertFailsWith<GeneratedBundleStoreException> {
+            store.recover(token)
+        }
+        assertTrue(store.discard(token))
+        assertFalse(corrupt.exists())
+        assertFalse(store.discard(token))
+    }
+
+    @Test
     fun `비정렬 v4 report는 package publish restart에서 canonical JSON identity를 유지한다`() {
         val original = result()
         val unsorted = original.compatibility.copy(
