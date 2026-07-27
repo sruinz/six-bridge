@@ -97,7 +97,7 @@ class AndroidWrapperVerifierTest {
     fun `managed temporary root의 process death CRX orphan을 시작 시 정리한다`() {
         val directory = Files.createTempDirectory("wrapper-verifier-managed-temp").toFile()
         try {
-            val orphan = File(directory, ".sixbridge-wrapper-crx-interrupted.tmp").apply {
+            val orphan = File(directory, ".sixbridge-wrapper-crx-101.tmp").apply {
                 writeText("sensitive extension payload")
             }
 

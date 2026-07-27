@@ -26,6 +26,113 @@ interface ConversionIdentityDao {
     @Update
     suspend fun update(entity: ConversionIdentityEntity)
 
+    @Query("SELECT * FROM conversion_identity_leases WHERE identitySha256 = :identitySha256")
+    suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity?
+
+    @Insert
+    suspend fun insertLease(entity: ConversionIdentityLeaseEntity)
+
+    @Query(
+        """
+        UPDATE conversion_identity_leases
+        SET state = 'READY',
+            extensionId = :extensionId,
+            packageName = :packageName,
+            wrapperSignerSha256 = :wrapperSignerSha256,
+            crxPublicKeySha256 = :crxPublicKeySha256
+        WHERE identitySha256 = :identitySha256
+          AND ownerToken = :ownerToken
+          AND state = 'PENDING'
+        """,
+    )
+    suspend fun markLeaseReady(
+        identitySha256: String,
+        ownerToken: String,
+        extensionId: String,
+        packageName: String,
+        wrapperSignerSha256: String,
+        crxPublicKeySha256: String,
+    ): Int
+
+    @Query(
+        """
+        UPDATE conversion_identity_leases
+        SET state = :nextState
+        WHERE identitySha256 = :identitySha256
+          AND ownerToken = :ownerToken
+          AND state = :expectedState
+        """,
+    )
+    suspend fun transitionLease(
+        identitySha256: String,
+        ownerToken: String,
+        expectedState: String,
+        nextState: String,
+    ): Int
+
+    @Query(
+        """
+        UPDATE conversion_identity_leases
+        SET state = 'RESERVED',
+            ownerToken = :reservationOwnerToken,
+            reservedVersionCode = :reservedVersionCode
+        WHERE identitySha256 = :identitySha256
+          AND ownerToken = :readyOwnerToken
+          AND state = 'READY'
+        """,
+    )
+    suspend fun consumeReadyLease(
+        identitySha256: String,
+        readyOwnerToken: String,
+        reservationOwnerToken: String,
+        reservedVersionCode: Int,
+    ): Int
+
+    @Query(
+        """
+        DELETE FROM conversion_identity_leases
+        WHERE identitySha256 = :identitySha256
+          AND ownerToken = :ownerToken
+          AND state = :state
+        """,
+    )
+    suspend fun deleteLease(
+        identitySha256: String,
+        ownerToken: String,
+        state: String,
+    ): Int
+
+    @Transaction
+    suspend fun claimCleanup(
+        identitySha256: String,
+        ownerToken: String,
+    ) {
+        require(get(identitySha256) == null) {
+            "원장에 예약된 CRX 신원은 미예약 cleanup으로 삭제할 수 없습니다."
+        }
+        val lease = getLease(identitySha256)
+            ?: throw IllegalArgumentException("정리할 identity lease를 찾을 수 없습니다.")
+        require(lease.ownerToken == ownerToken) {
+            "정리할 identity lease owner가 일치하지 않습니다."
+        }
+        when (lease.state) {
+            ConversionIdentityLeaseState.CLEANING.name -> Unit
+            ConversionIdentityLeaseState.PENDING.name,
+            ConversionIdentityLeaseState.READY.name,
+            -> check(
+                transitionLease(
+                    identitySha256 = identitySha256,
+                    ownerToken = ownerToken,
+                    expectedState = lease.state,
+                    nextState = ConversionIdentityLeaseState.CLEANING.name,
+                ) == 1,
+            ) {
+                "identity cleanup lease를 원자적으로 claim하지 못했습니다."
+            }
+            else -> throw IllegalArgumentException("예약 또는 package 중인 identity는 정리할 수 없습니다.")
+        }
+    }
+
     @Query(
         """
         SELECT * FROM conversion_identities
@@ -42,6 +149,10 @@ interface ConversionIdentityDao {
     suspend fun reserve(
         requested: ConversionIdentityEntity,
         installedVersionCode: Long?,
+        readyOwnerToken: String?,
+        reservationOwnerToken: String,
+        createdAtEpochMillis: Long,
+        crxPublicKeySha256: String?,
     ): ConversionIdentityEntity {
         require(installedVersionCode == null || installedVersionCode >= 0) {
             "설치본 versionCode가 올바르지 않습니다."
@@ -51,6 +162,27 @@ interface ConversionIdentityDao {
         }
         val current = get(requested.identitySha256)
         if (current != null) requireIdentityFieldsMatch(current, requested)
+        val lease = getLease(requested.identitySha256)
+        if (current == null && requested.mode == InstallationIdentityMode.CONVERTED.name) {
+            require(readyOwnerToken != null) {
+                "새 converted 신원에는 READY lease capability가 필요합니다."
+            }
+            requireReadyLeaseMatches(
+                requireNotNull(lease) { "새 converted 신원의 READY lease가 없습니다." },
+                requested,
+                readyOwnerToken,
+                requireNotNull(crxPublicKeySha256) {
+                    "새 converted 신원의 공개 키 proof가 없습니다."
+                },
+            )
+        } else {
+            require(readyOwnerToken == null) {
+                "기존 또는 passthrough 신원에는 READY lease capability를 사용할 수 없습니다."
+            }
+            require(lease == null) {
+                "설치 신원에 처리 중인 lease가 있습니다."
+            }
+        }
         requireNoCrossIdentityBindingCollision(
             requested,
             findByExtensionId(requested.extensionId),
@@ -86,7 +218,68 @@ interface ConversionIdentityDao {
         } else {
             update(stored)
         }
+        if (lease == null) {
+            insertLease(
+                ConversionIdentityLeaseEntity(
+                    identitySha256 = stored.identitySha256,
+                    crxKeyAlias = stored.crxKeyAlias,
+                    ownerToken = reservationOwnerToken,
+                    state = ConversionIdentityLeaseState.RESERVED.name,
+                    createdAtEpochMillis = createdAtEpochMillis,
+                    extensionId = stored.extensionId,
+                    packageName = stored.packageName,
+                    wrapperSignerSha256 = stored.wrapperSignerSha256,
+                    crxPublicKeySha256 = crxPublicKeySha256,
+                    reservedVersionCode = stored.lastReservedVersionCode,
+                ),
+            )
+        } else {
+            check(
+                consumeReadyLease(
+                    identitySha256 = stored.identitySha256,
+                    readyOwnerToken = requireNotNull(readyOwnerToken),
+                    reservationOwnerToken = reservationOwnerToken,
+                    reservedVersionCode = stored.lastReservedVersionCode,
+                ) == 1,
+            ) {
+                "READY lease 예약을 원자적으로 소비하지 못했습니다."
+            }
+        }
         return stored
+    }
+
+    @Transaction
+    suspend fun claimForPackaging(
+        requested: ConversionIdentityEntity,
+        versionCode: Int,
+        ownerToken: String,
+        crxPublicKeySha256: String?,
+    ) {
+        val current = get(requested.identitySha256)
+            ?: throw IllegalArgumentException("예약된 설치 신원을 찾을 수 없습니다.")
+        requireIdentityFieldsMatch(current, requested)
+        require(current.lastReservedVersionCode == versionCode) {
+            "현재 원장 versionCode와 package 예약이 일치하지 않습니다."
+        }
+        val lease = getLease(requested.identitySha256)
+            ?: throw IllegalArgumentException("package 예약 lease를 찾을 수 없습니다.")
+        requireReservedLeaseMatches(
+            lease = lease,
+            requested = requested,
+            ownerToken = ownerToken,
+            versionCode = versionCode,
+            crxPublicKeySha256 = crxPublicKeySha256,
+        )
+        check(
+            transitionLease(
+                identitySha256 = requested.identitySha256,
+                ownerToken = ownerToken,
+                expectedState = ConversionIdentityLeaseState.RESERVED.name,
+                nextState = ConversionIdentityLeaseState.PACKAGING.name,
+            ) == 1,
+        ) {
+            "package 예약을 원자적으로 소비하지 못했습니다."
+        }
     }
 }
 
@@ -124,5 +317,46 @@ private fun requireIdentityFieldsMatch(
     }
     require(current.crxKeyAlias == requested.crxKeyAlias) {
         "CRX key alias가 기존 대상과 일치하지 않습니다."
+    }
+}
+
+private fun requireReadyLeaseMatches(
+    lease: ConversionIdentityLeaseEntity,
+    requested: ConversionIdentityEntity,
+    ownerToken: String,
+    crxPublicKeySha256: String,
+) {
+    require(
+        lease.ownerToken == ownerToken &&
+            lease.state == ConversionIdentityLeaseState.READY.name &&
+            lease.crxKeyAlias == requested.crxKeyAlias &&
+            lease.extensionId == requested.extensionId &&
+            lease.packageName == requested.packageName &&
+            lease.wrapperSignerSha256 == requested.wrapperSignerSha256 &&
+            lease.crxPublicKeySha256 == crxPublicKeySha256 &&
+            lease.reservedVersionCode == null,
+    ) {
+        "READY lease proof가 예약 binding과 일치하지 않습니다."
+    }
+}
+
+private fun requireReservedLeaseMatches(
+    lease: ConversionIdentityLeaseEntity,
+    requested: ConversionIdentityEntity,
+    ownerToken: String,
+    versionCode: Int,
+    crxPublicKeySha256: String?,
+) {
+    require(
+        lease.ownerToken == ownerToken &&
+            lease.state == ConversionIdentityLeaseState.RESERVED.name &&
+            lease.crxKeyAlias == requested.crxKeyAlias &&
+            lease.extensionId == requested.extensionId &&
+            lease.packageName == requested.packageName &&
+            lease.wrapperSignerSha256 == requested.wrapperSignerSha256 &&
+            lease.crxPublicKeySha256 == crxPublicKeySha256 &&
+            lease.reservedVersionCode == versionCode,
+    ) {
+        "package 예약 lease proof가 현재 binding 또는 version과 일치하지 않습니다."
     }
 }

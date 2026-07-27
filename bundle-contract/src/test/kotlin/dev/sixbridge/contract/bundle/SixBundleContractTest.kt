@@ -6,6 +6,7 @@ import java.io.File
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.zip.CRC32
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -31,6 +32,9 @@ class SixBundleContractTest {
                 listOf("wrapper.apk", "extension.json", "compatibility.json"),
                 zip.entries().asSequence().map { it.name }.toList(),
             )
+            val wrapper = requireNotNull(zip.getEntry(SixBundleContract.WRAPPER_ENTRY))
+            assertEquals(ZipEntry.STORED, wrapper.method)
+            assertEquals(wrapper.size, wrapper.compressedSize)
         }
     }
 
@@ -224,8 +228,10 @@ class SixBundleContractTest {
             extension = validContents().extension.copy(wrapperSha256 = sha256(wrapper)),
         )
 
+        val untrustedDeflated = rewrite(encoded(contents)) { _, bytes -> bytes }
+
         assertFailsWith<IllegalArgumentException> {
-            SixBundleContract.read(ByteArrayInputStream(encoded(contents)))
+            SixBundleContract.read(ByteArrayInputStream(untrustedDeflated))
         }
     }
 
@@ -236,7 +242,8 @@ class SixBundleContractTest {
             wrapperApk = wrapper,
             extension = validContents().extension.copy(wrapperSha256 = sha256(wrapper)),
         )
-        val padded = withLocalCentralPadding(encoded(contents), 256 * 1024)
+        val untrustedDeflated = rewrite(encoded(contents)) { _, bytes -> bytes }
+        val padded = withLocalCentralPadding(untrustedDeflated, 256 * 1024)
 
         assertFailsWith<IllegalArgumentException> {
             SixBundleContract.read(ByteArrayInputStream(padded))
@@ -359,7 +366,7 @@ class SixBundleContractTest {
         ZipInputStream(ByteArrayInputStream(archive)).use { input ->
             ZipOutputStream(output).use { zip ->
                 generateSequence { input.nextEntry }.forEach { entry ->
-                    zip.putNextEntry(entry)
+                    zip.putNextEntry(ZipEntry(entry.name).apply { time = 0L })
                     zip.write(transform(entry.name, input.readBytes()))
                     zip.closeEntry()
                 }

@@ -7,9 +7,17 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionIdentityEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityLeaseEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityReservation
+import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.ConversionJobEntity
 import dev.sixbridge.manager.conversion.ConversionJobStage
 import dev.sixbridge.manager.conversion.ConversionWorkStore
+import dev.sixbridge.manager.conversion.InstallationIdentityKey
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
+import dev.sixbridge.manager.conversion.LogicalSourceIdentity
+import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import dev.sixbridge.manager.conversion.encodeCleanupTokens
 import java.io.File
 import java.security.MessageDigest
@@ -304,32 +312,41 @@ class ManagerDatabaseTest {
     }
 
     @Test
-    fun conversion_identity_room_transaction_serializes_concurrent_reservations() =
+    fun conversion_identity_room_transaction_allows_only_one_active_reservation() =
         runBlocking {
             val dao = database.conversionIdentityDao()
             val entity = ConversionIdentityEntity(
                 identitySha256 = "1".repeat(64),
                 logicalSourceIdentity = "project:${"1".repeat(32)}",
                 profileMajorVersion = 30,
-                mode = "CONVERTED",
+                mode = "PASSTHROUGH",
                 displayName = "Room transaction",
                 extensionId = "a".repeat(32),
                 packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
                 wrapperSignerSha256 = "2".repeat(64),
-                crxKeyAlias = "sixbridge-crx-room",
+                crxKeyAlias = null,
                 lastReservedVersionCode = 0,
             )
 
             val reserved = coroutineScope {
                 List(8) {
                     async(Dispatchers.Default) {
-                        dao.reserve(entity, installedVersionCode = null)
-                            .lastReservedVersionCode
+                        runCatching {
+                            dao.reserve(
+                                requested = entity,
+                                installedVersionCode = null,
+                                readyOwnerToken = null,
+                                reservationOwnerToken = "room-owner-$it",
+                                createdAtEpochMillis = it.toLong(),
+                                crxPublicKeySha256 = null,
+                            )
+                        }
                     }
                 }.awaitAll()
             }
 
-            assertEquals((1..8).toSet(), reserved.toSet())
+            assertEquals(1, reserved.count { it.isSuccess })
+            assertEquals(1, reserved.single { it.isSuccess }.getOrThrow().lastReservedVersionCode)
         }
 
     @Test
@@ -340,12 +357,12 @@ class ManagerDatabaseTest {
                 identitySha256 = "1".repeat(64),
                 logicalSourceIdentity = "project:${"1".repeat(32)}",
                 profileMajorVersion = 30,
-                mode = "CONVERTED",
+                mode = "PASSTHROUGH",
                 displayName = "First",
                 extensionId = "a".repeat(32),
                 packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
                 wrapperSignerSha256 = "2".repeat(64),
-                crxKeyAlias = "sixbridge-crx-room-unique",
+                crxKeyAlias = null,
                 lastReservedVersionCode = 0,
             )
             val competing = base.copy(
@@ -356,9 +373,18 @@ class ManagerDatabaseTest {
             )
 
             val results = coroutineScope {
-                listOf(base, competing).map { candidate ->
+                listOf(base, competing).mapIndexed { index, candidate ->
                     async(Dispatchers.Default) {
-                        runCatching { dao.reserve(candidate, null) }
+                        runCatching {
+                            dao.reserve(
+                                requested = candidate,
+                                installedVersionCode = null,
+                                readyOwnerToken = null,
+                                reservationOwnerToken = "unique-owner-$index",
+                                createdAtEpochMillis = index.toLong(),
+                                crxPublicKeySha256 = null,
+                            )
+                        }
                     }
                 }.awaitAll()
             }
@@ -374,7 +400,140 @@ class ManagerDatabaseTest {
                 mode = "PASSTHROUGH",
                 crxKeyAlias = null,
             )
-            assertTrue(runCatching { dao.reserve(passthrough, null) }.isFailure)
+            assertTrue(
+                runCatching {
+                    dao.reserve(
+                        requested = passthrough,
+                        installedVersionCode = null,
+                        readyOwnerToken = null,
+                        reservationOwnerToken = "collision-owner",
+                        createdAtEpochMillis = 2,
+                        crxPublicKeySha256 = null,
+                    )
+                }.isFailure,
+            )
+        }
+
+    @Test
+    fun conversion_identity_claim_rejects_old_version_and_forged_owner() = runBlocking {
+        val owners = ArrayDeque(
+            listOf(
+                java.util.UUID.fromString("00000000-0000-4000-8000-000000000001"),
+                java.util.UUID.fromString("00000000-0000-4000-8000-000000000002"),
+            ),
+        )
+        val ledger = ConversionIdentityLedger(
+            dao = database.conversionIdentityDao(),
+            ownerTokenFactory = { owners.removeFirst() },
+        )
+        val key = InstallationIdentityKey.create(
+            LogicalSourceIdentity.storeExtensionId("a".repeat(32)),
+            30,
+            InstallationIdentityMode.PASSTHROUGH,
+        )
+        val request = ConversionIdentityReservation(
+            identityKey = key,
+            displayName = "opaque capability",
+            packageBinding = ConversionPackageBinding(
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "b".repeat(64),
+                crxKeyAlias = null,
+                crxPublicKeySha256 = null,
+            ),
+            installedVersionCode = null,
+        )
+
+        val first = ledger.reserve(request)
+        val firstClaim = ledger.claimForPackaging(first)
+        ledger.finishPackaging(firstClaim, succeeded = true)
+        val second = ledger.reserve(request)
+
+        assertTrue(runCatching { ledger.claimForPackaging(first) }.isFailure)
+        val forged = ReservedConversionIdentity(
+            identityKey = second.identityKey,
+            extensionId = second.extensionId,
+            packageName = second.packageName,
+            wrapperSignerSha256 = second.wrapperSignerSha256,
+            crxKeyAlias = second.crxKeyAlias,
+            crxPublicKeySha256 = second.crxPublicKeySha256,
+            versionCode = second.versionCode,
+            ownerToken = "00000000-0000-4000-8000-000000000099",
+        )
+        assertTrue(runCatching { ledger.claimForPackaging(forged) }.isFailure)
+        val secondClaim = ledger.claimForPackaging(second)
+        ledger.finishPackaging(secondClaim, succeeded = true)
+    }
+
+    @Test
+    fun conversion_identity_ready_reserve_and_cleanup_race_has_one_durable_winner() =
+        runBlocking {
+            val dao = database.conversionIdentityDao()
+            val identitySha256 = "5".repeat(64)
+            val alias = "sixbridge.crx.rsa.v1.$identitySha256"
+            dao.insertLease(
+                ConversionIdentityLeaseEntity(
+                    identitySha256 = identitySha256,
+                    crxKeyAlias = alias,
+                    ownerToken = "00000000-0000-4000-8000-000000000010",
+                    state = "READY",
+                    createdAtEpochMillis = 1,
+                    extensionId = "c".repeat(32),
+                    packageName = "dev.sixbridge.ext.${"c".repeat(32)}",
+                    wrapperSignerSha256 = "d".repeat(64),
+                    crxPublicKeySha256 = "e".repeat(64),
+                    reservedVersionCode = null,
+                ),
+            )
+            val requested = ConversionIdentityEntity(
+                identitySha256 = identitySha256,
+                logicalSourceIdentity = "project:${"5".repeat(32)}",
+                profileMajorVersion = 30,
+                mode = "CONVERTED",
+                displayName = "reserve-cleanup race",
+                extensionId = "c".repeat(32),
+                packageName = "dev.sixbridge.ext.${"c".repeat(32)}",
+                wrapperSignerSha256 = "d".repeat(64),
+                crxKeyAlias = alias,
+                lastReservedVersionCode = 0,
+            )
+
+            val outcomes = coroutineScope {
+                listOf(
+                    async(Dispatchers.Default) {
+                        runCatching {
+                            dao.reserve(
+                                requested = requested,
+                                installedVersionCode = null,
+                                readyOwnerToken = "00000000-0000-4000-8000-000000000010",
+                                reservationOwnerToken = "00000000-0000-4000-8000-000000000011",
+                                createdAtEpochMillis = 2,
+                                crxPublicKeySha256 = "e".repeat(64),
+                            )
+                        }
+                    },
+                    async(Dispatchers.Default) {
+                        runCatching {
+                            dao.claimCleanup(
+                                identitySha256,
+                                "00000000-0000-4000-8000-000000000010",
+                            )
+                        }
+                    },
+                ).awaitAll()
+            }
+
+            assertEquals(1, outcomes.count { it.isSuccess })
+            val identity = dao.get(identitySha256)
+            val lease = requireNotNull(dao.getLease(identitySha256))
+            if (identity == null) {
+                assertEquals("CLEANING", lease.state)
+                assertEquals("00000000-0000-4000-8000-000000000010", lease.ownerToken)
+            } else {
+                assertEquals("RESERVED", lease.state)
+                assertEquals("00000000-0000-4000-8000-000000000011", lease.ownerToken)
+                assertEquals(1, identity.lastReservedVersionCode)
+            }
         }
 
     @Test
@@ -592,6 +751,62 @@ class ManagerDatabaseTest {
     }
 
     @Test
+    fun migration_3_to_4_preserves_identity_and_creates_empty_durable_lease_ledger() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(MIGRATION_V3_DATABASE)
+        migrationHelper.createDatabase(MIGRATION_V3_DATABASE, 3).apply {
+            execSQL(
+                """
+                INSERT INTO conversion_identities (
+                    identitySha256, logicalSourceIdentity, profileMajorVersion, mode,
+                    displayName, extensionId, packageName, wrapperSignerSha256,
+                    crxKeyAlias, lastReservedVersionCode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "1".repeat(64),
+                    "project:${"1".repeat(32)}",
+                    30,
+                    "CONVERTED",
+                    "Fold7 preserved identity",
+                    "a".repeat(32),
+                    "dev.sixbridge.ext.${"a".repeat(32)}",
+                    "2".repeat(64),
+                    "sixbridge-crx-v3",
+                    17,
+                ),
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_V3_DATABASE,
+            4,
+            true,
+            ManagerDatabase.MIGRATION_3_4,
+        )
+        migrated.query(
+            """
+            SELECT displayName, crxKeyAlias, lastReservedVersionCode
+            FROM conversion_identities WHERE identitySha256 = ?
+            """.trimIndent(),
+            arrayOf("1".repeat(64)),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("Fold7 preserved identity", cursor.getString(0))
+            assertEquals("sixbridge-crx-v3", cursor.getString(1))
+            assertEquals(17, cursor.getInt(2))
+            assertFalse(cursor.moveToNext())
+        }
+        migrated.query("SELECT COUNT(*) FROM conversion_identity_leases").use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(0, cursor.getInt(0))
+        }
+        migrated.close()
+        context.deleteDatabase(MIGRATION_V3_DATABASE)
+    }
+
+    @Test
     fun migration_2_to_3_first_restore_preserves_input_for_every_old_job_stage() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val now = System.currentTimeMillis()
@@ -678,7 +893,10 @@ class ManagerDatabaseTest {
                 context,
                 ManagerDatabase::class.java,
                 databaseName,
-            ).addMigrations(ManagerDatabase.MIGRATION_2_3)
+            ).addMigrations(
+                ManagerDatabase.MIGRATION_2_3,
+                ManagerDatabase.MIGRATION_3_4,
+            )
                 .allowMainThreadQueries()
                 .build()
             try {
@@ -827,5 +1045,6 @@ class ManagerDatabaseTest {
         const val MIGRATION_DATABASE = "manager-migration-1-2.db"
         const val MIGRATION_V2_DATABASE = "manager-migration-2-3.db"
         const val MIGRATION_V2_COLLISION_DATABASE = "manager-migration-2-3-collision.db"
+        const val MIGRATION_V3_DATABASE = "manager-migration-3-4.db"
     }
 }

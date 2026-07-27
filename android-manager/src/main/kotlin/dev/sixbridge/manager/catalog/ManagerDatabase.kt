@@ -6,6 +6,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import dev.sixbridge.manager.conversion.ConversionIdentityDao
 import dev.sixbridge.manager.conversion.ConversionIdentityEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityLeaseEntity
 import dev.sixbridge.manager.conversion.ConversionJobDao
 import dev.sixbridge.manager.conversion.ConversionJobEntity
 
@@ -13,9 +14,10 @@ import dev.sixbridge.manager.conversion.ConversionJobEntity
     entities = [
         CatalogEntryEntity::class,
         ConversionIdentityEntity::class,
+        ConversionIdentityLeaseEntity::class,
         ConversionJobEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class ManagerDatabase : RoomDatabase() {
@@ -148,6 +150,42 @@ abstract class ManagerDatabase : RoomDatabase() {
                 )
                 db.execSQL("DROP TABLE `conversion_job`")
                 db.execSQL("ALTER TABLE `conversion_job_v3` RENAME TO `conversion_job`")
+            }
+        }
+
+        val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `conversion_identity_leases` (
+                        `identitySha256` TEXT NOT NULL,
+                        `crxKeyAlias` TEXT,
+                        `ownerToken` TEXT NOT NULL,
+                        `state` TEXT NOT NULL,
+                        `createdAtEpochMillis` INTEGER NOT NULL,
+                        `extensionId` TEXT,
+                        `packageName` TEXT,
+                        `wrapperSignerSha256` TEXT,
+                        `crxPublicKeySha256` TEXT,
+                        `reservedVersionCode` INTEGER,
+                        PRIMARY KEY(`identitySha256`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identity_leases_crxKeyAlias`
+                    ON `conversion_identity_leases` (`crxKeyAlias`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identity_leases_ownerToken`
+                    ON `conversion_identity_leases` (`ownerToken`)
+                    """.trimIndent(),
+                )
             }
         }
 

@@ -9,7 +9,7 @@ import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
-import dev.sixbridge.manager.conversion.ReservedConversionIdentity
+import dev.sixbridge.manager.conversion.PackagingConversionIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -25,14 +25,13 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
-import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.zip.ZipFile
 import java.util.UUID
 
 data class OnDeviceWrapperRequest(
-    val reservation: ReservedConversionIdentity,
+    val reservation: PackagingConversionIdentity,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
     val descriptorName: String,
@@ -43,7 +42,7 @@ data class OnDeviceWrapperRequest(
 )
 
 data class OnDeviceWrapperPathRequest(
-    val reservation: ReservedConversionIdentity,
+    val reservation: PackagingConversionIdentity,
     val canonicalSourceZip: File?,
     val passthroughCrx: File?,
     val descriptorName: String,
@@ -70,10 +69,6 @@ class UnreservedIdentityLease internal constructor(
         get() = ownerToken.toString()
 }
 
-internal fun interface UnreservedIdentityCleaner {
-    fun discardUnreservedIdentity(lease: UnreservedIdentityLease): Boolean
-}
-
 data class OnDeviceWrapperResult(
     val extensionId: String,
     val packageName: String,
@@ -87,7 +82,7 @@ data class OnDeviceWrapperResult(
 )
 
 internal data class ValidatedOnDeviceWrapperRequest(
-    val reservation: ReservedConversionIdentity,
+    val reservation: PackagingConversionIdentity,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
     val descriptorName: String,
@@ -98,7 +93,7 @@ internal data class ValidatedOnDeviceWrapperRequest(
 )
 
 private data class ValidatedPathWrapperRequest(
-    val reservation: ReservedConversionIdentity,
+    val reservation: PackagingConversionIdentity,
     val canonicalSourceZip: Path?,
     val passthroughCrx: Path?,
     val descriptorName: String,
@@ -120,16 +115,16 @@ class OnDeviceWrapperPackager(context: Context) {
 
     private val appContext = context.applicationContext
     private val workingDirectory = TrustedWorkingDirectory.capture(appPrivateWorkingDirectory(appContext.filesDir))
+    private val temporaryDirectory = TrustedWorkingDirectory.capture(
+        appPrivateTemporaryDirectory(workingDirectory.path),
+    )
     private val identityStore = AndroidKeystoreIdentityStore()
     private val manifestPatcher = BinaryAndroidManifestPatcher()
     private val apkSigner = AndroidApkSigner()
     private val verifier = AndroidWrapperVerifier(
         AndroidArchiveInspector(appContext.packageManager),
-        workingDirectory.path.toFile(),
+        temporaryDirectory.path.toFile(),
     )
-    internal val unreservedIdentityCleaner =
-        UnreservedIdentityCleaner(::discardOwnedUnreservedIdentity)
-
     init {
         reconcileOwnedTemporaryFiles()
     }
@@ -150,6 +145,13 @@ class OnDeviceWrapperPackager(context: Context) {
             Crx3Verifier.verify(it.toPath(), ON_DEVICE_MAX_SOURCE_BYTES)
         },
     )
+
+    internal fun plannedCrxAlias(identityKey: InstallationIdentityKey): String {
+        require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
+            "converted 신원만 CRX alias를 가집니다."
+        }
+        return identityStore.crxAlias(identityKey.identitySha256)
+    }
 
     private fun resolveIdentitySnapshot(
         identityKey: InstallationIdentityKey,
@@ -201,7 +203,7 @@ class OnDeviceWrapperPackager(context: Context) {
     }
 
     private fun resolveReservedIdentity(
-        reservation: ReservedConversionIdentity,
+        reservation: PackagingConversionIdentity,
         passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
     ): OnDevicePackageIdentity {
         val wrapperIdentity = identityStore.existingWrapperIdentity()
@@ -238,7 +240,8 @@ class OnDeviceWrapperPackager(context: Context) {
             reservation.extensionId == current.extensionId &&
                 reservation.packageName == current.packageName &&
                 reservation.wrapperSignerSha256 == current.wrapperSignerSha256 &&
-                reservation.crxKeyAlias == current.crxKeyAlias,
+                reservation.crxKeyAlias == current.crxKeyAlias &&
+                reservation.crxPublicKeySha256 == current.crxPublicKeyDer?.let(::sha256),
         ) {
             "예약된 설치 신원과 현재 Android Keystore package identity가 일치하지 않습니다."
         }
@@ -246,13 +249,16 @@ class OnDeviceWrapperPackager(context: Context) {
     }
 
     @Synchronized
-    fun resolveUnreservedIdentity(identityKey: InstallationIdentityKey): UnreservedIdentityLease {
+    internal fun createOrRecoverUnreservedIdentity(
+        identityKey: InstallationIdentityKey,
+        ownerToken: UUID,
+    ): UnreservedIdentityLease {
         require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
             "converted CreateNew 신원만 미예약 lease를 만들 수 있습니다."
         }
         val wrapperIdentity = identityStore.wrapperIdentity()
         val crxIdentity = identityStore.createCrxIdentityIfAbsent(identityKey.identitySha256)
-            ?: throw IllegalArgumentException("기존 CRX 신원에는 미예약 cleanup lease를 발급할 수 없습니다.")
+            ?: identityStore.existingCrxIdentity(identityKey.identitySha256)
         val publicKey = crxIdentity.certificate.publicKey.encoded.copyOf()
         val extensionId = Crx3.extensionId(publicKey)
         val identity = OnDevicePackageIdentity(
@@ -262,70 +268,35 @@ class OnDeviceWrapperPackager(context: Context) {
             crxKeyAlias = crxIdentity.alias,
             crxPublicKeyDer = publicKey,
         )
-        val ownerToken = UUID.randomUUID()
-        try {
-            writeIdentityLease(ownerToken, identityKey.identitySha256, identity)
-        } catch (error: Throwable) {
-            runCatching {
-                identityStore.deleteCrxIdentity(
-                    identityKey.identitySha256,
-                    requireNotNull(identity.crxKeyAlias),
-                )
-            }.exceptionOrNull()?.let(error::addSuppressed)
-            throw error
-        }
         return UnreservedIdentityLease(identityKey.identitySha256, identity, ownerToken)
     }
 
     @Synchronized
-    fun recoverUnreservedIdentity(cleanupToken: String): UnreservedIdentityLease {
-        val ownerToken = runCatching { UUID.fromString(cleanupToken) }
-            .getOrElse { throw IllegalArgumentException("미예약 CRX cleanup token이 올바르지 않습니다.") }
-        val record = readIdentityLease(ownerToken)
-        val current = identityStore.existingCrxIdentity(record.identitySha256)
-        val currentPublicKey = current.certificate.publicKey.encoded
-        val currentIdentity = OnDevicePackageIdentity(
-            extensionId = Crx3.extensionId(currentPublicKey),
-            packageName = "dev.sixbridge.ext.${Crx3.extensionId(currentPublicKey)}",
-            wrapperSignerSha256 = sha256(identityStore.existingWrapperIdentity().certificate.encoded),
-            crxKeyAlias = current.alias,
-            crxPublicKeyDer = currentPublicKey,
-        )
-        requireLeaseMatches(record, currentIdentity)
-        return UnreservedIdentityLease(record.identitySha256, currentIdentity, ownerToken)
-    }
-
-    @Synchronized
-    private fun discardOwnedUnreservedIdentity(lease: UnreservedIdentityLease): Boolean {
-        val identitySha256 = lease.identitySha256
-        val resolvedIdentity = lease.identity
-        val record = readIdentityLease(lease.ownerToken)
-        require(record.identitySha256 == identitySha256) {
-            "미예약 CRX 신원 cleanup owner가 일치하지 않습니다."
-        }
-        requireLeaseMatches(record, resolvedIdentity)
-        val alias = requireNotNull(resolvedIdentity.crxKeyAlias) {
-            "정리할 CRX Android Keystore alias가 없습니다."
-        }
+    internal fun deleteUnreservedIdentity(
+        identitySha256: String,
+        expectedAlias: String,
+        expectedExtensionId: String?,
+        expectedPublicKeySha256: String?,
+    ): Boolean {
+        if (!identityStore.hasCrxIdentity(identitySha256)) return true
         val current = identityStore.existingCrxIdentity(identitySha256)
         val currentPublicKey = current.certificate.publicKey.encoded
         require(
-            current.alias == alias &&
-                resolvedIdentity.crxPublicKeyDer?.contentEquals(currentPublicKey) == true &&
-                resolvedIdentity.extensionId == Crx3.extensionId(currentPublicKey),
+            current.alias == expectedAlias &&
+                (expectedExtensionId == null || expectedExtensionId == Crx3.extensionId(currentPublicKey)) &&
+                (expectedPublicKeySha256 == null || expectedPublicKeySha256 == sha256(currentPublicKey)),
         ) {
             "정리할 미예약 CRX 신원 소유권이 일치하지 않습니다."
         }
-        val deleted = identityStore.deleteCrxIdentity(identitySha256, alias)
-        if (deleted) deleteIdentityLease(lease.ownerToken)
-        return deleted
+        return identityStore.deleteCrxIdentity(identitySha256, expectedAlias)
     }
 
     @Synchronized
     fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
+        request.reservation.consume()
         val snapshot = request.snapshot()
         validateBasicRequest(snapshot)
-        val stagedSource = Files.createTempFile(workingDirectory.path, ".source.", ".bin")
+        val stagedSource = createTemporaryFile(".source.", ".bin")
         try {
             val sourceBytes = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
             writeSourceBytes(stagedSource, sourceBytes)
@@ -350,10 +321,11 @@ class OnDeviceWrapperPackager(context: Context) {
 
     @Synchronized
     fun packageWrapper(request: OnDeviceWrapperPathRequest): OnDeviceWrapperResult {
+        request.reservation.consume()
         val snapshot = request.snapshot()
         validatePathRequest(snapshot)
         val source = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
-        val stagedSource = Files.createTempFile(workingDirectory.path, ".source.", ".bin")
+        val stagedSource = createTemporaryFile(".source.", ".bin")
         try {
             copyStableSource(source, stagedSource)
             return packageStaged(
@@ -376,8 +348,7 @@ class OnDeviceWrapperPackager(context: Context) {
             Crx3Verifier.verify(it, ON_DEVICE_MAX_SOURCE_BYTES)
         }
         val identity = resolveReservedIdentity(request.reservation, passthroughProof)
-        consumeIdentityLeases(request.reservation)
-        val generatedCrx = Files.createTempFile(workingDirectory.path, ".extension.", ".crx")
+        val generatedCrx = createTemporaryFile(".extension.", ".crx")
         try {
             val crxPath = when (request.reservation.identityKey.mode) {
                 InstallationIdentityMode.PASSTHROUGH -> requireNotNull(request.passthroughCrx)
@@ -394,9 +365,9 @@ class OnDeviceWrapperPackager(context: Context) {
             validateBoundPathRequest(request, identity, crxProof)
             testHooks?.afterRequestValidated?.invoke()
             val output = validatedOutput(request.outputApk)
-            val temporaryTemplate = Files.createTempFile(workingDirectory.path, ".wrapper-template.", ".apk")
-            val unsigned = Files.createTempFile(workingDirectory.path, ".unsigned.", ".apk")
-            val signed = Files.createTempFile(workingDirectory.path, ".signed.", ".apk")
+            val temporaryTemplate = createTemporaryFile(".wrapper-template.", ".apk")
+            val unsigned = createTemporaryFile(".unsigned.", ".apk")
+            val signed = createTemporaryFile(".signed.", ".apk")
             try {
                 val template = readVerifiedTemplate(temporaryTemplate)
                 val templateManifest = ZipFile(template.toFile()).use { archive ->
@@ -412,7 +383,7 @@ class OnDeviceWrapperPackager(context: Context) {
                         versionCode = request.reservation.versionCode,
                     ),
                 )
-                AlignedApkAssembler(workingDirectory.path).assemble(
+                AlignedApkAssembler(temporaryDirectory.path).assemble(
                     ApkAssemblyPathRequest(
                         templateApk = template.toFile(),
                         manifestBytes = patchedManifest,
@@ -455,6 +426,11 @@ class OnDeviceWrapperPackager(context: Context) {
                 forceFile(signed)
                 verifyPublishTarget(output)
                 Files.move(signed, output, ATOMIC_MOVE, REPLACE_EXISTING)
+                forceDirectory(workingDirectory.path)
+                verifyPublishTarget(output)
+                require(sha256(output) == descriptor.wrapperSha256) {
+                    "publish된 wrapper APK hash가 검증 결과와 일치하지 않습니다."
+                }
                 return OnDeviceWrapperResult(
                     extensionId = identity.extensionId,
                     packageName = identity.packageName,
@@ -645,11 +621,25 @@ class OnDeviceWrapperPackager(context: Context) {
         return root
     }
 
+    private fun appPrivateTemporaryDirectory(root: Path): Path {
+        val temporary = root.resolve(TEMPORARY_DIRECTORY)
+        if (!Files.exists(temporary, NOFOLLOW_LINKS)) Files.createDirectory(temporary)
+        require(Files.isDirectory(temporary, NOFOLLOW_LINKS) && !Files.isSymbolicLink(temporary)) {
+            "온디바이스 packager temporary 디렉터리가 올바르지 않습니다."
+        }
+        return temporary
+    }
+
+    private fun createTemporaryFile(prefix: String, suffix: String): Path {
+        temporaryDirectory.verifyUnchanged()
+        return Files.createTempFile(temporaryDirectory.path, prefix, suffix)
+    }
+
     private fun reconcileOwnedTemporaryFiles() {
-        workingDirectory.verifyUnchanged()
-        Files.newDirectoryStream(workingDirectory.path).use { entries ->
+        temporaryDirectory.verifyUnchanged()
+        Files.newDirectoryStream(temporaryDirectory.path).use { entries ->
             entries.forEach { path ->
-                if (PACKAGER_TEMPORARY_PREFIXES.none { path.fileName.toString().startsWith(it) }) {
+                if (!PACKAGER_TEMPORARY_FILE.matches(path.fileName.toString())) {
                     return@forEach
                 }
                 val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
@@ -663,94 +653,8 @@ class OnDeviceWrapperPackager(context: Context) {
                 Files.delete(path)
             }
         }
-        forceDirectory(workingDirectory.path)
+        forceDirectory(temporaryDirectory.path)
     }
-
-    private fun writeIdentityLease(
-        ownerToken: UUID,
-        identitySha256: String,
-        identity: OnDevicePackageIdentity,
-    ) {
-        val alias = requireNotNull(identity.crxKeyAlias)
-        val publicKey = requireNotNull(identity.crxPublicKeyDer)
-        val path = identityLeasePath(ownerToken)
-        val record = listOf(
-            identitySha256,
-            alias,
-            identity.extensionId,
-            sha256(publicKey),
-        ).joinToString("\n", postfix = "\n")
-        FileChannel.open(path, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { channel ->
-            val bytes = record.encodeToByteArray()
-            var offset = 0
-            while (offset < bytes.size) {
-                offset += channel.write(ByteBuffer.wrap(bytes, offset, bytes.size - offset))
-            }
-            channel.force(true)
-        }
-        forceDirectory(workingDirectory.path)
-    }
-
-    private fun readIdentityLease(ownerToken: UUID): IdentityLeaseRecord {
-        val path = identityLeasePath(ownerToken)
-        val attributes = runCatching {
-            Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
-        }.getOrElse {
-            throw IllegalArgumentException("미예약 CRX identity lease를 찾을 수 없습니다.", it)
-        }
-        require(
-            attributes.isRegularFile && !attributes.isSymbolicLink &&
-                attributes.size() in 1..4096 && unixLinkCount(path) == 1,
-        ) {
-            "미예약 CRX identity lease 파일이 올바르지 않습니다."
-        }
-        val fields = Files.readAllLines(path)
-        require(fields.size == 4) { "미예약 CRX identity lease 형식이 올바르지 않습니다." }
-        require(SHA256.matches(fields[0]) && SHA256.matches(fields[3])) {
-            "미예약 CRX identity lease hash가 올바르지 않습니다."
-        }
-        require(ON_DEVICE_EXTENSION_ID.matches(fields[2])) {
-            "미예약 CRX identity lease extension ID가 올바르지 않습니다."
-        }
-        return IdentityLeaseRecord(fields[0], fields[1], fields[2], fields[3])
-    }
-
-    private fun requireLeaseMatches(
-        record: IdentityLeaseRecord,
-        identity: OnDevicePackageIdentity,
-    ) {
-        require(
-            identity.crxKeyAlias == record.alias &&
-                identity.extensionId == record.extensionId &&
-                identity.crxPublicKeyDer?.let(::sha256) == record.publicKeySha256,
-        ) {
-            "미예약 CRX identity lease와 현재 Keystore 신원이 일치하지 않습니다."
-        }
-    }
-
-    private fun consumeIdentityLeases(reservation: ReservedConversionIdentity) {
-        Files.newDirectoryStream(workingDirectory.path, "$IDENTITY_LEASE_PREFIX*").use { entries ->
-            entries.forEach { path ->
-                val token = runCatching {
-                    UUID.fromString(path.fileName.toString().removePrefix(IDENTITY_LEASE_PREFIX))
-                }.getOrElse {
-                    throw IllegalArgumentException("미예약 CRX identity lease 파일명이 올바르지 않습니다.")
-                }
-                val record = readIdentityLease(token)
-                if (record.identitySha256 == reservation.identitySha256) deleteIdentityLease(token)
-            }
-        }
-    }
-
-    private fun deleteIdentityLease(ownerToken: UUID) {
-        val path = identityLeasePath(ownerToken)
-        readIdentityLease(ownerToken)
-        Files.delete(path)
-        forceDirectory(workingDirectory.path)
-    }
-
-    private fun identityLeasePath(ownerToken: UUID): Path =
-        workingDirectory.path.resolve("$IDENTITY_LEASE_PREFIX$ownerToken")
 
     private fun validatedOutput(file: File): Path {
         val output = file.toPath().toAbsolutePath().normalize()
@@ -844,27 +748,19 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
-    private data class IdentityLeaseRecord(
-        val identitySha256: String,
-        val alias: String,
-        val extensionId: String,
-        val publicKeySha256: String,
-    )
-
     private companion object {
         const val WORKING_DIRECTORY = "ondevice-packager-gate"
+        const val TEMPORARY_DIRECTORY = "tmp"
         const val TEMPLATE_ASSET = "wrapper-template.apk"
         const val TEMPLATE_SHA256_ASSET = "wrapper-template.sha256"
         const val MANIFEST_ENTRY = "AndroidManifest.xml"
-        const val IDENTITY_LEASE_PREFIX = ".identity-lease."
-        val PACKAGER_TEMPORARY_PREFIXES = setOf(
-            ".source.",
-            ".extension.",
-            ".wrapper-template.",
-            ".unsigned.",
-            ".signed.",
-            "..unsigned.",
-            "..signed.",
+        val PACKAGER_TEMPORARY_FILE = Regex(
+            """(?:\.source\.[0-9]{1,20}\.bin|""" +
+                """\.extension\.[0-9]{1,20}\.crx|""" +
+                """\.wrapper-template\.[0-9]{1,20}\.apk|""" +
+                """\.unsigned\.[0-9]{1,20}\.apk|""" +
+                """\.signed\.[0-9]{1,20}\.apk|""" +
+                """\.\.(?:unsigned|signed)\.[0-9]{1,20}\.apk\.[0-9]{1,20}\.tmp)""",
         )
         val SHA256 = Regex("[0-9a-f]{64}")
     }

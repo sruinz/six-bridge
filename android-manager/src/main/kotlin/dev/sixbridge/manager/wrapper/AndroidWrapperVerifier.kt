@@ -203,8 +203,7 @@ class AndroidWrapperVerifier(
     private fun cleanupOrphansLocked(directory: File) {
         directory.listFiles().orEmpty()
             .filter { file ->
-                file.name.startsWith(TEMPORARY_PREFIX) &&
-                    file.name.endsWith(TEMPORARY_SUFFIX) &&
+                TEMPORARY_FILE.matches(file.name) &&
                     file.toPath().toAbsolutePath().normalize().toString() !in ACTIVE_TEMPORARY_FILES
             }
             .forEach { file ->
@@ -239,6 +238,7 @@ class AndroidWrapperVerifier(
         val SHA256 = Regex("[0-9a-f]{64}")
         const val TEMPORARY_PREFIX = ".sixbridge-wrapper-crx-"
         const val TEMPORARY_SUFFIX = ".tmp"
+        val TEMPORARY_FILE = Regex("""\.sixbridge-wrapper-crx-[0-9]{1,20}\.tmp""")
         val TEMPORARY_LOCK = Any()
         val ACTIVE_TEMPORARY_FILES = mutableSetOf<String>()
     }

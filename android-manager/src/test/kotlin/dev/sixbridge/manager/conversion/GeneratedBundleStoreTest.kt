@@ -260,16 +260,11 @@ class GeneratedBundleStoreTest {
     }
 
     @Test
-    fun `128 MiB wrapper를 bundle publish copy discard까지 bounded heap으로 처리한다`() {
+    fun `압축 가능한 128 MiB wrapper를 STORED bundle publish restart discard까지 bounded heap으로 처리한다`() {
         val wrapper = File(filesDir, "large-wrapper.apk")
         wrapper.outputStream().buffered().use { output ->
             val buffer = ByteArray(64 * 1024)
-            var state = 0x13579bdf
             repeat(128 * 1024 * 1024 / buffer.size) {
-                for (index in buffer.indices) {
-                    state = state * 1103515245 + 12345
-                    buffer[index] = (state ushr 16).toByte()
-                }
                 output.write(buffer)
             }
         }
@@ -289,7 +284,8 @@ class GeneratedBundleStoreTest {
         val generated = try {
             val store = store()
             val published = store.publish(largeToken, largeResult)
-            val copied = store.copyTo(
+            val restarted = store()
+            val copied = restarted.copyTo(
                 largeToken,
                 object : java.io.OutputStream() {
                     override fun write(value: Int) = Unit
@@ -297,7 +293,7 @@ class GeneratedBundleStoreTest {
                 },
             )
             assertEquals(published.sha256, copied)
-            assertTrue(store.discard(largeToken))
+            assertTrue(restarted.discard(largeToken))
             published
         } finally {
             running.set(false)

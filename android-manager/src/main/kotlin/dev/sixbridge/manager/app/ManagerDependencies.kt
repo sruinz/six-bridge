@@ -46,6 +46,7 @@ class ManagerDependencies private constructor(
             ).addMigrations(
                 ManagerDatabase.MIGRATION_1_2,
                 ManagerDatabase.MIGRATION_2_3,
+                ManagerDatabase.MIGRATION_3_4,
             )
                 .build()
             val catalog = RoomManagerCatalog(database.catalogEntryDao())

@@ -55,6 +55,8 @@ class AndroidKeystoreIdentityStore private constructor(
         keyStore().containsAlias(aliases.crxAlias(identitySha256))
     }
 
+    internal fun crxAlias(identitySha256: String): String = aliases.crxAlias(identitySha256)
+
     fun crxSigningKey(sourceIdentity: ByteArray): AndroidKeystoreCrxSigningKey =
         AndroidKeystoreCrxSigningKey(crxIdentity(sourceIdentity))
 

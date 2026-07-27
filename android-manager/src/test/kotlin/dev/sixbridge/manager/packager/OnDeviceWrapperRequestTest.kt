@@ -10,6 +10,7 @@ import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
+import dev.sixbridge.manager.conversion.PackagingConversionIdentity
 import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -148,12 +149,21 @@ class OnDeviceWrapperRequestTest {
         val identity = packageIdentity(passthroughProof.extensionId)
         val request = passthroughRequest()
         listOf(
-            request.reservation.copy(extensionId = "abcdefghijklmnopabcdefghijklmnop"),
-            request.reservation.copy(
+            reservation(
+                passthroughKey,
+                "abcdefghijklmnopabcdefghijklmnop",
+            ),
+            reservation(
+                passthroughKey,
+                passthroughProof.extensionId,
                 packageName = "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
             ),
-            request.reservation.copy(wrapperSignerSha256 = "0".repeat(64)),
-            request.reservation.copy(crxKeyAlias = "unexpected"),
+            reservation(
+                passthroughKey,
+                passthroughProof.extensionId,
+                wrapperSignerSha256 = "0".repeat(64),
+            ),
+            reservation(passthroughKey, passthroughProof.extensionId, alias = "unexpected"),
         ).forEach { changed ->
             assertFailsWith<IllegalArgumentException> {
                 request.copy(reservation = changed).validateFor(identity, passthroughCrx)
@@ -225,13 +235,19 @@ class OnDeviceWrapperRequestTest {
         key: InstallationIdentityKey,
         extensionId: String,
         alias: String? = null,
-    ) = ReservedConversionIdentity(
-        identityKey = key,
-        extensionId = extensionId,
-        packageName = "dev.sixbridge.ext.$extensionId",
-        wrapperSignerSha256 = "f".repeat(64),
-        crxKeyAlias = alias,
-        versionCode = 1,
+        packageName: String = "dev.sixbridge.ext.$extensionId",
+        wrapperSignerSha256: String = "f".repeat(64),
+    ) = PackagingConversionIdentity(
+        ReservedConversionIdentity(
+            identityKey = key,
+            extensionId = extensionId,
+            packageName = packageName,
+            wrapperSignerSha256 = wrapperSignerSha256,
+            crxKeyAlias = alias,
+            crxPublicKeySha256 = if (alias == null) null else "e".repeat(64),
+            versionCode = 1,
+            ownerToken = "unit-owner",
+        ),
     )
 
     private fun identityKey(mode: InstallationIdentityMode) = InstallationIdentityKey.create(

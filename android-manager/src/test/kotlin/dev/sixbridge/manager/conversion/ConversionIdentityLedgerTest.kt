@@ -1,8 +1,5 @@
 package dev.sixbridge.manager.conversion
 
-import dev.sixbridge.manager.packager.OnDevicePackageIdentity
-import dev.sixbridge.manager.packager.UnreservedIdentityCleaner
-import dev.sixbridge.manager.packager.UnreservedIdentityLease
 import java.util.UUID
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -123,36 +120,6 @@ class ConversionIdentityLedgerTest {
             assertEquals(original, reserved.identityKey)
             assertEquals(binding.crxKeyAlias, reserved.crxKeyAlias)
             assertEquals(2, reserved.versionCode)
-        }
-
-    @Test
-    fun `미예약 cleanup은 원장 예약 전만 허용하고 예약 뒤 update key는 삭제하지 않는다`() =
-        runTest {
-            val dao = FakeConversionIdentityDao()
-            val ledger = ConversionIdentityLedger(dao)
-            val key = stableKey()
-            val binding = bindingFor(key)
-            val identity = OnDevicePackageIdentity(
-                extensionId = binding.extensionId,
-                packageName = binding.packageName,
-                wrapperSignerSha256 = binding.wrapperSignerSha256,
-                crxKeyAlias = binding.crxKeyAlias,
-                crxPublicKeyDer = byteArrayOf(1),
-            )
-            val lease = UnreservedIdentityLease(key.identitySha256, identity, UUID.randomUUID())
-            var cleanupCalls = 0
-            val cleaner = UnreservedIdentityCleaner {
-                cleanupCalls += 1
-                true
-            }
-
-            assertTrue(ledger.discardUnreservedIdentity(lease, cleaner))
-            assertEquals(1, cleanupCalls)
-            ledger.reserve(reservation(key, binding = binding))
-            assertFailsWith<IllegalArgumentException> {
-                ledger.discardUnreservedIdentity(lease, cleaner)
-            }
-            assertEquals(1, cleanupCalls)
         }
 
     @Test
@@ -316,6 +283,11 @@ class ConversionIdentityLedgerTest {
             } else {
                 null
             },
+            crxPublicKeySha256 = if (key.mode == InstallationIdentityMode.CONVERTED) {
+                "b".repeat(64)
+            } else {
+                null
+            },
         )
     }
 
@@ -337,6 +309,7 @@ class ConversionIdentityLedgerTest {
 
     private class FakeConversionIdentityDao : ConversionIdentityDao {
         private val rows = linkedMapOf<String, ConversionIdentityEntity>()
+        private val leases = linkedMapOf<String, ConversionIdentityLeaseEntity>()
 
         override suspend fun get(identitySha256: String): ConversionIdentityEntity? =
             synchronized(rows) { rows[identitySha256] }
@@ -360,6 +333,118 @@ class ConversionIdentityLedgerTest {
             synchronized(rows) {
                 check(rows.containsKey(entity.identitySha256))
                 rows[entity.identitySha256] = entity
+            }
+        }
+
+        override suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity? =
+            synchronized(rows) { leases[identitySha256] }
+
+        override suspend fun insertLease(entity: ConversionIdentityLeaseEntity) {
+            synchronized(rows) {
+                check(leases.putIfAbsent(entity.identitySha256, entity) == null)
+            }
+        }
+
+        override suspend fun markLeaseReady(
+            identitySha256: String,
+            ownerToken: String,
+            extensionId: String,
+            packageName: String,
+            wrapperSignerSha256: String,
+            crxPublicKeySha256: String,
+        ): Int = synchronized(rows) {
+            val current = leases[identitySha256]
+            if (current?.ownerToken != ownerToken || current.state != "PENDING") {
+                0
+            } else {
+                leases[identitySha256] = current.copy(
+                    state = "READY",
+                    extensionId = extensionId,
+                    packageName = packageName,
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxPublicKeySha256 = crxPublicKeySha256,
+                )
+                1
+            }
+        }
+
+        override suspend fun transitionLease(
+            identitySha256: String,
+            ownerToken: String,
+            expectedState: String,
+            nextState: String,
+        ): Int = synchronized(rows) {
+            val current = leases[identitySha256]
+            if (current?.ownerToken != ownerToken || current.state != expectedState) {
+                0
+            } else {
+                leases[identitySha256] = current.copy(state = nextState)
+                1
+            }
+        }
+
+        override suspend fun consumeReadyLease(
+            identitySha256: String,
+            readyOwnerToken: String,
+            reservationOwnerToken: String,
+            reservedVersionCode: Int,
+        ): Int = synchronized(rows) {
+            val current = leases[identitySha256]
+            if (current?.ownerToken != readyOwnerToken || current.state != "READY") {
+                0
+            } else {
+                leases[identitySha256] = current.copy(
+                    ownerToken = reservationOwnerToken,
+                    state = "RESERVED",
+                    reservedVersionCode = reservedVersionCode,
+                )
+                1
+            }
+        }
+
+        override suspend fun deleteLease(
+            identitySha256: String,
+            ownerToken: String,
+            state: String,
+        ): Int = synchronized(rows) {
+            val current = leases[identitySha256]
+            if (current?.ownerToken != ownerToken || current.state != state) {
+                0
+            } else {
+                leases.remove(identitySha256)
+                1
+            }
+        }
+
+        override suspend fun reserve(
+            requested: ConversionIdentityEntity,
+            installedVersionCode: Long?,
+            readyOwnerToken: String?,
+            reservationOwnerToken: String,
+            createdAtEpochMillis: Long,
+            crxPublicKeySha256: String?,
+        ): ConversionIdentityEntity = synchronized(rows) {
+            require(installedVersionCode == null || installedVersionCode in 0 until Int.MAX_VALUE.toLong())
+            val current = rows[requested.identitySha256]
+            if (current != null) {
+                require(current.copy(displayName = requested.displayName, lastReservedVersionCode = 0) ==
+                    requested.copy(lastReservedVersionCode = 0))
+            }
+            require(rows.values.none {
+                it.identitySha256 != requested.identitySha256 &&
+                    (
+                        it.extensionId == requested.extensionId ||
+                            it.packageName == requested.packageName ||
+                            (requested.crxKeyAlias != null && it.crxKeyAlias == requested.crxKeyAlias)
+                        )
+            })
+            val next = maxOf(
+                (current?.lastReservedVersionCode ?: 0).toLong() + 1,
+                installedVersionCode?.plus(1) ?: 1,
+            )
+            check(next <= Int.MAX_VALUE)
+            requested.copy(lastReservedVersionCode = next.toInt()).also {
+                rows[requested.identitySha256] = it
             }
         }
 

@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.packager
 
 import android.security.keystore.KeyProperties
+import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
@@ -10,10 +11,14 @@ import dev.sixbridge.contract.bundle.ContractSourceEvidence
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.manager.catalog.ManagerDatabase
+import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityReservation
+import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
-import dev.sixbridge.manager.conversion.ReservedConversionIdentity
+import dev.sixbridge.manager.conversion.PackagingConversionIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -28,6 +33,7 @@ import java.security.Signature
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -55,8 +61,8 @@ class OnDevicePackagerGateInstrumentedTest {
         val packager = OnDeviceWrapperPackager(context)
         val v1 = File(root, "orchestration-v1.apk")
         val v2 = File(root, "orchestration-v2.apk")
-        val first = packager.packageWrapper(request(packager, source, 1, v1))
-        val second = packager.packageWrapper(request(packager, source, 2, v2))
+        val first = packageClaim(packager, request(packager, source, 1, v1))
+        val second = packageClaim(packager, request(packager, source, 2, v2))
 
         assertEquals(first.extensionId, second.extensionId)
         assertEquals(first.packageName, second.packageName)
@@ -96,35 +102,39 @@ class OnDevicePackagerGateInstrumentedTest {
             source,
             3,
             File(root, "invalid-source.apk"),
-        ).let { request ->
-            request.copy(
-                compatibility = request.compatibility.copy(
-                    sourceSha256 = "0".repeat(64),
+        ).let { claimed ->
+            claimed.copy(
+                request = claimed.request.copy(
+                    compatibility = claimed.request.compatibility.copy(
+                        sourceSha256 = "0".repeat(64),
+                    ),
                 ),
             )
         }
-        assertRejected { packager.packageWrapper(invalidSource) }
-        assertFalse(invalidSource.outputApk.exists())
+        assertRejected { packageClaim(packager, invalidSource) }
+        assertFalse(invalidSource.request.outputApk.exists())
         val invalidProfile = request(
             packager,
             source,
             3,
             File(root, "invalid-profile.apk"),
-        ).let { request ->
-            request.copy(
-                compatibility = request.compatibility.copy(
-                    browserProfileSha256 = "z".repeat(64),
+        ).let { claimed ->
+            claimed.copy(
+                request = claimed.request.copy(
+                    compatibility = claimed.request.compatibility.copy(
+                        browserProfileSha256 = "z".repeat(64),
+                    ),
                 ),
             )
         }
-        assertRejected { packager.packageWrapper(invalidProfile) }
-        assertFalse(invalidProfile.outputApk.exists())
+        assertRejected { packageClaim(packager, invalidProfile) }
+        assertFalse(invalidProfile.request.outputApk.exists())
 
         val target = File(root, "symlink-target.apk")
         val symlink = File(root, "symlink-output.apk")
         Files.deleteIfExists(symlink.toPath())
         Files.createSymbolicLink(symlink.toPath(), target.toPath())
-        assertRejected { packager.packageWrapper(request(packager, source, 3, symlink)) }
+        assertRejected { packageClaim(packager, request(packager, source, 3, symlink)) }
         assertFalse(target.exists())
         Files.deleteIfExists(symlink.toPath())
     }
@@ -141,7 +151,8 @@ class OnDevicePackagerGateInstrumentedTest {
                 },
             ),
         )
-        val result = packager.packageWrapper(
+        val result = packageClaim(
+            packager,
             request(packager, mutableZip, 4, File(root, "snapshot.apk")),
         )
         val expected = Crx3Writer.create(
@@ -178,7 +189,8 @@ class OnDevicePackagerGateInstrumentedTest {
         )
 
         assertRejected {
-            packager.packageWrapper(
+            packageClaim(
+                packager,
                 request(packager, canonicalSourceZip(), 41, File(root, "cleanup-failure.apk")),
             )
         }
@@ -213,16 +225,14 @@ class OnDevicePackagerGateInstrumentedTest {
             originalExtensionId = proof.extensionId,
         )
         val output = File(root, "passthrough.apk")
-        val result = packager.packageWrapper(
-            OnDeviceWrapperRequest(
-                reservation = reservation(identityKey, identity, 1),
-                canonicalSourceZip = null,
-                passthroughCrx = originalCrx,
-                descriptorName = "SIX Bridge On-Device Gate",
-                descriptorVersion = "1.0",
-                sourceKind = "CRX3",
-                compatibility = report,
-                outputApk = output,
+        val result = packageClaim(
+            packager,
+            passthroughRequest(
+                identityKey = identityKey,
+                identity = identity,
+                originalCrx = originalCrx,
+                report = report,
+                output = output,
             ),
         )
         val embedded = AndroidArchiveInspector(context.packageManager)
@@ -244,20 +254,39 @@ class OnDevicePackagerGateInstrumentedTest {
             profileMajorVersion = 28,
             mode = InstallationIdentityMode.CONVERTED,
         )
+        val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
         val packager = OnDeviceWrapperPackager(context)
-        val lease = packager.resolveUnreservedIdentity(identityKey)
+        val lease = runBlocking { ledger.resolveUnreservedIdentity(identityKey, packager) }
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val alias = requireNotNull(lease.identity.crxKeyAlias)
         assertTrue(keyStore.containsAlias(alias))
 
         val restartedPackager = OnDeviceWrapperPackager(context)
-        val recovered = restartedPackager.recoverUnreservedIdentity(lease.cleanupToken)
+        val recovered = runBlocking {
+            ledger.resolveUnreservedIdentity(identityKey, restartedPackager)
+        }
         assertEquals(lease.identitySha256, recovered.identitySha256)
         val source = canonicalSourceZip()
-        val reserved = reservation(identityKey, recovered.identity, 1)
-        restartedPackager.packageWrapper(
+        val reserved = runBlocking {
+            ledger.reserve(
+                ConversionIdentityReservation(
+                    identityKey = identityKey,
+                    displayName = "lease recovery",
+                    packageBinding = binding(recovered.identity),
+                    installedVersionCode = null,
+                ),
+                recovered,
+            )
+        }
+        val capability = runBlocking { ledger.claimForPackaging(reserved) }
+        var succeeded = false
+        try {
+            restartedPackager.packageWrapper(
             OnDeviceWrapperRequest(
-                reservation = reserved,
+                reservation = capability,
                 canonicalSourceZip = source,
                 passthroughCrx = null,
                 descriptorName = "SIX Bridge On-Device Gate",
@@ -271,30 +300,102 @@ class OnDevicePackagerGateInstrumentedTest {
                 ),
                 outputApk = File(root, "lease-reserved.apk"),
             ),
-        )
+            ).also { succeeded = true }
+        } finally {
+            runBlocking { ledger.finishPackaging(capability, succeeded) }
+        }
         assertTrue(keyStore.containsAlias(alias))
         assertThrows(IllegalArgumentException::class.java) {
-            restartedPackager.recoverUnreservedIdentity(lease.cleanupToken)
+            runBlocking { ledger.resolveUnreservedIdentity(identityKey, restartedPackager) }
+        }
+        database.close()
+    }
+
+    @Test
+    fun cleaningLeaseRecoversBeforeAndAfterKeystoreDeletion() {
+        repeat(2) { iteration ->
+            val deleteBeforeRestart = iteration == 1
+            val identityKey = InstallationIdentityKey.create(
+                LogicalSourceIdentity.projectMarker(
+                    UUID.randomUUID().toString().replace("-", ""),
+                ),
+                profileMajorVersion = 28,
+                mode = InstallationIdentityMode.CONVERTED,
+            )
+            val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+            val firstLedger = ConversionIdentityLedger(database.conversionIdentityDao())
+            val firstPackager = OnDeviceWrapperPackager(context)
+            val lease = runBlocking {
+                firstLedger.resolveUnreservedIdentity(identityKey, firstPackager)
+            }
+            val alias = requireNotNull(lease.identity.crxKeyAlias)
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            assertTrue(keyStore.containsAlias(alias))
+            runBlocking {
+                database.conversionIdentityDao().claimCleanup(
+                    identityKey.identitySha256,
+                    lease.ownerToken.toString(),
+                )
+            }
+            if (deleteBeforeRestart) {
+                assertTrue(
+                    firstPackager.deleteUnreservedIdentity(
+                        identitySha256 = identityKey.identitySha256,
+                        expectedAlias = alias,
+                        expectedExtensionId = lease.identity.extensionId,
+                        expectedPublicKeySha256 = sha256(requireNotNull(lease.identity.crxPublicKeyDer)),
+                    ),
+                )
+            }
+
+            val restartedLedger = ConversionIdentityLedger(database.conversionIdentityDao())
+            val restartedPackager = OnDeviceWrapperPackager(context)
+            assertTrue(
+                runBlocking {
+                    restartedLedger.resumeUnreservedIdentityCleanup(
+                        identityKey,
+                        restartedPackager,
+                    )
+                },
+            )
+            assertFalse(keyStore.containsAlias(alias))
+            assertNull(
+                runBlocking {
+                    database.conversionIdentityDao().getLease(identityKey.identitySha256)
+                },
+            )
+            database.close()
         }
     }
 
     @Test
     fun packagerStartupReconcilesOnlyOwnedDirectTemporaryFiles() {
+        val temporaryRoot = File(root, "tmp").apply { mkdirs() }
         val owned = listOf(
-            ".source.interrupted.bin",
-            ".extension.interrupted.crx",
-            ".wrapper-template.interrupted.apk",
-            ".unsigned.interrupted.apk",
-            ".signed.interrupted.apk",
-            "..unsigned.interrupted.apk.tmp",
-            "..signed.interrupted.apk.tmp",
-        ).map { File(root, it).apply { writeText("orphan") } }
+            ".source.101.bin",
+            ".extension.102.crx",
+            ".wrapper-template.103.apk",
+            ".unsigned.104.apk",
+            ".signed.105.apk",
+            "..unsigned.104.apk.201.tmp",
+            "..signed.105.apk.202.tmp",
+        ).map { File(temporaryRoot, it).apply { writeText("orphan") } }
+        val nonOwnedTemporary = File(temporaryRoot, "..signed.105.apk.keep.202.tmp").apply {
+            writeText("not-owned")
+        }
         val unrelated = File(root, "keep.apk").apply { writeText("keep") }
+        val reservedPrefixFinal = File(root, ".signed.release.apk").apply {
+            writeText("final")
+        }
 
         OnDeviceWrapperPackager(context)
 
         owned.forEach { assertFalse(it.exists()) }
+        assertTrue(nonOwnedTemporary.exists())
         assertTrue(unrelated.exists())
+        assertTrue(reservedPrefixFinal.exists())
     }
 
     @Test
@@ -317,7 +418,7 @@ class OnDevicePackagerGateInstrumentedTest {
         )
         try {
             assertRejected {
-                packager.packageWrapper(request(packager, canonicalSourceZip(), 5, existing))
+                packageClaim(packager, request(packager, canonicalSourceZip(), 5, existing))
             }
             assertFalse(File(replacement, "preserved.apk").exists())
             assertEquals("keep", File(savedRoot, "preserved.apk").readText())
@@ -333,7 +434,11 @@ class OnDevicePackagerGateInstrumentedTest {
         val source = canonicalSourceZip()
         val output = File(root, "gate-v1.apk")
         val packager = OnDeviceWrapperPackager(context)
-        val result = packager.packageWrapper(request(packager, source, 1, output))
+        context.deleteDatabase(GATE_LEDGER_DATABASE)
+        val result = packageClaim(
+            packager,
+            request(packager, source, 1, output, GATE_LEDGER_DATABASE),
+        )
         val alias = "sixbridge.crx.rsa.v1.${CONVERTED_KEY.identitySha256}"
         val entry = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.getEntry(alias, null) as KeyStore.PrivateKeyEntry
         assertNull(entry.privateKey.encoded)
@@ -355,7 +460,10 @@ class OnDevicePackagerGateInstrumentedTest {
         val source = canonicalSourceZip()
         val v2 = File(root, "gate-v2.apk")
         val packager = OnDeviceWrapperPackager(context)
-        val result = packager.packageWrapper(request(packager, source, 2, v2))
+        val result = packageClaim(
+            packager,
+            request(packager, source, 2, v2, GATE_LEDGER_DATABASE),
+        )
         assertTrue(old.contains("\"extensionId\":\"${result.extensionId}\""))
         assertTrue(old.contains("\"packageName\":\"${result.packageName}\""))
         assertTrue(old.contains("\"wrapperSignerSha256\":\"${result.signerSha256}\""))
@@ -392,40 +500,159 @@ class OnDevicePackagerGateInstrumentedTest {
         source: ByteArray,
         versionCode: Int,
         output: File,
-    ): OnDeviceWrapperRequest {
-        val identity = runCatching {
-            packager.resolveIdentity(CONVERTED_KEY, null)
-        }.getOrElse {
-            packager.resolveUnreservedIdentity(CONVERTED_KEY).identity
+        persistentDatabaseName: String? = null,
+    ): ClaimedRequest {
+        val database = if (persistentDatabaseName == null) {
+            Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+        } else {
+            Room.databaseBuilder(context, ManagerDatabase::class.java, persistentDatabaseName)
+                .addMigrations(
+                    ManagerDatabase.MIGRATION_1_2,
+                    ManagerDatabase.MIGRATION_2_3,
+                    ManagerDatabase.MIGRATION_3_4,
+                )
+                .allowMainThreadQueries()
+                .build()
         }
-        return OnDeviceWrapperRequest(
-            reservation = reservation(CONVERTED_KEY, identity, versionCode),
-            canonicalSourceZip = source,
-            passthroughCrx = null,
-            descriptorName = "SIX Bridge On-Device Gate",
-            descriptorVersion = "1.0",
-            sourceKind = "ZIP",
-            compatibility = compatibility(
-                extensionId = identity.extensionId,
-                sourceSha256 = sha256(source),
-                conversionState = "converted",
-                originalExtensionId = ORIGINAL_EXTENSION_ID,
-            ),
-            outputApk = output,
-        )
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        return try {
+            runBlocking {
+                val selected = ledger.resolveSelection(
+                    logicalSourceIdentity = CONVERTED_KEY.logicalSourceIdentity,
+                    profileMajorVersion = CONVERTED_KEY.profileMajorVersion,
+                    mode = InstallationIdentityMode.CONVERTED,
+                    selection = null,
+                )
+                val existing = database.conversionIdentityDao().get(selected.identitySha256)
+                val lease = if (existing == null) {
+                    ledger.resolveUnreservedIdentity(selected, packager)
+                } else {
+                    null
+                }
+                val identity = lease?.identity ?: packager.resolveIdentity(selected, null)
+                val publicKeySha256 = sha256(requireNotNull(identity.crxPublicKeyDer))
+                val reserved = ledger.reserve(
+                    request = ConversionIdentityReservation(
+                        identityKey = selected,
+                        displayName = "SIX Bridge On-Device Gate",
+                        packageBinding = ConversionPackageBinding(
+                            extensionId = identity.extensionId,
+                            packageName = identity.packageName,
+                            wrapperSignerSha256 = identity.wrapperSignerSha256,
+                            crxKeyAlias = identity.crxKeyAlias,
+                            crxPublicKeySha256 = publicKeySha256,
+                        ),
+                        installedVersionCode = (versionCode - 1).toLong(),
+                    ),
+                    unreservedLease = lease,
+                )
+                assertEquals(versionCode, reserved.versionCode)
+                val capability = ledger.claimForPackaging(reserved)
+                ClaimedRequest(
+                    request = OnDeviceWrapperRequest(
+                        reservation = capability,
+                        canonicalSourceZip = source,
+                        passthroughCrx = null,
+                        descriptorName = "SIX Bridge On-Device Gate",
+                        descriptorVersion = "1.0",
+                        sourceKind = "ZIP",
+                        compatibility = compatibility(
+                            extensionId = identity.extensionId,
+                            sourceSha256 = sha256(source),
+                            conversionState = "converted",
+                            originalExtensionId = ORIGINAL_EXTENSION_ID,
+                        ),
+                        outputApk = output,
+                    ),
+                    ledger = ledger,
+                    capability = capability,
+                    database = database,
+                )
+            }
+        } catch (error: Throwable) {
+            database.close()
+            throw error
+        }
     }
 
-    private fun reservation(
+    private fun passthroughRequest(
         identityKey: InstallationIdentityKey,
         identity: OnDevicePackageIdentity,
-        versionCode: Int,
-    ) = ReservedConversionIdentity(
-        identityKey = identityKey,
+        originalCrx: ByteArray,
+        report: ContractCompatibilityReport,
+        output: File,
+    ): ClaimedRequest {
+        val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        return try {
+            runBlocking {
+                val selected = ledger.resolveSelection(
+                    logicalSourceIdentity = identityKey.logicalSourceIdentity,
+                    profileMajorVersion = identityKey.profileMajorVersion,
+                    mode = InstallationIdentityMode.PASSTHROUGH,
+                    selection = null,
+                )
+                val reserved = ledger.reserve(
+                    ConversionIdentityReservation(
+                        identityKey = selected,
+                        displayName = "SIX Bridge On-Device Gate",
+                        packageBinding = binding(identity),
+                        installedVersionCode = null,
+                    ),
+                )
+                val capability = ledger.claimForPackaging(reserved)
+                ClaimedRequest(
+                    request = OnDeviceWrapperRequest(
+                        reservation = capability,
+                        canonicalSourceZip = null,
+                        passthroughCrx = originalCrx,
+                        descriptorName = "SIX Bridge On-Device Gate",
+                        descriptorVersion = "1.0",
+                        sourceKind = "CRX3",
+                        compatibility = report,
+                        outputApk = output,
+                    ),
+                    ledger = ledger,
+                    capability = capability,
+                    database = database,
+                )
+            }
+        } catch (error: Throwable) {
+            database.close()
+            throw error
+        }
+    }
+
+    private fun binding(identity: OnDevicePackageIdentity) = ConversionPackageBinding(
         extensionId = identity.extensionId,
         packageName = identity.packageName,
         wrapperSignerSha256 = identity.wrapperSignerSha256,
         crxKeyAlias = identity.crxKeyAlias,
-        versionCode = versionCode,
+        crxPublicKeySha256 = identity.crxPublicKeyDer?.let(::sha256),
+    )
+
+    private fun packageClaim(
+        packager: OnDeviceWrapperPackager,
+        claimed: ClaimedRequest,
+    ): OnDeviceWrapperResult {
+        var succeeded = false
+        return try {
+            packager.packageWrapper(claimed.request).also { succeeded = true }
+        } finally {
+            runBlocking { claimed.ledger.finishPackaging(claimed.capability, succeeded) }
+            claimed.database.close()
+        }
+    }
+
+    private data class ClaimedRequest(
+        val request: OnDeviceWrapperRequest,
+        val ledger: ConversionIdentityLedger,
+        val capability: PackagingConversionIdentity,
+        val database: ManagerDatabase,
     )
 
     private fun compatibility(
@@ -524,6 +751,7 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     private companion object {
+        const val GATE_LEDGER_DATABASE = "ondevice-packager-gate-ledger.db"
         const val ORIGINAL_EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
         val CONVERTED_KEY = InstallationIdentityKey.create(
             LogicalSourceIdentity.storeExtensionId(ORIGINAL_EXTENSION_ID),

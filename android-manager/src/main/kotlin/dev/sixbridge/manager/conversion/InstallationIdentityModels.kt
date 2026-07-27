@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class InstallationIdentityMode {
     PASSTHROUGH,
@@ -131,6 +132,7 @@ data class ConversionPackageBinding(
     val packageName: String,
     val wrapperSignerSha256: String,
     val crxKeyAlias: String?,
+    val crxPublicKeySha256: String?,
 )
 
 data class ConversionIdentityReservation(
@@ -148,16 +150,49 @@ data class ExistingConversionTarget(
     val wrapperSignerSha256: String,
 )
 
-data class ReservedConversionIdentity(
+class ReservedConversionIdentity internal constructor(
     val identityKey: InstallationIdentityKey,
     val extensionId: String,
     val packageName: String,
     val wrapperSignerSha256: String,
     val crxKeyAlias: String?,
+    val crxPublicKeySha256: String?,
     val versionCode: Int,
+    internal val ownerToken: String,
 ) {
     val identitySha256: String
         get() = identityKey.identitySha256
+    val recoveryToken: String
+        get() = ownerToken
+}
+
+class PackagingConversionIdentity internal constructor(
+    internal val reservation: ReservedConversionIdentity,
+) {
+    private val consumed = AtomicBoolean()
+
+    val identityKey: InstallationIdentityKey
+        get() = reservation.identityKey
+    val identitySha256: String
+        get() = reservation.identitySha256
+    val extensionId: String
+        get() = reservation.extensionId
+    val packageName: String
+        get() = reservation.packageName
+    val wrapperSignerSha256: String
+        get() = reservation.wrapperSignerSha256
+    val crxKeyAlias: String?
+        get() = reservation.crxKeyAlias
+    val crxPublicKeySha256: String?
+        get() = reservation.crxPublicKeySha256
+    val versionCode: Int
+        get() = reservation.versionCode
+
+    internal fun consume() {
+        require(consumed.compareAndSet(false, true)) {
+            "package capability는 한 번만 사용할 수 있습니다."
+        }
+    }
 }
 
 private fun canonicalInstallationIdentitySha256(

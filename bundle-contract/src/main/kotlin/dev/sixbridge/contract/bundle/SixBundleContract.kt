@@ -15,6 +15,7 @@ import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
+import java.util.zip.CRC32
 
 object SixBundleContract {
     const val EXTENSION_ENTRY = "extension.json"
@@ -198,7 +199,7 @@ object SixBundleContract {
         }
         validateContents(contents.wrapperApk, contents.extension, contents.compatibility)
         ZipOutputStream(output).use { zip ->
-            add(zip, WRAPPER_ENTRY, contents.wrapperApk)
+            addStored(zip, WRAPPER_ENTRY, contents.wrapperApk)
             add(zip, EXTENSION_ENTRY, extension)
             add(zip, COMPATIBILITY_ENTRY, compatibility)
         }
@@ -236,11 +237,12 @@ object SixBundleContract {
             "SixBundle 압축 해제 크기가 제한을 초과합니다."
         }
         validateMetadata(extension, compatibility)
-        require(sha256(wrapperApk) == extension.wrapperSha256) {
+        val wrapperFacts = wrapperFacts(wrapperApk, attributes.size())
+        require(wrapperFacts.sha256 == extension.wrapperSha256) {
             "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
         }
         ZipOutputStream(output).use { zip ->
-            val copiedSha256 = add(zip, WRAPPER_ENTRY, wrapperApk, attributes.size())
+            val copiedSha256 = addStored(zip, WRAPPER_ENTRY, wrapperApk, wrapperFacts)
             require(copiedSha256 == extension.wrapperSha256) {
                 "기록한 wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
             }
@@ -563,22 +565,41 @@ object SixBundleContract {
         zip.closeEntry()
     }
 
-    private fun add(
+    private fun addStored(zip: ZipOutputStream, name: String, bytes: ByteArray) {
+        val crc = CRC32().apply { update(bytes) }.value
+        zip.putNextEntry(ZipEntry(name).apply {
+            time = 0L
+            method = ZipEntry.STORED
+            size = bytes.size.toLong()
+            compressedSize = size
+            this.crc = crc
+        })
+        zip.write(bytes)
+        zip.closeEntry()
+    }
+
+    private fun addStored(
         zip: ZipOutputStream,
         name: String,
         source: Path,
-        expectedSize: Long,
+        facts: WrapperFacts,
     ): String {
-        zip.putNextEntry(ZipEntry(name).apply { time = 0L })
+        zip.putNextEntry(ZipEntry(name).apply {
+            time = 0L
+            method = ZipEntry.STORED
+            size = facts.size
+            compressedSize = size
+            crc = facts.crc
+        })
         val digest = MessageDigest.getInstance("SHA-256")
         Files.newInputStream(source, NOFOLLOW_LINKS).use { input ->
             val buffer = ByteArray(STREAM_BUFFER_SIZE)
             var copied = 0L
-            while (copied < expectedSize) {
+            while (copied < facts.size) {
                 val count = input.read(
                     buffer,
                     0,
-                    minOf(buffer.size.toLong(), expectedSize - copied).toInt(),
+                    minOf(buffer.size.toLong(), facts.size - copied).toInt(),
                 )
                 require(count > 0) { "SixBundle source가 잘렸습니다: $name" }
                 zip.write(buffer, 0, count)
@@ -589,6 +610,26 @@ object SixBundleContract {
         }
         zip.closeEntry()
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun wrapperFacts(path: Path, expectedSize: Long): WrapperFacts {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val crc = CRC32()
+        var size = 0L
+        Files.newInputStream(path, NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(count > 0) { "wrapper.apk preflight 읽기가 진행되지 않습니다." }
+                size += count
+                require(size <= expectedSize) { "wrapper.apk 크기가 변경되었습니다." }
+                digest.update(buffer, 0, count)
+                crc.update(buffer, 0, count)
+            }
+        }
+        require(size == expectedSize) { "wrapper.apk 크기가 변경되었습니다." }
+        return WrapperFacts(size, crc.value, digest.digest().joinToString("") { "%02x".format(it) })
     }
 
     private fun deleteTemporaryFile(file: File) {
@@ -620,6 +661,7 @@ object SixBundleContract {
         }
 
     private data class TemporaryArchive(val file: File, val size: Long)
+    private data class WrapperFacts(val size: Long, val crc: Long, val sha256: String)
 
     private data class CentralDirectoryEntry(
         val name: String,
