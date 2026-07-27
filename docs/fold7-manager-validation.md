@@ -17,6 +17,8 @@
 - 삼성 인터넷 버전: `30.0.0.67` (versionCode `1300067502`)
 - 관리자 APK: `dist/sixbridge-manager-debug.apk`
 - 최종 수정 관리자 APK SHA-256:
+  `af3b469e2ef59d47544f5d889ea99d49b9e49b2cf5ab706a4fc16d4a3d0da395`
+- 과거 2026-07-27 아이콘 동시성 최종 관리자 APK SHA-256:
   `0b77f88516f58d3153a9769e459e6afba4b243160f16dc987571fad3db37c905`
 - 과거 2026-07-27 1차 아이콘 동시성 관리자 APK SHA-256:
   `c005580f1a69b28576ec6e9aa3f5ba483f50d5ee26d213b697d45260fc22977c`
@@ -24,6 +26,7 @@
   `574b0bd4b7fbb267ee400d3ea43559c605d30b7055d9814502e3cd9ae65f5704`
 - 과거 자동 검증 일자: 2026-07-26
 - 아이콘 동시성 최종 자동 검증 일시: 2026-07-27 09:18~09:22 KST
+- 관리자 launcher icon 보정 검증 일시: 2026-07-27 11:33~11:56 KST
 - 아이콘 동시성 최종 Fold7 serial:
   `adb-DEVICE_SERIAL._adb-tls-connect._tcp`
 - 개발용 무선 ADB 검증 일시: 2026-07-26 15:40 KST
@@ -108,6 +111,41 @@
   - `apkanalyzer manifest print dist/sixbridge-manager-debug.apk` 결과에는
     위 test Provider class와 authority가 없었다. production manifest와
     배포 APK에는 test-only Provider가 포함되지 않았다.
+- [x] 관리자 launcher icon 머티리얼 3D 계약과 전체 패키징
+  - 컬러 전경은 `108 × 108` viewport 안에서 원본 중심
+    `(52.5, 51)`, `0.75`배 축소, `translateX=3`,
+    `translateY=3`을 사용한다.
+  - 퍼즐 몸체는 반지름 `5` 라운드 경로를 사용하고, 오른쪽 아래
+    `translateX=4`, `translateY=4`의 Dark Plum `#2E1065`
+    머티리얼 돌출면을 먼저 그린다.
+  - 단색 전경은 같은 크기·위치·라운드를 공유하고 머티리얼 돌출면 없이
+    `evenOdd` track cutout을 유지한다.
+  - 돌출 track 굵기 변이, 단색 중첩 group, 최상위 sibling group과
+    `fillAlpha=0` 변이가 각각 계약 테스트에서 실패했다.
+  - 최종 `./scripts/package-manager-debug.sh`는 Gradle
+    `BUILD SUCCESSFUL`, Node 89/89, shell·conversion·manifest·distribution
+    계약을 통과했다.
+  - 구현·계약 교차 검토는 Critical, Important와 Minor 지적 없이
+    `CLEAN`으로 끝났다.
+
+## 관리자 launcher icon 수동 검증
+
+- [x] 보정 APK를 Fold7 기본 사용자에 `adb install -r`로 업데이트했다.
+  - 설치 결과: `Success`
+  - 관리자: `dev.sixbridge.manager`, versionName `0.1.0`,
+    versionCode `1`
+  - 업데이트 전후 설치 wrapper는 스마트 컨텍스트 메뉴, AI 레시피 추출기,
+    Video Download to NAS와 SIX Bridge Technical Gate의 4개로 같았다.
+- [x] 사용자가 Fold7 앱 서랍의 컬러 아이콘을 확인하고 현재 상태를
+  1차 승인했다.
+  - 적용값: 약 `48dp`, 우측 `1.5dp` 시각 보정, 반지름 `5` 라운드,
+    Dark Plum 머티리얼 돌출면
+  - 사용자 판단: “이정도면 우선 된 거 같아”
+  - 아이콘 미세 조정은 후속 작업으로 남긴다.
+- [ ] Android 13+ 색상 팔레트의 단색 테마 아이콘을 이번 보정 APK에서
+  다시 확인했다.
+  - 이번 사용자 확인은 컬러 아이콘의 1차 승인까지만 포함한다.
+  - 미실행 항목을 컬러 아이콘 확인으로 대신해 통과 처리하지 않는다.
 
 ## Task 12 개발용 무선 ADB 확인
 
@@ -278,4 +316,8 @@ manifest·Room schema version `1` 유지, Android unit 297/297, Fold7
 connected 28/28, 전체 패키징 74/74와 Node 89/89, build/dist APK
 byte 동일성을 자동 검증했다. 이번 최종 회귀에서는 실제 wrapper 제거 또는
 새 UI 수동 캡처를 수행하지 않았으므로 기존 사용자 확인 범위를 확대해
-주장하지 않는다.
+주장하지 않는다. 이어진 관리자 launcher icon 보정에서는 컬러 전경을
+약 `48dp`로 줄이고 우측 시각 보정, 라운드 모서리와 머티리얼 돌출면을
+적용했다. 전체 패키징과 구조 계약 교차 검토 뒤 Fold7에 업데이트했으며,
+사용자는 컬러 아이콘을 1차 승인했다. 단색 테마 아이콘 재확인과 추가 미세
+조정은 실행하지 않았으므로 후속 항목으로 유지한다.
