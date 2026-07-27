@@ -43,14 +43,26 @@ source_permission_contract() {
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local permission_elements="/*[local-name()='manifest']/*[starts-with(local-name(), 'uses-permission')]"
     local permission
+    local allowed_permissions="${attr_name}='android.permission.INTERNET' or ${attr_name}='android.permission.REQUEST_INSTALL_PACKAGES' or ${attr_name}='android.permission.REQUEST_DELETE_PACKAGES' or ${attr_name}='android.permission.POST_NOTIFICATIONS'"
     local -a required_permissions=(
+        "android.permission.INTERNET"
         "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.REQUEST_DELETE_PACKAGES"
+        "android.permission.POST_NOTIFICATIONS"
     )
     local -a forbidden_permissions=(
         "android.permission.DELETE_PACKAGES"
-        "android.permission.INTERNET"
         "android.permission.QUERY_ALL_PACKAGES"
+        "android.permission.READ_EXTERNAL_STORAGE"
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+        "android.permission.MANAGE_EXTERNAL_STORAGE"
+        "android.permission.READ_MEDIA_AUDIO"
+        "android.permission.READ_MEDIA_IMAGES"
+        "android.permission.READ_MEDIA_VIDEO"
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+        "android.permission.ACCESS_MEDIA_LOCATION"
+        "android.permission.FOREGROUND_SERVICE"
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
     )
 
     for permission in "${required_permissions[@]}"; do
@@ -64,6 +76,9 @@ source_permission_contract() {
             "${permission_elements}[${attr_name}='${permission}']" 0 \
             "${permission} must not be declared in uses-permission elements"
     done
+    assert_xpath_count "${manifest}" \
+        "${permission_elements}[not(${allowed_permissions})]" 0 \
+        "source manifest must not declare permissions outside the exact allowlist"
 }
 
 apk_permission_names() {
@@ -107,13 +122,24 @@ apk_permission_contract() {
     local permission
     local permission_count
     local -a required_permissions=(
+        "android.permission.INTERNET"
         "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.REQUEST_DELETE_PACKAGES"
+        "android.permission.POST_NOTIFICATIONS"
     )
     local -a forbidden_permissions=(
         "android.permission.DELETE_PACKAGES"
-        "android.permission.INTERNET"
         "android.permission.QUERY_ALL_PACKAGES"
+        "android.permission.READ_EXTERNAL_STORAGE"
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+        "android.permission.MANAGE_EXTERNAL_STORAGE"
+        "android.permission.READ_MEDIA_AUDIO"
+        "android.permission.READ_MEDIA_IMAGES"
+        "android.permission.READ_MEDIA_VIDEO"
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+        "android.permission.ACCESS_MEDIA_LOCATION"
+        "android.permission.FOREGROUND_SERVICE"
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
     )
 
     for permission in "${required_permissions[@]}"; do
@@ -127,6 +153,19 @@ apk_permission_contract() {
         [[ "${permission_count}" == "0" ]] ||
             fail "APK ${permission} must not be declared in uses-permission elements (expected 0, got ${permission_count})"
     done
+    while IFS= read -r permission; do
+        case "${permission}" in
+            android.permission.INTERNET|\
+            android.permission.REQUEST_INSTALL_PACKAGES|\
+            android.permission.REQUEST_DELETE_PACKAGES|\
+            android.permission.POST_NOTIFICATIONS|\
+            dev.sixbridge.manager.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION)
+                ;;
+            *)
+                fail "APK permission is outside the exact allowlist: ${permission}"
+                ;;
+        esac
+    done < <(apk_permission_names "${xmltree}")
 }
 
 manifest_contract() {
@@ -536,18 +575,24 @@ run_permission_self_test() {
 
     printf '%s\n' \
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_DELETE_PACKAGES" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '</manifest>' >"${fixture_dir}/source-allowed.xml"
     printf '%s\n' \
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_DELETE_PACKAGES" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.DELETE_PACKAGES" />' \
         '</manifest>' >"${fixture_dir}/source-forbidden.xml"
     printf '%s\n' \
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '</manifest>' \
         >"${fixture_dir}/source-missing.xml"
 
@@ -555,25 +600,37 @@ run_permission_self_test() {
         'N: android=http://schemas.android.com/apk/res/android' \
         '  E: manifest (line=2)' \
         '    E: uses-permission-sdk-23 (line=3)' \
-        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
         '    E: uses-permission-sdk-23 (line=4)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
+        '    E: uses-permission-sdk-23 (line=5)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_DELETE_PACKAGES" (Raw: "android.permission.REQUEST_DELETE_PACKAGES")' \
+        '    E: uses-permission-sdk-23 (line=6)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
         >"${fixture_dir}/apk-allowed.xmltree"
     printf '%s\n' \
         'N: android=http://schemas.android.com/apk/res/android' \
         '  E: manifest (line=2)' \
         '    E: uses-permission-sdk-23 (line=3)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
+        '    E: uses-permission-sdk-23 (line=4)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
         '    E: uses-permission-sdk-23 (line=5)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_DELETE_PACKAGES" (Raw: "android.permission.REQUEST_DELETE_PACKAGES")' \
         '    E: uses-permission-sdk-23 (line=6)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
+        '    E: uses-permission-sdk-23 (line=7)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.DELETE_PACKAGES" (Raw: "android.permission.DELETE_PACKAGES")' \
         >"${fixture_dir}/apk-forbidden.xmltree"
     printf '%s\n' \
         'N: android=http://schemas.android.com/apk/res/android' \
         '  E: manifest (line=2)' \
         '    E: uses-permission-sdk-23 (line=3)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
+        '    E: uses-permission-sdk-23 (line=4)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
+        '    E: uses-permission-sdk-23 (line=5)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
         >"${fixture_dir}/apk-missing.xmltree"
 
     if ! bash "${BASH_SOURCE[0]}" --check-source-permissions \
