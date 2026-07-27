@@ -1770,6 +1770,99 @@ class ManagerRepositoryTest {
             assertNull(publisher.state.value.single().iconPng)
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `한 package 삭제 실패는 같은 publication의 다른 package icon schedule을 유지한다`() =
+        runTest {
+            val secondPng = byteArrayOf(4, 5, 6)
+            val candidatesCaptured = CompletableDeferred<Unit>()
+            val allowPublication = CompletableDeferred<Unit>()
+            val first = record(version = 1, signer = "same")
+            val second = first.copy(
+                packageName = SECOND_PACKAGE,
+                extensionId = SECOND_EXTENSION_ID,
+                name = "Second",
+            )
+            val backingCatalog = FakeCatalog(listOf(first, second))
+            val persistedPackages = mutableListOf<String>()
+            var ensureCount = 0
+            val catalog = object : ManagerCatalog by backingCatalog {
+                override suspend fun ensureDiscoveredIdentity(
+                    discovered: CatalogRecord,
+                ): CatalogRecord {
+                    val ensured = backingCatalog.ensureDiscoveredIdentity(discovered)
+                    ensureCount += 1
+                    if (ensureCount == 2) {
+                        candidatesCaptured.complete(Unit)
+                        allowPublication.await()
+                    }
+                    return ensured
+                }
+
+                override suspend fun persistIconIfIdentity(
+                    identity: CatalogIdentity,
+                    iconPng: ByteArray,
+                ): CatalogRecord? {
+                    persistedPackages += identity.packageName
+                    return backingCatalog.persistIconIfIdentity(identity, iconPng)
+                }
+            }
+            val providerLoads = mutableListOf<String>()
+            val installed = FakeInstalledWrappers(
+                listOf(
+                    installed(PACKAGE, version = 1, signer = "same"),
+                    installed(SECOND_PACKAGE, version = 1, signer = "same"),
+                ),
+            )
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource { packageName ->
+                    providerLoads += packageName
+                    when (packageName) {
+                        PACKAGE -> PUBLISHER_PNG
+                        SECOND_PACKAGE -> secondPng
+                        else -> error("unexpected package: $packageName")
+                    }
+                },
+                scope = backgroundScope,
+            )
+            val removeFailure = IllegalStateException("Room unavailable")
+            backingCatalog.removeFailure = removeFailure
+
+            val publication = async { publisher.publish(listOf(first, second)) }
+            runCurrent()
+            candidatesCaptured.await()
+
+            val thrownResult = CompletableDeferred<Throwable>()
+            val removal = launch {
+                try {
+                    publisher.remove(PACKAGE)
+                } catch (error: Throwable) {
+                    thrownResult.complete(error)
+                }
+            }
+            runCurrent()
+            assertFalse(removal.isCompleted)
+
+            allowPublication.complete(Unit)
+            runCurrent()
+            publication.await()
+            removal.join()
+            runCurrent()
+
+            assertSame(removeFailure, thrownResult.await())
+            assertEquals(listOf(SECOND_PACKAGE), providerLoads)
+            assertEquals(listOf(SECOND_PACKAGE), persistedPackages)
+            assertEquals(1, backingCatalog.iconInsertCount)
+            val catalogByPackage = backingCatalog.records.associateBy(CatalogRecord::packageName)
+            val stateByPackage = publisher.state.value.associateBy(CatalogRecord::packageName)
+            assertNull(catalogByPackage.getValue(PACKAGE).iconPng)
+            assertNull(stateByPackage.getValue(PACKAGE).iconPng)
+            assertContentEquals(secondPng, catalogByPackage.getValue(SECOND_PACKAGE).iconPng)
+            assertContentEquals(secondPng, stateByPackage.getValue(SECOND_PACKAGE).iconPng)
+        }
+
     @Test
     fun `identity 변경은 이전 bytes와 저장 실패 상태를 재사용하지 않는다`() = runBlocking {
         var providerLoadCount = 0
