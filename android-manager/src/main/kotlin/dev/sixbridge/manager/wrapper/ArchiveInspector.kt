@@ -40,6 +40,10 @@ data class ArchiveProvider(
 )
 
 data class BinaryManifestFacts(
+    val packageName: String,
+    val versionCode: Int,
+    val minSdkVersion: Int,
+    val targetSdkVersion: Int,
     val metadata: Map<String, String>,
     val activities: List<ArchiveActivity>,
     val providers: List<ArchiveProvider>,

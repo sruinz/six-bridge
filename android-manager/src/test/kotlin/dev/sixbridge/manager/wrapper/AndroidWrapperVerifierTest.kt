@@ -764,7 +764,25 @@ class AndroidWrapperVerifierTest {
                 exported = node.attributes["exported"] == "true",
             )
         }
-        return BinaryManifestFacts(metadata, activities, providers)
+        val usesSdk = manifest.children.single { it.name == "uses-sdk" }
+        return BinaryManifestFacts(
+            packageName = manifest.attributes.getValue("package"),
+            versionCode = aaptInteger(manifest.attributes.getValue("versionCode")),
+            minSdkVersion = aaptInteger(usesSdk.attributes.getValue("minSdkVersion")),
+            targetSdkVersion = aaptInteger(usesSdk.attributes.getValue("targetSdkVersion")),
+            metadata = metadata,
+            activities = activities,
+            providers = providers,
+        )
+    }
+
+    private fun aaptInteger(value: String): Int {
+        val number = Regex("0x[0-9a-fA-F]+|[0-9]+")
+            .findAll(value)
+            .lastOrNull()
+            ?.value
+            ?: error("aapt integer가 없습니다: $value")
+        return number.removePrefix("0x").toInt(if (number.startsWith("0x")) 16 else 10)
     }
 
     private fun compareVersionParts(left: List<Int>, right: List<Int>): Int {

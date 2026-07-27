@@ -28,6 +28,14 @@ class AndroidArchiveInspector(
         } catch (_: IllegalArgumentException) {
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
+        val archivePackageName = packageInfo.packageName
+            .takeIf(String::isNotBlank)
+            ?: invalid(ImportFailureCode.ARCHIVE_INVALID)
+        if (archivePackageName != manifest.packageName ||
+            packageInfo.longVersionCode != manifest.versionCode.toLong()
+        ) {
+            invalid(ImportFailureCode.ARCHIVE_INVALID)
+        }
         val extensionId = manifest.metadata[EXTENSION_ID_METADATA]
         if (packageInfo.applicationInfo?.metaData?.getString(EXTENSION_ID_METADATA) != extensionId) {
             invalid(ImportFailureCode.ARCHIVE_INVALID)
@@ -53,9 +61,7 @@ class AndroidArchiveInspector(
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
         return ArchiveFacts(
-            packageName = packageInfo.packageName
-                .takeIf(String::isNotBlank)
-                ?: invalid(ImportFailureCode.ARCHIVE_INVALID),
+            packageName = archivePackageName,
             versionCode = packageInfo.longVersionCode,
             signerSha256 = sha256(signers.single().toByteArray()),
             metadata = manifest.metadata,

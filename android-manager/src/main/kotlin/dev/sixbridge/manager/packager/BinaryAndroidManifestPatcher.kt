@@ -1,0 +1,552 @@
+package dev.sixbridge.manager.packager
+
+import dev.sixbridge.manager.wrapper.ArchiveActivity
+import dev.sixbridge.manager.wrapper.ArchiveIntentFilter
+import dev.sixbridge.manager.wrapper.ArchiveProvider
+import dev.sixbridge.manager.wrapper.BinaryAndroidManifestReader
+import dev.sixbridge.manager.wrapper.BinaryManifestFacts
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
+
+data class WrapperManifestRequest(
+    val extensionId: String,
+    val versionCode: Int,
+)
+
+class BinaryAndroidManifestPatcher(
+    private val reader: BinaryAndroidManifestReader = BinaryAndroidManifestReader(),
+) {
+    fun patch(template: ByteArray, request: WrapperManifestRequest): ByteArray {
+        require(EXTENSION_ID.matches(request.extensionId)) { "확장 ID 형식이 올바르지 않습니다." }
+        require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
+
+        val immutableTemplate = template.copyOf()
+        val templateFacts = reader.read(immutableTemplate)
+        verifyTemplateFacts(templateFacts)
+        val layout = BinaryManifestLayout.parse(immutableTemplate)
+
+        val packageName = "$PACKAGE_PREFIX${request.extensionId}"
+        val authority = "$packageName$PROVIDER_SUFFIX"
+        val packageAttribute = layout.singleAttribute(
+            elementName = "manifest",
+            parentName = null,
+            namespace = null,
+            name = "package",
+            resourceId = 0,
+        )
+        val versionCodeAttribute = layout.singleAttribute(
+            elementName = "manifest",
+            parentName = null,
+            namespace = ANDROID_NAMESPACE,
+            name = "versionCode",
+            resourceId = VERSION_CODE_RESOURCE_ID,
+        )
+        val metadataValueAttribute = layout.singleMetadataValueAttribute()
+        val providerAuthorityAttribute = layout.singleAttribute(
+            elementName = "provider",
+            parentName = "application",
+            namespace = ANDROID_NAMESPACE,
+            name = "authorities",
+            resourceId = AUTHORITIES_RESOURCE_ID,
+        )
+
+        val packageSlot = layout.singlePlaceholder(PACKAGE_PREFIX + PLACEHOLDER_ID)
+        val extensionIdSlot = layout.singlePlaceholder(PLACEHOLDER_ID)
+        val authoritySlot = layout.singlePlaceholder(
+            "$PACKAGE_PREFIX$PLACEHOLDER_ID$PROVIDER_SUFFIX",
+        )
+        requireStringAttribute(packageAttribute, packageSlot)
+        requireStringAttribute(metadataValueAttribute, extensionIdSlot)
+        requireStringAttribute(providerAuthorityAttribute, authoritySlot)
+        require(
+            versionCodeAttribute.valueType == TYPE_INT_DEC &&
+                versionCodeAttribute.rawValueIndex == NO_INDEX &&
+                versionCodeAttribute.valueData == TEMPLATE_VERSION_CODE
+        ) {
+            "템플릿 versionCode attribute가 올바르지 않습니다."
+        }
+
+        val patched = immutableTemplate.copyOf()
+        packageSlot.replace(patched, packageName)
+        extensionIdSlot.replace(patched, request.extensionId)
+        authoritySlot.replace(patched, authority)
+        patched.writeInt(versionCodeAttribute.offset + ATTRIBUTE_RAW_VALUE_OFFSET, NO_INDEX)
+        patched.writeInt(versionCodeAttribute.offset + ATTRIBUTE_TYPED_DATA_OFFSET, request.versionCode)
+
+        val facts = reader.read(patched)
+        verifyPatchedFacts(facts, request, packageName, authority)
+        return patched
+    }
+
+    private fun verifyTemplateFacts(facts: BinaryManifestFacts) {
+        require(facts.packageName == "$PACKAGE_PREFIX$PLACEHOLDER_ID") {
+            "템플릿 package가 올바르지 않습니다."
+        }
+        require(facts.versionCode == TEMPLATE_VERSION_CODE) {
+            "템플릿 versionCode가 올바르지 않습니다."
+        }
+        verifyFixedFacts(facts, PLACEHOLDER_ID, "$PACKAGE_PREFIX$PLACEHOLDER_ID$PROVIDER_SUFFIX")
+    }
+
+    private fun verifyPatchedFacts(
+        facts: BinaryManifestFacts,
+        request: WrapperManifestRequest,
+        packageName: String,
+        authority: String,
+    ) {
+        require(facts.packageName == packageName && facts.versionCode == request.versionCode) {
+            "패치된 manifest package 또는 versionCode가 요청과 일치하지 않습니다."
+        }
+        verifyFixedFacts(facts, request.extensionId, authority)
+    }
+
+    private fun verifyFixedFacts(
+        facts: BinaryManifestFacts,
+        extensionId: String,
+        authority: String,
+    ) {
+        require(facts.minSdkVersion == MIN_SDK_VERSION && facts.targetSdkVersion == TARGET_SDK_VERSION) {
+            "manifest SDK 계약이 올바르지 않습니다."
+        }
+        require(facts.metadata == mapOf(EXTENSION_ID_METADATA to extensionId)) {
+            "manifest metadata 계약이 올바르지 않습니다."
+        }
+        require(
+            facts.activities == listOf(
+                ArchiveActivity(
+                    DISCOVERY_ACTIVITY,
+                    exported = true,
+                    intentFilters = listOf(
+                        ArchiveIntentFilter(
+                            actions = setOf(VIEW_ACTION),
+                            categories = setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
+                            schemes = setOf(SIX_SCHEME),
+                            hosts = setOf(EX_HOST),
+                        ),
+                    ),
+                ),
+            ),
+        ) {
+            "manifest Activity 계약이 올바르지 않습니다."
+        }
+        require(
+            facts.providers == listOf(
+                ArchiveProvider(EXTENSION_PROVIDER, authority, exported = true),
+            ),
+        ) {
+            "manifest Provider 계약이 올바르지 않습니다."
+        }
+    }
+
+    private fun requireStringAttribute(
+        attribute: BinaryManifestLayout.Attribute,
+        slot: BinaryManifestLayout.StringSlot,
+    ) {
+        require(
+            attribute.valueType == TYPE_STRING &&
+                attribute.valueData == slot.index &&
+                (attribute.rawValueIndex == NO_INDEX || attribute.rawValueIndex == slot.index)
+        ) {
+            "템플릿 string attribute가 올바르지 않습니다."
+        }
+    }
+
+    private companion object {
+        val EXTENSION_ID = Regex("[a-p]{32}")
+        const val PLACEHOLDER_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val PACKAGE_PREFIX = "dev.sixbridge.ext."
+        const val PROVIDER_SUFFIX = ".contentprovider"
+        const val TEMPLATE_VERSION_CODE = 1
+        const val MIN_SDK_VERSION = 30
+        const val TARGET_SDK_VERSION = 36
+        const val EXTENSION_ID_METADATA = "extension-id"
+        const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
+        const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"
+        const val VIEW_ACTION = "android.intent.action.VIEW"
+        const val DEFAULT_CATEGORY = "android.intent.category.DEFAULT"
+        const val BROWSABLE_CATEGORY = "android.intent.category.BROWSABLE"
+        const val SIX_SCHEME = "six"
+        const val EX_HOST = "ex"
+        const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+        const val VERSION_CODE_RESOURCE_ID = 0x0101021b
+        const val AUTHORITIES_RESOURCE_ID = 0x01010018
+        const val TYPE_STRING = 0x03
+        const val TYPE_INT_DEC = 0x10
+        const val NO_INDEX = -1
+        const val ATTRIBUTE_RAW_VALUE_OFFSET = 8
+        const val ATTRIBUTE_TYPED_DATA_OFFSET = 16
+    }
+}
+
+private class BinaryManifestLayout private constructor(
+    private val strings: List<StringSlot>,
+    private val attributes: List<Attribute>,
+) {
+    fun singlePlaceholder(value: String): StringSlot {
+        val slots = strings.filter { it.value == value }
+        require(slots.size == 1) { "템플릿 placeholder가 누락되었거나 중복되었습니다." }
+        return slots.single()
+    }
+
+    fun singleAttribute(
+        elementName: String,
+        parentName: String?,
+        namespace: String?,
+        name: String,
+        resourceId: Int,
+    ): Attribute = attributes.singleOrNull {
+        it.elementName == elementName &&
+            it.parentName == parentName &&
+            it.namespace == namespace &&
+            it.name == name &&
+            it.resourceId == resourceId
+    } ?: throw IllegalArgumentException("템플릿 manifest attribute가 누락되었거나 중복되었습니다.")
+
+    fun singleMetadataValueAttribute(): Attribute {
+        val candidates = attributes.filter {
+            it.elementName == "meta-data" &&
+                it.parentName == "application" &&
+                it.namespace == ANDROID_NAMESPACE &&
+                it.name == "value" &&
+                it.resourceId == VALUE_RESOURCE_ID
+        }
+        require(candidates.size == 1) { "템플릿 metadata value가 누락되었거나 중복되었습니다." }
+        val name = singleAttribute(
+            elementName = "meta-data",
+            parentName = "application",
+            namespace = ANDROID_NAMESPACE,
+            name = "name",
+            resourceId = NAME_RESOURCE_ID,
+        )
+        require(name.valueType == TYPE_STRING && string(name.valueData).value == EXTENSION_ID_METADATA) {
+            "템플릿 metadata 이름이 올바르지 않습니다."
+        }
+        return candidates.single()
+    }
+
+    private fun string(index: Int): StringSlot {
+        require(index in strings.indices) { "binary Android manifest string index가 올바르지 않습니다." }
+        return strings[index]
+    }
+
+    data class Attribute(
+        val elementName: String,
+        val parentName: String?,
+        val namespace: String?,
+        val name: String,
+        val resourceId: Int,
+        val rawValueIndex: Int,
+        val valueType: Int,
+        val valueData: Int,
+        val offset: Int,
+    )
+
+    data class StringSlot(
+        val index: Int,
+        val value: String,
+        val payloadOffset: Int,
+        val payloadLength: Int,
+        val charset: java.nio.charset.Charset,
+    ) {
+        fun replace(bytes: ByteArray, replacement: String) {
+            val encoded = replacement.toByteArray(charset)
+            require(encoded.size == payloadLength) {
+                "템플릿 문자열 길이가 요청값과 일치하지 않습니다."
+            }
+            encoded.copyInto(bytes, payloadOffset)
+        }
+    }
+
+    companion object {
+        fun parse(bytes: ByteArray): BinaryManifestLayout {
+            require(bytes.size >= CHUNK_HEADER_SIZE && bytes.u16(0) == XML_TYPE) {
+                "binary Android manifest root가 없습니다."
+            }
+            val rootHeaderSize = bytes.u16(2)
+            val rootSize = bytes.u32(4)
+            require(rootHeaderSize >= CHUNK_HEADER_SIZE && rootSize == bytes.size) {
+                "binary Android manifest root 범위가 올바르지 않습니다."
+            }
+
+            var strings: List<StringSlot>? = null
+            var resourceIds: List<Int>? = null
+            val attributes = mutableListOf<Attribute>()
+            val elements = mutableListOf<String>()
+            var offset = rootHeaderSize
+            while (offset < rootSize) {
+                require(offset <= rootSize - CHUNK_HEADER_SIZE) {
+                    "binary Android manifest chunk가 잘렸습니다."
+                }
+                val type = bytes.u16(offset)
+                val headerSize = bytes.u16(offset + 2)
+                val size = bytes.u32(offset + 4)
+                require(headerSize >= CHUNK_HEADER_SIZE && size >= headerSize && size <= rootSize - offset) {
+                    "binary Android manifest chunk 범위가 올바르지 않습니다."
+                }
+                when (type) {
+                    STRING_POOL_TYPE -> {
+                        require(strings == null) { "binary Android manifest string pool이 중복되었습니다." }
+                        strings = readStringPool(bytes, offset, headerSize, size)
+                    }
+                    RESOURCE_MAP_TYPE -> {
+                        require(resourceIds == null) { "binary Android manifest resource map이 중복되었습니다." }
+                        resourceIds = readResourceMap(
+                            bytes,
+                            offset,
+                            headerSize,
+                            size,
+                            requireNotNull(strings) { "resource map 전에 string pool이 필요합니다." },
+                        )
+                    }
+                    START_NAMESPACE_TYPE, END_NAMESPACE_TYPE -> Unit
+                    START_ELEMENT_TYPE -> {
+                        val pool = requireNotNull(strings) { "element 전에 string pool이 필요합니다." }
+                        val map = requireNotNull(resourceIds) { "element 전에 resource map이 필요합니다." }
+                        val element = readStartElement(bytes, offset, headerSize, size, pool, map)
+                        val parent = elements.lastOrNull()
+                        attributes += element.attributes.map {
+                            it.copy(elementName = element.name, parentName = parent)
+                        }
+                        elements += element.name
+                    }
+                    END_ELEMENT_TYPE -> {
+                        val pool = requireNotNull(strings) { "element 전에 string pool이 필요합니다." }
+                        val name = readEndElement(bytes, offset, headerSize, size, pool)
+                        require(elements.removeLastOrNull() == name) {
+                            "binary Android manifest element hierarchy가 올바르지 않습니다."
+                        }
+                    }
+                    else -> throw IllegalArgumentException("지원하지 않는 binary Android manifest chunk입니다.")
+                }
+                offset += size
+            }
+            require(offset == rootSize && elements.isEmpty() && strings != null && resourceIds != null) {
+                "binary Android manifest가 완전하지 않습니다."
+            }
+            return BinaryManifestLayout(requireNotNull(strings), attributes)
+        }
+
+        private fun readStringPool(
+            bytes: ByteArray,
+            offset: Int,
+            headerSize: Int,
+            size: Int,
+        ): List<StringSlot> {
+            require(headerSize >= STRING_POOL_HEADER_SIZE) { "binary Android manifest string pool header가 잘렸습니다." }
+            val stringCount = bytes.u32(offset + 8)
+            val styleCount = bytes.u32(offset + 12)
+            val flags = bytes.u32(offset + 16)
+            val stringsStart = bytes.u32(offset + 20)
+            require(stringCount <= MAX_STRING_COUNT && styleCount <= MAX_STRING_COUNT) {
+                "binary Android manifest string pool이 너무 큽니다."
+            }
+            val tableEnd = offset.toLong() + headerSize + (stringCount.toLong() + styleCount) * INT_SIZE
+            require(stringsStart >= headerSize && tableEnd <= offset.toLong() + stringsStart) {
+                "binary Android manifest string offset table이 올바르지 않습니다."
+            }
+            val dataStart = offset + stringsStart
+            val chunkEnd = offset + size
+            require(dataStart in offset..chunkEnd) { "binary Android manifest string data 범위가 올바르지 않습니다." }
+            val utf8 = flags and UTF8_FLAG != 0
+            return List(stringCount) { index ->
+                val relativeOffset = bytes.u32(offset + headerSize + index * INT_SIZE)
+                val stringOffset = dataStart.toLong() + relativeOffset
+                require(stringOffset in dataStart.toLong() until chunkEnd.toLong()) {
+                    "binary Android manifest string 범위가 올바르지 않습니다."
+                }
+                if (utf8) {
+                    val (utf16Length, afterUtf16Length) = bytes.readUtf8Length(stringOffset.toInt(), chunkEnd)
+                    val (byteLength, payloadOffset) = bytes.readUtf8Length(afterUtf16Length, chunkEnd)
+                    require(payloadOffset <= chunkEnd - byteLength - 1 && bytes.u8(payloadOffset + byteLength) == 0) {
+                        "binary Android manifest UTF-8 string이 잘렸습니다."
+                    }
+                    val value = bytes.decode(payloadOffset, byteLength, StandardCharsets.UTF_8)
+                    require(value.length == utf16Length) { "binary Android manifest UTF-8 길이가 올바르지 않습니다." }
+                    StringSlot(index, value, payloadOffset, byteLength, StandardCharsets.UTF_8)
+                } else {
+                    val (length, payloadOffset) = bytes.readUtf16Length(stringOffset.toInt(), chunkEnd)
+                    val byteLength = length.toLong() * 2
+                    require(
+                        byteLength <= Int.MAX_VALUE &&
+                            payloadOffset.toLong() + byteLength + 2 <= chunkEnd &&
+                            bytes.u16(payloadOffset + byteLength.toInt()) == 0,
+                    ) { "binary Android manifest UTF-16 string이 잘렸습니다." }
+                    val value = bytes.decode(payloadOffset, byteLength.toInt(), StandardCharsets.UTF_16LE)
+                    require(value.length == length) { "binary Android manifest UTF-16 길이가 올바르지 않습니다." }
+                    StringSlot(index, value, payloadOffset, byteLength.toInt(), StandardCharsets.UTF_16LE)
+                }
+            }
+        }
+
+        private fun readResourceMap(
+            bytes: ByteArray,
+            offset: Int,
+            headerSize: Int,
+            size: Int,
+            strings: List<StringSlot>,
+        ): List<Int> {
+            require(headerSize == CHUNK_HEADER_SIZE && (size - headerSize) % INT_SIZE == 0) {
+                "binary Android manifest resource map 범위가 올바르지 않습니다."
+            }
+            val count = (size - headerSize) / INT_SIZE
+            require(count <= strings.size) { "binary Android manifest resource map이 string pool보다 큽니다." }
+            return List(count) { index -> bytes.u32(offset + headerSize + index * INT_SIZE) }
+        }
+
+        private data class Element(
+            val name: String,
+            val attributes: List<Attribute>,
+        )
+
+        private fun readStartElement(
+            bytes: ByteArray,
+            offset: Int,
+            headerSize: Int,
+            size: Int,
+            strings: List<StringSlot>,
+            resourceIds: List<Int>,
+        ): Element {
+            require(headerSize >= XML_NODE_HEADER_SIZE && size >= headerSize + ATTRIBUTE_EXTENSION_SIZE) {
+                "binary Android manifest start element가 잘렸습니다."
+            }
+            val extension = offset + headerSize
+            val name = strings.required(bytes.u32(extension + 4)).value
+            val attributeStart = bytes.u16(extension + 8)
+            val attributeSize = bytes.u16(extension + 10)
+            val attributeCount = bytes.u16(extension + 12)
+            require(attributeStart >= ATTRIBUTE_EXTENSION_SIZE && attributeSize >= ATTRIBUTE_SIZE) {
+                "binary Android manifest attribute header가 올바르지 않습니다."
+            }
+            val firstAttribute = extension + attributeStart
+            val attributeBytes = attributeCount.toLong() * attributeSize
+            require(firstAttribute >= extension && firstAttribute.toLong() + attributeBytes <= offset.toLong() + size) {
+                "binary Android manifest attribute 범위가 올바르지 않습니다."
+            }
+            return Element(
+                name,
+                List(attributeCount) { index ->
+                    val attributeOffset = firstAttribute + index * attributeSize
+                    val namespaceIndex = bytes.u32(attributeOffset)
+                    val nameIndex = bytes.u32(attributeOffset + 4)
+                    val rawValueIndex = bytes.u32(attributeOffset + ATTRIBUTE_RAW_VALUE_OFFSET)
+                    val valueSize = bytes.u16(attributeOffset + 12)
+                    val valueReserved = bytes.u8(attributeOffset + 14)
+                    require(valueSize == TYPED_VALUE_SIZE && valueReserved == 0) {
+                        "binary Android manifest typed attribute header가 올바르지 않습니다."
+                    }
+                    Attribute(
+                        elementName = "",
+                        parentName = null,
+                        namespace = strings.optional(namespaceIndex)?.value,
+                        name = strings.required(nameIndex).value,
+                        resourceId = resourceIds.getOrElse(nameIndex) { 0 },
+                        rawValueIndex = rawValueIndex,
+                        valueType = bytes.u8(attributeOffset + 15),
+                        valueData = bytes.u32(attributeOffset + ATTRIBUTE_TYPED_DATA_OFFSET),
+                        offset = attributeOffset,
+                    )
+                },
+            )
+        }
+
+        private fun readEndElement(
+            bytes: ByteArray,
+            offset: Int,
+            headerSize: Int,
+            size: Int,
+            strings: List<StringSlot>,
+        ): String {
+            require(headerSize >= XML_NODE_HEADER_SIZE && size >= headerSize + END_ELEMENT_EXTENSION_SIZE) {
+                "binary Android manifest end element가 잘렸습니다."
+            }
+            return strings.required(bytes.u32(offset + headerSize + 4)).value
+        }
+
+        private fun List<StringSlot>.required(index: Int): StringSlot {
+            require(index != NO_INDEX && index in indices) { "binary Android manifest string index가 올바르지 않습니다." }
+            return this[index]
+        }
+
+        private fun List<StringSlot>.optional(index: Int): StringSlot? =
+            if (index == NO_INDEX) null else required(index)
+
+        private fun ByteArray.readUtf8Length(offset: Int, end: Int): Pair<Int, Int> {
+            require(offset < end) { "binary Android manifest UTF-8 length가 잘렸습니다." }
+            val first = u8(offset)
+            return if (first and 0x80 == 0) {
+                first to offset + 1
+            } else {
+                require(offset + 1 < end) { "binary Android manifest UTF-8 length가 잘렸습니다." }
+                (((first and 0x7f) shl 8) or u8(offset + 1)) to offset + 2
+            }
+        }
+
+        private fun ByteArray.readUtf16Length(offset: Int, end: Int): Pair<Int, Int> {
+            require(offset <= end - 2) { "binary Android manifest UTF-16 length가 잘렸습니다." }
+            val first = u16(offset)
+            return if (first and 0x8000 == 0) {
+                first to offset + 2
+            } else {
+                require(offset <= end - 4) { "binary Android manifest UTF-16 length가 잘렸습니다." }
+                (((first and 0x7fff) shl 16) or u16(offset + 2)) to offset + 4
+            }
+        }
+
+        private fun ByteArray.decode(offset: Int, length: Int, charset: java.nio.charset.Charset): String =
+            charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(this, offset, length))
+                .toString()
+
+        private fun ByteArray.u8(offset: Int): Int {
+            require(offset in indices) { "binary Android manifest byte 범위가 올바르지 않습니다." }
+            return this[offset].toInt() and 0xff
+        }
+
+        private fun ByteArray.u16(offset: Int): Int {
+            require(offset >= 0 && offset <= size - 2) { "binary Android manifest uint16 범위가 올바르지 않습니다." }
+            return ByteBuffer.wrap(this, offset, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xffff
+        }
+
+        private fun ByteArray.u32(offset: Int): Int {
+            require(offset >= 0 && offset <= size - 4) { "binary Android manifest uint32 범위가 올바르지 않습니다." }
+            val value = ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            require(value >= 0 || value == NO_INDEX) { "binary Android manifest uint32 값이 너무 큽니다." }
+            return value
+        }
+
+        private const val XML_TYPE = 0x0003
+        private const val STRING_POOL_TYPE = 0x0001
+        private const val RESOURCE_MAP_TYPE = 0x0180
+        private const val START_NAMESPACE_TYPE = 0x0100
+        private const val END_NAMESPACE_TYPE = 0x0101
+        private const val START_ELEMENT_TYPE = 0x0102
+        private const val END_ELEMENT_TYPE = 0x0103
+        private const val CHUNK_HEADER_SIZE = 8
+        private const val XML_NODE_HEADER_SIZE = 16
+        private const val STRING_POOL_HEADER_SIZE = 28
+        private const val ATTRIBUTE_EXTENSION_SIZE = 20
+        private const val END_ELEMENT_EXTENSION_SIZE = 8
+        private const val ATTRIBUTE_SIZE = 20
+        private const val TYPED_VALUE_SIZE = 8
+        private const val INT_SIZE = 4
+        private const val MAX_STRING_COUNT = 100_000
+        private const val NO_INDEX = -1
+        private const val UTF8_FLAG = 0x00000100
+        private const val TYPE_STRING = 0x03
+        private const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+        private const val VALUE_RESOURCE_ID = 0x01010024
+        private const val NAME_RESOURCE_ID = 0x01010003
+        private const val EXTENSION_ID_METADATA = "extension-id"
+        private const val ATTRIBUTE_RAW_VALUE_OFFSET = 8
+        private const val ATTRIBUTE_TYPED_DATA_OFFSET = 16
+    }
+}
+
+private fun ByteArray.writeInt(offset: Int, value: Int) {
+    require(offset >= 0 && offset <= size - 4) { "binary Android manifest write 범위가 올바르지 않습니다." }
+    ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(value)
+}

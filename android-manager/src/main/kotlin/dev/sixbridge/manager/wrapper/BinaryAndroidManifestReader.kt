@@ -26,6 +26,15 @@ class BinaryAndroidManifestReader {
         var intentFilter: IntentFilterBuilder? = null
         var manifestSeen = false
         var applicationCount = 0
+        var packageName: String? = null
+        var versionCode: Int? = null
+        var minSdkVersion: Int? = null
+        var targetSdkVersion: Int? = null
+        val requiredAttributeCounts = linkedMapOf(
+            VERSION_CODE_RESOURCE_ID to 0,
+            MIN_SDK_VERSION_RESOURCE_ID to 0,
+            TARGET_SDK_VERSION_RESOURCE_ID to 0,
+        )
 
         while (offset < rootSize) {
             require(offset <= rootSize - CHUNK_HEADER_SIZE) {
@@ -71,6 +80,11 @@ class BinaryAndroidManifestReader {
                             "binary Android manifest element 전에 resource map이 필요합니다."
                         },
                     )
+                    element.attributes.forEach { attribute ->
+                        requiredAttributeCounts[attribute.resourceId]?.let { count ->
+                            requiredAttributeCounts[attribute.resourceId] = count + 1
+                        }
+                    }
                     val parent = elements.lastOrNull()
                     if (elements.isEmpty()) {
                         require(!manifestSeen && element.name == "manifest") {
@@ -95,6 +109,9 @@ class BinaryAndroidManifestReader {
                                 "binary Android manifest application hierarchy가 올바르지 않습니다."
                             }
                         }
+                        "uses-sdk" -> require(elements == listOf("manifest")) {
+                            "binary Android manifest uses-sdk hierarchy가 올바르지 않습니다."
+                        }
                         "meta-data", "activity", "provider" ->
                             require(elements == listOf("manifest", "application")) {
                                 "binary Android manifest component hierarchy가 올바르지 않습니다."
@@ -118,6 +135,33 @@ class BinaryAndroidManifestReader {
                             }
                     }
                     when {
+                        element.name == "manifest" && parent == null -> {
+                            require(packageName == null && versionCode == null) {
+                                "binary Android manifest package 또는 versionCode가 중복되었습니다."
+                            }
+                            packageName = element.requiredStringAttribute(
+                                namespace = null,
+                                name = "package",
+                                resourceId = 0,
+                            )
+                            versionCode = element.requiredIntegerAttribute(
+                                name = "versionCode",
+                                resourceId = VERSION_CODE_RESOURCE_ID,
+                            )
+                        }
+                        element.name == "uses-sdk" && parent == "manifest" -> {
+                            require(minSdkVersion == null && targetSdkVersion == null) {
+                                "binary Android manifest SDK attribute가 중복되었습니다."
+                            }
+                            minSdkVersion = element.requiredIntegerAttribute(
+                                name = "minSdkVersion",
+                                resourceId = MIN_SDK_VERSION_RESOURCE_ID,
+                            )
+                            targetSdkVersion = element.requiredIntegerAttribute(
+                                name = "targetSdkVersion",
+                                resourceId = TARGET_SDK_VERSION_RESOURCE_ID,
+                            )
+                        }
                         element.name == "meta-data" && parent == "application" -> {
                             val name = element.androidValue("name")
                             val value = element.androidValue("value")
@@ -202,11 +246,28 @@ class BinaryAndroidManifestReader {
                 activity == null &&
                 intentFilter == null &&
                 manifestSeen &&
-                applicationCount == 1,
+                applicationCount == 1 &&
+                requiredAttributeCounts.values.all { it == 1 },
         ) {
             "binary Android manifest가 완전하지 않습니다."
         }
-        return BinaryManifestFacts(metadata, activities, providers)
+        return BinaryManifestFacts(
+            packageName = requireNotNull(packageName) {
+                "binary Android manifest package가 없습니다."
+            },
+            versionCode = requireNotNull(versionCode) {
+                "binary Android manifest versionCode가 없습니다."
+            },
+            minSdkVersion = requireNotNull(minSdkVersion) {
+                "binary Android manifest minSdkVersion이 없습니다."
+            },
+            targetSdkVersion = requireNotNull(targetSdkVersion) {
+                "binary Android manifest targetSdkVersion이 없습니다."
+            },
+            metadata = metadata,
+            activities = activities,
+            providers = providers,
+        )
     }
 
     private fun readElement(
@@ -264,13 +325,22 @@ class BinaryAndroidManifestReader {
                     }
                 }
                 TYPE_INT_BOOLEAN -> if (valueData == 0) "false" else "true"
-                TYPE_INT_DEC, TYPE_INT_HEX -> valueData.toString()
+                TYPE_INT_DEC, TYPE_INT_HEX -> {
+                    require(rawValueIndex == NO_INDEX) {
+                        "binary Android manifest typed integer raw string이 올바르지 않습니다."
+                    }
+                    valueData.toString()
+                }
                 else -> rawValue
             }
             attributes += Attribute(
                 namespace = namespace,
                 name = attributeName,
                 value = value,
+                resourceId = resourceMap.id(nameIndex),
+                rawValueIndex = rawValueIndex,
+                valueType = valueType,
+                valueData = valueData,
             )
         }
         return Element(name, attributes)
@@ -316,12 +386,36 @@ class BinaryAndroidManifestReader {
             attributes.singleOrNull { it.namespace == ANDROID_NAMESPACE && it.name == name }?.value
 
         fun androidBoolean(name: String): Boolean = androidValue(name) == "true"
+
+        fun requiredStringAttribute(namespace: String?, name: String, resourceId: Int): String {
+            val attribute = attributes.singleOrNull {
+                it.namespace == namespace && it.name == name && it.resourceId == resourceId
+            } ?: throw IllegalArgumentException("binary Android manifest string attribute가 올바르지 않습니다.")
+            require(attribute.valueType == TYPE_STRING && attribute.value != null) {
+                "binary Android manifest string attribute가 올바르지 않습니다."
+            }
+            return attribute.value
+        }
+
+        fun requiredIntegerAttribute(name: String, resourceId: Int): Int {
+            val attribute = attributes.singleOrNull {
+                it.namespace == ANDROID_NAMESPACE && it.name == name && it.resourceId == resourceId
+            } ?: throw IllegalArgumentException("binary Android manifest integer attribute가 올바르지 않습니다.")
+            require(attribute.valueType == TYPE_INT_DEC && attribute.rawValueIndex == NO_INDEX) {
+                "binary Android manifest integer attribute가 올바르지 않습니다."
+            }
+            return attribute.valueData
+        }
     }
 
     private data class Attribute(
         val namespace: String?,
         val name: String,
         val value: String?,
+        val resourceId: Int,
+        val rawValueIndex: Int,
+        val valueType: Int,
+        val valueData: Int,
     )
 
     private data class ActivityBuilder(
@@ -548,9 +642,15 @@ class BinaryAndroidManifestReader {
             "authorities" to ExpectedAttribute(0x01010018, TYPE_STRING),
             "scheme" to ExpectedAttribute(0x01010027, TYPE_STRING),
             "host" to ExpectedAttribute(0x01010028, TYPE_STRING),
+            "versionCode" to ExpectedAttribute(VERSION_CODE_RESOURCE_ID, TYPE_INT_DEC),
+            "minSdkVersion" to ExpectedAttribute(MIN_SDK_VERSION_RESOURCE_ID, TYPE_INT_DEC),
+            "targetSdkVersion" to ExpectedAttribute(TARGET_SDK_VERSION_RESOURCE_ID, TYPE_INT_DEC),
         )
         val VERIFIED_ANDROID_ATTRIBUTE_IDS =
             VERIFIED_ANDROID_ATTRIBUTES.values.mapTo(hashSetOf(), ExpectedAttribute::resourceId)
+        const val VERSION_CODE_RESOURCE_ID = 0x0101021b
+        const val MIN_SDK_VERSION_RESOURCE_ID = 0x0101020c
+        const val TARGET_SDK_VERSION_RESOURCE_ID = 0x01010270
     }
 
     private data class ExpectedAttribute(
