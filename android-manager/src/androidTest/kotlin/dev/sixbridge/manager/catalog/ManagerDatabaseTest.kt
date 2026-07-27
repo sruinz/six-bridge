@@ -1,26 +1,39 @@
 package dev.sixbridge.manager.catalog
 
 import androidx.room.Room
+import androidx.room.testing.MigrationTestHelper
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.manager.conversion.ConversionIdentityEntity
 import java.util.Collections
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class ManagerDatabaseTest {
+    @get:Rule
+    val migrationHelper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        ManagerDatabase::class.java,
+    )
+
     private lateinit var database: ManagerDatabase
     private lateinit var catalog: RoomManagerCatalog
     private val queries = Collections.synchronizedList(mutableListOf<String>())
@@ -281,6 +294,94 @@ class ManagerDatabaseTest {
         assertNull(catalog.get(discovered.packageName))
     }
 
+    @Test
+    fun conversion_identity_room_transaction_serializes_concurrent_reservations() =
+        runBlocking {
+            val dao = database.conversionIdentityDao()
+            val entity = ConversionIdentityEntity(
+                identitySha256 = "1".repeat(64),
+                logicalSourceIdentity = "project:room-transaction",
+                profileMajorVersion = 30,
+                mode = "CONVERTED",
+                displayName = "Room transaction",
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "2".repeat(64),
+                crxKeyAlias = "sixbridge-crx-room",
+                lastReservedVersionCode = 0,
+            )
+
+            val reserved = coroutineScope {
+                List(8) {
+                    async(Dispatchers.Default) {
+                        dao.reserve(entity, installedVersionCode = null)
+                            .lastReservedVersionCode
+                    }
+                }.awaitAll()
+            }
+
+            assertEquals((1..8).toSet(), reserved.toSet())
+        }
+
+    @Test
+    fun migration_1_to_2_preserves_catalog_and_creates_conversion_ledgers() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(MIGRATION_DATABASE)
+        migrationHelper.createDatabase(MIGRATION_DATABASE, 1).apply {
+            execSQL(
+                """
+                INSERT INTO catalog_entries (
+                    packageName, extensionId, name, iconPng, installedVersionCode,
+                    signerSha256, compatibilityStatus, reportJson,
+                    lastVerifiedAtEpochMillis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf(
+                    "dev.sixbridge.ext.migrated",
+                    "migrated",
+                    "Migrated extension",
+                    byteArrayOf(1, 2, 3),
+                    7L,
+                    "a".repeat(64),
+                    "COMPATIBLE",
+                    """{"status":"COMPATIBLE"}""",
+                    1234L,
+                ),
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_DATABASE,
+            2,
+            true,
+            ManagerDatabase.MIGRATION_1_2,
+        )
+        migrated.query(
+            "SELECT packageName, installedVersionCode FROM catalog_entries",
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("dev.sixbridge.ext.migrated", cursor.getString(0))
+            assertEquals(7L, cursor.getLong(1))
+            assertFalse(cursor.moveToNext())
+        }
+        migrated.query(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('conversion_identities', 'conversion_job')
+            ORDER BY name
+            """.trimIndent(),
+        ).use { cursor ->
+            val tables = buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0))
+            }
+            assertEquals(listOf("conversion_identities", "conversion_job"), tables)
+        }
+        migrated.close()
+        context.deleteDatabase(MIGRATION_DATABASE)
+    }
+
     private fun record(
         packageName: String,
         iconPng: ByteArray? = byteArrayOf(4, 5, 6),
@@ -296,4 +397,8 @@ class ManagerDatabaseTest {
         reportJson = reportJson,
         lastVerifiedAtEpochMillis = 1234,
     )
+
+    private companion object {
+        const val MIGRATION_DATABASE = "manager-migration-1-2.db"
+    }
 }
