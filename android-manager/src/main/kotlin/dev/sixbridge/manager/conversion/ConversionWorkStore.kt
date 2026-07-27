@@ -241,7 +241,17 @@ class ConversionWorkStore internal constructor(
         }
     }
 
-    suspend fun restore(): RestoredConversionJob? = mutex.withLock {
+    suspend fun restore(): RestoredConversionJob? = restoreInternal(
+        preserveBuilding = false,
+    )
+
+    suspend fun restorePreservingBuilding(): RestoredConversionJob? = restoreInternal(
+        preserveBuilding = true,
+    )
+
+    private suspend fun restoreInternal(
+        preserveBuilding: Boolean,
+    ): RestoredConversionJob? = mutex.withLock {
         withContext(Dispatchers.IO) {
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext null
             var row = dao.get() ?: return@withContext null
@@ -269,7 +279,7 @@ class ConversionWorkStore internal constructor(
                 discardInvalid(root, row)
                 return@withContext null
             }
-            if (stage == ConversionJobStage.BUILDING) {
+            if (stage == ConversionJobStage.BUILDING && !preserveBuilding) {
                 if (!deleteUnreferencedChildren(tokenDirectory, row.inputFileName)) {
                     return@withContext null
                 }
@@ -303,6 +313,20 @@ class ConversionWorkStore internal constructor(
             restored
         }
     }
+
+    suspend fun resetAwaitingApproval(
+        token: String,
+        profileSha256: String,
+    ): RestoredConversionJob = transition(
+        token = token,
+        expectedStage = ConversionJobStage.BUILDING,
+        nextStage = ConversionJobStage.AWAITING_APPROVAL,
+        approvedAdapterIds = null,
+        profileSha256 = profileSha256,
+        expectedProfileSha256 = profileSha256,
+        bundleFileName = null,
+        bundleSha256 = null,
+    )
 
     suspend fun discard(token: String): Boolean = mutex.withLock {
         withContext(Dispatchers.IO) {

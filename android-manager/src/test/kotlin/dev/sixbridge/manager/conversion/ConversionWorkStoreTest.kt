@@ -518,6 +518,26 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `coordinator 복구 조회는 BUILDING을 보존하고 명시 reset만 승인 단계로 내린다`() =
+        runTest {
+            val store = store()
+            val created = store.create(artifact("input".encodeToByteArray()))
+            store.markAwaitingApproval(created.token, PROFILE_SHA)
+            store.markBuilding(created.token, setOf("adapter"), PROFILE_SHA)
+
+            val preserved = requireNotNull(store.restorePreservingBuilding())
+
+            assertEquals(ConversionJobStage.BUILDING, preserved.stage)
+            assertEquals(ConversionJobStage.BUILDING.name, requireNotNull(dao.get()).stage)
+
+            val reset = store.resetAwaitingApproval(created.token, PROFILE_SHA)
+
+            assertEquals(ConversionJobStage.AWAITING_APPROVAL, reset.stage)
+            assertEquals(emptySet<String>(), reset.approvedAdapterIds)
+            assertEquals(PROFILE_SHA, reset.profileSha256)
+        }
+
+    @Test
     fun `BUILDING child 열거 실패는 stage와 orphan owner를 그대로 보존한다`() = runTest {
         val base = store()
         val created = base.create(artifact("input".encodeToByteArray()))

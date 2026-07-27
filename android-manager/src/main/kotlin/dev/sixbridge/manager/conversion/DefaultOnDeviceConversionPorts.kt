@@ -17,16 +17,14 @@ import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.packager.OnDeviceWrapperPathRequest
 import dev.sixbridge.manager.packager.OnDeviceWrapperResult
 import java.io.File
-import java.io.FileOutputStream
 import java.security.MessageDigest
-import java.util.UUID
 
 internal class DefaultConversionWorkPort(
     private val store: ConversionWorkStore,
-    private val temporaryRoot: File,
 ) : ConversionWorkPort {
     override suspend fun create(artifact: OnDeviceInputArtifact) = store.create(artifact)
     override suspend fun restore() = store.restore()
+    override suspend fun restoreBuildAware() = store.restorePreservingBuilding()
     override suspend fun markAwaitingApproval(token: String, profileSha256: String) {
         store.markAwaitingApproval(token, profileSha256)
     }
@@ -47,24 +45,16 @@ internal class DefaultConversionWorkPort(
     override suspend fun markBundleReady(token: String, bundle: File, expectedSha256: String) {
         store.markBundleReady(token, bundle, expectedSha256)
     }
+    override suspend fun resetAwaitingApproval(token: String, profileSha256: String) {
+        store.resetAwaitingApproval(token, profileSha256)
+    }
     override suspend fun discard(token: String) = store.discard(token)
 
     override suspend fun <T> withVerifiedInputFile(
         token: String,
         consume: (File) -> T,
     ): T {
-        require((temporaryRoot.isDirectory || temporaryRoot.mkdirs()) && !temporaryRoot.toPath().let(java.nio.file.Files::isSymbolicLink))
-        val temporary = File(temporaryRoot, "${UUID.randomUUID()}.input")
-        try {
-            store.openVerifiedInput(token) { input ->
-                FileOutputStream(temporary).use(input::copyTo)
-            }
-            require(temporary.setReadOnly())
-            return consume(temporary)
-        } finally {
-            temporary.setWritable(true)
-            temporary.delete()
-        }
+        return store.withVerifiedInputFile(token, consume)
     }
 }
 
@@ -277,19 +267,17 @@ internal class DefaultConversionIdentityPort(
 internal class DefaultConversionPackagePort(
     private val ledger: ConversionIdentityLedger,
     private val packager: OnDeviceWrapperPackager,
-    private val root: File,
 ) : ConversionPackagePort {
     override suspend fun packageWrapper(
         reservation: ReservedPackageIdentity,
         bound: BoundConversionSnapshot,
         token: String,
     ): PackagedConversion {
-        require(root.isDirectory || root.mkdirs())
-        val source = File(root, "$token.source")
-        val output = File(root, "$token.apk")
-        val bytes = bound.passthroughCrx ?: bound.sourceZip
-        source.writeBytes(bytes)
-        require(source.setReadOnly())
+        val output = packager.outputFile(token)
+        val source = packager.stageSource(
+            token,
+            bound.passthroughCrx ?: bound.sourceZip,
+        )
         try {
             val result = packager.packageWrapper(
                 ledger,
@@ -328,6 +316,7 @@ internal class DefaultConversionBundlePort(
         store.publish(token, packaged.opaque as OnDeviceWrapperResult)
     override fun recover(token: String): GeneratedBundle? =
         runCatching { store.recover(token) }.getOrNull()
+    override fun discard(token: String): Boolean = store.discard(token)
 }
 
 private fun sha256(bytes: ByteArray): String =

@@ -118,10 +118,7 @@ class ManagerDependencies private constructor(
                         application.contentResolver,
                     )::acquire,
                 ),
-                work = DefaultConversionWorkPort(
-                    workStore,
-                    File(application.cacheDir, "conversion-input-open"),
-                ),
+                work = DefaultConversionWorkPort(workStore),
                 profiles = ConversionProfilePort {
                     when (val profile = profileProvider.load()) {
                         is SamsungBrowserProfileResult.Supported ->
@@ -136,7 +133,6 @@ class ManagerDependencies private constructor(
                 packages = DefaultConversionPackagePort(
                     identityLedger,
                     packager,
-                    File(application.filesDir, "conversion-packages"),
                 ),
                 bundles = DefaultConversionBundlePort(generatedBundles),
                 imports = ConversionGeneratedImportPort { generated ->

@@ -141,6 +141,33 @@ class OnDeviceWrapperPackager(context: Context) {
         reconcileOwnedTemporaryFiles()
     }
 
+    fun outputFile(ownerToken: String): File {
+        val canonical = UUID.fromString(ownerToken).toString()
+        require(canonical == ownerToken) {
+            "output owner token은 canonical UUID여야 합니다."
+        }
+        val output = workingDirectory.path.resolve("$canonical.apk").toFile()
+        validatedOutput(output)
+        return output
+    }
+
+    internal fun stageSource(ownerToken: String, bytes: ByteArray): File {
+        require(UUID.fromString(ownerToken).toString() == ownerToken) {
+            "source owner token은 canonical UUID여야 합니다."
+        }
+        require(bytes.size.toLong() in 1..ON_DEVICE_MAX_SOURCE_BYTES) {
+            "온디바이스 source 크기가 올바르지 않습니다."
+        }
+        val staged = createTemporaryFile(".source.", ".bin")
+        return try {
+            writeSourceBytes(staged, bytes)
+            staged.toFile()
+        } catch (error: Throwable) {
+            Files.deleteIfExists(staged)
+            throw error
+        }
+    }
+
     @Synchronized
     fun resolveIdentity(
         identityKey: InstallationIdentityKey,

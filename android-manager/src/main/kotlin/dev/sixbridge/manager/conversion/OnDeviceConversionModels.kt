@@ -74,6 +74,10 @@ sealed interface RestoredConversion {
         val review: ReviewBundle,
         val generated: GeneratedBundle,
     ) : RestoredConversion
+
+    data class GeneratedPending(
+        val generated: GeneratedBundle,
+    ) : RestoredConversion
 }
 
 internal sealed interface SamsungProfileSnapshot {
@@ -137,6 +141,7 @@ internal fun interface ConversionInputPort {
 internal interface ConversionWorkPort {
     suspend fun create(artifact: OnDeviceInputArtifact): RestoredConversionJob
     suspend fun restore(): RestoredConversionJob?
+    suspend fun restoreBuildAware(): RestoredConversionJob? = restore()
     suspend fun markAwaitingApproval(token: String, profileSha256: String)
     suspend fun refreshAwaitingApproval(
         token: String,
@@ -148,6 +153,7 @@ internal interface ConversionWorkPort {
         approvedAdapterIds: Set<String>,
         profileSha256: String,
     )
+    suspend fun resetAwaitingApproval(token: String, profileSha256: String)
     suspend fun markBundleReady(token: String, bundle: File, expectedSha256: String)
     suspend fun discard(token: String): Boolean
     suspend fun <T> withVerifiedInputFile(token: String, consume: (File) -> T): T
@@ -210,6 +216,7 @@ internal interface ConversionPackagePort {
 internal interface ConversionBundlePort {
     fun publish(token: String, packaged: PackagedConversion): GeneratedBundle
     fun recover(token: String): GeneratedBundle?
+    fun discard(token: String): Boolean
 }
 
 internal fun interface ConversionGeneratedImportPort {

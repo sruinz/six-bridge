@@ -9,10 +9,15 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
+import dev.sixbridge.manager.wrapper.InstalledWrapper
 import java.io.File
+import java.util.UUID
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Rule
 import org.junit.Test
@@ -51,10 +56,10 @@ class OnDeviceConversionCoordinatorTest {
                 "profile",
                 "analyze",
                 "prepare",
-                "building",
                 "identity",
                 "installed",
                 "reserve",
+                "building",
                 "bind",
                 "package",
                 "publish",
@@ -127,21 +132,227 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue("reserve" !in fixture.events)
     }
 
+    @Test
+    fun `Task 6 입력 오류 code를 사용자 실패 code로 보존한다`() = runTest {
+        val cases = listOf(
+            OnDeviceInputErrorCode.INVALID_DRAFT to ConversionFailureCode.DRAFT_INVALID,
+            OnDeviceInputErrorCode.NETWORK to ConversionFailureCode.NETWORK,
+            OnDeviceInputErrorCode.URL to ConversionFailureCode.URL,
+            OnDeviceInputErrorCode.INVALID_ZIP to ConversionFailureCode.INPUT_INVALID,
+            OnDeviceInputErrorCode.INVALID_CRX3 to ConversionFailureCode.INPUT_INVALID,
+            OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED to ConversionFailureCode.INPUT_INVALID,
+        )
+        cases.forEach { (inputCode, expected) ->
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                inputFailure = OnDeviceInputException(inputCode, "private detail")
+            }
+
+            val failure = assertIs<ConversionBeginResult.Failure>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            assertEquals(expected, failure.code, inputCode.name)
+        }
+    }
+
+    @Test
+    fun `구조화 취소는 Failure로 삼키지 않는다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            inputFailure = CancellationException("route replaced")
+        }
+
+        assertFailsWith<CancellationException> {
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            )
+        }
+    }
+
+    @Test
+    fun `blocked unknown partial은 reserve 전에 차단한다`() = runTest {
+        for (
+            (status, expected) in listOf(
+                CompatibilityStatus.BLOCKED to ConversionFailureCode.BLOCKED,
+                CompatibilityStatus.UNKNOWN to ConversionFailureCode.UNKNOWN,
+            )
+        ) {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                compatibilityStatus = status
+            }
+            val failure = assertIs<ConversionBeginResult.Failure>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+            assertEquals(expected, failure.code)
+            assertTrue("reserve" !in fixture.events)
+        }
+
+        val partial = Fixture(temporaryFolder, mutableListOf())
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            partial.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            partial.coordinator().build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+            ),
+        )
+        assertEquals(ConversionFailureCode.PARTIAL_CONFIRMATION_REQUIRED, failure.code)
+        assertTrue("reserve" !in partial.events)
+    }
+
+    @Test
+    fun `markerless는 선택이 필요하고 stable 입력은 override를 거부한다`() = runTest {
+        val markerless = Fixture(temporaryFolder, mutableListOf()).apply {
+            logicalIdentity = null
+        }
+        val markerlessAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            markerless.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        assertIs<IdentityRequirement.UserSelectionRequired>(
+            markerlessAnalysis.identityRequirement,
+        )
+        val missing = assertIs<ConversionBuildResult.Failure>(
+            markerless.coordinator().build(
+                markerlessAnalysis.token,
+                markerlessAnalysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        assertEquals(ConversionFailureCode.IDENTITY_MISMATCH, missing.code)
+
+        val stable = Fixture(temporaryFolder, mutableListOf())
+        val stableAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            stable.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        val override = assertIs<ConversionBuildResult.Failure>(
+            stable.coordinator().build(
+                stableAnalysis.token,
+                stableAnalysis.requiredApprovals,
+                true,
+                InstallationIdentitySelection.CreateNew,
+            ),
+        )
+        assertEquals(ConversionFailureCode.IDENTITY_MISMATCH, override.code)
+    }
+
+    @Test
+    fun `signer 불일치와 reserve 실패는 즉시 승인 단계와 빈 owner로 복구한다`() = runTest {
+        val signer = Fixture(temporaryFolder, mutableListOf()).apply {
+            installedWrapper = InstalledWrapper(
+                PACKAGE,
+                EXTENSION_ID,
+                "Example",
+                7,
+                "b".repeat(64),
+            )
+        }
+        val signerAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            signer.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        val signerFailure = assertIs<ConversionBuildResult.Failure>(
+            signer.coordinator().build(
+                signerAnalysis.token,
+                signerAnalysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        assertEquals(ConversionFailureCode.IDENTITY_MISMATCH, signerFailure.code)
+        assertEquals(ConversionJobStage.AWAITING_APPROVAL, signer.stage)
+        assertTrue(signer.ownerAborted)
+
+        val reserve = Fixture(temporaryFolder, mutableListOf()).apply {
+            reserveFailure = IllegalStateException("reserve failed")
+        }
+        val reserveAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            reserve.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        assertIs<ConversionBuildResult.Failure>(
+            reserve.coordinator().build(
+                reserveAnalysis.token,
+                reserveAnalysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        assertEquals(ConversionJobStage.AWAITING_APPROVAL, reserve.stage)
+        assertTrue(reserve.ownerAborted)
+    }
+
+    @Test
+    fun `generated import 실패 뒤 restore가 같은 six를 다시 import하고 완료한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            importFailuresRemaining = 1
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        val failed = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        assertEquals(ConversionFailureCode.BUNDLE_IO, failed.code)
+        assertTrue(requireNotNull(failed.generated).file.isFile)
+        assertEquals(ConversionJobStage.BUILDING, fixture.stage)
+
+        val restored = assertIs<RestoredConversion.BundleReady>(coordinator.restore())
+
+        assertEquals(failed.generated, restored.generated)
+        assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
+        assertNull(fixture.activeOwner)
+    }
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
     ) {
         val token = "11111111-1111-4111-8111-111111111111"
-        val inputFile = folder.newFile("input.bin").apply { writeText("input") }
-        private val generatedFile = folder.newFile("$token.six").apply { writeText("bundle") }
+        val inputFile = folder.newFile("${UUID.randomUUID()}.input")
+            .apply { writeText("input") }
+        private val generatedFile = folder.newFile("${UUID.randomUUID()}.six")
+            .apply { writeText("bundle") }
         var currentProfile = profile()
         var profileResult: SamsungProfileSnapshot = SamsungProfileSnapshot.Supported(currentProfile)
-        private var stage = ConversionJobStage.INPUT_READY
+        var stage = ConversionJobStage.INPUT_READY
+            private set
         private var storedProfile: String? = null
+        var inputFailure: Throwable? = null
+        var compatibilityStatus = CompatibilityStatus.PARTIAL
+        var logicalIdentity: LogicalSourceIdentity? =
+            LogicalSourceIdentity.storeExtensionId(EXTENSION_ID)
+        var installedWrapper: InstalledWrapper? = null
+        var reserveFailure: Throwable? = null
+        var importFailuresRemaining = 0
+        var activeOwner: String? = null
+        var ownerAborted = false
 
         fun coordinator() = OnDeviceConversionCoordinator(
             input = ConversionInputPort {
                 events += "acquire"
+                inputFailure?.let { throw it }
                 OnDeviceInputArtifact(
                     token,
                     OnDeviceInputKind.CRX3,
@@ -183,6 +394,7 @@ class OnDeviceConversionCoordinatorTest {
                 ) {
                     events += "building"
                     stage = ConversionJobStage.BUILDING
+                    activeOwner = token
                 }
 
                 override suspend fun markBundleReady(
@@ -192,9 +404,18 @@ class OnDeviceConversionCoordinatorTest {
                 ) {
                     events += "bundle-ready"
                     stage = ConversionJobStage.BUNDLE_READY
+                    activeOwner = null
                 }
 
                 override suspend fun discard(token: String): Boolean = true
+
+                override suspend fun resetAwaitingApproval(
+                    token: String,
+                    profileSha256: String,
+                ) {
+                    events += "reset-awaiting"
+                    stage = ConversionJobStage.AWAITING_APPROVAL
+                }
 
                 override suspend fun <T> withVerifiedInputFile(
                     token: String,
@@ -266,6 +487,7 @@ class OnDeviceConversionCoordinatorTest {
                     ownerToken: String,
                 ): ReservedPackageIdentity {
                     events += "reserve"
+                    reserveFailure?.let { throw it }
                     return ReservedPackageIdentity(
                         resolved = resolved,
                         versionCode = 1,
@@ -273,11 +495,14 @@ class OnDeviceConversionCoordinatorTest {
                     )
                 }
 
-                override suspend fun abort(ownerToken: String) = Unit
+                override suspend fun abort(ownerToken: String) {
+                    ownerAborted = true
+                    activeOwner = null
+                }
             },
             installed = ConversionInstalledPort {
                 events += "installed"
-                null
+                installedWrapper
             },
             packages = object : ConversionPackagePort {
                 override suspend fun packageWrapper(
@@ -302,19 +527,26 @@ class OnDeviceConversionCoordinatorTest {
                     return GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
                 }
 
-                override fun recover(token: String): GeneratedBundle? = null
+                override fun recover(token: String): GeneratedBundle? =
+                    GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
+
+                override fun discard(token: String): Boolean = generatedFile.delete()
             },
             imports = ConversionGeneratedImportPort {
                 events += "import"
-                ReviewBundle(
-                    token = "22222222-2222-4222-8222-222222222222",
-                    packageName = PACKAGE,
-                    extensionId = EXTENSION_ID,
-                    name = "Example",
-                    version = "1.0",
-                    status = ContractCompatibilityStatus.PARTIAL,
-                    issues = emptyList(),
-                )
+                if (importFailuresRemaining-- > 0) {
+                    null
+                } else {
+                    ReviewBundle(
+                        token = "22222222-2222-4222-8222-222222222222",
+                        packageName = PACKAGE,
+                        extensionId = EXTENSION_ID,
+                        name = "Example",
+                        version = "1.0",
+                        status = ContractCompatibilityStatus.PARTIAL,
+                        issues = emptyList(),
+                    )
+                }
             },
         )
 
@@ -329,21 +561,19 @@ class OnDeviceConversionCoordinatorTest {
         )
 
         private fun analysis(profile: BrowserProfile) = ConversionAnalysisSnapshot(
-            report = coreReport(profile),
+            report = coreReport(profile, compatibilityStatus),
             selectedAutomaticAdapters = emptySet(),
             requiredApprovals = setOf("adapter"),
-            logicalSourceIdentity =
-                LogicalSourceIdentity.storeExtensionId(EXTENSION_ID),
+            logicalSourceIdentity = logicalIdentity,
         )
 
         private fun prepared(profile: BrowserProfile) = PreparedConversionSnapshot(
-            reportBefore = coreReport(profile),
+            reportBefore = coreReport(profile, compatibilityStatus),
             originalSourceSha256 = "4".repeat(64),
             planSha256 = "5".repeat(64),
             transformedSourceZip = "zip".encodeToByteArray(),
             passthroughCrx = "crx".encodeToByteArray(),
-            logicalSourceIdentity =
-                LogicalSourceIdentity.storeExtensionId(EXTENSION_ID),
+            logicalSourceIdentity = logicalIdentity,
             descriptorName = "Example",
             descriptorVersion = "1.0",
             sourceKind = "CRX3",
@@ -374,8 +604,11 @@ class OnDeviceConversionCoordinatorTest {
             sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         )
 
-        private fun coreReport(profile: BrowserProfile) = CompatibilityReport(
-            status = CompatibilityStatus.PARTIAL,
+        private fun coreReport(
+            profile: BrowserProfile,
+            status: CompatibilityStatus = CompatibilityStatus.PARTIAL,
+        ) = CompatibilityReport(
+            status = status,
             manifestVersion = 3,
             extensionName = "Example",
             extensionVersion = "1.0",

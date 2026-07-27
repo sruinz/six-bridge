@@ -19,11 +19,17 @@ import dev.sixbridge.manager.conversion.ConversionIdentityLedger
 import dev.sixbridge.manager.conversion.ConversionIdentityReservation
 import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.ConversionWorkStore
+import dev.sixbridge.manager.conversion.BoundConversionSnapshot
+import dev.sixbridge.manager.conversion.DefaultConversionBundlePort
+import dev.sixbridge.manager.conversion.DefaultConversionPackagePort
+import dev.sixbridge.manager.conversion.GeneratedBundleStore
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputArtifact
 import dev.sixbridge.manager.conversion.OnDeviceInputKind
+import dev.sixbridge.manager.conversion.ReservedPackageIdentity
+import dev.sixbridge.manager.conversion.ResolvedPackageIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -66,6 +72,62 @@ class OnDevicePackagerGateInstrumentedTest {
     private val context = instrumentation.targetContext
     private val testContext = instrumentation.context
     private val root = File(context.filesDir, "ondevice-packager-gate")
+
+    @Test
+    fun defaultPackagePortUsesPackagerOwnedOutputAndPublishesBundle() = runBlocking {
+        val source = canonicalSourceZip()
+        val packager = OnDeviceWrapperPackager(context)
+        val claimed = request(
+            packager,
+            source,
+            46,
+            File(root, "unused-default-port.apk"),
+        )
+        try {
+            claimed.workStore.markAwaitingApproval(claimed.ownerToken, PROFILE_SHA256)
+            claimed.workStore.markBuilding(claimed.ownerToken, emptySet(), PROFILE_SHA256)
+            val identity = packager.resolveIdentity(CONVERTED_KEY, null)
+            val reservation = ReservedPackageIdentity(
+                resolved = ResolvedPackageIdentity(
+                    key = CONVERTED_KEY,
+                    identity = identity,
+                    unreservedLease = null,
+                ),
+                versionCode = claimed.request.reservation.versionCode,
+                opaque = claimed.request.reservation,
+            )
+            val packaged = DefaultConversionPackagePort(
+                claimed.ledger,
+                packager,
+            ).packageWrapper(
+                reservation = reservation,
+                bound = BoundConversionSnapshot(
+                    sourceZip = source,
+                    passthroughCrx = null,
+                    compatibility = claimed.request.compatibility,
+                    extensionId = identity.extensionId,
+                ),
+                token = claimed.ownerToken,
+            )
+            val generated = DefaultConversionBundlePort(
+                GeneratedBundleStore(context),
+            ).publish(claimed.ownerToken, packaged)
+
+            assertEquals(
+                root.canonicalFile,
+                requireNotNull(packaged.outputApk.parentFile).canonicalFile,
+            )
+            assertTrue(packaged.outputApk.isFile)
+            assertTrue(generated.file.isFile)
+            assertEquals(claimed.ownerToken, generated.token)
+        } finally {
+            runCatching {
+                claimed.ledger.abortByOwnerToken(claimed.ownerToken, packager)
+            }
+            GeneratedBundleStore(context).discard(claimed.ownerToken)
+            claimed.database.close()
+        }
+    }
 
     @Test
     fun packagesVerifiedWrapperWithExactDescriptor() {

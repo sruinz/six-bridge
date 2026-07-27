@@ -1,8 +1,11 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
+import java.util.concurrent.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 internal class OnDeviceConversionCoordinator(
     private val input: ConversionInputPort,
@@ -20,11 +23,15 @@ internal class OnDeviceConversionCoordinator(
     suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
         val artifact = try {
             input.acquire(request)
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Throwable) {
             return ConversionBeginResult.Failure(error.toInputFailureCode())
         }
         val job = try {
             work.create(artifact)
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Throwable) {
             return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
@@ -71,6 +78,8 @@ internal class OnDeviceConversionCoordinator(
             work.withVerifiedInputFile(token) {
                 runtime.analyze(it, job.inputKind, profile)
             }
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Throwable) {
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
@@ -105,6 +114,8 @@ internal class OnDeviceConversionCoordinator(
             work.withVerifiedInputFile(token) {
                 runtime.prepare(it, job.inputKind, profile, approvedAdapterIds)
             }
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Throwable) {
             return@withLock ConversionBuildResult.Failure(
                 ConversionFailureCode.TRANSFORM_MISMATCH,
@@ -128,8 +139,8 @@ internal class OnDeviceConversionCoordinator(
         }
 
         var generated: GeneratedBundle? = null
+        var building = false
         try {
-            work.markBuilding(token, approvedAdapterIds, profileSha256)
             val resolved = identities.resolve(
                 prepared,
                 profile,
@@ -145,7 +156,7 @@ internal class OnDeviceConversionCoordinator(
                         installedWrapper.signerSha256 != resolved.identity.wrapperSignerSha256
                     )
             ) {
-                identities.abort(token)
+                abortOwner(token)
                 return@withLock ConversionBuildResult.Failure(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
@@ -156,9 +167,11 @@ internal class OnDeviceConversionCoordinator(
                 installedWrapper?.versionCode,
                 token,
             )
+            work.markBuilding(token, approvedAdapterIds, profileSha256)
+            building = true
             val bound = runtime.bind(prepared, profile, resolved.identity)
             if (bound.extensionId != resolved.identity.extensionId) {
-                identities.abort(token)
+                recoverFailedBuild(token, profileSha256)
                 return@withLock ConversionBuildResult.Failure(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
@@ -172,16 +185,39 @@ internal class OnDeviceConversionCoordinator(
                 )
             work.markBundleReady(token, generated.file, generated.sha256)
             ConversionBuildResult.BundleReady(review, generated)
+        } catch (error: CancellationException) {
+            if (generated == null) {
+                if (building) recoverFailedBuild(token, profileSha256) else abortOwner(token)
+            }
+            throw error
         } catch (error: Throwable) {
             if (generated == null) {
-                runCatching { identities.abort(token) }
+                if (building) recoverFailedBuild(token, profileSha256) else abortOwner(token)
             }
             ConversionBuildResult.Failure(error.toBuildFailureCode(), generated)
         }
     }
 
     suspend fun restore(): RestoredConversion? {
-        val job = work.restore() ?: return null
+        val job = work.restoreBuildAware() ?: return null
+        if (job.stage == ConversionJobStage.BUILDING) {
+            val generated = bundles.recover(job.token)
+            if (generated != null) {
+                val review = imports.importGenerated(generated)
+                    ?: return RestoredConversion.GeneratedPending(generated)
+                work.markBundleReady(job.token, generated.file, generated.sha256)
+                return RestoredConversion.BundleReady(review, generated)
+            }
+            val profileSha256 = requireNotNull(job.profileSha256)
+            recoverFailedBuild(job.token, profileSha256)
+            return analyzeJob(
+                job.copy(stage = ConversionJobStage.AWAITING_APPROVAL),
+                markAwaiting = false,
+            ).let {
+                (it as? ConversionBeginResult.AnalysisReady)
+                    ?.let(RestoredConversion::Analysis)
+            }
+        }
         if (job.stage == ConversionJobStage.BUNDLE_READY) {
             val generated = bundles.recover(job.token) ?: return null
             val review = imports.importGenerated(generated) ?: return null
@@ -195,7 +231,12 @@ internal class OnDeviceConversionCoordinator(
             ?.let(RestoredConversion::Analysis)
     }
 
-    suspend fun discard(token: String): Boolean = work.discard(token)
+    suspend fun discard(token: String): Boolean {
+        bundles.recover(token)?.let {
+            if (!bundles.discard(token)) return false
+        }
+        return work.discard(token)
+    }
 
     private suspend fun analyzeJob(
         job: RestoredConversionJob,
@@ -218,6 +259,8 @@ internal class OnDeviceConversionCoordinator(
             work.withVerifiedInputFile(job.token) {
                 runtime.analyze(it, job.inputKind, profile)
             }
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Throwable) {
             return ConversionBeginResult.Failure(
                 ConversionFailureCode.INPUT_INVALID,
@@ -274,6 +317,20 @@ internal class OnDeviceConversionCoordinator(
     }
 
     private fun Throwable.toInputFailureCode(): ConversionFailureCode = when (this) {
+        is OnDeviceInputException -> when (code) {
+            OnDeviceInputErrorCode.INVALID_DRAFT -> ConversionFailureCode.DRAFT_INVALID
+            OnDeviceInputErrorCode.NETWORK -> ConversionFailureCode.NETWORK
+            OnDeviceInputErrorCode.URL -> ConversionFailureCode.URL
+            OnDeviceInputErrorCode.SOURCE_UNAVAILABLE,
+            OnDeviceInputErrorCode.SOURCE_READ_FAILED,
+            OnDeviceInputErrorCode.INPUT_TOO_LARGE,
+            OnDeviceInputErrorCode.INVALID_ZIP,
+            OnDeviceInputErrorCode.INVALID_CRX3,
+            OnDeviceInputErrorCode.UNSUPPORTED_FORMAT,
+            OnDeviceInputErrorCode.INPUT_INVALID,
+            OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
+            -> ConversionFailureCode.INPUT_INVALID
+        }
         is java.net.UnknownHostException,
         is java.net.SocketException,
         -> ConversionFailureCode.NETWORK
@@ -285,5 +342,18 @@ internal class OnDeviceConversionCoordinator(
         is java.io.IOException -> ConversionFailureCode.BUNDLE_IO
         is IllegalArgumentException -> ConversionFailureCode.IDENTITY_MISMATCH
         else -> ConversionFailureCode.PACKAGE
+    }
+
+    private suspend fun abortOwner(token: String) {
+        withContext(NonCancellable) {
+            identities.abort(token)
+        }
+    }
+
+    private suspend fun recoverFailedBuild(token: String, profileSha256: String) {
+        withContext(NonCancellable) {
+            identities.abort(token)
+            work.resetAwaitingApproval(token, profileSha256)
+        }
     }
 }
