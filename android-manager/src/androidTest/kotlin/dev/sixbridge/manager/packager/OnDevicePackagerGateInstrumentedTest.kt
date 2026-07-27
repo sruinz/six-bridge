@@ -3,8 +3,16 @@ package dev.sixbridge.manager.packager
 import android.security.keystore.KeyProperties
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.contract.bundle.ContractAdapterDecision
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
+import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.contract.bundle.ContractSourceEvidence
+import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.manager.conversion.InstallationIdentityKey
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
+import dev.sixbridge.manager.conversion.LogicalSourceIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -12,8 +20,11 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.Signature
+import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
@@ -21,11 +32,15 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
+import org.junit.FixMethodOrder
 import org.junit.Test
+import org.junit.runners.MethodSorters
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
+@FixMethodOrder(MethodSorters.NAME_ASCENDING)
 class OnDevicePackagerGateInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext
@@ -38,8 +53,8 @@ class OnDevicePackagerGateInstrumentedTest {
         val packager = OnDeviceWrapperPackager(context)
         val v1 = File(root, "orchestration-v1.apk")
         val v2 = File(root, "orchestration-v2.apk")
-        val first = packager.packageWrapper(request(source, 1, v1))
-        val second = packager.packageWrapper(request(source, 2, v2))
+        val first = packager.packageWrapper(request(packager, source, 1, v1))
+        val second = packager.packageWrapper(request(packager, source, 2, v2))
 
         assertEquals(first.extensionId, second.extensionId)
         assertEquals(first.packageName, second.packageName)
@@ -51,6 +66,11 @@ class OnDevicePackagerGateInstrumentedTest {
         assertEquals(first.wrapperSha256, first.descriptor.wrapperSha256)
         assertEquals(first.signerSha256, first.descriptor.signerSha256)
         assertEquals(first.extensionId, first.compatibility.convertedExtensionId)
+        assertEquals(ContractCompatibilityStatus.PARTIAL, first.compatibility.status)
+        assertEquals(
+            "desktop-selection-event-bridge",
+            first.compatibility.adapterDecisions.single().id,
+        )
         assertTrue(first.outputApk.isFile)
         val verified = AndroidWrapperVerifier(AndroidArchiveInspector(context.packageManager)).verify(
             first.outputApk,
@@ -69,10 +89,32 @@ class OnDevicePackagerGateInstrumentedTest {
         )
         assertTrue(corrupted is WrapperVerificationResult.Failure)
 
-        val invalidSource = request(source, 3, File(root, "invalid-source.apk")).copy(sourceSha256 = "z".repeat(64))
+        val invalidSource = request(
+            packager,
+            source,
+            3,
+            File(root, "invalid-source.apk"),
+        ).let { request ->
+            request.copy(
+                compatibility = request.compatibility.copy(
+                    sourceSha256 = "0".repeat(64),
+                ),
+            )
+        }
         assertRejected { packager.packageWrapper(invalidSource) }
         assertFalse(invalidSource.outputApk.exists())
-        val invalidProfile = request(source, 3, File(root, "invalid-profile.apk")).copy(browserProfileSha256 = "z".repeat(64))
+        val invalidProfile = request(
+            packager,
+            source,
+            3,
+            File(root, "invalid-profile.apk"),
+        ).let { request ->
+            request.copy(
+                compatibility = request.compatibility.copy(
+                    browserProfileSha256 = "z".repeat(64),
+                ),
+            )
+        }
         assertRejected { packager.packageWrapper(invalidProfile) }
         assertFalse(invalidProfile.outputApk.exists())
 
@@ -80,32 +122,29 @@ class OnDevicePackagerGateInstrumentedTest {
         val symlink = File(root, "symlink-output.apk")
         Files.deleteIfExists(symlink.toPath())
         Files.createSymbolicLink(symlink.toPath(), target.toPath())
-        assertRejected { packager.packageWrapper(request(source, 3, symlink)) }
+        assertRejected { packager.packageWrapper(request(packager, source, 3, symlink)) }
         assertFalse(target.exists())
         Files.deleteIfExists(symlink.toPath())
     }
 
     @Test
     fun snapshotsMutableSourceBeforeValidationAndCrxCreation() {
-        val originalIdentity = SOURCE_IDENTITY.copyOf()
         val originalZip = canonicalSourceZip()
-        val mutableIdentity = originalIdentity.copyOf()
         val mutableZip = originalZip.copyOf()
         val packager = OnDeviceWrapperPackager(
             context,
             OnDevicePackagerTestHooks(
                 afterRequestValidated = {
-                    mutableIdentity.fill(0x5a)
                     mutableZip.fill(0x5a)
                 },
             ),
         )
         val result = packager.packageWrapper(
-            request(mutableZip, 4, File(root, "snapshot.apk")).copy(sourceIdentity = mutableIdentity),
+            request(packager, mutableZip, 4, File(root, "snapshot.apk")),
         )
         val expected = Crx3Writer.create(
             originalZip,
-            AndroidKeystoreIdentityStore().crxSigningKey(originalIdentity),
+            AndroidKeystoreIdentityStore().crxSigningKey(CONVERTED_KEY.identitySha256),
         )
         val facts = AndroidArchiveInspector(context.packageManager).inspect(result.outputApk)
         val crx = Crx3Verifier.verify(facts.crxBytes)
@@ -118,6 +157,81 @@ class OnDevicePackagerGateInstrumentedTest {
                 facts.crxBytes.copyOfRange(crx.zipOffset, crx.zipOffset + crx.zipLength),
             ),
         )
+    }
+
+    @Test
+    fun validationFailureCleansStagedSourceAndGeneratedCrx() {
+        val temporaryPrefixes = listOf(".source.", ".extension.", ".wrapper-template.", ".unsigned.", ".signed.")
+        root.listFiles().orEmpty()
+            .filter { file -> temporaryPrefixes.any(file.name::startsWith) }
+            .forEach(File::delete)
+        val before = root.listFiles().orEmpty().map(File::getName).toSet()
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterRequestValidated = {
+                    throw IllegalArgumentException("test validation boundary failure")
+                },
+            ),
+        )
+
+        assertRejected {
+            packager.packageWrapper(
+                request(packager, canonicalSourceZip(), 41, File(root, "cleanup-failure.apk")),
+            )
+        }
+
+        assertEquals(before, root.listFiles().orEmpty().map(File::getName).toSet())
+    }
+
+    @Test
+    fun passthroughPreservesOriginalCrxIdentityBytesAndDoesNotCreateCrxKey() {
+        val originalCrx = externalSignedCrx(canonicalSourceZip())
+        val proof = Crx3Verifier.verify(originalCrx)
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(
+                UUID.randomUUID().toString().replace("-", ""),
+            ),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.PASSTHROUGH,
+        )
+        val forbiddenAlias = "sixbridge.crx.rsa.v1.${identityKey.identitySha256}"
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        assertFalse(keyStore.containsAlias(forbiddenAlias))
+        val packager = OnDeviceWrapperPackager(context)
+        val identity = packager.resolveIdentity(identityKey, originalCrx)
+
+        assertEquals(proof.extensionId, identity.extensionId)
+        assertNull(identity.crxKeyAlias)
+        assertNull(identity.crxPublicKeyDer)
+        val report = compatibility(
+            extensionId = proof.extensionId,
+            sourceSha256 = proof.zipSha256,
+            conversionState = "passthrough",
+            originalExtensionId = proof.extensionId,
+        )
+        val output = File(root, "passthrough.apk")
+        val result = packager.packageWrapper(
+            OnDeviceWrapperRequest(
+                identityKey = identityKey,
+                canonicalSourceZip = null,
+                passthroughCrx = originalCrx,
+                versionCode = 1,
+                descriptorName = "SIX Bridge On-Device Gate",
+                descriptorVersion = "1.0",
+                sourceKind = "CRX3",
+                compatibility = report,
+                outputApk = output,
+            ),
+        )
+        val embedded = AndroidArchiveInspector(context.packageManager)
+            .inspect(result.outputApk)
+            .crxBytes
+
+        assertArrayEquals(originalCrx, embedded)
+        assertEquals(proof.extensionId, result.extensionId)
+        assertEquals(report, result.compatibility)
+        assertFalse(keyStore.containsAlias(forbiddenAlias))
     }
 
     @Test
@@ -139,7 +253,9 @@ class OnDevicePackagerGateInstrumentedTest {
             ),
         )
         try {
-            assertRejected { packager.packageWrapper(request(canonicalSourceZip(), 5, existing)) }
+            assertRejected {
+                packager.packageWrapper(request(packager, canonicalSourceZip(), 5, existing))
+            }
             assertFalse(File(replacement, "preserved.apk").exists())
             assertEquals("keep", File(savedRoot, "preserved.apk").readText())
         } finally {
@@ -153,8 +269,9 @@ class OnDevicePackagerGateInstrumentedTest {
     fun generateV1AndPersistIdentityEvidence() {
         val source = canonicalSourceZip()
         val output = File(root, "gate-v1.apk")
-        val result = OnDeviceWrapperPackager(context).packageWrapper(request(source, 1, output))
-        val alias = "sixbridge.crx.rsa.v1.${sha256(SOURCE_IDENTITY)}"
+        val packager = OnDeviceWrapperPackager(context)
+        val result = packager.packageWrapper(request(packager, source, 1, output))
+        val alias = "sixbridge.crx.rsa.v1.${CONVERTED_KEY.identitySha256}"
         val entry = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.getEntry(alias, null) as KeyStore.PrivateKeyEntry
         assertNull(entry.privateKey.encoded)
         assertEquals(KeyProperties.KEY_ALGORITHM_RSA, entry.privateKey.algorithm)
@@ -174,7 +291,8 @@ class OnDevicePackagerGateInstrumentedTest {
         assertTrue("v1 wrapper APK가 있어야 합니다.", v1.isFile)
         val source = canonicalSourceZip()
         val v2 = File(root, "gate-v2.apk")
-        val result = OnDeviceWrapperPackager(context).packageWrapper(request(source, 2, v2))
+        val packager = OnDeviceWrapperPackager(context)
+        val result = packager.packageWrapper(request(packager, source, 2, v2))
         assertTrue(old.contains("\"extensionId\":\"${result.extensionId}\""))
         assertTrue(old.contains("\"packageName\":\"${result.packageName}\""))
         assertTrue(old.contains("\"wrapperSignerSha256\":\"${result.signerSha256}\""))
@@ -206,18 +324,91 @@ class OnDevicePackagerGateInstrumentedTest {
         assertTrue(v2.isFile)
     }
 
-    private fun request(source: ByteArray, versionCode: Int, output: File): OnDeviceWrapperRequest =
-        OnDeviceWrapperRequest(
-            sourceIdentity = SOURCE_IDENTITY,
+    private fun request(
+        packager: OnDeviceWrapperPackager,
+        source: ByteArray,
+        versionCode: Int,
+        output: File,
+    ): OnDeviceWrapperRequest {
+        val identity = packager.resolveIdentity(CONVERTED_KEY, null)
+        return OnDeviceWrapperRequest(
+            identityKey = CONVERTED_KEY,
             canonicalSourceZip = source,
+            passthroughCrx = null,
             versionCode = versionCode,
-            extensionName = "SIX Bridge On-Device Gate",
-            extensionVersion = "1.0",
+            descriptorName = "SIX Bridge On-Device Gate",
+            descriptorVersion = "1.0",
             sourceKind = "ZIP",
-            sourceSha256 = sha256(source),
-            browserProfileSha256 = PROFILE_SHA256,
+            compatibility = compatibility(
+                extensionId = identity.extensionId,
+                sourceSha256 = sha256(source),
+                conversionState = "converted",
+                originalExtensionId = ORIGINAL_EXTENSION_ID,
+            ),
             outputApk = output,
         )
+    }
+
+    private fun compatibility(
+        extensionId: String,
+        sourceSha256: String,
+        conversionState: String,
+        originalExtensionId: String,
+    ) = ContractCompatibilityReport(
+        schemaVersion = 4,
+        status = ContractCompatibilityStatus.PARTIAL,
+        manifestVersion = 3,
+        extensionName = "SIX Bridge On-Device Gate",
+        extensionVersion = "1.0",
+        manifestKeyPresent = false,
+        manifestKeyExtensionId = null,
+        declaredPermissions = listOf("storage"),
+        usedApis = listOf("chrome.storage.local"),
+        unsupportedApis = listOf("chrome.desktopCapture"),
+        issues = emptyList(),
+        conversionState = conversionState,
+        adapterDecisions = listOf(
+            ContractAdapterDecision(
+                id = "desktop-selection-event-bridge",
+                version = 1,
+                risk = "behavior-change",
+                disposition = "requires-approval",
+                applied = true,
+                evidence = listOf(
+                    ContractSourceEvidence(
+                        relativePath = "content.js",
+                        line = 1,
+                        detail = "desktop selection event listener",
+                    ),
+                ),
+                changes = listOf("selection event bridge"),
+                remainingLimitations = listOf("desktop selection UI unavailable"),
+            ),
+        ),
+        originalExtensionId = originalExtensionId,
+        convertedExtensionId = extensionId,
+        sourceSha256 = sourceSha256,
+        browserProfileSha256 = PROFILE_SHA256,
+        originalSourceSha256 = "a".repeat(64),
+        planSha256 = "b".repeat(64),
+    )
+
+    private fun externalSignedCrx(source: ByteArray): ByteArray {
+        val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        return Crx3Writer.create(
+            source,
+            object : Crx3SigningKey {
+                override fun publicKeyDer(): ByteArray = pair.public.encoded
+
+                override fun signSha256Rsa(payload: ByteArray): ByteArray =
+                    Signature.getInstance("SHA256withRSA").run {
+                        initSign(pair.private)
+                        update(payload)
+                        sign()
+                    }
+            },
+        ).bytes
+    }
 
     private fun canonicalSourceZip(): ByteArray = ByteArrayOutputStream().use { bytes ->
         ZipOutputStream(bytes).use { zip ->
@@ -254,7 +445,12 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     private companion object {
-        val SOURCE_IDENTITY = "ondevice-gate-source-identity-v1".encodeToByteArray()
+        const val ORIGINAL_EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
+        val CONVERTED_KEY = InstallationIdentityKey.create(
+            LogicalSourceIdentity.storeExtensionId(ORIGINAL_EXTENSION_ID),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
         const val PROFILE_SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
 }

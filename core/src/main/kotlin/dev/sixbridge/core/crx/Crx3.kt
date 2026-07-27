@@ -7,6 +7,7 @@ import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.conversion.VerifiedCrxPayload
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -27,6 +28,21 @@ class KeyPairCrx3SigningKey(private val keyPair: KeyPair) : Crx3SigningKey {
         update(payload)
         sign()
     }
+
+    override fun signSha256Rsa(payload: InputStream): ByteArray =
+        Signature.getInstance("SHA256withRSA").run {
+            initSign(keyPair.private)
+            val buffer = ByteArray(64 * 1024)
+            payload.use { input ->
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    require(count > 0) { "CRX3 서명 stream 읽기가 진행되지 않습니다." }
+                    update(buffer, 0, count)
+                }
+            }
+            sign()
+        }
 }
 
 data class PackedCrx(

@@ -20,6 +20,13 @@ data class ApkAssemblyRequest(
     val outputApk: File,
 )
 
+data class ApkAssemblyPathRequest(
+    val templateApk: File,
+    val manifestBytes: ByteArray,
+    val crxFile: File,
+    val outputApk: File,
+)
+
 /**
  * 앱 전용 작업 디렉터리만 publish 대상으로 허용하는 unsigned wrapper APK 조립기다.
  * Task 6은 `context.filesDir` 아래의 private working directory를 이 생성자에 전달한다.
@@ -28,8 +35,39 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
     private val trustedDirectory = TrustedDirectory.capture(trustedOutputDirectory)
 
     fun assemble(request: ApkAssemblyRequest) {
-        val template = request.templateApk.toPath().toAbsolutePath().normalize()
-        val output = request.outputApk.toPath().toAbsolutePath().normalize()
+        assemblePrepared(
+            templateFile = request.templateApk,
+            manifest = request.manifestBytes,
+            crx = PreparedEntry.bytes("assets/extension.crx", request.crxBytes),
+            outputFile = request.outputApk,
+        )
+    }
+
+    fun assemble(request: ApkAssemblyPathRequest) {
+        val crx = request.crxFile.toPath().toAbsolutePath().normalize()
+        require(Files.isRegularFile(crx, NOFOLLOW_LINKS) && !Files.isSymbolicLink(crx)) {
+            "CRX3 file이 올바르지 않습니다."
+        }
+        val state = StableSource.capture(crx)
+        require(state.size in 1..MAX_CRX_SIZE) { "CRX3 크기가 올바르지 않습니다." }
+        val crc32 = crc32(crx, state)
+        assemblePrepared(
+            templateFile = request.templateApk,
+            manifest = request.manifestBytes,
+            crx = PreparedEntry.path("assets/extension.crx", crx, state, crc32),
+            outputFile = request.outputApk,
+        )
+        state.verify(crx)
+    }
+
+    private fun assemblePrepared(
+        templateFile: File,
+        manifest: ByteArray,
+        crx: PreparedEntry,
+        outputFile: File,
+    ) {
+        val template = templateFile.toPath().toAbsolutePath().normalize()
+        val output = outputFile.toPath().toAbsolutePath().normalize()
         trustedDirectory.verifyUnchanged()
         require(output.parent == trustedDirectory.path) { "output APK는 신뢰된 작업 디렉터리에 있어야 합니다." }
         require(Files.isRegularFile(template, NOFOLLOW_LINKS) && !Files.isSymbolicLink(template)) {
@@ -37,10 +75,8 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         }
         rejectUnsafeOutput(template, output)
 
-        val manifest = request.manifestBytes
-        val crx = request.crxBytes
         require(manifest.isNotEmpty() && manifest.size.toLong() <= MAX_ENTRY_SIZE) { "AndroidManifest.xml 크기가 올바르지 않습니다." }
-        require(crx.isNotEmpty() && crx.size.toLong() <= MAX_CRX_SIZE) { "CRX3 크기가 올바르지 않습니다." }
+        require(crx.size in 1..MAX_CRX_SIZE) { "CRX3 크기가 올바르지 않습니다." }
 
         val templateEntries = ApkZipStructureVerifier.templateEntries(template.toFile())
         val byName = templateEntries.associateBy { it.fact.name }
@@ -51,7 +87,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
             PreparedEntry.bytes("AndroidManifest.xml", manifest),
             PreparedEntry.template("classes.dex", byName.getValue("classes.dex")),
             PreparedEntry.template("resources.arsc", byName.getValue("resources.arsc")),
-            PreparedEntry.bytes("assets/extension.crx", crx),
+            crx,
         )
         require(byName.getValue("resources.arsc").fact.method == STORED) { "template resources.arsc는 STORED여야 합니다." }
         prepared.forEach { entry -> require(entry.size in 1L..MAX_ENTRY_SIZE) { "래퍼 APK entry 크기가 올바르지 않습니다: ${entry.name}" } }
@@ -61,7 +97,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         try {
             writeArchive(temp.toFile(), template.toFile(), prepared)
             FileChannel.open(temp, WRITE).use { it.force(true) }
-            verifyAssembly(temp.toFile(), crx.size.toLong())
+            verifyAssembly(temp.toFile(), crx.size)
             trustedDirectory.verifyUnchanged()
             rejectUnsafeOutput(template, output)
             Files.move(temp, output, ATOMIC_MOVE, REPLACE_EXISTING)
@@ -129,6 +165,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         when (val source = entry.source) {
             is EntrySource.Bytes -> writeBytesAndVerify(stream, source.bytes, entry.crc32)
             is EntrySource.Template -> ApkZipStructureVerifier.copyEntryData(template, source.entry, stream)
+            is EntrySource.PathSource -> writePathAndVerify(stream, source, entry.crc32)
         }
         return WrittenEntry(entry.name, entry.size, entry.crc32, extra, offset)
     }
@@ -136,6 +173,55 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
     private fun writeBytesAndVerify(stream: OutputStream, bytes: ByteArray, expectedCrc: Long) {
         stream.write(bytes)
         require(CRC32().apply { update(bytes) }.value == expectedCrc) { "래퍼 APK entry가 조립 중 변경되었습니다." }
+    }
+
+    private fun writePathAndVerify(
+        stream: OutputStream,
+        source: EntrySource.PathSource,
+        expectedCrc: Long,
+    ) {
+        source.state.verify(source.path)
+        val crc = CRC32()
+        var copied = 0L
+        Files.newInputStream(source.path, NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            while (copied < source.state.size) {
+                val count = input.read(
+                    buffer,
+                    0,
+                    minOf(buffer.size.toLong(), source.state.size - copied).toInt(),
+                )
+                require(count > 0) { "CRX3 file이 조립 중 잘렸습니다." }
+                stream.write(buffer, 0, count)
+                crc.update(buffer, 0, count)
+                copied += count
+            }
+            require(input.read() < 0) { "CRX3 file 크기가 조립 중 변경되었습니다." }
+        }
+        source.state.verify(source.path)
+        require(crc.value == expectedCrc) { "CRX3 file이 조립 중 변경되었습니다." }
+    }
+
+    private fun crc32(path: Path, state: StableSource): Long {
+        state.verify(path)
+        val crc = CRC32()
+        Files.newInputStream(path, NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            var readTotal = 0L
+            while (readTotal < state.size) {
+                val count = input.read(
+                    buffer,
+                    0,
+                    minOf(buffer.size.toLong(), state.size - readTotal).toInt(),
+                )
+                require(count > 0) { "CRX3 file이 잘렸습니다." }
+                crc.update(buffer, 0, count)
+                readTotal += count
+            }
+            require(input.read() < 0) { "CRX3 file 크기가 변경되었습니다." }
+        }
+        state.verify(path)
+        return crc.value
     }
 
     private fun alignmentExtra(offset: Long, nameSize: Int): ByteArray {
@@ -212,6 +298,10 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
     private sealed interface EntrySource {
         data class Bytes(val bytes: ByteArray) : EntrySource
         data class Template(val entry: ApkZipEntryData) : EntrySource
+        data class PathSource(
+            val path: Path,
+            val state: StableSource,
+        ) : EntrySource
     }
 
     private data class PreparedEntry(val name: String, val size: Long, val crc32: Long, val source: EntrySource) {
@@ -222,6 +312,42 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
             fun template(name: String, entry: ApkZipEntryData): PreparedEntry =
                 PreparedEntry(name, entry.fact.size, entry.crc32, EntrySource.Template(entry))
+
+            fun path(
+                name: String,
+                path: Path,
+                state: StableSource,
+                crc32: Long,
+            ): PreparedEntry =
+                PreparedEntry(name, state.size, crc32, EntrySource.PathSource(path, state))
+        }
+    }
+
+    private data class StableSource(
+        val fileKey: Any?,
+        val size: Long,
+        val modifiedMillis: Long,
+    ) {
+        fun verify(path: Path) {
+            require(capture(path) == this) { "CRX3 file identity가 변경되었습니다." }
+        }
+
+        companion object {
+            fun capture(path: Path): StableSource {
+                val attributes = Files.readAttributes(
+                    path,
+                    BasicFileAttributes::class.java,
+                    NOFOLLOW_LINKS,
+                )
+                require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+                    "CRX3 file은 regular file이어야 합니다."
+                }
+                return StableSource(
+                    attributes.fileKey(),
+                    attributes.size(),
+                    attributes.lastModifiedTime().toMillis(),
+                )
+            }
         }
     }
 
@@ -254,6 +380,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         const val MAX_CRX_SIZE = 128L * 1024L * 1024L
         const val MAX_ENTRY_SIZE = 128L * 1024L * 1024L
         const val MAX_OUTPUT_SIZE = 256L * 1024L * 1024L
+        const val STREAM_BUFFER_SIZE = 64 * 1024
         const val STORED = 0
         const val LOCAL_HEADER_SIZE = 30
         const val CENTRAL_HEADER_SIZE = 46

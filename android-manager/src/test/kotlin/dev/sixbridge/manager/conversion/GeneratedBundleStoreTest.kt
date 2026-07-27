@@ -1,0 +1,393 @@
+package dev.sixbridge.manager.conversion
+
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
+import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.manager.packager.OnDeviceWrapperResult
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.attribute.FileTime
+import java.lang.management.ManagementFactory
+import java.security.MessageDigest
+import java.util.UUID
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+import org.junit.After
+import org.junit.Test
+
+class GeneratedBundleStoreTest {
+    private val filesDir = Files.createTempDirectory("six-generated-bundle-store").toFile()
+    private val token = "11111111-1111-4111-8111-111111111111"
+
+    @After
+    fun tearDown() {
+        filesDir.deleteRecursively()
+    }
+
+    @Test
+    fun `게시한 bundle을 다시 열면 descriptor report wrapper가 동일하다`() {
+        val result = result()
+        var verifiedWrapper: ByteArray? = null
+        val store = store(
+            verifier = GeneratedWrapperVerifier { wrapper, descriptor, report ->
+                verifiedWrapper = wrapper.readBytes()
+                descriptor == result.descriptor && report == result.compatibility
+            },
+        )
+
+        val generated = store.publish(token, result)
+        val reopened = store.open(token).use(SixBundleContract::read)
+
+        assertContentEquals(result.outputApk.readBytes(), verifiedWrapper)
+        assertContentEquals(result.outputApk.readBytes(), reopened.wrapperApk)
+        assertEquals(result.descriptor, reopened.extension)
+        assertEquals(result.compatibility, reopened.compatibility)
+        assertEquals(sha256(generated.file), generated.sha256)
+        assertEquals(File(filesDir, "generated-bundles/$token.six"), generated.file)
+    }
+
+    @Test
+    fun `copyTo는 검증된 전체 bundle을 bounded streaming하고 같은 hash를 반환한다`() {
+        val store = store()
+        val generated = store.publish(token, result())
+        val output = ByteArrayOutputStream()
+
+        val copiedSha256 = store.copyTo(token, output)
+
+        assertEquals(generated.sha256, copiedSha256)
+        assertContentEquals(generated.file.readBytes(), output.toByteArray())
+    }
+
+    @Test
+    fun `게시 중 temporary partial write와 최종 symlink 교체를 거부한다`() {
+        val partialStore = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterBundleWritten = { file ->
+                    file.outputStream().use { it.write(byteArrayOf(1, 2, 3)) }
+                },
+            ),
+        )
+        assertFailsWith<IllegalArgumentException> {
+            partialStore.publish(token, result())
+        }
+        assertFalse(bundleFile().exists())
+
+        val target = File(filesDir, "symlink-target.six")
+        val symlinkStore = store(
+            hooks = GeneratedBundleStoreHooks(
+                beforeFinalPublish = { output ->
+                    Files.createSymbolicLink(output.toPath(), target.toPath())
+                },
+            ),
+        )
+        assertFailsWith<IllegalArgumentException> {
+            symlinkStore.publish(token, result())
+        }
+        assertFalse(target.exists())
+    }
+
+    @Test
+    fun `wrapper symlink와 hardlink를 publish source로 받지 않는다`() {
+        val original = result()
+        val symlink = File(filesDir, "wrapper-link.apk")
+        Files.createSymbolicLink(symlink.toPath(), original.outputApk.toPath())
+        assertFailsWith<IllegalArgumentException> {
+            store().publish(token, original.copy(outputApk = symlink))
+        }
+
+        val hardlink = File(filesDir, "wrapper-hardlink.apk")
+        Files.createLink(hardlink.toPath(), original.outputApk.toPath())
+        assertFailsWith<IllegalArgumentException> {
+            store().publish(UUID.randomUUID().toString(), original.copy(outputApk = hardlink))
+        }
+    }
+
+    @Test
+    fun `copy 중 published file 교체를 감지하고 hash를 반환하지 않는다`() {
+        lateinit var published: File
+        val store = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterCopyChunk = {
+                    val replacement = File(published.parentFile, ".replacement").apply {
+                        writeBytes("replaced".encodeToByteArray())
+                    }
+                    Files.move(
+                        replacement.toPath(),
+                        published.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    )
+                },
+            ),
+        )
+        published = store.publish(token, result()).file
+
+        assertFailsWith<IllegalArgumentException> {
+            store.copyTo(token, ByteArrayOutputStream())
+        }
+    }
+
+    @Test
+    fun `open은 게시 뒤 변조된 bundle hash를 거부한다`() {
+        val store = store()
+        val generated = store.publish(token, result())
+        generated.file.setWritable(true)
+        generated.file.writeText("tampered")
+
+        assertFailsWith<IllegalArgumentException> {
+            store.open(token)
+        }
+    }
+
+    @Test
+    fun `store 재생성 뒤 디스크 bundle을 재검증해 open copy discard한다`() {
+        val first = store()
+        val generated = first.publish(token, result())
+        val discardToken = UUID.randomUUID().toString()
+        val discardedAfterRestart = first.publish(discardToken, result("discard-after-restart.apk"))
+        val recreated = store()
+        val output = ByteArrayOutputStream()
+
+        assertTrue(recreated.discard(discardToken))
+        assertFalse(discardedAfterRestart.file.exists())
+        val opened = recreated.open(token).use { it.readBytes() }
+        val copiedSha256 = recreated.copyTo(token, output)
+
+        assertContentEquals(generated.file.readBytes(), opened)
+        assertContentEquals(generated.file.readBytes(), output.toByteArray())
+        assertEquals(generated.sha256, copiedSha256)
+        assertTrue(recreated.discard(token))
+        assertFalse(generated.file.exists())
+    }
+
+    @Test
+    fun `open 뒤 같은 inode size mtime 변조는 EOF와 close에서 hash로 감지한다`() {
+        val store = store()
+        val generated = store.publish(token, result())
+        val originalTime = Files.getLastModifiedTime(generated.file.toPath())
+        val stream = store.open(token)
+        generated.file.setWritable(true)
+        val bytes = generated.file.readBytes()
+        bytes[0] = (bytes[0].toInt() xor 1).toByte()
+        generated.file.writeBytes(bytes)
+        Files.setLastModifiedTime(generated.file.toPath(), originalTime)
+
+        assertFailsWith<IOException> {
+            stream.use { it.readBytes() }
+        }
+
+        generated.file.writeBytes(bytes.apply { this[0] = (this[0].toInt() xor 1).toByte() })
+        Files.setLastModifiedTime(generated.file.toPath(), FileTime.fromMillis(originalTime.toMillis()))
+        val partial = store.open(token)
+        partial.read()
+        generated.file.setWritable(true)
+        val second = generated.file.readBytes()
+        second[1] = (second[1].toInt() xor 1).toByte()
+        generated.file.writeBytes(second)
+        Files.setLastModifiedTime(generated.file.toPath(), originalTime)
+        assertFailsWith<IOException> {
+            partial.close()
+        }
+    }
+
+    @Test
+    fun `재생성 시 소유한 orphan temporary를 정리한다`() {
+        store()
+        val orphan = File(
+            filesDir,
+            "generated-bundles/.$token.interrupted.tmp",
+        ).apply { writeText("partial") }
+        val wrapperOrphan = File(
+            filesDir,
+            "generated-bundles/.wrapper.${UUID.randomUUID()}.apk",
+        ).apply { writeText("partial wrapper") }
+
+        store()
+
+        assertFalse(orphan.exists())
+        assertFalse(wrapperOrphan.exists())
+    }
+
+    @Test
+    fun `128 MiB wrapper를 bundle publish copy discard까지 bounded heap으로 처리한다`() {
+        val wrapper = File(filesDir, "large-wrapper.apk")
+        wrapper.outputStream().buffered().use { output ->
+            val buffer = ByteArray(64 * 1024)
+            var state = 0x13579bdf
+            repeat(128 * 1024 * 1024 / buffer.size) {
+                for (index in buffer.indices) {
+                    state = state * 1103515245 + 12345
+                    buffer[index] = (state ushr 16).toByte()
+                }
+                output.write(buffer)
+            }
+        }
+        val largeResult = result(wrapper)
+        System.gc()
+        val baseline = heapUsed()
+        var peak = baseline
+        val running = java.util.concurrent.atomic.AtomicBoolean(true)
+        val sampler = Thread {
+            while (running.get()) {
+                peak = maxOf(peak, heapUsed())
+                Thread.yield()
+            }
+        }.apply { start() }
+        val largeToken = UUID.randomUUID().toString()
+
+        val generated = try {
+            val store = store()
+            val published = store.publish(largeToken, largeResult)
+            val copied = store.copyTo(
+                largeToken,
+                object : java.io.OutputStream() {
+                    override fun write(value: Int) = Unit
+                    override fun write(bytes: ByteArray, offset: Int, length: Int) = Unit
+                },
+            )
+            assertEquals(published.sha256, copied)
+            assertTrue(store.discard(largeToken))
+            published
+        } finally {
+            running.set(false)
+            sampler.join()
+        }
+
+        assertFalse(generated.file.exists())
+        assertTrue(peak - baseline < 96L * 1024 * 1024, "streaming heap 증가량: ${peak - baseline}")
+    }
+
+    @Test
+    fun `discard는 private bundle을 제거하고 cleanup 실패를 성공으로 숨기지 않는다`() {
+        val store = store()
+        val generated = store.publish(token, result())
+
+        assertTrue(store.discard(token))
+        assertFalse(generated.file.exists())
+        assertFalse(store.discard(token))
+
+        val cleanupToken = UUID.randomUUID().toString()
+        val failing = store(
+            hooks = GeneratedBundleStoreHooks(
+                deletePublishedFile = { false },
+            ),
+        )
+        val retained = failing.publish(cleanupToken, result("retained.apk"))
+        assertFalse(failing.discard(cleanupToken))
+        assertTrue(retained.file.exists())
+    }
+
+    @Test
+    fun `잘못된 token과 기존 output은 publish하지 않는다`() {
+        val store = store()
+        assertFailsWith<IllegalArgumentException> {
+            store.publish("../escape", result())
+        }
+        requireNotNull(bundleFile().parentFile).mkdirs()
+        bundleFile().writeText("keep")
+
+        assertFailsWith<IllegalArgumentException> {
+            store.publish(token, result("second.apk"))
+        }
+        assertEquals("keep", bundleFile().readText())
+    }
+
+    @Test
+    fun `wrapper verifier 실패와 cleanup 실패를 모두 보고한다`() {
+        val store = store(
+            verifier = GeneratedWrapperVerifier { _, _, _ -> false },
+            hooks = GeneratedBundleStoreHooks(deleteFile = { false }),
+        )
+
+        val error = assertFailsWith<GeneratedBundleStoreException> {
+            store.publish(token, result())
+        }
+        assertEquals(GeneratedBundleStoreErrorCode.CLEANUP_FAILED, error.code)
+    }
+
+    private fun store(
+        verifier: GeneratedWrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+        hooks: GeneratedBundleStoreHooks = GeneratedBundleStoreHooks(),
+    ) = GeneratedBundleStore(
+        filesDir = filesDir,
+        wrapperVerifier = verifier,
+        hooks = hooks,
+    )
+
+    private fun result(name: String = "wrapper.apk"): OnDeviceWrapperResult {
+        val wrapper = File(filesDir, name).apply {
+            writeBytes(byteArrayOf(0x50, 0x4b, 3, 4, 1, 2, 3))
+        }
+        return result(wrapper)
+    }
+
+    private fun result(wrapper: File): OnDeviceWrapperResult {
+        val extensionId = "abcdefghijklmnopabcdefghijklmnop"
+        val descriptor = ContractExtensionDescriptor(
+            schemaVersion = 1,
+            extensionId = extensionId,
+            name = "SIX 테스트",
+            version = "1.0",
+            sourceKind = "ZIP",
+            crxSha256 = "a".repeat(64),
+            wrapperSha256 = sha256(wrapper),
+            wrapperPackage = "dev.sixbridge.ext.$extensionId",
+            wrapperVersionCode = 7,
+            signerSha256 = "b".repeat(64),
+        )
+        val compatibility = ContractCompatibilityReport(
+            schemaVersion = 4,
+            status = ContractCompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = descriptor.name,
+            extensionVersion = descriptor.version,
+            manifestKeyPresent = false,
+            manifestKeyExtensionId = null,
+            declaredPermissions = listOf("storage"),
+            usedApis = listOf("chrome.storage.local"),
+            unsupportedApis = emptyList(),
+            issues = emptyList(),
+            conversionState = "converted",
+            adapterDecisions = emptyList(),
+            originalExtensionId = "bcdefghijklmnopabcdefghijklmnopa",
+            convertedExtensionId = extensionId,
+            sourceSha256 = "c".repeat(64),
+            browserProfileSha256 = "d".repeat(64),
+            originalSourceSha256 = "e".repeat(64),
+            planSha256 = "f".repeat(64),
+        )
+        return OnDeviceWrapperResult(
+            extensionId = extensionId,
+            packageName = descriptor.wrapperPackage,
+            versionCode = descriptor.wrapperVersionCode,
+            signerSha256 = descriptor.signerSha256,
+            crxSha256 = descriptor.crxSha256,
+            wrapperSha256 = descriptor.wrapperSha256,
+            descriptor = descriptor,
+            compatibility = compatibility,
+            outputApk = wrapper,
+        )
+    }
+
+    private fun bundleFile() = File(filesDir, "generated-bundles/$token.six")
+
+    private fun sha256(file: File): String =
+        file.inputStream().use { input ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
+
+    private fun heapUsed(): Long =
+        ManagementFactory.getMemoryMXBean().heapMemoryUsage.used
+}

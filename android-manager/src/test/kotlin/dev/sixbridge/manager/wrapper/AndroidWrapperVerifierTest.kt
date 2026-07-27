@@ -69,6 +69,50 @@ class AndroidWrapperVerifierTest {
     }
 
     @Test
+    fun `streaming inspector의 CRX Path를 검증하고 legacy CRX ByteArray를 요구하지 않는다`() {
+        val fixture = fixture()
+        var pathInspectionCalled = false
+        val streamingInspector = object : StreamingArchiveInspector {
+            override fun inspect(apk: File): ArchiveFacts =
+                error("streaming verifier는 legacy inspect를 호출하면 안 됩니다.")
+
+            override fun inspect(apk: File, crxOutput: File): ArchiveFacts {
+                pathInspectionCalled = true
+                crxOutput.writeBytes(fixture.facts.crxBytes)
+                return fixture.facts.copy(crxBytes = ByteArray(0))
+            }
+        }
+
+        val result = AndroidWrapperVerifier(streamingInspector).verify(
+            fixture.wrapperFile,
+            fixture.descriptor,
+            fixture.report,
+        )
+
+        assertTrue(pathInspectionCalled)
+        assertIs<WrapperVerificationResult.Success>(result)
+    }
+
+    @Test
+    fun `managed temporary root의 process death CRX orphan을 시작 시 정리한다`() {
+        val directory = Files.createTempDirectory("wrapper-verifier-managed-temp").toFile()
+        try {
+            val orphan = File(directory, ".sixbridge-wrapper-crx-interrupted.tmp").apply {
+                writeText("sensitive extension payload")
+            }
+
+            AndroidWrapperVerifier(
+                ArchiveInspector { error("검증하지 않습니다.") },
+                directory,
+            )
+
+            assertTrue(!orphan.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `rejects a staged APK mutated while archive inspection is running`() {
         val fixture = fixture()
         val verifier = AndroidWrapperVerifier(

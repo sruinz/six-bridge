@@ -6,6 +6,11 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption.CREATE_NEW
+import java.nio.file.StandardOpenOption.WRITE
 import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -52,6 +57,58 @@ object SixBundleContract {
         }
     }
 
+    fun read(
+        input: InputStream,
+        wrapperOutput: Path,
+    ): ContractBundleFileContents {
+        val archive = stageArchive(input)
+        var completed = false
+        try {
+            require(!Files.exists(wrapperOutput, NOFOLLOW_LINKS)) {
+                "wrapper.apk output이 이미 존재합니다."
+            }
+            val centralDirectory = validateArchiveBoundary(archive)
+            ZipFile(archive.file).use { zip ->
+                val entries = validateEntries(zip, centralDirectory)
+                val extensionBytes = readEntry(
+                    zip,
+                    entries.getValue(EXTENSION_ENTRY),
+                    MAX_METADATA_SIZE,
+                )
+                val compatibilityBytes = readEntry(
+                    zip,
+                    entries.getValue(COMPATIBILITY_ENTRY),
+                    MAX_METADATA_SIZE,
+                )
+                val extension = BundleJson.decodeExtension(extensionBytes.decodeToString())
+                val compatibility = BundleJson.decodeCompatibility(compatibilityBytes.decodeToString())
+                val wrapperSha256 = extractEntry(
+                    zip,
+                    entries.getValue(WRAPPER_ENTRY),
+                    wrapperOutput,
+                    MAX_WRAPPER_SIZE,
+                )
+                validateMetadata(extension, compatibility)
+                require(wrapperSha256 == extension.wrapperSha256) {
+                    "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
+                }
+                completed = true
+                return ContractBundleFileContents(
+                    wrapperApk = wrapperOutput,
+                    extension = extension,
+                    compatibility = compatibility,
+                )
+            }
+        } catch (error: IllegalArgumentException) {
+            throw error
+        } catch (error: Exception) {
+            throw IllegalArgumentException("SixBundle을 읽을 수 없습니다: ${error.message}", error)
+        } finally {
+            deleteTemporaryFile(archive.file)
+            if (!completed) Files.deleteIfExists(wrapperOutput)
+        }
+    }
+
     fun write(output: OutputStream, contents: ContractBundleContents) {
         require(contents.compatibility.schemaVersion in 3..4) {
             "SixBundle writer는 compatibility schema v3 또는 v4만 기록합니다."
@@ -68,6 +125,63 @@ object SixBundleContract {
             add(zip, WRAPPER_ENTRY, contents.wrapperApk)
             add(zip, EXTENSION_ENTRY, extension)
             add(zip, COMPATIBILITY_ENTRY, compatibility)
+        }
+    }
+
+    fun write(
+        output: OutputStream,
+        wrapperApk: Path,
+        extension: ContractExtensionDescriptor,
+        compatibility: ContractCompatibilityReport,
+    ) {
+        require(compatibility.schemaVersion in 3..4) {
+            "SixBundle writer는 compatibility schema v3 또는 v4만 기록합니다."
+        }
+        val extensionBytes = BundleJson.encodeExtension(extension).encodeToByteArray()
+        val compatibilityBytes = BundleJson.encodeCompatibility(compatibility).encodeToByteArray()
+        require(extensionBytes.size.toLong() <= MAX_METADATA_SIZE) {
+            "extension.json 크기가 제한을 초과합니다."
+        }
+        require(compatibilityBytes.size.toLong() <= MAX_METADATA_SIZE) {
+            "compatibility.json 크기가 제한을 초과합니다."
+        }
+        val attributes = Files.readAttributes(
+            wrapperApk,
+            java.nio.file.attribute.BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+            "wrapper.apk는 regular file이어야 합니다."
+        }
+        require(
+            attributes.size() in 1..MAX_WRAPPER_SIZE &&
+                attributes.size() + extensionBytes.size + compatibilityBytes.size <= MAX_TOTAL_SIZE,
+        ) {
+            "SixBundle 압축 해제 크기가 제한을 초과합니다."
+        }
+        validateMetadata(extension, compatibility)
+        require(sha256(wrapperApk) == extension.wrapperSha256) {
+            "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
+        }
+        ZipOutputStream(output).use { zip ->
+            val copiedSha256 = add(zip, WRAPPER_ENTRY, wrapperApk, attributes.size())
+            require(copiedSha256 == extension.wrapperSha256) {
+                "기록한 wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
+            }
+            add(zip, EXTENSION_ENTRY, extensionBytes)
+            add(zip, COMPATIBILITY_ENTRY, compatibilityBytes)
+        }
+        val after = Files.readAttributes(
+            wrapperApk,
+            java.nio.file.attribute.BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(
+            after.fileKey() == attributes.fileKey() &&
+                after.size() == attributes.size() &&
+                after.lastModifiedTime() == attributes.lastModifiedTime(),
+        ) {
+            "wrapper.apk가 SixBundle 기록 중 변경되었습니다."
         }
     }
 
@@ -288,17 +402,57 @@ object SixBundleContract {
         return bytes
     }
 
+    private fun extractEntry(
+        zip: ZipFile,
+        entry: ZipEntry,
+        output: Path,
+        limit: Long,
+    ): String {
+        require(entry.size in 1..limit) {
+            "SixBundle 항목 크기가 제한을 초과합니다: ${entry.name}"
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newOutputStream(output, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { destination ->
+            zip.getInputStream(entry).use { input ->
+                val buffer = ByteArray(STREAM_BUFFER_SIZE)
+                var remaining = entry.size
+                while (remaining > 0L) {
+                    val count = input.read(
+                        buffer,
+                        0,
+                        minOf(buffer.size.toLong(), remaining).toInt(),
+                    )
+                    require(count > 0) { "SixBundle 항목이 잘렸습니다: ${entry.name}" }
+                    destination.write(buffer, 0, count)
+                    digest.update(buffer, 0, count)
+                    remaining -= count
+                }
+                require(input.read() < 0) {
+                    "SixBundle 항목 크기가 일치하지 않습니다: ${entry.name}"
+                }
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun validateContents(
         wrapper: ByteArray,
         extension: ContractExtensionDescriptor,
         compatibility: ContractCompatibilityReport,
     ) {
         require(wrapper.size.toLong() <= MAX_WRAPPER_SIZE) { "wrapper.apk 크기가 제한을 초과합니다." }
-        BundleJson.validateExtension(extension)
-        BundleJson.validateCompatibility(compatibility)
+        validateMetadata(extension, compatibility)
         require(sha256(wrapper) == extension.wrapperSha256) {
             "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
         }
+    }
+
+    private fun validateMetadata(
+        extension: ContractExtensionDescriptor,
+        compatibility: ContractCompatibilityReport,
+    ) {
+        BundleJson.validateExtension(extension)
+        BundleJson.validateCompatibility(compatibility)
         require(compatibility.extensionName == null || compatibility.extensionName == extension.name) {
             "compatibility extensionName이 descriptor와 일치하지 않습니다."
         }
@@ -333,6 +487,34 @@ object SixBundleContract {
         zip.closeEntry()
     }
 
+    private fun add(
+        zip: ZipOutputStream,
+        name: String,
+        source: Path,
+        expectedSize: Long,
+    ): String {
+        zip.putNextEntry(ZipEntry(name).apply { time = 0L })
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(source, NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            var copied = 0L
+            while (copied < expectedSize) {
+                val count = input.read(
+                    buffer,
+                    0,
+                    minOf(buffer.size.toLong(), expectedSize - copied).toInt(),
+                )
+                require(count > 0) { "SixBundle source가 잘렸습니다: $name" }
+                zip.write(buffer, 0, count)
+                digest.update(buffer, 0, count)
+                copied += count
+            }
+            require(input.read() < 0) { "SixBundle source 크기가 변경되었습니다: $name" }
+        }
+        zip.closeEntry()
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun deleteTemporaryFile(file: File) {
         if (file.exists() && !file.delete()) file.deleteOnExit()
     }
@@ -345,6 +527,19 @@ object SixBundleContract {
     private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(bytes)
         .joinToString("") { "%02x".format(it) }
+
+    private fun sha256(path: Path): String =
+        Files.newInputStream(path, NOFOLLOW_LINKS).use { input ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(count > 0) { "wrapper.apk hash 읽기가 진행되지 않습니다." }
+                digest.update(buffer, 0, count)
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
 
     private data class TemporaryArchive(val file: File, val size: Long)
 
@@ -361,6 +556,7 @@ object SixBundleContract {
     private val REQUIRED_ENTRIES = setOf(WRAPPER_ENTRY, EXTENSION_ENTRY, COMPATIBILITY_ENTRY)
 
     private const val TEMP_FILE_PREFIX = "six-bundle-contract-"
+    private const val STREAM_BUFFER_SIZE = 64 * 1024
     private const val DATA_DESCRIPTOR_FLAG = 0x08
     private const val LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50L
     private const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L

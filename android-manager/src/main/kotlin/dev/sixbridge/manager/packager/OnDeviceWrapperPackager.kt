@@ -1,15 +1,20 @@
 package dev.sixbridge.manager.packager
 
 import android.content.Context
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
-import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.manager.conversion.InstallationIdentityKey
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.File
 import java.io.InputStream
+import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -17,20 +22,42 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.zip.ZipFile
 
 data class OnDeviceWrapperRequest(
-    val sourceIdentity: ByteArray,
-    val canonicalSourceZip: ByteArray,
+    val identityKey: InstallationIdentityKey,
+    val canonicalSourceZip: ByteArray?,
+    val passthroughCrx: ByteArray?,
     val versionCode: Int,
-    val extensionName: String,
-    val extensionVersion: String,
+    val descriptorName: String,
+    val descriptorVersion: String,
     val sourceKind: String,
-    val sourceSha256: String,
-    val browserProfileSha256: String,
+    val compatibility: ContractCompatibilityReport,
     val outputApk: File,
+)
+
+data class OnDeviceWrapperPathRequest(
+    val identityKey: InstallationIdentityKey,
+    val canonicalSourceZip: File?,
+    val passthroughCrx: File?,
+    val versionCode: Int,
+    val descriptorName: String,
+    val descriptorVersion: String,
+    val sourceKind: String,
+    val compatibility: ContractCompatibilityReport,
+    val outputApk: File,
+)
+
+data class OnDevicePackageIdentity(
+    val extensionId: String,
+    val packageName: String,
+    val wrapperSignerSha256: String,
+    val crxKeyAlias: String?,
+    val crxPublicKeyDer: ByteArray?,
 )
 
 data class OnDeviceWrapperResult(
@@ -45,9 +72,32 @@ data class OnDeviceWrapperResult(
     val outputApk: File,
 )
 
+internal data class ValidatedOnDeviceWrapperRequest(
+    val identityKey: InstallationIdentityKey,
+    val canonicalSourceZip: ByteArray?,
+    val passthroughCrx: ByteArray?,
+    val versionCode: Int,
+    val descriptorName: String,
+    val descriptorVersion: String,
+    val sourceKind: String,
+    val compatibility: ContractCompatibilityReport,
+    val outputApk: File,
+)
+
+private data class ValidatedPathWrapperRequest(
+    val identityKey: InstallationIdentityKey,
+    val canonicalSourceZip: Path?,
+    val passthroughCrx: Path?,
+    val versionCode: Int,
+    val descriptorName: String,
+    val descriptorVersion: String,
+    val sourceKind: String,
+    val compatibility: ContractCompatibilityReport,
+    val outputApk: File,
+)
+
 /**
- * Android Keystore와 앱 private storage만 사용하는 최초 온디바이스 wrapper 생성 게이트다.
- * 이 단계는 canonical ZIP을 그대로 CRX3로 감싸며, 실제 extension 변환 판단은 후속 단계의 책임이다.
+ * 검증된 변환 결과 또는 원본 CRX3를 Android Keystore wrapper identity와 결합한다.
  */
 class OnDeviceWrapperPackager(context: Context) {
     private var testHooks: OnDevicePackagerTestHooks? = null
@@ -61,113 +111,386 @@ class OnDeviceWrapperPackager(context: Context) {
     private val identityStore = AndroidKeystoreIdentityStore()
     private val manifestPatcher = BinaryAndroidManifestPatcher()
     private val apkSigner = AndroidApkSigner()
-    private val verifier = AndroidWrapperVerifier(AndroidArchiveInspector(appContext.packageManager))
+    private val verifier = AndroidWrapperVerifier(
+        AndroidArchiveInspector(appContext.packageManager),
+        workingDirectory.path.toFile(),
+    )
 
     @Synchronized
-    fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
-        val sourceIdentity = request.sourceIdentity.copyOf()
-        val canonicalZip = request.canonicalSourceZip.copyOf()
-        validateRequest(request, sourceIdentity, canonicalZip)
-        testHooks?.afterRequestValidated?.invoke()
-        val output = validatedOutput(request.outputApk)
-        val temporaryTemplate = Files.createTempFile(workingDirectory.path, ".wrapper-template.", ".apk")
-        val unsigned = Files.createTempFile(workingDirectory.path, ".unsigned.", ".apk")
-        val signed = Files.createTempFile(workingDirectory.path, ".signed.", ".apk")
-        try {
-            val crx = Crx3Writer.create(canonicalZip, identityStore.crxSigningKey(sourceIdentity))
-            val extensionId = crx.extensionId
-            val packageName = "dev.sixbridge.ext.$extensionId"
-            val template = readVerifiedTemplate(temporaryTemplate)
-            val templateManifest = ZipFile(template.toFile()).use { archive ->
-                archive.getInputStream(archive.getEntry(MANIFEST_ENTRY) ?: error("래퍼 template manifest가 없습니다.")).use(InputStream::readBytes)
+    fun resolveIdentity(
+        identityKey: InstallationIdentityKey,
+        passthroughCrx: ByteArray?,
+    ): OnDevicePackageIdentity = resolveIdentitySnapshot(identityKey, passthroughCrx)
+
+    @Synchronized
+    fun resolveIdentityFromFile(
+        identityKey: InstallationIdentityKey,
+        passthroughCrx: File?,
+    ): OnDevicePackageIdentity = resolveIdentityProof(
+        identityKey,
+        passthroughCrx?.let {
+            Crx3Verifier.verify(it.toPath(), ON_DEVICE_MAX_SOURCE_BYTES)
+        },
+    )
+
+    private fun resolveIdentitySnapshot(
+        identityKey: InstallationIdentityKey,
+        passthroughCrx: ByteArray?,
+    ): OnDevicePackageIdentity = resolveIdentityProof(
+        identityKey,
+        passthroughCrx?.let {
+            require(it.size.toLong() in 1..ON_DEVICE_MAX_SOURCE_BYTES) {
+                "passthrough CRX3 크기가 올바르지 않습니다."
             }
-            val patchedManifest = manifestPatcher.patch(
-                templateManifest,
-                WrapperManifestRequest(extensionId = extensionId, versionCode = request.versionCode),
-            )
-            AlignedApkAssembler(workingDirectory.path).assemble(
-                ApkAssemblyRequest(
-                    templateApk = template.toFile(),
-                    manifestBytes = patchedManifest,
-                    crxBytes = crx.bytes,
-                    outputApk = unsigned.toFile(),
-                ),
-            )
-            val signing = apkSigner.sign(unsigned.toFile(), signed.toFile(), identityStore.wrapperIdentity())
-            val descriptor = ContractExtensionDescriptor(
-                schemaVersion = 1,
-                extensionId = extensionId,
-                name = request.extensionName,
-                version = request.extensionVersion,
-                sourceKind = request.sourceKind,
-                crxSha256 = sha256(crx.bytes),
-                wrapperSha256 = sha256(signed),
-                wrapperPackage = packageName,
-                wrapperVersionCode = request.versionCode,
-                signerSha256 = signing.signerCertificateSha256,
-            )
-            val compatibility = ContractCompatibilityReport(
-                schemaVersion = 3,
-                status = ContractCompatibilityStatus.COMPATIBLE,
-                manifestVersion = null,
-                extensionName = request.extensionName,
-                extensionVersion = request.extensionVersion,
-                manifestKeyPresent = false,
-                manifestKeyExtensionId = null,
-                declaredPermissions = emptyList(),
-                usedApis = emptyList(),
-                unsupportedApis = emptyList(),
-                issues = emptyList(),
-                conversionState = "passthrough",
-                adapterDecisions = emptyList(),
-                originalExtensionId = null,
-                convertedExtensionId = extensionId,
-                sourceSha256 = request.sourceSha256,
-                browserProfileSha256 = request.browserProfileSha256,
-            )
-            require(verifier.verify(signed.toFile(), descriptor, compatibility) is WrapperVerificationResult.Success) {
-                "생성된 wrapper APK 검증에 실패했습니다."
+            Crx3Verifier.verify(it)
+        },
+    )
+
+    private fun resolveIdentityProof(
+        identityKey: InstallationIdentityKey,
+        passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
+    ): OnDevicePackageIdentity {
+        val wrapperIdentity = identityStore.wrapperIdentity()
+        val wrapperSignerSha256 = sha256(wrapperIdentity.certificate.encoded)
+        return when (identityKey.mode) {
+            InstallationIdentityMode.PASSTHROUGH -> {
+                val proof = passthroughProof
+                    ?: throw IllegalArgumentException("passthrough 신원에는 원본 CRX3가 필요합니다.")
+                OnDevicePackageIdentity(
+                    extensionId = proof.extensionId,
+                    packageName = "dev.sixbridge.ext.${proof.extensionId}",
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxKeyAlias = null,
+                    crxPublicKeyDer = null,
+                )
             }
-            verifyPublishTarget(output)
-            testHooks?.beforeFinalPublish?.invoke()
-            verifyPublishTarget(output)
-            forceFile(signed)
-            verifyPublishTarget(output)
-            Files.move(signed, output, ATOMIC_MOVE, REPLACE_EXISTING)
-            return OnDeviceWrapperResult(
-                extensionId = extensionId,
-                packageName = packageName,
-                versionCode = request.versionCode,
-                signerSha256 = signing.signerCertificateSha256,
-                crxSha256 = descriptor.crxSha256,
-                wrapperSha256 = descriptor.wrapperSha256,
-                descriptor = descriptor,
-                compatibility = compatibility,
-                outputApk = output.toFile(),
-            )
-        } finally {
-            Files.deleteIfExists(temporaryTemplate)
-            Files.deleteIfExists(unsigned)
-            Files.deleteIfExists(signed)
+            InstallationIdentityMode.CONVERTED -> {
+                require(passthroughProof == null) {
+                    "converted 신원에는 passthrough CRX3를 사용할 수 없습니다."
+                }
+                val crxIdentity = identityStore.crxIdentity(identityKey.identitySha256)
+                val publicKey = crxIdentity.certificate.publicKey.encoded.copyOf()
+                val extensionId = Crx3.extensionId(publicKey)
+                OnDevicePackageIdentity(
+                    extensionId = extensionId,
+                    packageName = "dev.sixbridge.ext.$extensionId",
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxKeyAlias = crxIdentity.alias,
+                    crxPublicKeyDer = publicKey,
+                )
+            }
         }
     }
 
-    private fun validateRequest(
-        request: OnDeviceWrapperRequest,
-        sourceIdentity: ByteArray,
-        canonicalZip: ByteArray,
+    @Synchronized
+    fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
+        val snapshot = request.snapshot()
+        validateBasicRequest(snapshot)
+        val stagedSource = Files.createTempFile(workingDirectory.path, ".source.", ".bin")
+        try {
+            val sourceBytes = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
+            writeSourceBytes(stagedSource, sourceBytes)
+            return packageStaged(
+                ValidatedPathWrapperRequest(
+                    identityKey = snapshot.identityKey,
+                    canonicalSourceZip =
+                        stagedSource.takeIf { snapshot.canonicalSourceZip != null },
+                    passthroughCrx =
+                        stagedSource.takeIf { snapshot.passthroughCrx != null },
+                    versionCode = snapshot.versionCode,
+                    descriptorName = snapshot.descriptorName,
+                    descriptorVersion = snapshot.descriptorVersion,
+                    sourceKind = snapshot.sourceKind,
+                    compatibility = snapshot.compatibility,
+                    outputApk = snapshot.outputApk,
+                ),
+            )
+        } finally {
+            Files.deleteIfExists(stagedSource)
+        }
+    }
+
+    @Synchronized
+    fun packageWrapper(request: OnDeviceWrapperPathRequest): OnDeviceWrapperResult {
+        val snapshot = request.snapshot()
+        validatePathRequest(snapshot)
+        val source = snapshot.canonicalSourceZip ?: requireNotNull(snapshot.passthroughCrx)
+        val stagedSource = Files.createTempFile(workingDirectory.path, ".source.", ".bin")
+        try {
+            copyStableSource(source, stagedSource)
+            return packageStaged(
+                snapshot.copy(
+                    canonicalSourceZip =
+                        stagedSource.takeIf { snapshot.canonicalSourceZip != null },
+                    passthroughCrx =
+                        stagedSource.takeIf { snapshot.passthroughCrx != null },
+                ),
+            )
+        } finally {
+            Files.deleteIfExists(stagedSource)
+        }
+    }
+
+    private fun packageStaged(
+        request: ValidatedPathWrapperRequest,
+    ): OnDeviceWrapperResult {
+        val passthroughProof = request.passthroughCrx?.let {
+            Crx3Verifier.verify(it, ON_DEVICE_MAX_SOURCE_BYTES)
+        }
+        val identity = resolveIdentityProof(request.identityKey, passthroughProof)
+        val generatedCrx = Files.createTempFile(workingDirectory.path, ".extension.", ".crx")
+        try {
+            val crxPath = when (request.identityKey.mode) {
+                InstallationIdentityMode.PASSTHROUGH -> requireNotNull(request.passthroughCrx)
+                InstallationIdentityMode.CONVERTED -> {
+                    Crx3Writer.create(
+                        requireNotNull(request.canonicalSourceZip),
+                        generatedCrx,
+                        identityStore.crxSigningKey(request.identityKey.identitySha256),
+                    )
+                    generatedCrx
+                }
+            }
+            val crxProof = Crx3Verifier.verify(crxPath, ON_DEVICE_MAX_CRX_BYTES)
+            validateBoundPathRequest(request, identity, crxProof)
+            testHooks?.afterRequestValidated?.invoke()
+            val output = validatedOutput(request.outputApk)
+            val temporaryTemplate = Files.createTempFile(workingDirectory.path, ".wrapper-template.", ".apk")
+            val unsigned = Files.createTempFile(workingDirectory.path, ".unsigned.", ".apk")
+            val signed = Files.createTempFile(workingDirectory.path, ".signed.", ".apk")
+            try {
+                val template = readVerifiedTemplate(temporaryTemplate)
+                val templateManifest = ZipFile(template.toFile()).use { archive ->
+                    archive.getInputStream(
+                        archive.getEntry(MANIFEST_ENTRY)
+                            ?: error("래퍼 template manifest가 없습니다."),
+                    ).use(InputStream::readBytes)
+                }
+                val patchedManifest = manifestPatcher.patch(
+                    templateManifest,
+                    WrapperManifestRequest(
+                        extensionId = identity.extensionId,
+                        versionCode = request.versionCode,
+                    ),
+                )
+                AlignedApkAssembler(workingDirectory.path).assemble(
+                    ApkAssemblyPathRequest(
+                        templateApk = template.toFile(),
+                        manifestBytes = patchedManifest,
+                        crxFile = crxPath.toFile(),
+                        outputApk = unsigned.toFile(),
+                    ),
+                )
+                val signing = apkSigner.sign(
+                    unsigned.toFile(),
+                    signed.toFile(),
+                    identityStore.wrapperIdentity(),
+                )
+                require(signing.signerCertificateSha256 == identity.wrapperSignerSha256) {
+                    "wrapper signer가 사전 해석한 package identity와 일치하지 않습니다."
+                }
+                val descriptor = ContractExtensionDescriptor(
+                    schemaVersion = 1,
+                    extensionId = identity.extensionId,
+                    name = request.descriptorName,
+                    version = request.descriptorVersion,
+                    sourceKind = request.sourceKind,
+                    crxSha256 = crxProof.crxSha256,
+                    wrapperSha256 = sha256(signed),
+                    wrapperPackage = identity.packageName,
+                    wrapperVersionCode = request.versionCode,
+                    signerSha256 = signing.signerCertificateSha256,
+                )
+                require(
+                    verifier.verify(
+                        signed.toFile(),
+                        descriptor,
+                        request.compatibility,
+                    ) is WrapperVerificationResult.Success,
+                ) {
+                    "생성된 wrapper APK 검증에 실패했습니다."
+                }
+                verifyPublishTarget(output)
+                testHooks?.beforeFinalPublish?.invoke()
+                verifyPublishTarget(output)
+                forceFile(signed)
+                verifyPublishTarget(output)
+                Files.move(signed, output, ATOMIC_MOVE, REPLACE_EXISTING)
+                return OnDeviceWrapperResult(
+                    extensionId = identity.extensionId,
+                    packageName = identity.packageName,
+                    versionCode = request.versionCode,
+                    signerSha256 = signing.signerCertificateSha256,
+                    crxSha256 = descriptor.crxSha256,
+                    wrapperSha256 = descriptor.wrapperSha256,
+                    descriptor = descriptor,
+                    compatibility = request.compatibility,
+                    outputApk = output.toFile(),
+                )
+            } finally {
+                Files.deleteIfExists(temporaryTemplate)
+                Files.deleteIfExists(unsigned)
+                Files.deleteIfExists(signed)
+            }
+        } finally {
+            Files.deleteIfExists(generatedCrx)
+        }
+    }
+
+    private fun validateBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
+        requireBasicRequest(request)
+    }
+
+    private fun validateBoundRequest(
+        request: ValidatedOnDeviceWrapperRequest,
+        identity: OnDevicePackageIdentity,
+        crxBytes: ByteArray,
     ) {
-        require(sourceIdentity.isNotEmpty()) { "source identity가 비어 있습니다." }
-        require(canonicalZip.size >= ZIP_MAGIC_SIZE) { "canonical source ZIP이 올바르지 않습니다." }
+        requireBoundRequest(request, identity, crxBytes)
+    }
+
+    private fun validatePathRequest(request: ValidatedPathWrapperRequest) {
+        val hasCanonicalZip = request.canonicalSourceZip != null
+        val hasPassthroughCrx = request.passthroughCrx != null
+        require(hasCanonicalZip.xor(hasPassthroughCrx)) {
+            "canonical source ZIP과 passthrough CRX3 중 정확히 하나가 필요합니다."
+        }
+        when (request.identityKey.mode) {
+            InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
+                "passthrough 신원에는 원본 CRX3가 필요합니다."
+            }
+            InstallationIdentityMode.CONVERTED -> require(hasCanonicalZip) {
+                "converted 신원에는 canonical source ZIP이 필요합니다."
+            }
+        }
+        val source = request.canonicalSourceZip ?: requireNotNull(request.passthroughCrx)
+        val attributes = Files.readAttributes(source, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            attributes.isRegularFile && !attributes.isSymbolicLink &&
+                attributes.size() in 4..ON_DEVICE_MAX_SOURCE_BYTES,
+        ) {
+            "온디바이스 source file 크기 또는 형식이 올바르지 않습니다."
+        }
         require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
-        require(request.extensionName.isNotBlank() && request.extensionVersion.isNotBlank()) {
+        require(request.descriptorName.isNotBlank() && request.descriptorVersion.isNotBlank()) {
             "extension name과 version은 비어 있지 않아야 합니다."
         }
-        require(request.sourceKind in SOURCE_KINDS) { "sourceKind가 올바르지 않습니다." }
-        require(SHA256.matches(request.sourceSha256) && request.sourceSha256 == sha256(canonicalZip)) {
-            "source SHA-256이 canonical source ZIP과 일치하지 않습니다."
+        require(request.sourceKind in ON_DEVICE_SOURCE_KINDS) { "sourceKind가 올바르지 않습니다." }
+        require(request.compatibility.schemaVersion == 4) {
+            "온디바이스 package에는 compatibility schema v4가 필요합니다."
         }
-        require(SHA256.matches(request.browserProfileSha256)) { "browser profile SHA-256이 올바르지 않습니다." }
+        BundleJson.validateCompatibility(request.compatibility)
+    }
+
+    private fun validateBoundPathRequest(
+        request: ValidatedPathWrapperRequest,
+        identity: OnDevicePackageIdentity,
+        proof: dev.sixbridge.contract.crx.VerifiedCrx3,
+    ) {
+        validatePathRequest(request)
+        require(ON_DEVICE_EXTENSION_ID.matches(identity.extensionId)) {
+            "package identity extension ID가 올바르지 않습니다."
+        }
+        require(identity.packageName == "dev.sixbridge.ext.${identity.extensionId}") {
+            "package identity package가 extension ID와 일치하지 않습니다."
+        }
+        require(ON_DEVICE_SHA256.matches(identity.wrapperSignerSha256)) {
+            "package identity wrapper signer가 올바르지 않습니다."
+        }
+        require(proof.extensionId == identity.extensionId) {
+            "CRX3 extension ID가 package identity와 일치하지 않습니다."
+        }
+        val report = request.compatibility
+        require(
+            report.convertedExtensionId == identity.extensionId &&
+                report.sourceSha256 == proof.zipSha256,
+        ) {
+            "compatibility source 또는 converted ID가 CRX3 proof와 일치하지 않습니다."
+        }
+        require(
+            report.extensionName == request.descriptorName &&
+                report.extensionVersion == request.descriptorVersion,
+        ) {
+            "compatibility extension identity가 descriptor와 일치하지 않습니다."
+        }
+        when (request.identityKey.mode) {
+            InstallationIdentityMode.PASSTHROUGH -> {
+                require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
+                    "passthrough package identity에 CRX Keystore key가 포함되었습니다."
+                }
+                require(
+                    report.conversionState == "passthrough" &&
+                        report.originalExtensionId == identity.extensionId,
+                ) {
+                    "passthrough compatibility identity가 원본 CRX3와 일치하지 않습니다."
+                }
+            }
+            InstallationIdentityMode.CONVERTED -> {
+                val publicKey = identity.crxPublicKeyDer
+                    ?: throw IllegalArgumentException("converted package identity 공개 키가 없습니다.")
+                require(!identity.crxKeyAlias.isNullOrBlank()) {
+                    "converted package identity alias가 없습니다."
+                }
+                require(
+                    proof.publicKeySha256 == sha256Hex(publicKey) &&
+                        sha256(request.canonicalSourceZip!!) == proof.zipSha256,
+                ) {
+                    "converted CRX3 proof가 package identity 또는 canonical ZIP과 일치하지 않습니다."
+                }
+                require(report.conversionState != "passthrough") {
+                    "converted package에는 passthrough compatibility를 사용할 수 없습니다."
+                }
+            }
+        }
+    }
+
+    private fun writeSourceBytes(destination: Path, source: ByteArray) {
+        FileChannel.open(destination, WRITE, TRUNCATE_EXISTING, NOFOLLOW_LINKS).use { channel ->
+            var offset = 0
+            while (offset < source.size) {
+                val count = channel.write(ByteBuffer.wrap(source, offset, source.size - offset))
+                require(count > 0) { "온디바이스 source 기록이 진행되지 않습니다." }
+                offset += count
+            }
+            channel.force(true)
+        }
+    }
+
+    private fun copyStableSource(source: Path, destination: Path) {
+        val before = Files.readAttributes(source, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            before.isRegularFile && !before.isSymbolicLink &&
+                before.size() in 4..ON_DEVICE_MAX_SOURCE_BYTES,
+        ) {
+            "온디바이스 source file이 올바르지 않습니다."
+        }
+        FileChannel.open(source, READ, NOFOLLOW_LINKS).use { input ->
+            FileChannel.open(destination, WRITE, TRUNCATE_EXISTING, NOFOLLOW_LINKS).use { output ->
+                val buffer = ByteBuffer.allocate(STREAM_BUFFER_SIZE)
+                var remaining = before.size()
+                while (remaining > 0L) {
+                    buffer.clear()
+                    buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
+                    val count = input.read(buffer)
+                    require(count > 0) { "온디바이스 source file이 잘렸습니다." }
+                    buffer.flip()
+                    while (buffer.hasRemaining()) output.write(buffer)
+                    remaining -= count
+                }
+                require(input.read(ByteBuffer.allocate(1)) < 0) {
+                    "온디바이스 source file 크기가 변경되었습니다."
+                }
+                output.force(true)
+            }
+        }
+        val after = Files.readAttributes(source, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(
+            after.fileKey() == before.fileKey() &&
+                after.size() == before.size() &&
+                after.lastModifiedTime() == before.lastModifiedTime(),
+        ) {
+            "온디바이스 source file이 snapshot 중 변경되었습니다."
+        }
     }
 
     private fun appPrivateWorkingDirectory(filesDir: File): Path {
@@ -269,11 +592,175 @@ class OnDeviceWrapperPackager(context: Context) {
         const val TEMPLATE_ASSET = "wrapper-template.apk"
         const val TEMPLATE_SHA256_ASSET = "wrapper-template.sha256"
         const val MANIFEST_ENTRY = "AndroidManifest.xml"
-        const val ZIP_MAGIC_SIZE = 4
-        val SOURCE_KINDS = setOf("SOURCE_DIRECTORY", "ZIP", "CRX3", "CHROME_WEB_STORE")
         val SHA256 = Regex("[0-9a-f]{64}")
     }
 }
+
+internal fun OnDeviceWrapperRequest.validateFor(
+    identity: OnDevicePackageIdentity,
+    embeddedCrx: ByteArray,
+): ValidatedOnDeviceWrapperRequest = snapshot().also { request ->
+    requireBasicRequest(request)
+    requireBoundRequest(request, identity, embeddedCrx)
+}
+
+private fun OnDeviceWrapperRequest.snapshot() = ValidatedOnDeviceWrapperRequest(
+    identityKey = identityKey,
+    canonicalSourceZip = canonicalSourceZip,
+    passthroughCrx = passthroughCrx,
+    versionCode = versionCode,
+    descriptorName = descriptorName,
+    descriptorVersion = descriptorVersion,
+    sourceKind = sourceKind,
+    compatibility = compatibility.snapshot(),
+    outputApk = outputApk,
+)
+
+private fun OnDeviceWrapperPathRequest.snapshot() = ValidatedPathWrapperRequest(
+    identityKey = identityKey,
+    canonicalSourceZip = canonicalSourceZip?.toPath()?.toAbsolutePath()?.normalize(),
+    passthroughCrx = passthroughCrx?.toPath()?.toAbsolutePath()?.normalize(),
+    versionCode = versionCode,
+    descriptorName = descriptorName,
+    descriptorVersion = descriptorVersion,
+    sourceKind = sourceKind,
+    compatibility = compatibility.snapshot(),
+    outputApk = outputApk,
+)
+
+private fun ContractCompatibilityReport.snapshot(): ContractCompatibilityReport {
+    return copy(
+        declaredPermissions = declaredPermissions.toList(),
+        usedApis = usedApis.toList(),
+        unsupportedApis = unsupportedApis.toList(),
+        issues = issues.map { it.copy() },
+        adapterDecisions = adapterDecisions.map { decision ->
+            decision.copy(
+                evidence = decision.evidence.map { it.copy() },
+                changes = decision.changes.toList(),
+                remainingLimitations = decision.remainingLimitations.toList(),
+            )
+        },
+    )
+}
+
+private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
+    val hasCanonicalZip = request.canonicalSourceZip != null
+    val hasPassthroughCrx = request.passthroughCrx != null
+    require(hasCanonicalZip.xor(hasPassthroughCrx)) {
+        "canonical source ZIP과 passthrough CRX3 중 정확히 하나가 필요합니다."
+    }
+    when (request.identityKey.mode) {
+        InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
+            "passthrough 신원에는 원본 CRX3가 필요합니다."
+        }
+        InstallationIdentityMode.CONVERTED -> require(hasCanonicalZip) {
+            "converted 신원에는 canonical source ZIP이 필요합니다."
+        }
+    }
+    request.canonicalSourceZip?.let {
+        require(it.size.toLong() in 4..ON_DEVICE_MAX_SOURCE_BYTES) {
+            "canonical source ZIP 크기가 올바르지 않습니다."
+        }
+    }
+    request.passthroughCrx?.let {
+        require(it.size.toLong() in 1..ON_DEVICE_MAX_SOURCE_BYTES) {
+            "passthrough CRX3 크기가 올바르지 않습니다."
+        }
+    }
+    require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
+    require(request.descriptorName.isNotBlank() && request.descriptorVersion.isNotBlank()) {
+        "extension name과 version은 비어 있지 않아야 합니다."
+    }
+    require(request.sourceKind in ON_DEVICE_SOURCE_KINDS) {
+        "sourceKind가 올바르지 않습니다."
+    }
+    require(request.compatibility.schemaVersion == 4) {
+        "온디바이스 package에는 compatibility schema v4가 필요합니다."
+    }
+    BundleJson.validateCompatibility(request.compatibility)
+}
+
+private fun requireBoundRequest(
+    request: ValidatedOnDeviceWrapperRequest,
+    identity: OnDevicePackageIdentity,
+    crxBytes: ByteArray,
+) {
+    requireBasicRequest(request)
+    require(ON_DEVICE_EXTENSION_ID.matches(identity.extensionId)) {
+        "package identity extension ID가 올바르지 않습니다."
+    }
+    require(identity.packageName == "dev.sixbridge.ext.${identity.extensionId}") {
+        "package identity package가 extension ID와 일치하지 않습니다."
+    }
+    require(ON_DEVICE_SHA256.matches(identity.wrapperSignerSha256)) {
+        "package identity wrapper signer가 올바르지 않습니다."
+    }
+    val proof = Crx3Verifier.verify(crxBytes)
+    require(proof.extensionId == identity.extensionId) {
+        "CRX3 extension ID가 package identity와 일치하지 않습니다."
+    }
+    val report = request.compatibility
+    require(report.convertedExtensionId == identity.extensionId) {
+        "compatibility converted extension ID가 package identity와 일치하지 않습니다."
+    }
+    require(report.sourceSha256 == proof.zipSha256) {
+        "compatibility source SHA-256이 CRX3 ZIP payload와 일치하지 않습니다."
+    }
+    require(
+        report.extensionName == request.descriptorName &&
+            report.extensionVersion == request.descriptorVersion,
+    ) {
+        "compatibility extension identity가 descriptor와 일치하지 않습니다."
+    }
+    when (request.identityKey.mode) {
+        InstallationIdentityMode.PASSTHROUGH -> {
+            require(request.passthroughCrx!!.contentEquals(crxBytes)) {
+                "passthrough CRX3 bytes가 원본과 일치하지 않습니다."
+            }
+            require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
+                "passthrough package identity에 CRX Keystore key가 포함되었습니다."
+            }
+            require(
+                report.conversionState == "passthrough" &&
+                    report.originalExtensionId == identity.extensionId,
+            ) {
+                "passthrough compatibility identity가 원본 CRX3와 일치하지 않습니다."
+            }
+        }
+        InstallationIdentityMode.CONVERTED -> {
+            val publicKey = identity.crxPublicKeyDer
+                ?: throw IllegalArgumentException("converted package identity 공개 키가 없습니다.")
+            require(!identity.crxKeyAlias.isNullOrBlank()) {
+                "converted package identity alias가 없습니다."
+            }
+            require(
+                proof.publicKeySha256 == sha256Hex(publicKey) &&
+                    request.canonicalSourceZip!!.let(::sha256Hex) == proof.zipSha256,
+            ) {
+                "converted CRX3 proof가 package identity 또는 canonical ZIP과 일치하지 않습니다."
+            }
+            require(report.conversionState != "passthrough") {
+                "converted package에는 passthrough compatibility를 사용할 수 없습니다."
+            }
+        }
+    }
+}
+
+private fun sha256Hex(bytes: ByteArray): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { "%02x".format(it) }
+
+private val ON_DEVICE_EXTENSION_ID = Regex("[a-p]{32}")
+private val ON_DEVICE_SHA256 = Regex("[0-9a-f]{64}")
+private val ON_DEVICE_SOURCE_KINDS =
+    setOf("SOURCE_DIRECTORY", "ZIP", "CRX3", "CHROME_WEB_STORE")
+// final wrapper의 128 MiB contract 안에 CRX header, template entry와 APK signing block을
+// 함께 수용하기 위한 packaging 경계다. 수집/보관 Path API의 128 MiB streaming 계약은 유지한다.
+private const val ON_DEVICE_MAX_SOURCE_BYTES = 120L * 1024 * 1024
+private const val ON_DEVICE_MAX_CRX_BYTES = 122L * 1024 * 1024
+private const val STREAM_BUFFER_SIZE = 64 * 1024
 
 internal data class OnDevicePackagerTestHooks(
     val afterRequestValidated: (() -> Unit)? = null,

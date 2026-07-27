@@ -300,6 +300,25 @@ class ConversionWorkStore internal constructor(
         }
     }
 
+    suspend fun <T> withVerifiedInputFile(
+        token: String,
+        consume: (File) -> T,
+    ): T = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val row = requireCurrent(token)
+            val root = requirePrivateRoot()
+            val tokenDirectory = requireTokenDirectory(root, token)
+            val input = directChild(tokenDirectory, row.inputFileName)
+            val state = verifyFileHash(input, row.inputSha256)
+            hooks.afterInputSnapshot()
+            requireStableFile(input, state, "Path 소비 직전")
+            val result = consume(input)
+            requireStableFile(input, state, "Path 소비")
+            verifyFileHash(input, row.inputSha256)
+            result
+        }
+    }
+
     suspend fun <T> openVerifiedBundle(
         token: String,
         consume: (InputStream) -> T,

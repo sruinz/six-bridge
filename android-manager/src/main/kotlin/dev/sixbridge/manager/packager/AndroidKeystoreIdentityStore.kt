@@ -33,8 +33,14 @@ class AndroidKeystoreIdentityStore private constructor(
     fun crxIdentity(sourceIdentity: ByteArray): AndroidSigningIdentity =
         identity(aliases.crxAlias(sourceIdentity.copyOf()))
 
+    fun crxIdentity(identitySha256: String): AndroidSigningIdentity =
+        identity(aliases.crxAlias(identitySha256))
+
     fun crxSigningKey(sourceIdentity: ByteArray): AndroidKeystoreCrxSigningKey =
         AndroidKeystoreCrxSigningKey(crxIdentity(sourceIdentity))
+
+    fun crxSigningKey(identitySha256: String): AndroidKeystoreCrxSigningKey =
+        AndroidKeystoreCrxSigningKey(crxIdentity(identitySha256))
 
     private fun identity(alias: String): AndroidSigningIdentity = synchronized(lock) {
         val keyStore = keyStore()
@@ -105,6 +111,13 @@ class AndroidKeystoreIdentityStore private constructor(
         fun crxAlias(sourceIdentity: ByteArray): String =
             crxPrefix + sha256(sourceIdentity).joinToString("") { "%02x".format(it) }
 
+        fun crxAlias(identitySha256: String): String {
+            require(SHA256.matches(identitySha256)) {
+                "설치 identity SHA-256이 올바르지 않습니다."
+            }
+            return crxPrefix + identitySha256
+        }
+
         companion object {
             fun production(): AliasNamespace = AliasNamespace(
                 wrapperAlias = WRAPPER_ALIAS,
@@ -128,6 +141,7 @@ class AndroidKeystoreIdentityStore private constructor(
         private const val KEY_SIZE_BITS = 2048
         private const val REQUIRED_PURPOSES = KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         private val TEST_NAMESPACE = Regex("sixbridge\\.test\\.[0-9a-f-]+")
+        private val SHA256 = Regex("[0-9a-f]{64}")
         private val REQUIRED_DIGESTS = setOf(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
         private val REQUIRED_SIGNATURE_PADDINGS = setOf(
             KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,

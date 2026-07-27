@@ -7,6 +7,11 @@ import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
+import java.nio.file.StandardOpenOption.WRITE
 import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -14,9 +19,14 @@ import java.util.zip.ZipFile
 class AndroidArchiveInspector(
     private val packageManager: PackageManager,
     private val manifestReader: BinaryAndroidManifestReader = BinaryAndroidManifestReader(),
-) : ArchiveInspector {
-    override fun inspect(apk: File): ArchiveFacts {
-        val archive = ApkArchiveEntries.preflight(apk)
+) : StreamingArchiveInspector {
+    override fun inspect(apk: File): ArchiveFacts =
+        inspectArchive(apk, ApkArchiveEntries.preflight(apk))
+
+    override fun inspect(apk: File, crxOutput: File): ArchiveFacts =
+        inspectArchive(apk, ApkArchiveEntries.preflight(apk, crxOutput))
+
+    private fun inspectArchive(apk: File, archive: ApkArchiveEntries.Contents): ArchiveFacts {
         val packageInfo = archiveInfo(apk)
             ?: invalid(ImportFailureCode.ARCHIVE_INVALID)
         val signers = packageInfo.signingInfo?.apkContentsSigners.orEmpty()
@@ -110,7 +120,11 @@ internal object ApkArchiveEntries {
         val crxBytes: ByteArray,
     )
 
-    fun preflight(apk: File): Contents {
+    fun preflight(apk: File): Contents = preflightInternal(apk, null)
+
+    fun preflight(apk: File, crxOutput: File): Contents = preflightInternal(apk, crxOutput)
+
+    private fun preflightInternal(apk: File, crxOutput: File?): Contents {
         if (!apk.isFile || apk.length() !in 1..SixBundleContract.MAX_WRAPPER_SIZE) {
             invalid(ImportFailureCode.ARCHIVE_INVALID)
         }
@@ -183,12 +197,23 @@ internal object ApkArchiveEntries {
                         MAX_MANIFEST_SIZE,
                         ImportFailureCode.ARCHIVE_INVALID,
                     ),
-                    crxBytes = readBounded(
-                        zip,
-                        crxEntry,
-                        SixBundleContract.MAX_WRAPPER_SIZE,
-                        ImportFailureCode.CRX_TOO_LARGE,
-                    ),
+                    crxBytes = if (crxOutput == null) {
+                        readBounded(
+                            zip,
+                            crxEntry,
+                            SixBundleContract.MAX_WRAPPER_SIZE,
+                            ImportFailureCode.CRX_TOO_LARGE,
+                        )
+                    } else {
+                        extractBounded(
+                            zip,
+                            crxEntry,
+                            crxOutput,
+                            SixBundleContract.MAX_WRAPPER_SIZE,
+                            ImportFailureCode.CRX_TOO_LARGE,
+                        )
+                        ByteArray(0)
+                    },
                 )
             }
         } catch (error: ArchiveInspectionException) {
@@ -223,6 +248,36 @@ internal object ApkArchiveEntries {
         }
     }
 
+    private fun extractBounded(
+        zip: ZipFile,
+        entry: ZipEntry,
+        output: File,
+        maximumSize: Long,
+        tooLarge: ImportFailureCode,
+    ) {
+        val path = output.toPath()
+        if (!Files.isRegularFile(path, NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) {
+            invalid(ImportFailureCode.ARCHIVE_INVALID)
+        }
+        FileChannel.open(path, WRITE, TRUNCATE_EXISTING, NOFOLLOW_LINKS).use { channel ->
+            val destination = java.nio.channels.Channels.newOutputStream(channel)
+            zip.getInputStream(entry).use { input ->
+                val buffer = ByteArray(STREAM_BUFFER_SIZE)
+                var total = 0L
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (count == 0 || total > maximumSize - count) invalid(tooLarge)
+                    destination.write(buffer, 0, count)
+                    total += count
+                }
+                if (total != entry.size) invalid(ImportFailureCode.ARCHIVE_INVALID)
+            }
+            destination.flush()
+            channel.force(true)
+        }
+    }
+
     private fun canonicalPath(name: String): String? {
         if (name.isEmpty() ||
             name.indexOf('\u0000') >= 0 ||
@@ -241,4 +296,5 @@ internal object ApkArchiveEntries {
         throw ArchiveInspectionException(ImportFailure(code))
 
     private val DRIVE_PREFIX = Regex("^[A-Za-z]:")
+    private const val STREAM_BUFFER_SIZE = 64 * 1024
 }

@@ -1,5 +1,7 @@
 package dev.sixbridge.contract.bundle
 
+import java.nio.file.Path
+
 enum class ContractCompatibilityStatus {
     COMPATIBLE,
     PARTIAL,
@@ -67,6 +69,12 @@ data class ContractAdapterDecision(
 
 data class ContractBundleContents(
     val wrapperApk: ByteArray,
+    val extension: ContractExtensionDescriptor,
+    val compatibility: ContractCompatibilityReport,
+)
+
+data class ContractBundleFileContents(
+    val wrapperApk: Path,
     val extension: ContractExtensionDescriptor,
     val compatibility: ContractCompatibilityReport,
 )

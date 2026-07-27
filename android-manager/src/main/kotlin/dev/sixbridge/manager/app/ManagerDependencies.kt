@@ -54,6 +54,7 @@ class ManagerDependencies private constructor(
             val installGateway = AndroidPackageInstallGateway(application)
             val verifier = AndroidWrapperVerifier(
                 AndroidArchiveInspector(application.packageManager),
+                File(application.cacheDir, "wrapper-verifier"),
             )
             val installCoordinator = InstallCoordinator(
                 policy = InstallPolicy(),

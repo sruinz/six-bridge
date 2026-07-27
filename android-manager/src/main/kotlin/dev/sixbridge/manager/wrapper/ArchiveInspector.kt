@@ -7,6 +7,10 @@ fun interface ArchiveInspector {
     fun inspect(apk: File): ArchiveFacts
 }
 
+interface StreamingArchiveInspector : ArchiveInspector {
+    fun inspect(apk: File, crxOutput: File): ArchiveFacts
+}
+
 data class ArchiveFacts(
     val packageName: String,
     val versionCode: Long,

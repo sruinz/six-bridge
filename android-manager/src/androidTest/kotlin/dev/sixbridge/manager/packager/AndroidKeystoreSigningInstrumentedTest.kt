@@ -90,6 +90,23 @@ class AndroidKeystoreSigningInstrumentedTest {
     }
 
     @Test
+    fun installationIdentityShaKeepsExactAliasAndPublicKeyAcrossUpdates() {
+        val identitySha256 = "a".repeat(64)
+        val first = store.crxIdentity(identitySha256)
+        val again = store.crxIdentity(identitySha256)
+        val other = store.crxIdentity("b".repeat(64))
+
+        assertEquals("$namespace.crx.rsa.v1.$identitySha256", first.alias)
+        assertArrayEquals(first.certificate.publicKey.encoded, again.certificate.publicKey.encoded)
+        assertNotEquals(first.alias, other.alias)
+        assertFalse(
+            first.certificate.publicKey.encoded.contentEquals(
+                other.certificate.publicKey.encoded,
+            ),
+        )
+    }
+
+    @Test
     fun keystoreSignerCreatesV2AndV3WrapperWithItsCertificate() {
         val crx = Crx3Writer.create(MINIMAL_ZIP, store.crxSigningKey(SOURCE_A))
         val unsigned = buildUnsignedWrapper(crx.extensionId, crx.bytes)

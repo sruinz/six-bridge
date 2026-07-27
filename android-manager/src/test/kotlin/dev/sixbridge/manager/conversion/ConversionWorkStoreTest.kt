@@ -68,6 +68,21 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `검증된 private 입력을 production Path 경계로 제공하고 소비 뒤 다시 hash 검증한다`() =
+        runTest {
+            val bytes = "private path input".encodeToByteArray()
+            val store = store()
+            val created = store.create(artifact(bytes))
+
+            val consumed = store.withVerifiedInputFile(created.token) { input ->
+                assertTrue(input.isFile)
+                input.readBytes()
+            }
+
+            assertArrayEquals(bytes, consumed)
+        }
+
+    @Test
     fun `입력 hash 뒤 path 교체는 caller 전에 fail closed 한다`() = runTest {
         lateinit var row: ConversionJobEntity
         val expected = "verified input".encodeToByteArray()

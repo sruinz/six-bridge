@@ -1,6 +1,10 @@
 package dev.sixbridge.contract.crx
 
-import dev.sixbridge.contract.bundle.SixBundleContract
+import java.io.InputStream
+import java.io.RandomAccessFile
+import java.lang.management.ManagementFactory
+import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -14,6 +18,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class Crx3WriterTest {
     @Test
@@ -57,7 +62,7 @@ class Crx3WriterTest {
 
     @Test
     fun `128 MiB를 초과한 ZIP을 거부한다`() {
-        val oversizedZip = ByteArray(SixBundleContract.MAX_WRAPPER_SIZE.toInt() + 1).also {
+        val oversizedZip = ByteArray(128 * 1024 * 1024 + 1).also {
             it[0] = 'P'.code.toByte()
             it[1] = 'K'.code.toByte()
             it[2] = 3
@@ -119,6 +124,111 @@ class Crx3WriterTest {
         }
     }
 
+    @Test
+    fun `128 MiB ZIP Path를 대형 ByteArray 없이 streaming 서명하고 기록한다`() {
+        val directory = Files.createTempDirectory("crx3-path-writer")
+        val source = directory.resolve("source.zip")
+        val output = directory.resolve("output.crx")
+        try {
+            RandomAccessFile(source.toFile(), "rw").use { file ->
+                file.write(byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4))
+                file.setLength(128L * 1024 * 1024)
+            }
+            Files.createFile(output)
+            val streamingKey = object : Crx3SigningKey {
+                override fun publicKeyDer(): ByteArray = testKey.publicKeyDer()
+
+                override fun signSha256Rsa(payload: ByteArray): ByteArray =
+                    error("Path writer는 대형 payload ByteArray signer를 호출하면 안 됩니다.")
+
+                override fun signSha256Rsa(payload: InputStream): ByteArray =
+                    Signature.getInstance("SHA256withRSA").run {
+                        initSign(TEST_PRIVATE_KEY)
+                        val buffer = ByteArray(64 * 1024)
+                        payload.use { input ->
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                update(buffer, 0, count)
+                            }
+                        }
+                        sign()
+                    }
+            }
+            System.gc()
+            val baseline = heapUsed()
+            var peak = baseline
+            val running = java.util.concurrent.atomic.AtomicBoolean(true)
+            val sampler = Thread {
+                while (running.get()) {
+                    peak = maxOf(peak, heapUsed())
+                    Thread.yield()
+                }
+            }.apply { start() }
+
+            val created = try {
+                Crx3Writer.create(source, output, streamingKey)
+            } finally {
+                running.set(false)
+                sampler.join()
+            }
+
+            assertEquals(128L * 1024 * 1024, Crx3Verifier.verify(output, 130L * 1024 * 1024).zipLength.toLong())
+            assertEquals(created.extensionId, Crx3Verifier.verify(output, 130L * 1024 * 1024).extensionId)
+            assertTrue(peak - baseline < 64L * 1024 * 1024, "streaming heap 증가량: ${peak - baseline}")
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `Path signing 뒤 same inode size mtime 복원 변조를 output proof로 거부한다`() {
+        val directory = Files.createTempDirectory("crx3-path-mutation")
+        val source = directory.resolve("source.zip")
+        val output = directory.resolve("output.crx")
+        try {
+            Files.write(source, MINIMAL_ZIP)
+            Files.createFile(output)
+            val originalTime = Files.getLastModifiedTime(source)
+            val mutatingKey = object : Crx3SigningKey {
+                override fun publicKeyDer(): ByteArray = testKey.publicKeyDer()
+
+                override fun signSha256Rsa(payload: ByteArray): ByteArray =
+                    error("Path writer는 InputStream signer를 사용해야 합니다.")
+
+                override fun signSha256Rsa(payload: InputStream): ByteArray {
+                    val signature = Signature.getInstance("SHA256withRSA").run {
+                        initSign(TEST_PRIVATE_KEY)
+                        val buffer = ByteArray(64 * 1024)
+                        payload.use { input ->
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                update(buffer, 0, count)
+                            }
+                        }
+                        sign()
+                    }
+                    RandomAccessFile(source.toFile(), "rw").use { file ->
+                        file.seek(4)
+                        file.write(1)
+                    }
+                    Files.setLastModifiedTime(
+                        source,
+                        FileTime.fromMillis(originalTime.toMillis()),
+                    )
+                    return signature
+                }
+            }
+
+            assertFailsWith<IllegalArgumentException> {
+                Crx3Writer.create(source, output, mutatingKey)
+            }
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
     private class FixedRsaSigningKey(
         private val privateKey: PrivateKey,
         private val publicKey: PublicKey,
@@ -143,6 +253,14 @@ class Crx3WriterTest {
                 publicKey = factory.generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(RSA_X509))),
             )
         }
+
+        val TEST_PRIVATE_KEY: PrivateKey by lazy {
+            KeyFactory.getInstance("RSA").generatePrivate(
+                PKCS8EncodedKeySpec(Base64.getDecoder().decode(RSA_PKCS8)),
+            )
+        }
+
+        fun heapUsed(): Long = ManagementFactory.getMemoryMXBean().heapMemoryUsage.used
 
         const val RSA_PKCS8 =
             "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCWZc+lmFaBbhsHJTTXinX7rHTtVazLrcIoJQduvk0AMwngw8uZiDt29M8a2BrWk7wg15pF7YDgc5YG+bg43/XCjJnLoeL/wJ8sxbi10bLy4QHbk+scsnSVQFeteJjiWmD5PtN7vAV71tTY7u7hWc+nta1oC2R8f+3lfVz4ZOf9NJmOKl1XhPSO0LkFotw0RlvnK/Du4BEVHKSZPNk8o2Su7EZxM0kIfIr5GFDPqKqk5Wo+sjHVtEAbODvp7Y8gVH8jrqo2GJjoUi10GiREvzMYritvJaLxT4A7u9cY9EFLeliS/Qg9XRdv74s8TPKSi616VUZAGTu//CthAcPNydK1AgMBAAECggEAOJjGq/vobduX+zfiq0wVOyj6dYfct2dDneTVZ7TgeDc8u+MinrvYGNtmhqUVcHN3A+ruyOroKU8GAcj+rRSGwPg1Nh7NNE5x+CDN8kogK+tFzjJbc1iqq7HjbMnpyqCVRqaAYltuutwtDBfaOF6aWPPy9ij3XyyrQ0XKc0VR0gRhzKW+uJHvPYxiZHZUwfBsJwyQ+Yt7hyY6pE+t2YngDehaa9VHHxXCYcdp2wzOKgr6u45AIRJCpG1fmztpceme+eMB+jitXJEQ2AnN7bamZIuubTD004qPxSPUN2vc0vCz2E3GBBCMVqXinhiYzRTkgdwz/k/PkQV6FGuRRe36TwKBgQDSW7jRYcjYhd1s65kIvxQg2T+eeLK2IpevrAbK1s38MsvGY8h2qQ3tTmWoOHbW5+ivXjBM+xogaAp3vRKgoiAMMQKZj5qsW/jpfdS2UkA51yaSwOjwD1UfPSH7G5FgPXFL1cha/l7xvKVUPea0pSqXbsEi5TLyC7m9V9CCcADtUwKBgQC3B5ldw9n5oVRU0+sT6RFYcNqZCPU2rC+lBRpW8TiMPdI4YCu6AxTQAT06CuZ5un6XzAW654rCTtQk1s8Usuoc5DEnwmRfWZcxu8Bt39jmnHl0KiVdMdwI1tQZOt9EUnNVi5ZnAWF9x2d+kfS3KQAudOirlB3r5o+oLmipl+E21wKBgQC5J7y8p7pWQzXMCm+wECgSZcamoQyEXlxvZxavcXTrmHZekDPBpjm49/looRKRRJ09xsTy7U5o2crk7Ao6U5mrwXPNYGY/cdDdDEGvnSQlBShRofUmYAiHr5J6aSCDunE/09M/rIg7dNV9GeM4e+zKT9U19tHp1MJPU70XIqjeOwKBgDDmwN1ChKyjpAp+DGLndJDyphUZRZrz6k7mzCDKllcx9UbGuygZxqfEjP1DCE0hvM0F38oOLw63TQsCsZVQMCjD9zYuQ+8N2s2Y4lL46dTDndehoxYBSk66RzTue9SfSt1iTC79OXUHn+k7Sezd8YR4C+o7yrrKgTtoGuKlB7FFAoGAUF9XKZFRq3JT+uBQ9Apni0tJbyraf2PBbLkMGyVGv2rQ9NpIi6qdcF8EGq6357rp3FS7JQdQIKDSHqZoQdWWLmXXIwY4KU2n91shAFpPQ7pyDUmsq721numkiDzSvTkO8BBvuqsKm5taCN8ou1mNbC6KIarLGpLQ882I0R6UMGY="
