@@ -13,6 +13,7 @@ import dev.sixbridge.core.draft.SixDraftPayload
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
@@ -23,6 +24,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.UUID
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.writeText
 import kotlin.test.assertEquals
@@ -126,6 +128,19 @@ class OnDeviceInputServiceTest {
             it[offset] = 'x'.code.toByte()
         }
         val service = service(ByteArrayInputStream(draft))
+
+        val error = assertFailsWith<OnDeviceInputException> {
+            service.acquire(safRequest())
+        }
+
+        assertEquals(OnDeviceInputErrorCode.INVALID_DRAFT, error.code)
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `signature가 제거되고 manifest가 추가된 draft도 INVALID_DRAFT다`() = runTest {
+        val source = unsignedDraftWithManifest(validDraftV2())
+        val service = service(ByteArrayInputStream(source))
 
         val error = assertFailsWith<OnDeviceInputException> {
             service.acquire(safRequest())
@@ -375,6 +390,8 @@ class OnDeviceInputServiceTest {
             ChromeDownloadErrorCode.RESPONSE_TOO_LARGE to OnDeviceInputErrorCode.INPUT_INVALID,
             ChromeDownloadErrorCode.INVALID_CRX3 to OnDeviceInputErrorCode.INPUT_INVALID,
             ChromeDownloadErrorCode.EXTENSION_ID_MISMATCH to OnDeviceInputErrorCode.INPUT_INVALID,
+            ChromeDownloadErrorCode.CLEANUP_FAILED to
+                OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
         )
         val pageUrl =
             "https://chromewebstore.google.com/detail/name/${"a".repeat(32)}"
@@ -501,6 +518,30 @@ class OnDeviceInputServiceTest {
         )
         val signingKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         return SixDraft.createBytes(payload, signingKey)
+    }
+
+    private fun unsignedDraftWithManifest(draft: ByteArray): ByteArray {
+        val entries = linkedMapOf<String, ByteArray>()
+        ZipInputStream(ByteArrayInputStream(draft)).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                if (entry.name != "draft-signature.json") {
+                    entries[entry.name] = zip.readBytes()
+                }
+            }
+        }
+        entries["manifest.json"] =
+            """{"manifest_version":3,"name":"Unsigned Draft","version":"1"}"""
+                .encodeToByteArray()
+        return ByteArrayOutputStream().also { bytes ->
+            ZipOutputStream(bytes).use { zip ->
+                entries.toSortedMap().forEach { (name, value) ->
+                    zip.putNextEntry(ZipEntry(name))
+                    zip.write(value)
+                    zip.closeEntry()
+                }
+            }
+        }.toByteArray()
     }
 
     private fun sha256(bytes: ByteArray): String =

@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.conversion
 
+import android.util.Log
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.core.input.ChromeWebStoreAddress
@@ -21,6 +22,8 @@ import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -80,6 +83,7 @@ enum class ChromeDownloadErrorCode {
     RESPONSE_TOO_LARGE,
     INVALID_CRX3,
     EXTENSION_ID_MISMATCH,
+    CLEANUP_FAILED,
 }
 
 class ChromeDownloadException(
@@ -87,12 +91,20 @@ class ChromeDownloadException(
     message: String,
 ) : IllegalArgumentException(message)
 
+fun interface ChromeDownloadCleanupFailureReporter {
+    fun report(error: ChromeDownloadException)
+}
+
 class AndroidChromeCrxDownloader(
     private val transport: ChromeDownloadTransport = HttpsChromeDownloadTransport(),
     private val hostPolicy: ChromeDownloadHostPolicy = ChromeDownloadHostPolicy(),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val crxVerifier: CrxPathVerifier =
         CrxPathVerifier(Crx3Verifier::verify),
+    private val cleanupFailureReporter: ChromeDownloadCleanupFailureReporter =
+        ChromeDownloadCleanupFailureReporter {
+            Log.e(CLEANUP_LOG_TAG, "Chrome CRX destination cleanup failed.")
+        },
 ) : ChromeCrxDownloader {
     suspend fun download(
         address: ChromeWebStoreAddress,
@@ -128,9 +140,24 @@ class AndroidChromeCrxDownloader(
             proof
         } finally {
             if (!delivered && created.get()) {
-                withContext(NonCancellable + ioDispatcher) {
-                    runCatching { Files.deleteIfExists(destination) }
+                val cleanupError = withContext(NonCancellable + ioDispatcher) {
+                    val cleanupFailed = try {
+                        Files.deleteIfExists(destination)
+                        Files.exists(destination, NOFOLLOW_LINKS)
+                    } catch (_: Exception) {
+                        true
+                    }
+                    if (!cleanupFailed) return@withContext null
+                    val cleanupError = ChromeDownloadException(
+                        ChromeDownloadErrorCode.CLEANUP_FAILED,
+                        "Chrome CRX 임시 입력을 정리할 수 없습니다.",
+                    )
+                    runCatching {
+                        cleanupFailureReporter.report(cleanupError)
+                    }
+                    cleanupError
                 }
+                if (cleanupError != null) throw cleanupError
             }
         }
     }
@@ -311,6 +338,7 @@ class AndroidChromeCrxDownloader(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: Exception) {
+                    currentCoroutineContext().ensureActive()
                     fail(
                         ChromeDownloadErrorCode.NETWORK_FAILED,
                         "Chrome CRX 응답을 읽을 수 없습니다.",
@@ -349,17 +377,24 @@ class AndroidChromeCrxDownloader(
             )
         }
 
-    private suspend fun readCancellable(input: InputStream, buffer: ByteArray): Int =
-        suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation {
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend fun readCancellable(
+        input: InputStream,
+        buffer: ByteArray,
+    ): Int {
+        val cancellationHandle = currentCoroutineContext()[Job]
+            ?.invokeOnCompletion(
+                onCancelling = true,
+                invokeImmediately = true,
+            ) {
                 runCatching(input::close)
             }
-            try {
-                continuation.resumeWith(Result.success(input.read(buffer)))
-            } catch (error: Throwable) {
-                continuation.resumeWith(Result.failure(error))
-            }
+        return try {
+            input.read(buffer)
+        } finally {
+            cancellationHandle?.dispose()
         }
+    }
 
     private fun isHtml(contentType: String?): Boolean {
         val normalized = contentType?.substringBefore(';')?.trim()?.lowercase()
@@ -393,6 +428,7 @@ class AndroidChromeCrxDownloader(
         private const val READ_TIMEOUT_MILLIS = 60_000
         private const val BUFFER_SIZE = 64 * 1024
         private const val HTML_PREFIX_BYTES = 256
+        private const val CLEANUP_LOG_TAG = "SIX-Bridge"
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
 
         private fun updateUri(address: ChromeWebStoreAddress): URI = URI(

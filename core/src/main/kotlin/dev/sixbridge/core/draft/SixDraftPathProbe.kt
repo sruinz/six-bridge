@@ -16,7 +16,6 @@ import java.util.zip.CRC32
 import java.util.zip.DataFormatException
 import java.util.zip.Inflater
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 
 sealed interface SixDraftProbe {
     data object NotDraft : SixDraftProbe
@@ -38,19 +37,27 @@ internal object StrictDraftPathProbe {
         maximumBytes: Long,
         afterValidation: () -> Unit,
     ): SixDraftProbe {
-        val names = try {
-            ZipFile(path.toFile()).use { zip ->
-                zip.entries().asSequence().map { it.name }.toList()
-            }
+        val before = try {
+            readPathState(path)
         } catch (_: Exception) {
             return SixDraftProbe.NotDraft
         }
-        if (!isDraftCandidate(names)) return SixDraftProbe.NotDraft
-        return try {
-            val before = readPathState(path)
-            require(maximumBytes >= 0L && before.size <= maximumBytes) {
-                "SixDraft archive 크기가 제한을 초과합니다."
+        if (maximumBytes < 0L ||
+            maximumBytes > SixDraft.MAX_ARCHIVE_SIZE ||
+            before.size > maximumBytes ||
+            before.size > SixDraft.MAX_ARCHIVE_SIZE
+        ) {
+            return SixDraftProbe.MalformedDraft
+        }
+        val candidate = try {
+            FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+                DraftCandidatePreflight.isCandidate(channel, before.size)
             }
+        } catch (_: Exception) {
+            false
+        }
+        if (!candidate) return SixDraftProbe.NotDraft
+        return try {
             val initialHash = sha256(path, before.size)
             val result = inspect(path, maximumBytes)
             afterValidation()
@@ -64,17 +71,6 @@ internal object StrictDraftPathProbe {
         } catch (_: Exception) {
             SixDraftProbe.MalformedDraft
         }
-    }
-
-    private fun isDraftCandidate(names: List<String>): Boolean {
-        val unique = names.toSet()
-        val sourceNames = unique.intersect(SixDraft.SOURCE_ENTRIES)
-        val exact = sourceNames.size == 1 &&
-            unique == SixDraft.METADATA_ENTRIES + sourceNames.single()
-        val nearCanonical = sourceNames.size == 1 &&
-            DraftSignature.ENTRY_NAME in unique &&
-            unique.intersect(SixDraft.METADATA_ENTRIES).size >= 2
-        return exact || nearCanonical
     }
 
     private fun inspect(path: Path, maximumBytes: Long): SixDraftProbe.Valid {
@@ -343,6 +339,134 @@ internal object StrictDraftPathProbe {
         val size: Long,
         val modifiedTime: FileTime,
     )
+}
+
+private object DraftCandidatePreflight {
+    fun isCandidate(channel: FileChannel, size: Long): Boolean {
+        val eocd = findEocd(channel, size) ?: return false
+        if (eocd.diskNumber != 0 ||
+            eocd.centralDisk != 0 ||
+            eocd.diskEntries != eocd.entryCount ||
+            eocd.entryCount > MAX_PREFLIGHT_ENTRIES ||
+            eocd.centralSize > MAX_PREFLIGHT_CENTRAL_BYTES ||
+            eocd.centralOffset > eocd.offset ||
+            eocd.centralSize != eocd.offset - eocd.centralOffset
+        ) {
+            return false
+        }
+
+        var cursor = eocd.centralOffset
+        val centralEnd = eocd.offset
+        var nameBytes = 0L
+        var metadataMask = 0
+        var sourceMask = 0
+        var sourceOccurrences = 0
+        var matchedOccurrences = 0
+        repeat(eocd.entryCount) {
+            if (cursor > centralEnd - CENTRAL_HEADER_SIZE) return false
+            val header = readBytes(channel, cursor, CENTRAL_HEADER_SIZE)
+            if (le32(header, 0) != CENTRAL_SIGNATURE) return false
+            val nameLength = le16(header, 28)
+            val extraLength = le16(header, 30)
+            val commentLength = le16(header, 32)
+            val bodySize = nameLength.toLong() + extraLength + commentLength
+            if (bodySize > centralEnd - cursor - CENTRAL_HEADER_SIZE) return false
+            if (nameLength > MAX_PREFLIGHT_NAME_LENGTH ||
+                nameBytes > MAX_PREFLIGHT_NAME_BYTES - nameLength
+            ) {
+                return false
+            }
+            nameBytes += nameLength
+            val name = readBytes(
+                channel,
+                cursor + CENTRAL_HEADER_SIZE,
+                nameLength,
+            )
+            val metadataIndex = METADATA_NAMES.indexOfFirst(name::contentEquals)
+            if (metadataIndex >= 0) {
+                metadataMask = metadataMask or (1 shl metadataIndex)
+                matchedOccurrences += 1
+            } else {
+                val sourceIndex = SOURCE_NAMES.indexOfFirst(name::contentEquals)
+                if (sourceIndex >= 0) {
+                    sourceMask = sourceMask or (1 shl sourceIndex)
+                    sourceOccurrences += 1
+                    matchedOccurrences += 1
+                }
+            }
+            cursor += CENTRAL_HEADER_SIZE + bodySize
+        }
+        if (cursor != centralEnd) return false
+
+        val oneSource = Integer.bitCount(sourceMask) == 1 &&
+            sourceOccurrences == 1
+        val exact = oneSource &&
+            eocd.entryCount == SixDraft.MAX_ENTRIES &&
+            matchedOccurrences == SixDraft.MAX_ENTRIES &&
+            metadataMask == ALL_METADATA_MASK
+        val signedPartial = oneSource &&
+            metadataMask and SIGNATURE_MASK != 0 &&
+            Integer.bitCount(metadataMask) >= 2
+        val unsignedCanonical = oneSource &&
+            metadataMask and SIGNATURE_MASK == 0 &&
+            metadataMask and UNSIGNED_METADATA_MASK == UNSIGNED_METADATA_MASK
+        return exact || signedPartial || unsignedCanonical
+    }
+
+    private fun findEocd(channel: FileChannel, size: Long): PreflightEocd? {
+        if (size < EOCD_SIZE) return null
+        val tailSize = minOf(size, EOCD_SIZE + MAX_ZIP_COMMENT).toInt()
+        val tailOffset = size - tailSize
+        val tail = readBytes(channel, tailOffset, tailSize)
+        for (offset in tail.size - EOCD_SIZE downTo 0) {
+            if (le32(tail, offset) != EOCD_SIGNATURE) continue
+            val commentLength = le16(tail, offset + 20)
+            if (offset + EOCD_SIZE + commentLength != tail.size) continue
+            return PreflightEocd(
+                offset = tailOffset + offset,
+                diskNumber = le16(tail, offset + 4),
+                centralDisk = le16(tail, offset + 6),
+                diskEntries = le16(tail, offset + 8),
+                entryCount = le16(tail, offset + 10),
+                centralSize = unsigned32(tail, offset + 12),
+                centralOffset = unsigned32(tail, offset + 16),
+            )
+        }
+        return null
+    }
+
+    private data class PreflightEocd(
+        val offset: Long,
+        val diskNumber: Int,
+        val centralDisk: Int,
+        val diskEntries: Int,
+        val entryCount: Int,
+        val centralSize: Long,
+        val centralOffset: Long,
+    )
+
+    private val METADATA_NAMES = listOf(
+        "draft.json",
+        "input.json",
+        "conversion-plan.json",
+        "compatibility-before.json",
+        "compatibility-after.json",
+        "expected.json",
+        DraftSignature.ENTRY_NAME,
+    ).map(String::encodeToByteArray)
+    private val SOURCE_NAMES = listOf(
+        DraftSourceKind.ZIP.entryName,
+        DraftSourceKind.CRX.entryName,
+    ).map(String::encodeToByteArray)
+    private const val SIGNATURE_INDEX = 6
+    private const val SIGNATURE_MASK = 1 shl SIGNATURE_INDEX
+    private const val UNSIGNED_METADATA_MASK = SIGNATURE_MASK - 1
+    private const val ALL_METADATA_MASK = (SIGNATURE_MASK shl 1) - 1
+    private const val MAX_PREFLIGHT_ENTRIES = 10_000
+    private const val MAX_PREFLIGHT_CENTRAL_BYTES = 8L * 1024 * 1024
+    private const val MAX_PREFLIGHT_NAME_BYTES = 64L * 1024
+    private const val MAX_PREFLIGHT_NAME_LENGTH = 255
+    private const val MAX_ZIP_COMMENT = 65_535L
 }
 
 private object StrictPathArchive {

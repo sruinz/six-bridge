@@ -9,6 +9,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.URL
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 import java.security.KeyPairGenerator
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -20,12 +21,15 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Test
 
 class AndroidChromeCrxDownloaderTest {
@@ -238,6 +242,112 @@ class AndroidChromeCrxDownloaderTest {
     }
 
     @Test
+    fun `부분 write 실패 뒤 destination 삭제 실패는 structured cleanup 오류다`() = runTest {
+        val parent = Files.createTempDirectory("chrome-download-cleanup-failure")
+        val destination = parent.resolve("input.crx")
+        val writable = Files.getPosixFilePermissions(parent)
+        val locked = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_EXECUTE,
+        )
+        val reports = CopyOnWriteArrayList<ChromeDownloadException>()
+        val body = object : InputStream() {
+            private var first = true
+
+            override fun read(): Int = error("bulk read만 사용해야 합니다.")
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                if (first) {
+                    first = false
+                    buffer[offset] = 'C'.code.toByte()
+                    Files.setPosixFilePermissions(parent, locked)
+                    return 1
+                }
+                throw IOException("private-source")
+            }
+        }
+        try {
+            val error = assertFailsWith<ChromeDownloadException> {
+                AndroidChromeCrxDownloader(
+                    transport = FakeTransport(
+                        ChromeDownloadResponse(
+                            statusCode = 200,
+                            contentType = "application/x-chrome-extension",
+                            location = null,
+                            body = body,
+                        ),
+                    ),
+                    cleanupFailureReporter =
+                        ChromeDownloadCleanupFailureReporter {
+                            reports += it
+                            throw IllegalStateException("private-reporter")
+                        },
+                ).download(address("a".repeat(32)), destination)
+            }
+
+            assertEquals(ChromeDownloadErrorCode.CLEANUP_FAILED, error.code)
+            assertTrue(reports.single() === error)
+            assertNull(error.cause)
+            assertTrue(error.suppressed.isEmpty())
+            assertFalse(error.message.orEmpty().contains(destination.toString()))
+            assertTrue(Files.exists(destination))
+        } finally {
+            Files.setPosixFilePermissions(parent, writable)
+            Files.deleteIfExists(destination)
+            Files.deleteIfExists(parent)
+        }
+    }
+
+    @Test
+    fun `cancel 뒤 destination 삭제 실패도 structured cleanup 오류다`() = runBlocking {
+        val secret = "customer-secret-cancel-cleanup"
+        val parent = Files.createTempDirectory(secret)
+        val destination = parent.resolve("input.crx")
+        val body = CancellationDeleteFailureInputStream(destination)
+        val reports = CopyOnWriteArrayList<ChromeDownloadException>()
+        try {
+            val completion = CompletableDeferred<Throwable?>()
+            val job = launch {
+                AndroidChromeCrxDownloader(
+                    transport = FakeTransport(
+                        ChromeDownloadResponse(
+                            statusCode = 200,
+                            contentType = "application/x-chrome-extension",
+                            location = null,
+                            body = body,
+                        ),
+                    ),
+                    cleanupFailureReporter =
+                        ChromeDownloadCleanupFailureReporter {
+                            reports += it
+                        },
+                ).download(address("a".repeat(32)), destination)
+            }
+            job.invokeOnCompletion { completion.complete(it) }
+            body.started.await()
+
+            job.cancel()
+            job.join()
+            val cancellation = completion.await()
+
+            assertTrue(cancellation is CancellationException)
+            assertTrue(cancellation.suppressed.isEmpty())
+            assertTrue(Files.exists(destination))
+            assertEquals(1, reports.size)
+            val cleanup = reports.single()
+            assertEquals(ChromeDownloadErrorCode.CLEANUP_FAILED, cleanup.code)
+            assertNull(cleanup.cause)
+            assertTrue(cleanup.suppressed.isEmpty())
+            assertFalse(cleanup.message.orEmpty().contains(destination.toString()))
+            assertFalse(cleanup.stackTraceToString().contains(secret))
+        } finally {
+            Files.deleteIfExists(destination.resolve("blocker"))
+            Files.deleteIfExists(destination)
+            Files.deleteIfExists(parent)
+        }
+    }
+
+    @Test
     fun `public downloader transport copy verification close는 주입 IO dispatcher에서만 실행한다`() = runTest {
         val packed = validCrx()
         val threads = CopyOnWriteArrayList<String>()
@@ -383,6 +493,39 @@ class AndroidChromeCrxDownloaderTest {
         override fun read(): Int = error("bulk read만 사용해야 합니다.")
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            started.complete(Unit)
+            while (!closed.get()) {
+                LockSupport.parkNanos(1_000_000)
+            }
+            throw IOException("closed")
+        }
+
+        override fun close() {
+            closed.set(true)
+        }
+    }
+
+    private class CancellationDeleteFailureInputStream(
+        private val destination: java.nio.file.Path,
+    ) : InputStream() {
+        val started = CompletableDeferred<Unit>()
+        private val closed = AtomicBoolean()
+        private var first = true
+
+        override fun read(): Int = error("bulk read만 사용해야 합니다.")
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (first) {
+                first = false
+                buffer[offset] = 'C'.code.toByte()
+                Files.delete(destination)
+                Files.createDirectory(destination)
+                Files.write(
+                    destination.resolve("blocker"),
+                    byteArrayOf('x'.code.toByte()),
+                )
+                return 1
+            }
             started.complete(Unit)
             while (!closed.get()) {
                 LockSupport.parkNanos(1_000_000)

@@ -4,7 +4,9 @@ import java.io.ByteArrayOutputStream
 import java.lang.management.ManagementFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption.WRITE
 import java.nio.charset.StandardCharsets
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -92,6 +94,33 @@ class Crx3VerifierTest {
                 path = path,
                 maximumBytes = packed.bytes.size.toLong() - 1,
             )
+        }
+    }
+
+    @Test
+    fun `bounded path verifier rejects a ZIP offset above Int range`() {
+        val packed = crx3("RSA")
+        val path = Files.createTempFile("crx3-large-range-offset", ".bin")
+        val offset = Int.MAX_VALUE.toLong() + 1L
+        try {
+            FileChannel.open(path, WRITE).use { channel ->
+                val bytes = ByteBuffer.wrap(packed.bytes)
+                var position = offset
+                while (bytes.hasRemaining()) {
+                    position += channel.write(bytes, position)
+                }
+            }
+
+            assertFailsWith<IllegalArgumentException> {
+                Crx3Verifier.verify(
+                    path = path,
+                    offset = offset,
+                    length = packed.bytes.size.toLong(),
+                    maximumBytes = packed.bytes.size.toLong(),
+                )
+            }
+        } finally {
+            Files.deleteIfExists(path)
         }
     }
 

@@ -148,6 +148,9 @@ object Crx3Verifier {
         }
         val headerStart = offset + 12L
         val headerEnd = headerStart + headerLength
+        if (headerEnd > Int.MAX_VALUE) {
+            invalid("CRX3 ZIP offset이 지원 범위를 초과합니다.")
+        }
         val zipLength = length - 12L - headerLength
         if (zipLength < 4L ||
             !readRange(channel, headerEnd, 4).contentEquals(ZIP_MAGIC)

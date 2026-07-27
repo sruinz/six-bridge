@@ -15,6 +15,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.BufferedOutputStream
+import java.io.OutputStream
 import java.lang.management.ManagementFactory
 import java.nio.file.Files
 import java.security.KeyPair
@@ -494,6 +496,32 @@ class SixDraftTest {
     }
 
     @Test
+    fun `ZIP32 maximum entry inventory stays within a fixed allocation ceiling`() {
+        val path = rawEmptyZip(entryCount = 65_535, nameLength = 16)
+        val allocation = threadAllocation()
+        val before = allocation.currentThreadAllocatedBytes
+
+        val result = SixDraft.probe(path, 128L * 1024 * 1024)
+
+        val allocated = allocation.currentThreadAllocatedBytes - before
+        assertEquals(SixDraftProbe.NotDraft, result)
+        assertTrue(allocated < 8L * 1024 * 1024, "allocated=$allocated")
+    }
+
+    @Test
+    fun `long name ZIP inventory stays within a fixed allocation ceiling`() {
+        val path = rawEmptyZip(entryCount = 10_000, nameLength = 400)
+        val allocation = threadAllocation()
+        val before = allocation.currentThreadAllocatedBytes
+
+        val result = SixDraft.probe(path, 128L * 1024 * 1024)
+
+        val allocated = allocation.currentThreadAllocatedBytes - before
+        assertEquals(SixDraftProbe.NotDraft, result)
+        assertTrue(allocated < 8L * 1024 * 1024, "allocated=$allocated")
+    }
+
+    @Test
     fun `bounded path probe rejects same size mutation before returning`() {
         val bytes = SixDraft.createBytes(payload(DraftSourceKind.ZIP), keyPair())
         val path = Files.createTempFile("six-draft-probe-mutation", ".sixdraft")
@@ -516,9 +544,7 @@ class SixDraftTest {
     @Test
     fun `near 128 MiB valid draft probe stays below a fixed heap allocation ceiling`() {
         val path = largeValidDraftPath(127L * 1024 * 1024)
-        val allocation = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
-        assertTrue(allocation.isThreadAllocatedMemorySupported)
-        allocation.isThreadAllocatedMemoryEnabled = true
+        val allocation = threadAllocation()
         val before = allocation.currentThreadAllocatedBytes
 
         val result = SixDraft.probe(path, 128L * 1024 * 1024)
@@ -527,6 +553,95 @@ class SixDraftTest {
         assertTrue(result is SixDraftProbe.Valid)
         assertEquals(2, result.schemaVersion)
         assertTrue(allocated < 32L * 1024 * 1024, "allocated=$allocated")
+    }
+
+    private fun threadAllocation(): com.sun.management.ThreadMXBean =
+        (ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean)
+            .also {
+                assertTrue(it.isThreadAllocatedMemorySupported)
+                it.isThreadAllocatedMemoryEnabled = true
+            }
+
+    private fun rawEmptyZip(
+        entryCount: Int,
+        nameLength: Int,
+    ): java.nio.file.Path {
+        require(entryCount in 1..65_535)
+        require(nameLength >= 5)
+        val path = Files.createTempFile("six-draft-entry-inventory", ".zip")
+        val name = ByteArray(nameLength) { 'a'.code.toByte() }
+        val localSize = 30L + nameLength
+        val centralOffset = entryCount * localSize
+        val centralSize = entryCount * (46L + nameLength)
+        BufferedOutputStream(Files.newOutputStream(path), 64 * 1024).use { output ->
+            repeat(entryCount) { index ->
+                writeNameIndex(name, index)
+                output.writeLe32(0x04034b50)
+                output.writeLe16(20)
+                output.writeLe16(0x0800)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe32(0)
+                output.writeLe32(0)
+                output.writeLe32(0)
+                output.writeLe16(name.size)
+                output.writeLe16(0)
+                output.write(name)
+            }
+            repeat(entryCount) { index ->
+                writeNameIndex(name, index)
+                output.writeLe32(0x02014b50)
+                output.writeLe16(20)
+                output.writeLe16(20)
+                output.writeLe16(0x0800)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe32(0)
+                output.writeLe32(0)
+                output.writeLe32(0)
+                output.writeLe16(name.size)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe16(0)
+                output.writeLe32(0)
+                output.writeLe32(index * localSize)
+                output.write(name)
+            }
+            output.writeLe32(0x06054b50)
+            output.writeLe16(0)
+            output.writeLe16(0)
+            output.writeLe16(entryCount)
+            output.writeLe16(entryCount)
+            output.writeLe32(centralSize)
+            output.writeLe32(centralOffset)
+            output.writeLe16(0)
+        }
+        return path
+    }
+
+    private fun writeNameIndex(name: ByteArray, index: Int) {
+        var value = index
+        for (position in 4 downTo 0) {
+            name[position] = ('0'.code + value % 10).toByte()
+            value /= 10
+        }
+    }
+
+    private fun OutputStream.writeLe16(value: Int) {
+        write(value and 0xff)
+        write((value ushr 8) and 0xff)
+    }
+
+    private fun OutputStream.writeLe32(value: Long) {
+        writeLe16((value and 0xffff).toInt())
+        writeLe16(((value ushr 16) and 0xffff).toInt())
+    }
+
+    private fun OutputStream.writeLe32(value: Int) {
+        writeLe32(value.toLong())
     }
 
     private fun assertSignatureMutationRejected(

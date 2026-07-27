@@ -551,6 +551,8 @@ class OnDeviceInputService(
             ChromeDownloadErrorCode.INVALID_CRX3,
             ChromeDownloadErrorCode.EXTENSION_ID_MISMATCH,
             -> OnDeviceInputErrorCode.INPUT_INVALID
+            ChromeDownloadErrorCode.CLEANUP_FAILED ->
+                OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED
         }
 
     private fun inputFailure(
