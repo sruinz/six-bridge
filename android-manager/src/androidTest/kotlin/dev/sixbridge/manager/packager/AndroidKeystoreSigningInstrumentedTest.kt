@@ -2,12 +2,21 @@ package dev.sixbridge.manager.packager
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import com.android.apksig.ApkVerifier
 import dev.sixbridge.contract.crx.Crx3Writer
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.math.BigInteger
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption.WRITE
+import java.nio.channels.FileChannel
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.time.Instant
+import java.util.Date
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -22,6 +31,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.runner.RunWith
+import javax.security.auth.x500.X500Principal
 
 @RunWith(AndroidJUnit4::class)
 class AndroidKeystoreSigningInstrumentedTest {
@@ -53,6 +63,20 @@ class AndroidKeystoreSigningInstrumentedTest {
     }
 
     @Test
+    fun existingEcAliasIsRejectedInsteadOfBeingUsedAsWrapperIdentity() {
+        createEcKey(wrapperAlias())
+
+        assertPolicyRejected { store.wrapperIdentity() }
+    }
+
+    @Test
+    fun existingRsaAliasWithDifferentDigestPaddingAndCertificateIsRejected() {
+        createRsaKeyWithDifferentPolicy(wrapperAlias())
+
+        assertPolicyRejected { store.wrapperIdentity() }
+    }
+
+    @Test
     fun sameSourceIdentityKeepsCrxIdAndDifferentIdentitySeparatesIt() {
         val first = Crx3Writer.create(MINIMAL_ZIP, store.crxSigningKey(SOURCE_A))
         val again = Crx3Writer.create(MINIMAL_ZIP, store.crxSigningKey(SOURCE_A))
@@ -71,8 +95,13 @@ class AndroidKeystoreSigningInstrumentedTest {
         val unsigned = buildUnsignedWrapper(crx.extensionId, crx.bytes)
         val signed = File(work, "signed.apk")
         val identity = store.wrapperIdentity()
+        var forced = false
 
-        val signing = AndroidApkSigner().sign(unsigned, signed, identity)
+        val signing = AndroidApkSigner { temporary ->
+            FileChannel.open(temporary, WRITE).use { it.force(true) }
+            forced = true
+        }.sign(unsigned, signed, identity)
+        assertTrue(forced)
         assertTrue(signing.v2Verified)
         assertTrue(signing.v3Verified)
         assertEquals(sha256(identity.certificate.encoded), signing.signerCertificateSha256)
@@ -119,6 +148,19 @@ class AndroidKeystoreSigningInstrumentedTest {
         assertEquals("keep", preserved.readText())
     }
 
+    @Test
+    fun signerKeepsExistingOutputAndCleansTempWhenDurabilityForceFails() {
+        val crx = Crx3Writer.create(MINIMAL_ZIP, store.crxSigningKey(SOURCE_A))
+        val unsigned = buildUnsignedWrapper(crx.extensionId, crx.bytes)
+        val output = File(work, "durability.apk").apply { writeText("keep") }
+        val signer = AndroidApkSigner { throw IOException("force failed") }
+
+        assertSigningFails { signer.sign(unsigned, output, store.wrapperIdentity()) }
+
+        assertEquals("keep", output.readText())
+        assertTrue(work.listFiles().orEmpty().none { it.name.startsWith(".durability.apk.") && it.name.endsWith(".tmp") })
+    }
+
     private fun buildUnsignedWrapper(extensionId: String, crxBytes: ByteArray): File {
         val template = File(work, "wrapper-template.apk").also { destination ->
             context.assets.open("wrapper-template.apk").use { input ->
@@ -148,6 +190,50 @@ class AndroidKeystoreSigningInstrumentedTest {
             throw AssertionError("서명이 실패해야 합니다.")
         } catch (_: Exception) {
             // 예상한 서명 또는 입력 검증 실패다.
+        }
+    }
+
+    private fun assertPolicyRejected(action: () -> Unit) {
+        try {
+            action()
+            throw AssertionError("기존 Keystore alias 정책 위반을 거부해야 합니다.")
+        } catch (error: IllegalStateException) {
+            assertTrue(error.message.orEmpty().contains("Android Keystore"))
+        }
+    }
+
+    private fun wrapperAlias(): String = "$namespace.wrapper.rsa.v1"
+
+    private fun createEcKey(alias: String) {
+        KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore").apply {
+            initialize(
+                KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
+                    .setKeySize(256)
+                    .setDigests(KeyProperties.DIGEST_SHA256)
+                    .setCertificateSubject(X500Principal("CN=Unexpected EC"))
+                    .setCertificateSerialNumber(BigInteger.ONE)
+                    .setCertificateNotBefore(Date.from(Instant.parse("2025-01-01T00:00:00Z")))
+                    .setCertificateNotAfter(Date.from(Instant.parse("2050-01-01T00:00:00Z")))
+                    .build(),
+            )
+            generateKeyPair()
+        }
+    }
+
+    private fun createRsaKeyWithDifferentPolicy(alias: String) {
+        KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore").apply {
+            initialize(
+                KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
+                    .setKeySize(2048)
+                    .setDigests(KeyProperties.DIGEST_SHA256)
+                    .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                    .setCertificateSubject(X500Principal("CN=Unexpected RSA"))
+                    .setCertificateSerialNumber(BigInteger.ONE)
+                    .setCertificateNotBefore(Date.from(Instant.parse("2025-01-01T00:00:00Z")))
+                    .setCertificateNotAfter(Date.from(Instant.parse("2050-01-01T00:00:00Z")))
+                    .build(),
+            )
+            generateKeyPair()
         }
     }
 

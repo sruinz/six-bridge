@@ -8,7 +8,9 @@ import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.channels.FileChannel
 import java.security.MessageDigest
 
 data class ApkSigningResult(
@@ -18,7 +20,11 @@ data class ApkSigningResult(
     val v3Verified: Boolean,
 )
 
-class AndroidApkSigner {
+class AndroidApkSigner internal constructor(
+    private val forceFile: (Path) -> Unit,
+) {
+    constructor() : this(::forceFile)
+
     fun sign(
         unsignedApk: File,
         outputApk: File,
@@ -53,6 +59,7 @@ class AndroidApkSigner {
                 .sign()
 
             val evidence = verifySignedApk(temporary.toFile(), identity)
+            forceFile(temporary)
             trustedParent.verifyUnchanged()
             rejectUnsafeOutput(input, output)
             Files.move(temporary, output, ATOMIC_MOVE, REPLACE_EXISTING)
@@ -166,4 +173,8 @@ class AndroidApkSigner {
         val v2Verified: Boolean,
         val v3Verified: Boolean,
     )
+}
+
+private fun forceFile(file: Path) {
+    FileChannel.open(file, WRITE).use { it.force(true) }
 }

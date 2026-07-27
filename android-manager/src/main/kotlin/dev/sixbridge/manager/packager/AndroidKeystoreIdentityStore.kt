@@ -1,12 +1,15 @@
 package dev.sixbridge.manager.packager
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import java.math.BigInteger
 import java.security.KeyPairGenerator
+import java.security.KeyFactory
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PrivateKey
+import java.security.interfaces.RSAPublicKey
 import java.security.cert.X509Certificate
 import java.time.Instant
 import java.util.Date
@@ -41,11 +44,36 @@ class AndroidKeystoreIdentityStore private constructor(
                 generateKeyPair()
             }
         }
-        val entry = keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry
-            ?: throw IllegalStateException("Android Keystore 서명 키를 읽을 수 없습니다.")
+        val entry = keyStore().getEntry(alias, null) as? KeyStore.PrivateKeyEntry
+            ?: throw IllegalStateException("Android Keystore alias가 PrivateKeyEntry가 아닙니다: $alias")
         val certificate = entry.certificate as? X509Certificate
-            ?: throw IllegalStateException("Android Keystore 인증서 형식이 올바르지 않습니다.")
+            ?: throw IllegalStateException("Android Keystore alias 인증서 형식이 올바르지 않습니다: $alias")
+        validateExistingIdentity(alias, entry.privateKey, certificate)
         AndroidSigningIdentity(alias, entry.privateKey, certificate)
+    }
+
+    private fun validateExistingIdentity(alias: String, privateKey: PrivateKey, certificate: X509Certificate) {
+        requirePolicy(privateKey.algorithm == KeyProperties.KEY_ALGORITHM_RSA, alias, "개인 키가 RSA가 아닙니다")
+        requirePolicy(certificate.publicKey.algorithm == KeyProperties.KEY_ALGORITHM_RSA, alias, "인증서 공개 키가 RSA가 아닙니다")
+        requirePolicy(certificate.publicKey is RSAPublicKey, alias, "인증서 공개 키 RSA 형식이 올바르지 않습니다")
+        requirePolicy((certificate.publicKey as RSAPublicKey).modulus.bitLength() == KEY_SIZE_BITS, alias, "RSA 공개 키 길이가 올바르지 않습니다")
+        requirePolicy(certificate.subjectX500Principal == CERTIFICATE_SUBJECT, alias, "인증서 subject가 올바르지 않습니다")
+        requirePolicy(certificate.serialNumber == certificateSerial(alias), alias, "인증서 serial이 올바르지 않습니다")
+        requirePolicy(certificate.serialNumber.signum() > 0, alias, "인증서 serial이 양수가 아닙니다")
+        requirePolicy(certificate.notBefore == Date.from(CERTIFICATE_NOT_BEFORE), alias, "인증서 notBefore가 올바르지 않습니다")
+        requirePolicy(certificate.notAfter == Date.from(CERTIFICATE_NOT_AFTER), alias, "인증서 notAfter가 올바르지 않습니다")
+
+        val keyInfo = KeyFactory.getInstance(KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE)
+            .getKeySpec(privateKey, KeyInfo::class.java)
+        requirePolicy(keyInfo.keystoreAlias == alias, alias, "KeyInfo alias가 올바르지 않습니다")
+        requirePolicy(keyInfo.keySize == KEY_SIZE_BITS, alias, "KeyInfo keySize가 올바르지 않습니다")
+        requirePolicy(keyInfo.purposes == REQUIRED_PURPOSES, alias, "KeyInfo purposes가 올바르지 않습니다")
+        requirePolicy(keyInfo.digests.toSet() == REQUIRED_DIGESTS, alias, "KeyInfo digests가 올바르지 않습니다")
+        requirePolicy(keyInfo.signaturePaddings.toSet() == REQUIRED_SIGNATURE_PADDINGS, alias, "KeyInfo signature paddings가 올바르지 않습니다")
+    }
+
+    private fun requirePolicy(condition: Boolean, alias: String, problem: String) {
+        if (!condition) throw IllegalStateException("Android Keystore alias 정책 위반: $alias ($problem)")
     }
 
     private fun keyGenerationSpec(alias: String): KeyGenParameterSpec =
@@ -53,13 +81,13 @@ class AndroidKeystoreIdentityStore private constructor(
             alias,
             KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
         )
-            .setKeySize(2048)
+            .setKeySize(KEY_SIZE_BITS)
             .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
             .setSignaturePaddings(
                 KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
                 KeyProperties.SIGNATURE_PADDING_RSA_PSS,
             )
-            .setCertificateSubject(X500Principal("CN=SIX Bridge On-Device"))
+            .setCertificateSubject(CERTIFICATE_SUBJECT)
             .setCertificateSerialNumber(certificateSerial(alias))
             .setCertificateNotBefore(Date.from(CERTIFICATE_NOT_BEFORE))
             .setCertificateNotAfter(Date.from(CERTIFICATE_NOT_AFTER))
@@ -97,7 +125,15 @@ class AndroidKeystoreIdentityStore private constructor(
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val WRAPPER_ALIAS = "sixbridge.wrapper.rsa.v1"
         private const val CRX_ALIAS_PREFIX = "sixbridge.crx.rsa.v1."
+        private const val KEY_SIZE_BITS = 2048
+        private const val REQUIRED_PURPOSES = KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         private val TEST_NAMESPACE = Regex("sixbridge\\.test\\.[0-9a-f-]+")
+        private val REQUIRED_DIGESTS = setOf(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
+        private val REQUIRED_SIGNATURE_PADDINGS = setOf(
+            KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
+            KeyProperties.SIGNATURE_PADDING_RSA_PSS,
+        )
+        private val CERTIFICATE_SUBJECT = X500Principal("CN=SIX Bridge On-Device")
         private val CERTIFICATE_NOT_BEFORE: Instant = Instant.parse("2025-01-01T00:00:00Z")
         private val CERTIFICATE_NOT_AFTER: Instant = Instant.parse("2050-01-01T00:00:00Z")
         private val lock = Any()
