@@ -11,6 +11,7 @@ import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
@@ -38,6 +39,14 @@ class SixDraftCrxProvenanceTest {
         assertEquals(fixture.rawPayloadSha256, verified.payload.expected.transformedSourceSha256)
         assertEquals(fixture.rawPayloadSha256, replayed.prepared.originalSourceSha256)
         assertEquals(fixture.rawPayloadSha256, replayed.prepared.transformedSourceSha256)
+        assertEquals(
+            replayed.prepared.transformedSourceSha256,
+            sha256(replayed.prepared.transformedSourceZip),
+        )
+        assertContentEquals(
+            Crx3.parse(fixture.crxBytes).zipBytes,
+            replayed.prepared.transformedSourceZip,
+        )
         assertContentEquals(fixture.crxBytes, replayed.prepared.passthroughCrx)
     }
 
@@ -149,6 +158,11 @@ class SixDraftCrxProvenanceTest {
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     private data class CrxFixture(
         val crxBytes: ByteArray,

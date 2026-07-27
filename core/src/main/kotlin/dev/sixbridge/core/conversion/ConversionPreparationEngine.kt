@@ -149,19 +149,20 @@ class ConversionPreparationEngine private constructor(
             ).toByteArray(UTF_8),
         )
         val passthrough = input.originalCrx?.takeIf { !transformed }
+        val resultSourceZip = if (passthrough != null) {
+            input.canonicalOriginalZip
+        } else {
+            transformedArchive
+        }
         return PreparedConversion(
             compatibilityBefore = before,
             compatibilityAfter = after,
             originalSourceSha256 = originalSourceSha256,
-            transformedSourceSha256 = if (passthrough != null) {
-                originalSourceSha256
-            } else {
-                sha256(transformedArchive)
-            },
+            transformedSourceSha256 = sha256(resultSourceZip),
             planSha256 = proofPlan.proofSha256,
             reportSha256 = reportSha256,
             appliedAdapterIds = applied.mapTo(sortedSetOf()) { it.id },
-            transformedSourceZip = transformedArchive,
+            transformedSourceZip = resultSourceZip,
             originalExtensionId = originalExtensionId,
             logicalSourceIdentity = logicalSourceIdentity(
                 input,
