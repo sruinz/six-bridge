@@ -1705,6 +1705,71 @@ class ManagerRepositoryTest {
             assertContentEquals(durablePng, publisher.state.value.single().iconPng)
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `삭제 실패는 이전 null publication의 늦은 icon schedule 권한을 폐기한다`() =
+        runTest {
+            val firstCandidateCaptured = CompletableDeferred<Unit>()
+            val allowFirstPublication = CompletableDeferred<Unit>()
+            val withoutIcon = record(version = 1, signer = "same")
+            val backingCatalog = FakeCatalog(listOf(withoutIcon))
+            var ensureCount = 0
+            val catalog = object : ManagerCatalog by backingCatalog {
+                override suspend fun ensureDiscoveredIdentity(
+                    discovered: CatalogRecord,
+                ): CatalogRecord {
+                    val ensured = backingCatalog.ensureDiscoveredIdentity(discovered)
+                    ensureCount += 1
+                    if (ensureCount == 1) {
+                        firstCandidateCaptured.complete(Unit)
+                        allowFirstPublication.await()
+                    }
+                    return ensured
+                }
+            }
+            var providerLoadCount = 0
+            val installed =
+                FakeInstalledWrappers(listOf(installed(version = 1, signer = "same")))
+            val publisher = catalogPublisher(
+                catalog = catalog,
+                installed = installed,
+                source = InstalledExtensionIconSource {
+                    providerLoadCount += 1
+                    PUBLISHER_PNG
+                },
+                scope = backgroundScope,
+            )
+            val removeFailure = IllegalStateException("Room unavailable")
+            backingCatalog.removeFailure = removeFailure
+
+            val firstPublish = async { publisher.publish(listOf(withoutIcon)) }
+            runCurrent()
+            firstCandidateCaptured.await()
+
+            val thrownResult = CompletableDeferred<Throwable>()
+            val removal = launch {
+                try {
+                    publisher.remove(PACKAGE)
+                } catch (error: Throwable) {
+                    thrownResult.complete(error)
+                }
+            }
+            runCurrent()
+            assertFalse(removal.isCompleted)
+
+            allowFirstPublication.complete(Unit)
+            runCurrent()
+            firstPublish.await()
+            removal.join()
+            runCurrent()
+
+            assertSame(removeFailure, thrownResult.await())
+            assertEquals(0, providerLoadCount)
+            assertEquals(0, backingCatalog.iconInsertCount)
+            assertNull(backingCatalog.records.single().iconPng)
+            assertNull(publisher.state.value.single().iconPng)
+        }
+
     @Test
     fun `identity 변경은 이전 bytes와 저장 실패 상태를 재사용하지 않는다`() = runBlocking {
         var providerLoadCount = 0

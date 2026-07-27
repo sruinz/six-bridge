@@ -456,6 +456,7 @@ internal class CatalogPublisher(
         var cancelledJobs = emptyList<Job>()
         try {
             mutex.withLock {
+                publicationGeneration += 1
                 cancelledJobs = iconJobs
                     .filterKeys { it.packageName == packageName }
                     .values
