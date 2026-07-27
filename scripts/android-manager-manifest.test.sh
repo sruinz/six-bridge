@@ -204,6 +204,15 @@ assert_adaptive_icon_source() {
 
 source_icon_contract() {
     local attr_fill_type="@*[local-name()='fillType' and namespace-uri()='${ANDROID_NS}']"
+    local attr_fill_color="@*[local-name()='fillColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
+    local attr_pivot_x="@*[local-name()='pivotX' and namespace-uri()='${ANDROID_NS}']"
+    local attr_pivot_y="@*[local-name()='pivotY' and namespace-uri()='${ANDROID_NS}']"
+    local attr_scale_x="@*[local-name()='scaleX' and namespace-uri()='${ANDROID_NS}']"
+    local attr_scale_y="@*[local-name()='scaleY' and namespace-uri()='${ANDROID_NS}']"
+    local attr_stroke_color="@*[local-name()='strokeColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_translate_x="@*[local-name()='translateX' and namespace-uri()='${ANDROID_NS}']"
+    local attr_translate_y="@*[local-name()='translateY' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_height="@*[local-name()='viewportHeight' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_width="@*[local-name()='viewportWidth' and namespace-uri()='${ANDROID_NS}']"
     local file
@@ -238,10 +247,31 @@ source_icon_contract() {
         fail "launcher foreground is missing Deep Violet #5B21B6"
     grep -Fq '#FB7185' "${ICON_FOREGROUND}" ||
         fail "launcher foreground is missing Coral #FB7185"
+    grep -Fq '#2E1065' "${ICON_FOREGROUND}" ||
+        fail "launcher foreground is missing Dark Plum #2E1065 material depth"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "/*[local-name()='vector']/*[local-name()='group'][${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']" 1 \
+        "launcher foreground mark transform is incorrect"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "/*[local-name()='vector']/*[local-name()='group']/*[local-name()='group'][${attr_name}='material_depth' and ${attr_translate_x}='4' and ${attr_translate_y}='4']" 1 \
+        "launcher foreground material depth transform is incorrect"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "/*[local-name()='vector']/*[local-name()='group']/*[1][self::*[local-name()='group'] and ${attr_name}='material_depth']" 1 \
+        "launcher foreground material depth must precede the main mark"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "/*[local-name()='vector']/*[local-name()='group']/*[local-name()='group'][${attr_name}='material_depth']/*[local-name()='path'][${attr_fill_color}='#2E1065' or ${attr_stroke_color}='#2E1065']" 3 \
+        "launcher foreground material depth must contain the connected puzzle, tracks, and controls"
     assert_xpath_count "${ICON_MONOCHROME}" \
-        "/*[local-name()='vector']/*[local-name()='path'][${attr_fill_type}='evenOdd']" 1 \
+        "/*[local-name()='vector']/*[local-name()='group'][${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']" 1 \
+        "launcher monochrome mark transform is incorrect"
+    grep -Fq 'M23,40Q23,35 28,35' "${ICON_FOREGROUND}" ||
+        fail "launcher foreground is missing the approved 5dp rounded puzzle body"
+    grep -Fq 'M23,40Q23,35 28,35' "${ICON_MONOCHROME}" ||
+        fail "launcher monochrome is missing the approved 5dp rounded puzzle body"
+    assert_xpath_count "${ICON_MONOCHROME}" \
+        "/*[local-name()='vector']/*[local-name()='group']/*[local-name()='path'][${attr_fill_type}='evenOdd']" 1 \
         "monochrome launcher must contain one evenOdd alpha cutout path"
-    if grep -Eq '#6366F1|#6D28D9|#5B21B6|#FB7185' \
+    if grep -Eq '#6366F1|#6D28D9|#5B21B6|#FB7185|#2E1065' \
         "${ICON_MONOCHROME}"; then
         fail "monochrome launcher must not contain brand colors"
     fi
