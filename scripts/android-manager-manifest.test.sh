@@ -205,6 +205,7 @@ assert_adaptive_icon_source() {
 source_icon_contract() {
     local attr_fill_type="@*[local-name()='fillType' and namespace-uri()='${ANDROID_NS}']"
     local attr_fill_color="@*[local-name()='fillColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_height="@*[local-name()='height' and namespace-uri()='${ANDROID_NS}']"
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local attr_path_data="@*[local-name()='pathData' and namespace-uri()='${ANDROID_NS}']"
     local attr_pivot_x="@*[local-name()='pivotX' and namespace-uri()='${ANDROID_NS}']"
@@ -218,13 +219,15 @@ source_icon_contract() {
     local attr_translate_y="@*[local-name()='translateY' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_height="@*[local-name()='viewportHeight' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_width="@*[local-name()='viewportWidth' and namespace-uri()='${ANDROID_NS}']"
+    local attr_width="@*[local-name()='width' and namespace-uri()='${ANDROID_NS}']"
     local approved_body="M23,40Q23,35 28,35H36C34,33 33,30 33,27C33,22 37,19 42,19C47,19 51,22 51,27C51,30 50,33 48,35H58Q63,35 63,40V46C65,44 68,43 71,43C77,43 82,48 82,54C82,60 77,65 71,65C68,65 65,64 63,62V78Q63,83 58,83H28Q23,83 23,78Z"
     local approved_depth_controls="M47,39C51.418,39 55,42.582 55,47C55,51.418 51.418,55 47,55C42.582,55 39,51.418 39,47C39,42.582 42.582,39 47,39ZM64,54C68.418,54 72,57.582 72,62C72,66.418 68.418,70 64,70C59.582,70 56,66.418 56,62C56,57.582 59.582,54 64,54Z"
     local approved_main_controls="M47,40C50.866,40 54,43.134 54,47C54,50.866 50.866,54 47,54C43.134,54 40,50.866 40,47C40,43.134 43.134,40 47,40ZM64,55C67.866,55 71,58.134 71,62C71,65.866 67.866,69 64,69C60.134,69 57,65.866 57,62C57,58.134 60.134,55 64,55Z"
     local approved_monochrome_cutout="${approved_body}M35,44.5H73C74.381,44.5 75.5,45.619 75.5,47C75.5,48.381 74.381,49.5 73,49.5H35C33.619,49.5 32.5,48.381 32.5,47C32.5,45.619 33.619,44.5 35,44.5ZM35,59.5H73C74.381,59.5 75.5,60.619 75.5,62C75.5,63.381 74.381,64.5 73,64.5H35C33.619,64.5 32.5,63.381 32.5,62C32.5,60.619 33.619,59.5 35,59.5Z"
     local approved_tracks="M35,47H73M35,62H73"
-    local foreground_mark="/*[local-name()='vector']/*[local-name()='group'][${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
-    local monochrome_mark="/*[local-name()='vector']/*[local-name()='group'][${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
+    local launcher_vector="/*[local-name()='vector'][count(@*)=4 and ${attr_width}='108dp' and ${attr_height}='108dp' and ${attr_viewport_width}='108' and ${attr_viewport_height}='108']"
+    local foreground_mark="${launcher_vector}/*[1][self::*[local-name()='group'] and count(@*)=7 and ${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
+    local monochrome_mark="${launcher_vector}/*[1][self::*[local-name()='group'] and count(@*)=7 and ${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
     local file
 
     for file in \
@@ -251,38 +254,58 @@ source_icon_contract() {
         fail "launcher background is missing Indigo #6366F1"
     grep -Fq '#6D28D9' "${ICON_BACKGROUND}" ||
         fail "launcher background is missing Violet #6D28D9"
+    assert_xpath_count "${ICON_FOREGROUND}" "${launcher_vector}" 1 \
+        "launcher foreground vector rendering attributes are incorrect"
+    assert_xpath_count "${ICON_FOREGROUND}" "${launcher_vector}/*" 1 \
+        "launcher foreground vector must contain only the launcher mark"
     assert_xpath_count "${ICON_FOREGROUND}" "${foreground_mark}" 1 \
         "launcher foreground mark transform is incorrect"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "${launcher_vector}//*[local-name()='group']" 2 \
+        "launcher foreground must contain only the launcher mark and material depth groups"
+    assert_xpath_count "${ICON_FOREGROUND}" \
+        "${launcher_vector}//*[local-name()='path']" 6 \
+        "launcher foreground must contain exactly six approved paths"
     assert_xpath_count "${ICON_FOREGROUND}" \
         "${foreground_mark}/*" 4 \
         "launcher foreground mark must contain exactly four ordered children"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[1][self::*[local-name()='group'] and ${attr_name}='material_depth' and ${attr_translate_x}='4' and ${attr_translate_y}='4']" 1 \
+        "${foreground_mark}/*[1][self::*[local-name()='group'] and count(@*)=3 and ${attr_name}='material_depth' and ${attr_translate_x}='4' and ${attr_translate_y}='4']" 1 \
         "launcher foreground first child must be the approved material depth group"
     assert_xpath_count "${ICON_FOREGROUND}" \
         "${foreground_mark}/*[1]/*" 3 \
         "launcher foreground material depth must contain exactly three ordered paths"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[1]/*[1][self::*[local-name()='path'] and ${attr_fill_color}='#2E1065' and ${attr_path_data}='${approved_body}']" 1 \
+        "${foreground_mark}/*[1]/*[1][self::*[local-name()='path'] and count(@*)=2 and ${attr_fill_color}='#2E1065' and ${attr_path_data}='${approved_body}']" 1 \
         "launcher foreground material depth puzzle path is incorrect"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[1]/*[2][self::*[local-name()='path'] and ${attr_fill_color}='@android:color/transparent' and ${attr_stroke_color}='#2E1065' and ${attr_stroke_width}='7' and ${attr_stroke_line_cap}='round' and ${attr_path_data}='${approved_tracks}']" 1 \
+        "${foreground_mark}/*[1]/*[2][self::*[local-name()='path'] and count(@*)=5 and ${attr_fill_color}='@android:color/transparent' and ${attr_stroke_color}='#2E1065' and ${attr_stroke_width}='7' and ${attr_stroke_line_cap}='round' and ${attr_path_data}='${approved_tracks}']" 1 \
         "launcher foreground material depth tracks are incorrect"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[1]/*[3][self::*[local-name()='path'] and ${attr_fill_color}='#2E1065' and ${attr_path_data}='${approved_depth_controls}']" 1 \
+        "${foreground_mark}/*[1]/*[3][self::*[local-name()='path'] and count(@*)=2 and ${attr_fill_color}='#2E1065' and ${attr_path_data}='${approved_depth_controls}']" 1 \
         "launcher foreground material depth controls are incorrect"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[2][self::*[local-name()='path'] and ${attr_fill_color}='#FFFFFF' and ${attr_path_data}='${approved_body}']" 1 \
+        "${foreground_mark}/*[2][self::*[local-name()='path'] and count(@*)=2 and ${attr_fill_color}='#FFFFFF' and ${attr_path_data}='${approved_body}']" 1 \
         "launcher foreground second child must be the approved rounded main puzzle"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[3][self::*[local-name()='path'] and ${attr_fill_color}='@android:color/transparent' and ${attr_stroke_color}='#5B21B6' and ${attr_stroke_width}='5' and ${attr_stroke_line_cap}='round' and ${attr_path_data}='${approved_tracks}']" 1 \
+        "${foreground_mark}/*[3][self::*[local-name()='path'] and count(@*)=5 and ${attr_fill_color}='@android:color/transparent' and ${attr_stroke_color}='#5B21B6' and ${attr_stroke_width}='5' and ${attr_stroke_line_cap}='round' and ${attr_path_data}='${approved_tracks}']" 1 \
         "launcher foreground third child must be the approved main tracks"
     assert_xpath_count "${ICON_FOREGROUND}" \
-        "${foreground_mark}/*[4][self::*[local-name()='path'] and ${attr_fill_color}='#FB7185' and ${attr_stroke_color}='#FFFFFF' and ${attr_stroke_width}='2' and ${attr_path_data}='${approved_main_controls}']" 1 \
+        "${foreground_mark}/*[4][self::*[local-name()='path'] and count(@*)=4 and ${attr_fill_color}='#FB7185' and ${attr_stroke_color}='#FFFFFF' and ${attr_stroke_width}='2' and ${attr_path_data}='${approved_main_controls}']" 1 \
         "launcher foreground fourth child must be the approved main controls"
+    assert_xpath_count "${ICON_MONOCHROME}" "${launcher_vector}" 1 \
+        "launcher monochrome vector rendering attributes are incorrect"
+    assert_xpath_count "${ICON_MONOCHROME}" "${launcher_vector}/*" 1 \
+        "launcher monochrome vector must contain only the launcher mark"
     assert_xpath_count "${ICON_MONOCHROME}" \
         "${monochrome_mark}" 1 \
         "launcher monochrome mark transform is incorrect"
+    assert_xpath_count "${ICON_MONOCHROME}" \
+        "${launcher_vector}//*[local-name()='group']" 1 \
+        "launcher monochrome must contain only one launcher mark group"
+    assert_xpath_count "${ICON_MONOCHROME}" \
+        "${launcher_vector}//*[local-name()='path']" 2 \
+        "launcher monochrome must contain exactly two approved paths"
     assert_xpath_count "${ICON_MONOCHROME}" \
         "${monochrome_mark}//*[local-name()='group']" 0 \
         "launcher monochrome mark must not contain nested groups or material depth"
@@ -290,10 +313,10 @@ source_icon_contract() {
         "${monochrome_mark}/*" 2 \
         "launcher monochrome mark must contain exactly two ordered paths"
     assert_xpath_count "${ICON_MONOCHROME}" \
-        "${monochrome_mark}/*[1][self::*[local-name()='path'] and ${attr_fill_color}='#FFFFFFFF' and ${attr_fill_type}='evenOdd' and ${attr_path_data}='${approved_monochrome_cutout}']" 1 \
+        "${monochrome_mark}/*[1][self::*[local-name()='path'] and count(@*)=3 and ${attr_fill_color}='#FFFFFFFF' and ${attr_fill_type}='evenOdd' and ${attr_path_data}='${approved_monochrome_cutout}']" 1 \
         "launcher monochrome first child must be the approved rounded puzzle and track cutout"
     assert_xpath_count "${ICON_MONOCHROME}" \
-        "${monochrome_mark}/*[2][self::*[local-name()='path'] and ${attr_fill_color}='#FFFFFFFF' and ${attr_path_data}='${approved_main_controls}']" 1 \
+        "${monochrome_mark}/*[2][self::*[local-name()='path'] and count(@*)=2 and ${attr_fill_color}='#FFFFFFFF' and ${attr_path_data}='${approved_main_controls}']" 1 \
         "launcher monochrome second child must be the approved controls"
     assert_xpath_count "${ICON_MONOCHROME}" \
         "${monochrome_mark}/*[${attr_stroke_color} or ${attr_stroke_width}]" 0 \
