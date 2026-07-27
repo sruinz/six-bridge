@@ -101,10 +101,17 @@
   - 과거 10/10 기록은 아이콘 UI 회귀 테스트가 추가되기 전 부분 실행이며,
     현재 최종 connected 결과를 의미하지 않는다.
 - [x] production source·schema·test 전용 Provider 경계
-  - `git diff 82236be..HEAD --check`가 통과했고, 같은 범위에서
-    `android-manager/src/main/AndroidManifest.xml`과 canonical Room schema
+  - 아이콘 동시성 검토 당시 범위인 `git diff 82236be..8dce66a --check`가
+    통과했고, 같은 범위에서 production manifest와 canonical Room schema
+    diff가 없었다.
+  - 이후 사용자 승인 launcher icon 작업의 `5ba91bf`에서 production
+    manifest에 `android:icon="@mipmap/ic_launcher"`과
+    `android:roundIcon="@mipmap/ic_launcher_round"` 두 속성만 추가됐다.
+    현재 `git diff 82236be..HEAD -- android-manager/src/main/AndroidManifest.xml`
+    결과도 이 두 승인 속성 외 변경이 없다.
+  - canonical Room schema
     `android-manager/schemas/dev.sixbridge.manager.catalog.ManagerDatabase/1.json`
-    diff가 없었다. 데이터베이스 version은 계속 `1`이다.
+    는 현재까지 diff가 없고 데이터베이스 version은 계속 `1`이다.
   - 사용자 승인으로 `TestBlockingIconProvider`는
     `src/androidTest/java`의 Java 구현과 test manifest의
     `android:exported="true"`로만 존재한다.
@@ -112,6 +119,9 @@
     위 test Provider class와 authority가 없었다. production manifest와
     배포 APK에는 test-only Provider가 포함되지 않았다.
 - [x] 관리자 launcher icon 머티리얼 3D 계약과 전체 패키징
+  - 배경 vector는 `108 × 108` 전체 사각형과 Indigo `#6366F1`에서
+    Violet `#6D28D9`으로 이어지는 좌상단→우하단 linear gradient 하나만
+    사용한다.
   - 컬러 전경은 `108 × 108` viewport 안에서 원본 중심
     `(52.5, 51)`, `0.75`배 축소, `translateX=3`,
     `translateY=3`을 사용한다.
@@ -120,8 +130,16 @@
     머티리얼 돌출면을 먼저 그린다.
   - 단색 전경은 같은 크기·위치·라운드를 공유하고 머티리얼 돌출면 없이
     `evenOdd` track cutout을 유지한다.
-  - 돌출 track 굵기 변이, 단색 중첩 group, 최상위 sibling group과
+  - 돌출 track 굵기 변이, 단색 중첩 group, 최상위 sibling group과 전경
     `fillAlpha=0` 변이가 각각 계약 테스트에서 실패했다.
+  - 배경 gradient의 추가 alpha, built manifest의 잘못된 launcher ID와
+    v33 adaptive icon의 잘못된 foreground ID 변이도 각각 계약 테스트에서
+    실패했다.
+  - 빌드 APK의 `aapt2 dump resources`에서 얻은 launcher·round launcher와
+    background·foreground·monochrome resource ID를 `apkanalyzer` manifest
+    및 v26·v33 adaptive icon xmltree와 교차 검증했다. v26은
+    background·foreground 두 자식, v33은 여기에 monochrome 한 자식만
+    순서대로 포함한다.
   - 최종 `./scripts/package-manager-debug.sh`는 Gradle
     `BUILD SUCCESSFUL`, Node 89/89, shell·conversion·manifest·distribution
     계약을 통과했다.

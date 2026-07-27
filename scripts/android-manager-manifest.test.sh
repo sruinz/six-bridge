@@ -18,6 +18,7 @@ readonly SDK_ROOT="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}
 readonly APKANALYZER="${SDK_ROOT}/cmdline-tools/latest/bin/apkanalyzer"
 readonly AAPT2="${SDK_ROOT}/build-tools/36.0.0/aapt2"
 readonly ANDROID_NS="http://schemas.android.com/apk/res/android"
+readonly AAPT_NS="http://schemas.android.com/aapt"
 readonly FALLBACK_JAVA_HOME="/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home"
 
 fail() {
@@ -131,6 +132,8 @@ apk_permission_contract() {
 manifest_contract() {
     local manifest="$1"
     local package_check="$2"
+    local expected_icon_ref="${3:-}"
+    local expected_round_icon_ref="${4:-}"
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local attr_exported="@*[local-name()='exported' and namespace-uri()='${ANDROID_NS}']"
     local attr_icon="@*[local-name()='icon' and namespace-uri()='${ANDROID_NS}']"
@@ -138,9 +141,19 @@ manifest_contract() {
     local launcher_activity="/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='activity'][*[local-name()='intent-filter']/*[local-name()='action'][${attr_name}='android.intent.action.MAIN'] and *[local-name()='intent-filter']/*[local-name()='category'][${attr_name}='android.intent.category.LAUNCHER']]"
 
     if [[ "${package_check}" == "true" ]]; then
+        [[ -n "${expected_icon_ref}" ]] ||
+            fail "built APK icon resource ID is missing"
+        [[ -n "${expected_round_icon_ref}" ]] ||
+            fail "built APK round icon resource ID is missing"
         assert_xpath_count "${manifest}" \
             "/*[local-name()='manifest'][@package='dev.sixbridge.manager']" 1 \
             "built APK package must be dev.sixbridge.manager"
+        assert_xpath_count "${manifest}" \
+            "/*[local-name()='manifest']/*[local-name()='application'][${attr_icon}='${expected_icon_ref}']" 1 \
+            "built APK application icon must reference ${expected_icon_ref}"
+        assert_xpath_count "${manifest}" \
+            "/*[local-name()='manifest']/*[local-name()='application'][${attr_round_icon}='${expected_round_icon_ref}']" 1 \
+            "built APK application roundIcon must reference ${expected_round_icon_ref}"
     fi
 
     if [[ "${package_check}" == "false" ]]; then
@@ -205,6 +218,9 @@ assert_adaptive_icon_source() {
 source_icon_contract() {
     local attr_fill_type="@*[local-name()='fillType' and namespace-uri()='${ANDROID_NS}']"
     local attr_fill_color="@*[local-name()='fillColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_end_color="@*[local-name()='endColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_end_x="@*[local-name()='endX' and namespace-uri()='${ANDROID_NS}']"
+    local attr_end_y="@*[local-name()='endY' and namespace-uri()='${ANDROID_NS}']"
     local attr_height="@*[local-name()='height' and namespace-uri()='${ANDROID_NS}']"
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local attr_path_data="@*[local-name()='pathData' and namespace-uri()='${ANDROID_NS}']"
@@ -215,8 +231,12 @@ source_icon_contract() {
     local attr_stroke_color="@*[local-name()='strokeColor' and namespace-uri()='${ANDROID_NS}']"
     local attr_stroke_line_cap="@*[local-name()='strokeLineCap' and namespace-uri()='${ANDROID_NS}']"
     local attr_stroke_width="@*[local-name()='strokeWidth' and namespace-uri()='${ANDROID_NS}']"
+    local attr_start_color="@*[local-name()='startColor' and namespace-uri()='${ANDROID_NS}']"
+    local attr_start_x="@*[local-name()='startX' and namespace-uri()='${ANDROID_NS}']"
+    local attr_start_y="@*[local-name()='startY' and namespace-uri()='${ANDROID_NS}']"
     local attr_translate_x="@*[local-name()='translateX' and namespace-uri()='${ANDROID_NS}']"
     local attr_translate_y="@*[local-name()='translateY' and namespace-uri()='${ANDROID_NS}']"
+    local attr_type="@*[local-name()='type' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_height="@*[local-name()='viewportHeight' and namespace-uri()='${ANDROID_NS}']"
     local attr_viewport_width="@*[local-name()='viewportWidth' and namespace-uri()='${ANDROID_NS}']"
     local attr_width="@*[local-name()='width' and namespace-uri()='${ANDROID_NS}']"
@@ -226,6 +246,8 @@ source_icon_contract() {
     local approved_monochrome_cutout="${approved_body}M35,44.5H73C74.381,44.5 75.5,45.619 75.5,47C75.5,48.381 74.381,49.5 73,49.5H35C33.619,49.5 32.5,48.381 32.5,47C32.5,45.619 33.619,44.5 35,44.5ZM35,59.5H73C74.381,59.5 75.5,60.619 75.5,62C75.5,63.381 74.381,64.5 73,64.5H35C33.619,64.5 32.5,63.381 32.5,62C32.5,60.619 33.619,59.5 35,59.5Z"
     local approved_tracks="M35,47H73M35,62H73"
     local launcher_vector="/*[local-name()='vector'][count(@*)=4 and ${attr_width}='108dp' and ${attr_height}='108dp' and ${attr_viewport_width}='108' and ${attr_viewport_height}='108']"
+    local background_path="${launcher_vector}/*[1][self::*[local-name()='path'] and count(@*)=1 and ${attr_path_data}='M0,0H108V108H0Z']"
+    local background_fill="${background_path}/*[1][self::*[local-name()='attr'] and namespace-uri()='${AAPT_NS}' and count(@*)=1 and @name='android:fillColor']"
     local foreground_mark="${launcher_vector}/*[1][self::*[local-name()='group'] and count(@*)=7 and ${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
     local monochrome_mark="${launcher_vector}/*[1][self::*[local-name()='group'] and count(@*)=7 and ${attr_name}='launcher_mark' and ${attr_pivot_x}='52.5' and ${attr_pivot_y}='51' and ${attr_scale_x}='0.75' and ${attr_scale_y}='0.75' and ${attr_translate_x}='3' and ${attr_translate_y}='3']"
     local file
@@ -250,10 +272,23 @@ source_icon_contract() {
             "launcher vector viewport must be 108 by 108"
     done
 
-    grep -Fq '#6366F1' "${ICON_BACKGROUND}" ||
-        fail "launcher background is missing Indigo #6366F1"
-    grep -Fq '#6D28D9' "${ICON_BACKGROUND}" ||
-        fail "launcher background is missing Violet #6D28D9"
+    assert_xpath_count "${ICON_BACKGROUND}" "${launcher_vector}" 1 \
+        "launcher background vector rendering attributes are incorrect"
+    assert_xpath_count "${ICON_BACKGROUND}" "${launcher_vector}/*" 1 \
+        "launcher background vector must contain only one full-canvas path"
+    assert_xpath_count "${ICON_BACKGROUND}" "${launcher_vector}//*" 3 \
+        "launcher background must contain only the path, fill attribute, and gradient"
+    assert_xpath_count "${ICON_BACKGROUND}" "${background_path}" 1 \
+        "launcher background must use the approved full-canvas path"
+    assert_xpath_count "${ICON_BACKGROUND}" "${background_path}/*" 1 \
+        "launcher background path must contain only one aapt fill attribute"
+    assert_xpath_count "${ICON_BACKGROUND}" "${background_fill}" 1 \
+        "launcher background path must use one canonical aapt fillColor"
+    assert_xpath_count "${ICON_BACKGROUND}" "${background_fill}/*" 1 \
+        "launcher background fill must contain only one gradient"
+    assert_xpath_count "${ICON_BACKGROUND}" \
+        "${background_fill}/*[1][self::*[local-name()='gradient'] and count(@*)=7 and ${attr_type}='linear' and ${attr_start_x}='0' and ${attr_start_y}='0' and ${attr_end_x}='108' and ${attr_end_y}='108' and ${attr_start_color}='#6366F1' and ${attr_end_color}='#6D28D9' and not(*)]" 1 \
+        "launcher background gradient is not canonical"
     assert_xpath_count "${ICON_FOREGROUND}" "${launcher_vector}" 1 \
         "launcher foreground vector rendering attributes are incorrect"
     assert_xpath_count "${ICON_FOREGROUND}" "${launcher_vector}/*" 1 \
@@ -332,12 +367,134 @@ source_icon_contract() {
     assert_adaptive_icon_source "${ICON_ROUND_V33}" 1
 }
 
+resource_id() {
+    local resources_file="$1"
+    local resource_name="$2"
+    local id
+    local id_count
+
+    id="$(awk -v resource_name="${resource_name}" '
+        $1 == "resource" && $3 == resource_name {
+            print $2
+        }
+    ' "${resources_file}")"
+    id_count="$(printf '%s\n' "${id}" | awk 'NF { count++ } END { print count + 0 }')"
+    [[ "${id_count}" == "1" ]] ||
+        fail "built APK resource ID must be unique: ${resource_name} (got ${id_count})"
+    [[ "${id}" =~ ^0x[0-9a-fA-F]+$ ]] ||
+        fail "built APK resource ID is malformed: ${resource_name}"
+
+    printf '%s\n' "${id}"
+}
+
+assert_adaptive_icon_tree() {
+    local tree_file="$1"
+    local background_id="$2"
+    local foreground_id="$3"
+    local monochrome_id="$4"
+    local monochrome_count="$5"
+    local actual_elements
+    local actual_refs
+    local expected_elements
+    local expected_refs
+
+    if [[ "${monochrome_count}" == "0" ]]; then
+        expected_elements=$'adaptive-icon\nbackground\nforeground'
+        printf -v expected_refs \
+            'background=@%s\nforeground=@%s' \
+            "${background_id}" "${foreground_id}"
+    elif [[ "${monochrome_count}" == "1" ]]; then
+        expected_elements=$'adaptive-icon\nbackground\nforeground\nmonochrome'
+        printf -v expected_refs \
+            'background=@%s\nforeground=@%s\nmonochrome=@%s' \
+            "${background_id}" "${foreground_id}" "${monochrome_id}"
+    else
+        fail "unsupported built adaptive icon monochrome count: ${monochrome_count}"
+    fi
+
+    actual_elements="$(awk '$1 == "E:" { print $2 }' "${tree_file}")"
+    [[ "${actual_elements}" == "${expected_elements}" ]] ||
+        fail "built adaptive icon child order is incorrect: ${tree_file}"
+
+    actual_refs="$(awk '
+        $1 == "E:" {
+            element = $2
+            next
+        }
+        $1 == "A:" {
+            if (element == "adaptive-icon" ||
+                $0 !~ /:drawable(\([^)]*\))?=@0x[0-9a-fA-F]+[[:space:]]*$/) {
+                print "__invalid__=" $0
+                next
+            }
+            value = $0
+            sub(/^.*=/, "", value)
+            sub(/[[:space:]].*$/, "", value)
+            print element "=" value
+        }
+    ' "${tree_file}")"
+    [[ "${actual_refs}" == "${expected_refs}" ]] ||
+        fail "built adaptive icon drawable references are incorrect: ${tree_file}"
+}
+
+built_icon_files_contract() {
+    local rendered_manifest="$1"
+    local resources_file="$2"
+    local icon_v26_tree="$3"
+    local icon_round_v26_tree="$4"
+    local icon_v33_tree="$5"
+    local icon_round_v33_tree="$6"
+    local background_id
+    local foreground_id
+    local icon_id
+    local monochrome_id
+    local round_icon_id
+    local file
+
+    for file in \
+        "${rendered_manifest}" \
+        "${resources_file}" \
+        "${icon_v26_tree}" \
+        "${icon_round_v26_tree}" \
+        "${icon_v33_tree}" \
+        "${icon_round_v33_tree}"; do
+        assert_file_exists "${file}" "built launcher icon inspection file is missing"
+    done
+
+    icon_id="$(resource_id "${resources_file}" "mipmap/ic_launcher")"
+    round_icon_id="$(resource_id "${resources_file}" "mipmap/ic_launcher_round")"
+    background_id="$(resource_id "${resources_file}" "drawable/ic_launcher_background")"
+    foreground_id="$(resource_id "${resources_file}" "drawable/ic_launcher_foreground")"
+    monochrome_id="$(resource_id "${resources_file}" "drawable/ic_launcher_monochrome")"
+
+    manifest_contract \
+        "${rendered_manifest}" true \
+        "@ref/${icon_id}" "@ref/${round_icon_id}"
+    assert_adaptive_icon_tree \
+        "${icon_v26_tree}" \
+        "${background_id}" "${foreground_id}" "${monochrome_id}" 0
+    assert_adaptive_icon_tree \
+        "${icon_round_v26_tree}" \
+        "${background_id}" "${foreground_id}" "${monochrome_id}" 0
+    assert_adaptive_icon_tree \
+        "${icon_v33_tree}" \
+        "${background_id}" "${foreground_id}" "${monochrome_id}" 1
+    assert_adaptive_icon_tree \
+        "${icon_round_v33_tree}" \
+        "${background_id}" "${foreground_id}" "${monochrome_id}" 1
+}
+
 apk_icon_contract() {
     local apk="$1"
     local inspection_dir="$2"
+    local rendered_manifest="$3"
     local entries_file="${inspection_dir}/apk-entries.txt"
+    local resources_file="${inspection_dir}/resources.txt"
+    local icon_v26_tree="${inspection_dir}/ic_launcher.v26.xmltree"
+    local icon_round_v26_tree="${inspection_dir}/ic_launcher_round.v26.xmltree"
+    local icon_v33_tree="${inspection_dir}/ic_launcher.v33.xmltree"
+    local icon_round_v33_tree="${inspection_dir}/ic_launcher_round.v33.xmltree"
     local entry
-    local icon_tree
     local -a required_entries=(
         "res/mipmap-anydpi-v26/ic_launcher.xml"
         "res/mipmap-anydpi-v26/ic_launcher_round.xml"
@@ -351,24 +508,20 @@ apk_icon_contract() {
             fail "built APK launcher resource is missing: ${entry}"
     done
 
-    for entry in \
-        "res/mipmap-anydpi-v26/ic_launcher.xml" \
-        "res/mipmap-anydpi-v26/ic_launcher_round.xml"; do
-        icon_tree="${inspection_dir}/$(basename "${entry}").v26.xmltree"
-        "${AAPT2}" dump xmltree "${apk}" --file "${entry}" >"${icon_tree}"
-        if grep -Fq 'E: monochrome' "${icon_tree}"; then
-            fail "API 26 launcher resource must not contain monochrome"
-        fi
-    done
+    "${AAPT2}" dump resources "${apk}" >"${resources_file}"
+    "${AAPT2}" dump xmltree "${apk}" \
+        --file "res/mipmap-anydpi-v26/ic_launcher.xml" >"${icon_v26_tree}"
+    "${AAPT2}" dump xmltree "${apk}" \
+        --file "res/mipmap-anydpi-v26/ic_launcher_round.xml" >"${icon_round_v26_tree}"
+    "${AAPT2}" dump xmltree "${apk}" \
+        --file "res/mipmap-anydpi-v33/ic_launcher.xml" >"${icon_v33_tree}"
+    "${AAPT2}" dump xmltree "${apk}" \
+        --file "res/mipmap-anydpi-v33/ic_launcher_round.xml" >"${icon_round_v33_tree}"
 
-    for entry in \
-        "res/mipmap-anydpi-v33/ic_launcher.xml" \
-        "res/mipmap-anydpi-v33/ic_launcher_round.xml"; do
-        icon_tree="${inspection_dir}/$(basename "${entry}").v33.xmltree"
-        "${AAPT2}" dump xmltree "${apk}" --file "${entry}" >"${icon_tree}"
-        grep -Fq 'E: monochrome' "${icon_tree}" ||
-            fail "API 33 launcher resource must contain monochrome: ${entry}"
-    done
+    built_icon_files_contract \
+        "${rendered_manifest}" "${resources_file}" \
+        "${icon_v26_tree}" "${icon_round_v26_tree}" \
+        "${icon_v33_tree}" "${icon_round_v33_tree}"
 }
 
 run_permission_self_test() {
@@ -472,6 +625,13 @@ if [[ "${1:-}" == "--check-apk-permissions" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "--check-built-icons" ]]; then
+    [[ "$#" == "7" ]] ||
+        fail "usage: $0 --check-built-icons <manifest> <resources> <v26> <round-v26> <v33> <round-v33>"
+    built_icon_files_contract "$2" "$3" "$4" "$5" "$6" "$7"
+    exit 0
+fi
+
 [[ "$#" == "0" ]] || fail "unknown argument: $1"
 [[ -f "${BUILD_FILE}" ]] || fail "Android manager build file is missing: ${BUILD_FILE}"
 [[ -f "${SOURCE_MANIFEST}" ]] || fail "source manifest is missing: ${SOURCE_MANIFEST}"
@@ -502,9 +662,8 @@ trap 'rm -rf "${inspection_dir}"' EXIT
 JAVA_HOME="${java_runtime_home}" \
     "${APKANALYZER}" manifest print "${DEBUG_APK}" >"${rendered_manifest}"
 "${AAPT2}" dump xmltree "${DEBUG_APK}" --file AndroidManifest.xml >"${apk_xmltree}"
-apk_icon_contract "${DEBUG_APK}" "${inspection_dir}"
+apk_icon_contract "${DEBUG_APK}" "${inspection_dir}" "${rendered_manifest}"
 
 apk_permission_contract "${apk_xmltree}"
-manifest_contract "${rendered_manifest}" true
 
 printf 'PASS: Android manager source and APK manifest contracts\n'
