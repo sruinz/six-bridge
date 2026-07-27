@@ -5,6 +5,14 @@ readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly MODULE_DIR="${ROOT_DIR}/android-manager"
 readonly BUILD_FILE="${MODULE_DIR}/build.gradle.kts"
 readonly SOURCE_MANIFEST="${MODULE_DIR}/src/main/AndroidManifest.xml"
+readonly RES_DIR="${MODULE_DIR}/src/main/res"
+readonly ICON_BACKGROUND="${RES_DIR}/drawable/ic_launcher_background.xml"
+readonly ICON_FOREGROUND="${RES_DIR}/drawable/ic_launcher_foreground.xml"
+readonly ICON_MONOCHROME="${RES_DIR}/drawable/ic_launcher_monochrome.xml"
+readonly ICON_V26="${RES_DIR}/mipmap-anydpi-v26/ic_launcher.xml"
+readonly ICON_ROUND_V26="${RES_DIR}/mipmap-anydpi-v26/ic_launcher_round.xml"
+readonly ICON_V33="${RES_DIR}/mipmap-anydpi-v33/ic_launcher.xml"
+readonly ICON_ROUND_V33="${RES_DIR}/mipmap-anydpi-v33/ic_launcher_round.xml"
 readonly DEBUG_APK="${MODULE_DIR}/build/outputs/apk/debug/android-manager-debug.apk"
 readonly SDK_ROOT="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
 readonly APKANALYZER="${SDK_ROOT}/cmdline-tools/latest/bin/apkanalyzer"
@@ -125,12 +133,23 @@ manifest_contract() {
     local package_check="$2"
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local attr_exported="@*[local-name()='exported' and namespace-uri()='${ANDROID_NS}']"
+    local attr_icon="@*[local-name()='icon' and namespace-uri()='${ANDROID_NS}']"
+    local attr_round_icon="@*[local-name()='roundIcon' and namespace-uri()='${ANDROID_NS}']"
     local launcher_activity="/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='activity'][*[local-name()='intent-filter']/*[local-name()='action'][${attr_name}='android.intent.action.MAIN'] and *[local-name()='intent-filter']/*[local-name()='category'][${attr_name}='android.intent.category.LAUNCHER']]"
 
     if [[ "${package_check}" == "true" ]]; then
         assert_xpath_count "${manifest}" \
             "/*[local-name()='manifest'][@package='dev.sixbridge.manager']" 1 \
             "built APK package must be dev.sixbridge.manager"
+    fi
+
+    if [[ "${package_check}" == "false" ]]; then
+        assert_xpath_count "${manifest}" \
+            "/*[local-name()='manifest']/*[local-name()='application'][${attr_icon}='@mipmap/ic_launcher']" 1 \
+            "application icon must reference @mipmap/ic_launcher"
+        assert_xpath_count "${manifest}" \
+            "/*[local-name()='manifest']/*[local-name()='application'][${attr_round_icon}='@mipmap/ic_launcher_round']" 1 \
+            "application roundIcon must reference @mipmap/ic_launcher_round"
     fi
 
     assert_xpath_count "${manifest}" \
@@ -150,6 +169,126 @@ manifest_contract() {
     assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='receiver'][not(${attr_exported}) or ${attr_exported}!='false']" 0 \
         "every receiver must explicitly set android:exported=false"
+}
+
+assert_file_exists() {
+    local file="$1"
+    local message="$2"
+
+    [[ -f "${file}" ]] || fail "${message}: ${file}"
+}
+
+assert_adaptive_icon_source() {
+    local file="$1"
+    local monochrome_count="$2"
+    local attr_drawable="@*[local-name()='drawable' and namespace-uri()='${ANDROID_NS}']"
+
+    assert_xpath_count "${file}" "/*[local-name()='adaptive-icon']" 1 \
+        "adaptive icon root must exist"
+    assert_xpath_count "${file}" \
+        "/*[local-name()='adaptive-icon']/*[local-name()='background'][${attr_drawable}='@drawable/ic_launcher_background']" 1 \
+        "adaptive icon background must reference the launcher background"
+    assert_xpath_count "${file}" \
+        "/*[local-name()='adaptive-icon']/*[local-name()='foreground'][${attr_drawable}='@drawable/ic_launcher_foreground']" 1 \
+        "adaptive icon foreground must reference the launcher foreground"
+    assert_xpath_count "${file}" \
+        "/*[local-name()='adaptive-icon']/*[local-name()='monochrome']" \
+        "${monochrome_count}" \
+        "adaptive icon monochrome layer count is incorrect"
+    if [[ "${monochrome_count}" == "1" ]]; then
+        assert_xpath_count "${file}" \
+            "/*[local-name()='adaptive-icon']/*[local-name()='monochrome'][${attr_drawable}='@drawable/ic_launcher_monochrome']" 1 \
+            "adaptive icon monochrome must reference the launcher monochrome"
+    fi
+}
+
+source_icon_contract() {
+    local attr_fill_type="@*[local-name()='fillType' and namespace-uri()='${ANDROID_NS}']"
+    local attr_viewport_height="@*[local-name()='viewportHeight' and namespace-uri()='${ANDROID_NS}']"
+    local attr_viewport_width="@*[local-name()='viewportWidth' and namespace-uri()='${ANDROID_NS}']"
+    local file
+
+    for file in \
+        "${ICON_BACKGROUND}" \
+        "${ICON_FOREGROUND}" \
+        "${ICON_MONOCHROME}" \
+        "${ICON_V26}" \
+        "${ICON_ROUND_V26}" \
+        "${ICON_V33}" \
+        "${ICON_ROUND_V33}"; do
+        assert_file_exists "${file}" "launcher icon source is missing"
+    done
+
+    for file in \
+        "${ICON_BACKGROUND}" \
+        "${ICON_FOREGROUND}" \
+        "${ICON_MONOCHROME}"; do
+        assert_xpath_count "${file}" \
+            "/*[local-name()='vector'][${attr_viewport_width}='108' and ${attr_viewport_height}='108']" 1 \
+            "launcher vector viewport must be 108 by 108"
+    done
+
+    grep -Fq '#6366F1' "${ICON_BACKGROUND}" ||
+        fail "launcher background is missing Indigo #6366F1"
+    grep -Fq '#6D28D9' "${ICON_BACKGROUND}" ||
+        fail "launcher background is missing Violet #6D28D9"
+    grep -Fq '#FFFFFF' "${ICON_FOREGROUND}" ||
+        fail "launcher foreground is missing White #FFFFFF"
+    grep -Fq '#5B21B6' "${ICON_FOREGROUND}" ||
+        fail "launcher foreground is missing Deep Violet #5B21B6"
+    grep -Fq '#FB7185' "${ICON_FOREGROUND}" ||
+        fail "launcher foreground is missing Coral #FB7185"
+    assert_xpath_count "${ICON_MONOCHROME}" \
+        "/*[local-name()='vector']/*[local-name()='path'][${attr_fill_type}='evenOdd']" 1 \
+        "monochrome launcher must contain one evenOdd alpha cutout path"
+    if grep -Eq '#6366F1|#6D28D9|#5B21B6|#FB7185' \
+        "${ICON_MONOCHROME}"; then
+        fail "monochrome launcher must not contain brand colors"
+    fi
+
+    assert_adaptive_icon_source "${ICON_V26}" 0
+    assert_adaptive_icon_source "${ICON_ROUND_V26}" 0
+    assert_adaptive_icon_source "${ICON_V33}" 1
+    assert_adaptive_icon_source "${ICON_ROUND_V33}" 1
+}
+
+apk_icon_contract() {
+    local apk="$1"
+    local inspection_dir="$2"
+    local entries_file="${inspection_dir}/apk-entries.txt"
+    local entry
+    local icon_tree
+    local -a required_entries=(
+        "res/mipmap-anydpi-v26/ic_launcher.xml"
+        "res/mipmap-anydpi-v26/ic_launcher_round.xml"
+        "res/mipmap-anydpi-v33/ic_launcher.xml"
+        "res/mipmap-anydpi-v33/ic_launcher_round.xml"
+    )
+
+    unzip -Z1 "${apk}" >"${entries_file}"
+    for entry in "${required_entries[@]}"; do
+        grep -Fxq "${entry}" "${entries_file}" ||
+            fail "built APK launcher resource is missing: ${entry}"
+    done
+
+    for entry in \
+        "res/mipmap-anydpi-v26/ic_launcher.xml" \
+        "res/mipmap-anydpi-v26/ic_launcher_round.xml"; do
+        icon_tree="${inspection_dir}/$(basename "${entry}").v26.xmltree"
+        "${AAPT2}" dump xmltree "${apk}" --file "${entry}" >"${icon_tree}"
+        if grep -Fq 'E: monochrome' "${icon_tree}"; then
+            fail "API 26 launcher resource must not contain monochrome"
+        fi
+    done
+
+    for entry in \
+        "res/mipmap-anydpi-v33/ic_launcher.xml" \
+        "res/mipmap-anydpi-v33/ic_launcher_round.xml"; do
+        icon_tree="${inspection_dir}/$(basename "${entry}").v33.xmltree"
+        "${AAPT2}" dump xmltree "${apk}" --file "${entry}" >"${icon_tree}"
+        grep -Fq 'E: monochrome' "${icon_tree}" ||
+            fail "API 33 launcher resource must contain monochrome: ${entry}"
+    done
 }
 
 run_permission_self_test() {
@@ -266,6 +405,7 @@ grep -Eq 'applicationId[[:space:]]*=[[:space:]]*"dev\.sixbridge\.manager"' "${BU
     fail "applicationId must be dev.sixbridge.manager"
 
 source_permission_contract "${SOURCE_MANIFEST}"
+source_icon_contract
 manifest_contract "${SOURCE_MANIFEST}" false
 
 java_runtime_home="${JAVA_HOME:-}"
@@ -282,6 +422,7 @@ trap 'rm -rf "${inspection_dir}"' EXIT
 JAVA_HOME="${java_runtime_home}" \
     "${APKANALYZER}" manifest print "${DEBUG_APK}" >"${rendered_manifest}"
 "${AAPT2}" dump xmltree "${DEBUG_APK}" --file AndroidManifest.xml >"${apk_xmltree}"
+apk_icon_contract "${DEBUG_APK}" "${inspection_dir}"
 
 apk_permission_contract "${apk_xmltree}"
 manifest_contract "${rendered_manifest}" true
