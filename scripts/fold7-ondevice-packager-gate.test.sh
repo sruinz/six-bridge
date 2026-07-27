@@ -19,6 +19,34 @@ assert_contains() {
     grep -Fq -- "$expected" "$file" || fail "$message"
 }
 
+assert_not_contains() {
+    local file=$1
+    local unexpected=$2
+    local message=$3
+    if grep -Fq -- "$unexpected" "$file"; then
+        fail "$message"
+    fi
+}
+
+assert_not_matches() {
+    local file=$1
+    local pattern=$2
+    local message=$3
+    if grep -Eq -- "$pattern" "$file"; then
+        fail "$message"
+    fi
+}
+
+assert_instrumentation_failure_stops_before_artifacts() {
+    assert_not_contains "${FIXTURE_ROOT}/adb.log" 'exec-out' \
+        'instrumentation 실패 뒤 artifact 회수가 실행되었습니다.'
+    assert_not_matches "${FIXTURE_ROOT}/adb.log" \
+        ' install( -r)? [^ ]*gate-v[12]\.apk$' \
+        'instrumentation 실패 뒤 wrapper APK install이 실행되었습니다.'
+    assert_not_contains "${FIXTURE_ROOT}/adb.log" 'internet://extension' \
+        'instrumentation 실패 뒤 Samsung Add-ons intent가 실행되었습니다.'
+}
+
 assert_exit() {
     local expected=$1
     shift
@@ -247,11 +275,22 @@ main() {
     run_gate "$output" serial-1
     assert_contains "$output" 'Host-side checks passed.' '정상 host gate가 성공하지 않았습니다.'
     assert_contains "${FIXTURE_ROOT}/adb.log" 'install' 'v1/v2 install이 실행되지 않았습니다.'
-    grep -q ' install .*gate-v1.apk' "${FIXTURE_ROOT}/adb.log" || fail 'v1 install이 없습니다.'
-    grep -q ' install -r .*gate-v2.apk' "${FIXTURE_ROOT}/adb.log" || fail 'v2 install -r이 없습니다.'
+    v1_install_line=$(grep -nE ' install [^ ]*gate-v1\.apk$' "${FIXTURE_ROOT}/adb.log" |
+        sed -n '1s/:.*//p')
+    v2_install_line=$(grep -nE ' install -r [^ ]*gate-v2\.apk$' "${FIXTURE_ROOT}/adb.log" |
+        sed -n '1s/:.*//p')
+    [ -n "$v1_install_line" ] || fail 'v1 install이 없습니다.'
+    [ -n "$v2_install_line" ] || fail 'v2 install -r이 없습니다.'
+    [ "$v1_install_line" -lt "$v2_install_line" ] ||
+        fail 'v1 일반 install이 v2 install -r보다 앞서야 합니다.'
 
     expect_failure '기기가 offline 상태입니다.' env ADB_STATE=offline PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
+    : >"${FIXTURE_ROOT}/adb.log"
     expect_failure 'V1 instrumentation' env INSTRUMENT_FAIL=V1 PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
+    assert_instrumentation_failure_stops_before_artifacts
+    : >"${FIXTURE_ROOT}/adb.log"
+    expect_failure 'V2 instrumentation' env INSTRUMENT_FAIL=V2 PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
+    assert_instrumentation_failure_stops_before_artifacts
 
     original_state=$(cat "${FIXTURE_ROOT}/device/gate-state.json")
     jq '.v1Sha256 = ("0" * 64)' "${FIXTURE_ROOT}/device/gate-state.json" >"${FIXTURE_ROOT}/device/state.tmp"
@@ -270,6 +309,7 @@ main() {
     expect_failure 'versionCode' run_gate /dev/null serial-1
     printf '%s' "$original_result" >"${FIXTURE_ROOT}/device/gate-result.json"
 
+    expect_failure 'APK Signature Scheme v2' env APKSIGNER_V2=false PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
     expect_failure 'APK Signature Scheme v3' env APKSIGNER_V3=false PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
 
     make_apk "${FIXTURE_ROOT}/device/source-v1.apk" v1 compressed aligned
@@ -280,6 +320,15 @@ main() {
     expect_failure 'resources.arsc data offset' run_gate /dev/null serial-1
     make_apk "${FIXTURE_ROOT}/device/source-v1.apk" v1 stored aligned
     write_state "${FIXTURE_ROOT}/device/crx.sha" "${FIXTURE_ROOT}/device/source-v1.apk" "${FIXTURE_ROOT}/device/source-v2.apk"
+
+    : >"${FIXTURE_ROOT}/adb.log"
+    expect_failure '수동 제거하고 다시 실행하세요.' env PACKAGE_EXISTS=1 PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
+    assert_not_matches "${FIXTURE_ROOT}/adb.log" ' install( -r)? [^ ]*gate-v[12]\.apk$' \
+        '기존 wrapper package 충돌 뒤 wrapper APK install이 실행되었습니다.'
+    assert_not_contains "${FIXTURE_ROOT}/adb.log" ' uninstall ' \
+        '기존 wrapper package 충돌 뒤 자동 uninstall이 실행되었습니다.'
+    assert_not_contains "${FIXTURE_ROOT}/adb.log" ' downgrade ' \
+        '기존 wrapper package 충돌 뒤 자동 downgrade가 실행되었습니다.'
 
     expect_failure 'ContentProvider' env PROVIDER_MAGIC=NOPE PATH="${FIXTURE_ROOT}/bin:${PATH}" ANDROID_HOME="${FIXTURE_ROOT}/sdk" SIXBRIDGE_TEST_DEVICE="${FIXTURE_ROOT}/device" SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" bash "${FIXTURE_ROOT}/scripts/fold7-ondevice-packager-gate.sh" serial-1
 
