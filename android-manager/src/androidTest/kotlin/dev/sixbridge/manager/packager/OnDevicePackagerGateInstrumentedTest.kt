@@ -3,12 +3,15 @@ package dev.sixbridge.manager.packager
 import android.security.keystore.KeyProperties
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.contract.crx.Crx3Verifier
+import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.util.zip.ZipEntry
@@ -83,6 +86,70 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
+    fun snapshotsMutableSourceBeforeValidationAndCrxCreation() {
+        val originalIdentity = SOURCE_IDENTITY.copyOf()
+        val originalZip = canonicalSourceZip()
+        val mutableIdentity = originalIdentity.copyOf()
+        val mutableZip = originalZip.copyOf()
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterRequestValidated = {
+                    mutableIdentity.fill(0x5a)
+                    mutableZip.fill(0x5a)
+                },
+            ),
+        )
+        val result = packager.packageWrapper(
+            request(mutableZip, 4, File(root, "snapshot.apk")).copy(sourceIdentity = mutableIdentity),
+        )
+        val expected = Crx3Writer.create(
+            originalZip,
+            AndroidKeystoreIdentityStore().crxSigningKey(originalIdentity),
+        )
+        val facts = AndroidArchiveInspector(context.packageManager).inspect(result.outputApk)
+        val crx = Crx3Verifier.verify(facts.crxBytes)
+
+        assertEquals(sha256(originalZip), result.compatibility.sourceSha256)
+        assertEquals(expected.extensionId, result.extensionId)
+        assertEquals(expected.extensionId, crx.extensionId)
+        assertTrue(
+            originalZip.contentEquals(
+                facts.crxBytes.copyOfRange(crx.zipOffset, crx.zipOffset + crx.zipLength),
+            ),
+        )
+    }
+
+    @Test
+    fun rootReplacementBeforeFinalPublishIsRejectedAndPreservesExistingOutput() {
+        assertTrue(root.mkdirs() || root.isDirectory)
+        val existing = File(root, "preserved.apk").apply { writeText("keep") }
+        val savedRoot = File(context.filesDir, "ondevice-packager-gate-saved")
+        val replacement = File(context.filesDir, "ondevice-packager-gate-replacement")
+        Files.deleteIfExists(savedRoot.toPath())
+        replacement.deleteRecursively()
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                beforeFinalPublish = {
+                    Files.move(root.toPath(), savedRoot.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                    assertTrue(replacement.mkdirs())
+                    Files.createSymbolicLink(root.toPath(), replacement.toPath())
+                },
+            ),
+        )
+        try {
+            assertRejected { packager.packageWrapper(request(canonicalSourceZip(), 5, existing)) }
+            assertFalse(File(replacement, "preserved.apk").exists())
+            assertEquals("keep", File(savedRoot, "preserved.apk").readText())
+        } finally {
+            Files.deleteIfExists(root.toPath())
+            replacement.deleteRecursively()
+            if (savedRoot.exists()) Files.move(savedRoot.toPath(), root.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        }
+    }
+
+    @Test
     fun generateV1AndPersistIdentityEvidence() {
         val source = canonicalSourceZip()
         val output = File(root, "gate-v1.apk")
@@ -103,21 +170,40 @@ class OnDevicePackagerGateInstrumentedTest {
         val state = File(root, "gate-state.json")
         assertTrue("v1 계측 method를 먼저 실행해야 합니다.", state.isFile)
         val old = state.readText()
+        val v1 = File(root, "gate-v1.apk")
+        assertTrue("v1 wrapper APK가 있어야 합니다.", v1.isFile)
         val source = canonicalSourceZip()
-        val output = File(root, "gate-v2.apk")
-        val result = OnDeviceWrapperPackager(context).packageWrapper(request(source, 2, output))
+        val v2 = File(root, "gate-v2.apk")
+        val result = OnDeviceWrapperPackager(context).packageWrapper(request(source, 2, v2))
         assertTrue(old.contains("\"extensionId\":\"${result.extensionId}\""))
         assertTrue(old.contains("\"packageName\":\"${result.packageName}\""))
         assertTrue(old.contains("\"wrapperSignerSha256\":\"${result.signerSha256}\""))
         assertTrue(old.contains("\"crxSha256\":\"${result.crxSha256}\""))
-        val v1Hash = Regex("\\\"v1Sha256\\\":\\\"([0-9a-f]{64})\\\"").find(old)?.groupValues?.get(1)
+        val v1Hash = jsonField(old, "v1Sha256")
         assertNotNull(v1Hash)
-        assertNotEquals(v1Hash, result.wrapperSha256)
+        assertEquals(v1Hash, sha256(v1.readBytes()))
+        assertNotEquals(v1Hash, sha256(v2.readBytes()))
+        val verifier = AndroidWrapperVerifier(AndroidArchiveInspector(context.packageManager))
+        val v1Descriptor = result.descriptor.copy(
+            wrapperSha256 = requireNotNull(v1Hash),
+            wrapperVersionCode = 1,
+        )
+        val verifiedV1 = verifier.verify(v1, v1Descriptor, result.compatibility)
+        val verifiedV2 = verifier.verify(v2, result.descriptor, result.compatibility)
+        assertTrue(verifiedV1 is WrapperVerificationResult.Success)
+        assertTrue(verifiedV2 is WrapperVerificationResult.Success)
+        val v1Artifact = (verifiedV1 as WrapperVerificationResult.Success).value
+        val v2Artifact = (verifiedV2 as WrapperVerificationResult.Success).value
+        assertEquals(v1Artifact.extensionId, v2Artifact.extensionId)
+        assertEquals(v1Artifact.packageName, v2Artifact.packageName)
+        assertEquals(v1Artifact.signerSha256, v2Artifact.signerSha256)
+        assertEquals(1L, v1Artifact.versionCode)
+        assertEquals(2L, v2Artifact.versionCode)
         writeJson(
             File(root, "gate-result.json"),
-            """{"schemaVersion":1,"v1":{"file":"gate-v1.apk","sha256":"$v1Hash","versionCode":1},"v2":{"file":"gate-v2.apk","sha256":"${result.wrapperSha256}","versionCode":2}}""",
+            """{"schemaVersion":1,"v1":{"file":"gate-v1.apk","sha256":"${v1Artifact.wrapperSha256}","versionCode":${v1Artifact.versionCode}},"v2":{"file":"gate-v2.apk","sha256":"${v2Artifact.wrapperSha256}","versionCode":${v2Artifact.versionCode}}}""",
         )
-        assertTrue(output.isFile)
+        assertTrue(v2.isFile)
     }
 
     private fun request(source: ByteArray, versionCode: Int, output: File): OnDeviceWrapperRequest =
@@ -154,6 +240,9 @@ class OnDevicePackagerGateInstrumentedTest {
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun jsonField(json: String, name: String): String? =
+        Regex("\\\"$name\\\":\\\"([0-9a-f]{64})\\\"").find(json)?.groupValues?.get(1)
 
     private fun assertRejected(action: () -> Unit) {
         try {

@@ -17,8 +17,8 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
-import java.util.UUID
 import java.util.zip.ZipFile
 
 data class OnDeviceWrapperRequest(
@@ -50,8 +50,14 @@ data class OnDeviceWrapperResult(
  * 이 단계는 canonical ZIP을 그대로 CRX3로 감싸며, 실제 extension 변환 판단은 후속 단계의 책임이다.
  */
 class OnDeviceWrapperPackager(context: Context) {
+    private var testHooks: OnDevicePackagerTestHooks? = null
+
+    internal constructor(context: Context, testHooks: OnDevicePackagerTestHooks) : this(context) {
+        this.testHooks = testHooks
+    }
+
     private val appContext = context.applicationContext
-    private val workingDirectory = appPrivateWorkingDirectory(appContext.filesDir)
+    private val workingDirectory = TrustedWorkingDirectory.capture(appPrivateWorkingDirectory(appContext.filesDir))
     private val identityStore = AndroidKeystoreIdentityStore()
     private val manifestPatcher = BinaryAndroidManifestPatcher()
     private val apkSigner = AndroidApkSigner()
@@ -59,14 +65,15 @@ class OnDeviceWrapperPackager(context: Context) {
 
     @Synchronized
     fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
-        validateRequest(request)
+        val sourceIdentity = request.sourceIdentity.copyOf()
+        val canonicalZip = request.canonicalSourceZip.copyOf()
+        validateRequest(request, sourceIdentity, canonicalZip)
+        testHooks?.afterRequestValidated?.invoke()
         val output = validatedOutput(request.outputApk)
-        val temporaryTemplate = Files.createTempFile(workingDirectory, ".wrapper-template.", ".apk")
-        val unsigned = Files.createTempFile(workingDirectory, ".unsigned.", ".apk")
-        val signed = Files.createTempFile(workingDirectory, ".signed.", ".apk")
+        val temporaryTemplate = Files.createTempFile(workingDirectory.path, ".wrapper-template.", ".apk")
+        val unsigned = Files.createTempFile(workingDirectory.path, ".unsigned.", ".apk")
+        val signed = Files.createTempFile(workingDirectory.path, ".signed.", ".apk")
         try {
-            val sourceIdentity = request.sourceIdentity.copyOf()
-            val canonicalZip = request.canonicalSourceZip.copyOf()
             val crx = Crx3Writer.create(canonicalZip, identityStore.crxSigningKey(sourceIdentity))
             val extensionId = crx.extensionId
             val packageName = "dev.sixbridge.ext.$extensionId"
@@ -78,7 +85,7 @@ class OnDeviceWrapperPackager(context: Context) {
                 templateManifest,
                 WrapperManifestRequest(extensionId = extensionId, versionCode = request.versionCode),
             )
-            AlignedApkAssembler(workingDirectory).assemble(
+            AlignedApkAssembler(workingDirectory.path).assemble(
                 ApkAssemblyRequest(
                     templateApk = template.toFile(),
                     manifestBytes = patchedManifest,
@@ -121,8 +128,11 @@ class OnDeviceWrapperPackager(context: Context) {
             require(verifier.verify(signed.toFile(), descriptor, compatibility) is WrapperVerificationResult.Success) {
                 "생성된 wrapper APK 검증에 실패했습니다."
             }
+            verifyPublishTarget(output)
+            testHooks?.beforeFinalPublish?.invoke()
+            verifyPublishTarget(output)
             forceFile(signed)
-            rejectUnsafeOutput(output)
+            verifyPublishTarget(output)
             Files.move(signed, output, ATOMIC_MOVE, REPLACE_EXISTING)
             return OnDeviceWrapperResult(
                 extensionId = extensionId,
@@ -142,15 +152,19 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
-    private fun validateRequest(request: OnDeviceWrapperRequest) {
-        require(request.sourceIdentity.isNotEmpty()) { "source identity가 비어 있습니다." }
-        require(request.canonicalSourceZip.size >= ZIP_MAGIC_SIZE) { "canonical source ZIP이 올바르지 않습니다." }
+    private fun validateRequest(
+        request: OnDeviceWrapperRequest,
+        sourceIdentity: ByteArray,
+        canonicalZip: ByteArray,
+    ) {
+        require(sourceIdentity.isNotEmpty()) { "source identity가 비어 있습니다." }
+        require(canonicalZip.size >= ZIP_MAGIC_SIZE) { "canonical source ZIP이 올바르지 않습니다." }
         require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
         require(request.extensionName.isNotBlank() && request.extensionVersion.isNotBlank()) {
             "extension name과 version은 비어 있지 않아야 합니다."
         }
         require(request.sourceKind in SOURCE_KINDS) { "sourceKind가 올바르지 않습니다." }
-        require(SHA256.matches(request.sourceSha256) && request.sourceSha256 == sha256(request.canonicalSourceZip)) {
+        require(SHA256.matches(request.sourceSha256) && request.sourceSha256 == sha256(canonicalZip)) {
             "source SHA-256이 canonical source ZIP과 일치하지 않습니다."
         }
         require(SHA256.matches(request.browserProfileSha256)) { "browser profile SHA-256이 올바르지 않습니다." }
@@ -171,11 +185,16 @@ class OnDeviceWrapperPackager(context: Context) {
 
     private fun validatedOutput(file: File): Path {
         val output = file.toPath().toAbsolutePath().normalize()
-        require(output.parent == workingDirectory && output.fileName.toString().endsWith(".apk")) {
+        verifyPublishTarget(output)
+        return output
+    }
+
+    private fun verifyPublishTarget(output: Path) {
+        workingDirectory.verifyUnchanged()
+        require(output.parent == workingDirectory.path && output.fileName.toString().endsWith(".apk")) {
             "output APK는 앱 private ondevice-packager-gate 디렉터리에 있어야 합니다."
         }
         rejectUnsafeOutput(output)
-        return output
     }
 
     private fun rejectUnsafeOutput(output: Path) {
@@ -216,6 +235,35 @@ class OnDeviceWrapperPackager(context: Context) {
         FileChannel.open(file, WRITE).use { it.force(true) }
     }
 
+    private data class TrustedWorkingDirectory(
+        val path: Path,
+        val realPath: Path,
+        val fileKey: Any,
+    ) {
+        fun verifyUnchanged() {
+            require(Files.isDirectory(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) {
+                "온디바이스 packager 작업 디렉터리가 변경되었습니다."
+            }
+            val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+            require(attributes.fileKey() == fileKey && path.toRealPath(NOFOLLOW_LINKS) == realPath) {
+                "온디바이스 packager 작업 디렉터리가 변경되었습니다."
+            }
+        }
+
+        companion object {
+            fun capture(directory: Path): TrustedWorkingDirectory {
+                val path = directory.toAbsolutePath().normalize()
+                require(Files.isDirectory(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) {
+                    "온디바이스 packager 작업 디렉터리가 올바르지 않습니다."
+                }
+                val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+                val fileKey = attributes.fileKey()
+                    ?: throw IllegalArgumentException("온디바이스 packager 작업 디렉터리 fileKey가 없습니다.")
+                return TrustedWorkingDirectory(path, path.toRealPath(NOFOLLOW_LINKS), fileKey)
+            }
+        }
+    }
+
     private companion object {
         const val WORKING_DIRECTORY = "ondevice-packager-gate"
         const val TEMPLATE_ASSET = "wrapper-template.apk"
@@ -226,3 +274,8 @@ class OnDeviceWrapperPackager(context: Context) {
         val SHA256 = Regex("[0-9a-f]{64}")
     }
 }
+
+internal data class OnDevicePackagerTestHooks(
+    val afterRequestValidated: (() -> Unit)? = null,
+    val beforeFinalPublish: (() -> Unit)? = null,
+)
