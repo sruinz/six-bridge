@@ -21,3 +21,4 @@ android-manager/schemas/**/*.tmp
 
 # Subagent-driven development scratch state.
 .superpowers/
+.worktrees/
