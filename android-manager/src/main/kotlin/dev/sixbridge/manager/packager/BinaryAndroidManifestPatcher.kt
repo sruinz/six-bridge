@@ -9,6 +9,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.TreeMap
 
 data class WrapperManifestRequest(
     val extensionId: String,
@@ -274,6 +275,9 @@ private class BinaryManifestLayout private constructor(
             var resourceIds: List<Int>? = null
             val attributes = mutableListOf<Attribute>()
             val elements = mutableListOf<String>()
+            val namespaces = mutableListOf<Namespace>()
+            val namespaceDeclarations = mutableListOf<Namespace>()
+            val structure = TemplateStructure()
             var offset = rootHeaderSize
             while (offset < rootSize) {
                 require(offset <= rootSize - CHUNK_HEADER_SIZE) {
@@ -300,12 +304,44 @@ private class BinaryManifestLayout private constructor(
                             requireNotNull(strings) { "resource map 전에 string pool이 필요합니다." },
                         )
                     }
-                    START_NAMESPACE_TYPE, END_NAMESPACE_TYPE -> Unit
+                    START_NAMESPACE_TYPE -> {
+                        require(elements.isEmpty()) {
+                            "binary Android manifest namespace hierarchy가 올바르지 않습니다."
+                        }
+                        val namespace = readNamespace(
+                            bytes,
+                            offset,
+                            headerSize,
+                            size,
+                            requireNotNull(strings) { "namespace 전에 string pool이 필요합니다." },
+                        )
+                        require(namespaces.none { it.prefix == namespace.prefix }) {
+                            "binary Android manifest namespace prefix가 중복되었습니다."
+                        }
+                        namespaces += namespace
+                        namespaceDeclarations += namespace
+                    }
+                    END_NAMESPACE_TYPE -> {
+                        require(elements.isEmpty()) {
+                            "binary Android manifest namespace hierarchy가 올바르지 않습니다."
+                        }
+                        val namespace = readNamespace(
+                            bytes,
+                            offset,
+                            headerSize,
+                            size,
+                            requireNotNull(strings) { "namespace 전에 string pool이 필요합니다." },
+                        )
+                        require(namespaces.removeLastOrNull() == namespace) {
+                            "binary Android manifest namespace 종료 순서가 올바르지 않습니다."
+                        }
+                    }
                     START_ELEMENT_TYPE -> {
                         val pool = requireNotNull(strings) { "element 전에 string pool이 필요합니다." }
                         val map = requireNotNull(resourceIds) { "element 전에 resource map이 필요합니다." }
                         val element = readStartElement(bytes, offset, headerSize, size, pool, map)
                         val parent = elements.lastOrNull()
+                        structure.start(element.name, parent)
                         attributes += element.attributes.map {
                             it.copy(elementName = element.name, parentName = parent)
                         }
@@ -322,9 +358,17 @@ private class BinaryManifestLayout private constructor(
                 }
                 offset += size
             }
-            require(offset == rootSize && elements.isEmpty() && strings != null && resourceIds != null) {
+            require(
+                offset == rootSize &&
+                    elements.isEmpty() &&
+                    namespaces.isEmpty() &&
+                    namespaceDeclarations == listOf(Namespace("android", ANDROID_NAMESPACE)) &&
+                    strings != null &&
+                    resourceIds != null,
+            ) {
                 "binary Android manifest가 완전하지 않습니다."
             }
+            structure.finish()
             return BinaryManifestLayout(requireNotNull(strings), attributes)
         }
 
@@ -350,13 +394,19 @@ private class BinaryManifestLayout private constructor(
             val chunkEnd = offset + size
             require(dataStart in offset..chunkEnd) { "binary Android manifest string data 범위가 올바르지 않습니다." }
             val utf8 = flags and UTF8_FLAG != 0
+            val offsets = hashSetOf<Int>()
+            val payloadRanges = TreeMap<Int, Int>()
+            var decodedBytes = 0L
             return List(stringCount) { index ->
                 val relativeOffset = bytes.u32(offset + headerSize + index * INT_SIZE)
+                require(offsets.add(relativeOffset)) {
+                    "binary Android manifest string offset이 중복되었습니다."
+                }
                 val stringOffset = dataStart.toLong() + relativeOffset
                 require(stringOffset in dataStart.toLong() until chunkEnd.toLong()) {
                     "binary Android manifest string 범위가 올바르지 않습니다."
                 }
-                if (utf8) {
+                val slot = if (utf8) {
                     val (utf16Length, afterUtf16Length) = bytes.readUtf8Length(stringOffset.toInt(), chunkEnd)
                     val (byteLength, payloadOffset) = bytes.readUtf8Length(afterUtf16Length, chunkEnd)
                     require(payloadOffset <= chunkEnd - byteLength - 1 && bytes.u8(payloadOffset + byteLength) == 0) {
@@ -377,6 +427,20 @@ private class BinaryManifestLayout private constructor(
                     require(value.length == length) { "binary Android manifest UTF-16 길이가 올바르지 않습니다." }
                     StringSlot(index, value, payloadOffset, byteLength.toInt(), StandardCharsets.UTF_16LE)
                 }
+                val range = if (utf8) {
+                    bytes.utf8PayloadRange(stringOffset.toInt(), chunkEnd)
+                } else {
+                    bytes.utf16PayloadRange(stringOffset.toInt(), chunkEnd)
+                }
+                require(!payloadRanges.overlaps(range)) {
+                    "binary Android manifest string payload가 중복되었습니다."
+                }
+                payloadRanges[range.start] = range.endExclusive
+                decodedBytes += range.payloadLength
+                require(decodedBytes <= MAX_DECODED_STRING_BYTES) {
+                    "binary Android manifest string data가 너무 큽니다."
+                }
+                slot
             }
         }
 
@@ -464,6 +528,22 @@ private class BinaryManifestLayout private constructor(
             return strings.required(bytes.u32(offset + headerSize + 4)).value
         }
 
+        private fun readNamespace(
+            bytes: ByteArray,
+            offset: Int,
+            headerSize: Int,
+            size: Int,
+            strings: List<StringSlot>,
+        ): Namespace {
+            require(headerSize >= XML_NODE_HEADER_SIZE && size >= headerSize + NAMESPACE_EXTENSION_SIZE) {
+                "binary Android manifest namespace가 잘렸습니다."
+            }
+            return Namespace(
+                prefix = strings.required(bytes.u32(offset + headerSize)).value,
+                uri = strings.required(bytes.u32(offset + headerSize + INT_SIZE)).value,
+            )
+        }
+
         private fun List<StringSlot>.required(index: Int): StringSlot {
             require(index != NO_INDEX && index in indices) { "binary Android manifest string index가 올바르지 않습니다." }
             return this[index]
@@ -483,6 +563,15 @@ private class BinaryManifestLayout private constructor(
             }
         }
 
+        private fun ByteArray.utf8PayloadRange(offset: Int, end: Int): PayloadRange {
+            val (_, afterUtf16Length) = readUtf8Length(offset, end)
+            val (byteLength, contentOffset) = readUtf8Length(afterUtf16Length, end)
+            require(contentOffset <= end - byteLength - 1 && u8(contentOffset + byteLength) == 0) {
+                "binary Android manifest UTF-8 string이 잘렸습니다."
+            }
+            return PayloadRange(offset, contentOffset + byteLength + 1, byteLength)
+        }
+
         private fun ByteArray.readUtf16Length(offset: Int, end: Int): Pair<Int, Int> {
             require(offset <= end - 2) { "binary Android manifest UTF-16 length가 잘렸습니다." }
             val first = u16(offset)
@@ -492,6 +581,17 @@ private class BinaryManifestLayout private constructor(
                 require(offset <= end - 4) { "binary Android manifest UTF-16 length가 잘렸습니다." }
                 (((first and 0x7fff) shl 16) or u16(offset + 2)) to offset + 4
             }
+        }
+
+        private fun ByteArray.utf16PayloadRange(offset: Int, end: Int): PayloadRange {
+            val (length, contentOffset) = readUtf16Length(offset, end)
+            val byteLength = length.toLong() * 2
+            require(
+                byteLength <= Int.MAX_VALUE &&
+                    contentOffset.toLong() + byteLength + 2 <= end &&
+                    u16(contentOffset + byteLength.toInt()) == 0,
+            ) { "binary Android manifest UTF-16 string이 잘렸습니다." }
+            return PayloadRange(offset, contentOffset + byteLength.toInt() + 2, byteLength.toInt())
         }
 
         private fun ByteArray.decode(offset: Int, length: Int, charset: java.nio.charset.Charset): String =
@@ -530,10 +630,12 @@ private class BinaryManifestLayout private constructor(
         private const val STRING_POOL_HEADER_SIZE = 28
         private const val ATTRIBUTE_EXTENSION_SIZE = 20
         private const val END_ELEMENT_EXTENSION_SIZE = 8
+        private const val NAMESPACE_EXTENSION_SIZE = 8
         private const val ATTRIBUTE_SIZE = 20
         private const val TYPED_VALUE_SIZE = 8
         private const val INT_SIZE = 4
         private const val MAX_STRING_COUNT = 100_000
+        private const val MAX_DECODED_STRING_BYTES = 4 * 1024 * 1024L
         private const val NO_INDEX = -1
         private const val UTF8_FLAG = 0x00000100
         private const val TYPE_STRING = 0x03
@@ -543,6 +645,60 @@ private class BinaryManifestLayout private constructor(
         private const val EXTENSION_ID_METADATA = "extension-id"
         private const val ATTRIBUTE_RAW_VALUE_OFFSET = 8
         private const val ATTRIBUTE_TYPED_DATA_OFFSET = 16
+
+        private data class Namespace(val prefix: String, val uri: String)
+
+        private data class PayloadRange(
+            val start: Int,
+            val endExclusive: Int,
+            val payloadLength: Int,
+        )
+
+        private fun TreeMap<Int, Int>.overlaps(range: PayloadRange): Boolean =
+            floorEntry(range.start)?.value?.let { it > range.start } == true ||
+                ceilingEntry(range.start)?.key?.let { it < range.endExclusive } == true
+
+        private class TemplateStructure {
+            private val elements = linkedMapOf<String, Int>()
+
+            fun start(name: String, parent: String?) {
+                when (name) {
+                    "manifest" -> require(parent == null)
+                    "uses-sdk", "application" -> require(parent == "manifest")
+                    "meta-data", "activity", "provider" -> require(parent == "application")
+                    "intent-filter" -> require(parent == "activity")
+                    "action", "category", "data" -> require(parent == "intent-filter")
+                    else -> throw IllegalArgumentException("템플릿 manifest element가 허용 목록에 없습니다.")
+                }
+                elements[name] = (elements[name] ?: 0) + 1
+                when (name) {
+                    "manifest", "uses-sdk", "application", "meta-data", "activity", "provider", "intent-filter", "action", "data" ->
+                        require(elements.getValue(name) == 1) {
+                            "템플릿 manifest element가 중복되었습니다."
+                        }
+                    "category" -> require(elements.getValue(name) <= 2) {
+                        "템플릿 manifest category가 중복되었습니다."
+                    }
+                }
+            }
+
+            fun finish() {
+                require(
+                    elements == mapOf(
+                        "manifest" to 1,
+                        "uses-sdk" to 1,
+                        "application" to 1,
+                        "meta-data" to 1,
+                        "activity" to 1,
+                        "intent-filter" to 1,
+                        "action" to 1,
+                        "category" to 2,
+                        "data" to 1,
+                        "provider" to 1,
+                    ),
+                ) { "템플릿 manifest 구조가 올바르지 않습니다." }
+            }
+        }
     }
 }
 

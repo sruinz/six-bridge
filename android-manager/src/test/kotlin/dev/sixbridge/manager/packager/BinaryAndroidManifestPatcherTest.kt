@@ -143,6 +143,43 @@ class BinaryAndroidManifestPatcherTest {
         }
     }
 
+    @Test
+    fun `service receiver와 값 없는 metadata 추가를 거부한다`() {
+        val service = insertUnknownComponent(templateManifest, "service", "platformBuildVersionCode")
+        val receiver = insertUnknownComponent(templateManifest, "receiver", "platformBuildVersionName")
+        val metadataWithoutValue = insertMetadataWithoutAttributes(templateManifest)
+
+        listOf(service, receiver, metadataWithoutValue).forEach { mutated ->
+            assertFailsWith<IllegalArgumentException> {
+                BinaryAndroidManifestPatcher().patch(mutated, request())
+            }
+        }
+    }
+
+    @Test
+    fun `namespace 종료 누락 순서 URI 불일치와 Android URI 위조를 거부한다`() {
+        val missingEnd = removeNamespaceEnd(templateManifest)
+        val endPrefixMismatch = mutateNamespacePrefix(templateManifest, END_NAMESPACE_TYPE, PLACEHOLDER_ID)
+        val endUriMismatch = mutateNamespaceUri(templateManifest, END_NAMESPACE_TYPE, PLACEHOLDER_ID)
+        val androidUriForgery = mutateNamespaceUri(templateManifest, START_NAMESPACE_TYPE, PLACEHOLDER_ID)
+
+        listOf(missingEnd, endPrefixMismatch, endUriMismatch, androidUriForgery).forEach { mutated ->
+            assertFailsWith<IllegalArgumentException> {
+                BinaryAndroidManifestPatcher().patch(mutated, request())
+            }
+        }
+    }
+
+    @Test
+    fun `string pool offset 중복을 거부한다`() {
+        val mutated = templateManifest.copyOf()
+        duplicateStringValue(mutated, from = "1.0", to = "16")
+
+        assertFailsWith<IllegalArgumentException> {
+            BinaryAndroidManifestPatcher().patch(mutated, request())
+        }
+    }
+
     private fun request() = WrapperManifestRequest(
         extensionId = "bcdefghijklmnopabcdefghijklmnopa",
         versionCode = 42,
@@ -190,6 +227,94 @@ class BinaryAndroidManifestPatcherTest {
         }
         chunks[stringPoolIndex] = chunks[stringPoolIndex].copy(bytes = rebuilt)
         return rebuildXml(bytes, chunks)
+    }
+
+    private fun insertUnknownComponent(bytes: ByteArray, component: String, sourceName: String): ByteArray {
+        val mutated = bytes.copyOf()
+        val slots = stringSlots(mutated)
+        val nameIndex = slots.single { it.value == sourceName }.index
+        replaceShortString(mutated, sourceName, component)
+        val chunks = xmlChunks(mutated).toMutableList()
+        val providerStart = chunks.indexOfFirst { it.type == START_ELEMENT_TYPE && it.name == "provider" }
+        val providerEnd = matchingEnd(chunks, providerStart)
+        val componentChunks = chunks.subList(providerStart, providerEnd + 1).map { chunk ->
+            if (chunk.type == START_ELEMENT_TYPE || chunk.type == END_ELEMENT_TYPE) {
+                chunk.copy(bytes = chunk.bytes.copyOf().also { element ->
+                    element.writeInt(element.u16(2) + 4, nameIndex)
+                })
+            } else {
+                chunk
+            }
+        }
+        val applicationStart = chunks.indexOfFirst { it.type == START_ELEMENT_TYPE && it.name == "application" }
+        chunks.addAll(applicationStart + 1, componentChunks)
+        return rebuildXml(mutated, chunks)
+    }
+
+    private fun insertMetadataWithoutAttributes(bytes: ByteArray): ByteArray {
+        val chunks = xmlChunks(bytes).toMutableList()
+        val metadataStart = chunks.first { it.type == START_ELEMENT_TYPE && it.name == "meta-data" }
+        val metadataEnd = chunks.first { it.type == END_ELEMENT_TYPE && it.name == "meta-data" }
+        val bareStart = metadataStart.bytes.copyOfRange(0, metadataStart.bytes.u16(2) + 20).also { chunk ->
+            chunk.writeInt(4, chunk.size)
+            ByteBuffer.wrap(chunk, chunk.u16(2) + 12, 2)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putShort(0)
+        }
+        val applicationStart = chunks.indexOfFirst { it.type == START_ELEMENT_TYPE && it.name == "application" }
+        chunks.addAll(
+            applicationStart + 1,
+            listOf(
+                XmlChunk(START_ELEMENT_TYPE, "meta-data", bareStart),
+                metadataEnd.copy(bytes = metadataEnd.bytes.copyOf()),
+            ),
+        )
+        return rebuildXml(bytes, chunks)
+    }
+
+    private fun removeNamespaceEnd(bytes: ByteArray): ByteArray = rebuildXml(
+        bytes,
+        xmlChunks(bytes).filterNot { it.type == END_NAMESPACE_TYPE },
+    )
+
+    private fun mutateNamespaceUri(bytes: ByteArray, type: Int, uri: String): ByteArray {
+        val chunks = xmlChunks(bytes).toMutableList()
+        val index = chunks.indexOfFirst { it.type == type }
+        require(index >= 0)
+        val uriIndex = stringSlots(bytes).single { it.value == uri }.index
+        val chunk = chunks[index].bytes.copyOf()
+        chunk.writeInt(chunk.u16(2) + 4, uriIndex)
+        chunks[index] = chunks[index].copy(bytes = chunk)
+        return rebuildXml(bytes, chunks)
+    }
+
+    private fun mutateNamespacePrefix(bytes: ByteArray, type: Int, prefix: String): ByteArray {
+        val chunks = xmlChunks(bytes).toMutableList()
+        val index = chunks.indexOfFirst { it.type == type }
+        require(index >= 0)
+        val prefixIndex = stringSlots(bytes).single { it.value == prefix }.index
+        val chunk = chunks[index].bytes.copyOf()
+        chunk.writeInt(chunk.u16(2), prefixIndex)
+        chunks[index] = chunks[index].copy(bytes = chunk)
+        return rebuildXml(bytes, chunks)
+    }
+
+    private fun replaceShortString(bytes: ByteArray, from: String, to: String) {
+        val slot = stringSlots(bytes).single { it.value == from }
+        val replacement = to.toByteArray(if (slot.utf8) StandardCharsets.UTF_8 else StandardCharsets.UTF_16LE)
+        require(replacement.size < slot.payloadLength)
+        if (slot.utf8) {
+            bytes[slot.payloadOffset - 1] = replacement.size.toByte()
+            replacement.copyInto(bytes, slot.payloadOffset)
+            bytes[slot.payloadOffset + replacement.size] = 0
+        } else {
+            ByteBuffer.wrap(bytes, slot.payloadOffset - 2, 2)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putShort(to.length.toShort())
+            replacement.copyInto(bytes, slot.payloadOffset)
+            bytes[slot.payloadOffset + replacement.size] = 0
+            bytes[slot.payloadOffset + replacement.size + 1] = 0
+        }
     }
 
     private fun moveElementInside(mutated: ByteArray, element: String, parent: String): ByteArray {
@@ -348,6 +473,8 @@ class BinaryAndroidManifestPatcherTest {
     private companion object {
         const val PLACEHOLDER_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val STRING_POOL_TYPE = 0x0001
+        const val START_NAMESPACE_TYPE = 0x0100
+        const val END_NAMESPACE_TYPE = 0x0101
         const val START_ELEMENT_TYPE = 0x0102
         const val END_ELEMENT_TYPE = 0x0103
         const val UTF8_FLAG = 0x00000100

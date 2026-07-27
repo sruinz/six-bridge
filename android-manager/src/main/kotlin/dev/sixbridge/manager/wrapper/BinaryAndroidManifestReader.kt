@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.TreeMap
 
 class BinaryAndroidManifestReader {
     fun read(bytes: ByteArray): BinaryManifestFacts {
@@ -19,6 +20,8 @@ class BinaryAndroidManifestReader {
         var resourceMap: ResourceMap? = null
         var offset = rootHeaderSize
         val elements = mutableListOf<String>()
+        val namespaces = mutableListOf<Namespace>()
+        val namespaceDeclarations = mutableListOf<Namespace>()
         val metadata = linkedMapOf<String, String>()
         val activities = mutableListOf<ArchiveActivity>()
         val providers = mutableListOf<ArchiveProvider>()
@@ -65,7 +68,42 @@ class BinaryAndroidManifestReader {
                         },
                     )
                 }
-                START_NAMESPACE_TYPE, END_NAMESPACE_TYPE -> Unit
+                START_NAMESPACE_TYPE -> {
+                    require(elements.isEmpty()) {
+                        "binary Android manifest namespace hierarchy가 올바르지 않습니다."
+                    }
+                    val namespace = readNamespace(
+                        bytes,
+                        offset,
+                        headerSize,
+                        size,
+                        requireNotNull(strings) {
+                            "binary Android manifest namespace 전에 string pool이 필요합니다."
+                        },
+                    )
+                    require(namespaces.none { it.prefix == namespace.prefix }) {
+                        "binary Android manifest namespace prefix가 중복되었습니다."
+                    }
+                    namespaces += namespace
+                    namespaceDeclarations += namespace
+                }
+                END_NAMESPACE_TYPE -> {
+                    require(elements.isEmpty()) {
+                        "binary Android manifest namespace hierarchy가 올바르지 않습니다."
+                    }
+                    val namespace = readNamespace(
+                        bytes,
+                        offset,
+                        headerSize,
+                        size,
+                        requireNotNull(strings) {
+                            "binary Android manifest namespace 전에 string pool이 필요합니다."
+                        },
+                    )
+                    require(namespaces.removeLastOrNull() == namespace) {
+                        "binary Android manifest namespace 종료 순서가 올바르지 않습니다."
+                    }
+                }
                 START_ELEMENT_TYPE -> {
                     val pool = requireNotNull(strings) {
                         "binary Android manifest element 전에 string pool이 필요합니다."
@@ -247,6 +285,8 @@ class BinaryAndroidManifestReader {
                 intentFilter == null &&
                 manifestSeen &&
                 applicationCount == 1 &&
+                namespaces.isEmpty() &&
+                namespaceDeclarations == listOf(Namespace("android", ANDROID_NAMESPACE)) &&
                 requiredAttributeCounts.values.all { it == 1 },
         ) {
             "binary Android manifest가 완전하지 않습니다."
@@ -357,6 +397,22 @@ class BinaryAndroidManifestReader {
             "binary Android manifest end element가 잘렸습니다."
         }
         return strings.required(bytes.u32(offset + headerSize + 4))
+    }
+
+    private fun readNamespace(
+        bytes: ByteArray,
+        offset: Int,
+        headerSize: Int,
+        size: Int,
+        strings: StringPool,
+    ): Namespace {
+        require(headerSize >= XML_NODE_HEADER_SIZE && size >= headerSize + NAMESPACE_EXTENSION_SIZE) {
+            "binary Android manifest namespace가 잘렸습니다."
+        }
+        return Namespace(
+            prefix = strings.required(bytes.u32(offset + headerSize)),
+            uri = strings.required(bytes.u32(offset + headerSize + INT_SIZE)),
+        )
     }
 
     private fun validateAndroidAttribute(
@@ -474,8 +530,14 @@ class BinaryAndroidManifestReader {
         }
         val utf8 = flags and UTF8_FLAG != 0
         val values = ArrayList<String>(stringCount)
+        val offsets = hashSetOf<Int>()
+        val payloadRanges = TreeMap<Int, Int>()
+        var decodedBytes = 0L
         repeat(stringCount) { index ->
             val relative = bytes.u32(offset + headerSize + index * INT_SIZE)
+            require(offsets.add(relative)) {
+                "binary Android manifest string offset이 중복되었습니다."
+            }
             val stringOffset = stringData.toLong() + relative
             require(stringOffset in stringData.toLong() until chunkEnd.toLong()) {
                 "binary Android manifest string 범위가 올바르지 않습니다."
@@ -484,6 +546,19 @@ class BinaryAndroidManifestReader {
                 bytes.readUtf8(stringOffset.toInt(), chunkEnd)
             } else {
                 bytes.readUtf16(stringOffset.toInt(), chunkEnd)
+            }
+            val range = if (utf8) {
+                bytes.utf8PayloadRange(stringOffset.toInt(), chunkEnd)
+            } else {
+                bytes.utf16PayloadRange(stringOffset.toInt(), chunkEnd)
+            }
+            require(!payloadRanges.overlaps(range)) {
+                "binary Android manifest string payload가 중복되었습니다."
+            }
+            payloadRanges[range.start] = range.endExclusive
+            decodedBytes += range.payloadLength
+            require(decodedBytes <= MAX_DECODED_STRING_BYTES) {
+                "binary Android manifest string data가 너무 큽니다."
             }
         }
         return StringPool(values)
@@ -544,6 +619,15 @@ class BinaryAndroidManifestReader {
         return decode(contentOffset, byteLength, StandardCharsets.UTF_8)
     }
 
+    private fun ByteArray.utf8PayloadRange(offset: Int, end: Int): PayloadRange {
+        val (_, afterUtf16Length) = readUtf8Length(offset, end)
+        val (byteLength, contentOffset) = readUtf8Length(afterUtf16Length, end)
+        require(contentOffset <= end - byteLength - 1 && u8(contentOffset + byteLength) == 0) {
+            "binary Android manifest UTF-8 string이 잘렸습니다."
+        }
+        return PayloadRange(offset, contentOffset + byteLength + 1, byteLength)
+    }
+
     private fun ByteArray.readUtf8Length(offset: Int, end: Int): Pair<Int, Int> {
         require(offset < end) { "binary Android manifest UTF-8 length가 잘렸습니다." }
         val first = u8(offset)
@@ -568,6 +652,19 @@ class BinaryAndroidManifestReader {
             "binary Android manifest UTF-16 terminator가 없습니다."
         }
         return decode(contentOffset, bytesLength, StandardCharsets.UTF_16LE)
+    }
+
+    private fun ByteArray.utf16PayloadRange(offset: Int, end: Int): PayloadRange {
+        val (length, contentOffset) = readUtf16Length(offset, end)
+        val byteLength = length.toLong() * 2
+        require(
+            byteLength <= Int.MAX_VALUE &&
+                contentOffset.toLong() + byteLength + 2 <= end &&
+                u16(contentOffset + byteLength.toInt()) == 0,
+        ) {
+            "binary Android manifest UTF-16 string이 잘렸습니다."
+        }
+        return PayloadRange(offset, contentOffset + byteLength.toInt() + 2, byteLength.toInt())
     }
 
     private fun ByteArray.readUtf16Length(offset: Int, end: Int): Pair<Int, Int> {
@@ -624,10 +721,12 @@ class BinaryAndroidManifestReader {
         const val STRING_POOL_HEADER_SIZE = 28
         const val ATTRIBUTE_EXTENSION_SIZE = 20
         const val END_ELEMENT_EXTENSION_SIZE = 8
+        const val NAMESPACE_EXTENSION_SIZE = 8
         const val ATTRIBUTE_SIZE = 20
         const val TYPED_VALUE_SIZE = 8
         const val INT_SIZE = 4
         const val MAX_STRING_COUNT = 100_000
+        const val MAX_DECODED_STRING_BYTES = 4 * 1024 * 1024L
         const val NO_INDEX = -1
         const val UTF8_FLAG = 0x00000100
         const val TYPE_STRING = 0x03
@@ -657,4 +756,16 @@ class BinaryAndroidManifestReader {
         val resourceId: Int,
         val valueType: Int,
     )
+
+    private data class Namespace(val prefix: String, val uri: String)
+
+    private data class PayloadRange(
+        val start: Int,
+        val endExclusive: Int,
+        val payloadLength: Int,
+    )
+
+    private fun TreeMap<Int, Int>.overlaps(range: PayloadRange): Boolean =
+        floorEntry(range.start)?.value?.let { it > range.start } == true ||
+            ceilingEntry(range.start)?.key?.let { it < range.endExclusive } == true
 }
