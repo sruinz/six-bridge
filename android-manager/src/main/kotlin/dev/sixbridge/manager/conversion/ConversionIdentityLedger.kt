@@ -2,6 +2,9 @@ package dev.sixbridge.manager.conversion
 
 import android.database.sqlite.SQLiteConstraintException
 import java.util.UUID
+import dev.sixbridge.manager.packager.UnreservedIdentityLease
+import dev.sixbridge.manager.packager.UnreservedIdentityCleaner
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -81,6 +84,21 @@ class ConversionIdentityLedger(
             throw IllegalArgumentException("package identity binding이 다른 설치 신원과 충돌합니다.")
         }
         stored.toReserved()
+    }
+
+    internal suspend fun discardUnreservedIdentity(
+        lease: UnreservedIdentityLease,
+        packager: OnDeviceWrapperPackager,
+    ): Boolean = discardUnreservedIdentity(lease, packager.unreservedIdentityCleaner)
+
+    internal suspend fun discardUnreservedIdentity(
+        lease: UnreservedIdentityLease,
+        cleaner: UnreservedIdentityCleaner,
+    ): Boolean = reserveMutex.withLock {
+        require(dao.get(lease.identitySha256) == null) {
+            "원장에 예약된 CRX 신원은 미예약 cleanup으로 삭제할 수 없습니다."
+        }
+        cleaner.discardUnreservedIdentity(lease)
     }
 
     suspend fun listExistingTargets(

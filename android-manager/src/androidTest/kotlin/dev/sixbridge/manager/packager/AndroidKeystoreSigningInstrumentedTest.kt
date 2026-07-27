@@ -107,6 +107,21 @@ class AndroidKeystoreSigningInstrumentedTest {
     }
 
     @Test
+    fun existingIdentityLookupFailsClosedAndExplicitOwnedDeleteDoesNotRecreateKey() {
+        val identitySha256 = "c".repeat(64)
+        assertPolicyRejected { store.existingCrxIdentity(identitySha256) }
+        val created = store.crxIdentity(identitySha256)
+
+        assertTrue(store.deleteCrxIdentity(identitySha256, created.alias))
+        assertPolicyRejected { store.existingCrxIdentity(identitySha256) }
+        assertFalse(
+            runCatching {
+                store.deleteCrxIdentity(identitySha256, "$namespace.crx.rsa.v1.${"d".repeat(64)}")
+            }.isSuccess,
+        )
+    }
+
+    @Test
     fun keystoreSignerCreatesV2AndV3WrapperWithItsCertificate() {
         val crx = Crx3Writer.create(MINIMAL_ZIP, store.crxSigningKey(SOURCE_A))
         val unsigned = buildUnsignedWrapper(crx.extensionId, crx.bytes)

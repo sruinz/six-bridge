@@ -4,6 +4,7 @@ import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Writer
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -84,13 +85,14 @@ class AlignedApkAssemblerTest {
     }
 
     @Test
-    fun `128 MiB를 초과하는 CRX는 거부한다`() {
+    fun `128 MiB source와 최대 header 예산을 초과하는 CRX는 거부한다`() {
         val output = File(work, "too-large.apk")
-        val tooLarge = ByteArray(MAX_CRX_BYTES + 1)
+        val tooLarge = File(work, "too-large.crx")
+        RandomAccessFile(tooLarge, "rw").use { it.setLength(MAX_CRX_BYTES.toLong() + 1) }
 
         assertFailsWith<IllegalArgumentException> {
             assembler().assemble(
-                ApkAssemblyRequest(template, manifestBytes, tooLarge, output),
+                ApkAssemblyPathRequest(template, manifestBytes, tooLarge, output),
             )
         }
         assertTrue(!output.exists())
@@ -326,7 +328,7 @@ class AlignedApkAssemblerTest {
         ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffffffffL
 
     private companion object {
-        const val MAX_CRX_BYTES = 128 * 1024 * 1024
+        const val MAX_CRX_BYTES = 129 * 1024 * 1024 + 12
     }
 }
     private fun ByteArray.putLeInt(offset: Int, value: Int) {

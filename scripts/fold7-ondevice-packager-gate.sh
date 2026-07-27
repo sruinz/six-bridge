@@ -208,6 +208,8 @@ main() {
     adb -s "$SERIAL" shell am instrument -w -r -e class \
         "${GATE_CLASS}#generateV1AndPersistIdentityEvidence" "$INSTRUMENTATION" ||
         fail 'V1 instrumentation method가 실패했습니다.' 3
+    adb -s "$SERIAL" shell am force-stop dev.sixbridge.manager ||
+        fail 'V1 뒤 manager process force-stop에 실패했습니다.' 3
     adb -s "$SERIAL" shell am instrument -w -r -e class \
         "${GATE_CLASS}#generateV2AfterProcessRestartAndMatchIdentity" "$INSTRUMENTATION" ||
         fail 'V2 instrumentation method가 실패했습니다.' 3

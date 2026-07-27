@@ -11,6 +11,8 @@
 
 - `generateV1AndPersistIdentityEvidence`: `OK (1 test)`
 - 별도 process의 `generateV2AfterProcessRestartAndMatchIdentity`: `OK (1 test)`
+- host gate는 두 method 사이에 `am force-stop dev.sixbridge.manager`를 실행해
+  실제 app process 종료 뒤 Android Keystore 신원과 예약 binding이 유지되는지 검증한다.
 - host `apksigner` 검증: v2는 `--min-sdk-version 24`, v3는
   `--min-sdk-version 30`으로 각각 성공했다.
 - `resources.arsc`가 STORED이고 APK local header의 파일 데이터 offset이

@@ -3,6 +3,7 @@ package dev.sixbridge.manager.conversion
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.manager.packager.OnDeviceWrapperResult
 import java.io.ByteArrayOutputStream
@@ -37,7 +38,9 @@ class GeneratedBundleStoreTest {
         val store = store(
             verifier = GeneratedWrapperVerifier { wrapper, descriptor, report ->
                 verifiedWrapper = wrapper.readBytes()
-                descriptor == result.descriptor && report == result.compatibility
+                descriptor == result.descriptor &&
+                    BundleJson.encodeCompatibility(report) ==
+                    BundleJson.encodeCompatibility(result.compatibility)
             },
         )
 
@@ -50,6 +53,28 @@ class GeneratedBundleStoreTest {
         assertEquals(result.compatibility, reopened.compatibility)
         assertEquals(sha256(generated.file), generated.sha256)
         assertEquals(File(filesDir, "generated-bundles/$token.six"), generated.file)
+    }
+
+    @Test
+    fun `비정렬 v4 report는 package publish restart에서 canonical JSON identity를 유지한다`() {
+        val original = result()
+        val unsorted = original.compatibility.copy(
+            declaredPermissions = listOf("z.permission", "a.permission"),
+            usedApis = listOf("chrome.z", "chrome.a"),
+        )
+        val expectedJson = BundleJson.encodeCompatibility(unsorted)
+        val first = store(
+            verifier = GeneratedWrapperVerifier { _, _, report ->
+                BundleJson.encodeCompatibility(report) == expectedJson
+            },
+        )
+
+        first.publish(token, original.copy(compatibility = unsorted))
+        val reopened = store().open(token).use(SixBundleContract::read)
+
+        assertEquals(expectedJson, BundleJson.encodeCompatibility(reopened.compatibility))
+        assertEquals(listOf("a.permission", "z.permission"), reopened.compatibility.declaredPermissions)
+        assertEquals(listOf("chrome.a", "chrome.z"), reopened.compatibility.usedApis)
     }
 
     @Test
@@ -90,6 +115,27 @@ class GeneratedBundleStoreTest {
             symlinkStore.publish(token, result())
         }
         assertFalse(target.exists())
+    }
+
+    @Test
+    fun `검증 뒤 같은 inode size mtime 복원 변조를 publish하지 않는다`() {
+        var originalTime: FileTime? = null
+        val store = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterBundleWritten = { originalTime = Files.getLastModifiedTime(it.toPath()) },
+                afterBundleVerified = { file ->
+                    val bytes = file.readBytes()
+                    bytes[0] = (bytes[0].toInt() xor 1).toByte()
+                    file.writeBytes(bytes)
+                    Files.setLastModifiedTime(file.toPath(), requireNotNull(originalTime))
+                },
+            ),
+        )
+
+        assertFailsWith<GeneratedBundleStoreException> {
+            store.publish(token, result())
+        }
+        assertFalse(bundleFile().exists())
     }
 
     @Test
@@ -278,8 +324,44 @@ class GeneratedBundleStoreTest {
             ),
         )
         val retained = failing.publish(cleanupToken, result("retained.apk"))
-        assertFalse(failing.discard(cleanupToken))
+        val error = assertFailsWith<GeneratedBundleStoreException> {
+            failing.discard(cleanupToken)
+        }
+        assertEquals(GeneratedBundleStoreErrorCode.CLEANUP_FAILED, error.code)
         assertTrue(retained.file.exists())
+    }
+
+    @Test
+    fun `discard는 손상된 exact owned token만 제거하고 symlink hardlink는 명시 오류로 거부한다`() {
+        val corruptedStore = store()
+        val corrupted = corruptedStore.publish(token, result()).file
+        corrupted.setWritable(true)
+        corrupted.writeText("corrupt")
+        assertTrue(corruptedStore.discard(token))
+        assertFalse(corrupted.exists())
+
+        val symlinkToken = UUID.randomUUID().toString()
+        val target = File(filesDir, "outside.six").apply { writeText("keep") }
+        Files.createSymbolicLink(
+            File(filesDir, "generated-bundles/$symlinkToken.six").toPath(),
+            target.toPath(),
+        )
+        val symlinkError = assertFailsWith<GeneratedBundleStoreException> {
+            store().discard(symlinkToken)
+        }
+        assertEquals(GeneratedBundleStoreErrorCode.INVALID_INPUT, symlinkError.code)
+        assertEquals("keep", target.readText())
+
+        val hardlinkToken = UUID.randomUUID().toString()
+        Files.createLink(
+            File(filesDir, "generated-bundles/$hardlinkToken.six").toPath(),
+            target.toPath(),
+        )
+        val hardlinkError = assertFailsWith<GeneratedBundleStoreException> {
+            store().discard(hardlinkToken)
+        }
+        assertEquals(GeneratedBundleStoreErrorCode.INVALID_INPUT, hardlinkError.code)
+        assertEquals("keep", target.readText())
     }
 
     @Test

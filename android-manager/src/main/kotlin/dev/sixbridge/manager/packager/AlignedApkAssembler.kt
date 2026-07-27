@@ -377,8 +377,8 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
     private companion object {
         val REQUIRED_ENTRY_NAMES = listOf("AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/extension.crx")
-        const val MAX_CRX_SIZE = 128L * 1024L * 1024L
-        const val MAX_ENTRY_SIZE = 128L * 1024L * 1024L
+        const val MAX_CRX_SIZE = 129L * 1024L * 1024L + 12L
+        const val MAX_ENTRY_SIZE = MAX_CRX_SIZE
         const val MAX_OUTPUT_SIZE = 256L * 1024L * 1024L
         const val STREAM_BUFFER_SIZE = 64 * 1024
         const val STORED = 0

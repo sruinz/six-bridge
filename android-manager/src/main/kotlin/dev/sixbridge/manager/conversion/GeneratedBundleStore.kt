@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import android.content.Context
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.bundle.SixBundleContract
@@ -61,6 +62,7 @@ fun interface GeneratedWrapperVerifier {
 
 internal data class GeneratedBundleStoreHooks(
     val afterBundleWritten: (File) -> Unit = {},
+    val afterBundleVerified: (File) -> Unit = {},
     val beforeFinalPublish: (File) -> Unit = {},
     val afterCopyChunk: () -> Unit = {},
     val deleteFile: ((File) -> Boolean)? = null,
@@ -118,6 +120,7 @@ class GeneratedBundleStore internal constructor(
                     result.descriptor,
                     result.compatibility,
                 )
+                hooks.afterBundleVerified(temporary)
                 root.verifyUnchanged()
                 hooks.beforeFinalPublish(output.toFile())
                 root.verifyUnchanged()
@@ -138,6 +141,10 @@ class GeneratedBundleStore internal constructor(
                 ) {
                     "생성 bundle identity가 publish 중 변경되었습니다."
                 }
+                require(sha256(output) == verified.sha256) {
+                    "생성 bundle이 검증 뒤 publish 중 변경되었습니다."
+                }
+                requireStableFile(output.toFile(), publishedState, "publish 후 hash 검증")
                 val record = PublishedBundle(
                     sha256 = verified.sha256,
                     state = publishedState,
@@ -245,22 +252,18 @@ class GeneratedBundleStore internal constructor(
         if (!isToken(token)) return@synchronized false
         val file = directChild(root.path, "$token.six").toFile()
         if (!Files.exists(file.toPath(), NOFOLLOW_LINKS)) return@synchronized false
-        val record = published[token] ?: runCatching {
-            recoverPublished(token, file).record
-        }.getOrElse {
-            return@synchronized false
-        }
-        if (runCatching {
-                root.verifyUnchanged()
-                requireStableFile(file, record.state, "discard")
-            }.isFailure
-        ) {
-            return@synchronized false
-        }
+        root.verifyUnchanged()
+        requireDirectFile(file, "discard bundle")
         val deleted = hooks.deletePublishedFile?.let {
             it(file) && !Files.exists(file.toPath(), NOFOLLOW_LINKS)
         } ?: deleteOwnedFile(file)
-        if (!deleted) return@synchronized false
+        if (!deleted) {
+            throw GeneratedBundleStoreException(
+                GeneratedBundleStoreErrorCode.CLEANUP_FAILED,
+                "생성 bundle을 제거할 수 없습니다.",
+            )
+        }
+        forceDirectory(root.path)
         published.remove(token)
         true
         }
@@ -315,11 +318,7 @@ class GeneratedBundleStore internal constructor(
                 val sha256 = hashChannel(channel)
                 requireStableFile(bundle, state, "bundle hash 검증")
                 channel.position(0)
-                val bounded = GeneratedBoundedChannelInputStream(channel, state.size)
-                val contents = SixBundleContract.read(bounded, extractedPath)
-                require(bounded.remaining == 0L) {
-                    "SixBundle reader가 전체 bundle snapshot을 소비하지 않았습니다."
-                }
+                val contents = SixBundleContract.read(bundle.toPath(), extractedPath)
                 requireStableFile(bundle, state, "SixBundle 재검증")
                 VerifiedContents(
                     sha256 = sha256,
@@ -330,7 +329,8 @@ class GeneratedBundleStore internal constructor(
             if (expectedDescriptor != null || expectedReport != null) {
                 require(
                     verified.extension == expectedDescriptor &&
-                        verified.compatibility == expectedReport,
+                        BundleJson.encodeCompatibility(verified.compatibility) ==
+                        expectedReport?.let(BundleJson::encodeCompatibility),
                 ) {
                     "SixBundle 재검증 결과가 package 결과와 일치하지 않습니다."
                 }
@@ -399,7 +399,8 @@ class GeneratedBundleStore internal constructor(
         }
         require(
             recovered.record.extension == result.descriptor &&
-                recovered.record.compatibility == result.compatibility &&
+                BundleJson.encodeCompatibility(recovered.record.compatibility) ==
+                BundleJson.encodeCompatibility(result.compatibility) &&
                 recovered.record.extension.wrapperSha256 == result.wrapperSha256,
         ) {
             "같은 token에 다른 생성 bundle이 이미 게시되었습니다."
@@ -419,6 +420,10 @@ class GeneratedBundleStore internal constructor(
             forceDirectory(root.path)
         }
         val state = requireDirectFile(file, "recovered bundle")
+        require(sha256(file.toPath()) == verified.sha256) {
+            "복구한 생성 bundle이 검증 뒤 변경되었습니다."
+        }
+        requireStableFile(file, state, "복구 후 hash 검증")
         val record = PublishedBundle(
             sha256 = verified.sha256,
             state = state,
@@ -465,6 +470,19 @@ class GeneratedBundleStore internal constructor(
             }
         }
     }
+
+    private fun sha256(path: Path): String =
+        Files.newInputStream(path, NOFOLLOW_LINKS).use { input ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(STREAM_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(count > 0) { "생성 bundle hash 읽기가 진행되지 않습니다." }
+                digest.update(buffer, 0, count)
+            }
+            digest.digest().toHex()
+        }
 
     private fun rejectPublishTarget(output: Path) {
         require(output.parent == root.path) {

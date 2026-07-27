@@ -13,6 +13,7 @@ import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
+import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -34,6 +35,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.FixMethodOrder
 import org.junit.Test
 import org.junit.runners.MethodSorters
@@ -213,10 +215,9 @@ class OnDevicePackagerGateInstrumentedTest {
         val output = File(root, "passthrough.apk")
         val result = packager.packageWrapper(
             OnDeviceWrapperRequest(
-                identityKey = identityKey,
+                reservation = reservation(identityKey, identity, 1),
                 canonicalSourceZip = null,
                 passthroughCrx = originalCrx,
-                versionCode = 1,
                 descriptorName = "SIX Bridge On-Device Gate",
                 descriptorVersion = "1.0",
                 sourceKind = "CRX3",
@@ -232,6 +233,68 @@ class OnDevicePackagerGateInstrumentedTest {
         assertEquals(proof.extensionId, result.extensionId)
         assertEquals(report, result.compatibility)
         assertFalse(keyStore.containsAlias(forbiddenAlias))
+    }
+
+    @Test
+    fun unreservedCreateNewLeaseRecoversAcrossRestartAndReservationConsumesOwner() {
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(
+                UUID.randomUUID().toString().replace("-", ""),
+            ),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
+        val packager = OnDeviceWrapperPackager(context)
+        val lease = packager.resolveUnreservedIdentity(identityKey)
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val alias = requireNotNull(lease.identity.crxKeyAlias)
+        assertTrue(keyStore.containsAlias(alias))
+
+        val restartedPackager = OnDeviceWrapperPackager(context)
+        val recovered = restartedPackager.recoverUnreservedIdentity(lease.cleanupToken)
+        assertEquals(lease.identitySha256, recovered.identitySha256)
+        val source = canonicalSourceZip()
+        val reserved = reservation(identityKey, recovered.identity, 1)
+        restartedPackager.packageWrapper(
+            OnDeviceWrapperRequest(
+                reservation = reserved,
+                canonicalSourceZip = source,
+                passthroughCrx = null,
+                descriptorName = "SIX Bridge On-Device Gate",
+                descriptorVersion = "1.0",
+                sourceKind = "ZIP",
+                compatibility = compatibility(
+                    extensionId = recovered.identity.extensionId,
+                    sourceSha256 = sha256(source),
+                    conversionState = "converted",
+                    originalExtensionId = ORIGINAL_EXTENSION_ID,
+                ),
+                outputApk = File(root, "lease-reserved.apk"),
+            ),
+        )
+        assertTrue(keyStore.containsAlias(alias))
+        assertThrows(IllegalArgumentException::class.java) {
+            restartedPackager.recoverUnreservedIdentity(lease.cleanupToken)
+        }
+    }
+
+    @Test
+    fun packagerStartupReconcilesOnlyOwnedDirectTemporaryFiles() {
+        val owned = listOf(
+            ".source.interrupted.bin",
+            ".extension.interrupted.crx",
+            ".wrapper-template.interrupted.apk",
+            ".unsigned.interrupted.apk",
+            ".signed.interrupted.apk",
+            "..unsigned.interrupted.apk.tmp",
+            "..signed.interrupted.apk.tmp",
+        ).map { File(root, it).apply { writeText("orphan") } }
+        val unrelated = File(root, "keep.apk").apply { writeText("keep") }
+
+        OnDeviceWrapperPackager(context)
+
+        owned.forEach { assertFalse(it.exists()) }
+        assertTrue(unrelated.exists())
     }
 
     @Test
@@ -330,12 +393,15 @@ class OnDevicePackagerGateInstrumentedTest {
         versionCode: Int,
         output: File,
     ): OnDeviceWrapperRequest {
-        val identity = packager.resolveIdentity(CONVERTED_KEY, null)
+        val identity = runCatching {
+            packager.resolveIdentity(CONVERTED_KEY, null)
+        }.getOrElse {
+            packager.resolveUnreservedIdentity(CONVERTED_KEY).identity
+        }
         return OnDeviceWrapperRequest(
-            identityKey = CONVERTED_KEY,
+            reservation = reservation(CONVERTED_KEY, identity, versionCode),
             canonicalSourceZip = source,
             passthroughCrx = null,
-            versionCode = versionCode,
             descriptorName = "SIX Bridge On-Device Gate",
             descriptorVersion = "1.0",
             sourceKind = "ZIP",
@@ -348,6 +414,19 @@ class OnDevicePackagerGateInstrumentedTest {
             outputApk = output,
         )
     }
+
+    private fun reservation(
+        identityKey: InstallationIdentityKey,
+        identity: OnDevicePackageIdentity,
+        versionCode: Int,
+    ) = ReservedConversionIdentity(
+        identityKey = identityKey,
+        extensionId = identity.extensionId,
+        packageName = identity.packageName,
+        wrapperSignerSha256 = identity.wrapperSignerSha256,
+        crxKeyAlias = identity.crxKeyAlias,
+        versionCode = versionCode,
+    )
 
     private fun compatibility(
         extensionId: String,

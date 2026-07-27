@@ -1,5 +1,8 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.manager.packager.OnDevicePackageIdentity
+import dev.sixbridge.manager.packager.UnreservedIdentityCleaner
+import dev.sixbridge.manager.packager.UnreservedIdentityLease
 import java.util.UUID
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -120,6 +123,36 @@ class ConversionIdentityLedgerTest {
             assertEquals(original, reserved.identityKey)
             assertEquals(binding.crxKeyAlias, reserved.crxKeyAlias)
             assertEquals(2, reserved.versionCode)
+        }
+
+    @Test
+    fun `미예약 cleanup은 원장 예약 전만 허용하고 예약 뒤 update key는 삭제하지 않는다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(dao)
+            val key = stableKey()
+            val binding = bindingFor(key)
+            val identity = OnDevicePackageIdentity(
+                extensionId = binding.extensionId,
+                packageName = binding.packageName,
+                wrapperSignerSha256 = binding.wrapperSignerSha256,
+                crxKeyAlias = binding.crxKeyAlias,
+                crxPublicKeyDer = byteArrayOf(1),
+            )
+            val lease = UnreservedIdentityLease(key.identitySha256, identity, UUID.randomUUID())
+            var cleanupCalls = 0
+            val cleaner = UnreservedIdentityCleaner {
+                cleanupCalls += 1
+                true
+            }
+
+            assertTrue(ledger.discardUnreservedIdentity(lease, cleaner))
+            assertEquals(1, cleanupCalls)
+            ledger.reserve(reservation(key, binding = binding))
+            assertFailsWith<IllegalArgumentException> {
+                ledger.discardUnreservedIdentity(lease, cleaner)
+            }
+            assertEquals(1, cleanupCalls)
         }
 
     @Test

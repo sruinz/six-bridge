@@ -197,6 +197,7 @@ case "$1" in
   shell)
     shift
     case "$*" in
+      *'am force-stop dev.sixbridge.manager'*) :;;
       *'am instrument'*)
         case "$*" in
           *generateV1*) [ "${INSTRUMENT_FAIL:-}" = V1 ] && exit 1;;
@@ -274,6 +275,9 @@ main() {
     output="${FIXTURE_ROOT}/gate.log"
     run_gate "$output" serial-1
     assert_contains "$output" 'Host-side checks passed.' '정상 host gate가 성공하지 않았습니다.'
+    assert_contains "${FIXTURE_ROOT}/adb.log" \
+        'shell am force-stop dev.sixbridge.manager' \
+        'V1/V2 사이 실제 app process force-stop이 실행되지 않았습니다.'
     assert_contains "${FIXTURE_ROOT}/adb.log" 'install' 'v1/v2 install이 실행되지 않았습니다.'
     v1_install_line=$(grep -nE ' install [^ ]*gate-v1\.apk$' "${FIXTURE_ROOT}/adb.log" |
         sed -n '1s/:.*//p')

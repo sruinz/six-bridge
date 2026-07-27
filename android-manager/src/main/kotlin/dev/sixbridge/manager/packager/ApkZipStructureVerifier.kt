@@ -258,7 +258,7 @@ object ApkZipStructureVerifier {
 
     private const val MIN_ARCHIVE_SIZE = 22L
     private const val MAX_ARCHIVE_SIZE = 256L * 1024L * 1024L
-    private const val MAX_ENTRY_SIZE = 128L * 1024L * 1024L
+    private const val MAX_ENTRY_SIZE = 129L * 1024L * 1024L + 12L
     private const val MAX_ENTRIES = 64
     private const val MAX_METADATA_READ = 128 * 1024
     private const val COPY_BUFFER_SIZE = 64 * 1024

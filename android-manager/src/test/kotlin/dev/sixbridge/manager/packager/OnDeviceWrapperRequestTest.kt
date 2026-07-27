@@ -10,6 +10,7 @@ import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
+import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.KeyPairGenerator
@@ -52,13 +53,17 @@ class OnDeviceWrapperRequestTest {
         val identity = packageIdentity(passthroughProof.extensionId)
 
         assertFailsWith<IllegalArgumentException> {
-            passthroughRequest().copy(identityKey = convertedKey).validateFor(
+            passthroughRequest().copy(
+                reservation = reservation(convertedKey, passthroughProof.extensionId),
+            ).validateFor(
                 identity,
                 passthroughCrx,
             )
         }
         assertFailsWith<IllegalArgumentException> {
-            convertedRequest().copy(identityKey = passthroughKey).validateFor(
+            convertedRequest().copy(
+                reservation = reservation(passthroughKey, passthroughProof.extensionId),
+            ).validateFor(
                 identity,
                 passthroughCrx,
             )
@@ -108,7 +113,7 @@ class OnDeviceWrapperRequestTest {
     }
 
     @Test
-    fun `compatibility 목록 순서를 보존하면서 중첩 목록만 방어적으로 복사한다`() {
+    fun `compatibility를 canonical JSON 순서로 snapshot한다`() {
         val report = compatibility(
             extensionId = passthroughProof.extensionId,
             sourceSha256 = passthroughProof.zipSha256,
@@ -132,11 +137,28 @@ class OnDeviceWrapperRequestTest {
             passthroughCrx,
         )
 
-        assertEquals(listOf("z.permission", "a.permission"), validated.compatibility.declaredPermissions)
-        assertEquals(listOf("chrome.z", "chrome.a"), validated.compatibility.usedApis)
-        assertEquals(listOf("z-adapter", "a-adapter"), validated.compatibility.adapterDecisions.map { it.id })
-        assertEquals(report, validated.compatibility)
+        assertEquals(listOf("a.permission", "z.permission"), validated.compatibility.declaredPermissions)
+        assertEquals(listOf("chrome.a", "chrome.z"), validated.compatibility.usedApis)
+        assertEquals(listOf("a-adapter", "z-adapter"), validated.compatibility.adapterDecisions.map { it.id })
         assertNotSame(report.declaredPermissions, validated.compatibility.declaredPermissions)
+    }
+
+    @Test
+    fun `예약 신원의 alias extension package signer가 하나라도 다르면 거부한다`() {
+        val identity = packageIdentity(passthroughProof.extensionId)
+        val request = passthroughRequest()
+        listOf(
+            request.reservation.copy(extensionId = "abcdefghijklmnopabcdefghijklmnop"),
+            request.reservation.copy(
+                packageName = "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
+            ),
+            request.reservation.copy(wrapperSignerSha256 = "0".repeat(64)),
+            request.reservation.copy(crxKeyAlias = "unexpected"),
+        ).forEach { changed ->
+            assertFailsWith<IllegalArgumentException> {
+                request.copy(reservation = changed).validateFor(identity, passthroughCrx)
+            }
+        }
     }
 
     @Test
@@ -167,10 +189,9 @@ class OnDeviceWrapperRequestTest {
             sourceSha256 = passthroughProof.zipSha256,
         ),
     ) = OnDeviceWrapperRequest(
-        identityKey = passthroughKey,
+        reservation = reservation(passthroughKey, passthroughProof.extensionId),
         canonicalSourceZip = null,
         passthroughCrx = passthroughCrx,
-        versionCode = 1,
         descriptorName = "SIX 테스트",
         descriptorVersion = "1.0",
         sourceKind = "CRX3",
@@ -179,10 +200,9 @@ class OnDeviceWrapperRequestTest {
     )
 
     private fun convertedRequest() = OnDeviceWrapperRequest(
-        identityKey = convertedKey,
+        reservation = reservation(convertedKey, passthroughProof.extensionId, "test.alias"),
         canonicalSourceZip = canonicalZip,
         passthroughCrx = null,
-        versionCode = 1,
         descriptorName = "SIX 테스트",
         descriptorVersion = "1.0",
         sourceKind = "ZIP",
@@ -199,6 +219,19 @@ class OnDeviceWrapperRequestTest {
         wrapperSignerSha256 = "f".repeat(64),
         crxKeyAlias = null,
         crxPublicKeyDer = null,
+    )
+
+    private fun reservation(
+        key: InstallationIdentityKey,
+        extensionId: String,
+        alias: String? = null,
+    ) = ReservedConversionIdentity(
+        identityKey = key,
+        extensionId = extensionId,
+        packageName = "dev.sixbridge.ext.$extensionId",
+        wrapperSignerSha256 = "f".repeat(64),
+        crxKeyAlias = alias,
+        versionCode = 1,
     )
 
     private fun identityKey(mode: InstallationIdentityMode) = InstallationIdentityKey.create(

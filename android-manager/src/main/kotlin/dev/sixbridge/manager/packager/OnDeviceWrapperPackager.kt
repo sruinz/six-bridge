@@ -9,6 +9,7 @@ import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
+import dev.sixbridge.manager.conversion.ReservedConversionIdentity
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -24,15 +25,16 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
+import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.zip.ZipFile
+import java.util.UUID
 
 data class OnDeviceWrapperRequest(
-    val identityKey: InstallationIdentityKey,
+    val reservation: ReservedConversionIdentity,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
-    val versionCode: Int,
     val descriptorName: String,
     val descriptorVersion: String,
     val sourceKind: String,
@@ -41,10 +43,9 @@ data class OnDeviceWrapperRequest(
 )
 
 data class OnDeviceWrapperPathRequest(
-    val identityKey: InstallationIdentityKey,
+    val reservation: ReservedConversionIdentity,
     val canonicalSourceZip: File?,
     val passthroughCrx: File?,
-    val versionCode: Int,
     val descriptorName: String,
     val descriptorVersion: String,
     val sourceKind: String,
@@ -60,6 +61,19 @@ data class OnDevicePackageIdentity(
     val crxPublicKeyDer: ByteArray?,
 )
 
+class UnreservedIdentityLease internal constructor(
+    val identitySha256: String,
+    val identity: OnDevicePackageIdentity,
+    internal val ownerToken: UUID,
+) {
+    val cleanupToken: String
+        get() = ownerToken.toString()
+}
+
+internal fun interface UnreservedIdentityCleaner {
+    fun discardUnreservedIdentity(lease: UnreservedIdentityLease): Boolean
+}
+
 data class OnDeviceWrapperResult(
     val extensionId: String,
     val packageName: String,
@@ -73,10 +87,9 @@ data class OnDeviceWrapperResult(
 )
 
 internal data class ValidatedOnDeviceWrapperRequest(
-    val identityKey: InstallationIdentityKey,
+    val reservation: ReservedConversionIdentity,
     val canonicalSourceZip: ByteArray?,
     val passthroughCrx: ByteArray?,
-    val versionCode: Int,
     val descriptorName: String,
     val descriptorVersion: String,
     val sourceKind: String,
@@ -85,10 +98,9 @@ internal data class ValidatedOnDeviceWrapperRequest(
 )
 
 private data class ValidatedPathWrapperRequest(
-    val identityKey: InstallationIdentityKey,
+    val reservation: ReservedConversionIdentity,
     val canonicalSourceZip: Path?,
     val passthroughCrx: Path?,
-    val versionCode: Int,
     val descriptorName: String,
     val descriptorVersion: String,
     val sourceKind: String,
@@ -115,6 +127,12 @@ class OnDeviceWrapperPackager(context: Context) {
         AndroidArchiveInspector(appContext.packageManager),
         workingDirectory.path.toFile(),
     )
+    internal val unreservedIdentityCleaner =
+        UnreservedIdentityCleaner(::discardOwnedUnreservedIdentity)
+
+    init {
+        reconcileOwnedTemporaryFiles()
+    }
 
     @Synchronized
     fun resolveIdentity(
@@ -168,7 +186,7 @@ class OnDeviceWrapperPackager(context: Context) {
                 require(passthroughProof == null) {
                     "converted 신원에는 passthrough CRX3를 사용할 수 없습니다."
                 }
-                val crxIdentity = identityStore.crxIdentity(identityKey.identitySha256)
+                val crxIdentity = identityStore.existingCrxIdentity(identityKey.identitySha256)
                 val publicKey = crxIdentity.certificate.publicKey.encoded.copyOf()
                 val extensionId = Crx3.extensionId(publicKey)
                 OnDevicePackageIdentity(
@@ -182,6 +200,127 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
+    private fun resolveReservedIdentity(
+        reservation: ReservedConversionIdentity,
+        passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
+    ): OnDevicePackageIdentity {
+        val wrapperIdentity = identityStore.existingWrapperIdentity()
+        val wrapperSignerSha256 = sha256(wrapperIdentity.certificate.encoded)
+        val current = when (reservation.identityKey.mode) {
+            InstallationIdentityMode.PASSTHROUGH -> {
+                val proof = passthroughProof
+                    ?: throw IllegalArgumentException("passthrough 예약에는 원본 CRX3가 필요합니다.")
+                OnDevicePackageIdentity(
+                    extensionId = proof.extensionId,
+                    packageName = "dev.sixbridge.ext.${proof.extensionId}",
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxKeyAlias = null,
+                    crxPublicKeyDer = null,
+                )
+            }
+            InstallationIdentityMode.CONVERTED -> {
+                require(passthroughProof == null) {
+                    "converted 예약에는 passthrough CRX3를 사용할 수 없습니다."
+                }
+                val crxIdentity = identityStore.existingCrxIdentity(reservation.identitySha256)
+                val publicKey = crxIdentity.certificate.publicKey.encoded.copyOf()
+                val extensionId = Crx3.extensionId(publicKey)
+                OnDevicePackageIdentity(
+                    extensionId = extensionId,
+                    packageName = "dev.sixbridge.ext.$extensionId",
+                    wrapperSignerSha256 = wrapperSignerSha256,
+                    crxKeyAlias = crxIdentity.alias,
+                    crxPublicKeyDer = publicKey,
+                )
+            }
+        }
+        require(
+            reservation.extensionId == current.extensionId &&
+                reservation.packageName == current.packageName &&
+                reservation.wrapperSignerSha256 == current.wrapperSignerSha256 &&
+                reservation.crxKeyAlias == current.crxKeyAlias,
+        ) {
+            "예약된 설치 신원과 현재 Android Keystore package identity가 일치하지 않습니다."
+        }
+        return current
+    }
+
+    @Synchronized
+    fun resolveUnreservedIdentity(identityKey: InstallationIdentityKey): UnreservedIdentityLease {
+        require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
+            "converted CreateNew 신원만 미예약 lease를 만들 수 있습니다."
+        }
+        val wrapperIdentity = identityStore.wrapperIdentity()
+        val crxIdentity = identityStore.createCrxIdentityIfAbsent(identityKey.identitySha256)
+            ?: throw IllegalArgumentException("기존 CRX 신원에는 미예약 cleanup lease를 발급할 수 없습니다.")
+        val publicKey = crxIdentity.certificate.publicKey.encoded.copyOf()
+        val extensionId = Crx3.extensionId(publicKey)
+        val identity = OnDevicePackageIdentity(
+            extensionId = extensionId,
+            packageName = "dev.sixbridge.ext.$extensionId",
+            wrapperSignerSha256 = sha256(wrapperIdentity.certificate.encoded),
+            crxKeyAlias = crxIdentity.alias,
+            crxPublicKeyDer = publicKey,
+        )
+        val ownerToken = UUID.randomUUID()
+        try {
+            writeIdentityLease(ownerToken, identityKey.identitySha256, identity)
+        } catch (error: Throwable) {
+            runCatching {
+                identityStore.deleteCrxIdentity(
+                    identityKey.identitySha256,
+                    requireNotNull(identity.crxKeyAlias),
+                )
+            }.exceptionOrNull()?.let(error::addSuppressed)
+            throw error
+        }
+        return UnreservedIdentityLease(identityKey.identitySha256, identity, ownerToken)
+    }
+
+    @Synchronized
+    fun recoverUnreservedIdentity(cleanupToken: String): UnreservedIdentityLease {
+        val ownerToken = runCatching { UUID.fromString(cleanupToken) }
+            .getOrElse { throw IllegalArgumentException("미예약 CRX cleanup token이 올바르지 않습니다.") }
+        val record = readIdentityLease(ownerToken)
+        val current = identityStore.existingCrxIdentity(record.identitySha256)
+        val currentPublicKey = current.certificate.publicKey.encoded
+        val currentIdentity = OnDevicePackageIdentity(
+            extensionId = Crx3.extensionId(currentPublicKey),
+            packageName = "dev.sixbridge.ext.${Crx3.extensionId(currentPublicKey)}",
+            wrapperSignerSha256 = sha256(identityStore.existingWrapperIdentity().certificate.encoded),
+            crxKeyAlias = current.alias,
+            crxPublicKeyDer = currentPublicKey,
+        )
+        requireLeaseMatches(record, currentIdentity)
+        return UnreservedIdentityLease(record.identitySha256, currentIdentity, ownerToken)
+    }
+
+    @Synchronized
+    private fun discardOwnedUnreservedIdentity(lease: UnreservedIdentityLease): Boolean {
+        val identitySha256 = lease.identitySha256
+        val resolvedIdentity = lease.identity
+        val record = readIdentityLease(lease.ownerToken)
+        require(record.identitySha256 == identitySha256) {
+            "미예약 CRX 신원 cleanup owner가 일치하지 않습니다."
+        }
+        requireLeaseMatches(record, resolvedIdentity)
+        val alias = requireNotNull(resolvedIdentity.crxKeyAlias) {
+            "정리할 CRX Android Keystore alias가 없습니다."
+        }
+        val current = identityStore.existingCrxIdentity(identitySha256)
+        val currentPublicKey = current.certificate.publicKey.encoded
+        require(
+            current.alias == alias &&
+                resolvedIdentity.crxPublicKeyDer?.contentEquals(currentPublicKey) == true &&
+                resolvedIdentity.extensionId == Crx3.extensionId(currentPublicKey),
+        ) {
+            "정리할 미예약 CRX 신원 소유권이 일치하지 않습니다."
+        }
+        val deleted = identityStore.deleteCrxIdentity(identitySha256, alias)
+        if (deleted) deleteIdentityLease(lease.ownerToken)
+        return deleted
+    }
+
     @Synchronized
     fun packageWrapper(request: OnDeviceWrapperRequest): OnDeviceWrapperResult {
         val snapshot = request.snapshot()
@@ -192,12 +331,11 @@ class OnDeviceWrapperPackager(context: Context) {
             writeSourceBytes(stagedSource, sourceBytes)
             return packageStaged(
                 ValidatedPathWrapperRequest(
-                    identityKey = snapshot.identityKey,
+                    reservation = snapshot.reservation,
                     canonicalSourceZip =
                         stagedSource.takeIf { snapshot.canonicalSourceZip != null },
                     passthroughCrx =
                         stagedSource.takeIf { snapshot.passthroughCrx != null },
-                    versionCode = snapshot.versionCode,
                     descriptorName = snapshot.descriptorName,
                     descriptorVersion = snapshot.descriptorVersion,
                     sourceKind = snapshot.sourceKind,
@@ -237,16 +375,17 @@ class OnDeviceWrapperPackager(context: Context) {
         val passthroughProof = request.passthroughCrx?.let {
             Crx3Verifier.verify(it, ON_DEVICE_MAX_SOURCE_BYTES)
         }
-        val identity = resolveIdentityProof(request.identityKey, passthroughProof)
+        val identity = resolveReservedIdentity(request.reservation, passthroughProof)
+        consumeIdentityLeases(request.reservation)
         val generatedCrx = Files.createTempFile(workingDirectory.path, ".extension.", ".crx")
         try {
-            val crxPath = when (request.identityKey.mode) {
+            val crxPath = when (request.reservation.identityKey.mode) {
                 InstallationIdentityMode.PASSTHROUGH -> requireNotNull(request.passthroughCrx)
                 InstallationIdentityMode.CONVERTED -> {
                     Crx3Writer.create(
                         requireNotNull(request.canonicalSourceZip),
                         generatedCrx,
-                        identityStore.crxSigningKey(request.identityKey.identitySha256),
+                        identityStore.existingCrxSigningKey(request.reservation.identitySha256),
                     )
                     generatedCrx
                 }
@@ -270,7 +409,7 @@ class OnDeviceWrapperPackager(context: Context) {
                     templateManifest,
                     WrapperManifestRequest(
                         extensionId = identity.extensionId,
-                        versionCode = request.versionCode,
+                        versionCode = request.reservation.versionCode,
                     ),
                 )
                 AlignedApkAssembler(workingDirectory.path).assemble(
@@ -298,7 +437,7 @@ class OnDeviceWrapperPackager(context: Context) {
                     crxSha256 = crxProof.crxSha256,
                     wrapperSha256 = sha256(signed),
                     wrapperPackage = identity.packageName,
-                    wrapperVersionCode = request.versionCode,
+                    wrapperVersionCode = request.reservation.versionCode,
                     signerSha256 = signing.signerCertificateSha256,
                 )
                 require(
@@ -319,7 +458,7 @@ class OnDeviceWrapperPackager(context: Context) {
                 return OnDeviceWrapperResult(
                     extensionId = identity.extensionId,
                     packageName = identity.packageName,
-                    versionCode = request.versionCode,
+                    versionCode = request.reservation.versionCode,
                     signerSha256 = signing.signerCertificateSha256,
                     crxSha256 = descriptor.crxSha256,
                     wrapperSha256 = descriptor.wrapperSha256,
@@ -355,7 +494,7 @@ class OnDeviceWrapperPackager(context: Context) {
         require(hasCanonicalZip.xor(hasPassthroughCrx)) {
             "canonical source ZIP과 passthrough CRX3 중 정확히 하나가 필요합니다."
         }
-        when (request.identityKey.mode) {
+        when (request.reservation.identityKey.mode) {
             InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
                 "passthrough 신원에는 원본 CRX3가 필요합니다."
             }
@@ -371,7 +510,7 @@ class OnDeviceWrapperPackager(context: Context) {
         ) {
             "온디바이스 source file 크기 또는 형식이 올바르지 않습니다."
         }
-        require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
+        require(request.reservation.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
         require(request.descriptorName.isNotBlank() && request.descriptorVersion.isNotBlank()) {
             "extension name과 version은 비어 있지 않아야 합니다."
         }
@@ -413,7 +552,7 @@ class OnDeviceWrapperPackager(context: Context) {
         ) {
             "compatibility extension identity가 descriptor와 일치하지 않습니다."
         }
-        when (request.identityKey.mode) {
+        when (request.reservation.identityKey.mode) {
             InstallationIdentityMode.PASSTHROUGH -> {
                 require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
                     "passthrough package identity에 CRX Keystore key가 포함되었습니다."
@@ -506,6 +645,113 @@ class OnDeviceWrapperPackager(context: Context) {
         return root
     }
 
+    private fun reconcileOwnedTemporaryFiles() {
+        workingDirectory.verifyUnchanged()
+        Files.newDirectoryStream(workingDirectory.path).use { entries ->
+            entries.forEach { path ->
+                if (PACKAGER_TEMPORARY_PREFIXES.none { path.fileName.toString().startsWith(it) }) {
+                    return@forEach
+                }
+                val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+                require(
+                    attributes.isRegularFile &&
+                        !attributes.isSymbolicLink &&
+                        unixLinkCount(path) == 1,
+                ) {
+                    "중단된 packager temporary 파일이 단일 regular file이 아닙니다."
+                }
+                Files.delete(path)
+            }
+        }
+        forceDirectory(workingDirectory.path)
+    }
+
+    private fun writeIdentityLease(
+        ownerToken: UUID,
+        identitySha256: String,
+        identity: OnDevicePackageIdentity,
+    ) {
+        val alias = requireNotNull(identity.crxKeyAlias)
+        val publicKey = requireNotNull(identity.crxPublicKeyDer)
+        val path = identityLeasePath(ownerToken)
+        val record = listOf(
+            identitySha256,
+            alias,
+            identity.extensionId,
+            sha256(publicKey),
+        ).joinToString("\n", postfix = "\n")
+        FileChannel.open(path, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { channel ->
+            val bytes = record.encodeToByteArray()
+            var offset = 0
+            while (offset < bytes.size) {
+                offset += channel.write(ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+            }
+            channel.force(true)
+        }
+        forceDirectory(workingDirectory.path)
+    }
+
+    private fun readIdentityLease(ownerToken: UUID): IdentityLeaseRecord {
+        val path = identityLeasePath(ownerToken)
+        val attributes = runCatching {
+            Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        }.getOrElse {
+            throw IllegalArgumentException("미예약 CRX identity lease를 찾을 수 없습니다.", it)
+        }
+        require(
+            attributes.isRegularFile && !attributes.isSymbolicLink &&
+                attributes.size() in 1..4096 && unixLinkCount(path) == 1,
+        ) {
+            "미예약 CRX identity lease 파일이 올바르지 않습니다."
+        }
+        val fields = Files.readAllLines(path)
+        require(fields.size == 4) { "미예약 CRX identity lease 형식이 올바르지 않습니다." }
+        require(SHA256.matches(fields[0]) && SHA256.matches(fields[3])) {
+            "미예약 CRX identity lease hash가 올바르지 않습니다."
+        }
+        require(ON_DEVICE_EXTENSION_ID.matches(fields[2])) {
+            "미예약 CRX identity lease extension ID가 올바르지 않습니다."
+        }
+        return IdentityLeaseRecord(fields[0], fields[1], fields[2], fields[3])
+    }
+
+    private fun requireLeaseMatches(
+        record: IdentityLeaseRecord,
+        identity: OnDevicePackageIdentity,
+    ) {
+        require(
+            identity.crxKeyAlias == record.alias &&
+                identity.extensionId == record.extensionId &&
+                identity.crxPublicKeyDer?.let(::sha256) == record.publicKeySha256,
+        ) {
+            "미예약 CRX identity lease와 현재 Keystore 신원이 일치하지 않습니다."
+        }
+    }
+
+    private fun consumeIdentityLeases(reservation: ReservedConversionIdentity) {
+        Files.newDirectoryStream(workingDirectory.path, "$IDENTITY_LEASE_PREFIX*").use { entries ->
+            entries.forEach { path ->
+                val token = runCatching {
+                    UUID.fromString(path.fileName.toString().removePrefix(IDENTITY_LEASE_PREFIX))
+                }.getOrElse {
+                    throw IllegalArgumentException("미예약 CRX identity lease 파일명이 올바르지 않습니다.")
+                }
+                val record = readIdentityLease(token)
+                if (record.identitySha256 == reservation.identitySha256) deleteIdentityLease(token)
+            }
+        }
+    }
+
+    private fun deleteIdentityLease(ownerToken: UUID) {
+        val path = identityLeasePath(ownerToken)
+        readIdentityLease(ownerToken)
+        Files.delete(path)
+        forceDirectory(workingDirectory.path)
+    }
+
+    private fun identityLeasePath(ownerToken: UUID): Path =
+        workingDirectory.path.resolve("$IDENTITY_LEASE_PREFIX$ownerToken")
+
     private fun validatedOutput(file: File): Path {
         val output = file.toPath().toAbsolutePath().normalize()
         verifyPublishTarget(output)
@@ -525,7 +771,11 @@ class OnDeviceWrapperPackager(context: Context) {
             "output APK symlink는 허용하지 않습니다."
         }
         if (Files.exists(output, NOFOLLOW_LINKS)) {
-            require(Files.isRegularFile(output, NOFOLLOW_LINKS)) { "output APK는 regular file이어야 합니다." }
+            require(
+                Files.isRegularFile(output, NOFOLLOW_LINKS) && unixLinkCount(output) == 1,
+            ) {
+                "output APK는 단일 regular file이어야 합니다."
+            }
         }
     }
 
@@ -558,6 +808,13 @@ class OnDeviceWrapperPackager(context: Context) {
         FileChannel.open(file, WRITE).use { it.force(true) }
     }
 
+    private fun forceDirectory(directory: Path) {
+        FileChannel.open(directory, READ).use { it.force(true) }
+    }
+
+    private fun unixLinkCount(path: Path): Int =
+        (Files.getAttribute(path, "unix:nlink", NOFOLLOW_LINKS) as Number).toInt()
+
     private data class TrustedWorkingDirectory(
         val path: Path,
         val realPath: Path,
@@ -587,11 +844,28 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
+    private data class IdentityLeaseRecord(
+        val identitySha256: String,
+        val alias: String,
+        val extensionId: String,
+        val publicKeySha256: String,
+    )
+
     private companion object {
         const val WORKING_DIRECTORY = "ondevice-packager-gate"
         const val TEMPLATE_ASSET = "wrapper-template.apk"
         const val TEMPLATE_SHA256_ASSET = "wrapper-template.sha256"
         const val MANIFEST_ENTRY = "AndroidManifest.xml"
+        const val IDENTITY_LEASE_PREFIX = ".identity-lease."
+        val PACKAGER_TEMPORARY_PREFIXES = setOf(
+            ".source.",
+            ".extension.",
+            ".wrapper-template.",
+            ".unsigned.",
+            ".signed.",
+            "..unsigned.",
+            "..signed.",
+        )
         val SHA256 = Regex("[0-9a-f]{64}")
     }
 }
@@ -605,10 +879,9 @@ internal fun OnDeviceWrapperRequest.validateFor(
 }
 
 private fun OnDeviceWrapperRequest.snapshot() = ValidatedOnDeviceWrapperRequest(
-    identityKey = identityKey,
-    canonicalSourceZip = canonicalSourceZip,
-    passthroughCrx = passthroughCrx,
-    versionCode = versionCode,
+    reservation = reservation,
+    canonicalSourceZip = canonicalSourceZip?.copyOf(),
+    passthroughCrx = passthroughCrx?.copyOf(),
     descriptorName = descriptorName,
     descriptorVersion = descriptorVersion,
     sourceKind = sourceKind,
@@ -617,10 +890,9 @@ private fun OnDeviceWrapperRequest.snapshot() = ValidatedOnDeviceWrapperRequest(
 )
 
 private fun OnDeviceWrapperPathRequest.snapshot() = ValidatedPathWrapperRequest(
-    identityKey = identityKey,
+    reservation = reservation,
     canonicalSourceZip = canonicalSourceZip?.toPath()?.toAbsolutePath()?.normalize(),
     passthroughCrx = passthroughCrx?.toPath()?.toAbsolutePath()?.normalize(),
-    versionCode = versionCode,
     descriptorName = descriptorName,
     descriptorVersion = descriptorVersion,
     sourceKind = sourceKind,
@@ -628,21 +900,8 @@ private fun OnDeviceWrapperPathRequest.snapshot() = ValidatedPathWrapperRequest(
     outputApk = outputApk,
 )
 
-private fun ContractCompatibilityReport.snapshot(): ContractCompatibilityReport {
-    return copy(
-        declaredPermissions = declaredPermissions.toList(),
-        usedApis = usedApis.toList(),
-        unsupportedApis = unsupportedApis.toList(),
-        issues = issues.map { it.copy() },
-        adapterDecisions = adapterDecisions.map { decision ->
-            decision.copy(
-                evidence = decision.evidence.map { it.copy() },
-                changes = decision.changes.toList(),
-                remainingLimitations = decision.remainingLimitations.toList(),
-            )
-        },
-    )
-}
+private fun ContractCompatibilityReport.snapshot(): ContractCompatibilityReport =
+    BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(this))
 
 private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
     val hasCanonicalZip = request.canonicalSourceZip != null
@@ -650,7 +909,7 @@ private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
     require(hasCanonicalZip.xor(hasPassthroughCrx)) {
         "canonical source ZIP과 passthrough CRX3 중 정확히 하나가 필요합니다."
     }
-    when (request.identityKey.mode) {
+    when (request.reservation.identityKey.mode) {
         InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
             "passthrough 신원에는 원본 CRX3가 필요합니다."
         }
@@ -668,7 +927,7 @@ private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
             "passthrough CRX3 크기가 올바르지 않습니다."
         }
     }
-    require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
+    require(request.reservation.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
     require(request.descriptorName.isNotBlank() && request.descriptorVersion.isNotBlank()) {
         "extension name과 version은 비어 있지 않아야 합니다."
     }
@@ -713,7 +972,15 @@ private fun requireBoundRequest(
     ) {
         "compatibility extension identity가 descriptor와 일치하지 않습니다."
     }
-    when (request.identityKey.mode) {
+    require(
+        request.reservation.extensionId == identity.extensionId &&
+            request.reservation.packageName == identity.packageName &&
+            request.reservation.wrapperSignerSha256 == identity.wrapperSignerSha256 &&
+            request.reservation.crxKeyAlias == identity.crxKeyAlias,
+    ) {
+        "예약된 설치 신원이 package identity와 일치하지 않습니다."
+    }
+    when (request.reservation.identityKey.mode) {
         InstallationIdentityMode.PASSTHROUGH -> {
             require(request.passthroughCrx!!.contentEquals(crxBytes)) {
                 "passthrough CRX3 bytes가 원본과 일치하지 않습니다."
@@ -756,10 +1023,9 @@ private val ON_DEVICE_EXTENSION_ID = Regex("[a-p]{32}")
 private val ON_DEVICE_SHA256 = Regex("[0-9a-f]{64}")
 private val ON_DEVICE_SOURCE_KINDS =
     setOf("SOURCE_DIRECTORY", "ZIP", "CRX3", "CHROME_WEB_STORE")
-// final wrapper의 128 MiB contract 안에 CRX header, template entry와 APK signing block을
-// 함께 수용하기 위한 packaging 경계다. 수집/보관 Path API의 128 MiB streaming 계약은 유지한다.
-private const val ON_DEVICE_MAX_SOURCE_BYTES = 120L * 1024 * 1024
-private const val ON_DEVICE_MAX_CRX_BYTES = 122L * 1024 * 1024
+// Task 6 source 계약 128 MiB에 CRX3 고정 header prefix와 최대 protobuf header를 더한다.
+private const val ON_DEVICE_MAX_SOURCE_BYTES = 128L * 1024 * 1024
+private const val ON_DEVICE_MAX_CRX_BYTES = ON_DEVICE_MAX_SOURCE_BYTES + 1024L * 1024 + 12L
 private const val STREAM_BUFFER_SIZE = 64 * 1024
 
 internal data class OnDevicePackagerTestHooks(

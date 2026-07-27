@@ -130,7 +130,12 @@ object Crx3Writer {
         require(readPrefix(source, ZIP_MAGIC.size).contentEquals(ZIP_MAGIC)) {
             "CRX3 ZIP payload가 local file header로 시작하지 않습니다."
         }
-        require(Files.isRegularFile(output, NOFOLLOW_LINKS) && !Files.isSymbolicLink(output)) {
+        require(
+            Files.isRegularFile(output, NOFOLLOW_LINKS) &&
+                !Files.isSymbolicLink(output) &&
+                !Files.isSameFile(source, output) &&
+                (Files.getAttribute(output, "unix:nlink", NOFOLLOW_LINKS) as Number).toInt() == 1,
+        ) {
             "CRX3 output 경로가 올바르지 않습니다."
         }
 

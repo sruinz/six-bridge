@@ -182,6 +182,28 @@ class Crx3WriterTest {
     }
 
     @Test
+    fun `Path output이 source 또는 다른 파일의 hardlink이면 truncation 전에 거부한다`() {
+        val directory = Files.createTempDirectory("crx3-hardlink-output")
+        try {
+            val source = Files.write(directory.resolve("source.zip"), MINIMAL_ZIP)
+            val sourceLink = Files.createLink(directory.resolve("source-link.crx"), source)
+            assertFailsWith<IllegalArgumentException> {
+                Crx3Writer.create(source, sourceLink, testKey)
+            }
+            assertContentEquals(MINIMAL_ZIP, Files.readAllBytes(source))
+
+            val other = Files.write(directory.resolve("other.bin"), byteArrayOf(1, 2, 3, 4))
+            val otherLink = Files.createLink(directory.resolve("other-link.crx"), other)
+            assertFailsWith<IllegalArgumentException> {
+                Crx3Writer.create(source, otherLink, testKey)
+            }
+            assertContentEquals(byteArrayOf(1, 2, 3, 4), Files.readAllBytes(other))
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
     fun `Path signing 뒤 same inode size mtime 복원 변조를 output proof로 거부한다`() {
         val directory = Files.createTempDirectory("crx3-path-mutation")
         val source = directory.resolve("source.zip")

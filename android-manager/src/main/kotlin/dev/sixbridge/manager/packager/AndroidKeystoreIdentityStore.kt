@@ -30,17 +30,54 @@ class AndroidKeystoreIdentityStore private constructor(
 
     fun wrapperIdentity(): AndroidSigningIdentity = identity(aliases.wrapperAlias)
 
+    fun existingWrapperIdentity(): AndroidSigningIdentity =
+        existingIdentity(aliases.wrapperAlias)
+            ?: throw IllegalStateException("예약된 wrapper Android Keystore alias가 없습니다.")
+
     fun crxIdentity(sourceIdentity: ByteArray): AndroidSigningIdentity =
         identity(aliases.crxAlias(sourceIdentity.copyOf()))
 
     fun crxIdentity(identitySha256: String): AndroidSigningIdentity =
         identity(aliases.crxAlias(identitySha256))
 
+    internal fun createCrxIdentityIfAbsent(identitySha256: String): AndroidSigningIdentity? =
+        synchronized(lock) {
+            val alias = aliases.crxAlias(identitySha256)
+            if (keyStore().containsAlias(alias)) return@synchronized null
+            identity(alias)
+        }
+
+    fun existingCrxIdentity(identitySha256: String): AndroidSigningIdentity =
+        existingIdentity(aliases.crxAlias(identitySha256))
+            ?: throw IllegalStateException("예약된 CRX Android Keystore alias가 없습니다.")
+
+    internal fun hasCrxIdentity(identitySha256: String): Boolean = synchronized(lock) {
+        keyStore().containsAlias(aliases.crxAlias(identitySha256))
+    }
+
     fun crxSigningKey(sourceIdentity: ByteArray): AndroidKeystoreCrxSigningKey =
         AndroidKeystoreCrxSigningKey(crxIdentity(sourceIdentity))
 
     fun crxSigningKey(identitySha256: String): AndroidKeystoreCrxSigningKey =
         AndroidKeystoreCrxSigningKey(crxIdentity(identitySha256))
+
+    fun existingCrxSigningKey(identitySha256: String): AndroidKeystoreCrxSigningKey =
+        AndroidKeystoreCrxSigningKey(existingCrxIdentity(identitySha256))
+
+    internal fun deleteCrxIdentity(identitySha256: String, expectedAlias: String): Boolean = synchronized(lock) {
+        val alias = aliases.crxAlias(identitySha256)
+        require(alias == expectedAlias) { "삭제할 CRX Android Keystore alias 소유권이 일치하지 않습니다." }
+        val keyStore = keyStore()
+        if (!keyStore.containsAlias(alias)) return@synchronized false
+        keyStore.deleteEntry(alias)
+        !keyStore().containsAlias(alias)
+    }
+
+    private fun existingIdentity(alias: String): AndroidSigningIdentity? = synchronized(lock) {
+        val keyStore = keyStore()
+        if (!keyStore.containsAlias(alias)) return@synchronized null
+        readIdentity(alias)
+    }
 
     private fun identity(alias: String): AndroidSigningIdentity = synchronized(lock) {
         val keyStore = keyStore()
@@ -50,12 +87,16 @@ class AndroidKeystoreIdentityStore private constructor(
                 generateKeyPair()
             }
         }
+        readIdentity(alias)
+    }
+
+    private fun readIdentity(alias: String): AndroidSigningIdentity {
         val entry = keyStore().getEntry(alias, null) as? KeyStore.PrivateKeyEntry
             ?: throw IllegalStateException("Android Keystore alias가 PrivateKeyEntry가 아닙니다: $alias")
         val certificate = entry.certificate as? X509Certificate
             ?: throw IllegalStateException("Android Keystore alias 인증서 형식이 올바르지 않습니다: $alias")
         validateExistingIdentity(alias, entry.privateKey, certificate)
-        AndroidSigningIdentity(alias, entry.privateKey, certificate)
+        return AndroidSigningIdentity(alias, entry.privateKey, certificate)
     }
 
     private fun validateExistingIdentity(alias: String, privateKey: PrivateKey, certificate: X509Certificate) {

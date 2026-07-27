@@ -21,7 +21,8 @@ object SixBundleContract {
     const val COMPATIBILITY_ENTRY = "compatibility.json"
     const val WRAPPER_ENTRY = "wrapper.apk"
     const val MAX_METADATA_SIZE: Long = 1024L * 1024
-    const val MAX_WRAPPER_SIZE: Long = 128L * 1024 * 1024
+    // 128 MiB source + 1 MiB CRX header + template/signing overhead를 16 MiB envelope로 봉인한다.
+    const val MAX_WRAPPER_SIZE: Long = 144L * 1024 * 1024
     const val MAX_TOTAL_SIZE: Long = MAX_WRAPPER_SIZE + 2 * MAX_METADATA_SIZE
     const val MAX_ARCHIVE_SIZE: Long = MAX_TOTAL_SIZE + 4L * 1024 * 1024
     const val MAX_COMPRESSION_RATIO: Double = 100.0
@@ -105,6 +106,81 @@ object SixBundleContract {
             throw IllegalArgumentException("SixBundle을 읽을 수 없습니다: ${error.message}", error)
         } finally {
             deleteTemporaryFile(archive.file)
+            if (!completed) Files.deleteIfExists(wrapperOutput)
+        }
+    }
+
+    fun read(
+        archivePath: Path,
+        wrapperOutput: Path,
+    ): ContractBundleFileContents {
+        val path = archivePath.toAbsolutePath().normalize()
+        val before = Files.readAttributes(
+            path,
+            java.nio.file.attribute.BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(
+            before.isRegularFile && !before.isSymbolicLink &&
+                before.size() in 1..MAX_ARCHIVE_SIZE,
+        ) {
+            "SixBundle archive 파일이 올바르지 않습니다."
+        }
+        val archive = TemporaryArchive(path.toFile(), before.size())
+        var completed = false
+        try {
+            require(!Files.exists(wrapperOutput, NOFOLLOW_LINKS)) {
+                "wrapper.apk output이 이미 존재합니다."
+            }
+            val centralDirectory = validateArchiveBoundary(archive)
+            ZipFile(archive.file).use { zip ->
+                val entries = validateEntries(zip, centralDirectory)
+                val extensionBytes = readEntry(
+                    zip,
+                    entries.getValue(EXTENSION_ENTRY),
+                    MAX_METADATA_SIZE,
+                )
+                val compatibilityBytes = readEntry(
+                    zip,
+                    entries.getValue(COMPATIBILITY_ENTRY),
+                    MAX_METADATA_SIZE,
+                )
+                val extension = BundleJson.decodeExtension(extensionBytes.decodeToString())
+                val compatibility = BundleJson.decodeCompatibility(compatibilityBytes.decodeToString())
+                val wrapperSha256 = extractEntry(
+                    zip,
+                    entries.getValue(WRAPPER_ENTRY),
+                    wrapperOutput,
+                    MAX_WRAPPER_SIZE,
+                )
+                validateMetadata(extension, compatibility)
+                require(wrapperSha256 == extension.wrapperSha256) {
+                    "wrapper.apk SHA-256이 descriptor와 일치하지 않습니다."
+                }
+                val after = Files.readAttributes(
+                    path,
+                    java.nio.file.attribute.BasicFileAttributes::class.java,
+                    NOFOLLOW_LINKS,
+                )
+                require(
+                    after.fileKey() == before.fileKey() &&
+                        after.size() == before.size() &&
+                        after.lastModifiedTime() == before.lastModifiedTime(),
+                ) {
+                    "SixBundle archive가 읽는 중 변경되었습니다."
+                }
+                completed = true
+                return ContractBundleFileContents(
+                    wrapperApk = wrapperOutput,
+                    extension = extension,
+                    compatibility = compatibility,
+                )
+            }
+        } catch (error: IllegalArgumentException) {
+            throw error
+        } catch (error: Exception) {
+            throw IllegalArgumentException("SixBundle을 읽을 수 없습니다: ${error.message}", error)
+        } finally {
             if (!completed) Files.deleteIfExists(wrapperOutput)
         }
     }
@@ -516,7 +592,9 @@ object SixBundleContract {
     }
 
     private fun deleteTemporaryFile(file: File) {
-        if (file.exists() && !file.delete()) file.deleteOnExit()
+        if (file.exists() && !file.delete()) {
+            throw IllegalStateException("SixBundle temporary archive를 정리할 수 없습니다.")
+        }
     }
 
     private fun RandomAccessFile.readUInt16(): Int = readUnsignedByte() or (readUnsignedByte() shl 8)
