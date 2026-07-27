@@ -147,6 +147,21 @@ class ConversionWorkStore internal constructor(
         bundleSha256 = null,
     )
 
+    suspend fun refreshAwaitingApproval(
+        token: String,
+        expectedProfileSha256: String,
+        profileSha256: String,
+    ): RestoredConversionJob = transition(
+        token = token,
+        expectedStage = ConversionJobStage.AWAITING_APPROVAL,
+        nextStage = ConversionJobStage.AWAITING_APPROVAL,
+        approvedAdapterIds = null,
+        profileSha256 = profileSha256,
+        expectedProfileSha256 = expectedProfileSha256,
+        bundleFileName = null,
+        bundleSha256 = null,
+    )
+
     suspend fun markBuilding(
         token: String,
         approvedAdapterIds: Set<String>,

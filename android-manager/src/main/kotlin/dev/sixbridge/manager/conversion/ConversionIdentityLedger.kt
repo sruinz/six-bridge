@@ -685,6 +685,9 @@ class ConversionIdentityLedger(
         }
     }
 
+    internal suspend fun hasIdentity(identityKey: InstallationIdentityKey): Boolean =
+        dao.get(identityKey.identitySha256) != null
+
     private fun validateRequest(request: ConversionIdentityReservation) {
         val binding = request.packageBinding
         require(request.displayName.isNotBlank()) { "표시 이름이 비어 있습니다." }

@@ -2,19 +2,42 @@ package dev.sixbridge.manager.app
 
 import android.app.Application
 import androidx.room.Room
+import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.catalog.RoomManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.conversion.ConversionBundleVerifier
+import dev.sixbridge.manager.conversion.ConversionGeneratedImportPort
+import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionInputPort
+import dev.sixbridge.manager.conversion.ConversionInstalledPort
+import dev.sixbridge.manager.conversion.ConversionProfilePort
+import dev.sixbridge.manager.conversion.ConversionWorkStore
+import dev.sixbridge.manager.conversion.DefaultConversionBundlePort
+import dev.sixbridge.manager.conversion.DefaultConversionIdentityPort
+import dev.sixbridge.manager.conversion.DefaultConversionPackagePort
+import dev.sixbridge.manager.conversion.DefaultConversionRuntime
+import dev.sixbridge.manager.conversion.DefaultConversionWorkPort
+import dev.sixbridge.manager.conversion.GeneratedBundleStore
+import dev.sixbridge.manager.conversion.OnDeviceConversionCoordinator
+import dev.sixbridge.manager.conversion.OnDeviceInputService
+import dev.sixbridge.manager.conversion.SamsungProfileSnapshot
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.ContentProviderInstalledExtensionIconSource
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.ContentResolverBundleSource
+import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
+import dev.sixbridge.manager.importer.ImportResult
+import dev.sixbridge.manager.importer.RoutingBundleSource
 import dev.sixbridge.manager.install.AndroidPackageInstallGateway
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.navigation.AndroidSamsungBrowserNavigator
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
+import dev.sixbridge.manager.profile.AndroidSamsungBrowserProfileProvider
+import dev.sixbridge.manager.profile.SamsungBrowserProfileResult
 import dev.sixbridge.manager.uninstall.DefaultUninstallCoordinator
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
@@ -64,10 +87,71 @@ class ManagerDependencies private constructor(
                 installedWrappers = installedWrappers,
                 catalog = catalog,
             )
+            val generatedBundles = GeneratedBundleStore(application)
             val importer = BundleImportService(
-                source = ContentResolverBundleSource(application.contentResolver),
+                source = RoutingBundleSource(
+                    ContentResolverBundleSource(application.contentResolver),
+                    GeneratedBundleStoreSource(generatedBundles),
+                ),
                 verifier = verifier,
                 cacheDirectory = application.cacheDir,
+            )
+            val retainedImports = RetainedImportStore(
+                File(application.cacheDir, "imports"),
+                verifier,
+            )
+            val identityLedger = ConversionIdentityLedger(database.conversionIdentityDao())
+            val packager = OnDeviceWrapperPackager(application)
+            val workStore = ConversionWorkStore(
+                privateRoot = File(application.filesDir, "conversion-work"),
+                dao = database.conversionJobDao(),
+                bundleVerifier = ConversionBundleVerifier {
+                    runCatching { SixBundleContract.read(it); true }.getOrDefault(false)
+                },
+                identityOwnerLifecycle = identityLedger.ownerLifecycle(packager),
+            )
+            val profileProvider = AndroidSamsungBrowserProfileProvider(application)
+            val conversionCoordinator = OnDeviceConversionCoordinator(
+                input = ConversionInputPort(
+                    OnDeviceInputService(
+                        File(application.filesDir, "conversion-input"),
+                        application.contentResolver,
+                    )::acquire,
+                ),
+                work = DefaultConversionWorkPort(
+                    workStore,
+                    File(application.cacheDir, "conversion-input-open"),
+                ),
+                profiles = ConversionProfilePort {
+                    when (val profile = profileProvider.load()) {
+                        is SamsungBrowserProfileResult.Supported ->
+                            SamsungProfileSnapshot.Supported(profile.profile)
+                        SamsungBrowserProfileResult.Missing -> SamsungProfileSnapshot.Missing
+                        is SamsungBrowserProfileResult.Unknown -> SamsungProfileSnapshot.Unknown
+                    }
+                },
+                runtime = DefaultConversionRuntime(),
+                identities = DefaultConversionIdentityPort(identityLedger, packager),
+                installed = ConversionInstalledPort(installedWrappers::find),
+                packages = DefaultConversionPackagePort(
+                    identityLedger,
+                    packager,
+                    File(application.filesDir, "conversion-packages"),
+                ),
+                bundles = DefaultConversionBundlePort(generatedBundles),
+                imports = ConversionGeneratedImportPort { generated ->
+                    when (val imported = importer.importGenerated(generated)) {
+                        is ImportResult.Failure -> null
+                        is ImportResult.Success -> {
+                            if (retainedImports.save(imported.value)) {
+                                imported.value.toReview()
+                            } else {
+                                importer.discard(imported.value.token)
+                                null
+                            }
+                        }
+                    }
+                },
             )
             val uninstall = DefaultUninstallCoordinator(installedWrappers)
             val iconSource = ContentProviderInstalledExtensionIconSource(
@@ -85,10 +169,7 @@ class ManagerDependencies private constructor(
             )
             val repository = DefaultManagerRepository(
                 importer = importer,
-                retainedImports = RetainedImportStore(
-                    File(application.cacheDir, "imports"),
-                    verifier,
-                ),
+                retainedImports = retainedImports,
                 startupCleanup = StartupCleanup(
                     importRoot = File(application.cacheDir, "imports"),
                     installGateway = installGateway,
@@ -101,6 +182,7 @@ class ManagerDependencies private constructor(
                 samsungBrowserNavigator =
                     AndroidSamsungBrowserNavigator(application.packageManager),
                 catalogPublisher = catalogPublisher,
+                conversionCoordinator = conversionCoordinator,
             )
             repository.start(applicationScope, catalog)
             return ManagerDependencies(repository, applicationScope)

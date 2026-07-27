@@ -8,6 +8,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.contract.crx.Crx3Verifier
+import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.ArchiveActivity
 import dev.sixbridge.manager.wrapper.ArchiveFacts
@@ -17,6 +18,7 @@ import dev.sixbridge.manager.wrapper.ArchiveProvider
 import dev.sixbridge.manager.wrapper.createTestCrx
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
@@ -49,7 +51,7 @@ class BundleImportServiceTest {
             val source = BundleSource { throw IOException("private source detail") }
             val service = service(source, fixture.facts, cache)
 
-            val failure = assertIs<ImportResult.Failure>(service.importRequest(Any()))
+            val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
             assertEquals(ImportFailureCode.SOURCE_UNREADABLE, failure.reason.code)
             assertImportsEmpty(cache)
@@ -62,7 +64,7 @@ class BundleImportServiceTest {
         val source = BundleSource { ByteArrayInputStream(ByteArray(9)) }
         val service = service(source, fixture.facts, cache, maximumSourceBytes = 8)
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest("opaque request"))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.SOURCE_TOO_LARGE, failure.reason.code)
         assertImportsEmpty(cache)
@@ -83,7 +85,7 @@ class BundleImportServiceTest {
             cache,
         )
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest(42))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.INVALID_BUNDLE, failure.reason.code)
         assertImportsEmpty(cache)
@@ -101,7 +103,7 @@ class BundleImportServiceTest {
             cache,
         )
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest(Unit))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.WRAPPER_HASH_MISMATCH, failure.reason.code)
         assertImportsEmpty(cache)
@@ -123,7 +125,7 @@ class BundleImportServiceTest {
             },
         )
 
-        val success = assertIs<ImportResult.Success>(service.importRequest("opaque"))
+        val success = assertIs<ImportResult.Success>(service.importRequest(generatedRequest()))
         val tokenDirectory = requireNotNull(success.value.wrapperFile.parentFile)
 
         assertEquals(fixture.descriptor, success.value.descriptor)
@@ -156,7 +158,7 @@ class BundleImportServiceTest {
                     ioDispatcher = dispatcher,
                 )
 
-                assertIs<ImportResult.Success>(service.importRequest("opaque"))
+                assertIs<ImportResult.Success>(service.importRequest(generatedRequest()))
             }
 
         assertTrue(sourceThread.startsWith("six-import-io-test"))
@@ -173,7 +175,7 @@ class BundleImportServiceTest {
             cache = cache,
         )
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest("opaque"))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.PACKAGE_MISMATCH, failure.reason.code)
         assertImportsEmpty(cache)
@@ -191,7 +193,7 @@ class BundleImportServiceTest {
             afterPublish = { it.writeBytes("mutated after publish".encodeToByteArray()) },
         )
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest("opaque"))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.WRAPPER_HASH_MISMATCH, failure.reason.code)
         assertImportsEmpty(cache)
@@ -209,7 +211,7 @@ class BundleImportServiceTest {
         var cancelled = false
 
         try {
-            service.importRequest("opaque")
+            service.importRequest(generatedRequest())
         } catch (_: CancellationException) {
             cancelled = true
         }
@@ -230,7 +232,7 @@ class BundleImportServiceTest {
                 cache = cache,
             )
             val job = launch(Dispatchers.Default) {
-                service.importRequest("opaque")
+                service.importRequest(generatedRequest())
             }
             assertTrue(blocking.started.await(5, TimeUnit.SECONDS))
 
@@ -254,7 +256,7 @@ class BundleImportServiceTest {
             cache = cache.toFile(),
         )
 
-        val failure = assertIs<ImportResult.Failure>(service.importRequest("opaque"))
+        val failure = assertIs<ImportResult.Failure>(service.importRequest(generatedRequest()))
 
         assertEquals(ImportFailureCode.CACHE_BOUNDARY_INVALID, failure.reason.code)
         assertEquals(setOf("imports"), cache.toFile().list().orEmpty().toSet())
@@ -418,3 +420,12 @@ class BundleImportServiceTest {
         }
     }
 }
+
+private fun generatedRequest() = BundleOpenRequest.Generated(
+    GeneratedBundle(
+        token = "11111111-1111-4111-8111-111111111111",
+        file = File("opaque"),
+        sha256 = "1".repeat(64),
+        suggestedFileName = "opaque.six",
+    ),
+)

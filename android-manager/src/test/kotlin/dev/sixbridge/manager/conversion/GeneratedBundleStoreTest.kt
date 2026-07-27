@@ -59,6 +59,19 @@ class GeneratedBundleStoreTest {
     }
 
     @Test
+    fun `store proof와 다른 generated request 파일이나 hash는 열지 않는다`() {
+        val store = store()
+        val generated = store.publish(token, result())
+
+        assertFailsWith<IllegalArgumentException> {
+            store.open(generated.copy(file = File(filesDir, "outside.six")))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.open(generated.copy(sha256 = "0".repeat(64)))
+        }
+    }
+
+    @Test
     fun `비정렬 v4 report는 package publish restart에서 canonical JSON identity를 유지한다`() {
         val original = result()
         val unsorted = original.compatibility.copy(

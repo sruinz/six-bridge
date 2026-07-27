@@ -14,6 +14,13 @@ import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.ManagerCatalog
 import dev.sixbridge.manager.catalog.identity
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.conversion.ConversionBeginResult
+import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.OnDeviceConversionCoordinator
+import dev.sixbridge.manager.conversion.OnDeviceInputRequest
+import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.IconPersistenceResult
 import dev.sixbridge.manager.importer.BundleImportService
@@ -119,6 +126,22 @@ interface ManagerRepository {
 
     suspend fun initialize(reviewToken: String?, installSessionId: Int?): ManagerRestoreResult
     suspend fun import(uri: Uri): ManagerImportResult
+    suspend fun importGenerated(bundle: GeneratedBundle): ManagerImportResult =
+        ManagerImportResult.Failure(ImportFailure(ImportFailureCode.CACHE_IO))
+    suspend fun beginConversion(request: OnDeviceInputRequest): ConversionBeginResult =
+        ConversionBeginResult.Failure(
+            dev.sixbridge.manager.conversion.ConversionFailureCode.INPUT_INVALID,
+        )
+    suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+    ): ConversionBuildResult = ConversionBuildResult.Failure(
+        dev.sixbridge.manager.conversion.ConversionFailureCode.INPUT_INVALID,
+    )
+    suspend fun restoreConversion(): RestoredConversion? = null
+    suspend fun discardConversion(token: String): Boolean = false
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
     suspend fun cancelInstall(): Boolean
     fun discardReview(token: String): Boolean
@@ -142,6 +165,7 @@ internal class DefaultManagerRepository(
     private val installEvents: Flow<PackageInstallCallback> = PackageInstallEvents.events,
     private val afterInstallRequest: suspend (InstallState) -> Unit = {},
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val conversionCoordinator: OnDeviceConversionCoordinator? = null,
 ) : ManagerRepository {
     private val started = AtomicBoolean()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
@@ -224,7 +248,35 @@ internal class DefaultManagerRepository(
     }
 
     override suspend fun import(uri: Uri): ManagerImportResult {
-        return when (val result = importer.import(uri)) {
+        return retainImport(importer.import(uri))
+    }
+
+    override suspend fun importGenerated(bundle: GeneratedBundle): ManagerImportResult =
+        retainImport(importer.importGenerated(bundle))
+
+    override suspend fun beginConversion(
+        request: OnDeviceInputRequest,
+    ): ConversionBeginResult = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.begin(request)
+
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+    ): ConversionBuildResult = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.build(token, approvedAdapterIds, partialConfirmed, identitySelection)
+
+    override suspend fun restoreConversion(): RestoredConversion? =
+        conversionCoordinator?.restore()
+
+    override suspend fun discardConversion(token: String): Boolean =
+        conversionCoordinator?.discard(token) ?: false
+
+    private suspend fun retainImport(result: ImportResult): ManagerImportResult {
+        return when (result) {
             is ImportResult.Failure -> ManagerImportResult.Failure(result.reason)
             is ImportResult.Success -> {
                 val saved = try {
@@ -799,7 +851,7 @@ internal class RetainedImportStore(
         } catch (error: Exception) {
             throw RetainedImportTransientException(error)
         }
-        if (report.schemaVersion != 3 ||
+        if (report.schemaVersion !in 3..4 ||
             report.convertedExtensionId != descriptor.extensionId ||
             report.extensionName != descriptor.name ||
             report.extensionVersion != descriptor.version ||
@@ -955,7 +1007,7 @@ private fun retainedFileSha256(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
-private fun ImportedBundle.toReview() = ReviewBundle(
+internal fun ImportedBundle.toReview() = ReviewBundle(
     token = token,
     packageName = verifiedApk.packageName,
     extensionId = descriptor.extensionId,

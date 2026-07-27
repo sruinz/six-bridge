@@ -1,0 +1,335 @@
+package dev.sixbridge.manager.conversion
+
+import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.LogicalIdentityEvidence
+import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.conversion.PreparedConversion
+import dev.sixbridge.core.draft.DraftReplayResult
+import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.draft.SixDraftReplay
+import dev.sixbridge.core.input.ExtensionInputKind
+import dev.sixbridge.core.input.PortableExtensionInput
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.manager.packager.OnDevicePackageIdentity
+import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
+import dev.sixbridge.manager.packager.OnDeviceWrapperPathRequest
+import dev.sixbridge.manager.packager.OnDeviceWrapperResult
+import java.io.File
+import java.io.FileOutputStream
+import java.security.MessageDigest
+import java.util.UUID
+
+internal class DefaultConversionWorkPort(
+    private val store: ConversionWorkStore,
+    private val temporaryRoot: File,
+) : ConversionWorkPort {
+    override suspend fun create(artifact: OnDeviceInputArtifact) = store.create(artifact)
+    override suspend fun restore() = store.restore()
+    override suspend fun markAwaitingApproval(token: String, profileSha256: String) {
+        store.markAwaitingApproval(token, profileSha256)
+    }
+    override suspend fun refreshAwaitingApproval(
+        token: String,
+        expectedProfileSha256: String,
+        profileSha256: String,
+    ) {
+        store.refreshAwaitingApproval(token, expectedProfileSha256, profileSha256)
+    }
+    override suspend fun markBuilding(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        profileSha256: String,
+    ) {
+        store.markBuilding(token, approvedAdapterIds, profileSha256)
+    }
+    override suspend fun markBundleReady(token: String, bundle: File, expectedSha256: String) {
+        store.markBundleReady(token, bundle, expectedSha256)
+    }
+    override suspend fun discard(token: String) = store.discard(token)
+
+    override suspend fun <T> withVerifiedInputFile(
+        token: String,
+        consume: (File) -> T,
+    ): T {
+        require((temporaryRoot.isDirectory || temporaryRoot.mkdirs()) && !temporaryRoot.toPath().let(java.nio.file.Files::isSymbolicLink))
+        val temporary = File(temporaryRoot, "${UUID.randomUUID()}.input")
+        try {
+            store.openVerifiedInput(token) { input ->
+                FileOutputStream(temporary).use(input::copyTo)
+            }
+            require(temporary.setReadOnly())
+            return consume(temporary)
+        } finally {
+            temporary.setWritable(true)
+            temporary.delete()
+        }
+    }
+}
+
+internal class DefaultConversionRuntime : ConversionRuntimePort {
+    override fun analyze(
+        input: File,
+        kind: OnDeviceInputKind,
+        profile: BrowserProfile,
+    ): ConversionAnalysisSnapshot {
+        if (kind == OnDeviceInputKind.SIX_DRAFT) {
+            val payload = SixDraft.read(input.toPath()).payload
+            val report = payload.compatibilityBefore
+            return snapshot(report, logicalIdentity(payload.draft.sourceIdentity))
+        }
+        val portable = portable(input, kind)
+        return ConversionPreparationEngine().use { engine ->
+            val report = engine.analyze(portable, profile)
+            val prepared = runCatching {
+                engine.prepare(
+                    portable,
+                    profile,
+                    report.adapterDecisions
+                        .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
+                        .map { it.id },
+                )
+            }.getOrNull()
+            snapshot(report, prepared?.logicalSourceIdentity.toManagerIdentity())
+        }
+    }
+
+    override fun prepare(
+        input: File,
+        kind: OnDeviceInputKind,
+        profile: BrowserProfile,
+        approvedAdapterIds: Set<String>,
+    ): PreparedConversionSnapshot {
+        val prepared = if (kind == OnDeviceInputKind.SIX_DRAFT) {
+            when (
+                val replayed = SixDraftReplay().replay(
+                    SixDraft.read(input.toPath()),
+                    profile,
+                    approvedAdapterIds,
+                )
+            ) {
+                is DraftReplayResult.Ready -> replayed.prepared
+                is DraftReplayResult.ProfileChanged ->
+                    throw IllegalArgumentException("signed draft profile이 변경되었습니다.")
+            }
+        } else {
+            ConversionPreparationEngine().use {
+                it.prepare(portable(input, kind), profile, approvedAdapterIds)
+            }
+        }
+        val after = prepared.compatibilityAfter
+        return PreparedConversionSnapshot(
+            reportBefore = prepared.compatibilityBefore,
+            originalSourceSha256 = prepared.originalSourceSha256,
+            planSha256 = prepared.planSha256,
+            transformedSourceZip = prepared.transformedSourceZip,
+            passthroughCrx = prepared.passthroughCrx,
+            logicalSourceIdentity = prepared.logicalSourceIdentity.toManagerIdentity(),
+            descriptorName = requireNotNull(after.extensionName),
+            descriptorVersion = requireNotNull(after.extensionVersion),
+            sourceKind = kind.name,
+            opaque = prepared,
+        )
+    }
+
+    override fun bind(
+        prepared: PreparedConversionSnapshot,
+        profile: BrowserProfile,
+        identity: OnDevicePackageIdentity,
+    ): BoundConversionSnapshot {
+        val bound = ConversionPreparationEngine().use {
+            it.bindIdentity(
+                prepared.opaque as PreparedConversion,
+                profile,
+                identity.crxPublicKeyDer,
+            )
+        }
+        return BoundConversionSnapshot(
+            sourceZip = bound.sourceZip,
+            passthroughCrx = bound.passthroughCrx,
+            compatibility = SixBundle.toContractV4(
+                bound.compatibility,
+                prepared.originalSourceSha256,
+                prepared.planSha256,
+            ),
+            extensionId = bound.extensionId,
+        )
+    }
+
+    private fun portable(file: File, kind: OnDeviceInputKind): PortableExtensionInput =
+        when (kind) {
+            OnDeviceInputKind.ZIP -> PortableExtensionInput.fromZip(
+                ExtensionInputKind.ZIP,
+                file.readBytes(),
+            )
+            OnDeviceInputKind.CRX3 -> PortableExtensionInput.fromCrx(
+                ExtensionInputKind.CRX3,
+                file.readBytes(),
+            )
+            OnDeviceInputKind.SIX_DRAFT -> error("draft는 replay 경로를 사용해야 합니다.")
+        }
+
+    private fun snapshot(
+        report: dev.sixbridge.core.compat.CompatibilityReport,
+        logicalIdentity: LogicalSourceIdentity?,
+    ) = ConversionAnalysisSnapshot(
+        report = report,
+        selectedAutomaticAdapters = report.adapterDecisions
+            .filter { it.disposition == AdapterDisposition.AUTOMATIC }
+            .mapTo(sortedSetOf()) { it.id },
+        requiredApprovals = report.adapterDecisions
+            .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
+            .mapTo(sortedSetOf()) { it.id },
+        logicalSourceIdentity = logicalIdentity,
+    )
+
+    private fun logicalIdentity(value: String?): LogicalSourceIdentity? =
+        value?.let(LogicalSourceIdentity::signedDraft)
+
+    private fun LogicalSourceIdentityResult?.toManagerIdentity(): LogicalSourceIdentity? =
+        when (this) {
+            is LogicalSourceIdentityResult.Stable -> when (evidence) {
+                LogicalIdentityEvidence.VERIFIED_STORE_EXTENSION_ID ->
+                    LogicalSourceIdentity.storeExtensionId(value.removePrefix("store:"))
+                LogicalIdentityEvidence.SIGNED_DRAFT_METADATA ->
+                    LogicalSourceIdentity.signedDraft(value)
+                LogicalIdentityEvidence.PROJECT_MARKER ->
+                    LogicalSourceIdentity.projectMarker(value.removePrefix("project:"))
+                LogicalIdentityEvidence.MANIFEST_KEY ->
+                    LogicalSourceIdentity.manifestKeyExtensionId(value.removePrefix("manifest:"))
+            }
+            else -> null
+        }
+}
+
+internal class DefaultConversionIdentityPort(
+    private val ledger: ConversionIdentityLedger,
+    private val packager: OnDeviceWrapperPackager,
+) : ConversionIdentityPort {
+    override suspend fun existingTargets(profileMajorVersion: Int) =
+        ledger.listExistingTargets(profileMajorVersion)
+
+    override suspend fun resolve(
+        prepared: PreparedConversionSnapshot,
+        profile: BrowserProfile,
+        selection: InstallationIdentitySelection?,
+        ownerToken: String,
+    ): ResolvedPackageIdentity {
+        val mode = if (prepared.passthroughCrx != null) {
+            InstallationIdentityMode.PASSTHROUGH
+        } else {
+            InstallationIdentityMode.CONVERTED
+        }
+        val key = ledger.resolveSelection(
+            prepared.logicalSourceIdentity,
+            profile.majorVersion,
+            mode,
+            selection,
+        )
+        if (mode == InstallationIdentityMode.PASSTHROUGH) {
+            return ResolvedPackageIdentity(
+                key,
+                packager.resolveIdentity(key, prepared.passthroughCrx),
+                null,
+            )
+        }
+        val lease = if (ledger.hasIdentity(key)) {
+            null
+        } else {
+            ledger.resolveUnreservedIdentity(key, ownerToken, packager)
+        }
+        val identity = lease?.identity ?: packager.resolveIdentity(key, null)
+        return ResolvedPackageIdentity(key, identity, lease)
+    }
+
+    override suspend fun reserve(
+        resolved: ResolvedPackageIdentity,
+        displayName: String,
+        installedVersionCode: Long?,
+        ownerToken: String,
+    ): ReservedPackageIdentity {
+        val publicKeySha = resolved.identity.crxPublicKeyDer?.let(::sha256)
+        val reservation = ledger.reserve(
+            ConversionIdentityReservation(
+                identityKey = resolved.key,
+                displayName = displayName,
+                packageBinding = ConversionPackageBinding(
+                    resolved.identity.extensionId,
+                    resolved.identity.packageName,
+                    resolved.identity.wrapperSignerSha256,
+                    resolved.identity.crxKeyAlias,
+                    publicKeySha,
+                ),
+                installedVersionCode = installedVersionCode,
+            ),
+            ownerToken,
+            resolved.unreservedLease as? dev.sixbridge.manager.packager.UnreservedIdentityLease,
+        )
+        return ReservedPackageIdentity(resolved, reservation.versionCode, reservation)
+    }
+
+    override suspend fun abort(ownerToken: String) {
+        ledger.abortByOwnerToken(ownerToken, packager)
+    }
+}
+
+internal class DefaultConversionPackagePort(
+    private val ledger: ConversionIdentityLedger,
+    private val packager: OnDeviceWrapperPackager,
+    private val root: File,
+) : ConversionPackagePort {
+    override suspend fun packageWrapper(
+        reservation: ReservedPackageIdentity,
+        bound: BoundConversionSnapshot,
+        token: String,
+    ): PackagedConversion {
+        require(root.isDirectory || root.mkdirs())
+        val source = File(root, "$token.source")
+        val output = File(root, "$token.apk")
+        val bytes = bound.passthroughCrx ?: bound.sourceZip
+        source.writeBytes(bytes)
+        require(source.setReadOnly())
+        try {
+            val result = packager.packageWrapper(
+                ledger,
+                OnDeviceWrapperPathRequest(
+                    reservation = reservation.opaque as ConversionIdentityLedger.Reservation,
+                    canonicalSourceZip = source.takeIf { bound.passthroughCrx == null },
+                    passthroughCrx = source.takeIf { bound.passthroughCrx != null },
+                    descriptorName = bound.compatibility.extensionName.orEmpty(),
+                    descriptorVersion = bound.compatibility.extensionVersion.orEmpty(),
+                    sourceKind = if (bound.passthroughCrx == null) "ZIP" else "CRX3",
+                    compatibility = bound.compatibility,
+                    outputApk = output,
+                ),
+            )
+            return result.toPackaged()
+        } finally {
+            source.setWritable(true)
+            source.delete()
+        }
+    }
+
+    private fun OnDeviceWrapperResult.toPackaged() = PackagedConversion(
+        extensionId,
+        packageName,
+        versionCode,
+        wrapperSha256,
+        outputApk,
+        this,
+    )
+}
+
+internal class DefaultConversionBundlePort(
+    private val store: GeneratedBundleStore,
+) : ConversionBundlePort {
+    override fun publish(token: String, packaged: PackagedConversion) =
+        store.publish(token, packaged.opaque as OnDeviceWrapperResult)
+    override fun recover(token: String): GeneratedBundle? =
+        runCatching { store.recover(token) }.getOrNull()
+}
+
+private fun sha256(bytes: ByteArray): String =
+    MessageDigest.getInstance("SHA-256").digest(bytes)
+        .joinToString("") { "%02x".format(it) }

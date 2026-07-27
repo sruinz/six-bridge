@@ -79,7 +79,7 @@ object SixBundle {
     fun encodeCompatibility(value: CompatibilityReport): String =
         BundleJson.encodeCompatibility(value.toContract()).prettyJson()
 
-    internal fun toContractV4(
+    fun toContractV4(
         compatibility: CompatibilityReport,
         originalSourceSha256: String,
         planSha256: String,

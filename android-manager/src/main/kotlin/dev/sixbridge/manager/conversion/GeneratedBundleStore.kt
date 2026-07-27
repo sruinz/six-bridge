@@ -211,6 +211,29 @@ class GeneratedBundleStore internal constructor(
         }
     }
 
+    fun open(bundle: GeneratedBundle): InputStream {
+        val recovered = recover(bundle.token)
+        require(
+            recovered.file.canonicalFile == bundle.file.canonicalFile &&
+                recovered.sha256 == bundle.sha256 &&
+                recovered.suggestedFileName == bundle.suggestedFileName,
+        ) {
+            "생성 bundle request가 store proof와 일치하지 않습니다."
+        }
+        return open(bundle.token)
+    }
+
+    fun recover(token: String): GeneratedBundle = synchronized(lock) {
+        val canonicalToken = requireToken(token)
+        val (file, record) = requirePublished(canonicalToken)
+        GeneratedBundle(
+            token = canonicalToken,
+            file = file,
+            sha256 = record.sha256,
+            suggestedFileName = record.suggestedFileName,
+        )
+    }
+
     fun copyTo(token: String, output: OutputStream): String = synchronized(lock) {
         val (file, record) = requirePublished(token)
         try {

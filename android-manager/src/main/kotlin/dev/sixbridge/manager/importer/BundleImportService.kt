@@ -2,6 +2,7 @@ package dev.sixbridge.manager.importer
 
 import android.net.Uri
 import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
 import java.io.File
@@ -39,9 +40,13 @@ class BundleImportService(
         require(maximumSourceBytes in 1..SixBundleContract.MAX_ARCHIVE_SIZE)
     }
 
-    suspend fun import(uri: Uri): ImportResult = importRequest(uri)
+    suspend fun import(uri: Uri): ImportResult =
+        importRequest(BundleOpenRequest.Saf(uri))
 
-    internal suspend fun importRequest(request: Any): ImportResult {
+    suspend fun importGenerated(bundle: GeneratedBundle): ImportResult =
+        importRequest(BundleOpenRequest.Generated(bundle))
+
+    internal suspend fun importRequest(request: BundleOpenRequest): ImportResult {
         val ownedDirectory = AtomicReference<File?>()
         var result: ImportResult? = null
         var retained = false
@@ -69,7 +74,7 @@ class BundleImportService(
     }
 
     private suspend fun importBlocking(
-        request: Any,
+        request: BundleOpenRequest,
         ownDirectory: (File) -> Unit,
     ): ImportResult {
         val root = importRoot() ?: return failure(ImportFailureCode.CACHE_BOUNDARY_INVALID)
