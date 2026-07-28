@@ -7,6 +7,7 @@ import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
 import dev.sixbridge.manager.app.ManagerRestoreResult
@@ -1633,7 +1634,7 @@ class ManagerViewModelTest {
             val viewModel = ManagerViewModel(
                 repository,
                 SavedStateHandle(),
-                openConversionOutput = { copied },
+                saveGeneratedDocument = documentSaver(copied),
             )
             advanceUntilIdle()
 
@@ -1653,6 +1654,47 @@ class ManagerViewModelTest {
 
             assertEquals(listOf(TOKEN), repository.copiedConversionTokens)
             assertEquals(UserMessageKind.CONVERSION_SAVED, viewModel.state.value.message?.kind)
+        }
+
+    @Test
+    fun `저장 실패는 부분 파일 정리 실패 여부를 별도 메시지로 전달한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                false to UserMessageKind.CONVERSION_SAVE_FAILED,
+                true to UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+            ).forEach { (cleanupFailed, expectedKind) ->
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                }
+                val viewModel = ManagerViewModel(
+                    repository,
+                    SavedStateHandle(),
+                    saveGeneratedDocument = { _, _, _ ->
+                        GeneratedDocumentSaveResult.Failure(cleanupFailed)
+                    },
+                )
+                advanceUntilIdle()
+
+                viewModel.accept(ManagerAction.SaveGeneratedConversion)
+                val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                    viewModel.effects.first(),
+                )
+                viewModel.accept(
+                    ManagerAction.SaveGeneratedConversionTo(
+                        token = effect.token,
+                        destination = "content://save/failure.six",
+                        ownerGeneration = effect.ownerGeneration,
+                        launchId = effect.launchId,
+                    ),
+                )
+                advanceUntilIdle()
+
+                assertEquals(expectedKind, viewModel.state.value.message?.kind)
+                assertTrue(viewModel.state.value.message?.text?.contains("content://") == false)
+            }
         }
 
     @Test
@@ -2221,7 +2263,7 @@ class ManagerViewModelTest {
             val first = ManagerViewModel(
                 repository,
                 savedState,
-                openConversionOutput = { ByteArrayOutputStream() },
+                saveGeneratedDocument = documentSaver(ByteArrayOutputStream()),
             )
             advanceUntilIdle()
             first.accept(ManagerAction.SaveGeneratedConversion)
@@ -2232,7 +2274,7 @@ class ManagerViewModelTest {
             val recreated = ManagerViewModel(
                 repository,
                 savedState,
-                openConversionOutput = { ByteArrayOutputStream() },
+                saveGeneratedDocument = documentSaver(ByteArrayOutputStream()),
             )
             advanceUntilIdle()
             recreated.accept(
@@ -2264,6 +2306,17 @@ class ManagerViewModelTest {
         sha256 = "d".repeat(64),
         suggestedFileName = "확장.six",
     )
+
+    private fun documentSaver(
+        output: OutputStream,
+    ): (String, String, (OutputStream) -> String?) -> GeneratedDocumentSaveResult =
+        { _, expectedHash, copy ->
+            if (copy(output) == expectedHash) {
+                GeneratedDocumentSaveResult.Success
+            } else {
+                GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
+            }
+        }
 
     private fun conversionAnalysis(
         token: String = TOKEN,

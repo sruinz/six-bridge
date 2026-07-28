@@ -1,8 +1,9 @@
 package dev.sixbridge.manager
 
-import android.content.pm.PackageManager
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,7 +25,10 @@ import dev.sixbridge.manager.ui.ManagerEffect
 import dev.sixbridge.manager.ui.ManagerViewModel
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
 import java.nio.file.Files
+import java.util.concurrent.CancellationException
 
 class MainActivity : ComponentActivity() {
     private lateinit var managerViewModel: ManagerViewModel
@@ -84,8 +88,13 @@ class MainActivity : ComponentActivity() {
                     ManagerViewModel(
                         repository = repository,
                         savedStateHandle = createSavedStateHandle(),
-                        openConversionOutput = { destination ->
-                            contentResolver.openOutputStream(Uri.parse(destination), "w")
+                        saveGeneratedDocument = { destination, expectedHash, copy ->
+                            writeGeneratedDocument(
+                                resolver = contentResolver,
+                                uri = Uri.parse(destination),
+                                expectedHash = expectedHash,
+                                copy = copy,
+                            )
                         },
                     )
                 }
@@ -277,6 +286,57 @@ internal fun Bundle.restorePendingDocumentLaunch(
 }
 
 internal const val GENERATED_BUNDLE_MIME_TYPE = "application/vnd.sixbridge.bundle"
+
+sealed interface GeneratedDocumentSaveResult {
+    data object Success : GeneratedDocumentSaveResult
+
+    data class Failure(
+        val cleanupFailed: Boolean,
+    ) : GeneratedDocumentSaveResult
+}
+
+internal fun writeGeneratedDocument(
+    resolver: ContentResolver,
+    uri: Uri,
+    expectedHash: String,
+    copy: (OutputStream) -> String?,
+): GeneratedDocumentSaveResult {
+    try {
+        val descriptor = resolver.openFileDescriptor(uri, "rwt")
+            ?: return generatedDocumentFailure(resolver, uri)
+        val copiedHash = descriptor.use {
+            FileOutputStream(it.fileDescriptor).use { output ->
+                copy(output).also {
+                    output.flush()
+                    descriptor.checkError()
+                }
+            }
+        }
+        if (copiedHash == expectedHash) {
+            return GeneratedDocumentSaveResult.Success
+        }
+    } catch (error: CancellationException) {
+        resolver.deleteGeneratedDocument(uri)
+        throw error
+    } catch (_: Exception) {
+        // The partial destination is removed below.
+    }
+    return generatedDocumentFailure(resolver, uri)
+}
+
+private fun generatedDocumentFailure(
+    resolver: ContentResolver,
+    uri: Uri,
+): GeneratedDocumentSaveResult.Failure = GeneratedDocumentSaveResult.Failure(
+    cleanupFailed = !resolver.deleteGeneratedDocument(uri),
+)
+
+private fun ContentResolver.deleteGeneratedDocument(uri: Uri): Boolean =
+    try {
+        delete(uri, null, null) > 0
+    } catch (_: Exception) {
+        false
+    }
 
 internal fun generatedBundleSendIntent(uri: Uri): Intent = Intent(Intent.ACTION_SEND).apply {
     type = GENERATED_BUNDLE_MIME_TYPE

@@ -21,6 +21,7 @@ import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
+import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
@@ -40,7 +41,13 @@ import kotlinx.coroutines.withContext
 class ManagerViewModel(
     private val repository: ManagerRepository,
     private val savedStateHandle: SavedStateHandle,
-    private val openConversionOutput: (String) -> OutputStream? = { null },
+    private val saveGeneratedDocument: (
+        destination: String,
+        expectedHash: String,
+        copy: (OutputStream) -> String?,
+    ) -> GeneratedDocumentSaveResult = { _, _, _ ->
+        GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
+    },
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
@@ -449,30 +456,41 @@ class ManagerViewModel(
         if (result.token != token) return
         if (conversionIoJob?.isActive == true) return
         conversionIoJob = viewModelScope.launch {
-            val copiedHash = try {
-                openConversionOutput(destination)?.use { output ->
+            val saveResult = try {
+                saveGeneratedDocument(
+                    destination,
+                    result.generated.sha256,
+                ) { output ->
                     repository.copyGeneratedConversion(result.token, output)
                 }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
-                null
+                GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
             }
             if (mutableState.value.conversionState !is ConversionUiState.ResultReady) return@launch
             mutableState.update {
                 it.copy(
-                    message = if (copiedHash == result.generated.sha256) {
-                        UserMessage(
+                    message = when (saveResult) {
+                        GeneratedDocumentSaveResult.Success -> UserMessage(
                             UserMessageKind.CONVERSION_SAVED,
                             "변환된 .six 파일을 안전하게 저장했습니다.",
                             RecoveryAction.NONE,
                         )
-                    } else {
-                        UserMessage(
-                            UserMessageKind.CONVERSION_SAVE_FAILED,
-                            "파일 저장을 완료하지 못했습니다. 저장 위치를 다시 선택해 주세요.",
-                            RecoveryAction.RETRY,
-                        )
+                        is GeneratedDocumentSaveResult.Failure ->
+                            if (saveResult.cleanupFailed) {
+                                UserMessage(
+                                    UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+                                    "파일 저장과 부분 파일 삭제를 완료하지 못했습니다. 저장 위치에서 파일을 직접 삭제한 뒤 다시 시도해 주세요.",
+                                    RecoveryAction.RETRY,
+                                )
+                            } else {
+                                UserMessage(
+                                    UserMessageKind.CONVERSION_SAVE_FAILED,
+                                    "파일 저장을 완료하지 못했습니다. 저장 위치를 다시 선택해 주세요.",
+                                    RecoveryAction.RETRY,
+                                )
+                            }
                     },
                 )
             }
