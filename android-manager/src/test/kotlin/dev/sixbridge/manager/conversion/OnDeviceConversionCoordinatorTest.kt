@@ -15,6 +15,7 @@ import java.io.File
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -29,6 +30,143 @@ import org.junit.rules.TemporaryFolder
 class OnDeviceConversionCoordinatorTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `begin은 reclaim acquire create release 뒤에만 분석한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf())
+
+        val result = assertIs<ConversionBeginResult.AnalysisReady>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(fixture.token, result.token)
+        assertEquals(
+            listOf("reclaim", "acquire", "create", "release", "profile", "analyze", "awaiting"),
+            fixture.events,
+        )
+        assertEquals(listOf(fixture.token), fixture.releasedTokens)
+    }
+
+    @Test
+    fun `work create 실패도 exact input lease를 해제한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            workCreateFailure = IllegalStateException("create failed")
+        }
+
+        val result = assertIs<ConversionBeginResult.Failure>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.INPUT_INVALID, result.code)
+        assertNull(result.token)
+        assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
+        assertEquals(listOf(fixture.token), fixture.releasedTokens)
+    }
+
+    @Test
+    fun `work create 취소도 lease를 해제하고 원래 cancellation을 보존한다`() = runTest {
+        val cancellation = CancellationException("create cancelled")
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            workCreateFailure = cancellation
+        }
+
+        val thrown = assertFailsWith<CancellationException> {
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            )
+        }
+
+        assertEquals(cancellation, thrown)
+        assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
+        assertEquals(listOf(fixture.token), fixture.releasedTokens)
+    }
+
+    @Test
+    fun `create 성공 뒤 release 실패는 work token을 가진 INPUT_CLEANUP이다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            inputReleaseResult = false
+        }
+
+        val result = assertIs<ConversionBeginResult.Failure>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.INPUT_CLEANUP, result.code)
+        assertEquals(fixture.token, result.token)
+        assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
+        assertEquals(listOf(fixture.token), fixture.releasedTokens)
+        assertTrue(fixture.inputFile.isFile)
+    }
+
+    @Test
+    fun `create 실패와 release 실패가 겹치면 INPUT_CLEANUP으로 보존한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            workCreateFailure = IllegalStateException("create failed")
+            inputReleaseResult = false
+        }
+
+        val result = assertIs<ConversionBeginResult.Failure>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.INPUT_CLEANUP, result.code)
+        assertNull(result.token)
+        assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
+    }
+
+    @Test
+    fun `취소와 release 실패가 겹쳐도 cancellation을 우선하고 다음 begin이 reclaim한다`() =
+        runTest {
+            val cancellation = CancellationException("create cancelled")
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                workCreateFailure = cancellation
+                inputReleaseResult = false
+            }
+            val coordinator = fixture.coordinator()
+
+            assertFailsWith<CancellationException> {
+                coordinator.begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                )
+            }
+            assertTrue(fixture.inputOrphaned)
+            fixture.workCreateFailure = null
+            fixture.inputReleaseResult = true
+            assertIs<ConversionBeginResult.AnalysisReady>(
+                coordinator.begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            assertEquals(2, fixture.events.count { it == "reclaim" })
+            assertEquals(2, fixture.events.count { it == "release" })
+            assertFalse(fixture.inputOrphaned)
+        }
+
+    @Test
+    fun `reclaim 실패는 새 artifact를 만들기 전에 INPUT_CLEANUP으로 차단한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            inputReclaimResult = false
+        }
+
+        val result = assertIs<ConversionBeginResult.Failure>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.INPUT_CLEANUP, result.code)
+        assertNull(result.token)
+        assertEquals(listOf("reclaim"), fixture.events)
+    }
 
     @Test
     fun `승인된 변환은 package generated import BUNDLE_READY 순서를 지킨다`() = runTest {
@@ -50,8 +188,10 @@ class OnDeviceConversionCoordinatorTest {
 
         assertEquals(
             listOf(
+                "reclaim",
                 "acquire",
                 "create",
+                "release",
                 "profile",
                 "analyze",
                 "awaiting",
@@ -90,7 +230,7 @@ class OnDeviceConversionCoordinatorTest {
         )
 
         assertEquals(ConversionFailureCode.BROWSER_MISSING, failure.code)
-        assertEquals(listOf("acquire", "create", "profile"), events)
+        assertEquals(listOf("reclaim", "acquire", "create", "release", "profile"), events)
         assertTrue(fixture.inputFile.isFile)
     }
 
@@ -788,6 +928,11 @@ class OnDeviceConversionCoordinatorTest {
             private set
         private var storedProfile: String? = null
         var inputFailure: Throwable? = null
+        var inputReleaseResult = true
+        var inputReclaimResult = true
+        var inputOrphaned = false
+        val releasedTokens = mutableListOf<String>()
+        var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
         var logicalIdentity: LogicalSourceIdentity? =
             LogicalSourceIdentity.storeExtensionId(EXTENSION_ID)
@@ -822,20 +967,38 @@ class OnDeviceConversionCoordinatorTest {
         var workDiscardResult = true
 
         fun coordinator() = OnDeviceConversionCoordinator(
-            input = ConversionInputPort {
-                events += "acquire"
-                inputFailure?.let { throw it }
-                OnDeviceInputArtifact(
-                    token,
-                    OnDeviceInputKind.CRX3,
-                    inputFile,
-                    "1".repeat(64),
-                    EXTENSION_ID,
-                )
+            input = object : ConversionInputPort {
+                override suspend fun acquire(
+                    request: OnDeviceInputRequest,
+                ): OnDeviceInputArtifact {
+                    events += "acquire"
+                    inputFailure?.let { throw it }
+                    return OnDeviceInputArtifact(
+                        token,
+                        OnDeviceInputKind.CRX3,
+                        inputFile,
+                        "1".repeat(64),
+                        EXTENSION_ID,
+                    )
+                }
+
+                override suspend fun release(artifact: OnDeviceInputArtifact): Boolean {
+                    events += "release"
+                    releasedTokens += artifact.token
+                    if (!inputReleaseResult) inputOrphaned = true
+                    return inputReleaseResult
+                }
+
+                override suspend fun reclaimOrphans(): Boolean {
+                    events += "reclaim"
+                    if (inputReclaimResult) inputOrphaned = false
+                    return inputReclaimResult
+                }
             },
             work = object : ConversionWorkPort {
                 override suspend fun create(artifact: OnDeviceInputArtifact): RestoredConversionJob {
                     events += "create"
+                    workCreateFailure?.let { throw it }
                     return job()
                 }
 

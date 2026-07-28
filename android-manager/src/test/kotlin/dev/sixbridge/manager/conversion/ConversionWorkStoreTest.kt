@@ -1069,7 +1069,18 @@ class ConversionWorkStoreTest {
         workStore: ConversionWorkStore,
         bundleStore: GeneratedBundleStore,
     ) = OnDeviceConversionCoordinator(
-        input = ConversionInputPort { error("discard test에서 input은 사용하지 않습니다.") },
+        input = object : ConversionInputPort {
+            override suspend fun acquire(
+                request: OnDeviceInputRequest,
+            ): OnDeviceInputArtifact =
+                error("discard test에서 input은 사용하지 않습니다.")
+
+            override suspend fun release(artifact: OnDeviceInputArtifact): Boolean =
+                error("discard test에서 input은 사용하지 않습니다.")
+
+            override suspend fun reclaimOrphans(): Boolean =
+                error("discard test에서 input은 사용하지 않습니다.")
+        },
         work = DefaultConversionWorkPort(workStore),
         profiles = ConversionProfilePort {
             error("discard test에서 profile은 사용하지 않습니다.")

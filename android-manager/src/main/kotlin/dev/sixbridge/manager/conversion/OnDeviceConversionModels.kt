@@ -25,6 +25,7 @@ enum class ConversionFailureCode {
     URL,
     NETWORK,
     INPUT_INVALID,
+    INPUT_CLEANUP,
     DRAFT_INVALID,
     BROWSER_MISSING,
     PROFILE_UNKNOWN,
@@ -158,8 +159,10 @@ internal data class PackagedConversion(
     val opaque: Any,
 )
 
-internal fun interface ConversionInputPort {
+internal interface ConversionInputPort {
     suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact
+    suspend fun release(artifact: OnDeviceInputArtifact): Boolean
+    suspend fun reclaimOrphans(): Boolean
 }
 
 internal interface ConversionWorkPort {

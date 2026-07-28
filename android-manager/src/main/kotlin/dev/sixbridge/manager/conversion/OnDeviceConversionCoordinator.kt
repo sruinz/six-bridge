@@ -23,6 +23,16 @@ internal class OnDeviceConversionCoordinator(
     private val buildMutex = Mutex()
 
     override suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
+        val reclaimed = try {
+            input.reclaimOrphans()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            false
+        }
+        if (!reclaimed) {
+            return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_CLEANUP)
+        }
         val artifact = try {
             input.acquire(request)
         } catch (error: CancellationException) {
@@ -30,14 +40,30 @@ internal class OnDeviceConversionCoordinator(
         } catch (error: Throwable) {
             return ConversionBeginResult.Failure(error.toInputFailureCode())
         }
-        val job = try {
+        var job: RestoredConversionJob? = null
+        var createFailure: Throwable? = null
+        try {
             work.create(artifact)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Throwable) {
+                .also { job = it }
+        } catch (error: Throwable) {
+            createFailure = error
+        }
+        val released = withContext(NonCancellable) {
+            runCatching { input.release(artifact) }.getOrDefault(false)
+        }
+        if (createFailure is CancellationException) {
+            throw createFailure
+        }
+        if (!released) {
+            return ConversionBeginResult.Failure(
+                ConversionFailureCode.INPUT_CLEANUP,
+                job?.token,
+            )
+        }
+        if (createFailure != null) {
             return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
-        return analyzeJob(job, markAwaiting = true)
+        return analyzeJob(requireNotNull(job), markAwaiting = true)
     }
 
     suspend fun analyze(token: String): ConversionBeginResult {

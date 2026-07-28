@@ -30,6 +30,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private val NOFOLLOW_LINKS = LinkOption.NOFOLLOW_LINKS
@@ -40,7 +42,11 @@ class OnDeviceInputService(
     private val chromeDownloader: ChromeCrxDownloader = AndroidChromeCrxDownloader(),
     private val tokenFactory: () -> String = { UUID.randomUUID().toString() },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-) {
+    private val workspaceDeleter: (Path) -> Boolean = ::deleteInputTree,
+) : ConversionInputPort {
+    private val leaseMutex = Mutex()
+    private val activeTokens = mutableSetOf<String>()
+
     constructor(
         privateRoot: File,
         contentResolver: ContentResolver,
@@ -53,8 +59,31 @@ class OnDeviceInputService(
         chromeDownloader = chromeDownloader,
     )
 
-    suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact {
+    override suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact =
+        leaseMutex.withLock {
+            acquireLocked(request)
+        }
+
+    override suspend fun release(artifact: OnDeviceInputArtifact): Boolean =
+        leaseMutex.withLock {
+            val workspace = exactWorkspace(artifact) ?: return@withLock false
+            activeTokens.remove(artifact.token)
+            withContext(NonCancellable + ioDispatcher) {
+                workspaceDeleter(workspace)
+            }
+        }
+
+    override suspend fun reclaimOrphans(): Boolean = leaseMutex.withLock {
+        withContext(NonCancellable + ioDispatcher) {
+            reclaimOrphansOnIo()
+        }
+    }
+
+    private suspend fun acquireLocked(
+        request: OnDeviceInputRequest,
+    ): OnDeviceInputArtifact {
         val ownedWorkspace = AtomicReference<Path?>()
+        var primaryFailure: Throwable? = null
         return try {
             val artifact = withContext(ioDispatcher) {
                 currentCoroutineContext().ensureActive()
@@ -62,14 +91,18 @@ class OnDeviceInputService(
                 ownedWorkspace.set(workspace)
                 acquireOnIo(request, workspace)
             }
+            activeTokens += artifact.token
             ownedWorkspace.set(null)
             artifact
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
         } finally {
             ownedWorkspace.getAndSet(null)?.let { workspace ->
                 val cleaned = withContext(NonCancellable + ioDispatcher) {
-                    deleteTree(workspace)
+                    workspaceDeleter(workspace)
                 }
-                if (!cleaned) {
+                if (!cleaned && primaryFailure !is CancellationException) {
                     inputFailure(
                         OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
                         "private 입력 artifact를 정리할 수 없습니다.",
@@ -78,6 +111,72 @@ class OnDeviceInputService(
             }
         }
     }
+
+    private fun exactWorkspace(artifact: OnDeviceInputArtifact): Path? {
+        if (!isCanonicalToken(artifact.token)) return null
+        val root = canonicalRoot() ?: return null
+        if (Files.isSymbolicLink(root)) return null
+        val workspace = root.resolve(artifact.token)
+        if (workspace.parent != root || Files.isSymbolicLink(workspace)) return null
+        val expectedInput = workspace.resolve(INPUT_FILE_NAME)
+        val suppliedInput = runCatching {
+            artifact.privateFile.canonicalFile.toPath()
+        }.getOrNull() ?: return null
+        val canonicalExpected = runCatching {
+            expectedInput.toFile().canonicalFile.toPath()
+        }.getOrNull() ?: return null
+        if (suppliedInput != canonicalExpected || canonicalExpected != expectedInput) return null
+        if (
+            Files.exists(workspace, LinkOption.NOFOLLOW_LINKS) &&
+            (!Files.isDirectory(workspace, LinkOption.NOFOLLOW_LINKS) ||
+                runCatching { workspace.toFile().canonicalFile.toPath() != workspace }
+                    .getOrDefault(true))
+        ) {
+            return null
+        }
+        if (
+            Files.exists(expectedInput, LinkOption.NOFOLLOW_LINKS) &&
+            Files.isSymbolicLink(expectedInput)
+        ) {
+            return null
+        }
+        return workspace
+    }
+
+    private fun reclaimOrphansOnIo(): Boolean {
+        val root = canonicalRoot() ?: return false
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return true
+        if (
+            Files.isSymbolicLink(root) ||
+            !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)
+        ) {
+            return false
+        }
+        val children = runCatching {
+            Files.newDirectoryStream(root).use { stream -> stream.toList() }
+        }.getOrElse { return false }
+        var cleaned = true
+        children.forEach { child ->
+            val token = child.fileName.toString()
+            if (
+                token !in activeTokens &&
+                isCanonicalToken(token) &&
+                !Files.isSymbolicLink(child) &&
+                Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS) &&
+                child.parent == root &&
+                runCatching { child.toFile().canonicalFile.toPath() == child }
+                    .getOrDefault(false)
+            ) {
+                if (!workspaceDeleter(child)) cleaned = false
+            }
+        }
+        return cleaned
+    }
+
+    private fun canonicalRoot(): Path? = runCatching {
+        if (Files.isSymbolicLink(privateRoot.toPath())) return null
+        privateRoot.canonicalFile.toPath()
+    }.getOrNull()
 
     private suspend fun acquireOnIo(
         request: OnDeviceInputRequest,
@@ -422,7 +521,7 @@ class OnDeviceInputService(
         } catch (_: Exception) {
             inputFailure(errorCode, "확장 ZIP 구조가 올바르지 않습니다.")
         } finally {
-            if (!deleteTree(validationRoot)) {
+            if (!workspaceDeleter(validationRoot)) {
                 inputFailure(
                     OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
                     "ZIP 검증 임시 파일을 정리할 수 없습니다.",
@@ -512,34 +611,6 @@ class OnDeviceInputService(
         return digest.digest().toHex()
     }
 
-    private fun deleteTree(path: Path): Boolean {
-        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return true
-        return runCatching {
-            Files.walkFileTree(
-                path,
-                object : SimpleFileVisitor<Path>() {
-                    override fun visitFile(
-                        file: Path,
-                        attrs: BasicFileAttributes,
-                    ): FileVisitResult {
-                        Files.deleteIfExists(file)
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun postVisitDirectory(
-                        dir: Path,
-                        error: IOException?,
-                    ): FileVisitResult {
-                        if (error != null) throw error
-                        Files.deleteIfExists(dir)
-                        return FileVisitResult.CONTINUE
-                    }
-                },
-            )
-            !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
-        }.getOrDefault(false)
-    }
-
     private fun isCanonicalToken(token: String): Boolean =
         runCatching { UUID.fromString(token).toString() == token }.getOrDefault(false)
 
@@ -591,4 +662,32 @@ class OnDeviceInputService(
         private val CRX3_MAGIC = "Cr24".encodeToByteArray()
         private val ZIP_MAGIC = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4)
     }
+}
+
+private fun deleteInputTree(path: Path): Boolean {
+    if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return true
+    return runCatching {
+        Files.walkFileTree(
+            path,
+            object : SimpleFileVisitor<Path>() {
+                override fun visitFile(
+                    file: Path,
+                    attrs: BasicFileAttributes,
+                ): FileVisitResult {
+                    Files.deleteIfExists(file)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun postVisitDirectory(
+                    dir: Path,
+                    error: IOException?,
+                ): FileVisitResult {
+                    if (error != null) throw error
+                    Files.deleteIfExists(dir)
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
+        !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+    }.getOrDefault(false)
 }

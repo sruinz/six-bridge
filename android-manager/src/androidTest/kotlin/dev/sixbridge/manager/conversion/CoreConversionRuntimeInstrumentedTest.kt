@@ -29,6 +29,7 @@ import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
@@ -51,6 +52,72 @@ class CoreConversionRuntimeInstrumentedTest {
     private val testContext = InstrumentationRegistry.getInstrumentation().context
     private val targetContext =
         InstrumentationRegistry.getInstrumentation().targetContext
+
+    @Test
+    fun inputLeaseIsReleasedAfterDurableWorkHandoff() {
+        val source = assetZip("ondevice-conversion")
+        val database = Room.inMemoryDatabaseBuilder(
+            targetContext,
+            ManagerDatabase::class.java,
+        ).allowMainThreadQueries().build()
+        val inputRoot = File(
+            targetContext.filesDir,
+            "input-lease-gate/${UUID.randomUUID()}/conversion-input",
+        )
+        val workRoot = File(
+            targetContext.filesDir,
+            "input-lease-gate/${UUID.randomUUID()}/conversion-work",
+        )
+        val inputService = OnDeviceInputService(
+            privateRoot = inputRoot,
+            safInputOpener = SafInputOpener { ByteArrayInputStream(source) },
+        )
+        val packager = OnDeviceWrapperPackager(targetContext)
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val workStore = ConversionWorkStore(
+            privateRoot = workRoot,
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { true },
+            identityOwnerLifecycle = ledger.ownerLifecycle(packager),
+        )
+        val coordinator = OnDeviceConversionCoordinator(
+            input = inputService,
+            work = DefaultConversionWorkPort(workStore),
+            profiles = ConversionProfilePort {
+                SamsungProfileSnapshot.Supported(profile())
+            },
+            runtime = DefaultConversionRuntime(),
+            identities = DefaultConversionIdentityPort(ledger, packager),
+            installed = ConversionInstalledPort { null },
+            packages = DefaultConversionPackagePort(ledger, packager),
+            bundles = DefaultConversionBundlePort(GeneratedBundleStore(targetContext)),
+            imports = ConversionGeneratedImportPort { null },
+        )
+        var workToken: String? = null
+        try {
+            kotlinx.coroutines.runBlocking {
+                val result = coordinator.begin(
+                    OnDeviceInputRequest.Saf(android.net.Uri.EMPTY),
+                )
+                assertTrue(result is ConversionBeginResult.AnalysisReady)
+                val restored = requireNotNull(workStore.restore())
+                workToken = restored.token
+
+                assertTrue(inputRoot.listFiles().orEmpty().isEmpty())
+                workStore.withVerifiedInputFile(restored.token) { copied ->
+                    assertTrue(copied.isFile)
+                    assertArrayEquals(source, copied.readBytes())
+                }
+            }
+        } finally {
+            kotlinx.coroutines.runBlocking {
+                workToken?.let { runCatching { workStore.discard(it) } }
+            }
+            database.close()
+            inputRoot.parentFile?.deleteRecursively()
+            workRoot.parentFile?.deleteRecursively()
+        }
+    }
 
     @Test
     fun prepareIsDeterministicOnAndroid() {
@@ -331,7 +398,15 @@ class CoreConversionRuntimeInstrumentedTest {
         )
         var importFailuresRemaining = 3
         fun coordinator() = OnDeviceConversionCoordinator(
-            input = ConversionInputPort { artifact },
+            input = object : ConversionInputPort {
+                override suspend fun acquire(
+                    request: OnDeviceInputRequest,
+                ): OnDeviceInputArtifact = artifact
+
+                override suspend fun release(artifact: OnDeviceInputArtifact): Boolean = true
+
+                override suspend fun reclaimOrphans(): Boolean = true
+            },
             work = DefaultConversionWorkPort(workStore),
             profiles = ConversionProfilePort {
                 SamsungProfileSnapshot.Supported(profile)

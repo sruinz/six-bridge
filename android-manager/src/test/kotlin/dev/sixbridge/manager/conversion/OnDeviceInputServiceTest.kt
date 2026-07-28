@@ -14,11 +14,13 @@ import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -49,6 +51,152 @@ class OnDeviceInputServiceTest {
     @After
     fun cleanUp() {
         root.deleteRecursively()
+    }
+
+    @Test
+    fun `release는 exact artifact token directory만 삭제한다`() = runTest {
+        val service = service(ByteArrayInputStream(extensionZip()))
+        val artifact = service.acquire(safRequest())
+
+        assertTrue(service.release(artifact))
+
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `release는 token file root 경계가 다른 artifact를 삭제하지 않는다`() = runTest {
+        val service = service(ByteArrayInputStream(extensionZip()))
+        val artifact = service.acquire(safRequest())
+        val outside = Files.createTempFile("sixbridge-foreign-input", ".bin").toFile()
+        try {
+            val mismatches = listOf(
+                artifact.copy(token = "11111111-1111-4111-8111-111111111111"),
+                artifact.copy(privateFile = File(artifact.privateFile.parentFile, "other.bin")),
+                artifact.copy(privateFile = outside),
+            )
+
+            mismatches.forEach { mismatch ->
+                assertFalse(service.release(mismatch))
+                assertTrue(artifact.privateFile.isFile)
+            }
+        } finally {
+            outside.delete()
+        }
+
+        assertTrue(service.release(artifact))
+    }
+
+    @Test
+    fun `reclaim은 canonical UUID orphan만 삭제하고 foreign과 symlink는 보존한다`() =
+        runTest {
+            val canonical = File(root, "11111111-1111-4111-8111-111111111111").apply {
+                mkdirs()
+                resolve("input.bin").writeText("orphan")
+            }
+            val foreign = File(root, "not-a-token").apply {
+                mkdirs()
+                resolve("input.bin").writeText("foreign")
+            }
+            val external = Files.createTempDirectory("sixbridge-external-orphan").toFile()
+            val symlink = File(root, "22222222-2222-4222-8222-222222222222")
+            Files.createSymbolicLink(symlink.toPath(), external.toPath())
+            val service = service(ByteArrayInputStream(extensionZip()))
+
+            assertTrue(service.reclaimOrphans())
+
+            assertFalse(canonical.exists())
+            assertTrue(foreign.isDirectory)
+            assertTrue(Files.isSymbolicLink(symlink.toPath()))
+            assertTrue(external.isDirectory)
+            symlink.delete()
+            external.deleteRecursively()
+        }
+
+    @Test
+    fun `active lease는 reclaim에서 제외되고 release 뒤 삭제된다`() = runTest {
+        val service = service(ByteArrayInputStream(extensionZip()))
+        val artifact = service.acquire(safRequest())
+        val orphan = File(root, "33333333-3333-4333-8333-333333333333").apply {
+            mkdirs()
+            resolve("input.bin").writeText("orphan")
+        }
+
+        assertTrue(service.reclaimOrphans())
+
+        assertTrue(artifact.privateFile.isFile)
+        assertFalse(orphan.exists())
+        assertTrue(service.release(artifact))
+    }
+
+    @Test
+    fun `acquire는 coordinator 소유 reclaim을 중복 실행하지 않는다`() = runTest {
+        val orphan = File(root, "66666666-6666-4666-8666-666666666666").apply {
+            mkdirs()
+            resolve("input.bin").writeText("orphan")
+        }
+        val service = service(ByteArrayInputStream(extensionZip()))
+
+        val artifact = service.acquire(safRequest())
+
+        assertTrue(orphan.isDirectory)
+        assertTrue(service.reclaimOrphans())
+        assertFalse(orphan.exists())
+        assertTrue(artifact.privateFile.isFile)
+        assertTrue(service.release(artifact))
+    }
+
+    @Test
+    fun `release 삭제 실패도 active lease를 끝내 다음 reclaim이 orphan을 회수한다`() =
+        runTest {
+            val token = "44444444-4444-4444-8444-444444444444"
+            var failRelease = true
+            val service = OnDeviceInputService(
+                privateRoot = root,
+                safInputOpener = SafInputOpener { ByteArrayInputStream(extensionZip()) },
+                tokenFactory = { token },
+                workspaceDeleter = { path ->
+                    if (path.fileName.toString() == token && failRelease) {
+                        failRelease = false
+                        false
+                    } else {
+                        path.toFile().deleteRecursively()
+                        !Files.exists(path)
+                    }
+                },
+            )
+            val artifact = service.acquire(safRequest())
+
+            assertFalse(service.release(artifact))
+            assertTrue(artifact.privateFile.isFile)
+            assertTrue(service.reclaimOrphans())
+
+            assertFalse(requireNotNull(artifact.privateFile.parentFile).exists())
+        }
+
+    @Test
+    fun `release와 reclaim 경합은 exact token tree를 한 번만 삭제한다`() = runTest {
+        val token = "55555555-5555-4555-8555-555555555555"
+        val deleteCount = AtomicInteger()
+        val service = OnDeviceInputService(
+            privateRoot = root,
+            safInputOpener = SafInputOpener { ByteArrayInputStream(extensionZip()) },
+            tokenFactory = { token },
+            workspaceDeleter = { path ->
+                if (path.fileName.toString() == token) {
+                    deleteCount.incrementAndGet()
+                }
+                path.toFile().deleteRecursively()
+                !Files.exists(path)
+            },
+        )
+        val artifact = service.acquire(safRequest())
+
+        val release = async { service.release(artifact) }
+        val reclaim = async { service.reclaimOrphans() }
+
+        assertTrue(release.await())
+        assertTrue(reclaim.await())
+        assertEquals(1, deleteCount.get())
     }
 
     @Test

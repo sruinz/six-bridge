@@ -275,14 +275,20 @@ class DraftIdentityPreviewInstrumentedTest {
         val runtime = DefaultConversionRuntime()
         val identities = DefaultConversionIdentityPort(ledger, packager)
         val coordinator = OnDeviceConversionCoordinator(
-            input = ConversionInputPort {
-                OnDeviceInputArtifact(
+            input = object : ConversionInputPort {
+                override suspend fun acquire(
+                    request: OnDeviceInputRequest,
+                ) = OnDeviceInputArtifact(
                     token = artifactToken,
                     kind = OnDeviceInputKind.SIX_DRAFT,
                     privateFile = input,
                     sha256 = sha256(draftBytes),
                     expectedExtensionId = null,
                 )
+
+                override suspend fun release(artifact: OnDeviceInputArtifact): Boolean = true
+
+                override suspend fun reclaimOrphans(): Boolean = true
             },
             work = DefaultConversionWorkPort(workStore),
             profiles = ConversionProfilePort {

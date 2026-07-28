@@ -10,7 +10,6 @@ import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionGeneratedImportPort
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
-import dev.sixbridge.manager.conversion.ConversionInputPort
 import dev.sixbridge.manager.conversion.ConversionInstalledPort
 import dev.sixbridge.manager.conversion.ConversionProfilePort
 import dev.sixbridge.manager.conversion.ConversionWorkStore
@@ -47,6 +46,7 @@ import java.time.Clock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class ManagerDependencies private constructor(
     val repository: ManagerRepository,
@@ -62,6 +62,7 @@ class ManagerDependencies private constructor(
             }
 
         private fun build(application: Application): ManagerDependencies {
+            val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val database = Room.databaseBuilder(
                 application,
                 ManagerDatabase::class.java,
@@ -111,13 +112,15 @@ class ManagerDependencies private constructor(
                 identityOwnerLifecycle = identityLedger.ownerLifecycle(packager),
             )
             val profileProvider = AndroidSamsungBrowserProfileProvider(application)
+            val inputService = OnDeviceInputService(
+                File(application.filesDir, "conversion-input"),
+                application.contentResolver,
+            )
+            applicationScope.launch {
+                inputService.reclaimOrphans()
+            }
             val conversionCoordinator = OnDeviceConversionCoordinator(
-                input = ConversionInputPort(
-                    OnDeviceInputService(
-                        File(application.filesDir, "conversion-input"),
-                        application.contentResolver,
-                    )::acquire,
-                ),
+                input = inputService,
                 work = DefaultConversionWorkPort(workStore),
                 profiles = ConversionProfilePort {
                     when (val profile = profileProvider.load()) {
@@ -155,7 +158,6 @@ class ManagerDependencies private constructor(
                 File(application.cacheDir, "extension-icons"),
             )
             val iconEnricher = CatalogIconEnricher(catalog, iconSource)
-            val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val catalogPublisher = CatalogPublisher(
                 catalog = catalog,
                 installedWrappers = installedWrappers,

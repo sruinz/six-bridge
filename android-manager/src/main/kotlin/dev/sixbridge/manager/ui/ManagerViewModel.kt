@@ -2826,6 +2826,11 @@ internal fun conversionFailureMessage(code: ConversionFailureCode): UserMessage 
         "선택한 파일을 확장 입력으로 확인할 수 없습니다. 다른 ZIP 또는 CRX3 파일을 선택해 주세요.",
         RecoveryAction.SELECT_ANOTHER_FILE,
     )
+    ConversionFailureCode.INPUT_CLEANUP -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "private 입력 정리를 완료하지 못했습니다. 앱 저장 공간을 확인한 뒤 새 입력을 다시 선택해 주세요.",
+        RecoveryAction.NONE,
+    )
     ConversionFailureCode.DRAFT_INVALID -> UserMessage(
         UserMessageKind.CONVERSION_FAILURE,
         "SixDraft 서명이나 변환 증명이 올바르지 않습니다. 신뢰할 수 있는 초안을 다시 선택해 주세요.",

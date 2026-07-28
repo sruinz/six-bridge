@@ -79,6 +79,16 @@ class ConversionScreenTest {
         })
     }
 
+    @Test
+    fun `input cleanup 실패는 private 경로 없이 복구 불가 메시지로 표시한다`() {
+        val message = conversionFailureMessage(ConversionFailureCode.INPUT_CLEANUP)
+
+        assertEquals(RecoveryAction.NONE, message.recoveryAction)
+        assertTrue("private 입력 정리" in message.text)
+        assertFalse("/data/" in message.text)
+        assertFalse("conversion-input" in message.text)
+    }
+
     private fun analysis(
         status: CompatibilityStatus = CompatibilityStatus.COMPATIBLE,
         requiredApprovals: Set<String> = emptySet(),
