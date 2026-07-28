@@ -12,6 +12,9 @@ import dev.sixbridge.manager.packager.OnDevicePackageIdentity
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -21,7 +24,9 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.Rule
 import org.junit.Test
@@ -121,6 +126,76 @@ class OnDeviceConversionCoordinatorTest {
         assertNull(result.token)
         assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
     }
+
+    @Test
+    fun `post claim create 실패는 durable work token을 INPUT_INVALID에 보존한다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                workCreateFailure = ConversionWorkCreateException(CLAIMED_TOKEN)
+            }
+
+            val result = assertIs<ConversionBeginResult.Failure>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            assertEquals(ConversionFailureCode.INPUT_INVALID, result.code)
+            assertEquals(CLAIMED_TOKEN, result.token)
+            assertEquals(listOf("reclaim", "acquire", "create", "release"), fixture.events)
+        }
+
+    @Test
+    fun `post claim create와 release 실패는 durable work token을 INPUT_CLEANUP에 보존한다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                workCreateFailure = ConversionWorkCreateException(CLAIMED_TOKEN)
+                inputReleaseResult = false
+            }
+
+            val result = assertIs<ConversionBeginResult.Failure>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            assertEquals(ConversionFailureCode.INPUT_CLEANUP, result.code)
+            assertEquals(CLAIMED_TOKEN, result.token)
+        }
+
+    @Test
+    fun `release 대기 중 caller 취소는 cleanup 완료 뒤 INPUT_CLEANUP보다 우선한다`() =
+        runBlocking {
+            val releaseEntered = CountDownLatch(1)
+            val allowRelease = CountDownLatch(1)
+            val observed = AtomicReference<Any?>()
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                inputReleaseResult = false
+                inputReleaseBlockingEntered = releaseEntered
+                inputReleaseBlockingGate = allowRelease
+            }
+            val deferred = async(Dispatchers.Default) {
+                observed.set(
+                    try {
+                        fixture.coordinator().begin(
+                            OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                        )
+                    } catch (failure: CancellationException) {
+                        failure
+                    },
+                )
+            }
+            assertTrue(releaseEntered.await(5, TimeUnit.SECONDS))
+
+            deferred.cancel(CancellationException("caller cancelled"))
+            allowRelease.countDown()
+            deferred.join()
+
+            assertIs<CancellationException>(observed.get())
+            assertEquals(1, fixture.events.count { it == "release" })
+            assertTrue(fixture.inputOrphaned)
+            assertTrue("profile" !in fixture.events)
+        }
 
     @Test
     fun `취소와 release 실패가 겹쳐도 cancellation을 우선하고 다음 begin이 reclaim한다`() =
@@ -931,6 +1006,8 @@ class OnDeviceConversionCoordinatorTest {
         var inputReleaseResult = true
         var inputReclaimResult = true
         var inputOrphaned = false
+        var inputReleaseBlockingEntered: CountDownLatch? = null
+        var inputReleaseBlockingGate: CountDownLatch? = null
         val releasedTokens = mutableListOf<String>()
         var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
@@ -985,6 +1062,8 @@ class OnDeviceConversionCoordinatorTest {
                 override suspend fun release(artifact: OnDeviceInputArtifact): Boolean {
                     events += "release"
                     releasedTokens += artifact.token
+                    inputReleaseBlockingEntered?.countDown()
+                    inputReleaseBlockingGate?.await(5, TimeUnit.SECONDS)
                     if (!inputReleaseResult) inputOrphaned = true
                     return inputReleaseResult
                 }
@@ -1287,6 +1366,7 @@ class OnDeviceConversionCoordinatorTest {
     companion object {
         private val EXTENSION_ID = "a".repeat(32)
         private val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
+        private val CLAIMED_TOKEN = "77777777-7777-4777-8777-777777777777"
 
         private fun profile(versionCode: Long = 1) = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",

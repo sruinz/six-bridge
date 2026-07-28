@@ -87,6 +87,57 @@ class OnDeviceInputServiceTest {
     }
 
     @Test
+    fun `forged artifact는 정상 active lease를 종료하거나 삭제하지 않는다`() = runTest {
+        val service = service(ByteArrayInputStream(extensionZip()))
+        val artifact = service.acquire(safRequest())
+        val forged = artifact.copy(sha256 = "0".repeat(64))
+
+        assertFalse(service.release(forged))
+        assertTrue(service.reclaimOrphans())
+        assertTrue(artifact.privateFile.isFile)
+
+        assertTrue(service.release(artifact))
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `모든 필드가 같은 artifact copy도 정상 active lease를 종료하지 않는다`() = runTest {
+        val service = service(ByteArrayInputStream(extensionZip()))
+        val artifact = service.acquire(safRequest())
+
+        assertFalse(service.release(artifact.copy()))
+        assertTrue(service.reclaimOrphans())
+        assertTrue(artifact.privateFile.isFile)
+
+        assertTrue(service.release(artifact))
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `active artifact 경계 훼손 release는 lease를 끝내고 안전 orphan 복구 뒤 reclaim한다`() =
+        runTest {
+            val service = service(ByteArrayInputStream(extensionZip()))
+            val artifact = service.acquire(safRequest())
+            val external = Files.createTempFile("sixbridge-release-foreign", ".bin").toFile()
+            try {
+                assertTrue(artifact.privateFile.delete())
+                Files.createSymbolicLink(artifact.privateFile.toPath(), external.toPath())
+
+                assertFalse(service.release(artifact))
+                assertTrue(Files.isSymbolicLink(artifact.privateFile.toPath()))
+
+                assertTrue(artifact.privateFile.delete())
+                artifact.privateFile.writeText("safe orphan")
+                assertTrue(service.reclaimOrphans())
+
+                assertFalse(requireNotNull(artifact.privateFile.parentFile).exists())
+                assertTrue(external.isFile)
+            } finally {
+                external.delete()
+            }
+        }
+
+    @Test
     fun `reclaim은 canonical UUID orphan만 삭제하고 foreign과 symlink는 보존한다`() =
         runTest {
             val canonical = File(root, "11111111-1111-4111-8111-111111111111").apply {

@@ -26,6 +26,7 @@ import org.junit.Before
 import org.junit.Test
 import kotlin.io.path.createTempDirectory
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 
 class ConversionWorkStoreTest {
     private lateinit var root: File
@@ -129,9 +130,11 @@ class ConversionWorkStoreTest {
             ),
         )
 
-        assertFailsWith<IllegalArgumentException> {
+        val failure = assertFailsWith<ConversionWorkCreateException> {
             store.create(artifact("verified input".encodeToByteArray()))
         }
+        assertIs<IllegalArgumentException>(failure.cause)
+        assertEquals(requireNotNull(dao.get()).token, failure.claimedToken)
 
         val row = requireNotNull(dao.get())
         assertEquals(ConversionJobStage.INPUT_READY.name, row.stage)
@@ -160,9 +163,11 @@ class ConversionWorkStoreTest {
             ),
         )
 
-        assertFailsWith<IllegalArgumentException> {
+        val failure = assertFailsWith<ConversionWorkCreateException> {
             store.create(artifact(expected))
         }
+        assertIs<IllegalArgumentException>(failure.cause)
+        assertEquals(requireNotNull(dao.get()).token, failure.claimedToken)
 
         assertEquals(attacker.decodeToString(), privateInput(requireNotNull(dao.get())).readText())
     }
@@ -189,9 +194,11 @@ class ConversionWorkStoreTest {
                 ),
             )
 
-            assertFailsWith<IllegalArgumentException> {
+            val failure = assertFailsWith<ConversionWorkCreateException> {
                 store.create(artifact(expected))
             }
+            assertIs<IllegalArgumentException>(failure.cause)
+            assertEquals(requireNotNull(dao.get()).token, failure.claimedToken)
 
             assertTrue(mutated)
             assertFalse(privateInput(requireNotNull(dao.get())).readBytes().contentEquals(expected))
@@ -247,10 +254,11 @@ class ConversionWorkStoreTest {
                 ),
             )
 
-            assertFailsWith<IllegalStateException> {
+            val failure = assertFailsWith<ConversionWorkCreateException> {
                 failing.create(artifact("second".encodeToByteArray()))
             }
             val pending = requireNotNull(dao.get())
+            assertEquals(pending.token, failure.claimedToken)
             assertTrue(requireNotNull(decodeCleanupTokens(pending.cleanupTokensJson)).contains(first.token))
             assertTrue(File(root, first.token).exists())
 
@@ -467,10 +475,11 @@ class ConversionWorkStoreTest {
             ),
         )
 
-        assertFailsWith<IllegalStateException> {
+        val failure = assertFailsWith<ConversionWorkCreateException> {
             store.create(artifact("input".encodeToByteArray()))
         }
 
+        assertNull(failure.claimedToken)
         assertNull(dao.get())
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
@@ -775,9 +784,11 @@ class ConversionWorkStoreTest {
         val artifact = artifact("input".encodeToByteArray())
         val artifactAlias = File(sourceRoot, "artifact-alias")
         Files.createLink(artifactAlias.toPath(), artifact.privateFile.toPath())
-        assertFailsWith<IllegalArgumentException> {
+        val createFailure = assertFailsWith<ConversionWorkCreateException> {
             store().create(artifact)
         }
+        assertIs<IllegalArgumentException>(createFailure.cause)
+        assertNull(createFailure.claimedToken)
 
         artifactAlias.delete()
         val buildStore = readyToBuildStore()

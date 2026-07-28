@@ -186,6 +186,18 @@ internal interface ConversionWorkPort {
     suspend fun <T> withVerifiedInputFile(token: String, consume: (File) -> T): T
 }
 
+internal class ConversionWorkCreateException(
+    val claimedToken: String?,
+    cause: Throwable? = null,
+) : IllegalStateException(
+    if (claimedToken == null) {
+        "conversion work를 claim하기 전에 만들지 못했습니다."
+    } else {
+        "claim된 conversion work를 완성하지 못했습니다."
+    },
+    cause,
+)
+
 internal fun interface ConversionProfilePort {
     suspend fun load(): SamsungProfileSnapshot
 }

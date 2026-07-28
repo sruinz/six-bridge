@@ -5,6 +5,8 @@ import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -51,17 +53,22 @@ internal class OnDeviceConversionCoordinator(
         val released = withContext(NonCancellable) {
             runCatching { input.release(artifact) }.getOrDefault(false)
         }
+        currentCoroutineContext().ensureActive()
         if (createFailure is CancellationException) {
             throw createFailure
         }
+        val claimedToken = (createFailure as? ConversionWorkCreateException)?.claimedToken
         if (!released) {
             return ConversionBeginResult.Failure(
                 ConversionFailureCode.INPUT_CLEANUP,
-                job?.token,
+                job?.token ?: claimedToken,
             )
         }
         if (createFailure != null) {
-            return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            return ConversionBeginResult.Failure(
+                ConversionFailureCode.INPUT_INVALID,
+                claimedToken,
+            )
         }
         return analyzeJob(requireNotNull(job), markAwaiting = true)
     }

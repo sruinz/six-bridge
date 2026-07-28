@@ -45,7 +45,7 @@ class OnDeviceInputService(
     private val workspaceDeleter: (Path) -> Boolean = ::deleteInputTree,
 ) : ConversionInputPort {
     private val leaseMutex = Mutex()
-    private val activeTokens = mutableSetOf<String>()
+    private val activeLeases = mutableMapOf<String, ActiveInputLease>()
 
     constructor(
         privateRoot: File,
@@ -66,10 +66,17 @@ class OnDeviceInputService(
 
     override suspend fun release(artifact: OnDeviceInputArtifact): Boolean =
         leaseMutex.withLock {
-            val workspace = exactWorkspace(artifact) ?: return@withLock false
-            activeTokens.remove(artifact.token)
-            withContext(NonCancellable + ioDispatcher) {
-                workspaceDeleter(workspace)
+            val activeLease = activeLeases[artifact.token] ?: return@withLock false
+            if (!activeLease.matches(artifact)) return@withLock false
+            try {
+                val workspace = exactWorkspace(artifact) ?: return@withLock false
+                withContext(NonCancellable + ioDispatcher) {
+                    workspaceDeleter(workspace)
+                }
+            } finally {
+                if (activeLeases[artifact.token] == activeLease) {
+                    activeLeases.remove(artifact.token)
+                }
             }
         }
 
@@ -91,7 +98,7 @@ class OnDeviceInputService(
                 ownedWorkspace.set(workspace)
                 acquireOnIo(request, workspace)
             }
-            activeTokens += artifact.token
+            activeLeases[artifact.token] = ActiveInputLease.from(artifact)
             ownedWorkspace.set(null)
             artifact
         } catch (error: Throwable) {
@@ -159,7 +166,7 @@ class OnDeviceInputService(
         children.forEach { child ->
             val token = child.fileName.toString()
             if (
-                token !in activeTokens &&
+                token !in activeLeases &&
                 isCanonicalToken(token) &&
                 !Files.isSymbolicLink(child) &&
                 Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS) &&
@@ -217,6 +224,31 @@ class OnDeviceInputService(
             inputFailure(
                 OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
                 "private 입력 artifact를 만들 수 없습니다.",
+            )
+        }
+    }
+
+    private data class ActiveInputLease(
+        val artifact: OnDeviceInputArtifact,
+        val kind: OnDeviceInputKind,
+        val privatePath: Path,
+        val sha256: String,
+        val expectedExtensionId: String?,
+    ) {
+        fun matches(artifact: OnDeviceInputArtifact): Boolean =
+            this.artifact === artifact &&
+                kind == artifact.kind &&
+                privatePath == artifact.privateFile.absoluteFile.toPath().normalize() &&
+                sha256 == artifact.sha256 &&
+                expectedExtensionId == artifact.expectedExtensionId
+
+        companion object {
+            fun from(artifact: OnDeviceInputArtifact) = ActiveInputLease(
+                artifact = artifact,
+                kind = artifact.kind,
+                privatePath = artifact.privateFile.absoluteFile.toPath().normalize(),
+                sha256 = artifact.sha256,
+                expectedExtensionId = artifact.expectedExtensionId,
             )
         }
     }
