@@ -83,6 +83,7 @@ class ManagerViewModel(
     private var generatedResultReviewToken: String? =
         savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY]
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
+    private var quarantinedGeneratedCleanup: PendingGeneratedCleanup? = null
     private var generatedCleanupJob: Job? = null
     private var documentOwnerGeneration =
         savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
@@ -95,10 +96,14 @@ class ManagerViewModel(
     val effects: Flow<ManagerEffect> = effectChannel.receiveAsFlow().filter(::isEffectCurrent)
 
     init {
+        pendingGeneratedCleanup
+            ?.takeUnless { it.matchesResultOwners() }
+            ?.let(::quarantineGeneratedCleanup)
         restoreAndInitialize()
         observeCatalog()
         observeInstallState()
         observeRepositoryLaunches()
+        reconcileQuarantinedGeneratedCleanup()
     }
 
     fun accept(action: ManagerAction) {
@@ -892,7 +897,13 @@ class ManagerViewModel(
             if (resultOwner != null) {
                 val ready =
                     mutableState.value.conversionState as? ConversionUiState.ResultReady
-                if (ready?.token != resultOwner) {
+                val exactDeletedConversion =
+                    pendingGeneratedCleanup?.let { cleanup ->
+                        cleanup.phase == GeneratedCleanupPhase.CONVERSION &&
+                            cleanup.token == resultOwner &&
+                            cleanup.matchesSavedOwners()
+                    } == true
+                if (ready?.token != resultOwner && !exactDeletedConversion) {
                     clearGeneratedResultOwner()
                     restored.review?.let(::showReview)
                 }
@@ -918,6 +929,14 @@ class ManagerViewModel(
             ) {
                 showGeneratedCleanupFailure()
             }
+            if (pendingCleanup?.phase == GeneratedCleanupPhase.CONVERSION &&
+                ready == null &&
+                pendingCleanup.matchesSavedOwners()
+            ) {
+                enqueueGeneratedCleanup {
+                    performPendingGeneratedCleanup()
+                }
+            }
         }
     }
 
@@ -941,7 +960,11 @@ class ManagerViewModel(
                 showConversionResult(retainedReview ?: restored.review, restored.generated)
             is RestoredConversion.GeneratedPending ->
                 showConversionResult(review = retainedReview, generated = restored.generated)
-            null -> clearSavedConversion()
+            null -> {
+                if (pendingGeneratedCleanup?.matchesSavedOwners() != true) {
+                    clearSavedConversion()
+                }
+            }
         }
     }
 
@@ -1709,7 +1732,16 @@ class ManagerViewModel(
         destination: GeneratedCleanupDestination,
         installSessionId: Int? = null,
     ): PendingGeneratedCleanup {
-        pendingGeneratedCleanup?.let { return it }
+        pendingGeneratedCleanup?.let { existing ->
+            if (existing.token == token &&
+                existing.reviewToken == reviewToken &&
+                existing.matchesResultOwners()
+            ) {
+                return existing
+            }
+            quarantineGeneratedCleanup(existing)
+            reconcileQuarantinedGeneratedCleanup()
+        }
         return PendingGeneratedCleanup(
             token = token,
             reviewToken = reviewToken,
@@ -1780,6 +1812,15 @@ class ManagerViewModel(
 
     private suspend fun performPendingGeneratedCleanup(): Boolean {
         var cleanup = pendingGeneratedCleanup ?: return false
+        if (!cleanup.matchesResultOwners()) {
+            quarantineGeneratedCleanup(cleanup)
+            reconcileQuarantinedGeneratedCleanup()
+            return true
+        }
+        if (!cleanup.matchesSavedOwners()) {
+            showGeneratedCleanupFailure()
+            return false
+        }
         if (cleanup.phase == GeneratedCleanupPhase.INSTALL) {
             if (!retryPendingGeneratedInstallCleanup(cleanup)) return false
             cleanup = pendingGeneratedCleanup ?: return false
@@ -1792,6 +1833,10 @@ class ManagerViewModel(
             }
             if (ownedReviewToken == reviewToken) {
                 clearSavedReviewAndSession()
+            }
+            if (generatedResultReviewToken == reviewToken) {
+                generatedResultReviewToken = null
+                savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = null
             }
             mutableState.update {
                 val ready = it.conversionState as? ConversionUiState.ResultReady
@@ -1810,8 +1855,7 @@ class ManagerViewModel(
             showGeneratedCleanupFailure()
             return false
         }
-        completeGeneratedCleanup(cleanup)
-        return true
+        return completeGeneratedCleanup(cleanup)
     }
 
     private suspend fun retryPendingGeneratedInstallCleanup(
@@ -1865,7 +1909,12 @@ class ManagerViewModel(
         return true
     }
 
-    private fun completeGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+    private fun completeGeneratedCleanup(cleanup: PendingGeneratedCleanup): Boolean {
+        if (!cleanup.matchesSavedOwners()) {
+            quarantineGeneratedCleanup(cleanup)
+            reconcileQuarantinedGeneratedCleanup()
+            return false
+        }
         clearGeneratedInstallOwner()
         clearGeneratedResultOwner()
         clearSavedReviewAndSession()
@@ -1879,6 +1928,50 @@ class ManagerViewModel(
                 importState = ImportUiState.Idle,
                 message = null,
             )
+        }
+        return true
+    }
+
+    private fun PendingGeneratedCleanup.matchesSavedOwners(): Boolean {
+        if (!matchesResultOwners()) return false
+        if (phase == GeneratedCleanupPhase.INSTALL) {
+            return installSessionId != null &&
+                savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY) == token &&
+                savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY) == installSessionId
+        }
+        return true
+    }
+
+    private fun PendingGeneratedCleanup.matchesResultOwners(): Boolean {
+        if (savedStateHandle.get<String>(RESULT_OWNER_CONVERSION_TOKEN_KEY) != token ||
+            savedStateHandle.get<String>(CONVERSION_TOKEN_KEY) != token ||
+            savedStateHandle.get<String>(RESULT_OWNER_REVIEW_TOKEN_KEY) != reviewToken
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private fun quarantineGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+        if (pendingGeneratedCleanup == cleanup) {
+            clearPendingGeneratedCleanup()
+        }
+        quarantinedGeneratedCleanup = cleanup
+    }
+
+    private fun reconcileQuarantinedGeneratedCleanup() {
+        val cleanup = quarantinedGeneratedCleanup ?: return
+        viewModelScope.launch {
+            val reviewCleaned = cleanup.reviewToken
+                ?.let(repository::discardReview)
+                ?: true
+            val conversionCleaned = repository.discardConversion(cleanup.token)
+            if (reviewCleaned &&
+                conversionCleaned &&
+                quarantinedGeneratedCleanup == cleanup
+            ) {
+                quarantinedGeneratedCleanup = null
+            }
         }
     }
 
