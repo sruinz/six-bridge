@@ -43,16 +43,15 @@ fun ConversionResultScreen(
             Text("SHA-256: ${ready.generated.sha256}")
         }
         message?.let {
+            val recoveryAction = resultRecoveryAction(it)
             MessageCard(
-                message = it,
+                message = if (recoveryAction == null) {
+                    it.copy(recoveryAction = RecoveryAction.NONE)
+                } else {
+                    it
+                },
                 onRecovery = {
-                    onAction(
-                        if (it.recoveryAction == RecoveryAction.RETRY) {
-                            ManagerAction.RetryGeneratedCleanup
-                        } else {
-                            ManagerAction.DismissMessage
-                        },
-                    )
+                    recoveryAction?.let(onAction)
                 },
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
@@ -100,6 +99,16 @@ fun ConversionResultScreen(
         }
     }
 }
+
+private fun resultRecoveryAction(message: UserMessage): ManagerAction? =
+    when (message.kind) {
+        UserMessageKind.CONVERSION_CLEANUP_FAILED ->
+            ManagerAction.RetryGeneratedCleanup
+        UserMessageKind.CONVERSION_SAVE_FAILED,
+        UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+        -> ManagerAction.SaveGeneratedConversion
+        else -> null
+    }
 
 private fun dev.sixbridge.manager.install.InstallState.isActiveInstall(): Boolean =
         this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||

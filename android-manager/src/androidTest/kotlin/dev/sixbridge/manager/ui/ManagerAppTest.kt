@@ -44,6 +44,7 @@ import dev.sixbridge.manager.ManagerAppContent
 import dev.sixbridge.manager.GENERATED_BUNDLE_MIME_TYPE
 import dev.sixbridge.manager.generatedBundleSendIntent
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.IdentityRequirement
@@ -271,28 +272,70 @@ class ManagerAppTest {
     }
 
     @Test
-    fun generated_cleanup_retry_dispatches_exact_cleanup_action() {
+    fun generated_result_typed_recovery_dispatches_exact_action_by_message_kind() {
         val actions = mutableListOf<ManagerAction>()
         val initial = conversionResultState()
         val ready = initial.conversionState as ConversionUiState.ResultReady
+        var message by mutableStateOf(
+            UserMessage(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                "정리를 완료하지 못했습니다.",
+                RecoveryAction.RETRY,
+            ),
+        )
         composeRule.setContent {
             ManagerAppContent(
                 state = initial.copy(
                     conversionState = ready.copy(cleanupPending = true),
-                    message = UserMessage(
-                        UserMessageKind.CONVERSION_CLEANUP_FAILED,
-                        "정리를 완료하지 못했습니다.",
-                        RecoveryAction.RETRY,
-                    ),
+                    message = message,
                 ),
                 onAction = actions::add,
                 onAddSix = {},
             )
         }
 
-        composeRule.onNodeWithText("다시 확인").performClick()
+        listOf(
+            UserMessageKind.CONVERSION_CLEANUP_FAILED to
+                ManagerAction.RetryGeneratedCleanup,
+            UserMessageKind.CONVERSION_SAVE_FAILED to
+                ManagerAction.SaveGeneratedConversion,
+            UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED to
+                ManagerAction.SaveGeneratedConversion,
+        ).forEach { (kind, expected) ->
+            composeRule.runOnIdle {
+                message = UserMessage(kind, "복구가 필요합니다.", RecoveryAction.RETRY)
+            }
+            composeRule.onNodeWithText("다시 확인").performClick()
+            composeRule.runOnIdle {
+                assertEquals(listOf(expected), actions)
+                actions.clear()
+            }
+        }
+    }
 
-        assertEquals(listOf(ManagerAction.RetryGeneratedCleanup), actions)
+    @Test
+    fun generated_review_null_failure_has_no_retry_button_and_keeps_save_share() {
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        composeRule.setContent {
+            ManagerAppContent(
+                state = initial.copy(
+                    conversionState = ready.copy(
+                        review = null,
+                        failureCode = ConversionFailureCode.BUNDLE_IO,
+                    ),
+                    message = conversionFailureMessage(ConversionFailureCode.BUNDLE_IO).copy(
+                        recoveryAction = RecoveryAction.NONE,
+                    ),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("다시 확인").assertDoesNotExist()
+        composeRule.onNodeWithTag("conversion:save").assertIsEnabled()
+        composeRule.onNodeWithTag("conversion:share").assertIsEnabled()
     }
 
     @Test

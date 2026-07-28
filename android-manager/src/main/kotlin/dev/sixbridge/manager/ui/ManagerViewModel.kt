@@ -421,7 +421,7 @@ class ManagerViewModel(
                 it.copy(
                     message = conversionFailureMessage(
                         result.failureCode ?: ConversionFailureCode.BUNDLE_IO,
-                    ),
+                    ).copy(recoveryAction = RecoveryAction.NONE),
                 )
             }
             return
@@ -813,7 +813,9 @@ class ManagerViewModel(
                 ),
                 conversionUrl = "",
                 message = if (review == null) {
-                    conversionFailureMessage(failureCode ?: ConversionFailureCode.BUNDLE_IO)
+                    conversionFailureMessage(
+                        failureCode ?: ConversionFailureCode.BUNDLE_IO,
+                    ).copy(recoveryAction = RecoveryAction.NONE)
                 } else {
                     null
                 },

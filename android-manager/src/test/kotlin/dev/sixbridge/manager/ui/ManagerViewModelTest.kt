@@ -1693,7 +1693,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `generated proof가 있는 모든 build failure는 원래 code와 retry 동작을 유지한다`() =
+    fun `generated proof가 있는 모든 build failure는 원래 code와 export 동작을 유지한다`() =
         runTest(dispatcher.scheduler) {
             ConversionFailureCode.entries.forEach { code ->
                 val generated = generatedBundle()
@@ -1712,7 +1712,9 @@ class ManagerViewModelTest {
                 viewModel.accept(ManagerAction.BuildConversion)
                 advanceUntilIdle()
 
-                val expectedMessage = conversionFailureMessage(code)
+                val expectedMessage = conversionFailureMessage(code).copy(
+                    recoveryAction = RecoveryAction.NONE,
+                )
                 fun assertFailureProof() {
                     val ready = assertIs<ConversionUiState.ResultReady>(
                         viewModel.state.value.conversionState,
@@ -1841,7 +1843,51 @@ class ManagerViewModelTest {
 
                 assertEquals(expectedKind, viewModel.state.value.message?.kind)
                 assertTrue(viewModel.state.value.message?.text?.contains("content://") == false)
+
+                val recoveryEffects = mutableListOf<ManagerEffect>()
+                backgroundScope.launch {
+                    viewModel.effects.collect(recoveryEffects::add)
+                }
+                dispatcher.scheduler.runCurrent()
+                viewModel.accept(ManagerAction.SaveGeneratedConversion)
+                dispatcher.scheduler.runCurrent()
+
+                assertIs<ManagerEffect.CreateConversionDocument>(recoveryEffects.single())
+                assertTrue(repository.copiedConversionTokens.isEmpty())
             }
+        }
+
+    @Test
+    fun `review 없는 generated failure는 Retry 소유권과 effect를 만들지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+                conversionBuildResult = ConversionBuildResult.Failure(
+                    ConversionFailureCode.BUNDLE_IO,
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            val ready = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertEquals(null, ready.review)
+            assertEquals(ConversionFailureCode.BUNDLE_IO, ready.failureCode)
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.conversionBuildRequests.size)
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
         }
 
     @Test
