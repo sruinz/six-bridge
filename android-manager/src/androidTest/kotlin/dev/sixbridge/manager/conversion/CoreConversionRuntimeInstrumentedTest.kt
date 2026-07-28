@@ -457,6 +457,166 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
+    fun malformedPendingMarkerBlocksClaimAndReportsInvalid() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryPreferences = memorySharedPreferences()
+        val importRoot = Files.createTempDirectory("sixbridge-malformed-pending").toFile()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .commit(),
+        )
+
+        assertEquals(RecoveryRecordSnapshot.Invalid, store.pendingInstallSnapshot())
+        assertNull(
+            store.tryClaim(
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                importToken = "11111111-1111-1111-1111-111111111111",
+                startedAtEpochMillis = 1,
+            ),
+        )
+        assertEquals(41, pendingPreferences.getInt("session_id", -1))
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun malformedRawMarkerBlocksClaimAndReportsInvalid() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryPreferences = memorySharedPreferences()
+        val importRoot = Files.createTempDirectory("sixbridge-malformed-raw").toFile()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            recoveryPreferences.edit()
+                .putInt("result_session_id", 41)
+                .commit(),
+        )
+
+        assertEquals(RecoveryRecordSnapshot.Invalid, store.terminalResultSnapshot())
+        assertNull(
+            store.tryClaim(
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                importToken = "11111111-1111-1111-1111-111111111111",
+                startedAtEpochMillis = 1,
+            ),
+        )
+        assertEquals(41, recoveryPreferences.getInt("result_session_id", -1))
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun partialFinalAndHandoffPayloadWithoutVersionRemainInvalidAndBlockClaim() {
+        listOf(
+            "final_import_token" to { store: SharedPreferencesPendingInstallStore ->
+                store.finalReceiptSnapshot()
+            },
+            "handoff_import_token" to { store: SharedPreferencesPendingInstallStore ->
+                store.normalHandoffSnapshot()
+            },
+        ).forEach { (remainingKey, snapshot) ->
+            val pendingPreferences = memorySharedPreferences()
+            val recoveryPreferences = memorySharedPreferences()
+            val importRoot = Files.createTempDirectory("sixbridge-partial-record").toFile()
+            val store = SharedPreferencesPendingInstallStore(
+                pendingPreferences = pendingPreferences,
+                recoveryPreferences = recoveryPreferences,
+                importDirectory = importRoot,
+            )
+            assertTrue(
+                recoveryPreferences.edit()
+                    .putString(remainingKey, "11111111-1111-1111-1111-111111111111")
+                    .commit(),
+            )
+
+            assertEquals(remainingKey, RecoveryRecordSnapshot.Invalid, snapshot(store))
+            assertNull(
+                remainingKey,
+                store.tryClaim(
+                    packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                    importToken = "22222222-2222-2222-2222-222222222222",
+                    startedAtEpochMillis = 1,
+                ),
+            )
+            assertEquals(
+                remainingKey,
+                "11111111-1111-1111-1111-111111111111",
+                recoveryPreferences.getString(remainingKey, null),
+            )
+            importRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun wrongTypedConstituentKeysAreInvalidAndBlockClaim() {
+        data class Case(
+            val name: String,
+            val writeWrongType: (SharedPreferences, SharedPreferences) -> Unit,
+            val snapshot: (SharedPreferencesPendingInstallStore) -> RecoveryRecordSnapshot<*>,
+        )
+        val cases = listOf(
+            Case(
+                name = "pending",
+                writeWrongType = { pending, _ ->
+                    assertTrue(pending.edit().putString("session_id", "wrong").commit())
+                },
+                snapshot = SharedPreferencesPendingInstallStore::pendingInstallSnapshot,
+            ),
+            Case(
+                name = "raw",
+                writeWrongType = { _, recovery ->
+                    assertTrue(recovery.edit().putString("result_session_id", "wrong").commit())
+                },
+                snapshot = SharedPreferencesPendingInstallStore::terminalResultSnapshot,
+            ),
+            Case(
+                name = "final",
+                writeWrongType = { _, recovery ->
+                    assertTrue(recovery.edit().putString("final_version", "wrong").commit())
+                },
+                snapshot = SharedPreferencesPendingInstallStore::finalReceiptSnapshot,
+            ),
+            Case(
+                name = "handoff",
+                writeWrongType = { _, recovery ->
+                    assertTrue(recovery.edit().putString("handoff_version", "wrong").commit())
+                },
+                snapshot = SharedPreferencesPendingInstallStore::normalHandoffSnapshot,
+            ),
+        )
+
+        cases.forEach { case ->
+            val pendingPreferences = memorySharedPreferences()
+            val recoveryPreferences = memorySharedPreferences()
+            val importRoot = Files.createTempDirectory("sixbridge-wrong-type").toFile()
+            val store = SharedPreferencesPendingInstallStore(
+                pendingPreferences = pendingPreferences,
+                recoveryPreferences = recoveryPreferences,
+                importDirectory = importRoot,
+            )
+            case.writeWrongType(pendingPreferences, recoveryPreferences)
+
+            assertEquals(case.name, RecoveryRecordSnapshot.Invalid, case.snapshot(store))
+            assertNull(
+                case.name,
+                store.tryClaim(
+                    packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                    importToken = "22222222-2222-2222-2222-222222222222",
+                    startedAtEpochMillis = 1,
+                ),
+            )
+            importRoot.deleteRecursively()
+        }
+    }
+
+    @Test
     fun tokenlessRawQuarantineCommitFaultPreservesExactPendingAndImport() {
         val pendingPreferences = memorySharedPreferences()
         val recoveryControl = MemoryPreferenceControl()

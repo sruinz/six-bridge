@@ -1168,6 +1168,62 @@ class InstallCoordinatorTest {
         }
 
     @Test
+    fun `final absent proof는 raw와 pending도 실제 absent일 때만 성립한다`() =
+        runBlocking {
+            val tokenlessRaw = PendingInstallResult(
+                result = PackageInstallResult.Cancelled(SESSION_ID),
+                terminalAtEpochMillis = FINISHED_AT,
+                packageName = PACKAGE_NAME,
+                importToken = null,
+            )
+            val tokenedRaw = tokenlessRaw.copy(importToken = TOKEN)
+            val foreignRaw = tokenlessRaw.copy(
+                result = PackageInstallResult.Cancelled(77),
+                importToken = "22222222-2222-2222-2222-222222222222",
+            )
+            val cases = listOf(
+                "tokenless raw quarantine commit fault" to fixture(
+                    terminalResult = tokenlessRaw,
+                ).apply {
+                    pendingStore.quarantineFailure = true
+                },
+                "tokened raw persist commit fault" to fixture(
+                    pending = pendingInstall(),
+                    terminalResult = tokenedRaw,
+                ).apply {
+                    pendingStore.createFinalFailure = true
+                },
+                "foreign raw" to fixture(
+                    pending = pendingInstall(),
+                    terminalResult = foreignRaw,
+                ),
+                "pending owner" to fixture(
+                    pending = pendingInstall(),
+                ),
+                "malformed raw marker" to fixture().apply {
+                    pendingStore.terminalSnapshot = RecoveryRecordSnapshot.Invalid
+                },
+                "malformed pending marker" to fixture().apply {
+                    pendingStore.pendingSnapshot = RecoveryRecordSnapshot.Invalid
+                },
+            )
+
+            cases.forEach { (name, fixture) ->
+                assertEquals(
+                    FinalReceiptOwnerResult.OwnerMismatch,
+                    fixture.coordinator.currentFinalReceiptForOwner(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID,
+                        expectedPackageName = PACKAGE_NAME,
+                    ),
+                    name,
+                )
+                assertNull(fixture.pendingStore.finalReceipt, name)
+                assertTrue(fixture.pendingStore.discardedTokens.isEmpty(), name)
+            }
+        }
+
+    @Test
     fun `cancelling torn states require exact owned session and package before convergence`() =
         runBlocking {
             data class Case(
@@ -2304,6 +2360,8 @@ class InstallCoordinatorTest {
     ) : PendingInstallStore {
         var record: PendingInstall? = initial
         var terminalResult: PendingInstallResult? = null
+        var pendingSnapshot: RecoveryRecordSnapshot<PendingInstall>? = null
+        var terminalSnapshot: RecoveryRecordSnapshot<PendingInstallResult>? = null
         var finalReceipt: FinalInstallReceipt? = null
         var finalSnapshot: RecoveryRecordSnapshot<FinalInstallReceipt>? = null
         var normalHandoff: NormalInstallHandoff? = null
@@ -2319,6 +2377,7 @@ class InstallCoordinatorTest {
         var discardFailure = false
         var clearPendingAfterFailure = false
         var clearTerminalFailure = false
+        var quarantineFailure = false
         var clearMissingFailure = false
         var terminalBeforeStaleClear: PackageInstallResult? = null
         var loadBarrier: CyclicBarrier? = null
@@ -2347,6 +2406,11 @@ class InstallCoordinatorTest {
             barrier?.await()
             return synchronized(this) { record }
         }
+
+        override fun pendingInstallSnapshot(): RecoveryRecordSnapshot<PendingInstall> =
+            synchronized(this) {
+                pendingSnapshot ?: super.pendingInstallSnapshot()
+            }
 
         override fun tryClaim(
             packageName: String,
@@ -2433,6 +2497,11 @@ class InstallCoordinatorTest {
             terminalResult
         }
 
+        override fun terminalResultSnapshot(): RecoveryRecordSnapshot<PendingInstallResult> =
+            synchronized(this) {
+                terminalSnapshot ?: super.terminalResultSnapshot()
+            }
+
         override fun markConfirmationDelivered(sessionId: Int): Boolean = synchronized(this) {
             if (record?.sessionId != sessionId || confirmationDeliveredSessionId == sessionId) {
                 return@synchronized false
@@ -2496,7 +2565,8 @@ class InstallCoordinatorTest {
             expectedPending: PendingInstall?,
             expectedFinal: FinalInstallReceipt?,
         ): Boolean = synchronized(this) {
-            if (expectedRaw.importToken != null ||
+            if (quarantineFailure ||
+                expectedRaw.importToken != null ||
                 terminalResult != expectedRaw ||
                 record != expectedPending ||
                 finalReceipt != expectedFinal

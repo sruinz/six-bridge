@@ -5259,54 +5259,71 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `normal PREPARED 새 작업은 foreign receipt와 null session assignment에서 fail closed한다`() =
+    fun `normal PREPARED 새 import와 conversion은 foreign proof에서 기존 소유권을 보존한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
                 41 to TerminalReceiptOwnerResult.OwnerMismatch,
                 null to TerminalReceiptOwnerResult.OwnerSessionAssigned(41),
             ).forEach { (handoffSession, proof) ->
-                val handoff = NormalInstallHandoff(
-                    importToken = TOKEN,
-                    sessionId = handoffSession,
-                    packageName = PACKAGE,
-                    state = InstallState.Cancelled,
-                    stage = NormalHandoffStage.PREPARED,
-                )
-                val repository = FakeManagerRepository().apply {
-                    restoreResult = ManagerRestoreResult(
-                        review = review(ContractCompatibilityStatus.COMPATIBLE),
-                        normalHandoff = handoff,
+                listOf("import", "conversion").forEach { action ->
+                    val handoff = NormalInstallHandoff(
+                        importToken = TOKEN,
+                        sessionId = handoffSession,
+                        packageName = PACKAGE,
+                        state = InstallState.Cancelled,
+                        stage = NormalHandoffStage.PREPARED,
                     )
-                    normalHandoff = handoff
-                    currentTerminalReceiptResult = proof
-                    importResult = ManagerImportResult.Success(
-                        review(
-                            status = ContractCompatibilityStatus.COMPATIBLE,
-                            token = SECOND_TOKEN,
-                        ),
+                    val repository = FakeManagerRepository().apply {
+                        restoreResult = ManagerRestoreResult(
+                            review = review(ContractCompatibilityStatus.COMPATIBLE),
+                            normalHandoff = handoff,
+                        )
+                        normalHandoff = handoff
+                        currentTerminalReceiptResult = proof
+                        importResult = ManagerImportResult.Success(
+                            review(
+                                status = ContractCompatibilityStatus.COMPATIBLE,
+                                token = SECOND_TOKEN,
+                            ),
+                        )
+                    }
+                    var importRequested = false
+                    val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                    advanceUntilIdle()
+
+                    when (action) {
+                        "import" -> viewModel.startImport {
+                            importRequested = true
+                            repository.nextImport()
+                        }
+                        "conversion" -> viewModel.accept(ManagerAction.OpenConversionInput)
+                    }
+                    advanceUntilIdle()
+
+                    assertFalse(importRequested, "proof=$proof action=$action")
+                    assertEquals(
+                        handoff,
+                        repository.normalHandoff,
+                        "proof=$proof action=$action",
+                    )
+                    assertTrue(
+                        repository.discardedTokens.isEmpty(),
+                        "proof=$proof action=$action",
+                    )
+                    assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+                    assertEquals(
+                        TOKEN,
+                        assertIs<ImportUiState.ReviewReady>(
+                            viewModel.state.value.importState,
+                        ).review.token,
+                    )
+                    assertTrue(
+                        repository.currentTerminalReceiptArguments.all {
+                            it == Triple(TOKEN, handoffSession, PACKAGE)
+                        },
+                        "proof=$proof action=$action",
                     )
                 }
-                val viewModel = ManagerViewModel(repository, SavedStateHandle())
-                advanceUntilIdle()
-
-                viewModel.startImport(repository::nextImport)
-                advanceUntilIdle()
-
-                assertEquals(handoff, repository.normalHandoff, "proof=$proof")
-                assertTrue(repository.discardedTokens.isEmpty(), "proof=$proof")
-                assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-                assertEquals(
-                    TOKEN,
-                    assertIs<ImportUiState.ReviewReady>(
-                        viewModel.state.value.importState,
-                    ).review.token,
-                )
-                assertTrue(
-                    repository.currentTerminalReceiptArguments.all {
-                        it == Triple(TOKEN, handoffSession, PACKAGE)
-                    },
-                    "proof=$proof",
-                )
             }
         }
 

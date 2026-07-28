@@ -27,9 +27,17 @@ class StartupCleanup(
     suspend fun run() {
         val context = currentCoroutineContext()
         context.ensureActive()
-        val pending = pendingStore.load()
+        val pending = when (val snapshot = pendingStore.pendingInstallSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return
+        }
         context.ensureActive()
-        val terminal = pendingStore.loadTerminalResult()
+        val terminal = when (val snapshot = pendingStore.terminalResultSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return
+        }
         context.ensureActive()
         val finalReceipt = when (val snapshot = pendingStore.finalReceiptSnapshot()) {
             is RecoveryRecordSnapshot.Present -> snapshot.value

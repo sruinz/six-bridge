@@ -72,6 +72,12 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -405,6 +411,104 @@ class TerminalHandoffRaceInstrumentedTest {
         }
 
     @Test
+    fun generatedInstalledCleanupJournalPersistedBeforeProcessDeathResumesExactRecovery() =
+        runBlocking {
+            val fixture = ActualFixture()
+            try {
+                val savedState = SavedStateHandle()
+                fixture.prepareGeneratedLateSuccess(savedState)
+
+                val dying = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterGeneratedInstallCleanupTransitionPersisted = {
+                        throw CancellationException("cleanup journal 저장 직후 process death")
+                    },
+                )
+                val dyingStore = ViewModelStore().apply { put("dying", dying) }
+                fixture.await("generated cleanup journal persisted", dying, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                    ) != null
+                }
+                assertGeneratedInstalledRecovery(
+                    fixture = fixture,
+                    savedState = savedState,
+                    expectedFinalStage = FinalReceiptStage.READY,
+                    expectedRawPresent = true,
+                )
+                dyingStore.clear()
+
+                val recreated = ManagerViewModel(fixture.repository, savedState)
+                fixture.await("generated cleanup journal resumed", recreated, savedState) {
+                    recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
+                        fixture.conversion.discardedTokens == listOf(CONVERSION_TOKEN)
+                }
+                recreated.accept(
+                    ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
+                )
+                fixture.await("generated cleanup destination committed", recreated, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                    ) == null
+                }
+                assertGeneratedRecoveryCompleted(fixture, savedState)
+            } finally {
+                fixture.close()
+            }
+        }
+
+    @Test
+    fun generatedInstalledReceiptFinalizedBeforeProcessDeathResumesExactRecovery() =
+        runBlocking {
+            val fixture = ActualFixture()
+            try {
+                val savedState = SavedStateHandle()
+                fixture.prepareGeneratedLateSuccess(savedState)
+
+                val dying = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterTerminalReceiptFinalized = {
+                        throw CancellationException("terminal receipt finalize 직후 process death")
+                    },
+                )
+                val dyingStore = ViewModelStore().apply { put("dying", dying) }
+                fixture.await("generated receipt finalized", dying, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                    ) != null &&
+                        fixture.store.finalReceiptSnapshot() ==
+                        RecoveryRecordSnapshot.Absent
+                }
+                assertGeneratedInstalledRecovery(
+                    fixture = fixture,
+                    savedState = savedState,
+                    expectedFinalStage = null,
+                    expectedRawPresent = false,
+                )
+                dyingStore.clear()
+
+                val recreated = ManagerViewModel(fixture.repository, savedState)
+                fixture.await("generated finalized receipt resumed", recreated, savedState) {
+                    recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
+                        fixture.conversion.discardedTokens == listOf(CONVERSION_TOKEN)
+                }
+                recreated.accept(
+                    ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
+                )
+                fixture.await("generated finalized destination committed", recreated, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                    ) == null
+                }
+                assertGeneratedRecoveryCompleted(fixture, savedState)
+            } finally {
+                fixture.close()
+            }
+        }
+
+    @Test
     fun malformedCurrentFinalReceiptPreservesPreparedOwnerReviewAndBlocksNewClaim() =
         runBlocking {
             val fixture = ActualFixture()
@@ -466,6 +570,106 @@ class TerminalHandoffRaceInstrumentedTest {
                 fixture.close()
             }
         }
+
+    private suspend fun ActualFixture.prepareGeneratedLateSuccess(
+        savedState: SavedStateHandle,
+    ) {
+        val source = ManagerViewModel(
+            repository = repository,
+            savedStateHandle = savedState,
+            afterGeneratedTerminalHandoffPersisted = {
+                throw CancellationException("generated handoff 저장 직후 process death")
+            },
+        )
+        val sourceStore = ViewModelStore().apply { put("source", source) }
+        awaitGeneratedResult(source, savedState)
+        source.accept(ManagerAction.PrepareGeneratedInstall)
+        source.accept(ManagerAction.InstallReviewedBundle)
+        awaitSession(savedState, source)
+        source.accept(ManagerAction.CancelReview)
+        await("generated PREPARED", source, savedState) {
+            savedState.get<String>(
+                ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+            ) != null
+        }
+        sourceStore.clear()
+        installed.installed = installedWrapper()
+        assertTrue(coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID)))
+    }
+
+    private fun assertGeneratedInstalledRecovery(
+        fixture: ActualFixture,
+        savedState: SavedStateHandle,
+        expectedFinalStage: FinalReceiptStage?,
+        expectedRawPresent: Boolean,
+    ) {
+        val cleanup = Json.parseToJsonElement(
+            requireNotNull(
+                savedState.get<String>(
+                    ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                ),
+            ),
+        ).jsonObject
+        assertEquals(1, cleanup.getValue("version").jsonPrimitive.int)
+        assertEquals(CONVERSION_TOKEN, cleanup.getValue("token").jsonPrimitive.content)
+        assertEquals(REVIEW_TOKEN, cleanup.getValue("reviewToken").jsonPrimitive.content)
+        assertEquals("REVIEW", cleanup.getValue("phase").jsonPrimitive.content)
+        assertTrue(cleanup.getValue("installSessionId") is JsonNull)
+        assertTrue(cleanup.getValue("autoReplayPending").jsonPrimitive.boolean)
+        val destination = cleanup.getValue("destination").jsonObject
+        assertEquals("REPORT", destination.getValue("kind").jsonPrimitive.content)
+        assertEquals(PACKAGE, destination.getValue("packageName").jsonPrimitive.content)
+
+        val handoff = Json.parseToJsonElement(
+            requireNotNull(
+                savedState.get<String>(
+                    ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                ),
+            ),
+        ).jsonObject
+        assertEquals(CONVERSION_TOKEN, handoff.getValue("token").jsonPrimitive.content)
+        assertEquals(REVIEW_TOKEN, handoff.getValue("reviewToken").jsonPrimitive.content)
+        assertEquals(SESSION_ID, handoff.getValue("sessionId").jsonPrimitive.int)
+        assertEquals("INSTALLED", handoff.getValue("state").jsonPrimitive.content)
+        assertEquals(PACKAGE, handoff.getValue("packageName").jsonPrimitive.content)
+
+        val final = fixture.store.loadFinalReceipt()
+        if (expectedFinalStage == null) {
+            assertNull(final)
+        } else {
+            assertEquals(REVIEW_TOKEN, final?.importToken)
+            assertEquals(SESSION_ID, final?.sessionId)
+            assertEquals(PACKAGE, final?.packageName)
+            assertEquals(InstallState.Installed(PACKAGE), final?.state)
+            assertEquals(expectedFinalStage, final?.stage)
+            assertEquals(FinalReceiptOrigin.RAW_TERMINAL, final?.origin)
+        }
+        assertEquals(
+            expectedRawPresent,
+            fixture.store.terminalResultSnapshot() is RecoveryRecordSnapshot.Present,
+        )
+        assertTrue(fixture.retainedReviewExists())
+    }
+
+    private fun assertGeneratedRecoveryCompleted(
+        fixture: ActualFixture,
+        savedState: SavedStateHandle,
+    ) {
+        assertNull(
+            savedState.get<String>(
+                ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+            ),
+        )
+        assertNull(
+            savedState.get<String>(
+                ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+            ),
+        )
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.store.pendingInstallSnapshot())
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.store.terminalResultSnapshot())
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.store.finalReceiptSnapshot())
+        assertFalse(fixture.retainedReviewExists())
+    }
 
     private fun terminalCases(): List<TerminalCase> = listOf(
         TerminalCase(

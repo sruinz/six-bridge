@@ -238,6 +238,28 @@ class StartupCleanupTest {
         }
 
     @Test
+    fun `손상된 pending 또는 raw marker가 있으면 startup cleanup은 아무 소유권도 정리하지 않는다`() =
+        runBlocking {
+            listOf(
+                RecoveryRecordSnapshot.Invalid to RecoveryRecordSnapshot.Absent,
+                RecoveryRecordSnapshot.Absent to RecoveryRecordSnapshot.Invalid,
+            ).forEach { (pendingSnapshot, terminalSnapshot) ->
+                val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+                val gateway = FakeGateway(owned = mutableListOf(41))
+                val store = FakePendingStore(
+                    pendingSnapshot = pendingSnapshot,
+                    terminalSnapshot = terminalSnapshot,
+                )
+
+                cleanup(gateway = gateway, store = store).run()
+
+                assertTrue(expired.exists())
+                assertTrue(gateway.abandoned.isEmpty())
+                expired.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `abandons only owned sessions that are not the recoverable pending session`() = runBlocking {
         val pending = pending(sessionId = 41, startedAt = now)
         val gateway = FakeGateway(owned = mutableListOf(41, 77))
@@ -405,6 +427,8 @@ class StartupCleanupTest {
         var missingObservationFailure: Throwable? = null,
         var finalSnapshot: RecoveryRecordSnapshot<FinalInstallReceipt>? = null,
         var normalHandoffSnapshot: RecoveryRecordSnapshot<NormalInstallHandoff>? = null,
+        var pendingSnapshot: RecoveryRecordSnapshot<PendingInstall>? = null,
+        var terminalSnapshot: RecoveryRecordSnapshot<PendingInstallResult>? = null,
     ) : PendingInstallStore {
         var terminalLoads = 0
         var clearWithoutTerminalCalls = 0
@@ -413,6 +437,8 @@ class StartupCleanupTest {
             loadFailure?.let { throw it }
             return record
         }
+        override fun pendingInstallSnapshot(): RecoveryRecordSnapshot<PendingInstall> =
+            pendingSnapshot ?: super.pendingInstallSnapshot()
         override fun tryClaim(packageName: String, importToken: String, startedAtEpochMillis: Long): PendingInstall? = null
         override fun assignSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
         override fun recoverSession(claim: PendingInstall, sessionId: Int): PendingInstall? = null
@@ -431,6 +457,8 @@ class StartupCleanupTest {
             terminalLoadFailure?.let { throw it }
             return terminal
         }
+        override fun terminalResultSnapshot(): RecoveryRecordSnapshot<PendingInstallResult> =
+            terminalSnapshot ?: super.terminalResultSnapshot()
         override fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean = false
         override fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult? = null
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean = false

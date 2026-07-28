@@ -325,6 +325,16 @@ class ManagerViewModel(
         ) {
             return
         }
+        if (pendingNormalHandoff != null) {
+            val ticket = replaceRouteOperation()
+            val generation = ticket.generation
+            routeOperation = viewModelScope.launch {
+                if (!awaitRouteMutation(ticket)) return@launch
+                if (generation != operationGeneration) return@launch
+                openConversionInput()
+            }
+            return
+        }
         if (mutableState.value.conversionState is ConversionUiState.ResultReady) {
             cleanupConversion(ManagerRoute.ConversionInput)
             return
