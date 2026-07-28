@@ -1,0 +1,108 @@
+package dev.sixbridge.manager.ui
+
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ExistingConversionTarget
+import dev.sixbridge.manager.conversion.IdentityRequirement
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+import org.junit.Test
+
+class ConversionScreenTest {
+    @Test
+    fun `동작 변경 어댑터는 모두 승인하기 전 build할 수 없다`() {
+        val ready = analysis(requiredApprovals = setOf("action-popup-entry", "tabs"))
+
+        assertFalse(ready.canBuild)
+        assertFalse(ready.toggleAdapter("action-popup-entry").canBuild)
+        assertTrue(
+            ready.toggleAdapter("action-popup-entry")
+                .toggleAdapter("tabs")
+                .canBuild,
+        )
+    }
+
+    @Test
+    fun `partial은 별도 확인 전 build할 수 없다`() {
+        val ready = analysis(status = CompatibilityStatus.PARTIAL)
+
+        assertFalse(ready.canBuild)
+        assertTrue(ready.copy(partialConfirmed = true).canBuild)
+    }
+
+    @Test
+    fun `표식 없는 입력의 기존 대상은 선택과 별도 확인을 모두 요구한다`() {
+        val target = ExistingConversionTarget(
+            identitySha256 = "a".repeat(64),
+            displayName = "기존 변환",
+            extensionId = "b".repeat(32),
+            packageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+            wrapperSignerSha256 = "c".repeat(64),
+        )
+        val ready = analysis(
+            identityRequirement = IdentityRequirement.UserSelectionRequired(listOf(target)),
+        )
+
+        assertFalse(ready.canBuild)
+        val selected = ready.selectIdentity(
+            InstallationIdentitySelection.UseExisting(target.identitySha256),
+        )
+        assertFalse(selected.canBuild)
+        assertTrue(selected.copy(existingIdentityConfirmed = true).canBuild)
+        assertTrue(
+            ready.selectIdentity(InstallationIdentitySelection.CreateNew).canBuild,
+        )
+    }
+
+    @Test
+    fun `blocked와 unknown은 build할 수 없다`() {
+        assertFalse(analysis(status = CompatibilityStatus.BLOCKED).canBuild)
+        assertFalse(analysis(status = CompatibilityStatus.UNKNOWN).canBuild)
+    }
+
+    @Test
+    fun `변환 실패 코드는 서로 다른 한글 원인과 복구 행동으로 표시한다`() {
+        val messages = ConversionFailureCode.entries.map(::conversionFailureMessage)
+
+        assertEquals(messages.size, messages.map(UserMessage::text).toSet().size)
+        assertTrue(messages.all { message ->
+            message.text.any { character -> character.code in 0xAC00..0xD7A3 }
+        })
+        assertTrue(messages.none { message ->
+            "content://" in message.text ||
+                "/storage/" in message.text ||
+                "Exception" in message.text
+        })
+    }
+
+    private fun analysis(
+        status: CompatibilityStatus = CompatibilityStatus.COMPATIBLE,
+        requiredApprovals: Set<String> = emptySet(),
+        identityRequirement: IdentityRequirement =
+            IdentityRequirement.Stable("0123456789ab"),
+    ) = ConversionUiState.AnalysisReady(
+        token = TOKEN,
+        report = CompatibilityReport(
+            status = status,
+            manifestVersion = 3,
+            extensionName = "테스트 확장",
+            extensionVersion = "1.0",
+            declaredPermissions = setOf("storage"),
+            usedApis = setOf("tabs"),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+        ),
+        selectedAutomaticAdapters = emptySet(),
+        requiredApprovals = requiredApprovals,
+        identityRequirement = identityRequirement,
+    )
+
+    private companion object {
+        const val TOKEN = "11111111-1111-1111-1111-111111111111"
+    }
+}

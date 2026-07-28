@@ -6,10 +6,20 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.IdentityRequirement
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.manager.install.InstallState
+import java.io.File
 
 sealed interface ManagerRoute {
     data object Home : ManagerRoute
+    data object ConversionInput : ManagerRoute
+    data class ConversionAnalysis(val token: String) : ManagerRoute
+    data class ConversionResult(val token: String) : ManagerRoute
     data class Review(val token: String) : ManagerRoute
     data class Report(val packageName: String) : ManagerRoute
 }
@@ -50,6 +60,86 @@ sealed interface ImportUiState {
     }
 }
 
+sealed interface ConversionUiState {
+    data object Idle : ConversionUiState
+    data object Acquiring : ConversionUiState
+
+    data class AnalysisReady(
+        val token: String,
+        val report: CompatibilityReport,
+        val selectedAutomaticAdapters: Set<String>,
+        val requiredApprovals: Set<String>,
+        val identityRequirement: IdentityRequirement,
+        val selectedAdapters: Set<String> = emptySet(),
+        val partialConfirmed: Boolean = false,
+        val identitySelection: InstallationIdentitySelection? = null,
+        val existingIdentityConfirmed: Boolean = false,
+        val profileChanged: Boolean = false,
+    ) : ConversionUiState {
+        val canBuild: Boolean
+            get() = report.status in setOf(
+                CompatibilityStatus.COMPATIBLE,
+                CompatibilityStatus.PARTIAL,
+            ) &&
+                selectedAdapters == requiredApprovals &&
+                (report.status != CompatibilityStatus.PARTIAL || partialConfirmed) &&
+                identitySelectionSatisfied()
+
+        fun toggleAdapter(id: String): AnalysisReady {
+            if (id !in requiredApprovals) return this
+            return copy(
+                selectedAdapters = if (id in selectedAdapters) {
+                    selectedAdapters - id
+                } else {
+                    selectedAdapters + id
+                },
+            )
+        }
+
+        fun selectIdentity(selection: InstallationIdentitySelection): AnalysisReady {
+            val requirement = identityRequirement as? IdentityRequirement.UserSelectionRequired
+                ?: return this
+            val accepted = when (selection) {
+                InstallationIdentitySelection.CreateNew -> true
+                is InstallationIdentitySelection.UseExisting ->
+                    requirement.existingTargets.any {
+                        it.identitySha256 == selection.identitySha256
+                    }
+            }
+            if (!accepted) return this
+            return copy(
+                identitySelection = selection,
+                existingIdentityConfirmed = false,
+            )
+        }
+
+        private fun identitySelectionSatisfied(): Boolean = when (identityRequirement) {
+            is IdentityRequirement.Stable -> identitySelection == null
+            is IdentityRequirement.UserSelectionRequired -> when (identitySelection) {
+                InstallationIdentitySelection.CreateNew -> true
+                is InstallationIdentitySelection.UseExisting -> existingIdentityConfirmed
+                null -> false
+            }
+        }
+    }
+
+    data class Building(
+        val token: String,
+        val previous: AnalysisReady,
+    ) : ConversionUiState
+
+    data class ResultReady(
+        val token: String,
+        val review: ReviewBundle?,
+        val generated: GeneratedBundle,
+    ) : ConversionUiState
+
+    data class Failed(
+        val token: String?,
+        val code: ConversionFailureCode,
+    ) : ConversionUiState
+}
+
 enum class RecoveryAction {
     NONE,
     SELECT_ANOTHER_FILE,
@@ -73,6 +163,10 @@ enum class UserMessageKind {
     UNINSTALL_CANCELLED,
     UNINSTALLED,
     LAUNCH_FAILED,
+    CONVERSION_FAILURE,
+    CONVERSION_SAVED,
+    CONVERSION_SAVE_FAILED,
+    CONVERSION_SHARE_FAILED,
 }
 
 data class UserMessage(
@@ -85,6 +179,8 @@ data class ManagerUiState(
     val route: ManagerRoute = ManagerRoute.Home,
     val installed: List<ManagedExtensionItem> = emptyList(),
     val importState: ImportUiState = ImportUiState.Idle,
+    val conversionState: ConversionUiState = ConversionUiState.Idle,
+    val conversionUrl: String = "",
     val installState: InstallState = InstallState.Idle,
     val message: UserMessage? = null,
 )
@@ -92,6 +188,27 @@ data class ManagerUiState(
 sealed interface ManagerAction {
     data object FilePickerOpened : ManagerAction
     data class ImportSelected(val uri: Uri) : ManagerAction
+    data object OpenConversionInput : ManagerAction
+    data class ConversionUrlChanged(val value: String) : ManagerAction
+    data object OpenConversionFilePicker : ManagerAction
+    data class ConversionFileSelected(val uri: Uri) : ManagerAction
+    data object AnalyzeConversionUrl : ManagerAction
+    data class ToggleConversionAdapter(val id: String) : ManagerAction
+    data object ConfirmConversionPartial : ManagerAction
+    data object SelectNewConversionIdentity : ManagerAction
+    data class SelectExistingConversionIdentity(val identitySha256: String) : ManagerAction
+    data object ConfirmExistingConversionIdentity : ManagerAction
+    data object BuildConversion : ManagerAction
+    data object PrepareGeneratedInstall : ManagerAction
+    data object SaveGeneratedConversion : ManagerAction
+    data class SaveGeneratedConversionTo(
+        val token: String,
+        val destination: String,
+    ) : ManagerAction
+    data object ShareGeneratedConversion : ManagerAction
+    data object GeneratedShareFailed : ManagerAction
+    data object FinishConversion : ManagerAction
+    data object CancelConversion : ManagerAction
     data object ConfirmPartial : ManagerAction
     data object InstallReviewedBundle : ManagerAction
     data object CancelReview : ManagerAction
@@ -115,6 +232,18 @@ enum class LaunchDestination {
 }
 
 sealed interface ManagerEffect {
+    data object PickConversionDocument : ManagerEffect
+
+    data class CreateConversionDocument(
+        val token: String,
+        val suggestedFileName: String,
+    ) : ManagerEffect
+
+    data class ShareGeneratedBundle(
+        val token: String,
+        val file: File,
+    ) : ManagerEffect
+
     class LaunchIntent(
         val destination: LaunchDestination,
         val intentFactory: () -> Intent,

@@ -45,6 +45,15 @@
         <receiver
             android:name=".install.InstallResultReceiver"
             android:exported="false" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.generated"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/generated_bundle_paths" />
+        </provider>
     </application>
 
 </manifest>

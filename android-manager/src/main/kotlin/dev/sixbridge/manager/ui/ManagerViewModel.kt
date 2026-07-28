@@ -11,10 +11,17 @@ import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.catalog.CatalogRecord
+import dev.sixbridge.manager.conversion.ConversionBeginResult
+import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.OnDeviceInputRequest
+import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
+import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
@@ -31,10 +38,12 @@ import kotlinx.coroutines.launch
 class ManagerViewModel(
     private val repository: ManagerRepository,
     private val savedStateHandle: SavedStateHandle,
+    private val openConversionOutput: (String) -> OutputStream? = { null },
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
     private var routeOperation: Job? = null
+    private var conversionIoJob: Job? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -75,6 +84,52 @@ class ManagerViewModel(
         when (action) {
             ManagerAction.FilePickerOpened -> Unit
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
+            ManagerAction.OpenConversionInput -> openConversionInput()
+            is ManagerAction.ConversionUrlChanged -> updateConversionUrl(action.value)
+            ManagerAction.OpenConversionFilePicker ->
+                enqueueEffect(ManagerEffect.PickConversionDocument)
+            is ManagerAction.ConversionFileSelected ->
+                beginConversion(OnDeviceInputRequest.Saf(action.uri))
+            ManagerAction.AnalyzeConversionUrl -> analyzeConversionUrl()
+            is ManagerAction.ToggleConversionAdapter -> updateConversionAnalysis {
+                it.toggleAdapter(action.id)
+            }
+            ManagerAction.ConfirmConversionPartial -> updateConversionAnalysis {
+                it.copy(partialConfirmed = true)
+            }
+            ManagerAction.SelectNewConversionIdentity -> updateConversionAnalysis {
+                it.selectIdentity(InstallationIdentitySelection.CreateNew)
+            }
+            is ManagerAction.SelectExistingConversionIdentity -> updateConversionAnalysis {
+                it.selectIdentity(
+                    InstallationIdentitySelection.UseExisting(action.identitySha256),
+                )
+            }
+            ManagerAction.ConfirmExistingConversionIdentity -> updateConversionAnalysis {
+                if (it.identitySelection is InstallationIdentitySelection.UseExisting) {
+                    it.copy(existingIdentityConfirmed = true)
+                } else {
+                    it
+                }
+            }
+            ManagerAction.BuildConversion -> buildConversion()
+            ManagerAction.PrepareGeneratedInstall -> prepareGeneratedInstall()
+            ManagerAction.SaveGeneratedConversion -> requestGeneratedSave()
+            is ManagerAction.SaveGeneratedConversionTo ->
+                saveGenerated(action.token, action.destination)
+            ManagerAction.ShareGeneratedConversion -> shareGenerated()
+            ManagerAction.GeneratedShareFailed -> mutableState.update {
+                it.copy(
+                    message = UserMessage(
+                        UserMessageKind.CONVERSION_SHARE_FAILED,
+                        "공유 화면을 열 수 없습니다. 파일로 저장한 뒤 다시 공유해 주세요.",
+                        RecoveryAction.NONE,
+                    ),
+                )
+            }
+            ManagerAction.FinishConversion,
+            ManagerAction.CancelConversion,
+            -> cancelConversion()
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
@@ -144,9 +199,288 @@ class ManagerViewModel(
         }
     }
 
+    private fun openConversionInput() {
+        if (mutableState.value.conversionState is ConversionUiState.Building) return
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionInput,
+                conversionState = ConversionUiState.Idle,
+                conversionUrl = "",
+                message = null,
+            )
+        }
+        clearSavedConversion()
+    }
+
+    private fun updateConversionUrl(value: String) {
+        if (mutableState.value.route != ManagerRoute.ConversionInput) return
+        if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
+        mutableState.update { it.copy(conversionUrl = value, message = null) }
+    }
+
+    private fun analyzeConversionUrl() {
+        val url = mutableState.value.conversionUrl.trim()
+        if (url.isEmpty()) {
+            mutableState.update {
+                it.copy(message = conversionFailureMessage(ConversionFailureCode.URL))
+            }
+            return
+        }
+        beginConversion(OnDeviceInputRequest.ChromeStore(url))
+    }
+
+    private fun beginConversion(request: OnDeviceInputRequest) {
+        if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
+        val generation = replaceRouteOperation()
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionInput,
+                conversionState = ConversionUiState.Acquiring,
+                message = null,
+            )
+        }
+        routeOperation = viewModelScope.launch {
+            val result = try {
+                repository.beginConversion(request)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            }
+            if (generation != operationGeneration) return@launch
+            when (result) {
+                is ConversionBeginResult.AnalysisReady -> showConversionAnalysis(result)
+                is ConversionBeginResult.Failure -> {
+                    saveConversionRoute(result.token, "input")
+                    mutableState.update {
+                        it.copy(
+                            route = ManagerRoute.ConversionInput,
+                            conversionState = ConversionUiState.Failed(
+                                result.token,
+                                result.code,
+                            ),
+                            message = conversionFailureMessage(result.code),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateConversionAnalysis(
+        transform: (ConversionUiState.AnalysisReady) -> ConversionUiState.AnalysisReady,
+    ) {
+        val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return
+        mutableState.update { it.copy(conversionState = transform(ready), message = null) }
+    }
+
+    private fun buildConversion() {
+        val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return
+        if (!ready.canBuild || routeOperation?.isActive == true) return
+        val generation = replaceRouteOperation()
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionAnalysis(ready.token),
+                conversionState = ConversionUiState.Building(ready.token, ready),
+                message = null,
+            )
+        }
+        routeOperation = viewModelScope.launch {
+            val result = try {
+                repository.approveConversion(
+                    token = ready.token,
+                    approvedAdapterIds = ready.selectedAdapters,
+                    partialConfirmed = ready.partialConfirmed,
+                    identitySelection = ready.identitySelection,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            if (generation != operationGeneration) return@launch
+            when (result) {
+                is ConversionBuildResult.BundleReady ->
+                    showConversionResult(result.review, result.generated)
+                is ConversionBuildResult.Failure -> {
+                    if (result.generated != null) {
+                        showConversionResult(review = null, generated = result.generated)
+                    } else {
+                        mutableState.update {
+                            it.copy(
+                                route = ManagerRoute.ConversionAnalysis(ready.token),
+                                conversionState = ready,
+                                message = conversionFailureMessage(result.code),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun prepareGeneratedInstall() {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        val review = result.review ?: run {
+            mutableState.update {
+                it.copy(message = conversionFailureMessage(ConversionFailureCode.BUNDLE_IO))
+            }
+            return
+        }
+        ownedReviewToken = review.token
+        savedStateHandle[REVIEW_TOKEN_KEY] = review.token
+        mutableState.update {
+            it.copy(
+                importState = ImportUiState.ReviewReady(
+                    review = review,
+                    partialConfirmed = review.status == ContractCompatibilityStatus.PARTIAL,
+                ),
+                message = null,
+            )
+        }
+    }
+
+    private fun requestGeneratedSave() {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        enqueueEffect(
+            ManagerEffect.CreateConversionDocument(
+                token = result.token,
+                suggestedFileName = result.generated.suggestedFileName,
+            ),
+        )
+    }
+
+    private fun saveGenerated(token: String, destination: String) {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        if (result.token != token) return
+        if (conversionIoJob?.isActive == true) return
+        conversionIoJob = viewModelScope.launch {
+            val copiedHash = try {
+                openConversionOutput(destination)?.use { output ->
+                    repository.copyGeneratedConversion(result.token, output)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+            if (mutableState.value.conversionState !is ConversionUiState.ResultReady) return@launch
+            mutableState.update {
+                it.copy(
+                    message = if (copiedHash == result.generated.sha256) {
+                        UserMessage(
+                            UserMessageKind.CONVERSION_SAVED,
+                            "변환된 .six 파일을 안전하게 저장했습니다.",
+                            RecoveryAction.NONE,
+                        )
+                    } else {
+                        UserMessage(
+                            UserMessageKind.CONVERSION_SAVE_FAILED,
+                            "파일 저장을 완료하지 못했습니다. 저장 위치를 다시 선택해 주세요.",
+                            RecoveryAction.RETRY,
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    private fun shareGenerated() {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        enqueueEffect(
+            ManagerEffect.ShareGeneratedBundle(
+                token = result.token,
+                file = result.generated.file,
+            ),
+        )
+    }
+
+    private fun cancelConversion() {
+        val stateBeforeCancel = mutableState.value.conversionState
+        val token = when (stateBeforeCancel) {
+            is ConversionUiState.AnalysisReady -> stateBeforeCancel.token
+            is ConversionUiState.Building -> stateBeforeCancel.token
+            is ConversionUiState.ResultReady -> stateBeforeCancel.token
+            is ConversionUiState.Failed -> stateBeforeCancel.token
+            ConversionUiState.Acquiring,
+            ConversionUiState.Idle,
+            -> savedStateHandle.get<String>(CONVERSION_TOKEN_KEY)
+        }
+        val reviewToken = (stateBeforeCancel as? ConversionUiState.ResultReady)
+            ?.review
+            ?.token
+        val superseded = routeOperation
+        superseded?.cancel()
+        operationGeneration += 1
+        routeOperation = viewModelScope.launch {
+            superseded?.cancelAndJoin()
+            conversionIoJob?.cancelAndJoin()
+            conversionIoJob = null
+            token?.let { repository.discardConversion(it) }
+            reviewToken?.let(repository::discardReview)
+            if (ownedReviewToken == reviewToken) {
+                clearSavedReviewAndSession()
+            }
+            clearSavedConversion()
+            mutableState.update {
+                it.copy(
+                    route = ManagerRoute.Home,
+                    conversionState = ConversionUiState.Idle,
+                    conversionUrl = "",
+                    importState = if (ownedReviewToken == null) {
+                        ImportUiState.Idle
+                    } else {
+                        it.importState
+                    },
+                    message = null,
+                )
+            }
+        }
+    }
+
+    private fun showConversionAnalysis(result: ConversionBeginResult.AnalysisReady) {
+        saveConversionRoute(result.token, "analysis")
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionAnalysis(result.token),
+                conversionState = result.toUiState(),
+                conversionUrl = "",
+                message = if (result.profileChanged) {
+                    conversionFailureMessage(ConversionFailureCode.PROFILE_CHANGED)
+                } else {
+                    null
+                },
+            )
+        }
+    }
+
+    private fun showConversionResult(
+        review: ReviewBundle?,
+        generated: dev.sixbridge.manager.conversion.GeneratedBundle,
+    ) {
+        saveConversionRoute(generated.token, "result")
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionResult(generated.token),
+                conversionState = ConversionUiState.ResultReady(
+                    token = generated.token,
+                    review = review,
+                    generated = generated,
+                ),
+                conversionUrl = "",
+                message = if (review == null) {
+                    conversionFailureMessage(ConversionFailureCode.BUNDLE_IO)
+                } else {
+                    null
+                },
+            )
+        }
+    }
+
     private fun restoreAndInitialize() {
         val generation = operationGeneration
         viewModelScope.launch {
+            savedStateHandle["conversion_url"] = null
             val savedToken = savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
             val savedSession = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
             val restored = try {
@@ -181,6 +515,28 @@ class ManagerViewModel(
             if (restored.review == null && deferredTerminal != null) {
                 applyInstallTerminal(deferredTerminal)
             }
+            if (restored.review == null) {
+                restoreConversion(generation)
+            }
+        }
+    }
+
+    private suspend fun restoreConversion(generation: Long) {
+        val restored = try {
+            repository.restoreConversion()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+        if (generation != operationGeneration) return
+        when (restored) {
+            is RestoredConversion.Analysis -> showConversionAnalysis(restored.value)
+            is RestoredConversion.BundleReady ->
+                showConversionResult(restored.review, restored.generated)
+            is RestoredConversion.GeneratedPending ->
+                showConversionResult(review = null, generated = restored.generated)
+            null -> clearSavedConversion()
         }
     }
 
@@ -555,6 +911,17 @@ class ManagerViewModel(
         }
     }
 
+    private fun saveConversionRoute(token: String?, route: String) {
+        savedStateHandle[CONVERSION_TOKEN_KEY] = token
+        savedStateHandle[CONVERSION_ROUTE_KEY] = if (token == null) null else route
+    }
+
+    private fun clearSavedConversion() {
+        savedStateHandle[CONVERSION_TOKEN_KEY] = null
+        savedStateHandle[CONVERSION_ROUTE_KEY] = null
+        savedStateHandle["conversion_url"] = null
+    }
+
     private fun replaceRouteOperation(): Long {
         routeOperation?.cancel()
         operationGeneration += 1
@@ -739,6 +1106,8 @@ class ManagerViewModel(
     companion object {
         const val REVIEW_TOKEN_KEY = "review_token"
         const val INSTALL_SESSION_ID_KEY = "install_session_id"
+        const val CONVERSION_TOKEN_KEY = "conversion_token"
+        const val CONVERSION_ROUTE_KEY = "conversion_route"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",
@@ -746,6 +1115,99 @@ class ManagerViewModel(
             "MISSING_OBSERVATION_RESET_FAILED",
         )
     }
+}
+
+private fun ConversionBeginResult.AnalysisReady.toUiState() =
+    ConversionUiState.AnalysisReady(
+        token = token,
+        report = report,
+        selectedAutomaticAdapters = selectedAutomaticAdapters,
+        requiredApprovals = requiredApprovals,
+        identityRequirement = identityRequirement,
+        profileChanged = profileChanged,
+    )
+
+internal fun conversionFailureMessage(code: ConversionFailureCode): UserMessage = when (code) {
+    ConversionFailureCode.URL -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "Chrome 웹 스토어 상세 주소 형식이 아닙니다. 주소를 확인하고 다시 분석해 주세요.",
+        RecoveryAction.NONE,
+    )
+    ConversionFailureCode.NETWORK -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "Chrome 확장 다운로드에 실패했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.",
+        RecoveryAction.RETRY,
+    )
+    ConversionFailureCode.INPUT_INVALID -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "선택한 파일을 확장 입력으로 확인할 수 없습니다. 다른 ZIP 또는 CRX3 파일을 선택해 주세요.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
+    ConversionFailureCode.DRAFT_INVALID -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "SixDraft 서명이나 변환 증명이 올바르지 않습니다. 신뢰할 수 있는 초안을 다시 선택해 주세요.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
+    ConversionFailureCode.BROWSER_MISSING -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "삼성 인터넷이 설치되어 있지 않아 변환할 수 없습니다. 삼성 인터넷을 설치한 뒤 다시 확인해 주세요.",
+        RecoveryAction.NONE,
+    )
+    ConversionFailureCode.PROFILE_UNKNOWN -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "설치된 삼성 인터넷의 변환 계약을 확인하지 못했습니다. 앱을 업데이트한 뒤 다시 검사해 주세요.",
+        RecoveryAction.RETRY,
+    )
+    ConversionFailureCode.PROFILE_CHANGED -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "삼성 인터넷 프로필이 달라져 분석을 새로 실행했습니다. 승인 내용을 다시 검토해 주세요.",
+        RecoveryAction.NONE,
+    )
+    ConversionFailureCode.BLOCKED -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "차단되는 호환성 문제가 있어 이 입력은 변환할 수 없습니다. 이슈를 수정한 파일을 선택해 주세요.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
+    ConversionFailureCode.UNKNOWN -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "호환성 판단 근거가 부족해 변환을 차단했습니다. 지원 여부가 확인된 입력을 사용해 주세요.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
+    ConversionFailureCode.APPROVAL_REQUIRED -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "필수 동작 변경 어댑터 승인이 빠졌습니다. 모든 변경 항목을 직접 확인해 주세요.",
+        RecoveryAction.NONE,
+    )
+    ConversionFailureCode.PARTIAL_CONFIRMATION_REQUIRED -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "부분 호환 제한 확인이 필요합니다. 남은 제한을 읽고 별도 확인해 주세요.",
+        RecoveryAction.CONFIRM_PARTIAL,
+    )
+    ConversionFailureCode.TRANSFORM_MISMATCH -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "재검증한 변환 결과가 처음 분석과 달라졌습니다. 현재 입력으로 분석을 다시 시작해 주세요.",
+        RecoveryAction.RETRY,
+    )
+    ConversionFailureCode.KEYSTORE -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "기기 서명 신원을 사용할 수 없습니다. 기기 잠금을 확인한 뒤 변환을 다시 시도해 주세요.",
+        RecoveryAction.RETRY,
+    )
+    ConversionFailureCode.PACKAGE -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "Android 확장 래퍼 생성에 실패했습니다. 입력을 다시 분석한 뒤 재시도해 주세요.",
+        RecoveryAction.RETRY,
+    )
+    ConversionFailureCode.IDENTITY_MISMATCH -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "기존 변환 대상의 확장 ID, package 또는 signer가 일치하지 않습니다. 새 변환 신원을 선택해 주세요.",
+        RecoveryAction.NONE,
+    )
+    ConversionFailureCode.BUNDLE_IO -> UserMessage(
+        UserMessageKind.CONVERSION_FAILURE,
+        "생성된 .six 검증 또는 읽기에 실패했습니다. 결과를 닫고 변환을 다시 실행해 주세요.",
+        RecoveryAction.RETRY,
+    )
 }
 
 private fun CatalogRecord.toItem(): ManagedExtensionItem {

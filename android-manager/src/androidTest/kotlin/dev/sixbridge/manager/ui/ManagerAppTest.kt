@@ -2,6 +2,8 @@ package dev.sixbridge.manager.ui
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.MutableState
@@ -14,6 +16,7 @@ import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -30,7 +33,18 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.ManagerAppContent
+import dev.sixbridge.manager.GENERATED_BUNDLE_MIME_TYPE
+import dev.sixbridge.manager.generatedBundleSendIntent
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.IdentityRequirement
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.AdapterDecision
+import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.ConversionState
+import java.io.File
 import java.io.ByteArrayOutputStream
 import org.junit.Rule
 import org.junit.Test
@@ -55,6 +69,7 @@ class ManagerAppTest {
         }
 
         listOf(
+            "home:convert-on-device",
             "home:open-addons",
             "extension:$PACKAGE:report",
             "extension:$PACKAGE:remove",
@@ -67,6 +82,7 @@ class ManagerAppTest {
 
         assertEquals(
             listOf(
+                ManagerAction.OpenConversionInput,
                 ManagerAction.OpenSamsungAddOns,
                 ManagerAction.OpenReport(PACKAGE),
                 ManagerAction.Remove(PACKAGE),
@@ -74,6 +90,123 @@ class ManagerAppTest {
             actions,
         )
         assertEquals(1, addFileRequests)
+    }
+
+    @Test
+    fun conversion_input_exposes_url_file_and_analyze_actions() {
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(route = ManagerRoute.ConversionInput),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        listOf(
+            "conversion:url",
+            "conversion:pick-file",
+            "conversion:analyze",
+            "conversion:cancel",
+        ).forEach { tag ->
+            composeRule.onNodeWithTag(tag).assertExists()
+        }
+        composeRule.onNodeWithTag("conversion:pick-file").performClick()
+        composeRule.onNodeWithTag("conversion:cancel").performClick()
+
+        assertEquals(
+            listOf(
+                ManagerAction.OpenConversionFilePicker,
+                ManagerAction.CancelConversion,
+            ),
+            actions,
+        )
+    }
+
+    @Test
+    fun conversion_analysis_requires_adapter_and_partial_confirmation() {
+        var state by mutableStateOf(conversionAnalysisState())
+        composeRule.setContent {
+            ManagerAppContent(
+                state = state,
+                onAction = { action ->
+                    val ready = state.conversionState as ConversionUiState.AnalysisReady
+                    state = when (action) {
+                        is ManagerAction.ToggleConversionAdapter ->
+                            state.copy(conversionState = ready.toggleAdapter(action.id))
+                        ManagerAction.ConfirmConversionPartial ->
+                            state.copy(conversionState = ready.copy(partialConfirmed = true))
+                        else -> state
+                    }
+                },
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("conversion:adapter:action-popup-entry")
+            .assertIsNotSelected()
+        composeRule.onNodeWithTag("conversion:build").assertIsNotEnabled()
+        composeRule.onNodeWithTag("conversion:adapter:action-popup-entry").performClick()
+        composeRule.onNodeWithTag("conversion:confirm-partial").performClick()
+        composeRule.onNodeWithTag("conversion:build").assertIsEnabled()
+    }
+
+    @Test
+    fun conversion_result_exposes_install_save_share_done_and_cancel() {
+        composeRule.setContent {
+            ManagerAppContent(
+                state = conversionResultState(),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        listOf(
+            "conversion:install",
+            "conversion:save",
+            "conversion:share",
+            "conversion:done",
+            "conversion:cancel",
+        ).forEach { tag ->
+            composeRule.onNodeWithTag(tag).assertExists()
+        }
+    }
+
+    @Test
+    fun conversion_build_back_dispatches_cancel() {
+        val actions = mutableListOf<ManagerAction>()
+        val ready = conversionAnalysisState().conversionState as ConversionUiState.AnalysisReady
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    route = ManagerRoute.ConversionAnalysis(TOKEN),
+                    conversionState = ConversionUiState.Building(TOKEN, ready),
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        pressBack()
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(ManagerAction.CancelConversion), actions)
+    }
+
+    @Test
+    fun generated_bundle_share_grants_read_only_and_uses_bundle_mime() {
+        val uri = Uri.parse("content://dev.sixbridge.manager.generated/result.six")
+
+        val intent = generatedBundleSendIntent(uri)
+
+        assertEquals(Intent.ACTION_SEND, intent.action)
+        assertEquals(GENERATED_BUNDLE_MIME_TYPE, intent.type)
+        assertEquals(uri, intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))
+        assertEquals(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        )
+        assertEquals(0, intent.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
     }
 
     @Test
@@ -381,6 +514,59 @@ class ManagerAppTest {
         )
     }
 
+    private fun conversionAnalysisState() = ManagerUiState(
+        route = ManagerRoute.ConversionAnalysis(TOKEN),
+        conversionState = ConversionUiState.AnalysisReady(
+            token = TOKEN,
+            report = CompatibilityReport(
+                status = CompatibilityStatus.PARTIAL,
+                manifestVersion = 3,
+                extensionName = "테스트 확장",
+                extensionVersion = "1.2.3",
+                declaredPermissions = setOf("storage"),
+                usedApis = setOf("tabs"),
+                unsupportedApis = emptySet(),
+                issues = emptyList(),
+                conversionState = ConversionState.REQUIRES_APPROVAL,
+                adapterDecisions = listOf(
+                    AdapterDecision(
+                        id = "action-popup-entry",
+                        version = 1,
+                        risk = AdapterRisk.BEHAVIOR_CHANGE,
+                        disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                        applied = false,
+                        evidence = emptyList(),
+                        changes = listOf("팝업 진입 동작 변경"),
+                        remainingLimitations = listOf("사용자 확인 필요"),
+                    ),
+                ),
+            ),
+            selectedAutomaticAdapters = emptySet(),
+            requiredApprovals = setOf("action-popup-entry"),
+            identityRequirement = IdentityRequirement.Stable("0123456789ab"),
+        ),
+    )
+
+    private fun conversionResultState(): ManagerUiState {
+        val review = reviewState(ContractCompatibilityStatus.COMPATIBLE)
+            .importState
+            .let { it as ImportUiState.ReviewReady }
+            .review
+        return ManagerUiState(
+            route = ManagerRoute.ConversionResult(TOKEN),
+            conversionState = ConversionUiState.ResultReady(
+                token = TOKEN,
+                review = review,
+                generated = GeneratedBundle(
+                    token = TOKEN,
+                    file = File("/data/user/0/dev.sixbridge.manager/files/generated-bundles/$TOKEN.six"),
+                    sha256 = "d".repeat(64),
+                    suggestedFileName = "테스트-확장.six",
+                ),
+            ),
+        )
+    }
+
     private fun installedItem(
         iconPng: ByteArray? = null,
         name: String = "테스트 확장",
@@ -472,6 +658,7 @@ class ManagerAppTest {
     }
 
     private companion object {
+        const val TOKEN = "11111111-1111-1111-1111-111111111111"
         const val PACKAGE = "dev.sixbridge.ext.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val EXTENSION_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }

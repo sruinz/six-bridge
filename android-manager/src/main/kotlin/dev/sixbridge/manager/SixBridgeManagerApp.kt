@@ -9,6 +9,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.sixbridge.manager.ui.HomeScreen
+import dev.sixbridge.manager.ui.ConversionAnalysisScreen
+import dev.sixbridge.manager.ui.ConversionInputScreen
+import dev.sixbridge.manager.ui.ConversionResultScreen
+import dev.sixbridge.manager.ui.ConversionUiState
 import dev.sixbridge.manager.ui.ImportUiState
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerRoute
@@ -32,6 +36,10 @@ fun SixBridgeManagerApp(
                 onAction = viewModel::accept,
                 onAddSix = onAddSix,
                 onInstallReviewed = onInstallReviewed,
+                onInstallGenerated = {
+                    viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                    onInstallReviewed()
+                },
             )
         }
     }
@@ -46,6 +54,10 @@ fun ManagerAppContent(
     onInstallReviewed: () -> Unit = {
         onAction(ManagerAction.InstallReviewedBundle)
     },
+    onInstallGenerated: () -> Unit = {
+        onAction(ManagerAction.PrepareGeneratedInstall)
+        onAction(ManagerAction.InstallReviewedBundle)
+    },
 ) {
     val backAction = state.route.backAction()
     BackHandler(enabled = backAction != null) {
@@ -58,6 +70,39 @@ fun ManagerAppContent(
             onAddSix = onAddSix,
             modifier = modifier,
         )
+        ManagerRoute.ConversionInput -> ConversionInputScreen(
+            state = state,
+            onAction = onAction,
+            modifier = modifier,
+        )
+        is ManagerRoute.ConversionAnalysis -> ConversionAnalysisScreen(
+            state = state.conversionState,
+            message = state.message,
+            onAction = onAction,
+            modifier = modifier,
+        )
+        is ManagerRoute.ConversionResult -> {
+            val ready = state.conversionState as? ConversionUiState.ResultReady
+            if (ready == null || ready.token != route.token) {
+                ConversionInputScreen(
+                    state = state.copy(
+                        route = ManagerRoute.ConversionInput,
+                        conversionState = ConversionUiState.Idle,
+                    ),
+                    onAction = onAction,
+                    modifier = modifier,
+                )
+            } else {
+                ConversionResultScreen(
+                    ready = ready,
+                    message = state.message,
+                    installState = state.installState,
+                    onAction = onAction,
+                    onInstall = onInstallGenerated,
+                    modifier = modifier,
+                )
+            }
+        }
         is ManagerRoute.Review -> {
             val ready = state.importState as? ImportUiState.ReviewReady
             if (ready == null || ready.review.token != route.token) {
@@ -90,6 +135,10 @@ fun ManagerAppContent(
 
 internal fun ManagerRoute.backAction(): ManagerAction? = when (this) {
     ManagerRoute.Home -> null
+    ManagerRoute.ConversionInput,
+    is ManagerRoute.ConversionAnalysis,
+    is ManagerRoute.ConversionResult,
+    -> ManagerAction.CancelConversion
     is ManagerRoute.Review -> ManagerAction.CancelReview
     is ManagerRoute.Report -> ManagerAction.ReturnHome
 }

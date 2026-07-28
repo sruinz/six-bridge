@@ -6,6 +6,7 @@ readonly MODULE_DIR="${ROOT_DIR}/android-manager"
 readonly BUILD_FILE="${MODULE_DIR}/build.gradle.kts"
 readonly SOURCE_MANIFEST="${MODULE_DIR}/src/main/AndroidManifest.xml"
 readonly RES_DIR="${MODULE_DIR}/src/main/res"
+readonly GENERATED_PATHS="${RES_DIR}/xml/generated_bundle_paths.xml"
 readonly ICON_BACKGROUND="${RES_DIR}/drawable/ic_launcher_background.xml"
 readonly ICON_FOREGROUND="${RES_DIR}/drawable/ic_launcher_foreground.xml"
 readonly ICON_MONOCHROME="${RES_DIR}/drawable/ic_launcher_monochrome.xml"
@@ -177,9 +178,16 @@ manifest_contract() {
     local attr_exported="@*[local-name()='exported' and namespace-uri()='${ANDROID_NS}']"
     local attr_icon="@*[local-name()='icon' and namespace-uri()='${ANDROID_NS}']"
     local attr_round_icon="@*[local-name()='roundIcon' and namespace-uri()='${ANDROID_NS}']"
+    local attr_authorities="@*[local-name()='authorities' and namespace-uri()='${ANDROID_NS}']"
+    local attr_grant_uri_permissions="@*[local-name()='grantUriPermissions' and namespace-uri()='${ANDROID_NS}']"
+    local attr_resource="@*[local-name()='resource' and namespace-uri()='${ANDROID_NS}']"
+    local expected_generated_authority='${applicationId}.generated'
+    local generated_paths_resource="${attr_resource}='@xml/generated_bundle_paths'"
     local launcher_activity="/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='activity'][*[local-name()='intent-filter']/*[local-name()='action'][${attr_name}='android.intent.action.MAIN'] and *[local-name()='intent-filter']/*[local-name()='category'][${attr_name}='android.intent.category.LAUNCHER']]"
 
     if [[ "${package_check}" == "true" ]]; then
+        expected_generated_authority="dev.sixbridge.manager.generated"
+        generated_paths_resource="starts-with(${attr_resource}, '@ref/')"
         [[ -n "${expected_icon_ref}" ]] ||
             fail "built APK icon resource ID is missing"
         [[ -n "${expected_round_icon_ref}" ]] ||
@@ -221,6 +229,26 @@ manifest_contract() {
     assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='receiver'][not(${attr_exported}) or ${attr_exported}!='false']" 0 \
         "every receiver must explicitly set android:exported=false"
+    assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='provider'][${attr_name}='androidx.core.content.FileProvider' and ${attr_authorities}='${expected_generated_authority}' and ${attr_exported}='false' and ${attr_grant_uri_permissions}='true']" 1 \
+        "generated bundle FileProvider contract must be declared once"
+    assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='provider'][${attr_name}='androidx.core.content.FileProvider']/*[local-name()='meta-data'][${attr_name}='android.support.FILE_PROVIDER_PATHS' and ${generated_paths_resource}]" 1 \
+        "generated bundle FileProvider paths metadata must be declared once"
+}
+
+generated_paths_contract() {
+    local paths="$1"
+    local attr_name="@*[local-name()='name']"
+    local attr_path="@*[local-name()='path']"
+
+    assert_xpath_count "${paths}" "/*[local-name()='paths']" 1 \
+        "generated bundle paths root must exist"
+    assert_xpath_count "${paths}" "/*[local-name()='paths']/*" 1 \
+        "only one generated bundle path may be exposed"
+    assert_xpath_count "${paths}" \
+        "/*[local-name()='paths']/*[local-name()='files-path'][${attr_name}='generated-bundles' and ${attr_path}='generated-bundles/']" 1 \
+        "FileProvider must expose only files/generated-bundles"
 }
 
 assert_file_exists() {
@@ -692,6 +720,7 @@ fi
 [[ "$#" == "0" ]] || fail "unknown argument: $1"
 [[ -f "${BUILD_FILE}" ]] || fail "Android manager build file is missing: ${BUILD_FILE}"
 [[ -f "${SOURCE_MANIFEST}" ]] || fail "source manifest is missing: ${SOURCE_MANIFEST}"
+[[ -f "${GENERATED_PATHS}" ]] || fail "generated bundle paths are missing: ${GENERATED_PATHS}"
 [[ -x "${APKANALYZER}" ]] || fail "apkanalyzer is missing: ${APKANALYZER}"
 [[ -x "${AAPT2}" ]] || fail "aapt2 is missing: ${AAPT2}"
 [[ -f "${DEBUG_APK}" ]] || fail "debug APK is missing: ${DEBUG_APK}"
@@ -702,6 +731,7 @@ grep -Eq 'applicationId[[:space:]]*=[[:space:]]*"dev\.sixbridge\.manager"' "${BU
     fail "applicationId must be dev.sixbridge.manager"
 
 source_permission_contract "${SOURCE_MANIFEST}"
+generated_paths_contract "${GENERATED_PATHS}"
 source_icon_contract
 manifest_contract "${SOURCE_MANIFEST}" false
 

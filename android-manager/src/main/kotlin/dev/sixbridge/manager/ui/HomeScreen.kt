@@ -51,6 +51,19 @@ fun HomeScreen(
             style = MaterialTheme.typography.headlineMedium,
         )
         Button(
+            onClick = { onAction(ManagerAction.OpenConversionInput) },
+            modifier = Modifier.fillMaxWidth().testTag("home:convert-on-device"),
+        ) {
+            Text(text = stringResource(R.string.home_convert_on_device))
+        }
+        Button(
+            onClick = onAddSix,
+            enabled = state.importState != ImportUiState.Importing,
+            modifier = Modifier.fillMaxWidth().testTag("home:add-six"),
+        ) {
+            Text(text = stringResource(R.string.home_add_six))
+        }
+        Button(
             onClick = { onAction(ManagerAction.OpenSamsungAddOns) },
             modifier = Modifier.fillMaxWidth().testTag("home:open-addons"),
         ) {
@@ -95,13 +108,6 @@ fun HomeScreen(
                 },
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
-        }
-        Button(
-            onClick = onAddSix,
-            enabled = state.importState != ImportUiState.Importing,
-            modifier = Modifier.fillMaxWidth().testTag("home:add-six"),
-        ) {
-            Text(text = stringResource(R.string.home_add_six))
         }
     }
 }

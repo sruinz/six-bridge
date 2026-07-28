@@ -14,10 +14,26 @@ import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.catalog.CatalogRecord
+import dev.sixbridge.manager.conversion.ConversionBeginResult
+import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.IdentityRequirement
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.OnDeviceInputRequest
+import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
+import java.io.OutputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -1505,6 +1521,187 @@ class ManagerViewModelTest {
             assertTrue(viewModel.state.value.message?.text.orEmpty().any { it.code in 0xAC00..0xD7A3 })
         }
 
+    @Test
+    fun `Chrome URL 분석 성공은 token만 저장하고 분석 route로 이동한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://chrome.example/private"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            assertIs<OnDeviceInputRequest.ChromeStore>(repository.conversionRequests.single())
+            assertEquals(ManagerRoute.ConversionAnalysis(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(
+                "analysis",
+                savedState.get<String>(ManagerViewModel.CONVERSION_ROUTE_KEY),
+            )
+            assertNull(savedState.get<String>("conversion_url"))
+        }
+
+    @Test
+    fun `recreation은 SavedState payload 대신 repository restore 결과를 재검증한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.Analysis(conversionAnalysis())
+            }
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "analysis",
+                    "conversion_url" to "https://leak.invalid/private",
+                ),
+            )
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.restoreConversionRequests)
+            assertEquals(ManagerRoute.ConversionAnalysis(TOKEN), viewModel.state.value.route)
+            assertEquals("", viewModel.state.value.conversionUrl)
+            assertNull(savedState.get<String>("conversion_url"))
+        }
+
+    @Test
+    fun `build 중 중복 클릭은 coordinator를 한 번만 호출한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+                conversionBuildResult =
+                    ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.BuildConversion)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.conversionBuildRequests.size)
+        }
+
+    @Test
+    fun `공유 chooser 요청만으로 generated와 work를 삭제하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val generated = generatedBundle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generated,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(
+                    mapOf(
+                        ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                        ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(viewModel.effects.first())
+
+            assertEquals(TOKEN, effect.token)
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `저장은 repository copy hash가 generated hash와 같을 때만 성공한다`() =
+        runTest(dispatcher.scheduler) {
+            val generated = generatedBundle()
+            val copied = ByteArrayOutputStream()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generated,
+                )
+                copiedConversionHash = generated.sha256
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(),
+                openConversionOutput = { copied },
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    TOKEN,
+                    "content://save/result.six",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.copiedConversionTokens)
+            assertEquals(UserMessageKind.CONVERSION_SAVED, viewModel.state.value.message?.kind)
+        }
+
+    @Test
+    fun `결과 완료는 generated work와 retained review를 명시적으로 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    private fun generatedBundle() = GeneratedBundle(
+        token = TOKEN,
+        file = File("generated-bundles/$TOKEN.six"),
+        sha256 = "d".repeat(64),
+        suggestedFileName = "확장.six",
+    )
+
+    private fun conversionAnalysis() = ConversionBeginResult.AnalysisReady(
+        token = TOKEN,
+        profile = BrowserProfile(
+            browserPackage = "com.sec.android.app.sbrowser",
+            versionName = "30.0.2.61",
+            versionCode = 1,
+            majorVersion = 30,
+            supportedApis = emptySet(),
+            wrapperContract = WrapperContract.complete(),
+        ),
+        report = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "확장",
+            extensionVersion = "1.0",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.PASSTHROUGH,
+        ),
+        selectedAutomaticAdapters = emptySet(),
+        requiredApprovals = emptySet(),
+        identityRequirement = IdentityRequirement.Stable("0123456789ab"),
+    )
+
     private fun review(
         status: ContractCompatibilityStatus,
         token: String = TOKEN,
@@ -1606,6 +1803,17 @@ private class FakeManagerRepository : ManagerRepository {
             intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
         ),
     )
+    var conversionBeginResult: ConversionBeginResult =
+        ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+    var conversionBuildResult: ConversionBuildResult =
+        ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
+    var restoredConversion: RestoredConversion? = null
+    var restoreConversionRequests = 0
+    val conversionRequests = mutableListOf<OnDeviceInputRequest>()
+    val conversionBuildRequests = mutableListOf<ConversionBuildRequest>()
+    val discardedConversions = mutableListOf<String>()
+    var copiedConversionHash: String? = null
+    val copiedConversionTokens = mutableListOf<String>()
     var suspendImport = false
     var suspendInstall = false
     var suspendCancelInstall = false
@@ -1647,6 +1855,42 @@ private class FakeManagerRepository : ManagerRepository {
 
     override suspend fun import(uri: Uri): ManagerImportResult =
         nextImport()
+
+    override suspend fun beginConversion(request: OnDeviceInputRequest): ConversionBeginResult {
+        conversionRequests += request
+        return conversionBeginResult
+    }
+
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+    ): ConversionBuildResult {
+        conversionBuildRequests += ConversionBuildRequest(
+            token,
+            approvedAdapterIds,
+            partialConfirmed,
+            identitySelection,
+        )
+        return conversionBuildResult
+    }
+
+    override suspend fun restoreConversion(): RestoredConversion? {
+        restoreConversionRequests += 1
+        return restoredConversion
+    }
+
+    override suspend fun discardConversion(token: String): Boolean {
+        discardedConversions += token
+        return true
+    }
+
+    override fun copyGeneratedConversion(token: String, output: OutputStream): String? {
+        copiedConversionTokens += token
+        output.write(byteArrayOf(1, 2, 3))
+        return copiedConversionHash
+    }
 
     suspend fun nextImport(): ManagerImportResult {
         if (suspendImport) {
@@ -1750,3 +1994,10 @@ private class FakeManagerRepository : ManagerRepository {
         )
     }
 }
+
+private data class ConversionBuildRequest(
+    val token: String,
+    val approvedAdapterIds: Set<String>,
+    val partialConfirmed: Boolean,
+    val identitySelection: InstallationIdentitySelection?,
+)
