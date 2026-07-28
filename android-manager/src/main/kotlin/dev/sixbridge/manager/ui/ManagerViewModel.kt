@@ -78,6 +78,8 @@ class ManagerViewModel(
         savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY]
     private var generatedResultOwnerToken: String? =
         savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY]
+    private var generatedResultReviewToken: String? =
+        savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY]
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
     private var generatedTerminalJob: Job? = null
     private var documentOwnerGeneration =
@@ -711,7 +713,9 @@ class ManagerViewModel(
     ) {
         saveConversionRoute(generated.token, "result")
         generatedResultOwnerToken = generated.token
+        generatedResultReviewToken = review?.token
         savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = generated.token
+        savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = review?.token
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionResult(generated.token),
@@ -756,6 +760,9 @@ class ManagerViewModel(
                 return@launch
             }
             val resultOwner = generatedResultOwnerToken
+            val retainedResultReview = restored.review?.takeIf {
+                it.token == generatedResultReviewToken
+            }
             if (restored.review != null) {
                 if (generatedInstallOwnerToken != null || resultOwner != null) {
                     ownedReviewToken = restored.review.token
@@ -781,6 +788,19 @@ class ManagerViewModel(
             } else {
                 savedStateHandle[INSTALL_SESSION_ID_KEY] = null
             }
+            if (resultOwner != null &&
+                restored.review != null &&
+                retainedResultReview == null
+            ) {
+                clearGeneratedInstallOwner()
+                clearGeneratedResultOwner()
+                clearSavedConversion()
+                mutableState.update {
+                    it.copy(conversionState = ConversionUiState.Idle)
+                }
+                showReview(restored.review)
+                return@launch
+            }
             val deferredTerminal = deferredInitialTerminal
             deferredInitialTerminal = null
             if (restored.review == null && deferredTerminal != null) {
@@ -792,7 +812,7 @@ class ManagerViewModel(
             ) {
                 restoreConversion(
                     generation = generation,
-                    retainedReview = restored.review.takeIf { resultOwner != null },
+                    retainedReview = retainedResultReview.takeIf { resultOwner != null },
                     importReview = resultOwner == null &&
                         pendingGeneratedCleanup?.phase !=
                         GeneratedCleanupPhase.CONVERSION,
@@ -1694,7 +1714,9 @@ class ManagerViewModel(
 
     private fun clearGeneratedResultOwner() {
         generatedResultOwnerToken = null
+        generatedResultReviewToken = null
         savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = null
+        savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = null
     }
 
     private fun enqueueEffect(effect: ManagerEffect) {
@@ -1775,6 +1797,7 @@ class ManagerViewModel(
         const val CONVERSION_ROUTE_KEY = "conversion_route"
         const val INSTALL_OWNER_CONVERSION_TOKEN_KEY = "install_owner_conversion_token"
         const val RESULT_OWNER_CONVERSION_TOKEN_KEY = "result_owner_conversion_token"
+        const val RESULT_OWNER_REVIEW_TOKEN_KEY = "result_owner_review_token"
         const val GENERATED_CLEANUP_TOKEN_KEY = "generated_cleanup_token"
         const val GENERATED_CLEANUP_REVIEW_TOKEN_KEY = "generated_cleanup_review_token"
         const val GENERATED_CLEANUP_PHASE_KEY = "generated_cleanup_phase"

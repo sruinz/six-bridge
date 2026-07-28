@@ -2367,6 +2367,53 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `result owner review mismatch는 generated와 결합하지 않고 기존 Review로 fallback한다`() =
+        runTest(dispatcher.scheduler) {
+            val otherReview = review(
+                status = ContractCompatibilityStatus.COMPATIBLE,
+                token = SECOND_TOKEN,
+            )
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.REVIEW_TOKEN_KEY to SECOND_TOKEN,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = otherReview)
+                restoredConversion = RestoredConversion.GeneratedPending(generatedBundle())
+            }
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                ManagerRoute.Review(SECOND_TOKEN),
+                recreated.state.value.route,
+            )
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(
+                    recreated.state.value.importState,
+                ).review.token,
+            )
+            assertIs<ConversionUiState.Idle>(recreated.state.value.conversionState)
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY,
+                ),
+            )
+        }
+
+    @Test
     fun `process recreation은 generated install owner를 review route로 바꾸지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
