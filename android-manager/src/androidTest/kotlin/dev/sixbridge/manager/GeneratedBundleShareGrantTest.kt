@@ -8,6 +8,7 @@ import android.os.Looper
 import android.os.ResultReceiver
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertArrayEquals
@@ -22,13 +23,26 @@ class GeneratedBundleShareGrantTest {
         val targetContext = instrumentation.targetContext
         val testContext = instrumentation.context
         val expected = "generated-share-content".encodeToByteArray()
-        val root = File(targetContext.filesDir, "generated-bundles").apply { mkdirs() }
-        val file = File(root, "share-grant-${System.nanoTime()}.six")
-        file.writeBytes(expected)
+        val root = File(targetContext.filesDir, "generated-bundles/share-handoff").apply {
+            mkdirs()
+        }
+        val original = File(
+            targetContext.filesDir,
+            "generated-bundles/11111111-1111-4111-8111-111111111111.six",
+        ).apply {
+            parentFile?.mkdirs()
+            writeBytes(expected)
+        }
+        val file = File(root, "share-${UUID.randomUUID()}.six").apply {
+            original.copyTo(this)
+            assertTrue(setReadOnly())
+        }
 
         try {
             val chooser = generatedBundleShareChooser(targetContext, file)
             assertArrayEquals(expected, file.readBytes())
+            assertTrue(original.delete())
+            assertTrue(!original.exists())
             val target = requireNotNull(
                 chooser.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java),
             )
@@ -74,7 +88,9 @@ class GeneratedBundleShareGrantTest {
             )
             assertArrayEquals(expected, file.readBytes())
         } finally {
+            file.setWritable(true)
             file.delete()
+            original.delete()
         }
     }
 }

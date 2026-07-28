@@ -242,6 +242,7 @@ internal interface ConversionBundlePort {
     fun recover(token: String): GeneratedBundle?
     fun discard(token: String): Boolean
     fun copyTo(token: String, output: OutputStream): String
+    suspend fun createShareSnapshot(token: String): File? = null
 }
 
 internal fun interface ConversionGeneratedImportPort {
@@ -259,4 +260,5 @@ internal interface ConversionCoordinatorPort {
     suspend fun restore(importReview: Boolean = true): RestoredConversion?
     suspend fun discard(token: String): Boolean
     fun copyGenerated(token: String, output: OutputStream): String?
+    suspend fun createGeneratedShareSnapshot(token: String): File? = null
 }

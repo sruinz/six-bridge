@@ -397,12 +397,17 @@ internal fun generatedBundleSendIntent(
 }
 
 internal fun generatedBundleShareChooser(context: Context, file: File): Intent {
-    val root = File(context.filesDir, "generated-bundles").canonicalFile
+    val root = File(context.filesDir, "generated-bundles/share-handoff").canonicalFile
     val canonicalFile = file.canonicalFile
     require(canonicalFile.parentFile == root && file.parentFile?.canonicalFile == root) {
-        "공유 파일은 generated-bundles direct child여야 합니다."
+        "공유 파일은 share-handoff direct child여야 합니다."
     }
-    require(file.name.endsWith(".six") && file.isFile && !Files.isSymbolicLink(file.toPath())) {
+    require(
+        file.name.startsWith("share-") &&
+            file.name.endsWith(".six") &&
+            file.isFile &&
+            !Files.isSymbolicLink(file.toPath()),
+    ) {
         "공유할 생성 bundle이 올바르지 않습니다."
     }
     val uri = FileProvider.getUriForFile(

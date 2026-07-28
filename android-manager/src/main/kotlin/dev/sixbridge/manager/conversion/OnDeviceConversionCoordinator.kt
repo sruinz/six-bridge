@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
+import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -285,6 +286,9 @@ internal class OnDeviceConversionCoordinator(
 
     override fun copyGenerated(token: String, output: OutputStream): String? =
         bundles.recover(token)?.let { bundles.copyTo(token, output) }
+
+    override suspend fun createGeneratedShareSnapshot(token: String): File? =
+        bundles.recover(token)?.let { bundles.createShareSnapshot(token) }
 
     private suspend fun reconcileBuilding(
         job: RestoredConversionJob,

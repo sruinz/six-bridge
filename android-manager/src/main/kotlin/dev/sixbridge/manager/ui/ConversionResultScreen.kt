@@ -70,12 +70,14 @@ fun ConversionResultScreen(
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.SaveGeneratedConversion) },
+            enabled = !ready.cleanupPending && !ready.cleanupInProgress,
             modifier = Modifier.fillMaxWidth().testTag("conversion:save"),
         ) {
             Text(stringResource(R.string.conversion_save))
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.ShareGeneratedConversion) },
+            enabled = !ready.cleanupPending && !ready.cleanupInProgress,
             modifier = Modifier.fillMaxWidth().testTag("conversion:share"),
         ) {
             Text(stringResource(R.string.conversion_share))

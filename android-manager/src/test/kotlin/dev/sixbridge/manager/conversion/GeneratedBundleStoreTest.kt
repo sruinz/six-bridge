@@ -16,6 +16,7 @@ import java.lang.management.ManagementFactory
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import kotlin.test.assertContentEquals
@@ -23,6 +24,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Test
 
@@ -413,6 +415,76 @@ class GeneratedBundleStoreTest {
         }
         assertEquals(GeneratedBundleStoreErrorCode.CLEANUP_FAILED, error.code)
         assertTrue(retained.file.exists())
+    }
+
+    @Test
+    fun `startup은 24시간 지난 share snapshot만 bounded 정리한다`() {
+        val root = File(filesDir, "generated-bundles").apply { mkdirs() }
+        val shareRoot = File(root, "share-handoff").apply { mkdir() }
+        val expired = List(34) {
+            File(shareRoot, "share-${UUID.randomUUID()}.six").apply {
+                writeText("expired-$it")
+            }
+        }
+        val fresh = File(
+            shareRoot,
+            "share-11111111-1111-4111-8111-111111111113.six",
+        ).apply { writeText("fresh") }
+        val unrelated = File(shareRoot, "keep-expired.six").apply { writeText("keep") }
+        val original = File(root, "$token.six").apply { writeText("original") }
+        val expiredTime = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(30)
+        expired.forEachIndexed { index, file ->
+            Files.setLastModifiedTime(
+                file.toPath(),
+                FileTime.fromMillis(expiredTime + TimeUnit.MINUTES.toMillis(index.toLong())),
+            )
+        }
+        listOf(unrelated, original).forEach {
+            Files.setLastModifiedTime(it.toPath(), FileTime.fromMillis(expiredTime))
+        }
+
+        store()
+
+        expired.take(32).forEach { assertFalse(it.exists()) }
+        expired.takeLast(2).forEach { assertTrue(it.exists()) }
+        assertTrue(fresh.exists())
+        assertTrue(unrelated.exists())
+        assertTrue(original.exists())
+    }
+
+    @Test
+    fun `share snapshot은 verified original cleanup 뒤에도 exact bytes를 유지한다`() = runTest {
+        val store = store()
+        val generated = store.publish(token, result())
+
+        val snapshot = requireNotNull(store.createShareSnapshot(token))
+        val expected = generated.file.readBytes()
+        assertEquals(
+            File(filesDir, "generated-bundles/share-handoff").canonicalFile,
+            requireNotNull(snapshot.parentFile).canonicalFile,
+        )
+        assertTrue(snapshot.name.startsWith("share-"))
+        assertContentEquals(expected, snapshot.readBytes())
+
+        assertTrue(store.discard(token))
+        assertFalse(generated.file.exists())
+        assertContentEquals(expected, snapshot.readBytes())
+    }
+
+    @Test
+    fun `share snapshot final SHA 검증 실패는 temporary와 final을 모두 정리한다`() = runTest {
+        val store = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterShareSnapshotPublished = { snapshot ->
+                    snapshot.writeText("tampered after atomic move")
+                },
+            ),
+        )
+        store.publish(token, result())
+
+        assertEquals(null, store.createShareSnapshot(token))
+        val shareRoot = File(filesDir, "generated-bundles/share-handoff")
+        assertTrue(shareRoot.listFiles().orEmpty().isEmpty())
     }
 
     @Test

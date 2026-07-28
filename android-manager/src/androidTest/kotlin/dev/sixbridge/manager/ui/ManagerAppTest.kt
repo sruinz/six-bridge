@@ -244,7 +244,7 @@ class ManagerAppTest {
     }
 
     @Test
-    fun generated_cleanup_pending_disables_mutating_controls_but_keeps_save_and_share() {
+    fun generated_cleanup_pending_disables_all_result_actions() {
         var state by mutableStateOf(conversionResultState())
         composeRule.setContent {
             ManagerAppContent(
@@ -265,8 +265,8 @@ class ManagerAppTest {
             composeRule.onNodeWithTag("conversion:install").assertIsNotEnabled()
             composeRule.onNodeWithTag("conversion:done").assertIsNotEnabled()
             composeRule.onNodeWithTag("conversion:cancel").assertIsNotEnabled()
-            composeRule.onNodeWithTag("conversion:save").assertIsEnabled()
-            composeRule.onNodeWithTag("conversion:share").assertIsEnabled()
+            composeRule.onNodeWithTag("conversion:save").assertIsNotEnabled()
+            composeRule.onNodeWithTag("conversion:share").assertIsNotEnabled()
         }
     }
 

@@ -395,6 +395,8 @@ internal class DefaultConversionBundlePort(
     override fun discard(token: String): Boolean = store.discard(token)
     override fun copyTo(token: String, output: java.io.OutputStream): String =
         store.copyTo(token, output)
+    override suspend fun createShareSnapshot(token: String): File? =
+        store.createShareSnapshot(token)
 }
 
 private fun sha256(bytes: ByteArray): String =

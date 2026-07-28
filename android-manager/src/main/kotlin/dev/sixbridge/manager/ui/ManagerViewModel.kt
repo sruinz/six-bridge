@@ -58,6 +58,7 @@ class ManagerViewModel(
     private val scheduledConversionCleanupTokens = mutableSetOf<String>()
     private var conversionIoJob: Job? = null
     private var conversionIoResult: CompletableDeferred<GeneratedDocumentSaveResult>? = null
+    private var generatedShareJob: Job? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -443,6 +444,7 @@ class ManagerViewModel(
 
     private fun requestGeneratedSave() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        if (result.cleanupPending || result.cleanupInProgress) return
         val launch = newDocumentLaunch(token = result.token)
         pendingConversionSave = launch
         savePendingConversionSave(launch)
@@ -542,12 +544,29 @@ class ManagerViewModel(
 
     private fun shareGenerated() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
-        enqueueEffect(
-            ManagerEffect.ShareGeneratedBundle(
-                token = result.token,
-                file = result.generated.file,
-            ),
-        )
+        if (result.cleanupPending || result.cleanupInProgress) return
+        if (generatedShareJob?.isActive == true) return
+        generatedShareJob = viewModelScope.launch {
+            val snapshot = repository.createGeneratedShareSnapshot(result.token)
+            if (snapshot == null) {
+                mutableState.update {
+                    it.copy(
+                        message = UserMessage(
+                            UserMessageKind.CONVERSION_SHARE_FAILED,
+                            "공유용 파일을 준비하지 못했습니다. 파일로 저장한 뒤 다시 시도해 주세요.",
+                            RecoveryAction.NONE,
+                        ),
+                    )
+                }
+                return@launch
+            }
+            enqueueEffect(
+                ManagerEffect.ShareGeneratedBundle(
+                    token = result.token,
+                    file = snapshot,
+                ),
+            )
+        }
     }
 
     private fun cancelConversion() {
@@ -687,23 +706,8 @@ class ManagerViewModel(
                     )
                 }
             }
-            val saveJob = conversionIoJob
-            val saveResult = conversionIoResult
-            saveJob?.cancel()
-            val completedSave = saveResult?.await()
-            saveJob?.join()
-            if (conversionIoJob === saveJob) {
-                conversionIoJob = null
-                conversionIoResult = null
-            }
-            val saveCleanupFailed = when (completedSave) {
-                is GeneratedDocumentSaveResult.Cancelled -> completedSave.cleanupFailed
-                is GeneratedDocumentSaveResult.Failure -> completedSave.cleanupFailed
-                GeneratedDocumentSaveResult.Success,
-                null,
-                -> false
-            }
-            if (saveCleanupFailed) {
+            awaitGeneratedShareSnapshot()
+            if (!cancelAndAwaitGeneratedSave()) {
                 generatedCleanup?.let {
                     clearPendingGeneratedCleanup()
                     updateGeneratedCleanupState(
@@ -1826,6 +1830,16 @@ class ManagerViewModel(
             showGeneratedCleanupFailure()
             return false
         }
+        awaitGeneratedShareSnapshot()
+        if (!cancelAndAwaitGeneratedSave()) {
+            clearPendingGeneratedCleanup()
+            updateGeneratedCleanupState(
+                token = cleanup.token,
+                pending = false,
+                inProgress = false,
+            )
+            return true
+        }
         if (cleanup.phase == GeneratedCleanupPhase.INSTALL) {
             if (!retryPendingGeneratedInstallCleanup(cleanup)) return false
             cleanup = pendingGeneratedCleanup ?: return false
@@ -1861,6 +1875,35 @@ class ManagerViewModel(
             return false
         }
         return completeGeneratedCleanup(cleanup)
+    }
+
+    private suspend fun cancelAndAwaitGeneratedSave(): Boolean {
+        val saveJob = conversionIoJob
+        val saveResult = conversionIoResult
+        saveJob?.cancel()
+        val completedSave = saveResult?.await()
+        saveJob?.join()
+        if (conversionIoJob === saveJob) {
+            conversionIoJob = null
+            conversionIoResult = null
+        }
+        val cleanupFailed = when (completedSave) {
+            is GeneratedDocumentSaveResult.Cancelled -> completedSave.cleanupFailed
+            is GeneratedDocumentSaveResult.Failure -> completedSave.cleanupFailed
+            GeneratedDocumentSaveResult.Success,
+            null,
+            -> false
+        }
+        if (cleanupFailed) showConversionSaveCleanupFailure()
+        return !cleanupFailed
+    }
+
+    private suspend fun awaitGeneratedShareSnapshot() {
+        val shareJob = generatedShareJob
+        shareJob?.join()
+        if (generatedShareJob === shareJob) {
+            generatedShareJob = null
+        }
     }
 
     private suspend fun retryPendingGeneratedInstallCleanup(

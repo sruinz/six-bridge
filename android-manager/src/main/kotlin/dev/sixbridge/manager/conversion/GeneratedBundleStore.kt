@@ -29,6 +29,8 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 data class GeneratedBundle(
     val token: String,
@@ -66,6 +68,7 @@ internal data class GeneratedBundleStoreHooks(
     val afterBundleVerified: (File) -> Unit = {},
     val beforeFinalPublish: (File) -> Unit = {},
     val afterCopyChunk: () -> Unit = {},
+    val afterShareSnapshotPublished: (File) -> Unit = {},
     val deleteFile: ((File) -> Boolean)? = null,
     val deletePublishedFile: ((File) -> Boolean)? = null,
 )
@@ -92,6 +95,7 @@ class GeneratedBundleStore internal constructor(
     init {
         synchronized(lock) {
             cleanupOrphanTemporaryFiles()
+            cleanupExpiredShareSnapshots()
         }
     }
 
@@ -302,6 +306,92 @@ class GeneratedBundleStore internal constructor(
         published.remove(token)
         true
         }
+
+    suspend fun createShareSnapshot(token: String): File? = withContext(Dispatchers.IO) {
+        synchronized(lock) {
+            val (_, record) = requirePublished(token)
+            val directory = requireShareDirectory()
+            val snapshot = directory.resolve("share-${UUID.randomUUID()}.six")
+            val temporary = Files.createTempFile(directory, ".share-", ".tmp")
+            var publishedSnapshot: Path? = null
+            try {
+                val copiedHash = Files.newOutputStream(temporary, WRITE).use { output ->
+                    copyTo(token, output)
+                }
+                require(copiedHash == record.sha256) {
+                    "공유 snapshot hash가 생성 bundle과 일치하지 않습니다."
+                }
+                forceFile(temporary)
+                Files.move(temporary, snapshot, ATOMIC_MOVE)
+                publishedSnapshot = snapshot
+                hooks.afterShareSnapshotPublished(snapshot.toFile())
+                val snapshotFile = snapshot.toFile()
+                val snapshotState = requireRegularFile(snapshotFile, "공유 snapshot")
+                FileChannel.open(snapshot, READ, NOFOLLOW_LINKS).use { channel ->
+                    require(hashChannel(channel) == record.sha256) {
+                        "공유 snapshot final hash가 생성 bundle과 일치하지 않습니다."
+                    }
+                }
+                requireStableFile(snapshotFile, snapshotState, "공유 snapshot final hash 검증")
+                snapshotFile.apply {
+                    require(setReadOnly()) { "공유 snapshot을 read-only로 만들 수 없습니다." }
+                }
+                    .also { forceDirectory(directory) }
+            } catch (error: Throwable) {
+                val temporaryDeleted = deleteShareArtifact(temporary)
+                val snapshotDeleted = publishedSnapshot?.let(::deleteShareArtifact) ?: true
+                if (!temporaryDeleted || !snapshotDeleted) {
+                    throw GeneratedBundleStoreException(
+                        GeneratedBundleStoreErrorCode.CLEANUP_FAILED,
+                        "공유 snapshot incomplete 파일을 정리할 수 없습니다.",
+                        error,
+                    )
+                }
+                if (error is CancellationException) throw error
+                null
+            }
+        }
+    }
+
+    private fun deleteShareArtifact(path: Path): Boolean = runCatching {
+        Files.deleteIfExists(path)
+        !Files.exists(path, NOFOLLOW_LINKS)
+    }.getOrDefault(false)
+
+    private fun requireShareDirectory(): Path {
+        root.verifyUnchanged()
+        val directory = root.path.resolve(SHARE_DIRECTORY)
+        if (!Files.exists(directory, NOFOLLOW_LINKS)) {
+            Files.createDirectory(directory)
+            forceDirectory(root.path)
+        }
+        require(
+            Files.isDirectory(directory, NOFOLLOW_LINKS) &&
+                !Files.isSymbolicLink(directory) &&
+                directory.toRealPath(NOFOLLOW_LINKS).parent == root.realPath,
+        ) {
+            "공유 snapshot directory가 올바르지 않습니다."
+        }
+        return directory
+    }
+
+    private fun cleanupExpiredShareSnapshots() {
+        val directory = root.path.resolve(SHARE_DIRECTORY)
+        if (!Files.isDirectory(directory, NOFOLLOW_LINKS) || Files.isSymbolicLink(directory)) return
+        val cutoff = System.currentTimeMillis() - SHARE_RETENTION_MILLIS
+        Files.newDirectoryStream(directory).use { entries ->
+            entries.asSequence()
+                .filter { path ->
+                    SHARE_NAME.matches(path.fileName.toString()) &&
+                        Files.isRegularFile(path, NOFOLLOW_LINKS) &&
+                        !Files.isSymbolicLink(path) &&
+                        Files.getLastModifiedTime(path, NOFOLLOW_LINKS).toMillis() < cutoff
+                }
+                .sortedBy { Files.getLastModifiedTime(it, NOFOLLOW_LINKS).toMillis() }
+                .take(MAX_STARTUP_SHARE_DELETES)
+                .forEach(Files::deleteIfExists)
+        }
+    }
 
     private fun writeBundle(
         temporary: File,
@@ -791,8 +881,14 @@ class GeneratedBundleStore internal constructor(
 
     companion object {
         private const val ROOT_DIRECTORY = "generated-bundles"
+        private const val SHARE_DIRECTORY = "share-handoff"
+        private const val SHARE_RETENTION_MILLIS = 24L * 60 * 60 * 1_000
+        private const val MAX_STARTUP_SHARE_DELETES = 32
         private const val STREAM_BUFFER_SIZE = 64 * 1024
         private val SHA256 = Regex("[0-9a-f]{64}")
+        private val SHARE_NAME = Regex(
+            """share-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.six""",
+        )
         private val ORPHAN_TEMP_NAME = Regex(
             """\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\..+\.tmp""",
         )

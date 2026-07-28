@@ -1700,6 +1700,7 @@ class ManagerViewModelTest {
                 val repository = FakeManagerRepository().apply {
                     conversionBeginResult = conversionAnalysis()
                     conversionBuildResult = ConversionBuildResult.Failure(code, generated)
+                    generatedShareSnapshot = generated.file
                 }
                 val viewModel = ManagerViewModel(repository, SavedStateHandle())
                 advanceUntilIdle()
@@ -1728,6 +1729,7 @@ class ManagerViewModelTest {
                 assertFailureProof()
 
                 viewModel.accept(ManagerAction.ShareGeneratedConversion)
+                dispatcher.scheduler.runCurrent()
                 assertIs<ManagerEffect.ShareGeneratedBundle>(viewModel.effects.first())
                 assertFailureProof()
 
@@ -1971,6 +1973,154 @@ class ManagerViewModelTest {
                 TOKEN,
                 savedState.get<String>(ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY),
             )
+        }
+
+    @Test
+    fun `save gate 중 Installed cleanup은 typed completion 뒤에만 discard한다`() =
+        runTest(dispatcher.scheduler) {
+            val saveStarted = CompletableDeferred<Unit>()
+            val saveResult = CompletableDeferred<GeneratedDocumentSaveResult>()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(),
+                saveGeneratedDocument = { _, _, _ ->
+                    saveStarted.complete(Unit)
+                    try {
+                        CompletableDeferred<Unit>().await()
+                        error("save gate가 취소되어야 합니다.")
+                    } catch (_: CancellationException) {
+                        withContext(NonCancellable) { saveResult.await() }
+                    }
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = effect.token,
+                    destination = "content://save/installed-race.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            saveStarted.await()
+
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            saveResult.complete(GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false))
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `cleanup pending은 ViewModel Save와 Share effect를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch {
+                viewModel.effects.collect(effects::add)
+            }
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(effects.isEmpty())
+        }
+
+    @Test
+    fun `share effect는 original cleanup과 독립된 repository snapshot을 사용한다`() =
+        runTest(dispatcher.scheduler) {
+            val snapshot = File.createTempFile("share-snapshot", ".six").apply {
+                writeText("immutable snapshot")
+                deleteOnExit()
+            }
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                generatedShareSnapshot = snapshot
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.generatedShareSnapshotRequests)
+            assertEquals(snapshot, effect.file)
+            assertEquals("immutable snapshot", effect.file.readText())
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `share snapshot 생성 중 Finish는 snapshot 완료 뒤 original을 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val snapshot = File.createTempFile("share-race", ".six").apply {
+                writeText("immutable race snapshot")
+                deleteOnExit()
+            }
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                generatedShareSnapshot = snapshot
+                suspendGeneratedShareSnapshot = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch {
+                viewModel.effects.collect(effects::add)
+            }
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            dispatcher.scheduler.runCurrent()
+            assertEquals(listOf(TOKEN), repository.generatedShareSnapshotRequests)
+            viewModel.accept(ManagerAction.FinishConversion)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            repository.completeGeneratedShareSnapshot()
+            advanceUntilIdle()
+
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(effects.single())
+            assertEquals(snapshot, effect.file)
+            assertEquals("immutable race snapshot", effect.file.readText())
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
         }
 
     @Test
@@ -3662,6 +3812,9 @@ private class FakeManagerRepository : ManagerRepository {
     var generatedExists = true
     var copiedConversionHash: String? = null
     val copiedConversionTokens = mutableListOf<String>()
+    val generatedShareSnapshotRequests = mutableListOf<String>()
+    var generatedShareSnapshot: File? = null
+    var suspendGeneratedShareSnapshot = false
     val lifecycleEvents = mutableListOf<String>()
     var suspendImport = false
     var suspendInstall = false
@@ -3681,6 +3834,7 @@ private class FakeManagerRepository : ManagerRepository {
     private val firstConversionBeginGate = MutableSharedFlow<Unit>()
     private val firstConversionBuildGate = MutableSharedFlow<Unit>()
     private val discardConversionGate = MutableSharedFlow<Unit>()
+    private val generatedShareSnapshotGate = MutableSharedFlow<Unit>()
     private val uninstallReconcileGate = CompletableDeferred<Unit>()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
 
@@ -3776,6 +3930,22 @@ private class FakeManagerRepository : ManagerRepository {
         copiedConversionTokens += token
         output.write(byteArrayOf(1, 2, 3))
         return copiedConversionHash
+    }
+
+    override suspend fun createGeneratedShareSnapshot(token: String): File? {
+        generatedShareSnapshotRequests += token
+        if (suspendGeneratedShareSnapshot) generatedShareSnapshotGate.first()
+        return generatedShareSnapshot ?: when (val restored = restoredConversion) {
+            is RestoredConversion.BundleReady -> restored.generated.file
+            is RestoredConversion.GeneratedPending -> restored.generated.file
+            is RestoredConversion.Analysis,
+            null,
+            -> null
+        }
+    }
+
+    suspend fun completeGeneratedShareSnapshot() {
+        generatedShareSnapshotGate.emit(Unit)
     }
 
     suspend fun nextImport(): ManagerImportResult {

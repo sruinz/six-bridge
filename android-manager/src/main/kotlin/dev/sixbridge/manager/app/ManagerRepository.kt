@@ -144,6 +144,7 @@ interface ManagerRepository {
     suspend fun restoreConversion(importReview: Boolean = true): RestoredConversion? = null
     suspend fun discardConversion(token: String): Boolean = false
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
+    suspend fun createGeneratedShareSnapshot(token: String): File? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
     suspend fun cancelInstall(): Boolean
     fun discardReview(token: String): Boolean
@@ -281,6 +282,9 @@ internal class DefaultManagerRepository(
 
     override fun copyGeneratedConversion(token: String, output: OutputStream): String? =
         conversionCoordinator?.copyGenerated(token, output)
+
+    override suspend fun createGeneratedShareSnapshot(token: String): File? =
+        conversionCoordinator?.createGeneratedShareSnapshot(token)
 
     private suspend fun retainImport(result: ImportResult): ManagerImportResult {
         return when (result) {
