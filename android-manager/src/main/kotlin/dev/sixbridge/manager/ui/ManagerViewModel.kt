@@ -142,7 +142,6 @@ class ManagerViewModel(
             ) &&
             action.mutatesGeneratedCleanupOwners()
         ) {
-            operationGeneration += 1
             return
         }
         if (action != ManagerAction.RetryRecovery &&

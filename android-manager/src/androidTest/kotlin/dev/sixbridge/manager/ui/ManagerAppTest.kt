@@ -33,6 +33,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.SavedStateHandle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.espresso.Espresso.pressBack
 import androidx.test.platform.app.InstrumentationRegistry
@@ -42,13 +43,25 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.manager.ManagerAppContent
 import dev.sixbridge.manager.GENERATED_BUNDLE_MIME_TYPE
+import dev.sixbridge.manager.SixBridgeManagerApp
 import dev.sixbridge.manager.generatedBundleSendIntent
+import dev.sixbridge.manager.app.ManagerImportResult
+import dev.sixbridge.manager.app.ManagerRepository
+import dev.sixbridge.manager.app.ManagerRestoreResult
+import dev.sixbridge.manager.app.RepositoryLaunch
+import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.RestoredConversion
+import dev.sixbridge.manager.importer.ImportFailure
+import dev.sixbridge.manager.importer.ImportFailureCode
+import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
@@ -57,6 +70,11 @@ import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.ConversionState
 import java.io.File
 import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.emptyFlow
 import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertEquals
@@ -310,6 +328,103 @@ class ManagerAppTest {
                 assertEquals(listOf(expected), actions)
                 actions.clear()
             }
+        }
+    }
+
+    @Test
+    fun pending_review_restore_exposes_real_retry_and_completes_exact_report() {
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        val review = requireNotNull(ready.review)
+        val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+        val repository = CleanupRestoreUiRepository(
+            initializeResult = initializeResult,
+            review = review,
+            generated = ready.generated,
+        )
+        val savedState = SavedStateHandle(
+            mapOf(
+                ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+                ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY to
+                    """
+                        {
+                          "version": 1,
+                          "token": "$TOKEN",
+                          "reviewToken": "$TOKEN",
+                          "phase": "REVIEW",
+                          "destination": {
+                            "kind": "REPORT",
+                            "packageName": "$PACKAGE"
+                          },
+                          "installSessionId": null
+                        }
+                    """.trimIndent(),
+            ),
+        )
+        val viewModel = ManagerViewModel(repository, savedState)
+        composeRule.setContent {
+            SixBridgeManagerApp(
+                viewModel = viewModel,
+                onAddSix = {},
+                onInstallReviewed = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("home:convert-on-device").performClick()
+        composeRule.runOnIdle {
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY),
+            )
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = review,
+                    installSessionId = 41,
+                ),
+            )
+        }
+
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.route == ManagerRoute.ConversionResult(TOKEN)
+        }
+        composeRule.onNodeWithText("다시 확인").assertIsDisplayed()
+        composeRule.runOnIdle {
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY),
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+        }
+
+        composeRule.onNodeWithText("다시 확인").performClick()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
+        }
+        composeRule.runOnIdle {
+            assertEquals(listOf(TOKEN), repository.discardedReviews)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
         }
     }
 
@@ -982,4 +1097,66 @@ class ManagerAppTest {
         const val PACKAGE = "dev.sixbridge.ext.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val EXTENSION_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
+}
+
+private class CleanupRestoreUiRepository(
+    private val initializeResult: CompletableDeferred<ManagerRestoreResult>,
+    private val review: ReviewBundle,
+    private val generated: GeneratedBundle,
+) : ManagerRepository {
+    override val catalog: Flow<List<CatalogRecord>> =
+        MutableStateFlow(emptyList())
+    override val installState: StateFlow<InstallState> =
+        MutableStateFlow(InstallState.AwaitingUserApproval(41))
+    override val launches: Flow<RepositoryLaunch> = emptyFlow()
+    val discardedReviews = mutableListOf<String>()
+    val discardedConversions = mutableListOf<String>()
+
+    override suspend fun initialize(
+        reviewToken: String?,
+        installSessionId: Int?,
+    ): ManagerRestoreResult = initializeResult.await()
+
+    override suspend fun import(uri: Uri): ManagerImportResult =
+        ManagerImportResult.Failure(
+            ImportFailure(ImportFailureCode.SOURCE_UNREADABLE),
+        )
+
+    override suspend fun restoreConversion(
+        importReview: Boolean,
+    ): RestoredConversion = RestoredConversion.BundleReady(review, generated)
+
+    override fun discardReview(token: String): Boolean {
+        discardedReviews += token
+        return true
+    }
+
+    override suspend fun discardConversion(token: String): Boolean {
+        discardedConversions += token
+        return true
+    }
+
+    override suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+    ): InstallState = InstallState.Idle
+
+    override suspend fun cancelInstall(): Boolean = true
+
+    override fun unknownSourcesSettings(): RepositoryLaunch =
+        error("unexpected unknown sources navigation")
+
+    override suspend fun resumeAfterUnknownSourcesSettings() = Unit
+
+    override fun uninstall(packageName: String): RepositoryLaunch =
+        error("unexpected uninstall")
+
+    override suspend fun reconcileUninstall(
+        packageName: String,
+    ): UninstallOutcome = error("unexpected uninstall reconciliation")
+
+    override fun samsungAddOns(): RepositoryNavigationResult =
+        error("unexpected add-ons navigation")
+
+    override suspend fun reconcileCatalog() = Unit
 }

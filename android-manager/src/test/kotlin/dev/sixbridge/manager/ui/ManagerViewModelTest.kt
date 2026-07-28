@@ -4142,7 +4142,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `pending REVIEW initialize 전 conversion action은 owner를 보존하고 stale restore를 무시한다`() =
+    fun `pending REVIEW initialize 전 conversion action은 무시하고 Retry 화면을 복원한다`() =
         runTest(dispatcher.scheduler) {
             val initializeResult = CompletableDeferred<ManagerRestoreResult>()
             val savedState = pendingReviewReportSavedState()
@@ -4175,8 +4175,24 @@ class ManagerViewModelTest {
             initializeResult.complete(repository.restoreResult)
             advanceUntilIdle()
 
-            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-            assertNull(viewModel.state.value.message)
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                viewModel.state.value.message?.recoveryAction,
+            )
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
             assertGeneratedOwnersAndSessionPreserved(savedState)
             assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
             assertNull(
@@ -4196,7 +4212,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `pending REVIEW conversion restore 중 conversion action은 stale failure를 표시하지 않는다`() =
+    fun `pending REVIEW conversion restore 중 conversion action은 무시하고 Retry 화면을 유지한다`() =
         runTest(dispatcher.scheduler) {
             val conversionResult = CompletableDeferred<RestoredConversion?>()
             val savedState = pendingReviewReportSavedState()
@@ -4220,8 +4236,18 @@ class ManagerViewModelTest {
             conversionResult.complete(repository.restoredConversion)
             advanceUntilIdle()
 
-            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-            assertNull(viewModel.state.value.message)
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                viewModel.state.value.message?.recoveryAction,
+            )
             assertGeneratedOwnersAndSessionPreserved(savedState)
             assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
             assertNull(
