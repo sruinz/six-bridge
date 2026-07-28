@@ -247,8 +247,8 @@ generated_paths_contract() {
     assert_xpath_count "${paths}" "/*[local-name()='paths']/*" 1 \
         "only one generated bundle path may be exposed"
     assert_xpath_count "${paths}" \
-        "/*[local-name()='paths']/*[local-name()='files-path'][${attr_name}='generated-bundles' and ${attr_path}='generated-bundles/']" 1 \
-        "FileProvider must expose only files/generated-bundles"
+        "/*[local-name()='paths']/*[local-name()='files-path'][${attr_name}='generated-share-handoff' and ${attr_path}='generated-bundles/share-handoff/']" 1 \
+        "FileProvider must expose only files/generated-bundles/share-handoff"
 }
 
 assert_file_exists() {
