@@ -1,6 +1,7 @@
 package dev.sixbridge.manager
 
 import android.content.ContentResolver
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -338,9 +339,13 @@ private fun ContentResolver.deleteGeneratedDocument(uri: Uri): Boolean =
         false
     }
 
-internal fun generatedBundleSendIntent(uri: Uri): Intent = Intent(Intent.ACTION_SEND).apply {
+internal fun generatedBundleSendIntent(
+    resolver: ContentResolver,
+    uri: Uri,
+): Intent = Intent(Intent.ACTION_SEND).apply {
     type = GENERATED_BUNDLE_MIME_TYPE
     putExtra(Intent.EXTRA_STREAM, uri)
+    clipData = ClipData.newUri(resolver, "SIX bundle", uri)
     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 }
 
@@ -359,7 +364,7 @@ internal fun generatedBundleShareChooser(context: Context, file: File): Intent {
         file,
     )
     return Intent.createChooser(
-        generatedBundleSendIntent(uri),
+        generatedBundleSendIntent(context.contentResolver, uri),
         context.getString(dev.sixbridge.manager.R.string.conversion_share_chooser),
     )
 }

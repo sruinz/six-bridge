@@ -28,6 +28,7 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.espresso.Espresso.pressBack
+import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
@@ -218,11 +219,16 @@ class ManagerAppTest {
     fun generated_bundle_share_grants_read_only_and_uses_bundle_mime() {
         val uri = Uri.parse("content://dev.sixbridge.manager.generated/result.six")
 
-        val intent = generatedBundleSendIntent(uri)
+        val intent = generatedBundleSendIntent(
+            InstrumentationRegistry.getInstrumentation().targetContext.contentResolver,
+            uri,
+        )
 
         assertEquals(Intent.ACTION_SEND, intent.action)
         assertEquals(GENERATED_BUNDLE_MIME_TYPE, intent.type)
         assertEquals(uri, intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))
+        assertEquals(1, requireNotNull(intent.clipData).itemCount)
+        assertEquals(uri, intent.clipData?.getItemAt(0)?.uri)
         assertEquals(
             Intent.FLAG_GRANT_READ_URI_PERMISSION,
             intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION,
