@@ -332,7 +332,7 @@ class ConversionWorkStore internal constructor(
         withContext(Dispatchers.IO) {
             if (!isCanonicalUuid(token)) return@withContext false
             val row = dao.get()
-            if (row?.token != token) return@withContext false
+            if (row?.token != token) return@withContext true
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext false
             val reconciled = reconcileCleanupTokens(root, row) ?: return@withContext false
             val claimed = claimDiscarding(reconciled) ?: return@withContext false

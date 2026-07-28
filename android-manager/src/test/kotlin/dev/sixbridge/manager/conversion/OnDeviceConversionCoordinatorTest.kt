@@ -747,6 +747,17 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue(fixture.workDiscarded)
     }
 
+    @Test
+    fun `discard는 bundle cleanup false를 work cleanup true로 숨기지 않는다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            bundleDiscardResult = false
+        }
+
+        assertTrue(fixture.generatedFile.isFile)
+        assertTrue(fixture.coordinator().discard(fixture.token).not())
+        assertTrue(fixture.workDiscarded)
+    }
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
@@ -789,6 +800,7 @@ class OnDeviceConversionCoordinatorTest {
         var normalRestoreDestroysBuilding = false
         var normalRestoreDestroyedBuilding = false
         var bundleRecoverReturnsNull = false
+        var bundleDiscardResult: Boolean? = null
         var activeOwner: String? = null
         var ownerAborted = false
         var workDiscarded = false
@@ -1018,7 +1030,10 @@ class OnDeviceConversionCoordinatorTest {
                         GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
                     }
 
-                override fun discard(token: String): Boolean = generatedFile.delete()
+                override fun discard(token: String): Boolean {
+                    val deleted = generatedFile.delete()
+                    return bundleDiscardResult ?: deleted
+                }
 
                 override fun copyTo(token: String, output: java.io.OutputStream): String {
                     generatedFile.inputStream().use { it.copyTo(output) }

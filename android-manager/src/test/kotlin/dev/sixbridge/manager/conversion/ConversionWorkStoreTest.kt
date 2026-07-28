@@ -836,6 +836,58 @@ class ConversionWorkStoreTest {
     }
 
     @Test
+    fun `discard는 empty와 다른 current token에서 exact canonical token absent 성공이다`() =
+        runTest {
+            val absentToken = UUID(0, 999).toString()
+            val store = store()
+
+            assertTrue(store.discard(absentToken))
+            val current = store.create(artifact("current".encodeToByteArray()))
+            assertTrue(store.discard(absentToken))
+            assertEquals(current.token, store.restore()?.token)
+            assertFalse(store.discard("not-a-canonical-token"))
+        }
+
+    @Test
+    fun `coordinator discard는 bundle 성공 work 실패 뒤 actual store retry를 완료한다`() =
+        runTest {
+            var failWorkDelete = true
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path ->
+                        !failWorkDelete && path.toFile().deleteRecursively()
+                    },
+                ),
+            )
+            val current = workStore.create(artifact("current".encodeToByteArray()))
+            val generatedFiles = File(sourceRoot, "coordinator-generated").apply {
+                check(mkdir())
+            }
+            val bundleStore = GeneratedBundleStore(
+                filesDir = generatedFiles,
+                wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            )
+            val bundleFile = File(
+                generatedFiles,
+                "generated-bundles/${current.token}.six",
+            ).apply {
+                writeText("generated")
+            }
+            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+
+            assertFalse(coordinator.discard(current.token))
+            assertFalse(bundleFile.exists())
+            assertEquals(current.token, dao.get()?.token)
+
+            failWorkDelete = false
+            assertTrue(coordinator.discard(current.token))
+            assertNull(dao.get())
+
+            assertTrue(coordinator.discard(current.token))
+            assertNull(dao.get())
+        }
+
+    @Test
     fun `미래 음수 retention 경계와 작은 clock rollback을 구분한다`() = runTest {
         val base = store()
         val created = base.create(artifact("input".encodeToByteArray()))
@@ -895,6 +947,79 @@ class ConversionWorkStoreTest {
             UUID(1, fileSequence.toLong()).toString()
         },
         hooks = hooks,
+    )
+
+    private fun discardOnlyCoordinator(
+        workStore: ConversionWorkStore,
+        bundleStore: GeneratedBundleStore,
+    ) = OnDeviceConversionCoordinator(
+        input = ConversionInputPort { error("discard test에서 input은 사용하지 않습니다.") },
+        work = DefaultConversionWorkPort(workStore),
+        profiles = ConversionProfilePort {
+            error("discard test에서 profile은 사용하지 않습니다.")
+        },
+        runtime = object : ConversionRuntimePort {
+            override fun analyze(
+                input: File,
+                kind: OnDeviceInputKind,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+            ): ConversionAnalysisSnapshot =
+                error("discard test에서 analyze는 사용하지 않습니다.")
+
+            override fun prepare(
+                input: File,
+                kind: OnDeviceInputKind,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+                approvedAdapterIds: Set<String>,
+            ): PreparedConversionSnapshot =
+                error("discard test에서 prepare는 사용하지 않습니다.")
+
+            override fun bind(
+                prepared: PreparedConversionSnapshot,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+                identity: dev.sixbridge.manager.packager.OnDevicePackageIdentity,
+            ): BoundConversionSnapshot =
+                error("discard test에서 bind는 사용하지 않습니다.")
+        },
+        identities = object : ConversionIdentityPort {
+            override suspend fun existingTargets(
+                profileMajorVersion: Int,
+            ): List<ExistingConversionTarget> =
+                error("discard test에서 target 조회는 사용하지 않습니다.")
+
+            override suspend fun resolve(
+                prepared: PreparedConversionSnapshot,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+                selection: InstallationIdentitySelection?,
+                ownerToken: String,
+            ): ResolvedPackageIdentity =
+                error("discard test에서 identity resolve는 사용하지 않습니다.")
+
+            override suspend fun reserve(
+                resolved: ResolvedPackageIdentity,
+                displayName: String,
+                installedVersionCode: Long?,
+                ownerToken: String,
+            ): ReservedPackageIdentity =
+                error("discard test에서 identity reserve는 사용하지 않습니다.")
+
+            override suspend fun abort(ownerToken: String) = Unit
+        },
+        installed = ConversionInstalledPort {
+            error("discard test에서 installed 조회는 사용하지 않습니다.")
+        },
+        packages = object : ConversionPackagePort {
+            override suspend fun packageWrapper(
+                reservation: ReservedPackageIdentity,
+                bound: BoundConversionSnapshot,
+                token: String,
+            ): PackagedConversion =
+                error("discard test에서 package는 사용하지 않습니다.")
+        },
+        bundles = DefaultConversionBundlePort(bundleStore),
+        imports = ConversionGeneratedImportPort {
+            error("discard test에서 import는 사용하지 않습니다.")
+        },
     )
 
     private fun artifact(bytes: ByteArray): OnDeviceInputArtifact {

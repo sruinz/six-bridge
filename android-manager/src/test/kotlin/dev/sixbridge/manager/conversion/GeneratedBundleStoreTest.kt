@@ -84,7 +84,7 @@ class GeneratedBundleStoreTest {
         }
         assertTrue(store.discard(token))
         assertFalse(corrupt.exists())
-        assertFalse(store.discard(token))
+        assertTrue(store.discard(token))
     }
 
     @Test
@@ -378,7 +378,8 @@ class GeneratedBundleStoreTest {
 
         assertTrue(store.discard(token))
         assertFalse(generated.file.exists())
-        assertFalse(store.discard(token))
+        assertTrue(store.discard(token))
+        assertFalse(store.discard("not-a-canonical-token"))
 
         val cleanupToken = UUID.randomUUID().toString()
         val failing = store(

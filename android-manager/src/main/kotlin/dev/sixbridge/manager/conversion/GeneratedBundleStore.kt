@@ -280,7 +280,10 @@ class GeneratedBundleStore internal constructor(
     fun discard(token: String): Boolean = synchronized(lock) {
         if (!isToken(token)) return@synchronized false
         val file = directChild(root.path, "$token.six").toFile()
-        if (!Files.exists(file.toPath(), NOFOLLOW_LINKS)) return@synchronized false
+        if (!Files.exists(file.toPath(), NOFOLLOW_LINKS)) {
+            published.remove(token)
+            return@synchronized true
+        }
         root.verifyUnchanged()
         requireDirectFile(file, "discard bundle")
         val deleted = hooks.deletePublishedFile?.let {

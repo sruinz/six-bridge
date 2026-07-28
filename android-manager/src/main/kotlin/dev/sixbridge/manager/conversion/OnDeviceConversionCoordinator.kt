@@ -278,8 +278,9 @@ internal class OnDeviceConversionCoordinator(
 
     override suspend fun discard(token: String): Boolean {
         abortOwner(token)
-        bundles.discard(token)
-        return work.discard(token)
+        val bundleDiscarded = bundles.discard(token)
+        val workDiscarded = work.discard(token)
+        return bundleDiscarded && workDiscarded
     }
 
     override fun copyGenerated(token: String, output: OutputStream): String? =
