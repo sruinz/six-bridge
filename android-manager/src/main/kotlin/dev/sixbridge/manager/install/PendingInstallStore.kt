@@ -55,6 +55,13 @@ interface PendingInstallStore {
     fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
         loadNormalHandoff()?.let { RecoveryRecordSnapshot.Present(it) }
             ?: RecoveryRecordSnapshot.Absent
+    fun recoveryStoreSnapshot(): RecoveryStoreSnapshot =
+        combineRecoverySnapshots(
+            pending = pendingInstallSnapshot(),
+            terminal = terminalResultSnapshot(),
+            finalReceipt = finalReceiptSnapshot(),
+            normalHandoff = normalHandoffSnapshot(),
+        )
     fun compareAndSetNormalHandoff(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
@@ -70,6 +77,43 @@ interface PendingInstallStore {
     ): Boolean = false
     fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long
     fun clearSessionMissingObservation(pending: PendingInstall): Boolean
+}
+
+private fun combineRecoverySnapshots(
+    pending: RecoveryRecordSnapshot<PendingInstall>,
+    terminal: RecoveryRecordSnapshot<PendingInstallResult>,
+    finalReceipt: RecoveryRecordSnapshot<FinalInstallReceipt>,
+    normalHandoff: RecoveryRecordSnapshot<NormalInstallHandoff>,
+): RecoveryStoreSnapshot {
+    if (pending == RecoveryRecordSnapshot.Invalid ||
+        terminal == RecoveryRecordSnapshot.Invalid ||
+        finalReceipt == RecoveryRecordSnapshot.Invalid ||
+        normalHandoff == RecoveryRecordSnapshot.Invalid
+    ) {
+        return RecoveryStoreSnapshot.Invalid
+    }
+    return RecoveryStoreSnapshot.Valid(
+        pending = when (pending) {
+            is RecoveryRecordSnapshot.Present -> pending.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> error("invalid recovery snapshot")
+        },
+        terminal = when (terminal) {
+            is RecoveryRecordSnapshot.Present -> terminal.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> error("invalid recovery snapshot")
+        },
+        finalReceipt = when (finalReceipt) {
+            is RecoveryRecordSnapshot.Present -> finalReceipt.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> error("invalid recovery snapshot")
+        },
+        normalHandoff = when (normalHandoff) {
+            is RecoveryRecordSnapshot.Present -> normalHandoff.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> error("invalid recovery snapshot")
+        },
+    )
 }
 
 class SharedPreferencesPendingInstallStore internal constructor(
@@ -420,6 +464,16 @@ class SharedPreferencesPendingInstallStore internal constructor(
     override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
         synchronized(PROCESS_LOCK) {
             normalHandoffSnapshotLocked()
+        }
+
+    override fun recoveryStoreSnapshot(): RecoveryStoreSnapshot =
+        synchronized(PROCESS_LOCK) {
+            combineRecoverySnapshots(
+                pending = pendingInstallSnapshotLocked(),
+                terminal = terminalResultSnapshotLocked(),
+                finalReceipt = finalReceiptSnapshotLocked(),
+                normalHandoff = normalHandoffSnapshotLocked(),
+            )
         }
 
     override fun compareAndSetNormalHandoff(

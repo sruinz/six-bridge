@@ -49,6 +49,8 @@ import dev.sixbridge.manager.install.PendingCleanupResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallResult
 import dev.sixbridge.manager.install.PendingInstallStore
+import dev.sixbridge.manager.install.RecoveryRecordSnapshot
+import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.ui.LaunchDestination
 import dev.sixbridge.manager.ui.ImportUiState
 import dev.sixbridge.manager.ui.ManagerAction
@@ -123,6 +125,40 @@ import org.junit.rules.TemporaryFolder
 class ManagerRepositoryTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `recovery store snapshot은 하나의 Invalid도 전체 Invalid로 보존한다`() {
+        val pending = PendingInstall(41, PACKAGE, TOKEN, 1)
+        val store = StartupPendingStore(pending).apply {
+            terminalSnapshotOverride = RecoveryRecordSnapshot.Invalid
+        }
+
+        assertEquals(RecoveryStoreSnapshot.Invalid, store.recoveryStoreSnapshot())
+        assertEquals(pending, store.record)
+        assertEquals(0, store.discardAttempts)
+    }
+
+    @Test
+    fun `recovery store snapshot의 null은 decode된 Absent만 뜻한다`() {
+        val pending = PendingInstall(41, PACKAGE, TOKEN, 1)
+        val terminal = PendingInstallResult(
+            PackageInstallResult.Cancelled(41),
+            terminalAtEpochMillis = 2,
+            packageName = PACKAGE,
+            importToken = TOKEN,
+        )
+        val store = StartupPendingStore(pending).apply { this.terminal = terminal }
+
+        assertEquals(
+            RecoveryStoreSnapshot.Valid(
+                pending = pending,
+                terminal = terminal,
+                finalReceipt = null,
+                normalHandoff = null,
+            ),
+            store.recoveryStoreSnapshot(),
+        )
+    }
 
     @Test
     fun `새 repository 인스턴스가 bounded sidecar와 wrapper identity를 검증해 bundle을 복원한다`() {
@@ -3264,6 +3300,10 @@ private class StartupPendingStore(
     var terminal: PendingInstallResult? = null
     var finalReceipt: FinalInstallReceipt? = null
     var normalHandoff: NormalInstallHandoff? = null
+    var pendingSnapshotOverride: RecoveryRecordSnapshot<PendingInstall>? = null
+    var terminalSnapshotOverride: RecoveryRecordSnapshot<PendingInstallResult>? = null
+    var finalReceiptSnapshotOverride: RecoveryRecordSnapshot<FinalInstallReceipt>? = null
+    var normalHandoffSnapshotOverride: RecoveryRecordSnapshot<NormalInstallHandoff>? = null
     var discardFailure = false
     var discardAttempts = 0
     var loadFailures = 0
@@ -3275,6 +3315,8 @@ private class StartupPendingStore(
         }
         return record
     }
+    override fun pendingInstallSnapshot(): RecoveryRecordSnapshot<PendingInstall> =
+        pendingSnapshotOverride ?: super<PendingInstallStore>.pendingInstallSnapshot()
     override fun tryClaim(
         packageName: String,
         importToken: String,
@@ -3317,6 +3359,8 @@ private class StartupPendingStore(
         }
     }
     override fun loadTerminalResult(): PendingInstallResult? = terminal
+    override fun terminalResultSnapshot(): RecoveryRecordSnapshot<PendingInstallResult> =
+        terminalSnapshotOverride ?: super<PendingInstallStore>.terminalResultSnapshot()
     override fun recordTerminalResult(
         result: PackageInstallResult,
         terminalAtEpochMillis: Long,
@@ -3352,6 +3396,8 @@ private class StartupPendingStore(
         return true
     }
     override fun loadFinalReceipt(): FinalInstallReceipt? = finalReceipt
+    override fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
+        finalReceiptSnapshotOverride ?: super<PendingInstallStore>.finalReceiptSnapshot()
     override fun createFinalReceipt(
         expectedPending: PendingInstall?,
         expectedRaw: PendingInstallResult?,
@@ -3400,6 +3446,8 @@ private class StartupPendingStore(
         return true
     }
     override fun loadNormalHandoff(): NormalInstallHandoff? = normalHandoff
+    override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
+        normalHandoffSnapshotOverride ?: super<PendingInstallStore>.normalHandoffSnapshot()
     override fun compareAndSetNormalHandoff(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,

@@ -154,3 +154,14 @@ sealed interface RecoveryRecordSnapshot<out T> {
     data object Absent : RecoveryRecordSnapshot<Nothing>
     data object Invalid : RecoveryRecordSnapshot<Nothing>
 }
+
+sealed interface RecoveryStoreSnapshot {
+    data class Valid(
+        val pending: PendingInstall?,
+        val terminal: PendingInstallResult?,
+        val finalReceipt: FinalInstallReceipt?,
+        val normalHandoff: NormalInstallHandoff?,
+    ) : RecoveryStoreSnapshot
+
+    data object Invalid : RecoveryStoreSnapshot
+}

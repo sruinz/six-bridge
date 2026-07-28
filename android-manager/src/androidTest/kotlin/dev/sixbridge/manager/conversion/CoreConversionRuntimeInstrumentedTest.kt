@@ -20,6 +20,7 @@ import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
+import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
@@ -558,12 +559,16 @@ class CoreConversionRuntimeInstrumentedTest {
     fun wrongTypedConstituentKeysAreInvalidAndBlockClaim() {
         data class Case(
             val name: String,
+            val key: String,
+            val preferences: (SharedPreferences, SharedPreferences) -> SharedPreferences,
             val writeWrongType: (SharedPreferences, SharedPreferences) -> Unit,
             val snapshot: (SharedPreferencesPendingInstallStore) -> RecoveryRecordSnapshot<*>,
         )
         val cases = listOf(
             Case(
                 name = "pending",
+                key = "session_id",
+                preferences = { pending, _ -> pending },
                 writeWrongType = { pending, _ ->
                     assertTrue(pending.edit().putString("session_id", "wrong").commit())
                 },
@@ -571,6 +576,8 @@ class CoreConversionRuntimeInstrumentedTest {
             ),
             Case(
                 name = "raw",
+                key = "result_session_id",
+                preferences = { _, recovery -> recovery },
                 writeWrongType = { _, recovery ->
                     assertTrue(recovery.edit().putString("result_session_id", "wrong").commit())
                 },
@@ -578,6 +585,8 @@ class CoreConversionRuntimeInstrumentedTest {
             ),
             Case(
                 name = "final",
+                key = "final_version",
+                preferences = { _, recovery -> recovery },
                 writeWrongType = { _, recovery ->
                     assertTrue(recovery.edit().putString("final_version", "wrong").commit())
                 },
@@ -585,6 +594,8 @@ class CoreConversionRuntimeInstrumentedTest {
             ),
             Case(
                 name = "handoff",
+                key = "handoff_version",
+                preferences = { _, recovery -> recovery },
                 writeWrongType = { _, recovery ->
                     assertTrue(recovery.edit().putString("handoff_version", "wrong").commit())
                 },
@@ -604,6 +615,11 @@ class CoreConversionRuntimeInstrumentedTest {
             case.writeWrongType(pendingPreferences, recoveryPreferences)
 
             assertEquals(case.name, RecoveryRecordSnapshot.Invalid, case.snapshot(store))
+            assertEquals(
+                case.name,
+                RecoveryStoreSnapshot.Invalid,
+                store.recoveryStoreSnapshot(),
+            )
             assertNull(
                 case.name,
                 store.tryClaim(
@@ -611,6 +627,11 @@ class CoreConversionRuntimeInstrumentedTest {
                     importToken = "22222222-2222-2222-2222-222222222222",
                     startedAtEpochMillis = 1,
                 ),
+            )
+            assertEquals(
+                case.name,
+                "wrong",
+                case.preferences(pendingPreferences, recoveryPreferences).all[case.key],
             )
             importRoot.deleteRecursively()
         }
