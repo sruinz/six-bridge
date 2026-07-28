@@ -170,26 +170,38 @@ class InstallCoordinator(
         persisted
     }
 
-    suspend fun cancel(): Boolean = mutex.withLock {
-        restoreTerminalResultLocked()
-        if (pendingStore.loadTerminalResult() != null) return@withLock false
-        if (mutableState.value.isTerminal() &&
-            pendingStore.load() == null &&
-            activeBundle == null
-        ) {
-            return@withLock cleanupComplete()
-        }
-        val pending = pendingStore.load()
-        if (pending != null && pending.sessionId >= 0) {
-            finishSession(
-                pending = pending,
-                next = InstallState.Cancelled,
-                abandon = true,
-                inbox = null,
-            )
-            return@withLock cleanupComplete()
+    suspend fun cancel(
+        expectedImportToken: String,
+        expectedSessionId: Int?,
+    ): InstallCleanupResult = mutex.withLock {
+        val pending = try {
+            pendingStore.load()
+        } catch (_: Exception) {
+            return@withLock InstallCleanupResult.CleanupFailed
         }
         if (pending != null) {
+            if (pending.importToken != expectedImportToken) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            if (expectedSessionId == null && pending.sessionId >= 0) {
+                return@withLock InstallCleanupResult.OwnerSessionAssigned(pending.sessionId)
+            }
+            if (expectedSessionId != null && pending.sessionId != expectedSessionId) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            if (pendingStore.loadTerminalResult() != null) {
+                restoreTerminalResultLocked()
+                return@withLock cleanupResult()
+            }
+            if (pending.sessionId >= 0) {
+                finishSession(
+                    pending = pending,
+                    next = InstallState.Cancelled,
+                    abandon = true,
+                    inbox = null,
+                )
+                return@withLock cleanupResult()
+            }
             val owned = try {
                 gateway.ownedSessions()
             } catch (_: Exception) {
@@ -197,25 +209,15 @@ class InstallCoordinator(
                     "SESSION_OWNERSHIP_QUERY_FAILED",
                     "설치 session 소유 상태를 확인하지 못했습니다.",
                 )
-                return@withLock false
+                return@withLock InstallCleanupResult.CleanupFailed
             }
             if (owned.size == 1) {
                 val recovered = recoverUnassignedSession(pending, owned.single())
-                if (recovered == null) {
-                    mutableState.value = sessionRecoveryFailed()
-                    return@withLock false
-                }
-                finishSession(
-                    pending = recovered,
-                    next = InstallState.Cancelled,
-                    abandon = true,
-                    inbox = null,
-                )
-                return@withLock cleanupComplete()
+                    ?: return@withLock InstallCleanupResult.CleanupFailed
+                return@withLock InstallCleanupResult.OwnerSessionAssigned(recovered.sessionId)
             }
             if (owned.isNotEmpty()) {
-                mutableState.value = sessionRecoveryFailed()
-                return@withLock false
+                return@withLock InstallCleanupResult.CleanupFailed
             }
             finishSession(
                 pending = pending,
@@ -223,9 +225,24 @@ class InstallCoordinator(
                 abandon = false,
                 inbox = null,
             )
-            return@withLock cleanupComplete()
+            return@withLock cleanupResult()
         }
-        val bundle = activeBundle ?: return@withLock true
+
+        val bundle = activeBundle ?: return@withLock InstallCleanupResult.OwnerMismatch
+        if (bundle.token != expectedImportToken) {
+            return@withLock InstallCleanupResult.OwnerMismatch
+        }
+        val terminalResult = pendingStore.loadTerminalResult()
+        if (terminalResult != null) {
+            if (terminalResult.result.sessionId != expectedSessionId) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            restoreTerminalResultLocked()
+            return@withLock cleanupResult()
+        }
+        if (expectedSessionId != null) {
+            return@withLock InstallCleanupResult.OwnerMismatch
+        }
         val discarded = pendingStore.discardImportSafely(bundle.token)
         mutableState.value = if (discarded) {
             activeBundle = null
@@ -233,7 +250,7 @@ class InstallCoordinator(
         } else {
             cleanupFailed()
         }
-        cleanupComplete()
+        cleanupResult()
     }
 
     fun unknownSourcesSettingsIntent() = gateway.unknownSourcesSettingsIntent()
@@ -720,6 +737,13 @@ class InstallCoordinator(
         if (complete) volatileConfirmation = null
         return complete
     }
+
+    private fun cleanupResult(): InstallCleanupResult =
+        if (cleanupComplete()) {
+            InstallCleanupResult.Cleaned
+        } else {
+            InstallCleanupResult.CleanupFailed
+        }
 
     private fun PendingInstall.toState(): InstallState =
         if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)

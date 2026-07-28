@@ -29,6 +29,7 @@ import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.importer.ImportResult
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.install.InstallCoordinator
+import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.PackageInstallCallback
 import dev.sixbridge.manager.install.PackageInstallEvents
@@ -146,7 +147,10 @@ interface ManagerRepository {
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun createGeneratedShareSnapshot(token: String): File? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
-    suspend fun cancelInstall(): Boolean
+    suspend fun cancelInstall(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallCleanupResult
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
     suspend fun resumeAfterUnknownSourcesSettings()
@@ -317,9 +321,13 @@ internal class DefaultManagerRepository(
         return requestState
     }
 
-    override suspend fun cancelInstall(): Boolean {
-        return installCoordinator.cancel()
-    }
+    override suspend fun cancelInstall(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallCleanupResult = installCoordinator.cancel(
+        expectedImportToken = expectedReviewToken,
+        expectedSessionId = expectedSessionId,
+    )
 
     override fun discardReview(token: String): Boolean =
         runCatching { pendingStore.discardImport(token) }.isSuccess

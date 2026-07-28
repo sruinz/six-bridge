@@ -42,3 +42,10 @@ sealed interface PendingCleanupResult {
     data object TerminalAvailable : PendingCleanupResult
     data object Failed : PendingCleanupResult
 }
+
+sealed interface InstallCleanupResult {
+    data object Cleaned : InstallCleanupResult
+    data class OwnerSessionAssigned(val sessionId: Int) : InstallCleanupResult
+    data object OwnerMismatch : InstallCleanupResult
+    data object CleanupFailed : InstallCleanupResult
+}

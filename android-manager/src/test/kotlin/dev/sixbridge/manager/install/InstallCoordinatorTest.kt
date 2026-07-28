@@ -195,15 +195,98 @@ class InstallCoordinatorTest {
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
             fixture.pendingStore.discardFailure = true
 
-            assertTrue(!fixture.coordinator.cancel())
+            assertEquals(
+                InstallCleanupResult.CleanupFailed,
+                fixture.coordinator.cancel(TOKEN, null),
+            )
             assertEquals("CLEANUP_FAILED", assertIs<InstallState.Failed>(fixture.coordinator.state.value).code)
 
             fixture.pendingStore.discardFailure = false
 
-            assertTrue(fixture.coordinator.cancel())
+            assertEquals(
+                InstallCleanupResult.Cleaned,
+                fixture.coordinator.cancel(TOKEN, null),
+            )
             assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
             assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
         }
+
+    @Test
+    fun `null-session INSTALL active owner만 token으로 정리한다`() = runBlocking {
+        val fixture = fixture(canInstallPackages = false)
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+        val result = fixture.coordinator.cancel(
+            expectedImportToken = TOKEN,
+            expectedSessionId = null,
+        )
+
+        assertEquals(InstallCleanupResult.Cleaned, result)
+        assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `null-session INSTALL assigned same owner는 session만 알려주고 취소하지 않는다`() =
+        runBlocking {
+            val pending = pendingInstall()
+            val fixture = fixture(
+                pending = pending,
+                ownedSessions = listOf(SESSION_ID),
+            )
+
+            val result = fixture.coordinator.cancel(
+                expectedImportToken = TOKEN,
+                expectedSessionId = null,
+            )
+
+            assertEquals(InstallCleanupResult.OwnerSessionAssigned(SESSION_ID), result)
+            assertEquals(pending, fixture.pendingStore.record)
+            assertTrue(fixture.gateway.abandonedSessions.isEmpty())
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        }
+
+    @Test
+    fun `null-session INSTALL foreign owner는 상태와 파일을 건드리지 않는다`() = runBlocking {
+        val foreignToken = "22222222-2222-2222-2222-222222222222"
+        val pending = pendingInstall()
+        val fixture = fixture(
+            pending = pending,
+            ownedSessions = listOf(SESSION_ID),
+        )
+
+        val result = fixture.coordinator.cancel(
+            expectedImportToken = foreignToken,
+            expectedSessionId = null,
+        )
+
+        assertEquals(InstallCleanupResult.OwnerMismatch, result)
+        assertEquals(pending, fixture.pendingStore.record)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+    }
+
+    @Test
+    fun `session-bound INSTALL은 exact token과 session만 정리한다`() = runBlocking {
+        val fixture = fixture(
+            pending = pendingInstall(),
+            ownedSessions = listOf(SESSION_ID),
+        )
+
+        val mismatch = fixture.coordinator.cancel(
+            expectedImportToken = TOKEN,
+            expectedSessionId = SESSION_ID + 1,
+        )
+        val cleaned = fixture.coordinator.cancel(
+            expectedImportToken = TOKEN,
+            expectedSessionId = SESSION_ID,
+        )
+
+        assertEquals(InstallCleanupResult.OwnerMismatch, mismatch)
+        assertEquals(InstallCleanupResult.Cleaned, cleaned)
+        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
 
     @Test
     fun `pending prefs만 지워진 partial cleanup 실패도 cancel 성공으로 보고하지 않는다`() =
@@ -212,7 +295,10 @@ class InstallCoordinatorTest {
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
             fixture.pendingStore.clearPendingAfterFailure = true
 
-            assertTrue(!fixture.coordinator.cancel())
+            assertEquals(
+                InstallCleanupResult.CleanupFailed,
+                fixture.coordinator.cancel(TOKEN, SESSION_ID),
+            )
             assertNull(fixture.pendingStore.record)
             assertEquals(
                 "CLEANUP_FAILED",
@@ -221,7 +307,10 @@ class InstallCoordinatorTest {
 
             fixture.pendingStore.clearPendingAfterFailure = false
 
-            assertTrue(fixture.coordinator.cancel())
+            assertEquals(
+                InstallCleanupResult.Cleaned,
+                fixture.coordinator.cancel(TOKEN, null),
+            )
             assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         }
 
@@ -374,7 +463,7 @@ class InstallCoordinatorTest {
         )
         fixture.installedWrappers.installed = installedWrapper()
 
-        fixture.coordinator.cancel()
+        fixture.coordinator.cancel(TOKEN, null)
 
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.record)
@@ -448,7 +537,11 @@ class InstallCoordinatorTest {
         )
         fixture.pendingStore.recoverSessionSuccess = true
 
-        fixture.coordinator.cancel()
+        assertEquals(
+            InstallCleanupResult.OwnerSessionAssigned(SESSION_ID),
+            fixture.coordinator.cancel(TOKEN, null),
+        )
+        fixture.coordinator.cancel(TOKEN, SESSION_ID)
 
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
@@ -646,11 +739,17 @@ class InstallCoordinatorTest {
         assertNull(fixture.pendingStore.record)
         assertEquals(PACKAGE_NAME, fixture.pendingStore.terminalResult?.packageName)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
-        assertTrue(!fixture.coordinator.cancel())
+        assertEquals(
+            InstallCleanupResult.CleanupFailed,
+            fixture.coordinator.cancel(TOKEN, SESSION_ID),
+        )
         assertNotNull(fixture.pendingStore.terminalResult)
 
         fixture.pendingStore.clearTerminalFailure = false
-        assertTrue(fixture.coordinator.cancel())
+        assertEquals(
+            InstallCleanupResult.Cleaned,
+            fixture.coordinator.cancel(TOKEN, SESSION_ID),
+        )
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.terminalResult)
@@ -1086,26 +1185,38 @@ class InstallCoordinatorTest {
     @Test
     fun `cancel is a no-op after terminal states`() = runBlocking {
         val idleFixture = fixture()
-        idleFixture.coordinator.cancel()
+        assertEquals(
+            InstallCleanupResult.OwnerMismatch,
+            idleFixture.coordinator.cancel(TOKEN, null),
+        )
         assertEquals(InstallState.Idle, idleFixture.coordinator.state.value)
 
         val installedFixture = fixture()
         installedFixture.coordinator.request(installedFixture.bundle, partialConfirmed = false)
         installedFixture.installedWrappers.installed = installedWrapper()
         installedFixture.coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID))
-        installedFixture.coordinator.cancel()
+        assertEquals(
+            InstallCleanupResult.OwnerMismatch,
+            installedFixture.coordinator.cancel(TOKEN, SESSION_ID),
+        )
         assertEquals(InstallState.Installed(PACKAGE_NAME), installedFixture.coordinator.state.value)
 
         val cancelledFixture = fixture()
         cancelledFixture.coordinator.request(cancelledFixture.bundle, partialConfirmed = false)
         cancelledFixture.coordinator.onPackageInstallerResult(PackageInstallResult.Cancelled(SESSION_ID))
-        cancelledFixture.coordinator.cancel()
+        assertEquals(
+            InstallCleanupResult.OwnerMismatch,
+            cancelledFixture.coordinator.cancel(TOKEN, SESSION_ID),
+        )
         assertEquals(InstallState.Cancelled, cancelledFixture.coordinator.state.value)
 
         val failedFixture = fixture(status = ContractCompatibilityStatus.BLOCKED)
         failedFixture.coordinator.request(failedFixture.bundle, partialConfirmed = false)
         val failed = failedFixture.coordinator.state.value
-        failedFixture.coordinator.cancel()
+        assertEquals(
+            InstallCleanupResult.OwnerMismatch,
+            failedFixture.coordinator.cancel(TOKEN, null),
+        )
         assertEquals(failed, failedFixture.coordinator.state.value)
     }
 
@@ -1121,7 +1232,7 @@ class InstallCoordinatorTest {
             ),
         )
 
-        fixture.coordinator.cancel()
+        fixture.coordinator.cancel(TOKEN, SESSION_ID)
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertTrue(fixture.gateway.abandonedSessions.isEmpty())
@@ -1145,7 +1256,7 @@ class InstallCoordinatorTest {
             )
         }
 
-        fixture.coordinator.cancel()
+        fixture.coordinator.cancel(TOKEN, SESSION_ID)
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
@@ -1167,7 +1278,7 @@ class InstallCoordinatorTest {
             assertTrue(fixture.pendingStore.recordTerminalResult(result, FINISHED_AT))
         }
 
-        fixture.coordinator.cancel()
+        fixture.coordinator.cancel(TOKEN, SESSION_ID)
 
         assertEquals(
             InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),

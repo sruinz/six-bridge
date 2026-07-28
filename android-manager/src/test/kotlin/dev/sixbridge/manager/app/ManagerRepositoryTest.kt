@@ -31,6 +31,7 @@ import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.BundleSource
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.install.InstallCoordinator
+import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.PackageInstallGateway
@@ -898,7 +899,10 @@ class ManagerRepositoryTest {
                 coordinator,
             )
             assertEquals(TOKEN, repository.initialize(TOKEN, 41).review?.token)
-            assertTrue(coordinator.cancel())
+            assertEquals(
+                InstallCleanupResult.Cleaned,
+                coordinator.cancel(TOKEN, 41),
+            )
             val bundleB = importedBundle(root, SECOND_TOKEN)
             assertTrue(retainedImports.save(bundleB))
 
@@ -906,6 +910,47 @@ class ManagerRepositoryTest {
 
             assertEquals(SECOND_TOKEN, restored.review?.token)
             assertNull(restored.installSessionId)
+        }
+
+    @Test
+    fun `repository owner-aware cancel은 review token과 nullable session을 coordinator에 전달한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("owner-aware-cancel")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundle))
+            val pendingStore = StartupPendingStore(null, root)
+            val gateway = StartupGateway(emptyList()).apply {
+                canInstallPackages = false
+            }
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            coordinator.request(bundle, partialConfirmed = false)
+
+            val foreign = repository.cancelInstall(SECOND_TOKEN, null)
+            val cleaned = repository.cancelInstall(TOKEN, null)
+
+            assertEquals(InstallCleanupResult.OwnerMismatch, foreign)
+            assertEquals(InstallCleanupResult.Cleaned, cleaned)
+            assertNull(pendingStore.record)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1293,7 +1338,10 @@ class ManagerRepositoryTest {
                 )
                 firstCoordinator.restore(bundle)
 
-                assertFalse(firstCoordinator.cancel())
+                assertEquals(
+                    InstallCleanupResult.CleanupFailed,
+                    firstCoordinator.cancel(TOKEN, 41),
+                )
                 assertEquals(
                     "CLEANUP_FAILED",
                     assertIs<InstallState.Failed>(firstCoordinator.state.value).code,

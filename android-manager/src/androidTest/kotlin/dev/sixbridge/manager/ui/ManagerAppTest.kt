@@ -60,6 +60,7 @@ import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
+import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
@@ -399,6 +400,52 @@ class ManagerAppTest {
             viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
         }
         composeRule.runOnIdle {
+            assertEquals(listOf(TOKEN), repository.discardedReviews)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+    }
+
+    @Test
+    fun pending_null_session_install_retry_completes_exact_report() {
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        val review = requireNotNull(ready.review)
+        val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+        val repository = CleanupRestoreUiRepository(
+            initializeResult = initializeResult,
+            review = review,
+            generated = ready.generated,
+        )
+        val viewModel = ManagerViewModel(
+            repository,
+            cleanupNullSessionInstallSavedState(),
+        )
+        composeRule.setContent {
+            SixBridgeManagerApp(
+                viewModel = viewModel,
+                onAddSix = {},
+                onInstallReviewed = {},
+            )
+        }
+
+        composeRule.runOnIdle {
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = review,
+                    installSessionId = null,
+                ),
+            )
+        }
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.message?.kind ==
+                UserMessageKind.CONVERSION_CLEANUP_FAILED
+        }
+        composeRule.onNodeWithText("다시 확인").assertIsDisplayed().performClick()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
+        }
+        composeRule.runOnIdle {
+            assertEquals(listOf(TOKEN to null), repository.cancelArguments)
             assertEquals(listOf(TOKEN), repository.discardedReviews)
             assertEquals(listOf(TOKEN), repository.discardedConversions)
         }
@@ -1170,6 +1217,31 @@ class ManagerAppTest {
         ),
     )
 
+    private fun cleanupNullSessionInstallSavedState() = SavedStateHandle(
+        mapOf(
+            ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+            ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY to
+                """
+                    {
+                      "version": 1,
+                      "token": "$TOKEN",
+                      "reviewToken": "$TOKEN",
+                      "phase": "INSTALL",
+                      "destination": {
+                        "kind": "REPORT",
+                        "packageName": "$PACKAGE"
+                      },
+                      "installSessionId": null
+                    }
+                """.trimIndent(),
+        ),
+    )
+
     private fun corruptPngSignatureWithoutChangingContentHash(iconPng: ByteArray) {
         iconPng[0] = (iconPng[0] + 1).toByte()
         iconPng[1] = (iconPng[1] - 31).toByte()
@@ -1197,6 +1269,7 @@ private class CleanupRestoreUiRepository(
     override val launches: Flow<RepositoryLaunch> = emptyFlow()
     val discardedReviews = mutableListOf<String>()
     val discardedConversions = mutableListOf<String>()
+    val cancelArguments = mutableListOf<Pair<String, Int?>>()
 
     override suspend fun initialize(
         reviewToken: String?,
@@ -1227,7 +1300,13 @@ private class CleanupRestoreUiRepository(
         partialConfirmed: Boolean,
     ): InstallState = InstallState.Idle
 
-    override suspend fun cancelInstall(): Boolean = true
+    override suspend fun cancelInstall(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallCleanupResult {
+        cancelArguments += expectedReviewToken to expectedSessionId
+        return InstallCleanupResult.Cleaned
+    }
 
     override fun unknownSourcesSettings(): RepositoryLaunch =
         error("unexpected unknown sources navigation")
