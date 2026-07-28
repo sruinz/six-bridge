@@ -2783,6 +2783,267 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `quarantine cross owner overlap은 current review와 session을 건드리지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            source.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            savedState[ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.CONVERSION_ROUTE_KEY] = "result"
+            savedState[ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            val currentRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    generatedBundle(SECOND_TOKEN),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+
+            val recreated = ManagerViewModel(currentRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(0, currentRepository.cancelInstallRequests)
+            assertTrue(currentRepository.discardAttempts.isEmpty())
+            assertEquals(listOf(TOKEN), currentRepository.discardedConversions)
+            assertEquals(
+                ManagerRoute.ConversionResult(SECOND_TOKEN),
+                recreated.state.value.route,
+            )
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY))
+            assertEquals(
+                null,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                null,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+                ),
+            )
+            assertEquals(
+                null,
+                savedState.get<Int>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
+                ),
+            )
+            assertEquals(
+                null,
+                savedState.get<Boolean>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY,
+                ),
+            )
+        }
+
+    @Test
+    fun `quarantine failure survives recreation 뒤 safe conversion만 다시 시도한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            source.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            savedState[ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.CONVERSION_ROUTE_KEY] = "result"
+            savedState[ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            val failingRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    generatedBundle(SECOND_TOKEN),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+                discardConversionResults[TOKEN] = false
+            }
+            ManagerViewModel(failingRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(listOf("discardConversion:$TOKEN"), failingRepository.lifecycleEvents)
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                false,
+                savedState.get<Boolean>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY,
+                ),
+            )
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+                ),
+            )
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY,
+                ),
+            )
+            assertNull(
+                savedState.get<Int>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
+                ),
+            )
+
+            val retryRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    generatedBundle(SECOND_TOKEN),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+            val recreated = ManagerViewModel(retryRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(listOf("discardConversion:$TOKEN"), retryRepository.lifecycleEvents)
+            assertEquals(0, retryRepository.cancelInstallRequests)
+            assertTrue(retryRepository.discardAttempts.isEmpty())
+            assertEquals(
+                ManagerRoute.ConversionResult(SECOND_TOKEN),
+                recreated.state.value.route,
+            )
+            assertEquals(
+                null,
+                savedState.get<Boolean>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY,
+                ),
+            )
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+        }
+
+    @Test
+    fun `quarantine current conversion owner는 conversion을 discard하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            savedState[ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            savedState[ManagerViewModel.REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            val currentRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(
+                        ContractCompatibilityStatus.COMPATIBLE,
+                        token = SECOND_TOKEN,
+                    ),
+                    generatedBundle(),
+                )
+            }
+
+            val recreated = ManagerViewModel(currentRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), currentRepository.discardAttempts)
+            assertTrue(currentRepository.discardedConversions.isEmpty())
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+                ),
+            )
+            assertEquals(
+                false,
+                savedState.get<Boolean>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY,
+                ),
+            )
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                recreated.state.value.route,
+            )
+        }
+
+    @Test
     fun `generated active install 취소는 install job과 coordinator를 먼저 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

@@ -85,8 +85,9 @@ class ManagerViewModel(
     private var generatedResultReviewToken: String? =
         savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY]
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
-    private var quarantinedGeneratedCleanup: PendingGeneratedCleanup? = null
+    private var quarantinedGeneratedCleanup = restoreQuarantinedGeneratedCleanup()
     private var generatedCleanupJob: Job? = null
+    private var quarantinedGeneratedCleanupJob: Job? = null
     private var documentOwnerGeneration =
         savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
     private var documentLaunchSequence =
@@ -2050,26 +2051,133 @@ class ManagerViewModel(
     }
 
     private fun quarantineGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+        val quarantined = QuarantinedGeneratedCleanup(
+            token = cleanup.token,
+            reviewToken = cleanup.reviewToken,
+            phase = cleanup.phase,
+            installSessionId = cleanup.installSessionId,
+            conversionCleaned = false,
+        )
+        advanceQuarantinedGeneratedCleanup(quarantined)
         if (pendingGeneratedCleanup == cleanup) {
             clearPendingGeneratedCleanup()
         }
-        quarantinedGeneratedCleanup = cleanup
     }
 
     private fun reconcileQuarantinedGeneratedCleanup() {
-        val cleanup = quarantinedGeneratedCleanup ?: return
-        viewModelScope.launch {
-            val reviewCleaned = cleanup.reviewToken
-                ?.let(repository::discardReview)
-                ?: true
-            val conversionCleaned = repository.discardConversion(cleanup.token)
-            if (reviewCleaned &&
-                conversionCleaned &&
+        quarantinedGeneratedCleanup ?: return
+        quarantinedGeneratedCleanupJob
+            ?.takeIf { it.isActive }
+            ?.let { return }
+        quarantinedGeneratedCleanupJob = viewModelScope.launch {
+            var cleanup = quarantinedGeneratedCleanup ?: return@launch
+            if (cleanup.phase == GeneratedCleanupPhase.INSTALL) {
+                cleanup = cleanup.copy(
+                    phase = if (cleanup.reviewToken != null) {
+                        GeneratedCleanupPhase.REVIEW
+                    } else {
+                        GeneratedCleanupPhase.CONVERSION
+                    },
+                    installSessionId = null,
+                )
+                advanceQuarantinedGeneratedCleanup(cleanup)
+            }
+            if (cleanup.phase == GeneratedCleanupPhase.REVIEW) {
+                val reviewToken = cleanup.reviewToken
+                if (reviewToken == null ||
+                    cleanup.overlapsCurrentReview() ||
+                    repository.discardReview(reviewToken)
+                ) {
+                    cleanup = cleanup.copy(
+                        reviewToken = null,
+                        phase = GeneratedCleanupPhase.CONVERSION,
+                    )
+                    advanceQuarantinedGeneratedCleanup(cleanup)
+                }
+            }
+            if (!cleanup.conversionCleaned &&
+                !cleanup.overlapsCurrentConversion() &&
+                repository.discardConversion(cleanup.token)
+            ) {
+                cleanup = cleanup.copy(conversionCleaned = true)
+                advanceQuarantinedGeneratedCleanup(cleanup)
+            }
+            if (cleanup.phase == GeneratedCleanupPhase.CONVERSION &&
+                cleanup.conversionCleaned &&
                 quarantinedGeneratedCleanup == cleanup
             ) {
-                quarantinedGeneratedCleanup = null
+                clearQuarantinedGeneratedCleanup()
             }
         }
+    }
+
+    private fun QuarantinedGeneratedCleanup.overlapsCurrentReview(): Boolean =
+        reviewToken != null &&
+            reviewToken in setOfNotNull(
+                ownedReviewToken,
+                generatedResultReviewToken,
+                savedStateHandle[REVIEW_TOKEN_KEY],
+                savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY],
+                (mutableState.value.importState as? ImportUiState.ReviewReady)
+                    ?.review
+                    ?.token,
+                (mutableState.value.conversionState as? ConversionUiState.ResultReady)
+                    ?.review
+                    ?.token,
+            )
+
+    private fun QuarantinedGeneratedCleanup.overlapsCurrentConversion(): Boolean =
+        token in setOfNotNull(
+            generatedResultOwnerToken,
+            savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY],
+            savedStateHandle[CONVERSION_TOKEN_KEY],
+            (mutableState.value.conversionState as? ConversionUiState.ResultReady)?.token,
+        )
+
+    private fun advanceQuarantinedGeneratedCleanup(
+        cleanup: QuarantinedGeneratedCleanup,
+    ) {
+        quarantinedGeneratedCleanup = cleanup
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY] = cleanup.token
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY] =
+            cleanup.reviewToken
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_PHASE_KEY] = cleanup.phase.name
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] =
+            cleanup.installSessionId
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY] =
+            cleanup.conversionCleaned
+    }
+
+    private fun restoreQuarantinedGeneratedCleanup(): QuarantinedGeneratedCleanup? {
+        val token = savedStateHandle.get<String>(
+            QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+        ) ?: return null
+        val phase = savedStateHandle.get<String>(
+            QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+        )?.let { runCatching { GeneratedCleanupPhase.valueOf(it) }.getOrNull() }
+            ?: return null
+        return QuarantinedGeneratedCleanup(
+            token = token,
+            reviewToken = savedStateHandle[
+                QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY
+            ],
+            phase = phase,
+            installSessionId = savedStateHandle[
+                QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY
+            ],
+            conversionCleaned = savedStateHandle[
+                QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY
+            ] ?: false,
+        )
+    }
+
+    private fun clearQuarantinedGeneratedCleanup() {
+        quarantinedGeneratedCleanup = null
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY] = null
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = null
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_PHASE_KEY] = null
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] = null
+        savedStateHandle[QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY] = null
     }
 
     private fun restorePendingGeneratedCleanup(): PendingGeneratedCleanup? {
@@ -2200,6 +2308,16 @@ class ManagerViewModel(
         const val GENERATED_CLEANUP_PACKAGE_KEY = "generated_cleanup_package"
         const val GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY =
             "generated_cleanup_install_session_id"
+        const val QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY =
+            "quarantined_generated_cleanup_token"
+        const val QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY =
+            "quarantined_generated_cleanup_review_token"
+        const val QUARANTINED_GENERATED_CLEANUP_PHASE_KEY =
+            "quarantined_generated_cleanup_phase"
+        const val QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY =
+            "quarantined_generated_cleanup_install_session_id"
+        const val QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY =
+            "quarantined_generated_cleanup_conversion_cleaned"
         const val DOCUMENT_OWNER_GENERATION_KEY = "document_owner_generation"
         const val DOCUMENT_LAUNCH_SEQUENCE_KEY = "document_launch_sequence"
         const val PENDING_PICKER_OWNER_GENERATION_KEY = "pending_picker_owner_generation"
@@ -2228,6 +2346,14 @@ private data class PendingGeneratedCleanup(
     val phase: GeneratedCleanupPhase,
     val destination: GeneratedCleanupDestination,
     val installSessionId: Int? = null,
+)
+
+private data class QuarantinedGeneratedCleanup(
+    val token: String,
+    val reviewToken: String?,
+    val phase: GeneratedCleanupPhase,
+    val installSessionId: Int?,
+    val conversionCleaned: Boolean,
 )
 
 private data class GeneratedCleanupDestination(
