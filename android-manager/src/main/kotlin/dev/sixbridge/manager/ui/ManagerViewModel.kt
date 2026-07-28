@@ -59,6 +59,9 @@ class ManagerViewModel(
         GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
     },
     private val afterGeneratedInstallCleanupTransitionPersisted: () -> Unit = {},
+    private val afterGeneratedCleanupCompletionStep: (
+        GeneratedCleanupCompletionStep,
+    ) -> Unit = {},
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
@@ -112,7 +115,10 @@ class ManagerViewModel(
 
     init {
         pendingGeneratedCleanup
-            ?.takeUnless { it.matchesResultOwners() }
+            ?.takeUnless {
+                it.phase == GeneratedCleanupPhase.COMMIT_DESTINATION ||
+                    it.matchesResultOwners()
+            }
             ?.let(::quarantineGeneratedCleanup)
         restoreAndInitialize()
         observeCatalog()
@@ -130,6 +136,7 @@ class ManagerViewModel(
             action !is ManagerAction.GeneratedShareLaunchFailed &&
             action !is ManagerAction.ConversionFileSelected &&
             action !is ManagerAction.SaveGeneratedConversionTo &&
+            action !is ManagerAction.GeneratedCleanupDestinationPresented &&
             action != ManagerAction.ReturnedToForeground
         ) {
             beginNewUserAction(
@@ -187,6 +194,8 @@ class ManagerViewModel(
             ManagerAction.FinishConversion -> finishConversion()
             ManagerAction.CancelConversion -> cancelConversion()
             ManagerAction.RetryGeneratedCleanup -> retryGeneratedCleanup()
+            is ManagerAction.GeneratedCleanupDestinationPresented ->
+                acknowledgeGeneratedCleanupDestination(action.token)
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
@@ -897,6 +906,10 @@ class ManagerViewModel(
         val generation = operationGeneration
         viewModelScope.launch {
             savedStateHandle["conversion_url"] = null
+            val committedDestination = pendingGeneratedCleanup?.takeIf {
+                it.phase == GeneratedCleanupPhase.COMMIT_DESTINATION
+            }
+            committedDestination?.let(::completeGeneratedCleanup)
             val savedToken = savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
             val savedSession = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
             val restored = try {
@@ -907,6 +920,8 @@ class ManagerViewModel(
                 if (generatedCleanupRestoreInvalid) {
                     initialized = true
                     showGeneratedCleanupRestoreBlocked()
+                } else if (committedDestination != null) {
+                    initialized = true
                 }
                 return@launch
             }
@@ -915,6 +930,7 @@ class ManagerViewModel(
                 showGeneratedCleanupRestoreBlocked()
                 return@launch
             }
+            if (committedDestination != null) return@launch
             if (generation != operationGeneration) {
                 deferredInitialTerminal = null
                 restored.review?.token?.let(::queuePendingReviewDiscard)
@@ -1395,6 +1411,8 @@ class ManagerViewModel(
     }
 
     private fun beginNewUserAction(preserveRetryMessage: Boolean = false) {
+        mutableState.value.destinationCommitToken
+            ?.let(::acknowledgeGeneratedCleanupDestination)
         invalidatePendingDocumentLaunches()
         invalidateUninstallAttempt()
         launchGeneration += 1
@@ -1978,6 +1996,9 @@ class ManagerViewModel(
 
     private suspend fun performPendingGeneratedCleanup(): Boolean {
         var cleanup = pendingGeneratedCleanup ?: return false
+        if (cleanup.phase == GeneratedCleanupPhase.COMMIT_DESTINATION) {
+            return completeGeneratedCleanup(cleanup)
+        }
         if (!cleanup.matchesResultOwners()) {
             quarantineGeneratedCleanup(cleanup)
             reconcileQuarantinedGeneratedCleanup()
@@ -2031,7 +2052,16 @@ class ManagerViewModel(
             showGeneratedCleanupFailure()
             return false
         }
-        return completeGeneratedCleanup(cleanup)
+        val committed = cleanup.copy(
+            reviewToken = null,
+            phase = GeneratedCleanupPhase.COMMIT_DESTINATION,
+            installSessionId = null,
+        )
+        advanceGeneratedCleanup(committed)
+        afterGeneratedCleanupCompletionStep(
+            GeneratedCleanupCompletionStep.DESTINATION_COMMITTED,
+        )
+        return completeGeneratedCleanup(committed)
     }
 
     private suspend fun cancelAndAwaitGeneratedSave(): Boolean {
@@ -2099,16 +2129,29 @@ class ManagerViewModel(
     }
 
     private fun completeGeneratedCleanup(cleanup: PendingGeneratedCleanup): Boolean {
-        if (!cleanup.matchesSavedOwners()) {
+        if (cleanup.phase != GeneratedCleanupPhase.COMMIT_DESTINATION &&
+            !cleanup.matchesSavedOwners()
+        ) {
             quarantineGeneratedCleanup(cleanup)
             reconcileQuarantinedGeneratedCleanup()
             return false
         }
         clearGeneratedInstallOwner()
+        afterGeneratedCleanupCompletionStep(
+            GeneratedCleanupCompletionStep.INSTALL_OWNER_CLEARED,
+        )
         clearGeneratedResultOwner()
+        afterGeneratedCleanupCompletionStep(
+            GeneratedCleanupCompletionStep.RESULT_OWNER_CLEARED,
+        )
         clearSavedReviewAndSession()
+        afterGeneratedCleanupCompletionStep(
+            GeneratedCleanupCompletionStep.REVIEW_SESSION_CLEARED,
+        )
         clearSavedConversion()
-        clearPendingGeneratedCleanup()
+        afterGeneratedCleanupCompletionStep(
+            GeneratedCleanupCompletionStep.CONVERSION_OWNER_CLEARED,
+        )
         mutableState.update {
             it.copy(
                 route = cleanup.destination.toRoute(),
@@ -2116,9 +2159,24 @@ class ManagerViewModel(
                 conversionUrl = "",
                 importState = ImportUiState.Idle,
                 message = null,
+                destinationCommitToken = cleanup.token,
             )
         }
         return true
+    }
+
+    private fun acknowledgeGeneratedCleanupDestination(token: String) {
+        val cleanup = pendingGeneratedCleanup ?: return
+        val state = mutableState.value
+        if (cleanup.phase != GeneratedCleanupPhase.COMMIT_DESTINATION ||
+            cleanup.token != token ||
+            state.destinationCommitToken != token ||
+            state.route != cleanup.destination.toRoute()
+        ) {
+            return
+        }
+        clearPendingGeneratedCleanup()
+        mutableState.update { it.copy(destinationCommitToken = null) }
     }
 
     private fun PendingGeneratedCleanup.matchesSavedOwners(): Boolean {
@@ -2396,6 +2454,8 @@ class ManagerViewModel(
                     reviewToken != null && installSessionId == null
                 GeneratedCleanupPhase.CONVERSION ->
                     reviewToken == null && installSessionId == null
+                GeneratedCleanupPhase.COMMIT_DESTINATION ->
+                    reviewToken == null && installSessionId == null
             }
 
     private fun clearGeneratedInstallOwner() {
@@ -2547,10 +2607,19 @@ class ManagerViewModel(
     }
 }
 
+enum class GeneratedCleanupCompletionStep {
+    DESTINATION_COMMITTED,
+    INSTALL_OWNER_CLEARED,
+    RESULT_OWNER_CLEARED,
+    REVIEW_SESSION_CLEARED,
+    CONVERSION_OWNER_CLEARED,
+}
+
 private enum class GeneratedCleanupPhase {
     INSTALL,
     REVIEW,
     CONVERSION,
+    COMMIT_DESTINATION,
 }
 
 private data class PendingGeneratedCleanup(

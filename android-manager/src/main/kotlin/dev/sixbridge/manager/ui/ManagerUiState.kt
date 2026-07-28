@@ -189,6 +189,7 @@ data class ManagerUiState(
     val conversionUrl: String = "",
     val installState: InstallState = InstallState.Idle,
     val message: UserMessage? = null,
+    val destinationCommitToken: String? = null,
 )
 
 sealed interface ManagerAction {
@@ -229,6 +230,7 @@ sealed interface ManagerAction {
     data object FinishConversion : ManagerAction
     data object CancelConversion : ManagerAction
     data object RetryGeneratedCleanup : ManagerAction
+    data class GeneratedCleanupDestinationPresented(val token: String) : ManagerAction
     data object ConfirmPartial : ManagerAction
     data object InstallReviewedBundle : ManagerAction
     data object CancelReview : ManagerAction

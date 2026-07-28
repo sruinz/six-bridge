@@ -606,6 +606,80 @@ class ManagerAppTest {
     }
 
     @Test
+    fun `destination presented ACK는 report 한 frame 뒤 exact token을 한 번 전달한다`() {
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.mainClock.autoAdvance = false
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    route = ManagerRoute.Report(PACKAGE),
+                    installed = listOf(installedItem()),
+                    destinationCommitToken = TOKEN,
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnIdle {
+            assertEquals(
+                listOf(ManagerAction.GeneratedCleanupDestinationPresented(TOKEN)),
+                actions.filterIsInstance<
+                    ManagerAction.GeneratedCleanupDestinationPresented
+                >(),
+            )
+        }
+    }
+
+    @Test
+    fun `destination presented ACK는 null을 건너뛰고 token route exact 조합만 전달한다`() {
+        val actions = mutableListOf<ManagerAction>()
+        var state by mutableStateOf(
+            ManagerUiState(
+                route = ManagerRoute.Report(PACKAGE),
+                installed = listOf(installedItem()),
+            ),
+        )
+        composeRule.mainClock.autoAdvance = false
+        composeRule.setContent {
+            ManagerAppContent(
+                state = state,
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnIdle {
+            assertEquals(emptyList<ManagerAction>(), actions)
+            state = state.copy(destinationCommitToken = TOKEN)
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnIdle {
+            state = state.copy(route = ManagerRoute.Home)
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnIdle {
+            state = state.copy(destinationCommitToken = SECOND_TOKEN)
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnIdle {
+            assertEquals(
+                listOf(TOKEN, TOKEN, SECOND_TOKEN),
+                actions
+                    .filterIsInstance<
+                        ManagerAction.GeneratedCleanupDestinationPresented
+                    >()
+                    .map(ManagerAction.GeneratedCleanupDestinationPresented::token),
+            )
+        }
+    }
+
+    @Test
     fun missing_and_unreadable_reports_show_unknown_without_verified_empty_sections() {
         var item by mutableStateOf(
             installedItem(
@@ -904,6 +978,7 @@ class ManagerAppTest {
 
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
+        const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
         const val PACKAGE = "dev.sixbridge.ext.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val EXTENSION_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }

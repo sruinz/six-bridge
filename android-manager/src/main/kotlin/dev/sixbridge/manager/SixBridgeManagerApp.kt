@@ -5,7 +5,9 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.sixbridge.manager.ui.HomeScreen
@@ -62,6 +64,16 @@ fun ManagerAppContent(
     val backAction = state.route.backAction()
     BackHandler(enabled = backAction != null) {
         backAction?.let(onAction)
+    }
+    val destinationCommitToken = state.destinationCommitToken
+    LaunchedEffect(destinationCommitToken, state.route) {
+        destinationCommitToken ?: return@LaunchedEffect
+        withFrameNanos { }
+        onAction(
+            ManagerAction.GeneratedCleanupDestinationPresented(
+                destinationCommitToken,
+            ),
+        )
     }
     when (val route = state.route) {
         ManagerRoute.Home -> HomeScreen(

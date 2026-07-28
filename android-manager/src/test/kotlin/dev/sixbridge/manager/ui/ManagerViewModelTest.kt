@@ -42,6 +42,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
@@ -2928,6 +2929,154 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `COMMIT_DESTINATION owner clear process death는 exact report를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            val snapshots =
+                linkedMapOf<GeneratedCleanupCompletionStep, SavedStateHandle>()
+            val source = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedCleanupCompletionStep = { step ->
+                    snapshots[step] = generatedCleanupDeathSnapshot(savedState)
+                },
+            )
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertEquals(
+                GeneratedCleanupCompletionStep.entries.toSet(),
+                snapshots.keys,
+            )
+            snapshots.forEach { (step, deathState) ->
+                assertEquals(
+                    "COMMIT_DESTINATION",
+                    generatedCleanupPhase(deathState),
+                    "step=$step",
+                )
+                assertEquals(
+                    "REPORT",
+                    generatedCleanupDestinationKind(deathState),
+                    "step=$step",
+                )
+                assertEquals(
+                    PACKAGE,
+                    generatedCleanupDestinationPackage(deathState),
+                    "step=$step",
+                )
+
+                val recreatedRepository = currentGeneratedInstallRepository().apply {
+                    restoredConversion = null
+                }
+                val recreated = ManagerViewModel(recreatedRepository, deathState)
+                advanceUntilIdle()
+
+                assertEquals(
+                    ManagerRoute.Report(PACKAGE),
+                    recreated.state.value.route,
+                    "step=$step",
+                )
+                assertEquals(
+                    TOKEN,
+                    recreated.state.value.destinationCommitToken,
+                    "step=$step",
+                )
+                assertEquals(0, recreatedRepository.cleanupRequestCount(), "step=$step")
+                assertNotNull(deathState.get<String>(CLEANUP_JOURNAL_KEY), "step=$step")
+            }
+        }
+
+    @Test
+    fun `destination presented ACK는 route mismatch와 stale token을 무시하고 exact만 commit한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            var routeMismatchPreserved = false
+            lateinit var viewModel: ManagerViewModel
+            viewModel = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedCleanupCompletionStep = { step ->
+                    if (step == GeneratedCleanupCompletionStep.CONVERSION_OWNER_CLEARED) {
+                        assertEquals(
+                            ManagerRoute.ConversionResult(TOKEN),
+                            viewModel.state.value.route,
+                        )
+                        viewModel.accept(
+                            ManagerAction.GeneratedCleanupDestinationPresented(TOKEN),
+                        )
+                        routeMismatchPreserved =
+                            savedState.get<String>(CLEANUP_JOURNAL_KEY) != null
+                    }
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertTrue(routeMismatchPreserved)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertNotNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+
+            viewModel.accept(
+                ManagerAction.GeneratedCleanupDestinationPresented(SECOND_TOKEN),
+            )
+
+            assertNotNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+
+            viewModel.accept(
+                ManagerAction.GeneratedCleanupDestinationPresented(TOKEN),
+            )
+
+            assertNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertNull(viewModel.state.value.destinationCommitToken)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `destination presented 전 현재 목적지 사용자 동작은 ACK 뒤 실행한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertNotNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+
+            viewModel.accept(ManagerAction.ReturnHome)
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.destinationCommitToken)
+            assertNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+        }
+
+    @Test
     fun `stale pending X는 current Result Y와 destination을 오염시키지 않는다`() =
         runTest(dispatcher.scheduler) {
             val sourceRepository = FakeManagerRepository().apply {
@@ -3346,7 +3495,9 @@ class ManagerViewModelTest {
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-            assertNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(savedState))
+            assertEquals("HOME", generatedCleanupDestinationKind(savedState))
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
         }
 
     @Test
@@ -4872,6 +5023,22 @@ class ManagerViewModelTest {
             ?.jsonPrimitive
             ?.contentOrNull
             ?.toIntOrNull()
+
+    private fun generatedCleanupDestinationKind(savedState: SavedStateHandle): String? =
+        generatedCleanupJournal(savedState)
+            ?.get("destination")
+            ?.jsonObject
+            ?.get("kind")
+            ?.jsonPrimitive
+            ?.contentOrNull
+
+    private fun generatedCleanupDestinationPackage(savedState: SavedStateHandle): String? =
+        generatedCleanupJournal(savedState)
+            ?.get("destination")
+            ?.jsonObject
+            ?.get("packageName")
+            ?.jsonPrimitive
+            ?.contentOrNull
 
     private fun generatedCleanupJournal(savedState: SavedStateHandle) =
         savedState.get<String>(CLEANUP_JOURNAL_KEY)
