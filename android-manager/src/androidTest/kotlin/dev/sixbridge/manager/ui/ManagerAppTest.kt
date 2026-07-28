@@ -7,16 +7,22 @@ import android.net.Uri
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -25,6 +31,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.espresso.Espresso.pressBack
@@ -38,7 +45,9 @@ import dev.sixbridge.manager.GENERATED_BUNDLE_MIME_TYPE
 import dev.sixbridge.manager.generatedBundleSendIntent
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.IdentityRequirement
+import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
@@ -150,6 +159,67 @@ class ManagerAppTest {
         composeRule.onNodeWithTag("conversion:adapter:action-popup-entry").performClick()
         composeRule.onNodeWithTag("conversion:confirm-partial").performClick()
         composeRule.onNodeWithTag("conversion:build").assertIsEnabled()
+    }
+
+    @Test
+    fun identity_target_entire_row_is_merged_radio_and_scrolls_at_large_font() {
+        val identity = "a".repeat(64)
+        val extensionId = "b".repeat(32)
+        val packageName = "dev.sixbridge.ext.$extensionId"
+        val signer = "c".repeat(64)
+        val target = ExistingConversionTarget(
+            identitySha256 = identity,
+            displayName = "기존 변환 대상",
+            extensionId = extensionId,
+            packageName = packageName,
+            wrapperSignerSha256 = signer,
+        )
+        val initial = conversionAnalysisState()
+        val ready = initial.conversionState as ConversionUiState.AnalysisReady
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(
+                LocalDensity provides Density(density.density, fontScale = 2f),
+            ) {
+                ManagerAppContent(
+                    state = initial.copy(
+                        conversionState = ready.copy(
+                            identityRequirement =
+                                IdentityRequirement.UserSelectionRequired(listOf(target)),
+                            identitySelection =
+                                InstallationIdentitySelection.UseExisting(identity),
+                        ),
+                    ),
+                    onAction = actions::add,
+                    onAddSix = {},
+                )
+            }
+        }
+
+        val tag = "conversion:identity-existing:$identity"
+        composeRule.onNodeWithTag("conversion:analysis-screen")
+            .performScrollToNode(hasTestTag(tag))
+        val row = composeRule.onNodeWithTag(tag)
+            .assertIsDisplayed()
+            .assertHasClickAction()
+            .assertIsSelected()
+        val semantics = row.fetchSemanticsNode().config
+        assertEquals(Role.RadioButton, semantics[SemanticsProperties.Role])
+        assertEquals(
+            listOf(
+                "기존 변환 대상, Extension ID: $extensionId, Package: $packageName, Signer SHA-256: $signer",
+            ),
+            semantics[SemanticsProperties.ContentDescription],
+        )
+        row.performClick()
+
+        assertEquals(
+            listOf(ManagerAction.SelectExistingConversionIdentity(identity)),
+            actions,
+        )
+        composeRule.onNodeWithText("Signer SHA-256: $signer", substring = true)
+            .assertExists()
     }
 
     @Test

@@ -1592,6 +1592,50 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated proof가 있는 모든 build failure는 원래 code와 retry 동작을 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            ConversionFailureCode.entries.forEach { code ->
+                val generated = generatedBundle()
+                val repository = FakeManagerRepository().apply {
+                    conversionBeginResult = conversionAnalysis()
+                    conversionBuildResult = ConversionBuildResult.Failure(code, generated)
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.OpenConversionInput)
+                viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+                viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+                advanceUntilIdle()
+
+                viewModel.accept(ManagerAction.BuildConversion)
+                advanceUntilIdle()
+
+                val expectedMessage = conversionFailureMessage(code)
+                fun assertFailureProof() {
+                    val ready = assertIs<ConversionUiState.ResultReady>(
+                        viewModel.state.value.conversionState,
+                        "code=$code",
+                    )
+                    assertEquals(code, ready.failureCode, "code=$code")
+                    assertEquals(generated, ready.generated, "code=$code")
+                    assertEquals(expectedMessage, viewModel.state.value.message, "code=$code")
+                }
+                assertFailureProof()
+
+                viewModel.accept(ManagerAction.SaveGeneratedConversion)
+                assertIs<ManagerEffect.CreateConversionDocument>(viewModel.effects.first())
+                assertFailureProof()
+
+                viewModel.accept(ManagerAction.ShareGeneratedConversion)
+                assertIs<ManagerEffect.ShareGeneratedBundle>(viewModel.effects.first())
+                assertFailureProof()
+
+                viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                assertFailureProof()
+            }
+        }
+
+    @Test
     fun `공유 chooser 요청만으로 generated와 work를 삭제하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val generated = generatedBundle()

@@ -4,6 +4,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -15,9 +17,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.manager.R
@@ -181,15 +187,17 @@ private fun IdentitySelection(
                 selected = selected,
                 tag = "conversion:identity-existing:${target.identitySha256}",
                 label = target.displayName,
+                details = listOf(
+                    "Extension ID: ${target.extensionId}",
+                    "Package: ${target.packageName}",
+                    "Signer SHA-256: ${target.wrapperSignerSha256}",
+                ),
                 onClick = {
                     onAction(
                         ManagerAction.SelectExistingConversionIdentity(target.identitySha256),
                     )
                 },
             )
-            Text("Extension ID: ${target.extensionId}")
-            Text("Package: ${target.packageName}")
-            Text("Signer SHA-256: ${target.wrapperSignerSha256}")
             if (selected) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
@@ -211,15 +219,42 @@ private fun IdentityRadioRow(
     selected: Boolean,
     tag: String,
     label: String,
+    details: List<String> = emptyList(),
     onClick: () -> Unit,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    val description = (listOf(label) + details).joinToString(", ")
+    val selectedDescription = stringResource(
+        if (selected) {
+            R.string.conversion_identity_selected
+        } else {
+            R.string.conversion_identity_not_selected
+        },
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(tag)
+            .selectable(
+                selected = selected,
+                onClick = onClick,
+                role = Role.RadioButton,
+            )
+            .semantics(mergeDescendants = true) {
+                contentDescription = description
+                stateDescription = selectedDescription
+            }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
         RadioButton(
             selected = selected,
-            onClick = onClick,
-            modifier = Modifier.testTag(tag),
+            onClick = null,
+            modifier = Modifier.clearAndSetSemantics {},
         )
-        Text(label)
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(label)
+            details.forEach { Text(it) }
+        }
     }
 }
 

@@ -102,7 +102,11 @@ class ManagerViewModel(
             action !is ManagerAction.SaveGeneratedConversionTo &&
             action != ManagerAction.ReturnedToForeground
         ) {
-            beginNewUserAction()
+            beginNewUserAction(
+                preserveRetryMessage = action == ManagerAction.PrepareGeneratedInstall ||
+                    action == ManagerAction.SaveGeneratedConversion ||
+                    action == ManagerAction.ShareGeneratedConversion,
+            )
         }
         when (action) {
             ManagerAction.FilePickerOpened -> Unit
@@ -399,7 +403,11 @@ class ManagerViewModel(
         if (result.installOwnerActive) return
         val review = result.review ?: run {
             mutableState.update {
-                it.copy(message = conversionFailureMessage(ConversionFailureCode.BUNDLE_IO))
+                it.copy(
+                    message = conversionFailureMessage(
+                        result.failureCode ?: ConversionFailureCode.BUNDLE_IO,
+                    ),
+                )
             }
             return
         }
@@ -1055,12 +1063,14 @@ class ManagerViewModel(
         }
     }
 
-    private fun beginNewUserAction() {
+    private fun beginNewUserAction(preserveRetryMessage: Boolean = false) {
         invalidatePendingDocumentLaunches()
         invalidateUninstallAttempt()
         launchGeneration += 1
         pendingRecovery = null
-        if (mutableState.value.message?.recoveryAction == RecoveryAction.RETRY) {
+        if (!preserveRetryMessage &&
+            mutableState.value.message?.recoveryAction == RecoveryAction.RETRY
+        ) {
             mutableState.update { it.copy(message = null) }
         }
     }

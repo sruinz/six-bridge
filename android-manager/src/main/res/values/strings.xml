@@ -24,6 +24,8 @@
     <string name="conversion_identity_stable">안정적인 원본 신원 %1$s</string>
     <string name="conversion_identity_choose">표식 없는 입력의 설치 대상 선택</string>
     <string name="conversion_identity_new">새 변환으로 설치</string>
+    <string name="conversion_identity_selected">선택됨</string>
+    <string name="conversion_identity_not_selected">선택 안 됨</string>
     <string name="conversion_confirm_existing">표시된 extension ID, package, signer의 기존 대상을 업데이트합니다.</string>
     <string name="conversion_build">.six 생성</string>
     <string name="conversion_building">입력을 다시 검증하고 .six를 생성하는 중입니다.</string>
