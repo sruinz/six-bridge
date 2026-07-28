@@ -3452,7 +3452,7 @@ class ManagerViewModelTest {
                 )
                 assertEquals(UserMessageKind.CONVERSION_CLEANUP_FAILED, messageKind)
                 assertEquals(
-                    ManagerRoute.ConversionResult(TOKEN),
+                    ManagerRoute.Home,
                     viewModel.state.value.route,
                 )
                 assertEquals(41, savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
@@ -3617,6 +3617,77 @@ class ManagerViewModelTest {
                 assertTrue(repository.discardedTokens.isEmpty())
                 assertTrue(repository.discardedConversions.isEmpty())
             }
+        }
+
+    @Test
+    fun `invalid cleanup journal restore null은 모든 owner와 session을 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = currentGeneratedInstallSavedState(
+                cleanupJournal = """{"version":99}""",
+            )
+            val repository = currentGeneratedInstallRepository().apply {
+                restoredConversion = null
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+            assertEquals(0, repository.cancelInstallRequests)
+            assertEquals(0, repository.restoreConversionRequests)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `invalid cleanup journal restore exception은 모든 owner와 session을 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = currentGeneratedInstallSavedState(
+                cleanupJournal = """{"version":1,"phase":"BROKEN"}""",
+            )
+            val repository = currentGeneratedInstallRepository().apply {
+                restoreConversionFailure = IOException("transient")
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+            assertEquals(0, repository.restoreConversionRequests)
+            assertEquals(0, repository.cleanupRequestCount())
+        }
+
+    @Test
+    fun `invalid cleanup journal initialize exception은 모든 owner와 session을 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = currentGeneratedInstallSavedState(
+                cleanupJournal = "{broken",
+            )
+            val repository = currentGeneratedInstallRepository().apply {
+                initializeException = IllegalStateException("transient")
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+            assertEquals(0, repository.restoreConversionRequests)
+            assertEquals(0, repository.cleanupRequestCount())
         }
 
     @Test
@@ -4638,6 +4709,34 @@ class ManagerViewModelTest {
         ) + cleanupValues,
     )
 
+    private fun currentGeneratedInstallSavedState(
+        cleanupJournal: String,
+    ) = generatedInstallSavedState(
+        mapOf(CLEANUP_JOURNAL_KEY to cleanupJournal),
+    )
+
+    private fun assertGeneratedOwnersAndSessionPreserved(savedState: SavedStateHandle) {
+        assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        assertEquals(41, savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+        assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+        assertEquals(
+            "result",
+            savedState.get<String>(ManagerViewModel.CONVERSION_ROUTE_KEY),
+        )
+        assertEquals(
+            TOKEN,
+            savedState.get<String>(ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY),
+        )
+        assertEquals(
+            TOKEN,
+            savedState.get<String>(ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY),
+        )
+        assertEquals(
+            TOKEN,
+            savedState.get<String>(ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY),
+        )
+    }
+
     private fun currentGeneratedInstallRepository() = FakeManagerRepository().apply {
         restoreResult = ManagerRestoreResult(
             review = review(ContractCompatibilityStatus.COMPATIBLE),
@@ -4868,6 +4967,7 @@ private class FakeManagerRepository : ManagerRepository {
     var suspendFirstConversionBuild = false
     var ignoreFirstConversionBuildCancellation = false
     var restoredConversion: RestoredConversion? = null
+    var restoreConversionFailure: IOException? = null
     var restoreConversionRequests = 0
     val restoreConversionImportReviewRequests = mutableListOf<Boolean>()
     val conversionRequests = mutableListOf<OnDeviceInputRequest>()
@@ -4978,6 +5078,7 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun restoreConversion(importReview: Boolean): RestoredConversion? {
         restoreConversionRequests += 1
         restoreConversionImportReviewRequests += importReview
+        restoreConversionFailure?.let { throw it }
         return restoredConversion
     }
 
@@ -5116,6 +5217,9 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun reconcileCatalog() {
         reconcileRequests += 1
     }
+
+    fun cleanupRequestCount(): Int =
+        cancelInstallRequests + discardAttempts.size + discardedConversions.size
 
     fun emitLaunch(destination: LaunchDestination, installSessionId: Int? = null) {
         launchChannel.trySend(

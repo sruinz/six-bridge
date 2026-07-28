@@ -904,9 +904,17 @@ class ManagerViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
+                if (generatedCleanupRestoreInvalid) {
+                    initialized = true
+                    showGeneratedCleanupRestoreBlocked()
+                }
                 return@launch
             }
             initialized = true
+            if (generatedCleanupRestoreInvalid) {
+                showGeneratedCleanupRestoreBlocked()
+                return@launch
+            }
             if (generation != operationGeneration) {
                 deferredInitialTerminal = null
                 restored.review?.token?.let(::queuePendingReviewDiscard)
@@ -1851,6 +1859,18 @@ class ManagerViewModel(
                     UserMessageKind.CONVERSION_CLEANUP_FAILED,
                     "설치 작업 정리를 완료하지 못했습니다. 생성 결과를 보존했으니 다시 시도해 주세요.",
                     RecoveryAction.RETRY,
+                ),
+            )
+        }
+    }
+
+    private fun showGeneratedCleanupRestoreBlocked() {
+        mutableState.update {
+            it.copy(
+                message = UserMessage(
+                    UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                    "저장된 설치 정리 정보를 읽을 수 없어 복구 자료를 보존했습니다. 앱을 업데이트한 뒤 다시 확인해 주세요.",
+                    RecoveryAction.NONE,
                 ),
             )
         }
