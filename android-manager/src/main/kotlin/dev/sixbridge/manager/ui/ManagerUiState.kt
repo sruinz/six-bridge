@@ -219,6 +219,7 @@ sealed interface ManagerAction {
     data object GeneratedShareFailed : ManagerAction
     data object FinishConversion : ManagerAction
     data object CancelConversion : ManagerAction
+    data object RetryGeneratedCleanup : ManagerAction
     data object ConfirmPartial : ManagerAction
     data object InstallReviewedBundle : ManagerAction
     data object CancelReview : ManagerAction

@@ -96,6 +96,7 @@ class ManagerViewModel(
 
     fun accept(action: ManagerAction) {
         if (action != ManagerAction.RetryRecovery &&
+            action != ManagerAction.RetryGeneratedCleanup &&
             action !is ManagerAction.LaunchSucceeded &&
             action !is ManagerAction.LaunchFailed &&
             action !is ManagerAction.ConversionFileSelected &&
@@ -153,6 +154,7 @@ class ManagerViewModel(
             }
             ManagerAction.FinishConversion -> finishConversion()
             ManagerAction.CancelConversion -> cancelConversion()
+            ManagerAction.RetryGeneratedCleanup -> retryGeneratedCleanup()
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
@@ -517,6 +519,51 @@ class ManagerViewModel(
 
     private fun cancelConversion() {
         cleanupConversion(ManagerRoute.Home)
+    }
+
+    private fun retryGeneratedCleanup() {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        val failure = repository.installState.value as? InstallState.Failed ?: return
+        if (failure.code !in CLEANUP_RETRYABLE_FAILURES ||
+            generatedInstallOwnerToken != result.token
+        ) {
+            return
+        }
+        val supersededInstall = detachInstallJob()
+        supersededInstall?.cancel()
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
+        routeOperation = null
+        enqueueRouteCleanup {
+            ticket.previousOperation?.cancelAndJoin()
+            supersededInstall?.cancelAndJoin()
+            val cleaned = try {
+                cancelInstallForRoute(
+                    generation = generation,
+                    suppressTerminalOnSuccess = true,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                showGeneratedCleanupFailure()
+                return@enqueueRouteCleanup false
+            }
+            if (!cleaned) {
+                showGeneratedCleanupFailure()
+                return@enqueueRouteCleanup false
+            }
+            clearGeneratedInstallOwner()
+            savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+            mutableState.update {
+                val ready = it.conversionState as? ConversionUiState.ResultReady
+                it.copy(
+                    conversionState = ready?.copy(installOwnerActive = false)
+                        ?: it.conversionState,
+                    message = null,
+                )
+            }
+            true
+        }
     }
 
     private fun cleanupConversion(destination: ManagerRoute) {
@@ -1311,7 +1358,8 @@ class ManagerViewModel(
             previous == InstallState.UnknownSourcesPermissionRequired ||
             previous is InstallState.WritingSession ||
             previous is InstallState.AwaitingUserApproval ||
-            previous is InstallState.Failed && previous.code == "CLEANUP_FAILED"
+            previous is InstallState.Failed &&
+            previous.code in CLEANUP_RETRYABLE_FAILURES
         if (replacingActiveInstall) replacementCancelGeneration = generation
         val cleaned = try {
             repository.cancelInstall()
@@ -1437,9 +1485,20 @@ class ManagerViewModel(
                     RecoveryAction.NONE,
                 ),
             )
-            is InstallState.Failed -> returnGeneratedInstallToResult(
-                installFailureMessage(installState.code),
-            )
+            is InstallState.Failed ->
+                if (installState.code in CLEANUP_RETRYABLE_FAILURES) {
+                    mutableState.update {
+                        it.copy(
+                            route = ManagerRoute.ConversionResult(result.token),
+                            conversionState = result.copy(installOwnerActive = true),
+                            message = installFailureMessage(installState.code),
+                        )
+                    }
+                } else {
+                    returnGeneratedInstallToResult(
+                        installFailureMessage(installState.code),
+                    )
+                }
             else -> Unit
         }
     }

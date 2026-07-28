@@ -45,7 +45,15 @@ fun ConversionResultScreen(
         message?.let {
             MessageCard(
                 message = it,
-                onRecovery = { onAction(ManagerAction.DismissMessage) },
+                onRecovery = {
+                    onAction(
+                        if (it.recoveryAction == RecoveryAction.RETRY) {
+                            ManagerAction.RetryGeneratedCleanup
+                        } else {
+                            ManagerAction.DismissMessage
+                        },
+                    )
+                },
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }
@@ -87,7 +95,13 @@ fun ConversionResultScreen(
 }
 
 private fun dev.sixbridge.manager.install.InstallState.isActiveInstall(): Boolean =
-    this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||
+        this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||
         this is dev.sixbridge.manager.install.InstallState.WritingSession ||
         this is dev.sixbridge.manager.install.InstallState.AwaitingUserApproval ||
-        this is dev.sixbridge.manager.install.InstallState.Failed && code == "CLEANUP_FAILED"
+        this is dev.sixbridge.manager.install.InstallState.Failed &&
+        code in setOf(
+            "CLEANUP_FAILED",
+            "ABANDON_FAILED",
+            "SESSION_RECOVERY_FAILED",
+            "MISSING_OBSERVATION_RESET_FAILED",
+        )

@@ -1900,6 +1900,94 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated cleanup retryable failure 네 code는 active owner와 proof를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                "CLEANUP_FAILED",
+                "ABANDON_FAILED",
+                "SESSION_RECOVERY_FAILED",
+                "MISSING_OBSERVATION_RESET_FAILED",
+            ).forEach { code ->
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                }
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+                repository.installFlow.value = InstallState.Failed(code, "cleanup retry")
+                advanceUntilIdle()
+
+                val ready = assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                    "code=$code",
+                )
+                assertTrue(ready.installOwnerActive, "code=$code")
+                assertEquals(
+                    TOKEN,
+                    savedState.get<String>(
+                        ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                    ),
+                    "code=$code",
+                )
+                assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+                assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+
+                viewModel.accept(ManagerAction.FinishConversion)
+                advanceUntilIdle()
+
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    viewModel.state.value.route,
+                    "code=$code",
+                )
+                assertTrue(repository.discardedConversions.isEmpty(), "code=$code")
+                assertTrue(repository.discardedTokens.isEmpty(), "code=$code")
+            }
+        }
+
+    @Test
+    fun `generated cleanup retry action은 install cleanup만 다시 하고 result proof를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value =
+                InstallState.Failed("ABANDON_FAILED", "cleanup retry")
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            val ready = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertFalse(ready.installOwnerActive)
+            assertEquals(1, repository.cancelInstallRequests)
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+        }
+
+    @Test
     fun `generated active install 취소는 install job과 coordinator를 먼저 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

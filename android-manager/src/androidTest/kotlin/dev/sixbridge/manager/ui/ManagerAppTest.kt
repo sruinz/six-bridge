@@ -286,6 +286,34 @@ class ManagerAppTest {
     }
 
     @Test
+    fun generated_cleanup_retryable_failures_disable_install_for_all_four_codes() {
+        var installState by mutableStateOf<dev.sixbridge.manager.install.InstallState>(
+            dev.sixbridge.manager.install.InstallState.Idle,
+        )
+        composeRule.setContent {
+            ManagerAppContent(
+                state = conversionResultState().copy(installState = installState),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        listOf(
+            "CLEANUP_FAILED",
+            "ABANDON_FAILED",
+            "SESSION_RECOVERY_FAILED",
+            "MISSING_OBSERVATION_RESET_FAILED",
+        ).forEach { code ->
+            composeRule.runOnIdle {
+                installState =
+                    dev.sixbridge.manager.install.InstallState.Failed(code, "cleanup retry")
+            }
+            composeRule.onNodeWithTag("conversion:install")
+                .assertIsNotEnabled()
+        }
+    }
+
+    @Test
     fun generated_bundle_share_grants_read_only_and_uses_bundle_mime() {
         val uri = Uri.parse("content://dev.sixbridge.manager.generated/result.six")
 
