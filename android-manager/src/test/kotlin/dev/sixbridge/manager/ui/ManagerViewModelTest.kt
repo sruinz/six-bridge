@@ -1911,6 +1911,69 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `save failure cleanup 실패도 generated owner를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val saveStarted = CompletableDeferred<Unit>()
+            val failureResult = CompletableDeferred<GeneratedDocumentSaveResult>()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(
+                repository,
+                savedState,
+                saveGeneratedDocument = { _, _, _ ->
+                    saveStarted.complete(Unit)
+                    try {
+                        CompletableDeferred<Unit>().await()
+                        error("save gate가 취소되어야 합니다.")
+                    } catch (_: CancellationException) {
+                        withContext(NonCancellable) {
+                            failureResult.await()
+                        }
+                    }
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = effect.token,
+                    destination = "content://save/failure-delete-failure.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            saveStarted.await()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            failureResult.complete(
+                GeneratedDocumentSaveResult.Failure(cleanupFailed = true),
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY),
+            )
+        }
+
+    @Test
     fun `결과 완료는 generated work와 retained review를 명시적으로 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

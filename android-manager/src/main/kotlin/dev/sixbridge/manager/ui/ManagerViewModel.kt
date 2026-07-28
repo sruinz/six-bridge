@@ -696,9 +696,14 @@ class ManagerViewModel(
                 conversionIoJob = null
                 conversionIoResult = null
             }
-            if (completedSave is GeneratedDocumentSaveResult.Cancelled &&
-                completedSave.cleanupFailed
-            ) {
+            val saveCleanupFailed = when (completedSave) {
+                is GeneratedDocumentSaveResult.Cancelled -> completedSave.cleanupFailed
+                is GeneratedDocumentSaveResult.Failure -> completedSave.cleanupFailed
+                GeneratedDocumentSaveResult.Success,
+                null,
+                -> false
+            }
+            if (saveCleanupFailed) {
                 generatedCleanup?.let {
                     clearPendingGeneratedCleanup()
                     updateGeneratedCleanupState(

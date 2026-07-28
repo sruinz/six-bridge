@@ -26,6 +26,7 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 
@@ -272,6 +273,8 @@ class GeneratedBundleStore internal constructor(
                 }
                 outputSha256
             }
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Throwable) {
             throw error.asStoreFailure(GeneratedBundleStoreErrorCode.COPY_FAILED)
         }

@@ -4,7 +4,20 @@ import android.content.ContentResolver
 import android.net.Uri
 import android.os.Bundle
 import androidx.test.core.app.ApplicationProvider
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
+import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.manager.app.ManagerRepository
+import dev.sixbridge.manager.conversion.GeneratedBundleStore
+import dev.sixbridge.manager.conversion.GeneratedBundleStoreHooks
+import dev.sixbridge.manager.conversion.GeneratedWrapperVerifier
+import dev.sixbridge.manager.packager.OnDeviceWrapperResult
+import java.io.File
 import java.io.IOException
+import java.io.OutputStream
+import java.lang.reflect.Proxy
+import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
@@ -163,6 +176,81 @@ class ConversionDocumentIoTest {
     }
 
     @Test
+    fun actual_store_repository_helper_cancellation_returns_cancelled_and_deletes_destination() {
+        val name = "actual-store-cancel"
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val filesDir = File(context.cacheDir, "actual-store-${UUID.randomUUID()}").apply {
+            check(mkdir())
+        }
+        val firstChunkCopied = CountDownLatch(1)
+        val releaseCopy = CountDownLatch(1)
+        val store = GeneratedBundleStore(
+            filesDir = filesDir,
+            wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            hooks = GeneratedBundleStoreHooks(
+                afterCopyChunk = {
+                    firstChunkCopied.countDown()
+                    check(releaseCopy.await(5, TimeUnit.SECONDS))
+                },
+            ),
+        )
+        val generated = store.publish(
+            ACTUAL_STORE_TOKEN,
+            generatedResult(filesDir),
+        )
+        val repository = Proxy.newProxyInstance(
+            ManagerRepository::class.java.classLoader,
+            arrayOf(ManagerRepository::class.java),
+        ) { _, method, arguments ->
+            when (method.name) {
+                "copyGeneratedConversion" -> store.copyTo(
+                    arguments[0] as String,
+                    arguments[1] as OutputStream,
+                )
+                else -> error("계측 copy 경계에서 ${method.name}은 사용하지 않습니다.")
+            }
+        } as ManagerRepository
+        val result = CompletableDeferred<Any>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        val saveJob = scope.launch {
+            try {
+                result.complete(
+                    writeGeneratedDocument(
+                        resolver = resolver,
+                        uri = uri(name),
+                        expectedHash = generated.sha256,
+                        copy = { output ->
+                            repository.copyGeneratedConversion(ACTUAL_STORE_TOKEN, output)
+                        },
+                    ),
+                )
+            } catch (error: Throwable) {
+                result.complete(error)
+            }
+        }
+
+        try {
+            assertTrue(firstChunkCopied.await(5, TimeUnit.SECONDS))
+            saveJob.cancel()
+        } finally {
+            releaseCopy.countDown()
+        }
+        val completed = runBlocking {
+            withTimeout(5_000) {
+                result.await()
+            }
+        }
+        scope.cancel()
+        filesDir.deleteRecursively()
+
+        assertEquals(
+            GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false),
+            completed,
+        )
+        assertFalse(exists(name))
+    }
+
+    @Test
     fun existing_longer_document_is_truncated_and_matches_generated_bytes() = runBlocking {
         val name = "truncate"
         val expected = "new-six".encodeToByteArray()
@@ -282,4 +370,63 @@ class ConversionDocumentIoTest {
 
     private fun exists(name: String): Boolean =
         resolver.call(uri(name), "exists", name, null)?.getBoolean("exists") == true
+
+    private fun generatedResult(filesDir: File): OnDeviceWrapperResult {
+        val wrapper = File(filesDir, "wrapper.apk").apply {
+            writeBytes(ByteArray(192 * 1_024) { index -> (index % 251).toByte() })
+        }
+        val wrapperSha256 = sha256(wrapper.readBytes())
+        val descriptor = ContractExtensionDescriptor(
+            schemaVersion = 1,
+            extensionId = "abcdefghijklmnopabcdefghijklmnop",
+            name = "Cancellation",
+            version = "1.0",
+            sourceKind = "ZIP",
+            crxSha256 = "a".repeat(64),
+            wrapperSha256 = wrapperSha256,
+            wrapperPackage = "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop",
+            wrapperVersionCode = 1,
+            signerSha256 = "b".repeat(64),
+        )
+        return OnDeviceWrapperResult(
+            extensionId = descriptor.extensionId,
+            packageName = descriptor.wrapperPackage,
+            versionCode = descriptor.wrapperVersionCode,
+            signerSha256 = descriptor.signerSha256,
+            crxSha256 = descriptor.crxSha256,
+            wrapperSha256 = wrapperSha256,
+            outputApk = wrapper,
+            descriptor = descriptor,
+            compatibility = ContractCompatibilityReport(
+                schemaVersion = 4,
+                status = ContractCompatibilityStatus.COMPATIBLE,
+                manifestVersion = 3,
+                extensionName = descriptor.name,
+                extensionVersion = descriptor.version,
+                manifestKeyPresent = false,
+                manifestKeyExtensionId = null,
+                declaredPermissions = emptyList(),
+                usedApis = emptyList(),
+                unsupportedApis = emptyList(),
+                issues = emptyList(),
+                conversionState = "passthrough",
+                adapterDecisions = emptyList(),
+                originalExtensionId = descriptor.extensionId,
+                convertedExtensionId = descriptor.extensionId,
+                sourceSha256 = "c".repeat(64),
+                browserProfileSha256 = "d".repeat(64),
+                originalSourceSha256 = "e".repeat(64),
+                planSha256 = "f".repeat(64),
+            ),
+        )
+    }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        const val ACTUAL_STORE_TOKEN = "11111111-1111-4111-8111-111111111111"
+    }
 }

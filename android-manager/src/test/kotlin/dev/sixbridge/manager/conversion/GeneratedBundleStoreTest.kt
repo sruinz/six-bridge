@@ -15,6 +15,7 @@ import java.nio.file.attribute.FileTime
 import java.lang.management.ManagementFactory
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import kotlin.test.assertContentEquals
@@ -242,6 +243,25 @@ class GeneratedBundleStoreTest {
 
         assertFailsWith<IllegalArgumentException> {
             store.copyTo(token, ByteArrayOutputStream())
+        }
+    }
+
+    @Test
+    fun `copy output cancellation은 store failure로 감싸지 않고 재전파한다`() {
+        val store = store()
+        store.publish(token, result())
+        val cancellingOutput = object : java.io.OutputStream() {
+            override fun write(value: Int) {
+                throw CancellationException("cancel copy")
+            }
+
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                throw CancellationException("cancel copy")
+            }
+        }
+
+        assertFailsWith<CancellationException> {
+            store.copyTo(token, cancellingOutput)
         }
     }
 
