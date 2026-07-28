@@ -28,7 +28,8 @@ class StartupCleanup(
         context.ensureActive()
         val pending = pendingStore.load()
         context.ensureActive()
-        val terminalAvailable = pendingStore.loadTerminalResult() != null
+        val terminal = pendingStore.loadTerminalResult()
+        val terminalAvailable = terminal != null
         context.ensureActive()
         val ownedSessions = bestEffort { installGateway.ownedSessions().toSet() }
 
@@ -38,7 +39,10 @@ class StartupCleanup(
         }
 
         val cleanup = if (terminalAvailable) {
-            CleanupDecision(pending?.importToken, ownedSessions)
+            CleanupDecision(
+                pending?.importToken ?: terminal.importToken,
+                ownedSessions,
+            )
         } else {
             decidePendingCleanup(pending, ownedSessions, context)
         }

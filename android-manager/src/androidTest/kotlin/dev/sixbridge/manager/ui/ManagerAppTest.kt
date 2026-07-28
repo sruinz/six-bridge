@@ -62,6 +62,7 @@ import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -1307,6 +1308,11 @@ private class CleanupRestoreUiRepository(
         cancelArguments += expectedReviewToken to expectedSessionId
         return InstallCleanupResult.Cleaned
     }
+
+    override suspend fun terminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallTerminalOwnerResult = InstallTerminalOwnerResult.OwnerMismatch
 
     override fun unknownSourcesSettings(): RepositoryLaunch =
         error("unexpected unknown sources navigation")

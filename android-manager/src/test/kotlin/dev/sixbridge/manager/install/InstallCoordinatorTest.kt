@@ -1183,6 +1183,60 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `pending 없는 terminal은 immutable token과 nullable session으로 owner를 증명한다`() =
+        runBlocking {
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Cancelled(SESSION_ID),
+                terminalAtEpochMillis = FINISHED_AT,
+                packageName = PACKAGE_NAME,
+                importToken = TOKEN,
+            )
+            val fixture = fixture(terminalResult = terminal)
+
+            fixture.coordinator.restore()
+
+            assertEquals(
+                InstallTerminalOwnerResult.OwnerSessionAssigned(
+                    sessionId = SESSION_ID,
+                    state = InstallState.Cancelled,
+                ),
+                fixture.coordinator.terminalForOwner(TOKEN, null),
+            )
+            assertEquals(
+                InstallTerminalOwnerResult.Owned(InstallState.Cancelled),
+                fixture.coordinator.terminalForOwner(TOKEN, SESSION_ID),
+            )
+            assertEquals(
+                InstallTerminalOwnerResult.OwnerMismatch,
+                fixture.coordinator.terminalForOwner(TOKEN, SESSION_ID + 1),
+            )
+            assertEquals(
+                InstallTerminalOwnerResult.OwnerMismatch,
+                fixture.coordinator.terminalForOwner(
+                    "22222222-2222-2222-2222-222222222222",
+                    SESSION_ID,
+                ),
+            )
+        }
+
+    @Test
+    fun `legacy token 없는 terminal은 generated owner 증명을 fail closed한다`() = runBlocking {
+        val terminal = PendingInstallResult(
+            result = PackageInstallResult.Cancelled(SESSION_ID),
+            terminalAtEpochMillis = FINISHED_AT,
+            packageName = PACKAGE_NAME,
+        )
+        val fixture = fixture(terminalResult = terminal)
+
+        fixture.coordinator.restore()
+
+        assertEquals(
+            InstallTerminalOwnerResult.OwnerMismatch,
+            fixture.coordinator.terminalForOwner(TOKEN, null),
+        )
+    }
+
+    @Test
     fun `cancel is a no-op after terminal states`() = runBlocking {
         val idleFixture = fixture()
         assertEquals(

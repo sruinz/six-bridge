@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.conversion
 
+import android.content.SharedPreferences
 import android.os.Bundle
 import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -11,6 +12,8 @@ import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
 import dev.sixbridge.manager.importer.ImportResult
+import dev.sixbridge.manager.install.PackageInstallResult
+import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
@@ -32,6 +35,7 @@ import dev.sixbridge.core.profile.WrapperContract
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.lang.reflect.Proxy
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -52,6 +56,54 @@ class CoreConversionRuntimeInstrumentedTest {
     private val testContext = InstrumentationRegistry.getInstrumentation().context
     private val targetContext =
         InstrumentationRegistry.getInstrumentation().targetContext
+
+    @Test
+    fun terminalImportTokenSchemaRoundTripsLegacyAndClear() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryPreferences = memorySharedPreferences()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = File(testContext.packageCodePath, "unused-imports"),
+        )
+        val token = "11111111-1111-1111-1111-111111111111"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .putString("package_name", packageName)
+                .putString("import_token", token)
+                .putLong("started_at", 1)
+                .commit(),
+        )
+        val pending = requireNotNull(store.load())
+        assertTrue(
+            store.recordTerminalResult(
+                PackageInstallResult.Cancelled(41),
+                terminalAtEpochMillis = 2,
+            ),
+        )
+
+        val terminal = requireNotNull(store.loadTerminalResult())
+        assertEquals(token, terminal.importToken)
+        assertEquals(token, recoveryPreferences.getString("result_import_token", null))
+        assertTrue(store.clearTerminalResult(terminal))
+        assertFalse(recoveryPreferences.contains("result_import_token"))
+        assertTrue(store.clear(pending))
+
+        assertTrue(
+            recoveryPreferences.edit()
+                .putInt("result_session_id", 42)
+                .putString("result_kind", "cancelled")
+                .putString("result_package_name", packageName)
+                .putLong("terminal_at", 3)
+                .commit(),
+        )
+        val legacy = requireNotNull(store.loadTerminalResult())
+        assertNull(legacy.importToken)
+        assertTrue(store.clearTerminalResult(legacy))
+        assertFalse(recoveryPreferences.contains("result_import_token"))
+    }
 
     @Test
     fun inputLeaseIsReleasedAfterDurableWorkHandoff() {
@@ -583,4 +635,88 @@ class CoreConversionRuntimeInstrumentedTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+}
+
+private fun memorySharedPreferences(): SharedPreferences {
+    val values = linkedMapOf<String, Any?>()
+
+    fun editor(): SharedPreferences.Editor {
+        val updates = linkedMapOf<String, Any?>()
+        val removals = linkedSetOf<String>()
+        var clear = false
+        lateinit var proxy: SharedPreferences.Editor
+
+        fun applyChanges() {
+            if (clear) values.clear()
+            removals.forEach(values::remove)
+            updates.forEach { (key, value) ->
+                if (value == null) values.remove(key) else values[key] = value
+            }
+        }
+
+        proxy = Proxy.newProxyInstance(
+            SharedPreferences.Editor::class.java.classLoader,
+            arrayOf(SharedPreferences.Editor::class.java),
+        ) { _, method, arguments ->
+            val args = arguments.orEmpty()
+            when (method.name) {
+                "putString", "putStringSet", "putInt", "putLong", "putFloat",
+                "putBoolean",
+                -> {
+                    updates[args[0] as String] = args[1]
+                    removals.remove(args[0] as String)
+                    proxy
+                }
+
+                "remove" -> {
+                    removals += args[0] as String
+                    updates.remove(args[0] as String)
+                    proxy
+                }
+
+                "clear" -> {
+                    clear = true
+                    updates.clear()
+                    removals.clear()
+                    proxy
+                }
+
+                "commit" -> {
+                    applyChanges()
+                    true
+                }
+
+                "apply" -> {
+                    applyChanges()
+                    null
+                }
+
+                else -> error("지원하지 않는 SharedPreferences.Editor 호출: ${method.name}")
+            }
+        } as SharedPreferences.Editor
+        return proxy
+    }
+
+    return Proxy.newProxyInstance(
+        SharedPreferences::class.java.classLoader,
+        arrayOf(SharedPreferences::class.java),
+    ) { _, method, arguments ->
+        val args = arguments.orEmpty()
+        when (method.name) {
+            "getAll" -> values.toMap()
+            "getString" -> values[args[0] as String] as? String ?: args[1]
+            "getStringSet" -> values[args[0] as String] as? Set<*> ?: args[1]
+            "getInt" -> values[args[0] as String] as? Int ?: args[1]
+            "getLong" -> values[args[0] as String] as? Long ?: args[1]
+            "getFloat" -> values[args[0] as String] as? Float ?: args[1]
+            "getBoolean" -> values[args[0] as String] as? Boolean ?: args[1]
+            "contains" -> values.containsKey(args[0] as String)
+            "edit" -> editor()
+            "registerOnSharedPreferenceChangeListener",
+            "unregisterOnSharedPreferenceChangeListener",
+            -> null
+
+            else -> error("지원하지 않는 SharedPreferences 호출: ${method.name}")
+        }
+    } as SharedPreferences
 }

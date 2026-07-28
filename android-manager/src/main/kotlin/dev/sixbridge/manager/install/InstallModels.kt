@@ -34,6 +34,7 @@ data class PendingInstallResult(
     val result: PackageInstallResult,
     val terminalAtEpochMillis: Long,
     val packageName: String = "",
+    val importToken: String? = null,
     val processed: Boolean = false,
 )
 
@@ -48,4 +49,13 @@ sealed interface InstallCleanupResult {
     data class OwnerSessionAssigned(val sessionId: Int) : InstallCleanupResult
     data object OwnerMismatch : InstallCleanupResult
     data object CleanupFailed : InstallCleanupResult
+}
+
+sealed interface InstallTerminalOwnerResult {
+    data class Owned(val state: InstallState) : InstallTerminalOwnerResult
+    data class OwnerSessionAssigned(
+        val sessionId: Int,
+        val state: InstallState,
+    ) : InstallTerminalOwnerResult
+    data object OwnerMismatch : InstallTerminalOwnerResult
 }

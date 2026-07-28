@@ -30,6 +30,7 @@ class InstallCoordinator(
 ) {
     private val mutex = Mutex()
     private var activeBundle: ImportedBundle? = null
+    private var terminalOwner: InstallTerminalOwner? = null
     private var volatileConfirmation: Pair<Int, String>? = null
     private val mutableState = MutableStateFlow<InstallState>(restoreState())
 
@@ -51,6 +52,7 @@ class InstallCoordinator(
             discardCompetingImport(bundle.token, existing?.importToken ?: activeBundle?.token)
             return@withLock mutableState.value
         }
+        terminalOwner = null
         val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
         } catch (error: CancellationException) {
@@ -168,6 +170,30 @@ class InstallCoordinator(
             volatileConfirmation = sessionId to pending.importToken
         }
         persisted
+    }
+
+    suspend fun terminalForOwner(
+        expectedImportToken: String,
+        expectedSessionId: Int?,
+    ): InstallTerminalOwnerResult = mutex.withLock {
+        val owner = terminalOwner ?: return InstallTerminalOwnerResult.OwnerMismatch
+        if (owner.importToken == null ||
+            owner.importToken != expectedImportToken ||
+            mutableState.value != owner.state
+        ) {
+            return InstallTerminalOwnerResult.OwnerMismatch
+        }
+        if (expectedSessionId == null) {
+            return InstallTerminalOwnerResult.OwnerSessionAssigned(
+                sessionId = owner.sessionId,
+                state = owner.state,
+            )
+        }
+        return if (expectedSessionId == owner.sessionId) {
+            InstallTerminalOwnerResult.Owned(owner.state)
+        } else {
+            InstallTerminalOwnerResult.OwnerMismatch
+        }
     }
 
     suspend fun cancel(
@@ -425,7 +451,9 @@ class InstallCoordinator(
             finishCompletedTerminalCleanup(inbox)
             return
         }
-        if (pending.sessionId != inbox.result.sessionId) {
+        if (pending.sessionId != inbox.result.sessionId ||
+            inbox.importToken?.let { it != pending.importToken } == true
+        ) {
             pendingStore.clearTerminalResult(inbox)
             return
         }
@@ -510,7 +538,7 @@ class InstallCoordinator(
             return
         }
         activeBundle = null
-        mutableState.value = when (val result = inbox.result) {
+        val next = when (val result = inbox.result) {
             is PackageInstallResult.Success -> {
                 if (inbox.packageName.isBlank()) {
                     InstallState.Failed(
@@ -525,6 +553,7 @@ class InstallCoordinator(
             is PackageInstallResult.Failure -> InstallState.Failed(result.code, result.message)
             is PackageInstallResult.PendingUserAction -> return
         }
+        publishTerminal(inbox, next)
     }
 
     private suspend fun verifyAndRecord(
@@ -691,7 +720,7 @@ class InstallCoordinator(
             return
         }
         activeBundle = null
-        mutableState.value = next
+        publishTerminal(cleanupInbox, next)
     }
 
     private fun abandonConfirmed(sessionId: Int): Boolean {
@@ -744,6 +773,24 @@ class InstallCoordinator(
         } else {
             InstallCleanupResult.CleanupFailed
         }
+
+    private fun publishTerminal(
+        inbox: PendingInstallResult,
+        state: InstallState,
+    ) {
+        terminalOwner = InstallTerminalOwner(
+            importToken = inbox.importToken,
+            sessionId = inbox.result.sessionId,
+            state = state,
+        )
+        mutableState.value = state
+    }
+
+    private data class InstallTerminalOwner(
+        val importToken: String?,
+        val sessionId: Int,
+        val state: InstallState,
+    )
 
     private fun PendingInstall.toState(): InstallState =
         if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)

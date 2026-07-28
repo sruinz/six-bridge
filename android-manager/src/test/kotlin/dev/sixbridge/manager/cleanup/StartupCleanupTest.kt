@@ -113,6 +113,7 @@ class StartupCleanupTest {
             result = PackageInstallResult.Success(41),
             terminalAtEpochMillis = now,
             packageName = PACKAGE_NAME,
+            importToken = pending.importToken,
         )
         val store = FakePendingStore(record = pending, terminal = terminal)
         val pendingDirectory = tokenDirectory(pending.importToken, now - DAY_MILLIS - 1)
@@ -123,6 +124,24 @@ class StartupCleanupTest {
         assertEquals(terminal, store.terminal)
         assertTrue(pendingDirectory.exists())
     }
+
+    @Test
+    fun `pending 없는 durable terminal의 immutable import token을 startup cleanup에서 보호한다`() =
+        runBlocking {
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Cancelled(41),
+                terminalAtEpochMillis = now,
+                packageName = PACKAGE_NAME,
+                importToken = EXPIRED_TOKEN,
+            )
+            val store = FakePendingStore(terminal = terminal)
+            val terminalImport = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+
+            cleanup(store = store).run()
+
+            assertTrue(terminalImport.exists())
+            assertEquals(terminal, store.terminal)
+        }
 
     @Test
     fun `abandons only owned sessions that are not the recoverable pending session`() = runBlocking {

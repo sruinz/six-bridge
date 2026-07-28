@@ -31,6 +31,7 @@ import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.PackageInstallCallback
 import dev.sixbridge.manager.install.PackageInstallEvents
 import dev.sixbridge.manager.install.PackageInstallResult
@@ -151,6 +152,10 @@ interface ManagerRepository {
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallCleanupResult
+    suspend fun terminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallTerminalOwnerResult
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
     suspend fun resumeAfterUnknownSourcesSettings()
@@ -325,6 +330,14 @@ internal class DefaultManagerRepository(
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallCleanupResult = installCoordinator.cancel(
+        expectedImportToken = expectedReviewToken,
+        expectedSessionId = expectedSessionId,
+    )
+
+    override suspend fun terminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallTerminalOwnerResult = installCoordinator.terminalForOwner(
         expectedImportToken = expectedReviewToken,
         expectedSessionId = expectedSessionId,
     )

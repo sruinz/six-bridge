@@ -28,6 +28,7 @@ import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -55,6 +56,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -4722,6 +4724,8 @@ class ManagerViewModelTest {
             val viewModel = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
             viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
             viewModel.accept(ManagerAction.CancelConversion)
             advanceUntilIdle()
             repository.cancelInstallOutcomes += InstallCleanupResult.OwnerSessionAssigned(41)
@@ -4736,6 +4740,246 @@ class ManagerViewModelTest {
             )
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
             assertNull(savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+        }
+
+    @Test
+    fun `generated promotion의 두 cancel 사이 exact terminal은 journal owner로 회수한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallOutcome = InstallCleanupResult.CleanupFailed
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+
+            repository.cancelInstallOutcome = null
+            repository.cancelInstallOutcomes += InstallCleanupResult.OwnerSessionAssigned(41)
+            repository.cancelInstallOutcomes += InstallCleanupResult.OwnerMismatch
+            repository.terminalStateOnCancelInstall = InstallState.Installed(PACKAGE)
+            repository.terminalStateOnCancelInstallRequest = 2
+            repository.yieldAfterTerminalStateOnCancelInstall = true
+            repository.terminalOwnerImportToken = TOKEN
+            repository.terminalOwnerSessionId = 41
+            repository.terminalOwnerState = InstallState.Installed(PACKAGE)
+            repository.terminalOwnerProofConfigured = true
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf(TOKEN to null, TOKEN to null, TOKEN to 41),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(savedState))
+            viewModel.accept(ManagerAction.GeneratedCleanupDestinationPresented(TOKEN))
+            advanceUntilIdle()
+            assertNull(generatedCleanupPhase(savedState))
+        }
+
+    @Test
+    fun `normal review promotion의 두 cancel 사이 exact terminal은 current owner로 회수한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                cancelInstallOutcomes += InstallCleanupResult.OwnerSessionAssigned(41)
+                cancelInstallOutcomes += InstallCleanupResult.OwnerMismatch
+                terminalStateOnCancelInstall = InstallState.Cancelled
+                terminalStateOnCancelInstallRequest = 1
+                yieldAfterTerminalStateOnCancelInstall = true
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = InstallState.Cancelled
+                terminalOwnerProofConfigured = true
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.CancelReview)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf(TOKEN to null, TOKEN to 41),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `promotion 사이 foreign terminal은 generated journal과 owner를 소비하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallOutcome = InstallCleanupResult.CleanupFailed
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+
+            repository.cancelInstallOutcome = null
+            repository.cancelInstallOutcomes += InstallCleanupResult.OwnerSessionAssigned(41)
+            repository.cancelInstallOutcomes += InstallCleanupResult.OwnerMismatch
+            repository.terminalStateOnCancelInstall = InstallState.Installed(PACKAGE)
+            repository.terminalStateOnCancelInstallRequest = 2
+            repository.yieldAfterTerminalStateOnCancelInstall = true
+            repository.terminalOwnerImportToken = SECOND_TOKEN
+            repository.terminalOwnerSessionId = 41
+            repository.terminalOwnerState = InstallState.Installed(PACKAGE)
+            repository.terminalOwnerProofConfigured = true
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals("INSTALL", generatedCleanupPhase(savedState))
+            assertEquals(41, generatedCleanupInstallSession(savedState))
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+        }
+
+    @Test
+    fun `startup foreign 또는 legacy terminal은 null-session generated owner를 소비하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallOutcome = InstallCleanupResult.CleanupFailed
+            }
+            val sourceState = SavedStateHandle()
+            val source = ManagerViewModel(sourceRepository, sourceState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value =
+                InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            source.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+            assertEquals("INSTALL", generatedCleanupPhase(sourceState))
+            assertNull(generatedCleanupInstallSession(sourceState))
+
+            listOf(
+                "foreign" to SECOND_TOKEN,
+                "legacy" to null,
+            ).forEach { (kind, terminalToken) ->
+                val deathState = generatedCleanupDeathSnapshot(sourceState)
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    )
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                    installFlow.value = InstallState.Installed(PACKAGE)
+                    terminalOwnerImportToken = terminalToken
+                    terminalOwnerSessionId = 41
+                    terminalOwnerState = InstallState.Installed(PACKAGE)
+                    terminalOwnerProofConfigured = true
+                }
+
+                val recreated = ManagerViewModel(repository, deathState)
+                advanceUntilIdle()
+
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    recreated.state.value.route,
+                    kind,
+                )
+                assertEquals("INSTALL", generatedCleanupPhase(deathState), kind)
+                assertNull(generatedCleanupInstallSession(deathState), kind)
+                assertNull(
+                    deathState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY),
+                    kind,
+                )
+                assertTrue(repository.discardedTokens.isEmpty(), kind)
+                assertTrue(repository.discardedConversions.isEmpty(), kind)
+            }
+        }
+
+    @Test
+    fun `startup exact terminal은 null-session generated journal을 promote하고 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallOutcome = InstallCleanupResult.CleanupFailed
+            }
+            val sourceState = SavedStateHandle()
+            val source = ManagerViewModel(sourceRepository, sourceState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value =
+                InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            source.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+            val deathState = generatedCleanupDeathSnapshot(sourceState)
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                installFlow.value = InstallState.Installed(PACKAGE)
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = InstallState.Installed(PACKAGE)
+                terminalOwnerProofConfigured = true
+            }
+
+            val recreated = ManagerViewModel(repository, deathState)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf(TOKEN to (null as Int?)),
+                repository.terminalOwnerArguments,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), recreated.state.value.route)
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(deathState))
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            recreated.accept(ManagerAction.GeneratedCleanupDestinationPresented(TOKEN))
+            advanceUntilIdle()
+            assertNull(generatedCleanupPhase(deathState))
+            assertNull(deathState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
         }
 
     @Test
@@ -6165,6 +6409,13 @@ private class FakeManagerRepository : ManagerRepository {
     var suspendCancelInstall = false
     var emitCancelledOnCancelInstall = false
     var terminalStateOnCancelInstall: InstallState? = null
+    var terminalStateOnCancelInstallRequest: Int? = null
+    var yieldAfterTerminalStateOnCancelInstall = false
+    var terminalOwnerImportToken: String? = null
+    var terminalOwnerSessionId: Int? = null
+    var terminalOwnerState: InstallState? = null
+    var terminalOwnerProofConfigured = false
+    val terminalOwnerArguments = mutableListOf<Pair<String, Int?>>()
     var cancelInstallResult = true
     var cancelInstallOutcome: InstallCleanupResult? = null
     val cancelInstallOutcomes = mutableListOf<InstallCleanupResult>()
@@ -6344,13 +6595,54 @@ private class FakeManagerRepository : ManagerRepository {
         if (suspendCancelInstall) cancelInstallGate.first()
         cancelInstallException?.let { throw it }
         if (emitCancelledOnCancelInstall) installFlow.value = InstallState.Cancelled
-        terminalStateOnCancelInstall?.let { installFlow.value = it }
+        if (terminalStateOnCancelInstallRequest == null ||
+            terminalStateOnCancelInstallRequest == cancelInstallRequests
+        ) {
+            terminalStateOnCancelInstall?.let {
+                installFlow.value = it
+                if (yieldAfterTerminalStateOnCancelInstall) yield()
+            }
+        }
         return cancelInstallOutcomes.removeFirstOrNull() ?: cancelInstallOutcome ?: if (
             cancelInstallResult
         ) {
             InstallCleanupResult.Cleaned
         } else {
             InstallCleanupResult.CleanupFailed
+        }
+    }
+
+    override suspend fun terminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+    ): InstallTerminalOwnerResult {
+        terminalOwnerArguments += expectedReviewToken to expectedSessionId
+        if (!terminalOwnerProofConfigured) {
+            val state = installFlow.value
+            return if (state is InstallState.Installed ||
+                state == InstallState.Cancelled ||
+                state is InstallState.Failed
+            ) {
+                InstallTerminalOwnerResult.Owned(state)
+            } else {
+                InstallTerminalOwnerResult.OwnerMismatch
+            }
+        }
+        val state = terminalOwnerState ?: return InstallTerminalOwnerResult.OwnerMismatch
+        val importToken =
+            terminalOwnerImportToken ?: return InstallTerminalOwnerResult.OwnerMismatch
+        val sessionId =
+            terminalOwnerSessionId ?: return InstallTerminalOwnerResult.OwnerMismatch
+        if (importToken != expectedReviewToken || installFlow.value != state) {
+            return InstallTerminalOwnerResult.OwnerMismatch
+        }
+        if (expectedSessionId == null) {
+            return InstallTerminalOwnerResult.OwnerSessionAssigned(sessionId, state)
+        }
+        return if (expectedSessionId == sessionId) {
+            InstallTerminalOwnerResult.Owned(state)
+        } else {
+            InstallTerminalOwnerResult.OwnerMismatch
         }
     }
 

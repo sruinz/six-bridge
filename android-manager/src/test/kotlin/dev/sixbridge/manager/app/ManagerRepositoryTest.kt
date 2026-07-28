@@ -34,6 +34,7 @@ import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.PackageInstallCallback
@@ -951,6 +952,56 @@ class ManagerRepositoryTest {
             assertEquals(InstallCleanupResult.OwnerMismatch, foreign)
             assertEquals(InstallCleanupResult.Cleaned, cleaned)
             assertNull(pendingStore.record)
+        }
+
+    @Test
+    fun `repository terminal owner proof는 coordinator의 immutable token과 session을 전달한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("terminal-owner-proof")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            val pendingStore = StartupPendingStore(null, root).apply {
+                terminal = PendingInstallResult(
+                    result = PackageInstallResult.Cancelled(41),
+                    terminalAtEpochMillis = 2,
+                    packageName = PACKAGE,
+                    importToken = TOKEN,
+                )
+            }
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            coordinator.restore()
+
+            assertEquals(
+                InstallTerminalOwnerResult.OwnerSessionAssigned(
+                    sessionId = 41,
+                    state = InstallState.Cancelled,
+                ),
+                repository.terminalForOwner(TOKEN, null),
+            )
+            assertEquals(
+                InstallTerminalOwnerResult.Owned(InstallState.Cancelled),
+                repository.terminalForOwner(TOKEN, 41),
+            )
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -2635,7 +2686,12 @@ private class StartupPendingStore(
             return false
         }
         if (terminal != null) return false
-        terminal = PendingInstallResult(result, terminalAtEpochMillis, pending.packageName)
+        terminal = PendingInstallResult(
+            result = result,
+            terminalAtEpochMillis = terminalAtEpochMillis,
+            packageName = pending.packageName,
+            importToken = pending.importToken,
+        )
         return true
     }
     override fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult? {

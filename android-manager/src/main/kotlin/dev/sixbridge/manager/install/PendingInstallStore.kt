@@ -29,7 +29,7 @@ interface PendingInstallStore {
     fun clearSessionMissingObservation(pending: PendingInstall): Boolean
 }
 
-class SharedPreferencesPendingInstallStore private constructor(
+class SharedPreferencesPendingInstallStore internal constructor(
     private val pendingPreferences: SharedPreferences,
     private val recoveryPreferences: SharedPreferences,
     private val importDirectory: File,
@@ -166,6 +166,7 @@ class SharedPreferencesPendingInstallStore private constructor(
             result = sanitize(result),
             terminalAtEpochMillis = terminalAtEpochMillis,
             packageName = pending.packageName,
+            importToken = pending.importToken,
         )
         val existing = loadTerminalLocked()
         if (existing != null) {
@@ -175,6 +176,7 @@ class SharedPreferencesPendingInstallStore private constructor(
             .putInt(KEY_RESULT_SESSION_ID, sanitized.result.sessionId)
             .putString(KEY_RESULT_KIND, sanitized.result.kind())
             .putString(KEY_RESULT_PACKAGE_NAME, sanitized.packageName)
+            .putString(KEY_RESULT_IMPORT_TOKEN, sanitized.importToken)
             .putLong(KEY_TERMINAL_AT, sanitized.terminalAtEpochMillis)
             .remove(KEY_RESULT_PROCESSED)
             .remove(KEY_CONFIRMATION_SESSION_ID)
@@ -210,6 +212,7 @@ class SharedPreferencesPendingInstallStore private constructor(
                 .remove(KEY_RESULT_CODE)
                 .remove(KEY_RESULT_MESSAGE)
                 .remove(KEY_RESULT_PACKAGE_NAME)
+                .remove(KEY_RESULT_IMPORT_TOKEN)
                 .remove(KEY_RESULT_PROCESSED)
                 .remove(KEY_CONFIRMATION_SESSION_ID)
                 .remove(KEY_TERMINAL_AT)
@@ -317,6 +320,8 @@ class SharedPreferencesPendingInstallStore private constructor(
         val terminalAt = recoveryPreferences.getLong(KEY_TERMINAL_AT, -1)
         val packageName = recoveryPreferences.getString(KEY_RESULT_PACKAGE_NAME, null).orEmpty()
         if (sessionId < 0 || terminalAt <= 0 || !PACKAGE_NAME.matches(packageName)) return null
+        val importToken = recoveryPreferences.getString(KEY_RESULT_IMPORT_TOKEN, null)
+            ?.takeIf(::isCanonicalToken)
         val result = when (recoveryPreferences.getString(KEY_RESULT_KIND, null)) {
             RESULT_SUCCESS -> PackageInstallResult.Success(sessionId)
             RESULT_CANCELLED -> PackageInstallResult.Cancelled(sessionId)
@@ -335,6 +340,7 @@ class SharedPreferencesPendingInstallStore private constructor(
             result = result,
             terminalAtEpochMillis = terminalAt,
             packageName = packageName,
+            importToken = importToken,
             processed = recoveryPreferences.getBoolean(KEY_RESULT_PROCESSED, false),
         )
     }
@@ -423,6 +429,7 @@ class SharedPreferencesPendingInstallStore private constructor(
         const val KEY_RESULT_CODE = "result_code"
         const val KEY_RESULT_MESSAGE = "result_message"
         const val KEY_RESULT_PACKAGE_NAME = "result_package_name"
+        const val KEY_RESULT_IMPORT_TOKEN = "result_import_token"
         const val KEY_RESULT_PROCESSED = "result_processed"
         const val KEY_CONFIRMATION_SESSION_ID = "confirmation_session_id"
         const val KEY_TERMINAL_AT = "terminal_at"
