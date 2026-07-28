@@ -23,6 +23,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -39,6 +40,13 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.put
 
 class ManagerViewModel(
     private val repository: ManagerRepository,
@@ -87,6 +95,7 @@ class ManagerViewModel(
         savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY]
     private var generatedResultReviewToken: String? =
         savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY]
+    private var generatedCleanupRestoreInvalid = false
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
     private var quarantinedGeneratedCleanup = restoreQuarantinedGeneratedCleanup()
     private var generatedCleanupJob: Job? = null
@@ -762,6 +771,7 @@ class ManagerViewModel(
                             } else {
                                 GeneratedCleanupPhase.CONVERSION
                             },
+                            installSessionId = null,
                         ),
                     )
                 }
@@ -991,6 +1001,9 @@ class ManagerViewModel(
             }
             val pendingCleanup = pendingGeneratedCleanup
             val ready = mutableState.value.conversionState as? ConversionUiState.ResultReady
+            if (generatedCleanupRestoreInvalid && ready != null) {
+                showGeneratedCleanupFailure()
+            }
             if (pendingCleanup != null &&
                 ready?.token == pendingCleanup.token &&
                 pendingCleanup.phase in setOf(
@@ -1933,14 +1946,9 @@ class ManagerViewModel(
     }
 
     private fun advanceGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+        savedStateHandle[GENERATED_CLEANUP_JOURNAL_KEY] =
+            encodePendingGeneratedCleanup(cleanup)
         pendingGeneratedCleanup = cleanup
-        savedStateHandle[GENERATED_CLEANUP_TOKEN_KEY] = cleanup.token
-        savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = cleanup.reviewToken
-        savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = cleanup.phase.name
-        savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY] = cleanup.destination.kind
-        savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = cleanup.destination.packageName
-        savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] =
-            cleanup.installSessionId
     }
 
     private suspend fun performPendingGeneratedCleanup(): Boolean {
@@ -2239,27 +2247,58 @@ class ManagerViewModel(
     }
 
     private fun restorePendingGeneratedCleanup(): PendingGeneratedCleanup? {
-        val token = savedStateHandle.get<String>(GENERATED_CLEANUP_TOKEN_KEY)
-            ?: return null
-        val phase = savedStateHandle.get<String>(GENERATED_CLEANUP_PHASE_KEY)
-            ?.let { runCatching { GeneratedCleanupPhase.valueOf(it) }.getOrNull() }
-            ?: return null
-        val destination = GeneratedCleanupDestination.restore(
-            kind = savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY],
-            packageName = savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY],
-        ) ?: return null
-        return PendingGeneratedCleanup(
-            token = token,
-            reviewToken = savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY],
-            phase = phase,
-            destination = destination,
-            installSessionId =
-                savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY],
-        )
+        savedStateHandle.get<String>(GENERATED_CLEANUP_JOURNAL_KEY)?.let { encoded ->
+            return decodePendingGeneratedCleanup(encoded).also {
+                generatedCleanupRestoreInvalid = it == null
+            }
+        }
+        if (!hasLegacyGeneratedCleanup()) return null
+        val cleanup = restoreLegacyPendingGeneratedCleanup()
+        if (cleanup == null) {
+            generatedCleanupRestoreInvalid = true
+            return null
+        }
+        savedStateHandle[GENERATED_CLEANUP_JOURNAL_KEY] =
+            encodePendingGeneratedCleanup(cleanup)
+        clearLegacyGeneratedCleanup()
+        return cleanup
     }
 
     private fun clearPendingGeneratedCleanup() {
+        clearLegacyGeneratedCleanup()
+        savedStateHandle[GENERATED_CLEANUP_JOURNAL_KEY] = null
+        generatedCleanupRestoreInvalid = false
         pendingGeneratedCleanup = null
+    }
+
+    private fun hasLegacyGeneratedCleanup(): Boolean =
+        GENERATED_CLEANUP_LEGACY_KEYS.any { savedStateHandle.get<Any>(it) != null }
+
+    private fun restoreLegacyPendingGeneratedCleanup(): PendingGeneratedCleanup? =
+        runCatching {
+            PendingGeneratedCleanup(
+                token = requireNotNull(
+                    savedStateHandle.get<String>(GENERATED_CLEANUP_TOKEN_KEY),
+                ),
+                reviewToken =
+                    savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY],
+                phase = GeneratedCleanupPhase.valueOf(
+                    requireNotNull(
+                        savedStateHandle.get<String>(GENERATED_CLEANUP_PHASE_KEY),
+                    ),
+                ),
+                destination = requireNotNull(
+                    GeneratedCleanupDestination.restore(
+                        kind = savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY],
+                        packageName = savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY],
+                    ),
+                ),
+                installSessionId =
+                    savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY],
+            ).also { require(it.isValid()) }
+        }.getOrNull()
+
+    private fun clearLegacyGeneratedCleanup() {
         savedStateHandle[GENERATED_CLEANUP_TOKEN_KEY] = null
         savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = null
         savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = null
@@ -2267,6 +2306,71 @@ class ManagerViewModel(
         savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = null
         savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] = null
     }
+
+    private fun encodePendingGeneratedCleanup(cleanup: PendingGeneratedCleanup): String {
+        require(cleanup.isValid())
+        return buildJsonObject {
+            put("version", GENERATED_CLEANUP_JOURNAL_VERSION)
+            put("token", cleanup.token)
+            put(
+                "reviewToken",
+                cleanup.reviewToken?.let(::JsonPrimitive) ?: JsonNull,
+            )
+            put("phase", cleanup.phase.name)
+            put(
+                "destination",
+                buildJsonObject {
+                    put("kind", cleanup.destination.kind)
+                    put(
+                        "packageName",
+                        cleanup.destination.packageName?.let(::JsonPrimitive) ?: JsonNull,
+                    )
+                },
+            )
+            put(
+                "installSessionId",
+                cleanup.installSessionId?.let(::JsonPrimitive) ?: JsonNull,
+            )
+        }.toString()
+    }
+
+    private fun decodePendingGeneratedCleanup(encoded: String): PendingGeneratedCleanup? =
+        runCatching {
+            val root = Json.parseToJsonElement(encoded) as? JsonObject
+                ?: error("cleanup journal root")
+            require(root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS)
+            require(
+                root.requiredInt("version") == GENERATED_CLEANUP_JOURNAL_VERSION,
+            )
+            val destination = root.getValue("destination") as? JsonObject
+                ?: error("cleanup destination")
+            require(destination.keys == GENERATED_CLEANUP_DESTINATION_FIELDS)
+            PendingGeneratedCleanup(
+                token = root.requiredString("token"),
+                reviewToken = root.nullableString("reviewToken"),
+                phase = GeneratedCleanupPhase.valueOf(root.requiredString("phase")),
+                destination = requireNotNull(
+                    GeneratedCleanupDestination.restore(
+                        kind = destination.requiredString("kind"),
+                        packageName = destination.nullableString("packageName"),
+                    ),
+                ),
+                installSessionId = root.nullableInt("installSessionId"),
+            ).also { require(it.isValid()) }
+        }.getOrNull()
+
+    private fun PendingGeneratedCleanup.isValid(): Boolean =
+        token.isCanonicalUuid() &&
+            (reviewToken == null || reviewToken.isCanonicalUuid()) &&
+            destination.isValid() &&
+            when (phase) {
+                GeneratedCleanupPhase.INSTALL ->
+                    installSessionId == null || installSessionId >= 0
+                GeneratedCleanupPhase.REVIEW ->
+                    reviewToken != null && installSessionId == null
+                GeneratedCleanupPhase.CONVERSION ->
+                    reviewToken == null && installSessionId == null
+            }
 
     private fun clearGeneratedInstallOwner() {
         generatedInstallOwnerToken = null
@@ -2369,6 +2473,7 @@ class ManagerViewModel(
         const val GENERATED_CLEANUP_PACKAGE_KEY = "generated_cleanup_package"
         const val GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY =
             "generated_cleanup_install_session_id"
+        const val GENERATED_CLEANUP_JOURNAL_KEY = "generated_cleanup_journal"
         const val QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY =
             "quarantined_generated_cleanup_token"
         const val QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY =
@@ -2391,6 +2496,27 @@ class ManagerViewModel(
             "ABANDON_FAILED",
             "SESSION_RECOVERY_FAILED",
             "MISSING_OBSERVATION_RESET_FAILED",
+        )
+        private const val GENERATED_CLEANUP_JOURNAL_VERSION = 1
+        private val GENERATED_CLEANUP_JOURNAL_FIELDS = setOf(
+            "version",
+            "token",
+            "reviewToken",
+            "phase",
+            "destination",
+            "installSessionId",
+        )
+        private val GENERATED_CLEANUP_DESTINATION_FIELDS = setOf(
+            "kind",
+            "packageName",
+        )
+        private val GENERATED_CLEANUP_LEGACY_KEYS = setOf(
+            GENERATED_CLEANUP_TOKEN_KEY,
+            GENERATED_CLEANUP_REVIEW_TOKEN_KEY,
+            GENERATED_CLEANUP_PHASE_KEY,
+            GENERATED_CLEANUP_DESTINATION_KEY,
+            GENERATED_CLEANUP_PACKAGE_KEY,
+            GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
         )
     }
 }
@@ -2435,6 +2561,12 @@ private data class GeneratedCleanupDestination(
         else -> error("지원하지 않는 generated cleanup destination입니다.")
     }
 
+    fun isValid(): Boolean = when (kind) {
+        HOME, INPUT -> packageName == null
+        REPORT -> packageName?.matches(ANDROID_PACKAGE_NAME) == true
+        else -> false
+    }
+
     companion object {
         private const val HOME = "HOME"
         private const val INPUT = "INPUT"
@@ -2456,6 +2588,40 @@ private data class GeneratedCleanupDestination(
             }
     }
 }
+
+private fun JsonObject.requiredString(key: String): String {
+    val primitive = getValue(key) as? JsonPrimitive ?: error("string: $key")
+    require(primitive.isString)
+    return primitive.content
+}
+
+private fun JsonObject.nullableString(key: String): String? {
+    val value = getValue(key)
+    if (value is JsonNull) return null
+    val primitive = value as? JsonPrimitive ?: error("nullable string: $key")
+    require(primitive.isString)
+    return primitive.content
+}
+
+private fun JsonObject.requiredInt(key: String): Int {
+    val primitive = getValue(key) as? JsonPrimitive ?: error("int: $key")
+    require(!primitive.isString)
+    return requireNotNull(primitive.intOrNull)
+}
+
+private fun JsonObject.nullableInt(key: String): Int? {
+    val value = getValue(key)
+    if (value is JsonNull) return null
+    val primitive = value as? JsonPrimitive ?: error("nullable int: $key")
+    require(!primitive.isString)
+    return requireNotNull(primitive.intOrNull)
+}
+
+private fun String.isCanonicalUuid(): Boolean =
+    runCatching { UUID.fromString(this).toString() == this }.getOrDefault(false)
+
+private val ANDROID_PACKAGE_NAME =
+    Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+")
 
 private fun ConversionBeginResult.AnalysisReady.toUiState() =
     ConversionUiState.AnalysisReady(

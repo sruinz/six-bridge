@@ -59,6 +59,13 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -2645,7 +2652,7 @@ class ManagerViewModelTest {
             assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
 
             repository.lifecycleEvents.clear()
@@ -2663,7 +2670,7 @@ class ManagerViewModelTest {
             assertTrue(repository.generatedExists)
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             assertEquals(false, repository.restoreConversionImportReviewRequests.last())
         }
@@ -2817,7 +2824,7 @@ class ManagerViewModelTest {
             assertTrue(repository.discardedConversions.isEmpty())
             assertEquals(
                 "REVIEW",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             val failed = assertIs<ConversionUiState.ResultReady>(
                 viewModel.state.value.conversionState,
@@ -2865,7 +2872,7 @@ class ManagerViewModelTest {
             assertEquals(2, repository.discardedConversions.size)
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             val failed = assertIs<ConversionUiState.ResultReady>(
                 viewModel.state.value.conversionState,
@@ -2906,7 +2913,7 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             repository.discardConversionResult = true
             repository.restoredConversion = null
@@ -2938,7 +2945,7 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
 
             savedState[ManagerViewModel.CONVERSION_TOKEN_KEY] = SECOND_TOKEN
@@ -3064,7 +3071,7 @@ class ManagerViewModelTest {
             source.accept(ManagerAction.CancelConversion)
             dispatcher.scheduler.runCurrent()
 
-            savedState[ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            rewriteGeneratedCleanupReviewToken(savedState, SECOND_TOKEN)
             savedState[ManagerViewModel.CONVERSION_TOKEN_KEY] = SECOND_TOKEN
             savedState[ManagerViewModel.CONVERSION_ROUTE_KEY] = "result"
             savedState[ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
@@ -3145,7 +3152,7 @@ class ManagerViewModelTest {
             source.accept(ManagerAction.CancelConversion)
             dispatcher.scheduler.runCurrent()
 
-            savedState[ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = SECOND_TOKEN
+            rewriteGeneratedCleanupReviewToken(savedState, SECOND_TOKEN)
             savedState[ManagerViewModel.CONVERSION_TOKEN_KEY] = SECOND_TOKEN
             savedState[ManagerViewModel.CONVERSION_ROUTE_KEY] = "result"
             savedState[ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
@@ -3316,7 +3323,8 @@ class ManagerViewModelTest {
                 )
                 suspendInstall = true
             }
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
             viewModel.accept(ManagerAction.PrepareGeneratedInstall)
             viewModel.accept(ManagerAction.InstallReviewedBundle)
@@ -3338,6 +3346,7 @@ class ManagerViewModelTest {
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(savedState.get<String>(CLEANUP_JOURNAL_KEY))
         }
 
     @Test
@@ -3406,6 +3415,236 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `torn legacy cleanup은 current owner를 보존하고 retry를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                mapOf<String, Any?>(
+                    ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY to "REVIEW",
+                    ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY to "HOME",
+                    ManagerViewModel.GENERATED_CLEANUP_PACKAGE_KEY to null,
+                    ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY to 41,
+                ),
+                mapOf<String, Any?>(
+                    ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY to "REVIEW",
+                    ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY to "REPORT",
+                    ManagerViewModel.GENERATED_CLEANUP_PACKAGE_KEY to null,
+                    ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY to 41,
+                ),
+            ).forEach { legacy ->
+                val savedState = generatedInstallSavedState(legacy)
+                val repository = currentGeneratedInstallRepository()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+
+                val messageKind = viewModel.state.value.message?.kind
+                viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+                advanceUntilIdle()
+
+                assertEquals(
+                    TOKEN,
+                    savedState.get<String>(
+                        ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                    ),
+                )
+                assertEquals(UserMessageKind.CONVERSION_CLEANUP_FAILED, messageKind)
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    viewModel.state.value.route,
+                )
+                assertEquals(41, savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+                assertEquals(0, repository.cancelInstallRequests)
+                assertTrue(repository.discardedTokens.isEmpty())
+                assertTrue(repository.discardedConversions.isEmpty())
+            }
+        }
+
+    @Test
+    fun `single cleanup journal Installed supersede는 persistence key 하나만 commit한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            var persistedSnapshot: SavedStateHandle? = null
+            val viewModel = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedInstallCleanupTransitionPersisted = {
+                    persistedSnapshot = generatedCleanupDeathSnapshot(savedState)
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            val before = generatedCleanupPersistenceValues(savedState)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            val deathState = requireNotNull(persistedSnapshot)
+            val after = generatedCleanupPersistenceValues(deathState)
+            assertEquals(
+                setOf(CLEANUP_JOURNAL_KEY),
+                after.keys.filterTo(mutableSetOf()) { before[it] != after[it] },
+            )
+            val journal = Json.parseToJsonElement(
+                requireNotNull(deathState.get<String>(CLEANUP_JOURNAL_KEY)),
+            ).jsonObject
+            assertEquals(1, journal.getValue("version").jsonPrimitive.int)
+            assertEquals("REVIEW", journal.getValue("phase").jsonPrimitive.content)
+            val destination = journal.getValue("destination").jsonObject
+            assertEquals("REPORT", destination.getValue("kind").jsonPrimitive.content)
+            assertEquals(PACKAGE, destination.getValue("packageName").jsonPrimitive.content)
+            assertEquals(
+                TOKEN,
+                deathState.get<String>(ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY),
+            )
+            assertEquals(41, deathState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+
+            val recreated = ManagerViewModel(currentGeneratedInstallRepository(), deathState)
+            advanceUntilIdle()
+            recreated.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), recreated.state.value.route)
+        }
+
+    @Test
+    fun `single cleanup journal INSTALL cancel transition은 exact HOME을 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            source.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            val before = generatedCleanupPersistenceValues(savedState)
+            val dying = ManagerViewModel(
+                repository = currentGeneratedInstallRepository(),
+                savedStateHandle = savedState,
+                afterGeneratedInstallCleanupTransitionPersisted = {
+                    error("simulated process death")
+                },
+            )
+            advanceUntilIdle()
+            dying.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            val after = generatedCleanupPersistenceValues(savedState)
+            assertEquals(
+                setOf(CLEANUP_JOURNAL_KEY),
+                after.keys.filterTo(mutableSetOf()) { before[it] != after[it] },
+            )
+            val journal = Json.parseToJsonElement(
+                requireNotNull(savedState.get<String>(CLEANUP_JOURNAL_KEY)),
+            ).jsonObject
+            assertEquals("REVIEW", journal.getValue("phase").jsonPrimitive.content)
+            assertEquals(
+                "HOME",
+                journal.getValue("destination").jsonObject
+                    .getValue("kind").jsonPrimitive.content,
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY),
+            )
+
+            val recreated = ManagerViewModel(currentGeneratedInstallRepository(), savedState)
+            advanceUntilIdle()
+            recreated.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, recreated.state.value.route)
+        }
+
+    @Test
+    fun `invalid cleanup journal은 valid legacy fallback 없이 owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                "{broken",
+                """{"version":99}""",
+            ).forEach { invalidJournal ->
+                val legacy = mapOf<String, Any?>(
+                    ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY to "INSTALL",
+                    ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY to "HOME",
+                    ManagerViewModel.GENERATED_CLEANUP_PACKAGE_KEY to null,
+                    ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY to 41,
+                    CLEANUP_JOURNAL_KEY to invalidJournal,
+                )
+                val savedState = generatedInstallSavedState(legacy)
+                val repository = currentGeneratedInstallRepository()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+
+                assertEquals(
+                    UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                    viewModel.state.value.message?.kind,
+                )
+                viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+                advanceUntilIdle()
+
+                assertEquals(invalidJournal, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+                assertEquals(
+                    TOKEN,
+                    savedState.get<String>(
+                        ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                    ),
+                )
+                assertEquals(0, repository.cancelInstallRequests)
+                assertTrue(repository.discardedTokens.isEmpty())
+                assertTrue(repository.discardedConversions.isEmpty())
+            }
+        }
+
+    @Test
+    fun `single cleanup journal absent valid legacy는 migration 뒤 old keys를 지운다`() =
+        runTest(dispatcher.scheduler) {
+            val legacy = mapOf<String, Any?>(
+                ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY to TOKEN,
+                ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY to "INSTALL",
+                ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY to "HOME",
+                ManagerViewModel.GENERATED_CLEANUP_PACKAGE_KEY to null,
+                ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY to 41,
+            )
+            val savedState = generatedInstallSavedState(legacy)
+            ManagerViewModel(currentGeneratedInstallRepository(), savedState)
+            advanceUntilIdle()
+
+            val journal = Json.parseToJsonElement(
+                requireNotNull(savedState.get<String>(CLEANUP_JOURNAL_KEY)),
+            ).jsonObject
+            assertEquals(1, journal.getValue("version").jsonPrimitive.int)
+            assertEquals("INSTALL", journal.getValue("phase").jsonPrimitive.content)
+            generatedCleanupLegacyKeys().forEach { key ->
+                assertNull(savedState.get<Any>(key), "key=$key")
+            }
+        }
+
+    @Test
     fun `pending INSTALL same session terminal은 cancel 재호출 없이 destination을 supersede한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
@@ -3430,7 +3669,7 @@ class ManagerViewModelTest {
                 dispatcher.scheduler.runCurrent()
                 assertEquals(
                     "INSTALL",
-                    savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                    generatedCleanupPhase(savedState),
                 )
 
                 repository.installFlow.value = terminal
@@ -3486,7 +3725,7 @@ class ManagerViewModelTest {
 
             assertEquals(
                 "REVIEW",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             assertEquals(
                 TOKEN,
@@ -3545,14 +3784,12 @@ class ManagerViewModelTest {
 
                 assertEquals(
                     "INSTALL",
-                    savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                    generatedCleanupPhase(savedState),
                     "code=$code",
                 )
                 assertEquals(
                     41,
-                    savedState.get<Int>(
-                        ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
-                    ),
+                    generatedCleanupInstallSession(savedState),
                     "code=$code",
                 )
                 assertEquals(
@@ -3595,9 +3832,7 @@ class ManagerViewModelTest {
 
             assertEquals(
                 41,
-                savedState.get<Int>(
-                    ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
-                ),
+                generatedCleanupInstallSession(savedState),
             )
         }
 
@@ -3858,7 +4093,7 @@ class ManagerViewModelTest {
             assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
             assertEquals(
                 "CONVERSION",
-                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+                generatedCleanupPhase(savedState),
             )
             assertTrue(repository.generatedExists)
         }
@@ -4389,6 +4624,91 @@ class ManagerViewModelTest {
         suggestedFileName = "확장.six",
     )
 
+    private fun generatedInstallSavedState(
+        cleanupValues: Map<String, Any?>,
+    ) = SavedStateHandle(
+        mapOf(
+            ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+            ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+            ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+        ) + cleanupValues,
+    )
+
+    private fun currentGeneratedInstallRepository() = FakeManagerRepository().apply {
+        restoreResult = ManagerRestoreResult(
+            review = review(ContractCompatibilityStatus.COMPATIBLE),
+            installSessionId = 41,
+        )
+        restoredConversion = RestoredConversion.BundleReady(
+            review(ContractCompatibilityStatus.COMPATIBLE),
+            generatedBundle(),
+        )
+        installFlow.value = InstallState.AwaitingUserApproval(41)
+    }
+
+    private fun generatedCleanupPersistenceValues(
+        savedState: SavedStateHandle,
+    ): Map<String, Any?> = (generatedCleanupLegacyKeys() + CLEANUP_JOURNAL_KEY).associateWith {
+        savedState.get<Any>(it)
+    }
+
+    private fun generatedCleanupPhase(savedState: SavedStateHandle): String? =
+        generatedCleanupJournal(savedState)
+            ?.get("phase")
+            ?.jsonPrimitive
+            ?.contentOrNull
+
+    private fun generatedCleanupInstallSession(savedState: SavedStateHandle): Int? =
+        generatedCleanupJournal(savedState)
+            ?.get("installSessionId")
+            ?.jsonPrimitive
+            ?.contentOrNull
+            ?.toIntOrNull()
+
+    private fun generatedCleanupJournal(savedState: SavedStateHandle) =
+        savedState.get<String>(CLEANUP_JOURNAL_KEY)
+            ?.let(Json::parseToJsonElement)
+            ?.jsonObject
+
+    private fun rewriteGeneratedCleanupReviewToken(
+        savedState: SavedStateHandle,
+        reviewToken: String,
+    ) {
+        val journal = requireNotNull(generatedCleanupJournal(savedState))
+        savedState[CLEANUP_JOURNAL_KEY] =
+            JsonObject(journal + ("reviewToken" to JsonPrimitive(reviewToken))).toString()
+    }
+
+    private fun generatedCleanupDeathSnapshot(
+        savedState: SavedStateHandle,
+    ) = SavedStateHandle(
+        (
+            setOf(
+                ManagerViewModel.REVIEW_TOKEN_KEY,
+                ManagerViewModel.INSTALL_SESSION_ID_KEY,
+                ManagerViewModel.CONVERSION_TOKEN_KEY,
+                ManagerViewModel.CONVERSION_ROUTE_KEY,
+                ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY,
+                ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY,
+                ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                CLEANUP_JOURNAL_KEY,
+            ) + generatedCleanupLegacyKeys()
+        ).associateWith { savedState.get<Any>(it) },
+    )
+
+    private fun generatedCleanupLegacyKeys() = setOf(
+        ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY,
+        ManagerViewModel.GENERATED_CLEANUP_REVIEW_TOKEN_KEY,
+        ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY,
+        ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY,
+        ManagerViewModel.GENERATED_CLEANUP_PACKAGE_KEY,
+        ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
+    )
+
     private fun documentSaver(
         output: OutputStream,
     ): suspend (String, String, (OutputStream) -> String?) -> GeneratedDocumentSaveResult =
@@ -4500,6 +4820,7 @@ class ManagerViewModelTest {
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
         const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
+        const val CLEANUP_JOURNAL_KEY = "generated_cleanup_journal"
         val EXTENSION_ID = "a".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
         val SECOND_PACKAGE = "$PACKAGE.second"
