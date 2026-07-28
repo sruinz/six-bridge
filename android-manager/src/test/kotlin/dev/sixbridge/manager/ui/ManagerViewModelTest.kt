@@ -2431,6 +2431,221 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `pending INSTALL Retry는 cancelInstall을 다시 호출하고 cleanup을 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            repository.cancelInstallResult = true
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(2, repository.cancelInstallRequests)
+            assertEquals(
+                listOf(
+                    "cancelInstall",
+                    "cancelInstall",
+                    "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
+                ),
+                repository.lifecycleEvents,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `pending INSTALL cleanup은 exact install session을 durable 저장한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                41,
+                savedState.get<Int>(
+                    ManagerViewModel.GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY,
+                ),
+            )
+        }
+
+    @Test
+    fun `pending INSTALL Retry는 session 불일치면 cancelInstall을 호출하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            savedState[ManagerViewModel.INSTALL_SESSION_ID_KEY] = 42
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.cancelInstallRequests)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `pending INSTALL Retry는 token owner 불일치면 cancelInstall을 호출하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            source.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            savedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+
+            val recreatedRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+            val recreated = ManagerViewModel(recreatedRepository, savedState)
+            advanceUntilIdle()
+
+            recreated.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(0, recreatedRepository.cancelInstallRequests)
+            assertTrue(recreatedRepository.discardedTokens.isEmpty())
+            assertTrue(recreatedRepository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `pending INSTALL recreation은 cleanup Retry message를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            sourceRepository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            source.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            val recreatedRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+            val recreated = ManagerViewModel(recreatedRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                recreated.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                recreated.state.value.message?.recoveryAction,
+            )
+        }
+
+    @Test
+    fun `pending REVIEW recreation은 cleanup Retry message를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val sourceRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val source = ManagerViewModel(sourceRepository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            val recreatedRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val recreated = ManagerViewModel(recreatedRepository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                recreated.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                recreated.state.value.message?.recoveryAction,
+            )
+        }
+
+    @Test
     fun `generated active install cancel 예외는 review와 conversion owner를 보존한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -2456,6 +2671,32 @@ class ManagerViewModelTest {
             assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `pending INSTALL cancel 예외 뒤 Retry는 exact session cancel을 다시 호출한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallException = IllegalStateException("cancel failed")
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            repository.cancelInstallException = null
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(2, repository.cancelInstallRequests)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
         }
 
     @Test

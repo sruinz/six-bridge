@@ -637,6 +637,11 @@ class ManagerViewModel(
                     GeneratedCleanupPhase.CONVERSION
                 },
                 destination = GeneratedCleanupDestination.fromRoute(destination),
+                installSessionId = if (generatedInstallOwned) {
+                    savedStateHandle[INSTALL_SESSION_ID_KEY]
+                } else {
+                    null
+                },
             )
         } else {
             null
@@ -901,6 +906,17 @@ class ManagerViewModel(
                 } else if (deferredTerminal != null) {
                     applyInstallTerminal(deferredTerminal)
                 }
+            }
+            val pendingCleanup = pendingGeneratedCleanup
+            val ready = mutableState.value.conversionState as? ConversionUiState.ResultReady
+            if (pendingCleanup != null &&
+                ready?.token == pendingCleanup.token &&
+                pendingCleanup.phase in setOf(
+                    GeneratedCleanupPhase.INSTALL,
+                    GeneratedCleanupPhase.REVIEW,
+                )
+            ) {
+                showGeneratedCleanupFailure()
             }
         }
     }
@@ -1691,6 +1707,7 @@ class ManagerViewModel(
         reviewToken: String?,
         phase: GeneratedCleanupPhase,
         destination: GeneratedCleanupDestination,
+        installSessionId: Int? = null,
     ): PendingGeneratedCleanup {
         pendingGeneratedCleanup?.let { return it }
         return PendingGeneratedCleanup(
@@ -1698,6 +1715,7 @@ class ManagerViewModel(
             reviewToken = reviewToken,
             phase = phase,
             destination = destination,
+            installSessionId = installSessionId,
         ).also {
             advanceGeneratedCleanup(it)
             updateGeneratedCleanupState(
@@ -1756,11 +1774,16 @@ class ManagerViewModel(
         savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = cleanup.phase.name
         savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY] = cleanup.destination.kind
         savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = cleanup.destination.packageName
+        savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] =
+            cleanup.installSessionId
     }
 
     private suspend fun performPendingGeneratedCleanup(): Boolean {
         var cleanup = pendingGeneratedCleanup ?: return false
-        if (cleanup.phase == GeneratedCleanupPhase.INSTALL) return false
+        if (cleanup.phase == GeneratedCleanupPhase.INSTALL) {
+            if (!retryPendingGeneratedInstallCleanup(cleanup)) return false
+            cleanup = pendingGeneratedCleanup ?: return false
+        }
         if (cleanup.phase == GeneratedCleanupPhase.REVIEW) {
             val reviewToken = cleanup.reviewToken
             if (reviewToken != null && !repository.discardReview(reviewToken)) {
@@ -1788,6 +1811,57 @@ class ManagerViewModel(
             return false
         }
         completeGeneratedCleanup(cleanup)
+        return true
+    }
+
+    private suspend fun retryPendingGeneratedInstallCleanup(
+        cleanup: PendingGeneratedCleanup,
+    ): Boolean {
+        val ready = mutableState.value.conversionState as? ConversionUiState.ResultReady
+        val installSessionId = cleanup.installSessionId
+        val exactOwner = ready?.token == cleanup.token &&
+            generatedInstallOwnerToken == cleanup.token &&
+            installSessionId != null &&
+            savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY) == installSessionId
+        if (!exactOwner) {
+            showGeneratedCleanupFailure()
+            return false
+        }
+        val cleaned = try {
+            cancelInstallForRoute(
+                generation = operationGeneration,
+                suppressTerminalOnSuccess = true,
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            showGeneratedCleanupFailure()
+            return false
+        }
+        if (!cleaned) {
+            showGeneratedCleanupFailure()
+            return false
+        }
+        clearGeneratedInstallOwner()
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        mutableState.update {
+            val result = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                conversionState = result?.copy(installOwnerActive = false)
+                    ?: it.conversionState,
+                message = null,
+            )
+        }
+        advanceGeneratedCleanup(
+            cleanup.copy(
+                phase = if (cleanup.reviewToken != null) {
+                    GeneratedCleanupPhase.REVIEW
+                } else {
+                    GeneratedCleanupPhase.CONVERSION
+                },
+                installSessionId = null,
+            ),
+        )
         return true
     }
 
@@ -1823,6 +1897,8 @@ class ManagerViewModel(
             reviewToken = savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY],
             phase = phase,
             destination = destination,
+            installSessionId =
+                savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY],
         )
     }
 
@@ -1833,6 +1909,7 @@ class ManagerViewModel(
         savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = null
         savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY] = null
         savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = null
+        savedStateHandle[GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY] = null
     }
 
     private fun clearGeneratedInstallOwner() {
@@ -1931,6 +2008,8 @@ class ManagerViewModel(
         const val GENERATED_CLEANUP_PHASE_KEY = "generated_cleanup_phase"
         const val GENERATED_CLEANUP_DESTINATION_KEY = "generated_cleanup_destination"
         const val GENERATED_CLEANUP_PACKAGE_KEY = "generated_cleanup_package"
+        const val GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY =
+            "generated_cleanup_install_session_id"
         const val DOCUMENT_OWNER_GENERATION_KEY = "document_owner_generation"
         const val DOCUMENT_LAUNCH_SEQUENCE_KEY = "document_launch_sequence"
         const val PENDING_PICKER_OWNER_GENERATION_KEY = "pending_picker_owner_generation"
@@ -1958,6 +2037,7 @@ private data class PendingGeneratedCleanup(
     val reviewToken: String?,
     val phase: GeneratedCleanupPhase,
     val destination: GeneratedCleanupDestination,
+    val installSessionId: Int? = null,
 )
 
 private data class GeneratedCleanupDestination(
