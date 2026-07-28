@@ -7,6 +7,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ResultReceiver
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.manager.ui.ManagerAction
+import dev.sixbridge.manager.ui.ManagerEffect
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -39,7 +41,22 @@ class GeneratedBundleShareGrantTest {
         }
 
         try {
-            val chooser = generatedBundleShareChooser(targetContext, file)
+            lateinit var chooser: Intent
+            var launchAction: ManagerAction? = null
+            val effect = ManagerEffect.ShareGeneratedBundle(
+                token = "11111111-1111-4111-8111-111111111111",
+                file = file,
+                handoffId = 29,
+            )
+            executeGeneratedShareLaunch(
+                effect = effect,
+                resolveChooser = { generatedBundleShareChooser(targetContext, it.file) },
+                launchChooser = { chooser = it },
+                onAction = { launchAction = it },
+            )
+            val succeeded = launchAction as ManagerAction.GeneratedShareLaunchSucceeded
+            assertEquals(effect.token, succeeded.token)
+            assertEquals(effect.handoffId, succeeded.handoffId)
             assertArrayEquals(expected, file.readBytes())
             assertTrue(original.delete())
             assertTrue(!original.exists())

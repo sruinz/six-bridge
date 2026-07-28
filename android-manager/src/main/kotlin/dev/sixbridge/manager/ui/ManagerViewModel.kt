@@ -25,6 +25,7 @@ import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
@@ -60,6 +61,8 @@ class ManagerViewModel(
     private var conversionIoJob: Job? = null
     private var conversionIoResult: CompletableDeferred<GeneratedDocumentSaveResult>? = null
     private var generatedShareJob: Job? = null
+    private var pendingGeneratedShareHandoff: PendingGeneratedShareHandoff? = null
+    private var generatedShareHandoffSequence = 0L
     private var installJob: Job? = null
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -114,6 +117,8 @@ class ManagerViewModel(
             action != ManagerAction.RetryGeneratedCleanup &&
             action !is ManagerAction.LaunchSucceeded &&
             action !is ManagerAction.LaunchFailed &&
+            action !is ManagerAction.GeneratedShareLaunchSucceeded &&
+            action !is ManagerAction.GeneratedShareLaunchFailed &&
             action !is ManagerAction.ConversionFileSelected &&
             action !is ManagerAction.SaveGeneratedConversionTo &&
             action != ManagerAction.ReturnedToForeground
@@ -158,15 +163,18 @@ class ManagerViewModel(
             ManagerAction.SaveGeneratedConversion -> requestGeneratedSave()
             is ManagerAction.SaveGeneratedConversionTo -> acceptConversionSaveResult(action)
             ManagerAction.ShareGeneratedConversion -> shareGenerated()
-            ManagerAction.GeneratedShareFailed -> mutableState.update {
-                it.copy(
-                    message = UserMessage(
-                        UserMessageKind.CONVERSION_SHARE_FAILED,
-                        "공유 화면을 열 수 없습니다. 파일로 저장한 뒤 다시 공유해 주세요.",
-                        RecoveryAction.NONE,
-                    ),
+            is ManagerAction.GeneratedShareLaunchSucceeded ->
+                acknowledgeGeneratedShareHandoff(
+                    action.token,
+                    action.handoffId,
+                    launched = true,
                 )
-            }
+            is ManagerAction.GeneratedShareLaunchFailed ->
+                acknowledgeGeneratedShareHandoff(
+                    action.token,
+                    action.handoffId,
+                    launched = false,
+                )
             ManagerAction.FinishConversion -> finishConversion()
             ManagerAction.CancelConversion -> cancelConversion()
             ManagerAction.RetryGeneratedCleanup -> retryGeneratedCleanup()
@@ -548,30 +556,73 @@ class ManagerViewModel(
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
         if (result.cleanupPending || result.cleanupInProgress) return
         if (generatedShareJob?.isActive == true) return
-        generatedShareJob = viewModelScope.launch {
-            val snapshot = try {
-                repository.createGeneratedShareSnapshot(result.token)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Exception) {
-                null
-            }
-            if (snapshot == null) {
-                mutableState.update {
-                    it.copy(
-                        message = UserMessage(
-                            UserMessageKind.CONVERSION_SHARE_FAILED,
-                            "공유용 파일을 준비하지 못했습니다. 파일로 저장한 뒤 다시 시도해 주세요.",
-                            RecoveryAction.NONE,
-                        ),
+        generatedShareHandoffSequence += 1
+        val handoffId = generatedShareHandoffSequence
+        val completion = CompletableDeferred<Boolean>()
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                val snapshot = try {
+                    repository.createGeneratedShareSnapshot(result.token)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    null
+                }
+                if (snapshot == null) {
+                    showGeneratedShareFailure(
+                        "공유용 파일을 준비하지 못했습니다. 파일로 저장한 뒤 다시 시도해 주세요.",
+                    )
+                    return@launch
+                }
+                enqueueEffect(
+                    ManagerEffect.ShareGeneratedBundle(
+                        token = result.token,
+                        file = snapshot,
+                        handoffId = handoffId,
+                    ),
+                )
+                if (!completion.await()) {
+                    showGeneratedShareFailure(
+                        "공유 화면을 열 수 없습니다. 파일로 저장한 뒤 다시 공유해 주세요.",
                     )
                 }
-                return@launch
+            } finally {
+                val pending = pendingGeneratedShareHandoff
+                if (pending?.token == result.token &&
+                    pending.handoffId == handoffId &&
+                    pending.completion === completion
+                ) {
+                    pendingGeneratedShareHandoff = null
+                }
             }
-            enqueueEffect(
-                ManagerEffect.ShareGeneratedBundle(
-                    token = result.token,
-                    file = snapshot,
+        }
+        pendingGeneratedShareHandoff = PendingGeneratedShareHandoff(
+            token = result.token,
+            handoffId = handoffId,
+            completion = completion,
+            job = job,
+        )
+        generatedShareJob = job
+        job.start()
+    }
+
+    private fun acknowledgeGeneratedShareHandoff(
+        token: String,
+        handoffId: Long,
+        launched: Boolean,
+    ) {
+        val pending = pendingGeneratedShareHandoff ?: return
+        if (pending.token != token || pending.handoffId != handoffId) return
+        pending.completion.complete(launched)
+    }
+
+    private fun showGeneratedShareFailure(text: String) {
+        mutableState.update {
+            it.copy(
+                message = UserMessage(
+                    UserMessageKind.CONVERSION_SHARE_FAILED,
+                    text,
+                    RecoveryAction.NONE,
                 ),
             )
         }
@@ -603,6 +654,7 @@ class ManagerViewModel(
         enqueueRouteCleanup {
             ticket.previousOperation?.cancelAndJoin()
             supersededInstall?.cancelAndJoin()
+            awaitGeneratedShareSnapshot()
             val cleaned = try {
                 cancelInstallForRoute(
                     generation = generation,
@@ -2275,10 +2327,13 @@ class ManagerViewModel(
                     pending.ownerGeneration == documentOwnerGeneration
             }
             is ManagerEffect.ShareGeneratedBundle -> {
+                val handoff = pendingGeneratedShareHandoff ?: return false
                 val result =
                     mutableState.value.conversionState as? ConversionUiState.ResultReady
                         ?: return false
                 return result.token == effect.token &&
+                    handoff.token == effect.token &&
+                    handoff.handoffId == effect.handoffId &&
                     mutableState.value.route == ManagerRoute.ConversionResult(effect.token)
             }
             is ManagerEffect.LaunchIntent -> Unit
@@ -2360,6 +2415,13 @@ private data class QuarantinedGeneratedCleanup(
     val phase: GeneratedCleanupPhase,
     val installSessionId: Int?,
     val conversionCleaned: Boolean,
+)
+
+private data class PendingGeneratedShareHandoff(
+    val token: String,
+    val handoffId: Long,
+    val completion: CompletableDeferred<Boolean>,
+    val job: Job,
 )
 
 private data class GeneratedCleanupDestination(

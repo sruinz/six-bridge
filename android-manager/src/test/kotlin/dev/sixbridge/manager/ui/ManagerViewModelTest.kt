@@ -1733,7 +1733,16 @@ class ManagerViewModelTest {
 
                 viewModel.accept(ManagerAction.ShareGeneratedConversion)
                 dispatcher.scheduler.runCurrent()
-                assertIs<ManagerEffect.ShareGeneratedBundle>(viewModel.effects.first())
+                val share = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                    viewModel.effects.first(),
+                )
+                viewModel.accept(
+                    ManagerAction.GeneratedShareLaunchSucceeded(
+                        share.token,
+                        share.handoffId,
+                    ),
+                )
+                dispatcher.scheduler.runCurrent()
                 assertFailureProof()
 
                 viewModel.accept(ManagerAction.PrepareGeneratedInstall)
@@ -1764,6 +1773,13 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.ShareGeneratedConversion)
             val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(viewModel.effects.first())
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    effect.token,
+                    effect.handoffId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
 
             assertEquals(TOKEN, effect.token)
             assertTrue(repository.discardedConversions.isEmpty())
@@ -2122,6 +2138,12 @@ class ManagerViewModelTest {
             val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
                 viewModel.effects.first(),
             )
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    effect.token,
+                    effect.handoffId,
+                ),
+            )
             viewModel.accept(ManagerAction.FinishConversion)
             advanceUntilIdle()
 
@@ -2161,9 +2183,16 @@ class ManagerViewModelTest {
             assertTrue(repository.discardedConversions.isEmpty())
 
             repository.completeGeneratedShareSnapshot()
-            advanceUntilIdle()
+            dispatcher.scheduler.runCurrent()
 
             val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(effects.single())
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    effect.token,
+                    effect.handoffId,
+                ),
+            )
+            advanceUntilIdle()
             assertEquals(snapshot, effect.file)
             assertEquals("immutable race snapshot", effect.file.readText())
             assertEquals(listOf(TOKEN), repository.discardedConversions)
@@ -2199,6 +2228,208 @@ class ManagerViewModelTest {
                 ManagerRoute.ConversionResult(TOKEN),
                 viewModel.state.value.route,
             )
+        }
+
+    @Test
+    fun `stopped share collector waits exact handoff ACK`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.FinishConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+            assertTrue(repository.discardedConversions.isEmpty())
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    token = SECOND_TOKEN,
+                    handoffId = effect.handoffId,
+                ),
+            )
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    token = TOKEN,
+                    handoffId = effect.handoffId + 1,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchSucceeded(
+                    token = TOKEN,
+                    handoffId = effect.handoffId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `exact share failure ACK는 message를 표시하고 handoff를 종료한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchFailed(
+                    effect.token,
+                    effect.handoffId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                UserMessageKind.CONVERSION_SHARE_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `share failure ACK도 pending cleanup을 unblock한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.FinishConversion)
+            dispatcher.scheduler.runCurrent()
+            val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.GeneratedShareLaunchFailed(
+                    effect.token,
+                    effect.handoffId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `generated cleanup gates wait share ACK`() =
+        runTest(dispatcher.scheduler) {
+            listOf("Installed", "Retry", "Finish", "Cancel").forEach { gate ->
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                if (gate == "Retry") {
+                    viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                    repository.installFlow.value =
+                        InstallState.Failed("ABANDON_FAILED", "cleanup retry")
+                    advanceUntilIdle()
+                }
+
+                viewModel.accept(ManagerAction.ShareGeneratedConversion)
+                dispatcher.scheduler.runCurrent()
+                val cancelRequestsBeforeGate = repository.cancelInstallRequests
+                when (gate) {
+                    "Installed" -> {
+                        viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                        repository.installFlow.value = InstallState.Installed(PACKAGE)
+                    }
+                    "Retry" -> viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+                    "Finish" -> viewModel.accept(ManagerAction.FinishConversion)
+                    "Cancel" -> viewModel.accept(ManagerAction.CancelConversion)
+                }
+                dispatcher.scheduler.runCurrent()
+
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    viewModel.state.value.route,
+                    "gate=$gate",
+                )
+                assertTrue(repository.discardedConversions.isEmpty(), "gate=$gate")
+                if (gate == "Retry") {
+                    assertEquals(
+                        cancelRequestsBeforeGate,
+                        repository.cancelInstallRequests,
+                        "gate=$gate",
+                    )
+                }
+
+                val effect = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                    viewModel.effects.first(),
+                )
+                viewModel.accept(
+                    ManagerAction.GeneratedShareLaunchSucceeded(
+                        token = effect.token,
+                        handoffId = effect.handoffId,
+                    ),
+                )
+                advanceUntilIdle()
+
+                when (gate) {
+                    "Installed" ->
+                        assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+                    "Retry" -> {
+                        assertEquals(
+                            ManagerRoute.ConversionResult(TOKEN),
+                            viewModel.state.value.route,
+                        )
+                        assertEquals(
+                            cancelRequestsBeforeGate + 1,
+                            repository.cancelInstallRequests,
+                        )
+                    }
+                    "Finish",
+                    "Cancel",
+                    -> assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+                }
+            }
         }
 
     @Test
@@ -3717,12 +3948,20 @@ class ManagerViewModelTest {
                     ).token,
                 )
                 recreated.accept(ManagerAction.ShareGeneratedConversion)
+                val share = assertIs<ManagerEffect.ShareGeneratedBundle>(
+                    recreated.effects.first(),
+                )
                 assertEquals(
                     TOKEN,
-                    assertIs<ManagerEffect.ShareGeneratedBundle>(
-                        recreated.effects.first(),
-                    ).token,
+                    share.token,
                 )
+                recreated.accept(
+                    ManagerAction.GeneratedShareLaunchSucceeded(
+                        share.token,
+                        share.handoffId,
+                    ),
+                )
+                dispatcher.scheduler.runCurrent()
             }
         }
 

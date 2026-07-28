@@ -168,12 +168,17 @@ class MainActivity : ComponentActivity() {
                             createConversionDocument.launch(effect.suggestedFileName)
                         }
                         is ManagerEffect.ShareGeneratedBundle -> {
-                            val shared = runCatching {
-                                startActivity(generatedBundleShareChooser(this@MainActivity, effect.file))
-                            }.isSuccess
-                            if (!shared) {
-                                managerViewModel.accept(ManagerAction.GeneratedShareFailed)
-                            }
+                            executeGeneratedShareLaunch(
+                                effect = effect,
+                                resolveChooser = {
+                                    generatedBundleShareChooser(
+                                        this@MainActivity,
+                                        it.file,
+                                    )
+                                },
+                                launchChooser = ::startActivity,
+                                onAction = managerViewModel::accept,
+                            )
                         }
                     }
                 }
@@ -427,6 +432,27 @@ internal fun openSixFilePicker(
 ) {
     onAction(ManagerAction.FilePickerOpened)
     launchPicker()
+}
+
+internal fun <T> executeGeneratedShareLaunch(
+    effect: ManagerEffect.ShareGeneratedBundle,
+    resolveChooser: (ManagerEffect.ShareGeneratedBundle) -> T,
+    launchChooser: (T) -> Unit,
+    onAction: (ManagerAction) -> Unit,
+) {
+    val action = try {
+        launchChooser(resolveChooser(effect))
+        ManagerAction.GeneratedShareLaunchSucceeded(
+            token = effect.token,
+            handoffId = effect.handoffId,
+        )
+    } catch (_: Exception) {
+        ManagerAction.GeneratedShareLaunchFailed(
+            token = effect.token,
+            handoffId = effect.handoffId,
+        )
+    }
+    onAction(action)
 }
 
 internal fun <T> executeLaunch(

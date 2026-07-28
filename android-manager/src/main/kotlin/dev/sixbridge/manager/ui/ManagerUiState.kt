@@ -218,7 +218,14 @@ sealed interface ManagerAction {
         val launchId: Long,
     ) : ManagerAction
     data object ShareGeneratedConversion : ManagerAction
-    data object GeneratedShareFailed : ManagerAction
+    data class GeneratedShareLaunchSucceeded(
+        val token: String,
+        val handoffId: Long,
+    ) : ManagerAction
+    data class GeneratedShareLaunchFailed(
+        val token: String,
+        val handoffId: Long,
+    ) : ManagerAction
     data object FinishConversion : ManagerAction
     data object CancelConversion : ManagerAction
     data object RetryGeneratedCleanup : ManagerAction
@@ -260,6 +267,7 @@ sealed interface ManagerEffect {
     data class ShareGeneratedBundle(
         val token: String,
         val file: File,
+        val handoffId: Long,
     ) : ManagerEffect
 
     class LaunchIntent(
