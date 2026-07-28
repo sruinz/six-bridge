@@ -24,6 +24,7 @@ import dev.sixbridge.manager.uninstall.UninstallOutcome
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ManagerViewModel(
     private val repository: ManagerRepository,
@@ -43,6 +45,9 @@ class ManagerViewModel(
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
     private var routeOperation: Job? = null
+    private var routeCleanup: Job? = null
+    private var routeCleanupFailed = false
+    private val scheduledConversionCleanupTokens = mutableSetOf<String>()
     private var conversionIoJob: Job? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
@@ -62,6 +67,9 @@ class ManagerViewModel(
     private var suppressedInstallTerminal: InstallState? = null
     private var replacementCancelGeneration: Long? = null
     private var deferredReplacementTerminal: Pair<Long, InstallState>? = null
+    private var generatedInstallOwnerToken: String? =
+        savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY]
+    private var generatedTerminalJob: Job? = null
 
     val state: StateFlow<ManagerUiState> = mutableState.asStateFlow()
     val effects: Flow<ManagerEffect> = effectChannel.receiveAsFlow().filter(::isEffectCurrent)
@@ -127,9 +135,8 @@ class ManagerViewModel(
                     ),
                 )
             }
-            ManagerAction.FinishConversion,
-            ManagerAction.CancelConversion,
-            -> cancelConversion()
+            ManagerAction.FinishConversion -> finishConversion()
+            ManagerAction.CancelConversion -> cancelConversion()
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
@@ -150,8 +157,10 @@ class ManagerViewModel(
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
-        val generation = replaceRouteOperation()
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
         routeOperation = viewModelScope.launch {
+            if (!awaitRouteMutation(ticket)) return@launch
             supersededInstall?.cancelAndJoin()
             val cleaned = try {
                 cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
@@ -200,7 +209,15 @@ class ManagerViewModel(
     }
 
     private fun openConversionInput() {
-        if (mutableState.value.conversionState is ConversionUiState.Building) return
+        if (mutableState.value.conversionState is ConversionUiState.Building &&
+            routeCleanup?.isActive != true
+        ) {
+            return
+        }
+        if (mutableState.value.conversionState is ConversionUiState.ResultReady) {
+            cleanupConversion(ManagerRoute.ConversionInput)
+            return
+        }
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionInput,
@@ -231,7 +248,8 @@ class ManagerViewModel(
 
     private fun beginConversion(request: OnDeviceInputRequest) {
         if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
-        val generation = replaceRouteOperation()
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionInput,
@@ -240,6 +258,7 @@ class ManagerViewModel(
             )
         }
         routeOperation = viewModelScope.launch {
+            if (!awaitRouteMutation(ticket)) return@launch
             val result = try {
                 repository.beginConversion(request)
             } catch (error: CancellationException) {
@@ -247,7 +266,10 @@ class ManagerViewModel(
             } catch (_: Exception) {
                 ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
             }
-            if (generation != operationGeneration) return@launch
+            if (generation != operationGeneration) {
+                result.conversionTokenOrNull()?.let(::enqueueStaleConversionCleanup)
+                return@launch
+            }
             when (result) {
                 is ConversionBeginResult.AnalysisReady -> showConversionAnalysis(result)
                 is ConversionBeginResult.Failure -> {
@@ -277,7 +299,8 @@ class ManagerViewModel(
     private fun buildConversion() {
         val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return
         if (!ready.canBuild || routeOperation?.isActive == true) return
-        val generation = replaceRouteOperation()
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionAnalysis(ready.token),
@@ -286,6 +309,7 @@ class ManagerViewModel(
             )
         }
         routeOperation = viewModelScope.launch {
+            if (!awaitRouteMutation(ticket)) return@launch
             val result = try {
                 repository.approveConversion(
                     token = ready.token,
@@ -298,13 +322,20 @@ class ManagerViewModel(
             } catch (_: Exception) {
                 ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
             }
-            if (generation != operationGeneration) return@launch
+            if (generation != operationGeneration) {
+                enqueueStaleBuildCleanup(result)
+                return@launch
+            }
             when (result) {
                 is ConversionBuildResult.BundleReady ->
                     showConversionResult(result.review, result.generated)
                 is ConversionBuildResult.Failure -> {
                     if (result.generated != null) {
-                        showConversionResult(review = null, generated = result.generated)
+                        showConversionResult(
+                            review = null,
+                            generated = result.generated,
+                            failureCode = result.code,
+                        )
                     } else {
                         mutableState.update {
                             it.copy(
@@ -321,6 +352,7 @@ class ManagerViewModel(
 
     private fun prepareGeneratedInstall() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        if (result.installOwnerActive) return
         val review = result.review ?: run {
             mutableState.update {
                 it.copy(message = conversionFailureMessage(ConversionFailureCode.BUNDLE_IO))
@@ -329,8 +361,11 @@ class ManagerViewModel(
         }
         ownedReviewToken = review.token
         savedStateHandle[REVIEW_TOKEN_KEY] = review.token
+        generatedInstallOwnerToken = result.token
+        savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY] = result.token
         mutableState.update {
             it.copy(
+                conversionState = result.copy(installOwnerActive = true),
                 importState = ImportUiState.ReviewReady(
                     review = review,
                     partialConfirmed = review.status == ContractCompatibilityStatus.PARTIAL,
@@ -396,6 +431,10 @@ class ManagerViewModel(
     }
 
     private fun cancelConversion() {
+        cleanupConversion(ManagerRoute.Home)
+    }
+
+    private fun cleanupConversion(destination: ManagerRoute) {
         val stateBeforeCancel = mutableState.value.conversionState
         val token = when (stateBeforeCancel) {
             is ConversionUiState.AnalysisReady -> stateBeforeCancel.token
@@ -409,22 +448,56 @@ class ManagerViewModel(
         val reviewToken = (stateBeforeCancel as? ConversionUiState.ResultReady)
             ?.review
             ?.token
-        val superseded = routeOperation
-        superseded?.cancel()
-        operationGeneration += 1
-        routeOperation = viewModelScope.launch {
-            superseded?.cancelAndJoin()
+        val generatedInstallOwned = generatedInstallOwnerToken == token
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
+        val supersededInstall = if (generatedInstallOwned) detachInstallJob() else null
+        supersededInstall?.cancel()
+        routeOperation = null
+        enqueueRouteCleanup {
+            ticket.previousOperation?.cancelAndJoin()
+            supersededInstall?.cancelAndJoin()
+            if (generatedInstallOwned) {
+                val cleaned = try {
+                    cancelInstallForRoute(
+                        generation = generation,
+                        suppressTerminalOnSuccess = true,
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    showGeneratedCleanupFailure()
+                    return@enqueueRouteCleanup false
+                }
+                if (!cleaned) {
+                    showGeneratedCleanupFailure()
+                    return@enqueueRouteCleanup false
+                }
+            }
             conversionIoJob?.cancelAndJoin()
             conversionIoJob = null
-            token?.let { repository.discardConversion(it) }
-            reviewToken?.let(repository::discardReview)
+            if (token != null &&
+                token !in scheduledConversionCleanupTokens &&
+                !repository.discardConversion(token)
+            ) {
+                showGeneratedCleanupFailure()
+                return@enqueueRouteCleanup false
+            }
+            if (reviewToken != null &&
+                token !in scheduledConversionCleanupTokens &&
+                !repository.discardReview(reviewToken)
+            ) {
+                showGeneratedCleanupFailure()
+                return@enqueueRouteCleanup false
+            }
             if (ownedReviewToken == reviewToken) {
                 clearSavedReviewAndSession()
             }
+            clearGeneratedInstallOwner()
             clearSavedConversion()
             mutableState.update {
                 it.copy(
-                    route = ManagerRoute.Home,
+                    route = destination,
                     conversionState = ConversionUiState.Idle,
                     conversionUrl = "",
                     importState = if (ownedReviewToken == null) {
@@ -435,7 +508,14 @@ class ManagerViewModel(
                     message = null,
                 )
             }
+            true
         }
+    }
+
+    private fun finishConversion() {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
+        if (result?.installOwnerActive == true || generatedInstallOwnerToken == result?.token) return
+        cleanupConversion(ManagerRoute.Home)
     }
 
     private fun showConversionAnalysis(result: ConversionBeginResult.AnalysisReady) {
@@ -457,6 +537,8 @@ class ManagerViewModel(
     private fun showConversionResult(
         review: ReviewBundle?,
         generated: dev.sixbridge.manager.conversion.GeneratedBundle,
+        failureCode: ConversionFailureCode? = null,
+        installOwnerActive: Boolean = generatedInstallOwnerToken == generated.token,
     ) {
         saveConversionRoute(generated.token, "result")
         mutableState.update {
@@ -466,10 +548,12 @@ class ManagerViewModel(
                     token = generated.token,
                     review = review,
                     generated = generated,
+                    failureCode = failureCode,
+                    installOwnerActive = installOwnerActive,
                 ),
                 conversionUrl = "",
                 message = if (review == null) {
-                    conversionFailureMessage(ConversionFailureCode.BUNDLE_IO)
+                    conversionFailureMessage(failureCode ?: ConversionFailureCode.BUNDLE_IO)
                 } else {
                     null
                 },
@@ -501,7 +585,22 @@ class ManagerViewModel(
                 return@launch
             }
             if (restored.review != null) {
-                showReview(restored.review)
+                if (generatedInstallOwnerToken != null) {
+                    ownedReviewToken = restored.review.token
+                    savedStateHandle[REVIEW_TOKEN_KEY] = restored.review.token
+                    mutableState.update {
+                        it.copy(
+                            importState = ImportUiState.ReviewReady(
+                                review = restored.review,
+                                partialConfirmed =
+                                    restored.review.status ==
+                                        ContractCompatibilityStatus.PARTIAL,
+                            ),
+                        )
+                    }
+                } else {
+                    showReview(restored.review)
+                }
             } else {
                 savedStateHandle[REVIEW_TOKEN_KEY] = null
             }
@@ -515,8 +614,18 @@ class ManagerViewModel(
             if (restored.review == null && deferredTerminal != null) {
                 applyInstallTerminal(deferredTerminal)
             }
-            if (restored.review == null) {
+            if (restored.review == null || generatedInstallOwnerToken != null) {
                 restoreConversion(generation)
+            }
+            val generatedOwner = generatedInstallOwnerToken
+            if (generatedOwner != null) {
+                val ready = mutableState.value.conversionState as? ConversionUiState.ResultReady
+                if (ready?.token != generatedOwner || restored.review == null) {
+                    clearGeneratedInstallOwner()
+                    restored.review?.let(::showReview)
+                } else if (deferredTerminal != null) {
+                    applyInstallTerminal(deferredTerminal)
+                }
             }
         }
     }
@@ -670,20 +779,23 @@ class ManagerViewModel(
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
-        val generation = replaceRouteOperation()
-        routeOperation = viewModelScope.launch {
+        val ticket = replaceRouteOperation()
+        val generation = ticket.generation
+        routeOperation = null
+        enqueueRouteCleanup {
+            ticket.previousOperation?.cancelAndJoin()
             supersededInstall?.cancelAndJoin()
             val cleaned = try {
                 cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
-                return@launch
+                return@enqueueRouteCleanup false
             }
             if (cleaned &&
                 generation == operationGeneration
             ) {
-                if (!discardPendingReviews()) return@launch
+                if (!discardPendingReviews()) return@enqueueRouteCleanup false
                 completedReplacementCleanupGeneration = generation
                 clearSavedReviewAndSession()
                 mutableState.update {
@@ -694,6 +806,7 @@ class ManagerViewModel(
                     )
                 }
             }
+            cleaned
         }
     }
 
@@ -922,10 +1035,71 @@ class ManagerViewModel(
         savedStateHandle["conversion_url"] = null
     }
 
-    private fun replaceRouteOperation(): Long {
-        routeOperation?.cancel()
+    private fun replaceRouteOperation(): RouteOperationTicket {
+        val previous = routeOperation
+        previous?.cancel()
         operationGeneration += 1
-        return operationGeneration
+        return RouteOperationTicket(operationGeneration, previous)
+    }
+
+    private suspend fun awaitRouteMutation(ticket: RouteOperationTicket): Boolean {
+        ticket.previousOperation?.cancelAndJoin()
+        while (true) {
+            val cleanup = routeCleanup ?: break
+            cleanup.join()
+            if (cleanup === routeCleanup) break
+        }
+        if (routeCleanupFailed) {
+            showGeneratedCleanupFailure()
+            return false
+        }
+        return ticket.generation == operationGeneration
+    }
+
+    private fun enqueueRouteCleanup(
+        cleanup: suspend () -> Boolean,
+    ): Job {
+        val previous = routeCleanup
+        val job = viewModelScope.launch {
+            previous?.join()
+            val succeeded = withContext(NonCancellable) {
+                runCatching { cleanup() }.getOrDefault(false)
+            }
+            routeCleanupFailed = !succeeded
+        }
+        routeCleanup = job
+        return job
+    }
+
+    private fun enqueueStaleConversionCleanup(token: String) {
+        enqueueStaleConversionCleanup(token, reviewToken = null)
+    }
+
+    private fun enqueueStaleConversionCleanup(
+        token: String,
+        reviewToken: String?,
+    ) {
+        if (!scheduledConversionCleanupTokens.add(token)) return
+        enqueueRouteCleanup {
+            try {
+                val reviewCleaned = reviewToken?.let(repository::discardReview) ?: true
+                val conversionCleaned = repository.discardConversion(token)
+                reviewCleaned && conversionCleaned
+            } finally {
+                scheduledConversionCleanupTokens.remove(token)
+            }
+        }
+    }
+
+    private fun enqueueStaleBuildCleanup(result: ConversionBuildResult) {
+        when (result) {
+            is ConversionBuildResult.BundleReady -> enqueueStaleConversionCleanup(
+                token = result.generated.token,
+                reviewToken = result.review.token,
+            )
+            is ConversionBuildResult.Failure ->
+                result.generated?.token?.let(::enqueueStaleConversionCleanup)
+        }
     }
 
     private fun detachInstallJob(): Job? =
@@ -1025,6 +1199,11 @@ class ManagerViewModel(
     }
 
     private fun applyInstallTerminal(installState: InstallState) {
+        val generatedOwner = generatedInstallOwnerToken
+        if (generatedOwner != null) {
+            applyGeneratedInstallTerminal(generatedOwner, installState)
+            return
+        }
         supersedeRecoveryForTerminal()
         if (installState is InstallState.Failed &&
             installState.code in CLEANUP_RETRYABLE_FAILURES &&
@@ -1057,6 +1236,86 @@ class ManagerViewModel(
                 else -> it
             }
         }
+    }
+
+    private fun applyGeneratedInstallTerminal(
+        token: String,
+        installState: InstallState,
+    ) {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
+        if (result?.token != token) return
+        supersedeRecoveryForTerminal()
+        when (installState) {
+            is InstallState.Installed -> {
+                if (generatedTerminalJob?.isActive == true) return
+                generatedTerminalJob = viewModelScope.launch {
+                    if (!repository.discardConversion(token)) {
+                        showGeneratedCleanupFailure()
+                        return@launch
+                    }
+                    val reviewToken = result.review?.token
+                    if (reviewToken != null && !repository.discardReview(reviewToken)) {
+                        showGeneratedCleanupFailure()
+                        return@launch
+                    }
+                    clearGeneratedInstallOwner()
+                    clearSavedReviewAndSession()
+                    clearSavedConversion()
+                    mutableState.update {
+                        it.copy(
+                            route = ManagerRoute.Report(installState.packageName),
+                            importState = ImportUiState.Idle,
+                            conversionState = ConversionUiState.Idle,
+                            message = null,
+                        )
+                    }
+                }
+            }
+            InstallState.Cancelled -> returnGeneratedInstallToResult(
+                UserMessage(
+                    UserMessageKind.INSTALL_CANCELLED,
+                    "시스템 설치가 취소되었습니다. 생성 결과를 저장하거나 다시 설치할 수 있습니다.",
+                    RecoveryAction.NONE,
+                ),
+            )
+            is InstallState.Failed -> returnGeneratedInstallToResult(
+                installFailureMessage(installState.code),
+            )
+            else -> Unit
+        }
+    }
+
+    private fun returnGeneratedInstallToResult(message: UserMessage) {
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        clearGeneratedInstallOwner()
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionResult(result.token),
+                conversionState = result.copy(installOwnerActive = false),
+                message = message,
+            )
+        }
+    }
+
+    private fun showGeneratedCleanupFailure() {
+        mutableState.update {
+            val result = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                route = result?.let { ready -> ManagerRoute.ConversionResult(ready.token) }
+                    ?: it.route,
+                message = UserMessage(
+                    UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                    "설치 작업 정리를 완료하지 못했습니다. 생성 결과를 보존했으니 다시 시도해 주세요.",
+                    RecoveryAction.RETRY,
+                ),
+            )
+        }
+    }
+
+    private fun clearGeneratedInstallOwner() {
+        generatedInstallOwnerToken = null
+        savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY] = null
     }
 
     private fun enqueueEffect(effect: ManagerEffect) {
@@ -1108,6 +1367,7 @@ class ManagerViewModel(
         const val INSTALL_SESSION_ID_KEY = "install_session_id"
         const val CONVERSION_TOKEN_KEY = "conversion_token"
         const val CONVERSION_ROUTE_KEY = "conversion_route"
+        const val INSTALL_OWNER_CONVERSION_TOKEN_KEY = "install_owner_conversion_token"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",
@@ -1302,3 +1562,13 @@ private data class PendingUninstallReturn(
     val packageName: String,
     val generation: Long,
 )
+
+private data class RouteOperationTicket(
+    val generation: Long,
+    val previousOperation: Job?,
+)
+
+private fun ConversionBeginResult.conversionTokenOrNull(): String? = when (this) {
+    is ConversionBeginResult.AnalysisReady -> token
+    is ConversionBeginResult.Failure -> token
+}

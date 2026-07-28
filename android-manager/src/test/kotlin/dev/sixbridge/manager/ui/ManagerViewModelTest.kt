@@ -1669,6 +1669,385 @@ class ManagerViewModelTest {
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
         }
 
+    @Test
+    fun `generated active install 중 완료는 owner와 결과를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.UnknownSourcesPermissionRequired,
+                InstallState.WritingSession(40),
+                InstallState.AwaitingUserApproval(41),
+            ).forEach { active ->
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                }
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                repository.installFlow.value = active
+                dispatcher.scheduler.runCurrent()
+
+                viewModel.accept(ManagerAction.FinishConversion)
+                dispatcher.scheduler.runCurrent()
+
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    viewModel.state.value.route,
+                    "active=$active",
+                )
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                    "active=$active",
+                )
+                assertTrue(repository.discardedConversions.isEmpty(), "active=$active")
+                assertTrue(repository.discardedTokens.isEmpty(), "active=$active")
+            }
+        }
+
+    @Test
+    fun `generated active install 취소는 install job과 coordinator를 먼저 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                suspendInstall = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            dispatcher.scheduler.runCurrent()
+            repository.installFlow.value = InstallState.WritingSession(40)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                listOf(
+                    "install:start",
+                    "install:end",
+                    "cancelInstall",
+                    "discardConversion:$TOKEN",
+                    "discardReview:$TOKEN",
+                ),
+                repository.lifecycleEvents,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `generated active install cancel 거부는 review와 conversion owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.cancelInstallRequests)
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `generated active install cancel 예외는 review와 conversion owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallException = IllegalStateException("cancel failed")
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.cancelInstallRequests)
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `generated install 성공은 exact conversion cleanup 뒤 report로 이동한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("discardConversion:$TOKEN", "discardReview:$TOKEN"),
+                repository.lifecycleEvents,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+        }
+
+    @Test
+    fun `generated install 성공 cleanup 실패는 결과와 retry owner를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardConversionResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `generated install 취소와 실패 terminal은 결과로 돌아가 retry proof를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.Cancelled,
+                InstallState.Failed("INSTALL_FAILED", "failed"),
+            ).forEach { terminal ->
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        review(ContractCompatibilityStatus.COMPATIBLE),
+                        generatedBundle(),
+                    )
+                }
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+                repository.installFlow.value = terminal
+                advanceUntilIdle()
+
+                val ready = assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                    "terminal=$terminal",
+                )
+                assertEquals(TOKEN, ready.generated.token)
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    viewModel.state.value.route,
+                    "terminal=$terminal",
+                )
+                assertTrue(repository.discardedConversions.isEmpty(), "terminal=$terminal")
+                assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            }
+        }
+
+    @Test
+    fun `process recreation은 generated install owner를 review route로 바꾸지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                )
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ),
+            )
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            val ready = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertTrue(ready.installOwnerActive)
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(
+                TOKEN,
+                assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+                    .review
+                    .token,
+            )
+            assertEquals(1, repository.restoreConversionRequests)
+        }
+
+    @Test
+    fun `새 begin은 cancellation 무시 old begin과 compensation cleanup 완료를 기다린다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResults += conversionAnalysis(TOKEN)
+                conversionBeginResults += conversionAnalysis(SECOND_TOKEN)
+                suspendFirstConversionBegin = true
+                ignoreFirstConversionBeginCancellation = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/old"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/new"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.conversionRequests.size)
+
+            repository.completeFirstConversionBegin()
+            advanceUntilIdle()
+
+            assertEquals(2, repository.conversionRequests.size)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(
+                ManagerRoute.ConversionAnalysis(SECOND_TOKEN),
+                viewModel.state.value.route,
+            )
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ConversionUiState.AnalysisReady>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+        }
+
+    @Test
+    fun `새 mutation은 cancellation 무시 old build의 generated와 review compensation을 기다린다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis(TOKEN)
+                conversionBuildResult = ConversionBuildResult.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                suspendFirstConversionBuild = true
+                ignoreFirstConversionBuildCancellation = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/old"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.BuildConversion)
+            dispatcher.scheduler.runCurrent()
+
+            repository.conversionBeginResult = conversionAnalysis(SECOND_TOKEN)
+            viewModel.accept(ManagerAction.CancelConversion)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/new"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.conversionRequests.size)
+
+            repository.completeFirstConversionBuild()
+            advanceUntilIdle()
+
+            assertEquals(2, repository.conversionRequests.size)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(
+                ManagerRoute.ConversionAnalysis(SECOND_TOKEN),
+                viewModel.state.value.route,
+            )
+        }
+
+    @Test
+    fun `결과에서 새 변환 진입은 이전 generated와 review cleanup 성공 뒤에만 열린다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(ManagerRoute.ConversionInput, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `결과 cleanup 실패는 새 변환 진입 대신 기존 result owner를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardConversionResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+        }
+
     private fun generatedBundle() = GeneratedBundle(
         token = TOKEN,
         file = File("generated-bundles/$TOKEN.six"),
@@ -1676,8 +2055,10 @@ class ManagerViewModelTest {
         suggestedFileName = "확장.six",
     )
 
-    private fun conversionAnalysis() = ConversionBeginResult.AnalysisReady(
-        token = TOKEN,
+    private fun conversionAnalysis(
+        token: String = TOKEN,
+    ) = ConversionBeginResult.AnalysisReady(
+        token = token,
         profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",
             versionName = "30.0.2.61",
@@ -1807,13 +2188,20 @@ private class FakeManagerRepository : ManagerRepository {
         ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
     var conversionBuildResult: ConversionBuildResult =
         ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
+    val conversionBeginResults = mutableListOf<ConversionBeginResult>()
+    var suspendFirstConversionBegin = false
+    var ignoreFirstConversionBeginCancellation = false
+    var suspendFirstConversionBuild = false
+    var ignoreFirstConversionBuildCancellation = false
     var restoredConversion: RestoredConversion? = null
     var restoreConversionRequests = 0
     val conversionRequests = mutableListOf<OnDeviceInputRequest>()
     val conversionBuildRequests = mutableListOf<ConversionBuildRequest>()
     val discardedConversions = mutableListOf<String>()
+    var discardConversionResult = true
     var copiedConversionHash: String? = null
     val copiedConversionTokens = mutableListOf<String>()
+    val lifecycleEvents = mutableListOf<String>()
     var suspendImport = false
     var suspendInstall = false
     var suspendCancelInstall = false
@@ -1828,6 +2216,8 @@ private class FakeManagerRepository : ManagerRepository {
     private val installGate = MutableSharedFlow<Unit>()
     private val cancelInstallGate = MutableSharedFlow<Unit>()
     private val initializeGate = MutableSharedFlow<Unit>()
+    private val firstConversionBeginGate = MutableSharedFlow<Unit>()
+    private val firstConversionBuildGate = MutableSharedFlow<Unit>()
     private val uninstallReconcileGate = CompletableDeferred<Unit>()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
 
@@ -1857,8 +2247,20 @@ private class FakeManagerRepository : ManagerRepository {
         nextImport()
 
     override suspend fun beginConversion(request: OnDeviceInputRequest): ConversionBeginResult {
+        val index = conversionRequests.size
         conversionRequests += request
-        return conversionBeginResult
+        if (index == 0 && suspendFirstConversionBegin) {
+            if (ignoreFirstConversionBeginCancellation) {
+                withContext(NonCancellable) { firstConversionBeginGate.first() }
+            } else {
+                firstConversionBeginGate.first()
+            }
+        }
+        return conversionBeginResults.getOrNull(index) ?: conversionBeginResult
+    }
+
+    suspend fun completeFirstConversionBegin() {
+        firstConversionBeginGate.emit(Unit)
     }
 
     override suspend fun approveConversion(
@@ -1867,13 +2269,25 @@ private class FakeManagerRepository : ManagerRepository {
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
     ): ConversionBuildResult {
+        val index = conversionBuildRequests.size
         conversionBuildRequests += ConversionBuildRequest(
             token,
             approvedAdapterIds,
             partialConfirmed,
             identitySelection,
         )
+        if (index == 0 && suspendFirstConversionBuild) {
+            if (ignoreFirstConversionBuildCancellation) {
+                withContext(NonCancellable) { firstConversionBuildGate.first() }
+            } else {
+                firstConversionBuildGate.first()
+            }
+        }
         return conversionBuildResult
+    }
+
+    suspend fun completeFirstConversionBuild() {
+        firstConversionBuildGate.emit(Unit)
     }
 
     override suspend fun restoreConversion(): RestoredConversion? {
@@ -1882,8 +2296,9 @@ private class FakeManagerRepository : ManagerRepository {
     }
 
     override suspend fun discardConversion(token: String): Boolean {
+        lifecycleEvents += "discardConversion:$token"
         discardedConversions += token
-        return true
+        return discardConversionResult
     }
 
     override fun copyGeneratedConversion(token: String, output: OutputStream): String? {
@@ -1911,11 +2326,16 @@ private class FakeManagerRepository : ManagerRepository {
         review: ReviewBundle,
         partialConfirmed: Boolean,
     ): InstallState {
+        lifecycleEvents += "install:start"
         installRequests += 1
         lastPartialConfirmed = partialConfirmed
-        if (suspendInstall) installGate.first()
-        completedInstallRequests += 1
-        return installResult
+        try {
+            if (suspendInstall) installGate.first()
+            completedInstallRequests += 1
+            return installResult
+        } finally {
+            lifecycleEvents += "install:end"
+        }
     }
 
     suspend fun completeInstall() {
@@ -1923,6 +2343,7 @@ private class FakeManagerRepository : ManagerRepository {
     }
 
     override suspend fun cancelInstall(): Boolean {
+        lifecycleEvents += "cancelInstall"
         cancelInstallRequests += 1
         if (suspendCancelInstall) cancelInstallGate.first()
         cancelInstallException?.let { throw it }
@@ -1939,6 +2360,7 @@ private class FakeManagerRepository : ManagerRepository {
     val discardAttempts = mutableListOf<String>()
 
     override fun discardReview(token: String): Boolean {
+        lifecycleEvents += "discardReview:$token"
         discardAttempts += token
         val result = discardReviewResults[token] ?: discardReviewResult
         if (result) discardedTokens += token

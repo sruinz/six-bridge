@@ -52,7 +52,8 @@ fun ConversionResultScreen(
         Button(
             onClick = onInstall,
             enabled = ready.review != null &&
-                installState == dev.sixbridge.manager.install.InstallState.Idle,
+                !ready.installOwnerActive &&
+                !installState.isActiveInstall(),
             modifier = Modifier.fillMaxWidth().testTag("conversion:install"),
         ) {
             Text(stringResource(R.string.review_install))
@@ -71,6 +72,7 @@ fun ConversionResultScreen(
         }
         Button(
             onClick = { onAction(ManagerAction.FinishConversion) },
+            enabled = !ready.installOwnerActive,
             modifier = Modifier.fillMaxWidth().testTag("conversion:done"),
         ) {
             Text(stringResource(R.string.conversion_done))
@@ -83,3 +85,9 @@ fun ConversionResultScreen(
         }
     }
 }
+
+private fun dev.sixbridge.manager.install.InstallState.isActiveInstall(): Boolean =
+    this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||
+        this is dev.sixbridge.manager.install.InstallState.WritingSession ||
+        this is dev.sixbridge.manager.install.InstallState.AwaitingUserApproval ||
+        this is dev.sixbridge.manager.install.InstallState.Failed && code == "CLEANUP_FAILED"

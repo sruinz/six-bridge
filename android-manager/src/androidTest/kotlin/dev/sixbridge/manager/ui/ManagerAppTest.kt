@@ -194,6 +194,27 @@ class ManagerAppTest {
     }
 
     @Test
+    fun generated_unknown_sources_owner_disables_done_and_back_dispatches_cancel() {
+        assertGeneratedActiveInstallControls(
+            dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired,
+        )
+    }
+
+    @Test
+    fun generated_writing_owner_disables_done_and_back_dispatches_cancel() {
+        assertGeneratedActiveInstallControls(
+            dev.sixbridge.manager.install.InstallState.WritingSession(40),
+        )
+    }
+
+    @Test
+    fun generated_awaiting_owner_disables_done_and_back_dispatches_cancel() {
+        assertGeneratedActiveInstallControls(
+            dev.sixbridge.manager.install.InstallState.AwaitingUserApproval(41),
+        )
+    }
+
+    @Test
     fun generated_bundle_share_grants_read_only_and_uses_bundle_mime() {
         val uri = Uri.parse("content://dev.sixbridge.manager.generated/result.six")
 
@@ -546,6 +567,31 @@ class ManagerAppTest {
             identityRequirement = IdentityRequirement.Stable("0123456789ab"),
         ),
     )
+
+    private fun assertGeneratedActiveInstallControls(
+        installState: dev.sixbridge.manager.install.InstallState,
+    ) {
+        val actions = mutableListOf<ManagerAction>()
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        composeRule.setContent {
+            ManagerAppContent(
+                state = initial.copy(
+                    conversionState = ready.copy(installOwnerActive = true),
+                    installState = installState,
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("conversion:done").assertIsNotEnabled()
+        composeRule.onNodeWithTag("conversion:cancel").assertIsEnabled()
+        pressBack()
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(ManagerAction.CancelConversion), actions)
+    }
 
     private fun conversionResultState(): ManagerUiState {
         val review = reviewState(ContractCompatibilityStatus.COMPATIBLE)

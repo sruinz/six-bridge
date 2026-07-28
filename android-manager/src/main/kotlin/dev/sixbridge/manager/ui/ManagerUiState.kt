@@ -132,6 +132,8 @@ sealed interface ConversionUiState {
         val token: String,
         val review: ReviewBundle?,
         val generated: GeneratedBundle,
+        val failureCode: ConversionFailureCode? = null,
+        val installOwnerActive: Boolean = false,
     ) : ConversionUiState
 
     data class Failed(
@@ -167,6 +169,7 @@ enum class UserMessageKind {
     CONVERSION_SAVED,
     CONVERSION_SAVE_FAILED,
     CONVERSION_SHARE_FAILED,
+    CONVERSION_CLEANUP_FAILED,
 }
 
 data class UserMessage(
