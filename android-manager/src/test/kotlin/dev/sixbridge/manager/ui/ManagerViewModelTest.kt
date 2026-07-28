@@ -1939,10 +1939,89 @@ class ManagerViewModelTest {
 
             assertEquals(listOf("discardReview:$TOKEN"), repository.lifecycleEvents)
             assertTrue(repository.generatedExists)
-            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            val ready = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertTrue(ready.cleanupPending)
+            assertFalse(ready.cleanupInProgress)
             assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `installed finalizing review 중 Cancel은 cleanup과 Report destination을 바꾸지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            lateinit var viewModel: ManagerViewModel
+            var cleanupInProgressObserved = false
+            repository.beforeDiscardReview = {
+                cleanupInProgressObserved = assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).cleanupInProgress
+                viewModel.accept(ManagerAction.CancelConversion)
+            }
+            viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertTrue(cleanupInProgressObserved)
+            assertEquals(
+                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                repository.lifecycleEvents,
+            )
+            assertEquals(1, repository.discardAttempts.size)
+            assertEquals(1, repository.discardedConversions.size)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `installed finalizing conversion gate 중 Cancel은 두 번째 cleanup을 만들지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                suspendDiscardConversion = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            dispatcher.scheduler.runCurrent()
+
+            val finalizing = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertTrue(finalizing.cleanupPending)
+            assertTrue(finalizing.cleanupInProgress)
+            assertEquals(1, repository.discardAttempts.size)
+            assertEquals(1, repository.discardedConversions.size)
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.discardAttempts.size)
+            assertEquals(1, repository.discardedConversions.size)
+
+            repository.completeDiscardConversion()
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                repository.lifecycleEvents,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
         }
 
     @Test
@@ -2954,6 +3033,7 @@ private class FakeManagerRepository : ManagerRepository {
     val conversionBuildRequests = mutableListOf<ConversionBuildRequest>()
     val discardedConversions = mutableListOf<String>()
     var discardConversionResult = true
+    var suspendDiscardConversion = false
     var generatedExists = true
     var copiedConversionHash: String? = null
     val copiedConversionTokens = mutableListOf<String>()
@@ -2966,6 +3046,7 @@ private class FakeManagerRepository : ManagerRepository {
     var cancelInstallResult = true
     var cancelInstallException: RuntimeException? = null
     var discardReviewResult = true
+    var beforeDiscardReview: ((String) -> Unit)? = null
     val discardReviewResults = mutableMapOf<String, Boolean>()
     var ignoreImportCancellation = false
     private val importGate = MutableSharedFlow<Unit>()
@@ -2974,6 +3055,7 @@ private class FakeManagerRepository : ManagerRepository {
     private val initializeGate = MutableSharedFlow<Unit>()
     private val firstConversionBeginGate = MutableSharedFlow<Unit>()
     private val firstConversionBuildGate = MutableSharedFlow<Unit>()
+    private val discardConversionGate = MutableSharedFlow<Unit>()
     private val uninstallReconcileGate = CompletableDeferred<Unit>()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
 
@@ -3055,8 +3137,13 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun discardConversion(token: String): Boolean {
         lifecycleEvents += "discardConversion:$token"
         discardedConversions += token
+        if (suspendDiscardConversion) discardConversionGate.first()
         if (discardConversionResult) generatedExists = false
         return discardConversionResult
+    }
+
+    suspend fun completeDiscardConversion() {
+        discardConversionGate.emit(Unit)
     }
 
     override fun copyGeneratedConversion(token: String, output: OutputStream): String? {
@@ -3120,6 +3207,7 @@ private class FakeManagerRepository : ManagerRepository {
     override fun discardReview(token: String): Boolean {
         lifecycleEvents += "discardReview:$token"
         discardAttempts += token
+        beforeDiscardReview?.invoke(token)
         val result = discardReviewResults[token] ?: discardReviewResult
         if (result) discardedTokens += token
         return result

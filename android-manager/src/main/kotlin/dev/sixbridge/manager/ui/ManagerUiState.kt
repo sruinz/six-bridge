@@ -134,6 +134,8 @@ sealed interface ConversionUiState {
         val generated: GeneratedBundle,
         val failureCode: ConversionFailureCode? = null,
         val installOwnerActive: Boolean = false,
+        val cleanupPending: Boolean = false,
+        val cleanupInProgress: Boolean = false,
     ) : ConversionUiState
 
     data class Failed(

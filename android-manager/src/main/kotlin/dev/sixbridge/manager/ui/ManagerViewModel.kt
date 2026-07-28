@@ -81,7 +81,7 @@ class ManagerViewModel(
     private var generatedResultReviewToken: String? =
         savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY]
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
-    private var generatedTerminalJob: Job? = null
+    private var generatedCleanupJob: Job? = null
     private var documentOwnerGeneration =
         savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
     private var documentLaunchSequence =
@@ -407,7 +407,7 @@ class ManagerViewModel(
 
     private fun prepareGeneratedInstall() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
-        if (result.installOwnerActive) return
+        if (result.installOwnerActive || result.cleanupPending || result.cleanupInProgress) return
         val review = result.review ?: run {
             mutableState.update {
                 it.copy(
@@ -573,6 +573,13 @@ class ManagerViewModel(
 
     private fun cleanupConversion(destination: ManagerRoute) {
         val stateBeforeCancel = mutableState.value.conversionState
+        if (stateBeforeCancel is ConversionUiState.ResultReady &&
+            (stateBeforeCancel.cleanupPending ||
+                stateBeforeCancel.cleanupInProgress ||
+                pendingGeneratedCleanup?.token == stateBeforeCancel.token)
+        ) {
+            return
+        }
         val token = when (stateBeforeCancel) {
             is ConversionUiState.AnalysisReady -> stateBeforeCancel.token
             is ConversionUiState.Building -> stateBeforeCancel.token
@@ -610,7 +617,7 @@ class ManagerViewModel(
         val supersededInstall = if (generatedInstallOwned) detachInstallJob() else null
         supersededInstall?.cancel()
         routeOperation = null
-        enqueueRouteCleanup {
+        val cleanupWork: suspend () -> Boolean = cleanup@{
             ticket.previousOperation?.cancelAndJoin()
             supersededInstall?.cancelAndJoin()
             if (generatedInstallOwned) {
@@ -623,11 +630,11 @@ class ManagerViewModel(
                     throw error
                 } catch (_: Exception) {
                     showGeneratedCleanupFailure()
-                    return@enqueueRouteCleanup false
+                    return@cleanup false
                 }
                 if (!cleaned) {
                     showGeneratedCleanupFailure()
-                    return@enqueueRouteCleanup false
+                    return@cleanup false
                 }
                 generatedCleanup?.let {
                     advanceGeneratedCleanup(
@@ -644,14 +651,14 @@ class ManagerViewModel(
             conversionIoJob?.cancelAndJoin()
             conversionIoJob = null
             if (generatedCleanup != null) {
-                return@enqueueRouteCleanup performPendingGeneratedCleanup()
+                return@cleanup performPendingGeneratedCleanup()
             }
             if (token != null &&
                 token !in scheduledConversionCleanupTokens &&
                 !repository.discardConversion(token)
             ) {
                 showGeneratedCleanupFailure()
-                return@enqueueRouteCleanup false
+                return@cleanup false
             }
             if (ownedReviewToken == reviewToken) {
                 clearSavedReviewAndSession()
@@ -661,7 +668,7 @@ class ManagerViewModel(
                 !repository.discardReview(reviewToken)
             ) {
                 showGeneratedCleanupFailure()
-                return@enqueueRouteCleanup false
+                return@cleanup false
             }
             clearGeneratedInstallOwner()
             clearGeneratedResultOwner()
@@ -680,6 +687,11 @@ class ManagerViewModel(
                 )
             }
             true
+        }
+        if (generatedCleanup != null) {
+            enqueueGeneratedCleanup(cleanupWork)
+        } else {
+            enqueueRouteCleanup(cleanupWork)
         }
     }
 
@@ -716,6 +728,7 @@ class ManagerViewModel(
         generatedResultReviewToken = review?.token
         savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = generated.token
         savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = review?.token
+        val cleanupPending = pendingGeneratedCleanup?.token == generated.token
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionResult(generated.token),
@@ -725,6 +738,9 @@ class ManagerViewModel(
                     generated = generated,
                     failureCode = failureCode,
                     installOwnerActive = installOwnerActive,
+                    cleanupPending = cleanupPending,
+                    cleanupInProgress = cleanupPending &&
+                        generatedCleanupJob?.isActive == true,
                 ),
                 conversionUrl = "",
                 message = if (review == null) {
@@ -1536,7 +1552,6 @@ class ManagerViewModel(
         supersedeRecoveryForTerminal()
         when (installState) {
             is InstallState.Installed -> {
-                if (generatedTerminalJob?.isActive == true) return
                 beginGeneratedCleanup(
                     token = token,
                     reviewToken = result.review?.token,
@@ -1549,7 +1564,7 @@ class ManagerViewModel(
                         ManagerRoute.Report(installState.packageName),
                     ),
                 )
-                generatedTerminalJob = viewModelScope.launch {
+                enqueueGeneratedCleanup {
                     performPendingGeneratedCleanup()
                 }
             }
@@ -1618,7 +1633,55 @@ class ManagerViewModel(
             reviewToken = reviewToken,
             phase = phase,
             destination = destination,
-        ).also(::advanceGeneratedCleanup)
+        ).also {
+            advanceGeneratedCleanup(it)
+            updateGeneratedCleanupState(
+                token = it.token,
+                pending = true,
+                inProgress = false,
+            )
+        }
+    }
+
+    private fun enqueueGeneratedCleanup(
+        cleanup: suspend () -> Boolean,
+    ): Job {
+        generatedCleanupJob?.takeIf { it.isActive }?.let { return it }
+        val token = requireNotNull(pendingGeneratedCleanup).token
+        updateGeneratedCleanupState(token, pending = true, inProgress = true)
+        return enqueueRouteCleanup {
+            try {
+                cleanup()
+            } finally {
+                updateGeneratedCleanupState(
+                    token = token,
+                    pending = pendingGeneratedCleanup?.token == token,
+                    inProgress = false,
+                )
+            }
+        }.also {
+            generatedCleanupJob = it
+        }
+    }
+
+    private fun updateGeneratedCleanupState(
+        token: String,
+        pending: Boolean,
+        inProgress: Boolean,
+    ) {
+        mutableState.update {
+            val ready = it.conversionState as? ConversionUiState.ResultReady
+            if (ready?.token != token) {
+                it
+            } else {
+                it.copy(
+                    conversionState = ready.copy(
+                        cleanupPending = pending,
+                        cleanupInProgress = inProgress,
+                    ),
+                )
+            }
+        }
     }
 
     private fun advanceGeneratedCleanup(cleanup: PendingGeneratedCleanup) {

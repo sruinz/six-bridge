@@ -61,6 +61,8 @@ fun ConversionResultScreen(
             onClick = onInstall,
             enabled = ready.review != null &&
                 !ready.installOwnerActive &&
+                !ready.cleanupPending &&
+                !ready.cleanupInProgress &&
                 !installState.isActiveInstall(),
             modifier = Modifier.fillMaxWidth().testTag("conversion:install"),
         ) {
@@ -80,13 +82,16 @@ fun ConversionResultScreen(
         }
         Button(
             onClick = { onAction(ManagerAction.FinishConversion) },
-            enabled = !ready.installOwnerActive,
+            enabled = !ready.installOwnerActive &&
+                !ready.cleanupPending &&
+                !ready.cleanupInProgress,
             modifier = Modifier.fillMaxWidth().testTag("conversion:done"),
         ) {
             Text(stringResource(R.string.conversion_done))
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.CancelConversion) },
+            enabled = !ready.cleanupPending && !ready.cleanupInProgress,
             modifier = Modifier.fillMaxWidth().testTag("conversion:cancel"),
         ) {
             Text(stringResource(R.string.conversion_cancel))

@@ -244,6 +244,33 @@ class ManagerAppTest {
     }
 
     @Test
+    fun generated_cleanup_pending_disables_mutating_controls_but_keeps_save_and_share() {
+        var state by mutableStateOf(conversionResultState())
+        composeRule.setContent {
+            ManagerAppContent(
+                state = state,
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+        val ready = state.conversionState as ConversionUiState.ResultReady
+
+        listOf(
+            ready.copy(cleanupPending = true),
+            ready.copy(cleanupPending = true, cleanupInProgress = true),
+        ).forEach { cleanupState ->
+            composeRule.runOnIdle {
+                state = state.copy(conversionState = cleanupState)
+            }
+            composeRule.onNodeWithTag("conversion:install").assertIsNotEnabled()
+            composeRule.onNodeWithTag("conversion:done").assertIsNotEnabled()
+            composeRule.onNodeWithTag("conversion:cancel").assertIsNotEnabled()
+            composeRule.onNodeWithTag("conversion:save").assertIsEnabled()
+            composeRule.onNodeWithTag("conversion:share").assertIsEnabled()
+        }
+    }
+
+    @Test
     fun conversion_build_back_dispatches_cancel() {
         val actions = mutableListOf<ManagerAction>()
         val ready = conversionAnalysisState().conversionState as ConversionUiState.AnalysisReady
