@@ -49,6 +49,7 @@ class ManagerViewModel(
     ) -> GeneratedDocumentSaveResult = { _, _, _ ->
         GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
     },
+    private val afterGeneratedInstallCleanupTransitionPersisted: () -> Unit = {},
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
@@ -1650,6 +1651,26 @@ class ManagerViewModel(
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
         if (result?.token != token) return
         supersedeRecoveryForTerminal()
+        val pendingInstallCleanup = pendingInstallCleanupForCurrentOwner(token)
+        if (pendingInstallCleanup != null &&
+            (installState !is InstallState.Failed ||
+                installState.code !in CLEANUP_RETRYABLE_FAILURES)
+        ) {
+            transitionPendingInstallCleanup(
+                cleanup = pendingInstallCleanup,
+                destination = if (installState is InstallState.Installed) {
+                    GeneratedCleanupDestination.fromRoute(
+                        ManagerRoute.Report(installState.packageName),
+                    )
+                } else {
+                    pendingInstallCleanup.destination
+                },
+            )
+            enqueueGeneratedCleanup {
+                performPendingGeneratedCleanup()
+            }
+            return
+        }
         when (installState) {
             is InstallState.Installed -> {
                 beginGeneratedCleanup(
@@ -1691,6 +1712,48 @@ class ManagerViewModel(
                 }
             else -> Unit
         }
+    }
+
+    private fun pendingInstallCleanupForCurrentOwner(
+        token: String,
+    ): PendingGeneratedCleanup? {
+        val cleanup = pendingGeneratedCleanup ?: return null
+        val installSessionId = cleanup.installSessionId ?: return null
+        return cleanup.takeIf {
+            it.token == token &&
+                it.phase == GeneratedCleanupPhase.INSTALL &&
+                generatedInstallOwnerToken == token &&
+                savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY) == token &&
+                savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY) == installSessionId
+        }
+    }
+
+    private fun transitionPendingInstallCleanup(
+        cleanup: PendingGeneratedCleanup,
+        destination: GeneratedCleanupDestination,
+    ): PendingGeneratedCleanup {
+        val next = cleanup.copy(
+            phase = if (cleanup.reviewToken != null) {
+                GeneratedCleanupPhase.REVIEW
+            } else {
+                GeneratedCleanupPhase.CONVERSION
+            },
+            destination = destination,
+            installSessionId = null,
+        )
+        advanceGeneratedCleanup(next)
+        afterGeneratedInstallCleanupTransitionPersisted()
+        clearGeneratedInstallOwner()
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        mutableState.update {
+            val ready = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                conversionState = ready?.copy(installOwnerActive = false)
+                    ?: it.conversionState,
+                message = null,
+            )
+        }
+        return next
     }
 
     private fun returnGeneratedInstallToResult(message: UserMessage) {
@@ -1936,25 +1999,9 @@ class ManagerViewModel(
             showGeneratedCleanupFailure()
             return false
         }
-        clearGeneratedInstallOwner()
-        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
-        mutableState.update {
-            val result = it.conversionState as? ConversionUiState.ResultReady
-            it.copy(
-                conversionState = result?.copy(installOwnerActive = false)
-                    ?: it.conversionState,
-                message = null,
-            )
-        }
-        advanceGeneratedCleanup(
-            cleanup.copy(
-                phase = if (cleanup.reviewToken != null) {
-                    GeneratedCleanupPhase.REVIEW
-                } else {
-                    GeneratedCleanupPhase.CONVERSION
-                },
-                installSessionId = null,
-            ),
+        transitionPendingInstallCleanup(
+            cleanup = cleanup,
+            destination = cleanup.destination,
         )
         return true
     }
