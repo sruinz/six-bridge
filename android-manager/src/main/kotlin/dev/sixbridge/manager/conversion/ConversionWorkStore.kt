@@ -332,13 +332,51 @@ class ConversionWorkStore internal constructor(
         withContext(Dispatchers.IO) {
             if (!isCanonicalUuid(token)) return@withContext false
             val row = dao.get()
-            if (row?.token != token) return@withContext true
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext false
+            if (row?.token != token) {
+                return@withContext discardOtherToken(root, row, token)
+            }
             val reconciled = reconcileCleanupTokens(root, row) ?: return@withContext false
             val claimed = claimDiscarding(reconciled) ?: return@withContext false
             hooks.afterDiscardClaim()
             discardClaimed(root, claimed)
         }
+    }
+
+    private suspend fun discardOtherToken(
+        root: File,
+        row: ConversionJobEntity?,
+        token: String,
+    ): Boolean {
+        val tokenPath = directChild(root, token).toPath()
+        val physicalExists = Files.exists(tokenPath, NOFOLLOW_LINKS)
+        if (row == null) return !physicalExists
+        var cleanup = decodeCleanupTokens(row.cleanupTokensJson) ?: return false
+        if (cleanup.any { !isCanonicalUuid(it) || it == row.token }) return false
+        if (!physicalExists && token !in cleanup) return true
+        var claimed = row
+        if (token !in cleanup) {
+            val changed = dao.updateCleanupTokens(
+                token = row.token,
+                expectedGeneration = row.generation,
+                cleanupTokensJson = encodeCleanupTokens(cleanup + token),
+                updatedAtEpochMillis = now(),
+            )
+            if (changed != 1) return false
+            claimed = dao.get()
+                ?.takeIf { it.token == row.token }
+                ?: return false
+            cleanup = decodeCleanupTokens(claimed.cleanupTokensJson) ?: return false
+            if (token !in cleanup) return false
+        }
+        identityOwnerLifecycle.abort(token)
+        if (!deleteTokenDirectory(root, token)) return false
+        return dao.updateCleanupTokens(
+            token = claimed.token,
+            expectedGeneration = claimed.generation,
+            cleanupTokensJson = encodeCleanupTokens(cleanup - token),
+            updatedAtEpochMillis = now(),
+        ) == 1
     }
 
     suspend fun <T> openVerifiedInput(

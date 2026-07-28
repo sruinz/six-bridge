@@ -843,9 +843,125 @@ class ConversionWorkStoreTest {
 
             assertTrue(store.discard(absentToken))
             val current = store.create(artifact("current".encodeToByteArray()))
+            val before = requireNotNull(dao.get())
             assertTrue(store.discard(absentToken))
+            assertEquals(before, dao.get())
             assertEquals(current.token, store.restore()?.token)
             assertFalse(store.discard("not-a-canonical-token"))
+        }
+
+    @Test
+    fun `다른 current Y가 있어도 physical X를 durable claim 뒤 X만 제거한다`() =
+        runTest {
+            val store = store()
+            val current = store.create(artifact("current".encodeToByteArray()))
+            val otherCleanupToken = UUID(0, 998).toString()
+            dao.force(
+                requireNotNull(dao.get()).copy(
+                    cleanupTokensJson = encodeCleanupTokens(setOf(otherCleanupToken)),
+                ),
+            )
+            val before = requireNotNull(dao.get())
+            val staleToken = UUID(0, 999).toString()
+            val staleDirectory = File(root, staleToken).apply { check(mkdir()) }
+            File(staleDirectory, "stale.input").writeText("stale")
+
+            assertTrue(store.discard(staleToken))
+
+            val after = requireNotNull(dao.get())
+            assertEquals(current.token, after.token)
+            assertEquals(before.stage, after.stage)
+            assertEquals(before.inputFileName, after.inputFileName)
+            assertEquals(before.inputSha256, after.inputSha256)
+            assertTrue(privateInput(after).isFile)
+            assertFalse(staleDirectory.exists())
+            assertEquals(
+                setOf(otherCleanupToken),
+                decodeCleanupTokens(after.cleanupTokensJson),
+            )
+        }
+
+    @Test
+    fun `physical X delete 실패 claim은 재생성 retry까지 Y에 남는다`() =
+        runTest {
+            var failStaleDelete = true
+            val staleToken = UUID(0, 999).toString()
+            val failing = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path ->
+                        if (path.fileName.toString() == staleToken && failStaleDelete) {
+                            false
+                        } else {
+                            path.toFile().deleteRecursively()
+                        }
+                    },
+                ),
+            )
+            val current = failing.create(artifact("current".encodeToByteArray()))
+            val before = requireNotNull(dao.get())
+            val staleDirectory = File(root, staleToken).apply { check(mkdir()) }
+            File(staleDirectory, "stale.input").writeText("stale")
+
+            assertFalse(failing.discard(staleToken))
+
+            val claimed = requireNotNull(dao.get())
+            assertEquals(current.token, claimed.token)
+            assertEquals(before.stage, claimed.stage)
+            assertTrue(
+                staleToken in requireNotNull(
+                    decodeCleanupTokens(claimed.cleanupTokensJson),
+                ),
+            )
+            assertTrue(staleDirectory.isDirectory)
+
+            failStaleDelete = false
+            val recreated = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path -> path.toFile().deleteRecursively() },
+                ),
+            )
+
+            assertTrue(recreated.discard(staleToken))
+
+            val cleaned = requireNotNull(dao.get())
+            assertEquals(current.token, cleaned.token)
+            assertEquals(before.stage, cleaned.stage)
+            assertEquals(before.inputFileName, cleaned.inputFileName)
+            assertTrue(privateInput(cleaned).isFile)
+            assertFalse(staleDirectory.exists())
+            assertTrue(
+                staleToken !in requireNotNull(
+                    decodeCleanupTokens(cleaned.cleanupTokensJson),
+                ),
+            )
+        }
+
+    @Test
+    fun `physical X 제거 뒤 claim CAS 실패는 retry 가능한 claim을 보존한다`() =
+        runTest {
+            val store = store()
+            store.create(artifact("current".encodeToByteArray()))
+            val staleToken = UUID(0, 999).toString()
+            val staleDirectory = File(root, staleToken).apply { check(mkdir()) }
+            File(staleDirectory, "stale.input").writeText("stale")
+            dao.failCleanupUpdateCall = 2
+
+            assertFalse(store.discard(staleToken))
+
+            assertFalse(staleDirectory.exists())
+            assertTrue(
+                staleToken in requireNotNull(
+                    decodeCleanupTokens(requireNotNull(dao.get()).cleanupTokensJson),
+                ),
+            )
+
+            dao.failCleanupUpdateCall = null
+            assertTrue(store.discard(staleToken))
+            assertTrue(
+                staleToken !in requireNotNull(
+                    decodeCleanupTokens(requireNotNull(dao.get()).cleanupTokensJson),
+                ),
+            )
         }
 
     @Test
@@ -1187,6 +1303,8 @@ class ConversionWorkStoreTest {
 
     private class FakeConversionJobDao : ConversionJobDao() {
         private var row: ConversionJobEntity? = null
+        private var cleanupUpdateCalls = 0
+        var failCleanupUpdateCall: Int? = null
 
         override suspend fun get(): ConversionJobEntity? = synchronized(this) { row }
 
@@ -1256,6 +1374,8 @@ class ConversionWorkStoreTest {
             cleanupTokensJson: String,
             updatedAtEpochMillis: Long,
         ): Int = synchronized(this) {
+            cleanupUpdateCalls += 1
+            if (cleanupUpdateCalls == failCleanupUpdateCall) return@synchronized 0
             val current = row ?: return@synchronized 0
             if (current.token != token || current.generation != expectedGeneration) {
                 return@synchronized 0

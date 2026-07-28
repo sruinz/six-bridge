@@ -758,6 +758,21 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue(fixture.workDiscarded)
     }
 
+    @Test
+    fun `generated discard waits for physical other work cleanup`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            generatedFile.delete()
+            bundleDiscardResult = true
+            workDiscardResult = false
+        }
+
+        assertTrue(!fixture.coordinator().discard(fixture.token))
+        assertTrue(fixture.workDiscarded)
+
+        fixture.workDiscardResult = true
+        assertTrue(fixture.coordinator().discard(fixture.token))
+    }
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
@@ -804,6 +819,7 @@ class OnDeviceConversionCoordinatorTest {
         var activeOwner: String? = null
         var ownerAborted = false
         var workDiscarded = false
+        var workDiscardResult = true
 
         fun coordinator() = OnDeviceConversionCoordinator(
             input = ConversionInputPort {
@@ -878,7 +894,7 @@ class OnDeviceConversionCoordinatorTest {
 
                 override suspend fun discard(token: String): Boolean {
                     workDiscarded = true
-                    return true
+                    return workDiscardResult
                 }
 
                 override suspend fun resetAwaitingApproval(
