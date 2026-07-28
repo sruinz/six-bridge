@@ -30,6 +30,8 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -76,6 +78,120 @@ class DraftIdentityPreviewInstrumentedTest {
             } finally {
                 file.delete()
             }
+        }
+    }
+
+    @Test
+    fun passthroughModeWithoutCrxProofIsRejectedBeforeIdentityMutation() {
+        assertForgedPreparedRejected(
+            baseKind = OnDeviceInputKind.CRX3,
+            identityMode = InstallationIdentityMode.PASSTHROUGH,
+            passthroughCrx = null,
+        )
+    }
+
+    @Test
+    fun convertedModeWithCrxProofIsRejectedBeforeLeaseCreation() {
+        val crx = externalSignedCrx(simpleExtensionZip())
+        assertForgedPreparedRejected(
+            baseKind = OnDeviceInputKind.ZIP,
+            identityMode = InstallationIdentityMode.CONVERTED,
+            passthroughCrx = crx,
+        )
+    }
+
+    private fun assertForgedPreparedRejected(
+        baseKind: OnDeviceInputKind,
+        identityMode: InstallationIdentityMode,
+        passthroughCrx: ByteArray?,
+    ) {
+        val profile = profile()
+        val bytes = if (baseKind == OnDeviceInputKind.ZIP) {
+            simpleExtensionZip()
+        } else {
+            externalSignedCrx(simpleExtensionZip())
+        }
+        val artifactToken = UUID.randomUUID().toString()
+        val source = File(
+            context.filesDir,
+            "forged-identity-input/$artifactToken/input.bin",
+        ).apply {
+            requireNotNull(parentFile).mkdirs()
+            writeBytes(bytes)
+        }
+        val runtime = DefaultConversionRuntime()
+        val analysis = runtime.analyze(source, baseKind, profile)
+        val validPrepared = runtime.prepare(
+            source,
+            baseKind,
+            profile,
+            analysis.requiredApprovals,
+        )
+        val forgedPrepared = validPrepared.copy(
+            identityMode = identityMode,
+            passthroughCrx = passthroughCrx,
+        )
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ManagerDatabase::class.java,
+        ).allowMainThreadQueries().build()
+        val packager = OnDeviceWrapperPackager(context)
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val workRoot = File(
+            context.filesDir,
+            "forged-identity-work/${UUID.randomUUID()}",
+        )
+        val workStore = ConversionWorkStore(
+            privateRoot = workRoot,
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { true },
+            identityOwnerLifecycle = ledger.ownerLifecycle(packager),
+        )
+        var ownerToken: String? = null
+        try {
+            runBlocking {
+                val job = workStore.create(
+                    OnDeviceInputArtifact(
+                        token = artifactToken,
+                        kind = baseKind,
+                        privateFile = source,
+                        sha256 = sha256(bytes),
+                        expectedExtensionId = null,
+                    ),
+                )
+                ownerToken = job.token
+                val outcome = runCatching {
+                    DefaultConversionIdentityPort(ledger, packager).resolve(
+                        prepared = forgedPrepared,
+                        profile = profile,
+                        selection = if (forgedPrepared.logicalSourceIdentity == null) {
+                            InstallationIdentitySelection.CreateNew
+                        } else {
+                            null
+                        },
+                        ownerToken = job.token,
+                    )
+                }
+
+                assertNull(
+                    database.conversionIdentityDao().getLeaseByOwnerToken(job.token),
+                )
+                assertTrue(outcome.exceptionOrNull() is IllegalArgumentException)
+                assertEquals(
+                    "prepared identity mode와 passthrough CRX proof가 일치하지 않습니다.",
+                    outcome.exceptionOrNull()?.message,
+                )
+            }
+        } finally {
+            runBlocking {
+                ownerToken?.let {
+                    runCatching { ledger.abortByOwnerToken(it, packager) }
+                    runCatching { workStore.discard(it) }
+                }
+            }
+            database.close()
+            source.parentFile?.deleteRecursively()
+            workRoot.deleteRecursively()
         }
     }
 

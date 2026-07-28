@@ -281,6 +281,12 @@ internal class DefaultConversionIdentityPort(
         selection: InstallationIdentitySelection?,
         ownerToken: String,
     ): ResolvedPackageIdentity {
+        require(
+            (prepared.identityMode == InstallationIdentityMode.PASSTHROUGH) ==
+                (prepared.passthroughCrx != null),
+        ) {
+            "prepared identity mode와 passthrough CRX proof가 일치하지 않습니다."
+        }
         val key = ledger.resolveSelection(
             prepared.logicalSourceIdentity,
             profile.majorVersion,

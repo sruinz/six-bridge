@@ -155,6 +155,61 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `analysis와 prepared identity mode 양방향 불일치는 reserve 전에 거부한다`() =
+        runTest {
+            listOf(
+                InstallationIdentityMode.CONVERTED to
+                    InstallationIdentityMode.PASSTHROUGH,
+                InstallationIdentityMode.PASSTHROUGH to
+                    InstallationIdentityMode.CONVERTED,
+            ).forEach { (analysisMode, preparedMode) ->
+                val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                    analysisIdentityMode = analysisMode
+                    preparedIdentityMode = preparedMode
+                    preparedPassthroughCrx = if (
+                        preparedMode == InstallationIdentityMode.PASSTHROUGH
+                    ) {
+                        "crx".encodeToByteArray()
+                    } else {
+                        null
+                    }
+                }
+                val coordinator = fixture.coordinator()
+                val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                    coordinator.begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    ),
+                )
+                val expectedPreview = InstallationIdentityKey.create(
+                    requireNotNull(fixture.logicalIdentity),
+                    analysis.profile.majorVersion,
+                    analysisMode,
+                ).identitySha256.take(12)
+                assertEquals(
+                    expectedPreview,
+                    assertIs<IdentityRequirement.Stable>(
+                        analysis.identityRequirement,
+                    ).identityKeyPreview,
+                )
+
+                val failure = assertIs<ConversionBuildResult.Failure>(
+                    coordinator.build(
+                        analysis.token,
+                        analysis.requiredApprovals,
+                        partialConfirmed = true,
+                        identitySelection = null,
+                    ),
+                )
+
+                assertEquals(ConversionFailureCode.TRANSFORM_MISMATCH, failure.code)
+                assertEquals(0, fixture.events.count { it == "identity" })
+                assertEquals(0, fixture.events.count { it == "reserve" })
+                assertTrue("building" !in fixture.events)
+                assertNull(fixture.activeOwner)
+            }
+        }
+
+    @Test
     fun `Task 6 입력 오류 code를 사용자 실패 code로 보존한다`() = runTest {
         val cases = listOf(
             OnDeviceInputErrorCode.INVALID_DRAFT to ConversionFailureCode.DRAFT_INVALID,
@@ -682,6 +737,9 @@ class OnDeviceConversionCoordinatorTest {
         var compatibilityStatus = CompatibilityStatus.PARTIAL
         var logicalIdentity: LogicalSourceIdentity? =
             LogicalSourceIdentity.storeExtensionId(EXTENSION_ID)
+        var analysisIdentityMode = InstallationIdentityMode.PASSTHROUGH
+        var preparedIdentityMode = InstallationIdentityMode.PASSTHROUGH
+        var preparedPassthroughCrx: ByteArray? = "crx".encodeToByteArray()
         var installedWrapper: InstalledWrapper? = null
         var reserveFailure: Throwable? = null
         var identityFailure: Throwable? = null
@@ -976,7 +1034,7 @@ class OnDeviceConversionCoordinatorTest {
             selectedAutomaticAdapters = emptySet(),
             requiredApprovals = setOf("adapter"),
             logicalSourceIdentity = logicalIdentity,
-            identityMode = InstallationIdentityMode.PASSTHROUGH,
+            identityMode = analysisIdentityMode,
         )
 
         private fun prepared(profile: BrowserProfile) = PreparedConversionSnapshot(
@@ -986,9 +1044,9 @@ class OnDeviceConversionCoordinatorTest {
             originalSourceSha256 = "4".repeat(64),
             planSha256 = "5".repeat(64),
             transformedSourceZip = "zip".encodeToByteArray(),
-            passthroughCrx = "crx".encodeToByteArray(),
+            passthroughCrx = preparedPassthroughCrx,
             logicalSourceIdentity = logicalIdentity,
-            identityMode = InstallationIdentityMode.PASSTHROUGH,
+            identityMode = preparedIdentityMode,
             descriptorName = "Example",
             descriptorVersion = "1.0",
             sourceKind = "CRX3",

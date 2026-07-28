@@ -166,7 +166,8 @@ internal class OnDeviceConversionCoordinator(
         }
         if (
             prepared.reportBefore.browserProfileSha256 != profileSha256 ||
-            prepared.reportBefore.sourceSha256 != analysis.report.sourceSha256
+            prepared.reportBefore.sourceSha256 != analysis.report.sourceSha256 ||
+            prepared.identityMode != analysis.identityMode
         ) {
             return@withLock ConversionBuildResult.Failure(
                 ConversionFailureCode.TRANSFORM_MISMATCH,
