@@ -78,10 +78,12 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
                 is DraftReplayResult.Ready -> snapshot(
                     replay.prepared.compatibilityBefore,
                     replay.prepared.logicalSourceIdentity.toManagerIdentity(),
+                    payload.input.inputKind,
                 )
                 is DraftReplayResult.ProfileChanged -> snapshot(
                     replay.currentAnalysis,
                     logicalIdentity(payload.draft.sourceIdentity),
+                    payload.input.inputKind,
                     profileChanged = true,
                 )
             }
@@ -98,7 +100,11 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
                         .map { it.id },
                 )
             }.getOrNull()
-            snapshot(report, prepared?.logicalSourceIdentity.toManagerIdentity())
+            snapshot(
+                report,
+                prepared?.logicalSourceIdentity.toManagerIdentity(),
+                portable.kind,
+            )
         }
     }
 
@@ -134,6 +140,17 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             }
         }
         val after = prepared.compatibilityAfter
+        val inputKind = ExtensionInputKind.valueOf(sourceKind)
+        val identityMode = installationIdentityMode(
+            inputKind,
+            after.conversionState,
+        )
+        check(
+            (prepared.passthroughCrx != null) ==
+                (identityMode == InstallationIdentityMode.PASSTHROUGH),
+        ) {
+            "준비 결과의 passthrough proof와 installation identity mode가 다릅니다."
+        }
         return PreparedConversionSnapshot(
             reportBefore = prepared.compatibilityBefore,
             originalSourceSha256 = prepared.originalSourceSha256,
@@ -141,6 +158,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             transformedSourceZip = prepared.transformedSourceZip,
             passthroughCrx = prepared.passthroughCrx,
             logicalSourceIdentity = prepared.logicalSourceIdentity.toManagerIdentity(),
+            identityMode = identityMode,
             descriptorName = requireNotNull(after.extensionName),
             descriptorVersion = requireNotNull(after.extensionVersion),
             sourceKind = sourceKind,
@@ -216,6 +234,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
     private fun snapshot(
         report: dev.sixbridge.core.compat.CompatibilityReport,
         logicalIdentity: LogicalSourceIdentity?,
+        inputKind: ExtensionInputKind,
         profileChanged: Boolean = false,
     ) = ConversionAnalysisSnapshot(
         report = report,
@@ -226,6 +245,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
             .mapTo(sortedSetOf()) { it.id },
         logicalSourceIdentity = logicalIdentity,
+        identityMode = installationIdentityMode(inputKind, report.conversionState),
         profileChanged = profileChanged,
     )
 
@@ -261,18 +281,13 @@ internal class DefaultConversionIdentityPort(
         selection: InstallationIdentitySelection?,
         ownerToken: String,
     ): ResolvedPackageIdentity {
-        val mode = if (prepared.passthroughCrx != null) {
-            InstallationIdentityMode.PASSTHROUGH
-        } else {
-            InstallationIdentityMode.CONVERTED
-        }
         val key = ledger.resolveSelection(
             prepared.logicalSourceIdentity,
             profile.majorVersion,
-            mode,
+            prepared.identityMode,
             selection,
         )
-        if (mode == InstallationIdentityMode.PASSTHROUGH) {
+        if (prepared.identityMode == InstallationIdentityMode.PASSTHROUGH) {
             return ResolvedPackageIdentity(
                 key,
                 packager.resolveIdentity(key, prepared.passthroughCrx),

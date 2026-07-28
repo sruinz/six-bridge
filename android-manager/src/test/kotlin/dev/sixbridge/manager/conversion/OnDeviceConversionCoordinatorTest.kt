@@ -976,6 +976,7 @@ class OnDeviceConversionCoordinatorTest {
             selectedAutomaticAdapters = emptySet(),
             requiredApprovals = setOf("adapter"),
             logicalSourceIdentity = logicalIdentity,
+            identityMode = InstallationIdentityMode.PASSTHROUGH,
         )
 
         private fun prepared(profile: BrowserProfile) = PreparedConversionSnapshot(
@@ -987,6 +988,7 @@ class OnDeviceConversionCoordinatorTest {
             transformedSourceZip = "zip".encodeToByteArray(),
             passthroughCrx = "crx".encodeToByteArray(),
             logicalSourceIdentity = logicalIdentity,
+            identityMode = InstallationIdentityMode.PASSTHROUGH,
             descriptorName = "Example",
             descriptorVersion = "1.0",
             sourceKind = "CRX3",

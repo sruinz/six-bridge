@@ -346,22 +346,11 @@ internal class OnDeviceConversionCoordinator(
             )
         }
         val identityRequirement = analysis.logicalSourceIdentity?.let {
-            val mode = if (
-                job.inputKind in setOf(
-                    OnDeviceInputKind.CRX3,
-                    OnDeviceInputKind.CHROME_WEB_STORE,
-                ) &&
-                analysis.report.conversionState.name == "PASSTHROUGH"
-            ) {
-                InstallationIdentityMode.PASSTHROUGH
-            } else {
-                InstallationIdentityMode.CONVERTED
-            }
             IdentityRequirement.Stable(
                 InstallationIdentityKey.create(
                     it,
                     profile.majorVersion,
-                    mode,
+                    analysis.identityMode,
                 ).identitySha256.take(12),
             )
         } ?: IdentityRequirement.UserSelectionRequired(

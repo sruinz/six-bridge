@@ -2,6 +2,8 @@ package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
@@ -93,6 +95,7 @@ internal data class ConversionAnalysisSnapshot(
     val selectedAutomaticAdapters: Set<String>,
     val requiredApprovals: Set<String>,
     val logicalSourceIdentity: LogicalSourceIdentity?,
+    val identityMode: InstallationIdentityMode,
     val profileChanged: Boolean = false,
 )
 
@@ -103,11 +106,28 @@ internal data class PreparedConversionSnapshot(
     val transformedSourceZip: ByteArray,
     val passthroughCrx: ByteArray?,
     val logicalSourceIdentity: LogicalSourceIdentity?,
+    val identityMode: InstallationIdentityMode,
     val descriptorName: String,
     val descriptorVersion: String,
     val sourceKind: String,
     val opaque: Any,
 )
+
+internal fun installationIdentityMode(
+    inputKind: ExtensionInputKind,
+    conversionState: ConversionState,
+): InstallationIdentityMode =
+    if (
+        inputKind in setOf(
+            ExtensionInputKind.CRX3,
+            ExtensionInputKind.CHROME_WEB_STORE,
+        ) &&
+        conversionState == ConversionState.PASSTHROUGH
+    ) {
+        InstallationIdentityMode.PASSTHROUGH
+    } else {
+        InstallationIdentityMode.CONVERTED
+    }
 
 internal data class BoundConversionSnapshot(
     val sourceZip: ByteArray,

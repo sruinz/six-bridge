@@ -161,6 +161,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 profile,
             )
             assertFalse(same.profileChanged)
+            assertEquals(InstallationIdentityMode.CONVERTED, same.identityMode)
             val samePrepared = runtime.prepare(
                 draftFile,
                 OnDeviceInputKind.SIX_DRAFT,
@@ -168,6 +169,10 @@ class CoreConversionRuntimeInstrumentedTest {
                 same.requiredApprovals,
             )
             assertEquals("ZIP", samePrepared.sourceKind)
+            assertEquals(
+                InstallationIdentityMode.CONVERTED,
+                samePrepared.identityMode,
+            )
 
             val changedProfile = profile.copy(versionCode = profile.versionCode + 1)
             val changed = runtime.analyze(
@@ -176,6 +181,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 changedProfile,
             )
             assertTrue(changed.profileChanged)
+            assertEquals(InstallationIdentityMode.CONVERTED, changed.identityMode)
             assertEquals(
                 changedProfile.canonicalSha256(),
                 changed.report.browserProfileSha256,
@@ -191,6 +197,10 @@ class CoreConversionRuntimeInstrumentedTest {
                 newlyApproved.reportBefore.browserProfileSha256,
             )
             assertEquals("ZIP", newlyApproved.sourceKind)
+            assertEquals(
+                InstallationIdentityMode.CONVERTED,
+                newlyApproved.identityMode,
+            )
 
             packageDraftThroughDefaultPorts(
                 draftFile = draftFile,
