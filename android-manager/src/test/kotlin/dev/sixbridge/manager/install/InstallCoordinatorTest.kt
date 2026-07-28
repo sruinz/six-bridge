@@ -28,6 +28,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
@@ -92,6 +93,9 @@ class InstallCoordinatorTest {
             fixture.catalog.replaced,
         )
         assertNull(fixture.pendingStore.record)
+        assertNotNull(fixture.pendingStore.terminalResult)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        fixture.acknowledgeTerminal(InstallState.Installed(PACKAGE_NAME))
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
 
@@ -140,6 +144,7 @@ class InstallCoordinatorTest {
             fixture.coordinator.onPackageInstallerResult(
                 PackageInstallResult.Cancelled(SESSION_ID),
             )
+            fixture.acknowledgeTerminal(InstallState.Cancelled)
 
             val nextToken = "123e4567-e89b-12d3-a456-426614174001"
             fixture.coordinator.request(
@@ -185,6 +190,8 @@ class InstallCoordinatorTest {
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
         assertNull(fixture.pendingStore.record)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        fixture.acknowledgeTerminal(InstallState.Cancelled)
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
 
@@ -673,6 +680,10 @@ class InstallCoordinatorTest {
         )
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
         assertNull(fixture.pendingStore.record)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        fixture.acknowledgeTerminal(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+        )
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
 
@@ -689,7 +700,7 @@ class InstallCoordinatorTest {
             fixture.coordinator.state.value,
         )
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -705,21 +716,18 @@ class InstallCoordinatorTest {
 
         fixture.coordinator.onPackageInstallerResult(result)
 
-        assertEquals(
-            InstallState.Failed("CLEANUP_FAILED", "설치 임시 데이터를 정리하지 못했습니다."),
-            fixture.coordinator.state.value,
-        )
-        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        val terminalState =
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package")
+        assertEquals(terminalState, fixture.coordinator.state.value)
+        assertNull(fixture.pendingStore.record)
         assertEquals(result, fixture.pendingStore.terminalResult?.result)
+        assertFalse(
+            fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState),
+        )
+        assertNotNull(fixture.pendingStore.terminalResult)
 
         fixture.pendingStore.discardFailure = false
-        fixture.coordinator.restore()
-
-        assertEquals(
-            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
-            fixture.coordinator.state.value,
-        )
-        assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(terminalState)
         assertNull(fixture.pendingStore.terminalResult)
     }
 
@@ -732,24 +740,18 @@ class InstallCoordinatorTest {
 
         fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID))
 
-        assertEquals(
-            InstallState.Failed("CLEANUP_FAILED", "설치 임시 데이터를 정리하지 못했습니다."),
-            fixture.coordinator.state.value,
-        )
+        val terminalState = InstallState.Installed(PACKAGE_NAME)
+        assertEquals(terminalState, fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.record)
         assertEquals(PACKAGE_NAME, fixture.pendingStore.terminalResult?.packageName)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
-        assertEquals(
-            InstallCleanupResult.CleanupFailed,
-            fixture.coordinator.cancel(TOKEN, SESSION_ID),
+        assertFalse(
+            fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState),
         )
         assertNotNull(fixture.pendingStore.terminalResult)
 
         fixture.pendingStore.clearTerminalFailure = false
-        assertEquals(
-            InstallCleanupResult.Cleaned,
-            fixture.coordinator.cancel(TOKEN, SESSION_ID),
-        )
+        fixture.acknowledgeTerminal(terminalState)
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.terminalResult)
@@ -879,6 +881,8 @@ class InstallCoordinatorTest {
             val terminal = PendingInstallResult(
                 result = PackageInstallResult.Success(SESSION_ID),
                 terminalAtEpochMillis = FINISHED_AT,
+                packageName = PACKAGE_NAME,
+                importToken = TOKEN,
             )
             val fixture = fixture(
                 pending = pendingInstall(),
@@ -891,6 +895,7 @@ class InstallCoordinatorTest {
             assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
             assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
             assertNull(fixture.pendingStore.record)
+            fixture.acknowledgeTerminal(InstallState.Installed(PACKAGE_NAME))
             assertNull(fixture.pendingStore.terminalResult)
         }
 
@@ -900,6 +905,8 @@ class InstallCoordinatorTest {
             val terminal = PendingInstallResult(
                 result = PackageInstallResult.Success(SESSION_ID),
                 terminalAtEpochMillis = FINISHED_AT,
+                packageName = PACKAGE_NAME,
+                importToken = TOKEN,
             )
             val fixture = fixture(
                 pending = pendingInstall(),
@@ -931,6 +938,13 @@ class InstallCoordinatorTest {
 
             assertEquals(InstallState.Installed(PACKAGE_NAME), coordinator.state.value)
             assertNull(fixture.pendingStore.record)
+            assertTrue(
+                coordinator.acknowledgeTerminal(
+                    TOKEN,
+                    SESSION_ID,
+                    InstallState.Installed(PACKAGE_NAME),
+                ),
+            )
             assertNull(fixture.pendingStore.terminalResult)
         }
 
@@ -1045,6 +1059,9 @@ class InstallCoordinatorTest {
             fixture.coordinator.state.value,
         )
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+        )
         assertNull(fixture.pendingStore.terminalResult)
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
@@ -1077,6 +1094,8 @@ class InstallCoordinatorTest {
                 message = "installer rejected package",
             ),
             terminalAtEpochMillis = FINISHED_AT,
+            packageName = PACKAGE_NAME,
+            importToken = TOKEN,
         )
         val fixture = fixture(
             pending = pending,
@@ -1091,6 +1110,9 @@ class InstallCoordinatorTest {
             fixture.coordinator.state.value,
         )
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+        )
         assertNull(fixture.pendingStore.terminalResult)
         assertEquals(listOf(terminal), fixture.pendingStore.clearedTerminalResults)
     }
@@ -1113,6 +1135,9 @@ class InstallCoordinatorTest {
             fixture.coordinator.state.value,
         )
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+        )
         assertNull(fixture.pendingStore.terminalResult)
     }
 
@@ -1178,6 +1203,7 @@ class InstallCoordinatorTest {
         fixture.coordinator.restore()
 
         assertEquals(InstallState.Failed("FIRST_FAILURE", "first"), fixture.coordinator.state.value)
+        fixture.acknowledgeTerminal(InstallState.Failed("FIRST_FAILURE", "first"))
         assertNull(fixture.pendingStore.terminalResult)
         assertNull(fixture.catalog.replaced)
     }
@@ -1220,6 +1246,55 @@ class InstallCoordinatorTest {
         }
 
     @Test
+    fun `terminal receipt는 coordinator 재생성 뒤에도 exact owner 증명을 유지한다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+            fixture.coordinator.onPackageInstallerResult(
+                PackageInstallResult.Cancelled(SESSION_ID),
+            )
+
+            assertNull(fixture.pendingStore.record)
+            assertNotNull(fixture.pendingStore.terminalResult)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+
+            val recreated = coordinator(
+                gateway = fixture.gateway,
+                pendingStore = fixture.pendingStore,
+                installedWrappers = fixture.installedWrappers,
+                catalog = fixture.catalog,
+            )
+            recreated.restore()
+
+            assertEquals(InstallState.Cancelled, recreated.state.value)
+            assertEquals(
+                InstallTerminalOwnerResult.Owned(InstallState.Cancelled),
+                recreated.terminalForOwner(TOKEN, SESSION_ID),
+            )
+            assertFalse(
+                recreated.acknowledgeTerminal(
+                    expectedImportToken =
+                        "123e4567-e89b-12d3-a456-426614174099",
+                    expectedSessionId = SESSION_ID,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
+            assertNotNull(fixture.pendingStore.terminalResult)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+
+            assertTrue(
+                recreated.acknowledgeTerminal(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
+            assertNull(fixture.pendingStore.terminalResult)
+            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        }
+
+    @Test
     fun `legacy token 없는 terminal은 generated owner 증명을 fail closed한다`() = runBlocking {
         val terminal = PendingInstallResult(
             result = PackageInstallResult.Cancelled(SESSION_ID),
@@ -1234,6 +1309,15 @@ class InstallCoordinatorTest {
             InstallTerminalOwnerResult.OwnerMismatch,
             fixture.coordinator.terminalForOwner(TOKEN, null),
         )
+        assertFalse(
+            fixture.coordinator.acknowledgeTerminal(
+                expectedImportToken = TOKEN,
+                expectedSessionId = SESSION_ID,
+                expectedState = InstallState.Cancelled,
+            ),
+        )
+        assertEquals(terminal, fixture.pendingStore.terminalResult)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -1250,7 +1334,7 @@ class InstallCoordinatorTest {
         installedFixture.installedWrappers.installed = installedWrapper()
         installedFixture.coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID))
         assertEquals(
-            InstallCleanupResult.OwnerMismatch,
+            InstallCleanupResult.CleanupFailed,
             installedFixture.coordinator.cancel(TOKEN, SESSION_ID),
         )
         assertEquals(InstallState.Installed(PACKAGE_NAME), installedFixture.coordinator.state.value)
@@ -1259,7 +1343,7 @@ class InstallCoordinatorTest {
         cancelledFixture.coordinator.request(cancelledFixture.bundle, partialConfirmed = false)
         cancelledFixture.coordinator.onPackageInstallerResult(PackageInstallResult.Cancelled(SESSION_ID))
         assertEquals(
-            InstallCleanupResult.OwnerMismatch,
+            InstallCleanupResult.CleanupFailed,
             cancelledFixture.coordinator.cancel(TOKEN, SESSION_ID),
         )
         assertEquals(InstallState.Cancelled, cancelledFixture.coordinator.state.value)
@@ -1291,6 +1375,7 @@ class InstallCoordinatorTest {
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertTrue(fixture.gateway.abandonedSessions.isEmpty())
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(InstallState.Installed(PACKAGE_NAME))
         assertNull(fixture.pendingStore.terminalResult)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
     }
@@ -1315,6 +1400,7 @@ class InstallCoordinatorTest {
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(InstallState.Installed(PACKAGE_NAME))
         assertNull(fixture.pendingStore.terminalResult)
     }
 
@@ -1339,6 +1425,9 @@ class InstallCoordinatorTest {
             fixture.coordinator.state.value,
         )
         assertNull(fixture.pendingStore.record)
+        fixture.acknowledgeTerminal(
+            InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
+        )
         assertNull(fixture.pendingStore.terminalResult)
     }
 
@@ -1532,6 +1621,16 @@ class InstallCoordinatorTest {
         startedAtEpochMillis = STARTED_AT,
     )
 
+    private suspend fun Fixture.acknowledgeTerminal(state: InstallState) {
+        assertTrue(
+            coordinator.acknowledgeTerminal(
+                expectedImportToken = TOKEN,
+                expectedSessionId = SESSION_ID,
+                expectedState = state,
+            ),
+        )
+    }
+
     private data class Fixture(
         val coordinator: InstallCoordinator,
         val gateway: FakePackageInstallGateway,
@@ -1688,6 +1787,7 @@ class InstallCoordinatorTest {
                     result = result,
                     terminalAtEpochMillis = FINISHED_AT,
                     packageName = record?.packageName.orEmpty(),
+                    importToken = record?.importToken,
                 )
             }
             if (record != expected || discardFailure) {
@@ -1741,6 +1841,7 @@ class InstallCoordinatorTest {
                 result = result,
                 terminalAtEpochMillis = terminalAtEpochMillis,
                 packageName = record?.packageName.orEmpty(),
+                importToken = record?.importToken,
             )
             val existing = terminalResult
             if (existing != null) return@synchronized false

@@ -144,6 +144,27 @@ class StartupCleanupTest {
         }
 
     @Test
+    fun `session 조회 실패에도 pending 없는 durable terminal import를 보호한다`() =
+        runBlocking {
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Cancelled(41),
+                terminalAtEpochMillis = now,
+                packageName = PACKAGE_NAME,
+                importToken = EXPIRED_TOKEN,
+            )
+            val store = FakePendingStore(terminal = terminal)
+            val terminalImport = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+            val gateway = FakeGateway(
+                ownedFailure = IllegalStateException("session query failed"),
+            )
+
+            cleanup(gateway = gateway, store = store).run()
+
+            assertTrue(terminalImport.exists())
+            assertEquals(terminal, store.terminal)
+        }
+
+    @Test
     fun `abandons only owned sessions that are not the recoverable pending session`() = runBlocking {
         val pending = pending(sessionId = 41, startedAt = now)
         val gateway = FakeGateway(owned = mutableListOf(41, 77))

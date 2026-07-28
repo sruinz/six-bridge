@@ -30,7 +30,6 @@ class InstallCoordinator(
 ) {
     private val mutex = Mutex()
     private var activeBundle: ImportedBundle? = null
-    private var terminalOwner: InstallTerminalOwner? = null
     private var volatileConfirmation: Pair<Int, String>? = null
     private val mutableState = MutableStateFlow<InstallState>(restoreState())
 
@@ -52,7 +51,11 @@ class InstallCoordinator(
             discardCompetingImport(bundle.token, existing?.importToken ?: activeBundle?.token)
             return@withLock mutableState.value
         }
-        terminalOwner = null
+        pendingStore.loadTerminalResult()?.let { terminal ->
+            discardCompetingImport(bundle.token, terminal.importToken)
+            restoreTerminalResultLocked()
+            return@withLock mutableState.value
+        }
         val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
         } catch (error: CancellationException) {
@@ -176,24 +179,48 @@ class InstallCoordinator(
         expectedImportToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult = mutex.withLock {
-        val owner = terminalOwner ?: return InstallTerminalOwnerResult.OwnerMismatch
-        if (owner.importToken == null ||
-            owner.importToken != expectedImportToken ||
-            mutableState.value != owner.state
+        val inbox = pendingStore.loadTerminalResult()
+            ?: return InstallTerminalOwnerResult.OwnerMismatch
+        val state = inbox.toTerminalState()
+            ?: return InstallTerminalOwnerResult.OwnerMismatch
+        if (inbox.importToken == null ||
+            inbox.importToken != expectedImportToken ||
+            mutableState.value != state
         ) {
             return InstallTerminalOwnerResult.OwnerMismatch
         }
         if (expectedSessionId == null) {
             return InstallTerminalOwnerResult.OwnerSessionAssigned(
-                sessionId = owner.sessionId,
-                state = owner.state,
+                sessionId = inbox.result.sessionId,
+                state = state,
             )
         }
-        return if (expectedSessionId == owner.sessionId) {
-            InstallTerminalOwnerResult.Owned(owner.state)
+        return if (expectedSessionId == inbox.result.sessionId) {
+            InstallTerminalOwnerResult.Owned(state)
         } else {
             InstallTerminalOwnerResult.OwnerMismatch
         }
+    }
+
+    suspend fun acknowledgeTerminal(
+        expectedImportToken: String,
+        expectedSessionId: Int,
+        expectedState: InstallState,
+    ): Boolean = mutex.withLock {
+        val inbox = pendingStore.loadTerminalResult() ?: return@withLock false
+        val state = inbox.toTerminalState() ?: return@withLock false
+        if (inbox.importToken == null ||
+            inbox.importToken != expectedImportToken ||
+            inbox.result.sessionId != expectedSessionId ||
+            state != expectedState ||
+            mutableState.value != expectedState
+        ) {
+            return@withLock false
+        }
+        if (!pendingStore.discardImportSafely(expectedImportToken)) {
+            return@withLock false
+        }
+        pendingStore.clearTerminalResult(inbox)
     }
 
     suspend fun cancel(
@@ -254,17 +281,27 @@ class InstallCoordinator(
             return@withLock cleanupResult()
         }
 
-        val bundle = activeBundle ?: return@withLock InstallCleanupResult.OwnerMismatch
-        if (bundle.token != expectedImportToken) {
-            return@withLock InstallCleanupResult.OwnerMismatch
-        }
         val terminalResult = pendingStore.loadTerminalResult()
         if (terminalResult != null) {
+            if (terminalResult.importToken == null ||
+                terminalResult.importToken != expectedImportToken
+            ) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            if (expectedSessionId == null) {
+                return@withLock InstallCleanupResult.OwnerSessionAssigned(
+                    terminalResult.result.sessionId,
+                )
+            }
             if (terminalResult.result.sessionId != expectedSessionId) {
                 return@withLock InstallCleanupResult.OwnerMismatch
             }
             restoreTerminalResultLocked()
-            return@withLock cleanupResult()
+            return@withLock InstallCleanupResult.CleanupFailed
+        }
+        val bundle = activeBundle ?: return@withLock InstallCleanupResult.OwnerMismatch
+        if (bundle.token != expectedImportToken) {
+            return@withLock InstallCleanupResult.OwnerMismatch
         }
         if (expectedSessionId != null) {
             return@withLock InstallCleanupResult.OwnerMismatch
@@ -533,27 +570,9 @@ class InstallCoordinator(
             )
             return
         }
-        if (!pendingStore.clearTerminalResult(inbox)) {
-            mutableState.value = cleanupFailed()
-            return
-        }
         activeBundle = null
-        val next = when (val result = inbox.result) {
-            is PackageInstallResult.Success -> {
-                if (inbox.packageName.isBlank()) {
-                    InstallState.Failed(
-                        "TERMINAL_RECOVERY_FAILED",
-                        "완료된 설치 결과를 복구하지 못했습니다.",
-                    )
-                } else {
-                    InstallState.Installed(inbox.packageName)
-                }
-            }
-            is PackageInstallResult.Cancelled -> InstallState.Cancelled
-            is PackageInstallResult.Failure -> InstallState.Failed(result.code, result.message)
-            is PackageInstallResult.PendingUserAction -> return
-        }
-        publishTerminal(inbox, next)
+        val next = inbox.toTerminalState() ?: return
+        publishTerminal(next)
     }
 
     private suspend fun verifyAndRecord(
@@ -705,22 +724,30 @@ class InstallCoordinator(
         } else {
             inbox
         }
-        val importDiscarded = pendingStore.discardImportSafely(pending.importToken)
-        if (!importDiscarded) {
-            mutableState.value = cleanupFailed()
+        if (cleanupInbox.toTerminalState() != next) {
+            val importDiscarded = pendingStore.discardImportSafely(pending.importToken)
+            val ledgerCleared = if (importDiscarded) {
+                runCatching { pendingStore.clear(pending) }.getOrDefault(false)
+            } else {
+                false
+            }
+            val terminalCleared = ledgerCleared &&
+                pendingStore.clearTerminalResult(cleanupInbox)
+            if (!terminalCleared) {
+                mutableState.value = cleanupFailed()
+                return
+            }
+            activeBundle = null
+            mutableState.value = next
             return
         }
         val ledgerCleared = runCatching { pendingStore.clear(pending) }.getOrDefault(false)
-        if (!ledgerCleared || !importDiscarded) {
-            mutableState.value = cleanupFailed()
-            return
-        }
-        if (!pendingStore.clearTerminalResult(cleanupInbox)) {
+        if (!ledgerCleared) {
             mutableState.value = cleanupFailed()
             return
         }
         activeBundle = null
-        publishTerminal(cleanupInbox, next)
+        publishTerminal(next)
     }
 
     private fun abandonConfirmed(sessionId: Int): Boolean {
@@ -774,23 +801,23 @@ class InstallCoordinator(
             InstallCleanupResult.CleanupFailed
         }
 
-    private fun publishTerminal(
-        inbox: PendingInstallResult,
-        state: InstallState,
-    ) {
-        terminalOwner = InstallTerminalOwner(
-            importToken = inbox.importToken,
-            sessionId = inbox.result.sessionId,
-            state = state,
-        )
+    private fun publishTerminal(state: InstallState) {
         mutableState.value = state
     }
 
-    private data class InstallTerminalOwner(
-        val importToken: String?,
-        val sessionId: Int,
-        val state: InstallState,
-    )
+    private fun PendingInstallResult.toTerminalState(): InstallState? =
+        when (val terminal = result) {
+            is PackageInstallResult.Success ->
+                if (processed && packageName.isNotBlank()) {
+                    InstallState.Installed(packageName)
+                } else {
+                    null
+                }
+            is PackageInstallResult.Cancelled -> InstallState.Cancelled
+            is PackageInstallResult.Failure ->
+                InstallState.Failed(terminal.code, terminal.message)
+            is PackageInstallResult.PendingUserAction -> null
+        }
 
     private fun PendingInstall.toState(): InstallState =
         if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)

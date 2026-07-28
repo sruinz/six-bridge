@@ -156,6 +156,11 @@ interface ManagerRepository {
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult
+    suspend fun acknowledgeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int,
+        expectedState: InstallState,
+    ): Boolean
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
     suspend fun resumeAfterUnknownSourcesSettings()
@@ -340,6 +345,16 @@ internal class DefaultManagerRepository(
     ): InstallTerminalOwnerResult = installCoordinator.terminalForOwner(
         expectedImportToken = expectedReviewToken,
         expectedSessionId = expectedSessionId,
+    )
+
+    override suspend fun acknowledgeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int,
+        expectedState: InstallState,
+    ): Boolean = installCoordinator.acknowledgeTerminal(
+        expectedImportToken = expectedReviewToken,
+        expectedSessionId = expectedSessionId,
+        expectedState = expectedState,
     )
 
     override fun discardReview(token: String): Boolean =

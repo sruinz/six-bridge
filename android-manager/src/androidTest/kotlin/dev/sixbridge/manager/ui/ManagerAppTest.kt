@@ -80,6 +80,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
@@ -388,11 +389,13 @@ class ManagerAppTest {
                     ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY,
                 ),
             )
-            assertEquals(
-                TOKEN,
+            assertNull(
                 savedState.get<String>(
                     ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
                 ),
+            )
+            assertNull(
+                savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY),
             )
         }
 
@@ -416,6 +419,7 @@ class ManagerAppTest {
             initializeResult = initializeResult,
             review = review,
             generated = ready.generated,
+            installState = InstallState.AwaitingUserApproval(41),
         )
         val viewModel = ManagerViewModel(
             repository,
@@ -1262,11 +1266,12 @@ private class CleanupRestoreUiRepository(
     private val generated: GeneratedBundle,
     private val restoredConversion: RestoredConversion? =
         RestoredConversion.BundleReady(review, generated),
+    installState: InstallState = InstallState.Idle,
 ) : ManagerRepository {
     override val catalog: Flow<List<CatalogRecord>> =
         MutableStateFlow(emptyList())
     override val installState: StateFlow<InstallState> =
-        MutableStateFlow(InstallState.AwaitingUserApproval(41))
+        MutableStateFlow(installState)
     override val launches: Flow<RepositoryLaunch> = emptyFlow()
     val discardedReviews = mutableListOf<String>()
     val discardedConversions = mutableListOf<String>()
@@ -1313,6 +1318,12 @@ private class CleanupRestoreUiRepository(
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult = InstallTerminalOwnerResult.OwnerMismatch
+
+    override suspend fun acknowledgeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int,
+        expectedState: InstallState,
+    ): Boolean = false
 
     override fun unknownSourcesSettings(): RepositoryLaunch =
         error("unexpected unknown sources navigation")

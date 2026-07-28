@@ -981,6 +981,16 @@ class ManagerViewModel(
                 return@launch
             }
             if (intermediateCleanup != null) {
+                if (!reconcilePersistedGeneratedTerminal(
+                        cleanup = intermediateCleanup,
+                        savedReviewToken = savedToken,
+                        savedSessionId = savedSession,
+                    )
+                ) {
+                    intermediateGeneratedCleanupRestorePending = false
+                    showGeneratedCleanupFailure()
+                    return@launch
+                }
                 restoreConversion(
                     generation = generation,
                     retainedReview = restored.review?.takeIf {
@@ -1118,6 +1128,43 @@ class ManagerViewModel(
                 }
             }
         }
+    }
+
+    private suspend fun reconcilePersistedGeneratedTerminal(
+        cleanup: PendingGeneratedCleanup,
+        savedReviewToken: String?,
+        savedSessionId: Int?,
+    ): Boolean {
+        val installOwner = generatedInstallOwnerToken ?: return true
+        val reviewToken = cleanup.reviewToken ?: return false
+        if (cleanup.phase !in setOf(
+                GeneratedCleanupPhase.REVIEW,
+                GeneratedCleanupPhase.CONVERSION,
+            ) ||
+            installOwner != cleanup.token ||
+            savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY) != cleanup.token ||
+            savedReviewToken != reviewToken ||
+            savedSessionId == null
+        ) {
+            return false
+        }
+        val acknowledged = when (
+            val owner = repository.terminalForOwner(reviewToken, savedSessionId)
+        ) {
+            is InstallTerminalOwnerResult.Owned ->
+                repository.acknowledgeTerminal(
+                    expectedReviewToken = reviewToken,
+                    expectedSessionId = savedSessionId,
+                    expectedState = owner.state,
+                )
+            is InstallTerminalOwnerResult.OwnerSessionAssigned -> false
+            InstallTerminalOwnerResult.OwnerMismatch ->
+                repository.installState.value == InstallState.Idle
+        }
+        if (!acknowledged) return false
+        clearGeneratedInstallOwner()
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        return true
     }
 
     private suspend fun restoreConversion(
@@ -1292,12 +1339,24 @@ class ManagerViewModel(
         installJob = viewModelScope.launch {
             val attemptResult = repository.install(ready.review, ready.partialConfirmed)
             if (generation != operationGeneration) return@launch
-            if (attemptResult.isTerminalState() &&
-                ownedReviewToken == reviewToken &&
+            val generatedOwner = generatedInstallOwnerToken
+            val stillOwnsAttempt = ownedReviewToken == reviewToken &&
                 savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == reviewToken &&
-                mutableState.value.route == ManagerRoute.Review(reviewToken)
-            ) {
-                applyInstallTerminal(attemptResult)
+                if (generatedOwner == null) {
+                    mutableState.value.route == ManagerRoute.Review(reviewToken)
+                } else {
+                    val result =
+                        mutableState.value.conversionState as? ConversionUiState.ResultReady
+                    result?.token == generatedOwner && result.review?.token == reviewToken
+                }
+            if (attemptResult.isTerminalState() && stillOwnsAttempt) {
+                val applied = applyObservedInstallTerminal(attemptResult)
+                if (!applied &&
+                    attemptResult is InstallState.Failed &&
+                    !hasOwnedTerminal(reviewToken, attemptResult)
+                ) {
+                    applyAttemptOwnedFailure(reviewToken, attemptResult)
+                }
             }
         }
     }
@@ -1792,9 +1851,17 @@ class ManagerViewModel(
         return when (resolution) {
             InstallCancellationResolution.Cleaned -> true
             is InstallCancellationResolution.OwnedTerminal -> when (resolution.state) {
-                InstallState.Cancelled -> true
+                InstallState.Cancelled -> repository.acknowledgeTerminal(
+                    expectedReviewToken = expectedReviewToken,
+                    expectedSessionId = resolution.sessionId,
+                    expectedState = resolution.state,
+                )
                 else -> {
-                    applyInstallTerminal(resolution.state)
+                    applyInstallTerminal(
+                        installState = resolution.state,
+                        expectedReviewToken = expectedReviewToken,
+                        expectedSessionId = resolution.sessionId,
+                    )
                     false
                 }
             }
@@ -1885,8 +1952,6 @@ class ManagerViewModel(
                         .takeIf(InstallState::isTerminalState)
                         ?.let { suppressedInstallTerminal = it }
                 }
-            } else {
-                deferred?.let(::applyInstallTerminal)
             }
             return InstallCancellationResolution.Cleaned
         }
@@ -1900,8 +1965,11 @@ class ManagerViewModel(
             )
         ) {
             is InstallTerminalOwnerResult.Owned ->
-                if (owner.state == terminal) {
-                    InstallCancellationResolution.OwnedTerminal(terminal)
+                if (owner.state == terminal && expectedSessionId != null) {
+                    InstallCancellationResolution.OwnedTerminal(
+                        state = terminal,
+                        sessionId = expectedSessionId,
+                    )
                 } else {
                     InstallCancellationResolution.Failed
                 }
@@ -1911,19 +1979,19 @@ class ManagerViewModel(
         }
     }
 
-    private suspend fun applyObservedInstallTerminal(installState: InstallState) {
+    private suspend fun applyObservedInstallTerminal(installState: InstallState): Boolean {
         val generatedToken = generatedInstallOwnerToken
-        if (generatedToken == null) {
-            applyInstallTerminal(installState)
-            return
-        }
-        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
-        val expectedReviewToken =
-            result?.review?.token?.takeIf { result.token == generatedToken } ?: return
+        val expectedReviewToken = if (generatedToken != null) {
+            val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
+            result?.review?.token?.takeIf { result.token == generatedToken }
+        } else {
+            ownedReviewToken ?: savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
+        } ?: return false
         val expectedSessionId = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
         val proof = repository.terminalForOwner(expectedReviewToken, expectedSessionId)
-        val owned = when (proof) {
-            is InstallTerminalOwnerResult.Owned -> proof.state == installState
+        val ownedSessionId = when (proof) {
+            is InstallTerminalOwnerResult.Owned ->
+                expectedSessionId?.takeIf { proof.state == installState }
             is InstallTerminalOwnerResult.OwnerSessionAssigned -> {
                 if (proof.state != installState ||
                     expectedSessionId != null ||
@@ -1932,14 +2000,75 @@ class ManagerViewModel(
                         proof.sessionId,
                     )
                 ) {
-                    false
+                    null
                 } else {
-                    true
+                    proof.sessionId
                 }
             }
-            InstallTerminalOwnerResult.OwnerMismatch -> false
+            InstallTerminalOwnerResult.OwnerMismatch -> null
         }
-        if (owned) applyInstallTerminal(installState)
+        return ownedSessionId != null &&
+            applyInstallTerminal(
+                installState = installState,
+                expectedReviewToken = expectedReviewToken,
+                expectedSessionId = ownedSessionId,
+            )
+    }
+
+    private suspend fun hasOwnedTerminal(
+        expectedReviewToken: String,
+        expectedState: InstallState,
+    ): Boolean = when (
+        val proof = repository.terminalForOwner(
+            expectedReviewToken,
+            savedStateHandle[INSTALL_SESSION_ID_KEY],
+        )
+    ) {
+        is InstallTerminalOwnerResult.Owned -> proof.state == expectedState
+        is InstallTerminalOwnerResult.OwnerSessionAssigned -> proof.state == expectedState
+        InstallTerminalOwnerResult.OwnerMismatch -> false
+    }
+
+    private fun applyAttemptOwnedFailure(
+        expectedReviewToken: String,
+        installState: InstallState.Failed,
+    ) {
+        if (ownedReviewToken != expectedReviewToken ||
+            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != expectedReviewToken
+        ) {
+            return
+        }
+        val generatedOwner = generatedInstallOwnerToken
+        if (generatedOwner != null) {
+            val result =
+                mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+            if (result.token != generatedOwner || result.review?.token != expectedReviewToken) return
+            if (installState.code in CLEANUP_RETRYABLE_FAILURES) {
+                mutableState.update {
+                    it.copy(
+                        route = ManagerRoute.ConversionResult(result.token),
+                        conversionState = result.copy(installOwnerActive = true),
+                        message = installFailureMessage(installState.code),
+                    )
+                }
+            } else {
+                returnGeneratedInstallToResult(installFailureMessage(installState.code))
+            }
+            return
+        }
+        supersedeRecoveryForTerminal()
+        if (installState.code in CLEANUP_RETRYABLE_FAILURES) {
+            mutableState.update { it.copy(message = installFailureMessage(installState.code)) }
+            return
+        }
+        clearSavedReviewAndSession()
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.Home,
+                importState = ImportUiState.Idle,
+                message = installFailureMessage(installState.code),
+            )
+        }
     }
 
     private fun assignTerminalSessionToCurrentOwner(
@@ -1966,7 +2095,12 @@ class ManagerViewModel(
                 return false
             }
         } else if (ownedReviewToken != expectedReviewToken) {
-            return false
+            val savedOwnerAwaitingInitialization =
+                !initialized &&
+                    ownedReviewToken == null &&
+                    savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == expectedReviewToken
+            if (!savedOwnerAwaitingInitialization) return false
+            ownedReviewToken = expectedReviewToken
         }
         savedStateHandle[INSTALL_SESSION_ID_KEY] = sessionId
         return true
@@ -1994,7 +2128,10 @@ class ManagerViewModel(
 
     private sealed interface InstallCancellationResolution {
         data object Cleaned : InstallCancellationResolution
-        data class OwnedTerminal(val state: InstallState) : InstallCancellationResolution
+        data class OwnedTerminal(
+            val state: InstallState,
+            val sessionId: Int,
+        ) : InstallCancellationResolution
         data object Failed : InstallCancellationResolution
     }
 
@@ -2008,18 +2145,43 @@ class ManagerViewModel(
         return deferred
     }
 
-    private fun applyInstallTerminal(installState: InstallState) {
+    private suspend fun applyInstallTerminal(
+        installState: InstallState,
+        expectedReviewToken: String,
+        expectedSessionId: Int,
+    ): Boolean {
         val generatedOwner = generatedInstallOwnerToken
         if (generatedOwner != null) {
-            applyGeneratedInstallTerminal(generatedOwner, installState)
-            return
+            return applyGeneratedInstallTerminal(
+                token = generatedOwner,
+                installState = installState,
+                expectedReviewToken = expectedReviewToken,
+                expectedSessionId = expectedSessionId,
+            )
+        }
+        if (!repository.acknowledgeTerminal(
+                expectedReviewToken = expectedReviewToken,
+                expectedSessionId = expectedSessionId,
+                expectedState = installState,
+            )
+        ) {
+            mutableState.update {
+                it.copy(
+                    message = UserMessage(
+                        UserMessageKind.INSTALL_FAILED,
+                        "설치 결과 정리를 완료하지 못했습니다. 다시 시도하거나 다른 파일을 선택해 주세요.",
+                        RecoveryAction.SELECT_ANOTHER_FILE,
+                    ),
+                )
+            }
+            return false
         }
         supersedeRecoveryForTerminal()
         if (installState is InstallState.Failed &&
             installState.code in CLEANUP_RETRYABLE_FAILURES &&
             savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
         ) {
-            return
+            return true
         }
         clearSavedReviewAndSession()
         mutableState.update {
@@ -2046,14 +2208,17 @@ class ManagerViewModel(
                 else -> it
             }
         }
+        return true
     }
 
-    private fun applyGeneratedInstallTerminal(
+    private suspend fun applyGeneratedInstallTerminal(
         token: String,
         installState: InstallState,
-    ) {
+        expectedReviewToken: String,
+        expectedSessionId: Int,
+    ): Boolean {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
-        if (result?.token != token) return
+        if (result?.token != token) return false
         supersedeRecoveryForTerminal()
         val pendingInstallCleanup = pendingInstallCleanupForCurrentOwner(token)
         if (pendingGeneratedCleanup?.let {
@@ -2061,13 +2226,13 @@ class ManagerViewModel(
             } == true &&
             pendingInstallCleanup == null
         ) {
-            return
+            return false
         }
         if (pendingInstallCleanup != null &&
             (installState !is InstallState.Failed ||
                 installState.code !in CLEANUP_RETRYABLE_FAILURES)
         ) {
-            transitionPendingInstallCleanup(
+            val transitioned = transitionPendingInstallCleanup(
                 cleanup = pendingInstallCleanup,
                 destination = if (installState is InstallState.Installed) {
                     GeneratedCleanupDestination.fromRoute(
@@ -2076,13 +2241,19 @@ class ManagerViewModel(
                 } else {
                     pendingInstallCleanup.destination
                 },
+                terminalReceipt = GeneratedTerminalReceipt(
+                    reviewToken = expectedReviewToken,
+                    sessionId = expectedSessionId,
+                    state = installState,
+                ),
             )
+            if (transitioned == null) return false
             enqueueGeneratedCleanup {
                 performPendingGeneratedCleanup()
             }
-            return
+            return true
         }
-        when (installState) {
+        return when (installState) {
             is InstallState.Installed -> {
                 beginGeneratedCleanup(
                     token = token,
@@ -2096,17 +2267,50 @@ class ManagerViewModel(
                         ManagerRoute.Report(installState.packageName),
                     ),
                 )
-                enqueueGeneratedCleanup {
-                    performPendingGeneratedCleanup()
+                afterGeneratedInstallCleanupTransitionPersisted()
+                if (!repository.acknowledgeTerminal(
+                        expectedReviewToken = expectedReviewToken,
+                        expectedSessionId = expectedSessionId,
+                        expectedState = installState,
+                    )
+                ) {
+                    showGeneratedCleanupFailure()
+                    false
+                } else {
+                    clearGeneratedInstallOwner()
+                    savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+                    mutableState.update {
+                        val ready = it.conversionState as? ConversionUiState.ResultReady
+                        it.copy(
+                            conversionState = ready?.copy(installOwnerActive = false)
+                                ?: it.conversionState,
+                        )
+                    }
+                    enqueueGeneratedCleanup {
+                        performPendingGeneratedCleanup()
+                    }
+                    true
                 }
             }
-            InstallState.Cancelled -> returnGeneratedInstallToResult(
-                UserMessage(
-                    UserMessageKind.INSTALL_CANCELLED,
-                    "시스템 설치가 취소되었습니다. 생성 결과를 저장하거나 다시 설치할 수 있습니다.",
-                    RecoveryAction.NONE,
-                ),
-            )
+            InstallState.Cancelled -> {
+                if (!repository.acknowledgeTerminal(
+                        expectedReviewToken = expectedReviewToken,
+                        expectedSessionId = expectedSessionId,
+                        expectedState = installState,
+                    )
+                ) {
+                    false
+                } else {
+                    returnGeneratedInstallToResult(
+                        UserMessage(
+                            UserMessageKind.INSTALL_CANCELLED,
+                            "시스템 설치가 취소되었습니다. 생성 결과를 저장하거나 다시 설치할 수 있습니다.",
+                            RecoveryAction.NONE,
+                        ),
+                    )
+                    true
+                }
+            }
             is InstallState.Failed ->
                 if (installState.code in CLEANUP_RETRYABLE_FAILURES) {
                     mutableState.update {
@@ -2116,12 +2320,23 @@ class ManagerViewModel(
                             message = installFailureMessage(installState.code),
                         )
                     }
+                    true
                 } else {
-                    returnGeneratedInstallToResult(
-                        installFailureMessage(installState.code),
-                    )
+                    if (!repository.acknowledgeTerminal(
+                            expectedReviewToken = expectedReviewToken,
+                            expectedSessionId = expectedSessionId,
+                            expectedState = installState,
+                        )
+                    ) {
+                        false
+                    } else {
+                        returnGeneratedInstallToResult(
+                            installFailureMessage(installState.code),
+                        )
+                        true
+                    }
                 }
-            else -> Unit
+            else -> false
         }
     }
 
@@ -2139,10 +2354,11 @@ class ManagerViewModel(
         }
     }
 
-    private fun transitionPendingInstallCleanup(
+    private suspend fun transitionPendingInstallCleanup(
         cleanup: PendingGeneratedCleanup,
         destination: GeneratedCleanupDestination,
-    ): PendingGeneratedCleanup {
+        terminalReceipt: GeneratedTerminalReceipt? = null,
+    ): PendingGeneratedCleanup? {
         val next = cleanup.copy(
             phase = if (cleanup.reviewToken != null) {
                 GeneratedCleanupPhase.REVIEW
@@ -2154,6 +2370,16 @@ class ManagerViewModel(
         )
         advanceGeneratedCleanup(next)
         afterGeneratedInstallCleanupTransitionPersisted()
+        if (terminalReceipt != null &&
+            !repository.acknowledgeTerminal(
+                expectedReviewToken = terminalReceipt.reviewToken,
+                expectedSessionId = terminalReceipt.sessionId,
+                expectedState = terminalReceipt.state,
+            )
+        ) {
+            showGeneratedCleanupFailure()
+            return null
+        }
         clearGeneratedInstallOwner()
         savedStateHandle[INSTALL_SESSION_ID_KEY] = null
         mutableState.update {
@@ -2457,10 +2683,22 @@ class ManagerViewModel(
                 return false
             }
         }
-        transitionPendingInstallCleanup(
+        val terminalReceipt = (resolution as? InstallCancellationResolution.OwnedTerminal)
+            ?.let {
+                GeneratedTerminalReceipt(
+                    reviewToken = reviewToken,
+                    sessionId = it.sessionId,
+                    state = it.state,
+                )
+            }
+        if (transitionPendingInstallCleanup(
             cleanup = current,
             destination = destination,
-        )
+            terminalReceipt = terminalReceipt,
+        ) == null
+        ) {
+            return false
+        }
         return true
     }
 
@@ -2974,6 +3212,12 @@ private data class PendingGeneratedCleanup(
     val phase: GeneratedCleanupPhase,
     val destination: GeneratedCleanupDestination,
     val installSessionId: Int? = null,
+)
+
+private data class GeneratedTerminalReceipt(
+    val reviewToken: String,
+    val sessionId: Int,
+    val state: InstallState,
 )
 
 private data class QuarantinedGeneratedCleanup(

@@ -606,6 +606,14 @@ class ManagerRepositoryTest {
             assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
             assertEquals(PACKAGE, catalog.records.single().packageName)
             assertNull(pendingStore.record)
+            assertNotNull(pendingStore.terminal)
+            assertTrue(
+                coordinator.acknowledgeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
             assertNull(pendingStore.terminal)
             scope.cancel()
         }
@@ -620,6 +628,7 @@ class ManagerRepositoryTest {
                     PackageInstallResult.Success(41),
                     terminalAtEpochMillis = 2,
                     packageName = PACKAGE,
+                    importToken = TOKEN,
                 )
             }
             val gateway = StartupGateway(listOf(41))
@@ -675,6 +684,7 @@ class ManagerRepositoryTest {
                     PackageInstallResult.Success(41),
                     terminalAtEpochMillis = 2,
                     packageName = PACKAGE,
+                    importToken = TOKEN,
                 )
             }
             val gateway = StartupGateway(listOf(41))
@@ -719,6 +729,14 @@ class ManagerRepositoryTest {
             assertNull(snapshot.pending)
             assertNull(snapshot.restoredBundle)
             assertNull(pendingStore.record)
+            assertTrue(File(root, TOKEN).exists())
+            assertTrue(
+                coordinator.acknowledgeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
             assertFalse(File(root, TOKEN).exists())
         }
 
@@ -1002,6 +1020,14 @@ class ManagerRepositoryTest {
                 InstallTerminalOwnerResult.Owned(InstallState.Cancelled),
                 repository.terminalForOwner(TOKEN, 41),
             )
+            assertTrue(
+                repository.acknowledgeTerminal(
+                    expectedReviewToken = TOKEN,
+                    expectedSessionId = 41,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
+            assertNull(pendingStore.terminal)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1204,6 +1230,14 @@ class ManagerRepositoryTest {
 
             assertEquals(0, pendingStore.loadFailures)
             assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
+            assertNotNull(pendingStore.terminal)
+            assertTrue(
+                coordinator.acknowledgeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
             assertNull(pendingStore.terminal)
             assertEquals(PACKAGE, catalog.records.single().packageName)
             val snapshot = foregroundInitialization.await()

@@ -34,7 +34,7 @@ class StartupCleanup(
         val ownedSessions = bestEffort { installGateway.ownedSessions().toSet() }
 
         if (ownedSessions == null) {
-            cleanupExpiredImports(pending?.importToken, context)
+            cleanupExpiredImports(pending?.importToken ?: terminal?.importToken, context)
             return
         }
 
