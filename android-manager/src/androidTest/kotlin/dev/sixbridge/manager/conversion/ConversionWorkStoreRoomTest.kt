@@ -48,7 +48,7 @@ class ConversionWorkStoreRoomTest {
     }
 
     @Test
-    fun multi_store_create_approve_build_and_discard_use_room_CAS() = runBlocking {
+    fun multi_store_transitions_use_room_CAS_and_discard_is_idempotent() = runBlocking {
         val first = store(
             token = "00000000-0000-0000-0000-000000000001",
             file = "00000000-0000-0000-0000-000000000011",
@@ -105,7 +105,7 @@ class ConversionWorkStoreRoomTest {
                 async(Dispatchers.Default) { store.discard(active.token) }
             }.awaitAll()
         }
-        assertEquals(listOf(false, true), discards.sorted())
+        assertEquals(listOf(true, true), discards.sorted())
         assertEquals(null, database.conversionJobDao().get())
         assertTrue(workRoot.listFiles().orEmpty().isEmpty())
     }

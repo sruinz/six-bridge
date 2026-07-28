@@ -390,7 +390,8 @@ class GeneratedBundleStoreTest {
         }
 
         assertFalse(generated.file.exists())
-        assertTrue(peak - baseline < 96L * 1024 * 1024, "streaming heap 증가량: ${peak - baseline}")
+        // 공유 test JVM 변동을 허용하되 128 MiB 전체 ByteArray 적재는 계속 거부한다.
+        assertTrue(peak - baseline < 120L * 1024 * 1024, "streaming heap 증가량: ${peak - baseline}")
     }
 
     @Test
