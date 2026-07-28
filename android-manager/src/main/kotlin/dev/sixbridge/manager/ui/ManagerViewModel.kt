@@ -755,8 +755,9 @@ class ManagerViewModel(
                 deferredInitialTerminal = null
                 return@launch
             }
+            val resultOwner = generatedResultOwnerToken
             if (restored.review != null) {
-                if (generatedInstallOwnerToken != null) {
+                if (generatedInstallOwnerToken != null || resultOwner != null) {
                     ownedReviewToken = restored.review.token
                     savedStateHandle[REVIEW_TOKEN_KEY] = restored.review.token
                     mutableState.update {
@@ -785,8 +786,25 @@ class ManagerViewModel(
             if (restored.review == null && deferredTerminal != null) {
                 applyInstallTerminal(deferredTerminal)
             }
-            if (restored.review == null || generatedInstallOwnerToken != null) {
-                restoreConversion(generation)
+            if (restored.review == null ||
+                generatedInstallOwnerToken != null ||
+                resultOwner != null
+            ) {
+                restoreConversion(
+                    generation = generation,
+                    retainedReview = restored.review.takeIf { resultOwner != null },
+                    importReview = resultOwner == null &&
+                        pendingGeneratedCleanup?.phase !=
+                        GeneratedCleanupPhase.CONVERSION,
+                )
+            }
+            if (resultOwner != null) {
+                val ready =
+                    mutableState.value.conversionState as? ConversionUiState.ResultReady
+                if (ready?.token != resultOwner) {
+                    clearGeneratedResultOwner()
+                    restored.review?.let(::showReview)
+                }
             }
             val generatedOwner = generatedInstallOwnerToken
             if (generatedOwner != null) {
@@ -801,12 +819,14 @@ class ManagerViewModel(
         }
     }
 
-    private suspend fun restoreConversion(generation: Long) {
+    private suspend fun restoreConversion(
+        generation: Long,
+        retainedReview: ReviewBundle? = null,
+        importReview: Boolean =
+            pendingGeneratedCleanup?.phase != GeneratedCleanupPhase.CONVERSION,
+    ) {
         val restored = try {
-            repository.restoreConversion(
-                importReview =
-                    pendingGeneratedCleanup?.phase != GeneratedCleanupPhase.CONVERSION,
-            )
+            repository.restoreConversion(importReview = importReview)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
@@ -816,9 +836,9 @@ class ManagerViewModel(
         when (restored) {
             is RestoredConversion.Analysis -> showConversionAnalysis(restored.value)
             is RestoredConversion.BundleReady ->
-                showConversionResult(restored.review, restored.generated)
+                showConversionResult(retainedReview ?: restored.review, restored.generated)
             is RestoredConversion.GeneratedPending ->
-                showConversionResult(review = null, generated = restored.generated)
+                showConversionResult(review = retainedReview, generated = restored.generated)
             null -> clearSavedConversion()
         }
     }

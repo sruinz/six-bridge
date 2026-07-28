@@ -2309,6 +2309,64 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated terminal result recreation은 Cancelled와 Failed 뒤 Result owner를 우선한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.Cancelled,
+                InstallState.Failed("INSTALL_FAILED", "failed"),
+            ).forEach { terminal ->
+                val retainedReview = review(ContractCompatibilityStatus.COMPATIBLE)
+                val generated = generatedBundle()
+                val repository = FakeManagerRepository().apply {
+                    restoredConversion = RestoredConversion.BundleReady(
+                        retainedReview,
+                        generated,
+                    )
+                }
+                val savedState = SavedStateHandle()
+                val original = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                original.accept(ManagerAction.PrepareGeneratedInstall)
+                repository.installFlow.value = terminal
+                advanceUntilIdle()
+
+                repository.restoreResult = ManagerRestoreResult(review = retainedReview)
+                repository.restoredConversion = RestoredConversion.GeneratedPending(generated)
+                val recreated = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+
+                val ready = assertIs<ConversionUiState.ResultReady>(
+                    recreated.state.value.conversionState,
+                    "terminal=$terminal",
+                )
+                assertEquals(TOKEN, ready.token, "terminal=$terminal")
+                assertEquals(TOKEN, ready.review?.token, "terminal=$terminal")
+                assertFalse(ready.installOwnerActive, "terminal=$terminal")
+                assertEquals(
+                    ManagerRoute.ConversionResult(TOKEN),
+                    recreated.state.value.route,
+                    "terminal=$terminal",
+                )
+                assertEquals(false, repository.restoreConversionImportReviewRequests.last())
+
+                recreated.accept(ManagerAction.SaveGeneratedConversion)
+                assertEquals(
+                    TOKEN,
+                    assertIs<ManagerEffect.CreateConversionDocument>(
+                        recreated.effects.first(),
+                    ).token,
+                )
+                recreated.accept(ManagerAction.ShareGeneratedConversion)
+                assertEquals(
+                    TOKEN,
+                    assertIs<ManagerEffect.ShareGeneratedBundle>(
+                        recreated.effects.first(),
+                    ).token,
+                )
+            }
+        }
+
+    @Test
     fun `process recreation은 generated install owner를 review route로 바꾸지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
