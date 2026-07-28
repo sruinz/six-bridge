@@ -1637,10 +1637,16 @@ class ManagerViewModelTest {
             )
             advanceUntilIdle()
 
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                viewModel.effects.first(),
+            )
             viewModel.accept(
                 ManagerAction.SaveGeneratedConversionTo(
-                    TOKEN,
-                    "content://save/result.six",
+                    token = TOKEN,
+                    destination = "content://save/result.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
                 ),
             )
             advanceUntilIdle()
@@ -2048,6 +2054,210 @@ class ManagerViewModelTest {
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
         }
 
+    @Test
+    fun `OpenDocument callback은 exact owner generation과 launch identity만 한 번 수락한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.OpenConversionFilePicker)
+            val effect = assertIs<ManagerEffect.PickConversionDocument>(
+                viewModel.effects.first(),
+            )
+
+            val uri = unitTestUri()
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    uri = uri,
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    uri = uri,
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(1, repository.conversionRequests.size)
+            assertTrue(
+                uri ===
+                    assertIs<OnDeviceInputRequest.Saf>(
+                        repository.conversionRequests.single(),
+                    ).uri,
+            )
+        }
+
+    @Test
+    fun `stale OpenDocument result는 review route와 retained owner를 덮지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.OpenConversionFilePicker)
+            val stale = assertIs<ManagerEffect.PickConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    uri = unitTestUri(),
+                    ownerGeneration = stale.ownerGeneration,
+                    launchId = stale.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertTrue(repository.conversionRequests.isEmpty())
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertEquals(
+                TOKEN,
+                assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+                    .review
+                    .token,
+            )
+        }
+
+    @Test
+    fun `새 picker B 뒤 늦은 picker A result는 B ownership으로 오인하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.OpenConversionFilePicker)
+            val first = assertIs<ManagerEffect.PickConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(ManagerAction.OpenConversionFilePicker)
+            val second = assertIs<ManagerEffect.PickConversionDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    unitTestUri(),
+                    first.ownerGeneration,
+                    first.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            assertTrue(repository.conversionRequests.isEmpty())
+
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    unitTestUri(),
+                    second.ownerGeneration,
+                    second.launchId,
+                ),
+            )
+            advanceUntilIdle()
+            assertEquals(1, repository.conversionRequests.size)
+        }
+
+    @Test
+    fun `stale CreateDocument result는 새 review에서 generated copy를 실행하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            val stale = assertIs<ManagerEffect.CreateConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = stale.token,
+                    destination = "content://save/stale.six",
+                    ownerGeneration = stale.ownerGeneration,
+                    launchId = stale.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertTrue(repository.copiedConversionTokens.isEmpty())
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `CreateDocument pending ownership은 recreation 뒤 URI 없이 복구해 한 번 소비한다`() =
+        runTest(dispatcher.scheduler) {
+            val generated = generatedBundle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generated,
+                )
+                copiedConversionHash = generated.sha256
+            }
+            val savedState = SavedStateHandle()
+            val first = ManagerViewModel(
+                repository,
+                savedState,
+                openConversionOutput = { ByteArrayOutputStream() },
+            )
+            advanceUntilIdle()
+            first.accept(ManagerAction.SaveGeneratedConversion)
+            val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                first.effects.first(),
+            )
+
+            val recreated = ManagerViewModel(
+                repository,
+                savedState,
+                openConversionOutput = { ByteArrayOutputStream() },
+            )
+            advanceUntilIdle()
+            recreated.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = effect.token,
+                    destination = "content://save/result.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+            recreated.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = effect.token,
+                    destination = "content://save/result.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.copiedConversionTokens)
+            assertNull(savedState.get<String>("pending_conversion_destination"))
+        }
+
     private fun generatedBundle() = GeneratedBundle(
         token = TOKEN,
         file = File("generated-bundles/$TOKEN.six"),
@@ -2423,3 +2633,7 @@ private data class ConversionBuildRequest(
     val partialConfirmed: Boolean,
     val identitySelection: InstallationIdentitySelection?,
 )
+
+private fun unitTestUri(): Uri {
+    return android.net.TestUri()
+}

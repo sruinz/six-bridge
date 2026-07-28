@@ -70,6 +70,12 @@ class ManagerViewModel(
     private var generatedInstallOwnerToken: String? =
         savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY]
     private var generatedTerminalJob: Job? = null
+    private var documentOwnerGeneration =
+        savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
+    private var documentLaunchSequence =
+        savedStateHandle.get<Long>(DOCUMENT_LAUNCH_SEQUENCE_KEY) ?: 0L
+    private var pendingConversionPicker = restorePendingConversionPicker()
+    private var pendingConversionSave = restorePendingConversionSave()
 
     val state: StateFlow<ManagerUiState> = mutableState.asStateFlow()
     val effects: Flow<ManagerEffect> = effectChannel.receiveAsFlow().filter(::isEffectCurrent)
@@ -85,6 +91,8 @@ class ManagerViewModel(
         if (action != ManagerAction.RetryRecovery &&
             action !is ManagerAction.LaunchSucceeded &&
             action !is ManagerAction.LaunchFailed &&
+            action !is ManagerAction.ConversionFileSelected &&
+            action !is ManagerAction.SaveGeneratedConversionTo &&
             action != ManagerAction.ReturnedToForeground
         ) {
             beginNewUserAction()
@@ -94,10 +102,8 @@ class ManagerViewModel(
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
             ManagerAction.OpenConversionInput -> openConversionInput()
             is ManagerAction.ConversionUrlChanged -> updateConversionUrl(action.value)
-            ManagerAction.OpenConversionFilePicker ->
-                enqueueEffect(ManagerEffect.PickConversionDocument)
-            is ManagerAction.ConversionFileSelected ->
-                beginConversion(OnDeviceInputRequest.Saf(action.uri))
+            ManagerAction.OpenConversionFilePicker -> requestConversionFilePicker()
+            is ManagerAction.ConversionFileSelected -> acceptConversionFileResult(action)
             ManagerAction.AnalyzeConversionUrl -> analyzeConversionUrl()
             is ManagerAction.ToggleConversionAdapter -> updateConversionAnalysis {
                 it.toggleAdapter(action.id)
@@ -123,8 +129,7 @@ class ManagerViewModel(
             ManagerAction.BuildConversion -> buildConversion()
             ManagerAction.PrepareGeneratedInstall -> prepareGeneratedInstall()
             ManagerAction.SaveGeneratedConversion -> requestGeneratedSave()
-            is ManagerAction.SaveGeneratedConversionTo ->
-                saveGenerated(action.token, action.destination)
+            is ManagerAction.SaveGeneratedConversionTo -> acceptConversionSaveResult(action)
             ManagerAction.ShareGeneratedConversion -> shareGenerated()
             ManagerAction.GeneratedShareFailed -> mutableState.update {
                 it.copy(
@@ -233,6 +238,38 @@ class ManagerViewModel(
         if (mutableState.value.route != ManagerRoute.ConversionInput) return
         if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
         mutableState.update { it.copy(conversionUrl = value, message = null) }
+    }
+
+    private fun requestConversionFilePicker() {
+        if (mutableState.value.route != ManagerRoute.ConversionInput ||
+            mutableState.value.conversionState == ConversionUiState.Acquiring
+        ) {
+            return
+        }
+        val launch = newDocumentLaunch()
+        pendingConversionPicker = launch
+        savePendingConversionPicker(launch)
+        enqueueEffect(
+            ManagerEffect.PickConversionDocument(
+                ownerGeneration = launch.ownerGeneration,
+                launchId = launch.launchId,
+            ),
+        )
+    }
+
+    private fun acceptConversionFileResult(
+        action: ManagerAction.ConversionFileSelected,
+    ) {
+        val pending = pendingConversionPicker
+            ?.takeIf {
+                it.ownerGeneration == action.ownerGeneration &&
+                    it.launchId == action.launchId &&
+                    it.ownerGeneration == documentOwnerGeneration
+            }
+            ?: return
+        if (mutableState.value.route != ManagerRoute.ConversionInput) return
+        clearPendingConversionPicker()
+        action.uri?.let { beginConversion(OnDeviceInputRequest.Saf(it)) }
     }
 
     private fun analyzeConversionUrl() {
@@ -377,12 +414,34 @@ class ManagerViewModel(
 
     private fun requestGeneratedSave() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        val launch = newDocumentLaunch(token = result.token)
+        pendingConversionSave = launch
+        savePendingConversionSave(launch)
         enqueueEffect(
             ManagerEffect.CreateConversionDocument(
                 token = result.token,
                 suggestedFileName = result.generated.suggestedFileName,
+                ownerGeneration = launch.ownerGeneration,
+                launchId = launch.launchId,
             ),
         )
+    }
+
+    private fun acceptConversionSaveResult(
+        action: ManagerAction.SaveGeneratedConversionTo,
+    ) {
+        val pending = pendingConversionSave
+            ?.takeIf {
+                it.token == action.token &&
+                    it.ownerGeneration == action.ownerGeneration &&
+                    it.launchId == action.launchId &&
+                    it.ownerGeneration == documentOwnerGeneration
+            }
+            ?: return
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        if (result.token != action.token) return
+        clearPendingConversionSave()
+        action.destination?.let { saveGenerated(action.token, it) }
     }
 
     private fun saveGenerated(token: String, destination: String) {
@@ -979,6 +1038,7 @@ class ManagerViewModel(
     }
 
     private fun beginNewUserAction() {
+        invalidatePendingDocumentLaunches()
         invalidateUninstallAttempt()
         launchGeneration += 1
         pendingRecovery = null
@@ -1100,6 +1160,77 @@ class ManagerViewModel(
             is ConversionBuildResult.Failure ->
                 result.generated?.token?.let(::enqueueStaleConversionCleanup)
         }
+    }
+
+    private fun newDocumentLaunch(token: String? = null): PendingDocumentLaunch {
+        documentOwnerGeneration += 1
+        documentLaunchSequence += 1
+        savedStateHandle[DOCUMENT_OWNER_GENERATION_KEY] = documentOwnerGeneration
+        savedStateHandle[DOCUMENT_LAUNCH_SEQUENCE_KEY] = documentLaunchSequence
+        return PendingDocumentLaunch(
+            token = token,
+            ownerGeneration = documentOwnerGeneration,
+            launchId = documentLaunchSequence,
+        )
+    }
+
+    private fun invalidatePendingDocumentLaunches() {
+        documentOwnerGeneration += 1
+        savedStateHandle[DOCUMENT_OWNER_GENERATION_KEY] = documentOwnerGeneration
+        clearPendingConversionPicker()
+        clearPendingConversionSave()
+    }
+
+    private fun savePendingConversionPicker(launch: PendingDocumentLaunch) {
+        savedStateHandle[PENDING_PICKER_OWNER_GENERATION_KEY] = launch.ownerGeneration
+        savedStateHandle[PENDING_PICKER_LAUNCH_ID_KEY] = launch.launchId
+    }
+
+    private fun savePendingConversionSave(launch: PendingDocumentLaunch) {
+        savedStateHandle[PENDING_SAVE_TOKEN_KEY] = launch.token
+        savedStateHandle[PENDING_SAVE_OWNER_GENERATION_KEY] = launch.ownerGeneration
+        savedStateHandle[PENDING_SAVE_LAUNCH_ID_KEY] = launch.launchId
+    }
+
+    private fun clearPendingConversionPicker() {
+        pendingConversionPicker = null
+        savedStateHandle[PENDING_PICKER_OWNER_GENERATION_KEY] = null
+        savedStateHandle[PENDING_PICKER_LAUNCH_ID_KEY] = null
+    }
+
+    private fun clearPendingConversionSave() {
+        pendingConversionSave = null
+        savedStateHandle[PENDING_SAVE_TOKEN_KEY] = null
+        savedStateHandle[PENDING_SAVE_OWNER_GENERATION_KEY] = null
+        savedStateHandle[PENDING_SAVE_LAUNCH_ID_KEY] = null
+    }
+
+    private fun restorePendingConversionPicker(): PendingDocumentLaunch? {
+        val owner = savedStateHandle.get<Long>(PENDING_PICKER_OWNER_GENERATION_KEY)
+            ?: return null
+        val launchId = savedStateHandle.get<Long>(PENDING_PICKER_LAUNCH_ID_KEY)
+            ?: return null
+        if (owner != documentOwnerGeneration) return null
+        return PendingDocumentLaunch(
+            token = null,
+            ownerGeneration = owner,
+            launchId = launchId,
+        )
+    }
+
+    private fun restorePendingConversionSave(): PendingDocumentLaunch? {
+        val token = savedStateHandle.get<String>(PENDING_SAVE_TOKEN_KEY)
+            ?: return null
+        val owner = savedStateHandle.get<Long>(PENDING_SAVE_OWNER_GENERATION_KEY)
+            ?: return null
+        val launchId = savedStateHandle.get<Long>(PENDING_SAVE_LAUNCH_ID_KEY)
+            ?: return null
+        if (owner != documentOwnerGeneration) return null
+        return PendingDocumentLaunch(
+            token = token,
+            ownerGeneration = owner,
+            launchId = launchId,
+        )
     }
 
     private fun detachInstallJob(): Job? =
@@ -1345,7 +1476,34 @@ class ManagerViewModel(
     }
 
     private fun isEffectCurrent(effect: ManagerEffect): Boolean {
-        if (effect !is ManagerEffect.LaunchIntent) return true
+        when (effect) {
+            is ManagerEffect.PickConversionDocument -> {
+                val pending = pendingConversionPicker ?: return false
+                return mutableState.value.route == ManagerRoute.ConversionInput &&
+                    pending.ownerGeneration == effect.ownerGeneration &&
+                    pending.launchId == effect.launchId &&
+                    pending.ownerGeneration == documentOwnerGeneration
+            }
+            is ManagerEffect.CreateConversionDocument -> {
+                val pending = pendingConversionSave ?: return false
+                val result =
+                    mutableState.value.conversionState as? ConversionUiState.ResultReady
+                        ?: return false
+                return result.token == effect.token &&
+                    pending.token == effect.token &&
+                    pending.ownerGeneration == effect.ownerGeneration &&
+                    pending.launchId == effect.launchId &&
+                    pending.ownerGeneration == documentOwnerGeneration
+            }
+            is ManagerEffect.ShareGeneratedBundle -> {
+                val result =
+                    mutableState.value.conversionState as? ConversionUiState.ResultReady
+                        ?: return false
+                return result.token == effect.token &&
+                    mutableState.value.route == ManagerRoute.ConversionResult(effect.token)
+            }
+            is ManagerEffect.LaunchIntent -> Unit
+        }
         if (effect.ownerGeneration?.let { it != launchGeneration } == true) return false
         if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION &&
             effect.ownerGeneration == null
@@ -1368,6 +1526,13 @@ class ManagerViewModel(
         const val CONVERSION_TOKEN_KEY = "conversion_token"
         const val CONVERSION_ROUTE_KEY = "conversion_route"
         const val INSTALL_OWNER_CONVERSION_TOKEN_KEY = "install_owner_conversion_token"
+        const val DOCUMENT_OWNER_GENERATION_KEY = "document_owner_generation"
+        const val DOCUMENT_LAUNCH_SEQUENCE_KEY = "document_launch_sequence"
+        const val PENDING_PICKER_OWNER_GENERATION_KEY = "pending_picker_owner_generation"
+        const val PENDING_PICKER_LAUNCH_ID_KEY = "pending_picker_launch_id"
+        const val PENDING_SAVE_TOKEN_KEY = "pending_save_token"
+        const val PENDING_SAVE_OWNER_GENERATION_KEY = "pending_save_owner_generation"
+        const val PENDING_SAVE_LAUNCH_ID_KEY = "pending_save_launch_id"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",
@@ -1566,6 +1731,12 @@ private data class PendingUninstallReturn(
 private data class RouteOperationTicket(
     val generation: Long,
     val previousOperation: Job?,
+)
+
+private data class PendingDocumentLaunch(
+    val token: String?,
+    val ownerGeneration: Long,
+    val launchId: Long,
 )
 
 private fun ConversionBeginResult.conversionTokenOrNull(): String? = when (this) {

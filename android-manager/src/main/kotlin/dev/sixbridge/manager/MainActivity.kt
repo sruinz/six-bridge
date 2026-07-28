@@ -29,7 +29,8 @@ import java.nio.file.Files
 class MainActivity : ComponentActivity() {
     private lateinit var managerViewModel: ManagerViewModel
     private lateinit var notificationInstallGate: NotificationPermissionInstallGate
-    private var pendingConversionSaveToken: String? = null
+    private var pendingConversionPicker: PendingActivityDocumentLaunch? = null
+    private var pendingConversionSave: PendingActivityDocumentLaunch? = null
 
     private val openDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -40,18 +41,20 @@ class MainActivity : ComponentActivity() {
     private val openConversionDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        uri?.let { managerViewModel.accept(ManagerAction.ConversionFileSelected(it)) }
+        val pending = pendingConversionPicker
+        pendingConversionPicker = null
+        pending?.let {
+            managerViewModel.accept(it.conversionFileAction(uri))
+        }
     }
 
     private val createConversionDocument = registerForActivityResult(
         ActivityResultContracts.CreateDocument(GENERATED_BUNDLE_MIME_TYPE),
     ) { uri ->
-        val token = pendingConversionSaveToken
-        pendingConversionSaveToken = null
-        if (uri != null && token != null) {
-            managerViewModel.accept(
-                ManagerAction.SaveGeneratedConversionTo(token, uri.toString()),
-            )
+        val pending = pendingConversionSave
+        pendingConversionSave = null
+        if (pending != null) {
+            managerViewModel.accept(pending.conversionSaveAction(uri))
         }
     }
 
@@ -64,8 +67,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repository = ManagerDependencies.create(application).repository
-        pendingConversionSaveToken =
-            savedInstanceState?.getString(PENDING_CONVERSION_SAVE_TOKEN)
+        pendingConversionPicker = savedInstanceState?.restorePendingDocumentLaunch(
+            tokenKey = null,
+            ownerKey = PENDING_CONVERSION_PICKER_OWNER,
+            launchKey = PENDING_CONVERSION_PICKER_LAUNCH_ID,
+        )
+        pendingConversionSave = savedInstanceState?.restorePendingDocumentLaunch(
+            tokenKey = PENDING_CONVERSION_SAVE_TOKEN,
+            ownerKey = PENDING_CONVERSION_SAVE_OWNER,
+            launchKey = PENDING_CONVERSION_SAVE_LAUNCH_ID,
+        )
         managerViewModel = ViewModelProvider(
             this,
             viewModelFactory {
@@ -122,10 +133,20 @@ class MainActivity : ComponentActivity() {
                                 managerViewModel.accept(ManagerAction.LaunchFailed(it))
                             },
                         )
-                        ManagerEffect.PickConversionDocument ->
+                        is ManagerEffect.PickConversionDocument -> {
+                            pendingConversionPicker = PendingActivityDocumentLaunch(
+                                token = null,
+                                ownerGeneration = effect.ownerGeneration,
+                                launchId = effect.launchId,
+                            )
                             openConversionDocument.launch(CONVERSION_MIME_TYPES)
+                        }
                         is ManagerEffect.CreateConversionDocument -> {
-                            pendingConversionSaveToken = effect.token
+                            pendingConversionSave = PendingActivityDocumentLaunch(
+                                token = effect.token,
+                                ownerGeneration = effect.ownerGeneration,
+                                launchId = effect.launchId,
+                            )
                             createConversionDocument.launch(effect.suggestedFileName)
                         }
                         is ManagerEffect.ShareGeneratedBundle -> {
@@ -156,9 +177,18 @@ class MainActivity : ComponentActivity() {
                 notificationInstallGate.awaitingPermissionResult,
             )
         }
-        pendingConversionSaveToken?.let {
-            outState.putString(PENDING_CONVERSION_SAVE_TOKEN, it)
-        }
+        pendingConversionPicker?.save(
+            outState = outState,
+            tokenKey = null,
+            ownerKey = PENDING_CONVERSION_PICKER_OWNER,
+            launchKey = PENDING_CONVERSION_PICKER_LAUNCH_ID,
+        )
+        pendingConversionSave?.save(
+            outState = outState,
+            tokenKey = PENDING_CONVERSION_SAVE_TOKEN,
+            ownerKey = PENDING_CONVERSION_SAVE_OWNER,
+            launchKey = PENDING_CONVERSION_SAVE_LAUNCH_ID,
+        )
         super.onSaveInstanceState(outState)
     }
 
@@ -179,6 +209,10 @@ class MainActivity : ComponentActivity() {
     private companion object {
         const val AWAITING_NOTIFICATION_PERMISSION = "awaiting_notification_permission"
         const val PENDING_CONVERSION_SAVE_TOKEN = "pending_conversion_save_token"
+        const val PENDING_CONVERSION_SAVE_OWNER = "pending_conversion_save_owner"
+        const val PENDING_CONVERSION_SAVE_LAUNCH_ID = "pending_conversion_save_launch_id"
+        const val PENDING_CONVERSION_PICKER_OWNER = "pending_conversion_picker_owner"
+        const val PENDING_CONVERSION_PICKER_LAUNCH_ID = "pending_conversion_picker_launch_id"
         const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
         val SIX_MIME_TYPES = arrayOf(
             "application/zip",
@@ -191,6 +225,55 @@ class MainActivity : ComponentActivity() {
             "application/vnd.sixbridge.draft",
         )
     }
+}
+
+internal data class PendingActivityDocumentLaunch(
+    val token: String?,
+    val ownerGeneration: Long,
+    val launchId: Long,
+) {
+    internal fun save(
+        outState: Bundle,
+        tokenKey: String?,
+        ownerKey: String,
+        launchKey: String,
+    ) {
+        tokenKey?.let { key -> token?.let { outState.putString(key, it) } }
+        outState.putLong(ownerKey, ownerGeneration)
+        outState.putLong(launchKey, launchId)
+    }
+}
+
+internal fun PendingActivityDocumentLaunch.conversionFileAction(
+    uri: Uri?,
+): ManagerAction.ConversionFileSelected = ManagerAction.ConversionFileSelected(
+    uri = uri,
+    ownerGeneration = ownerGeneration,
+    launchId = launchId,
+)
+
+internal fun PendingActivityDocumentLaunch.conversionSaveAction(
+    uri: Uri?,
+): ManagerAction.SaveGeneratedConversionTo = ManagerAction.SaveGeneratedConversionTo(
+    token = requireNotNull(token),
+    destination = uri?.toString(),
+    ownerGeneration = ownerGeneration,
+    launchId = launchId,
+)
+
+internal fun Bundle.restorePendingDocumentLaunch(
+    tokenKey: String?,
+    ownerKey: String,
+    launchKey: String,
+): PendingActivityDocumentLaunch? {
+    if (!containsKey(ownerKey) || !containsKey(launchKey)) return null
+    val token = tokenKey?.let(::getString)
+    if (tokenKey != null && token == null) return null
+    return PendingActivityDocumentLaunch(
+        token = token,
+        ownerGeneration = getLong(ownerKey),
+        launchId = getLong(launchKey),
+    )
 }
 
 internal const val GENERATED_BUNDLE_MIME_TYPE = "application/vnd.sixbridge.bundle"

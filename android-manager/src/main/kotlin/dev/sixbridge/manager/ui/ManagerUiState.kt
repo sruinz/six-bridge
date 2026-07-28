@@ -194,7 +194,11 @@ sealed interface ManagerAction {
     data object OpenConversionInput : ManagerAction
     data class ConversionUrlChanged(val value: String) : ManagerAction
     data object OpenConversionFilePicker : ManagerAction
-    data class ConversionFileSelected(val uri: Uri) : ManagerAction
+    data class ConversionFileSelected(
+        val uri: Uri?,
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerAction
     data object AnalyzeConversionUrl : ManagerAction
     data class ToggleConversionAdapter(val id: String) : ManagerAction
     data object ConfirmConversionPartial : ManagerAction
@@ -206,7 +210,9 @@ sealed interface ManagerAction {
     data object SaveGeneratedConversion : ManagerAction
     data class SaveGeneratedConversionTo(
         val token: String,
-        val destination: String,
+        val destination: String?,
+        val ownerGeneration: Long,
+        val launchId: Long,
     ) : ManagerAction
     data object ShareGeneratedConversion : ManagerAction
     data object GeneratedShareFailed : ManagerAction
@@ -235,11 +241,16 @@ enum class LaunchDestination {
 }
 
 sealed interface ManagerEffect {
-    data object PickConversionDocument : ManagerEffect
+    data class PickConversionDocument(
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerEffect
 
     data class CreateConversionDocument(
         val token: String,
         val suggestedFileName: String,
+        val ownerGeneration: Long,
+        val launchId: Long,
     ) : ManagerEffect
 
     data class ShareGeneratedBundle(
