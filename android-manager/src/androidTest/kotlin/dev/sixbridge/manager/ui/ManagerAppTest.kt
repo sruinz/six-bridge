@@ -271,6 +271,31 @@ class ManagerAppTest {
     }
 
     @Test
+    fun generated_cleanup_retry_dispatches_exact_cleanup_action() {
+        val actions = mutableListOf<ManagerAction>()
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        composeRule.setContent {
+            ManagerAppContent(
+                state = initial.copy(
+                    conversionState = ready.copy(cleanupPending = true),
+                    message = UserMessage(
+                        UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                        "정리를 완료하지 못했습니다.",
+                        RecoveryAction.RETRY,
+                    ),
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("다시 확인").performClick()
+
+        assertEquals(listOf(ManagerAction.RetryGeneratedCleanup), actions)
+    }
+
+    @Test
     fun conversion_build_back_dispatches_cancel() {
         val actions = mutableListOf<ManagerAction>()
         val ready = conversionAnalysisState().conversionState as ConversionUiState.AnalysisReady

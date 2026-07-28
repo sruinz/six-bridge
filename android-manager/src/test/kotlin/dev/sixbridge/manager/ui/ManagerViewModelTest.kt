@@ -2204,6 +2204,101 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated cleanup retry는 REVIEW 재실패를 유지하고 성공하면 Home으로 commit한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(2, repository.discardAttempts.size)
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                "REVIEW",
+                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+            )
+            val failed = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertTrue(failed.cleanupPending)
+            assertFalse(failed.cleanupInProgress)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+
+            repository.discardReviewResult = true
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(3, repository.discardAttempts.size)
+            assertEquals(1, repository.discardedConversions.size)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY))
+        }
+
+    @Test
+    fun `generated cleanup retry는 CONVERSION 재실패를 유지하고 성공하면 Report로 commit한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardConversionResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.discardAttempts.size)
+            assertEquals(2, repository.discardedConversions.size)
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+            )
+            val failed = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertTrue(failed.cleanupPending)
+            assertFalse(failed.cleanupInProgress)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+
+            repository.discardConversionResult = true
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.discardAttempts.size)
+            assertEquals(3, repository.discardedConversions.size)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_TOKEN_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_DESTINATION_KEY))
+        }
+
+    @Test
     fun `generated active install 취소는 install job과 coordinator를 먼저 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

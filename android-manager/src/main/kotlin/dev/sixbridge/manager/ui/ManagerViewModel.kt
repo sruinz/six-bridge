@@ -527,6 +527,12 @@ class ManagerViewModel(
     }
 
     private fun retryGeneratedCleanup() {
+        if (pendingGeneratedCleanup != null) {
+            enqueueGeneratedCleanup {
+                performPendingGeneratedCleanup()
+            }
+            return
+        }
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
         val failure = repository.installState.value as? InstallState.Failed ?: return
         if (failure.code !in CLEANUP_RETRYABLE_FAILURES ||
