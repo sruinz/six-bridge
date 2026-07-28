@@ -2949,6 +2949,8 @@ class ManagerViewModelTest {
             )
             advanceUntilIdle()
             source.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
 
             repository.installFlow.value = InstallState.Installed(PACKAGE)
             advanceUntilIdle()
@@ -2973,6 +2975,7 @@ class ManagerViewModelTest {
                     generatedCleanupDestinationPackage(deathState),
                     "step=$step",
                 )
+                assertGeneratedCleanupCompletionSnapshot(step, deathState)
 
                 val recreatedRepository = currentGeneratedInstallRepository().apply {
                     restoredConversion = null
@@ -4073,6 +4076,183 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `INSTALL transition 직후 process death는 tombstone owner와 HOME을 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                cancelInstallResult = false
+                discardReviewResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            repository.cancelInstallResult = true
+            var deathState: SavedStateHandle? = null
+            repository.beforeDiscardReview = {
+                deathState = generatedCleanupDeathSnapshot(savedState)
+            }
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            val snapshot = requireNotNull(deathState)
+            assertEquals("REVIEW", generatedCleanupPhase(snapshot))
+            assertEquals("HOME", generatedCleanupDestinationKind(snapshot))
+            assertGeneratedOwnersAndSessionPreserved(snapshot)
+
+            val recreatedRepository = currentGeneratedInstallRepository().apply {
+                installFlow.value = InstallState.Installed(PACKAGE)
+            }
+            val recreated = ManagerViewModel(recreatedRepository, snapshot)
+            advanceUntilIdle()
+
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                recreated.state.value.route,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                recreated.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                recreated.state.value.message?.recoveryAction,
+            )
+            assertEquals(0, recreatedRepository.cancelInstallRequests)
+            assertTrue(recreatedRepository.discardedTokens.isEmpty())
+            assertTrue(recreatedRepository.discardedConversions.isEmpty())
+            assertEquals("REVIEW", generatedCleanupPhase(snapshot))
+            assertGeneratedOwnersAndSessionPreserved(snapshot)
+
+            recreated.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, recreated.state.value.route)
+            assertEquals(TOKEN, recreated.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), recreatedRepository.discardedTokens)
+            assertEquals(listOf(TOKEN), recreatedRepository.discardedConversions)
+        }
+
+    @Test
+    fun `REVIEW discard 뒤 CONVERSION process death는 owner를 유지하고 cleanup만 replay한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardConversionResult = false
+            }
+            val savedState = SavedStateHandle()
+            var conversionDeathState: SavedStateHandle? = null
+            repository.beforeDiscardConversion = {
+                conversionDeathState = generatedCleanupDeathSnapshot(savedState)
+            }
+            var reviewDeathState: SavedStateHandle? = null
+            val source = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedReviewCleanupCompleted = {
+                    reviewDeathState = generatedCleanupDeathSnapshot(savedState)
+                },
+            )
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            val reviewSnapshot = requireNotNull(reviewDeathState)
+            assertEquals("REVIEW", generatedCleanupPhase(reviewSnapshot))
+            assertEquals("REPORT", generatedCleanupDestinationKind(reviewSnapshot))
+            assertEquals(PACKAGE, generatedCleanupDestinationPackage(reviewSnapshot))
+            assertGeneratedOwnersAndSessionPreserved(reviewSnapshot)
+
+            val conversionSnapshot = requireNotNull(conversionDeathState)
+            assertEquals("CONVERSION", generatedCleanupPhase(conversionSnapshot))
+            assertEquals("REPORT", generatedCleanupDestinationKind(conversionSnapshot))
+            assertEquals(PACKAGE, generatedCleanupDestinationPackage(conversionSnapshot))
+            assertEquals(
+                TOKEN,
+                generatedCleanupJournal(conversionSnapshot)
+                    ?.get("reviewToken")
+                    ?.jsonPrimitive
+                    ?.contentOrNull,
+            )
+            assertGeneratedOwnersAndSessionPreserved(conversionSnapshot)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+
+            val completionSnapshots =
+                linkedMapOf<GeneratedCleanupCompletionStep, SavedStateHandle>()
+            val reviewRecreatedRepository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.Installed(PACKAGE)
+                restoredConversion = null
+            }
+            val reviewRecreated = ManagerViewModel(
+                repository = reviewRecreatedRepository,
+                savedStateHandle = reviewSnapshot,
+                afterGeneratedCleanupCompletionStep = { step ->
+                    completionSnapshots[step] =
+                        generatedCleanupDeathSnapshot(reviewSnapshot)
+                },
+            )
+            advanceUntilIdle()
+            assertEquals("REVIEW", generatedCleanupPhase(reviewSnapshot))
+            assertGeneratedOwnersAndSessionPreserved(reviewSnapshot)
+
+            reviewRecreated.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), reviewRecreated.state.value.route)
+            assertEquals(TOKEN, reviewRecreated.state.value.destinationCommitToken)
+            assertEquals(0, reviewRecreatedRepository.cancelInstallRequests)
+            assertEquals(listOf(TOKEN), reviewRecreatedRepository.discardedTokens)
+            assertEquals(listOf(TOKEN), reviewRecreatedRepository.discardedConversions)
+            assertEquals(
+                GeneratedCleanupCompletionStep.entries.toSet(),
+                completionSnapshots.keys,
+            )
+            completionSnapshots.forEach { (step, completionState) ->
+                assertEquals(
+                    "COMMIT_DESTINATION",
+                    generatedCleanupPhase(completionState),
+                    "step=$step",
+                )
+                assertGeneratedCleanupCompletionSnapshot(step, completionState)
+            }
+
+            val conversionRecreatedRepository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.Installed(PACKAGE)
+                restoredConversion = null
+            }
+            val conversionRecreated = ManagerViewModel(
+                conversionRecreatedRepository,
+                conversionSnapshot,
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), conversionRecreated.state.value.route)
+            assertEquals(TOKEN, conversionRecreated.state.value.destinationCommitToken)
+            assertEquals(0, conversionRecreatedRepository.cancelInstallRequests)
+            assertTrue(conversionRecreatedRepository.discardedTokens.isEmpty())
+            assertEquals(
+                listOf(TOKEN),
+                conversionRecreatedRepository.discardedConversions,
+            )
+        }
+
+    @Test
     fun `pending INSTALL cleanup retryable terminal은 exact session과 owner를 유지한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
@@ -4408,7 +4588,10 @@ class ManagerViewModelTest {
                 ).review,
             )
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
-            assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY),
+            )
             assertEquals(
                 "CONVERSION",
                 generatedCleanupPhase(savedState),
@@ -4993,6 +5176,63 @@ class ManagerViewModelTest {
         assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
     }
 
+    private fun assertGeneratedCleanupCompletionSnapshot(
+        step: GeneratedCleanupCompletionStep,
+        savedState: SavedStateHandle,
+    ) {
+        val installOwner =
+            savedState.get<String>(ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY)
+        val resultOwner =
+            savedState.get<String>(ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY)
+        val resultReview =
+            savedState.get<String>(ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY)
+        val review = savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY)
+        val session = savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY)
+        val conversion = savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY)
+        when (step) {
+            GeneratedCleanupCompletionStep.DESTINATION_COMMITTED -> {
+                assertEquals(TOKEN, installOwner)
+                assertEquals(TOKEN, resultOwner)
+                assertEquals(TOKEN, resultReview)
+                assertEquals(TOKEN, review)
+                assertEquals(41, session)
+                assertEquals(TOKEN, conversion)
+            }
+            GeneratedCleanupCompletionStep.INSTALL_OWNER_CLEARED -> {
+                assertNull(installOwner)
+                assertEquals(TOKEN, resultOwner)
+                assertEquals(TOKEN, resultReview)
+                assertEquals(TOKEN, review)
+                assertEquals(41, session)
+                assertEquals(TOKEN, conversion)
+            }
+            GeneratedCleanupCompletionStep.RESULT_OWNER_CLEARED -> {
+                assertNull(installOwner)
+                assertNull(resultOwner)
+                assertNull(resultReview)
+                assertEquals(TOKEN, review)
+                assertEquals(41, session)
+                assertEquals(TOKEN, conversion)
+            }
+            GeneratedCleanupCompletionStep.REVIEW_SESSION_CLEARED -> {
+                assertNull(installOwner)
+                assertNull(resultOwner)
+                assertNull(resultReview)
+                assertNull(review)
+                assertNull(session)
+                assertEquals(TOKEN, conversion)
+            }
+            GeneratedCleanupCompletionStep.CONVERSION_OWNER_CLEARED -> {
+                assertNull(installOwner)
+                assertNull(resultOwner)
+                assertNull(resultReview)
+                assertNull(review)
+                assertNull(session)
+                assertNull(conversion)
+            }
+        }
+    }
+
     private fun currentGeneratedInstallRepository() = FakeManagerRepository().apply {
         restoreResult = ManagerRestoreResult(
             review = review(ContractCompatibilityStatus.COMPATIBLE),
@@ -5247,6 +5487,7 @@ private class FakeManagerRepository : ManagerRepository {
     val discardedConversions = mutableListOf<String>()
     var discardConversionResult = true
     val discardConversionResults = mutableMapOf<String, Boolean>()
+    var beforeDiscardConversion: ((String) -> Unit)? = null
     var suspendDiscardConversion = false
     var generatedExists = true
     var copiedConversionHash: String? = null
@@ -5357,6 +5598,7 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun discardConversion(token: String): Boolean {
         lifecycleEvents += "discardConversion:$token"
         discardedConversions += token
+        beforeDiscardConversion?.invoke(token)
         if (suspendDiscardConversion) discardConversionGate.first()
         val result = discardConversionResults[token] ?: discardConversionResult
         if (result) generatedExists = false

@@ -59,6 +59,7 @@ class ManagerViewModel(
         GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
     },
     private val afterGeneratedInstallCleanupTransitionPersisted: () -> Unit = {},
+    private val afterGeneratedReviewCleanupCompleted: () -> Unit = {},
     private val afterGeneratedCleanupCompletionStep: (
         GeneratedCleanupCompletionStep,
     ) -> Unit = {},
@@ -870,12 +871,15 @@ class ManagerViewModel(
         generated: dev.sixbridge.manager.conversion.GeneratedBundle,
         failureCode: ConversionFailureCode? = null,
         installOwnerActive: Boolean = generatedInstallOwnerToken == generated.token,
+        persistOwners: Boolean = true,
     ) {
-        saveConversionRoute(generated.token, "result")
-        generatedResultOwnerToken = generated.token
-        generatedResultReviewToken = review?.token
-        savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = generated.token
-        savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = review?.token
+        if (persistOwners) {
+            saveConversionRoute(generated.token, "result")
+            generatedResultOwnerToken = generated.token
+            generatedResultReviewToken = review?.token
+            savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = generated.token
+            savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = review?.token
+        }
         val cleanupPending = pendingGeneratedCleanup?.token == generated.token
         mutableState.update {
             it.copy(
@@ -931,6 +935,32 @@ class ManagerViewModel(
                 return@launch
             }
             if (committedDestination != null) return@launch
+            val intermediateCleanup = pendingGeneratedCleanup?.takeIf {
+                it.phase == GeneratedCleanupPhase.REVIEW ||
+                    it.phase == GeneratedCleanupPhase.CONVERSION
+            }
+            if (intermediateCleanup != null) {
+                restoreConversion(
+                    generation = generation,
+                    retainedReview = restored.review?.takeIf {
+                        intermediateCleanup.phase == GeneratedCleanupPhase.REVIEW &&
+                            it.token == intermediateCleanup.reviewToken
+                    },
+                    importReview =
+                        intermediateCleanup.phase == GeneratedCleanupPhase.REVIEW,
+                    persistOwners = false,
+                )
+                if (intermediateCleanup.phase == GeneratedCleanupPhase.CONVERSION &&
+                    mutableState.value.conversionState !is ConversionUiState.ResultReady
+                ) {
+                    enqueueGeneratedCleanup {
+                        performPendingGeneratedCleanup()
+                    }
+                } else {
+                    showGeneratedCleanupFailure()
+                }
+                return@launch
+            }
             if (generation != operationGeneration) {
                 deferredInitialTerminal = null
                 restored.review?.token?.let(::queuePendingReviewDiscard)
@@ -1053,6 +1083,7 @@ class ManagerViewModel(
         retainedReview: ReviewBundle? = null,
         importReview: Boolean =
             pendingGeneratedCleanup?.phase != GeneratedCleanupPhase.CONVERSION,
+        persistOwners: Boolean = true,
     ) {
         val restored = try {
             repository.restoreConversion(importReview = importReview)
@@ -1063,11 +1094,21 @@ class ManagerViewModel(
         }
         if (generation != operationGeneration) return
         when (restored) {
-            is RestoredConversion.Analysis -> showConversionAnalysis(restored.value)
+            is RestoredConversion.Analysis -> {
+                if (persistOwners) showConversionAnalysis(restored.value)
+            }
             is RestoredConversion.BundleReady ->
-                showConversionResult(retainedReview ?: restored.review, restored.generated)
+                showConversionResult(
+                    review = if (importReview) retainedReview ?: restored.review else retainedReview,
+                    generated = restored.generated,
+                    persistOwners = persistOwners,
+                )
             is RestoredConversion.GeneratedPending ->
-                showConversionResult(review = retainedReview, generated = restored.generated)
+                showConversionResult(
+                    review = retainedReview,
+                    generated = restored.generated,
+                    persistOwners = persistOwners,
+                )
             null -> {
                 if (pendingGeneratedCleanup?.matchesSavedOwners() != true) {
                     clearSavedConversion()
@@ -1094,6 +1135,13 @@ class ManagerViewModel(
                 mutableState.update { it.copy(installState = installState) }
                 if (generatedCleanupRestoreInvalid) {
                     showGeneratedCleanupRestoreBlocked()
+                    return@collect
+                }
+                if (pendingGeneratedCleanup?.phase in setOf(
+                        GeneratedCleanupPhase.REVIEW,
+                        GeneratedCleanupPhase.CONVERSION,
+                    )
+                ) {
                     return@collect
                 }
                 if (firstEmission &&
@@ -1846,8 +1894,6 @@ class ManagerViewModel(
         )
         advanceGeneratedCleanup(next)
         afterGeneratedInstallCleanupTransitionPersisted()
-        clearGeneratedInstallOwner()
-        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
         mutableState.update {
             val ready = it.conversionState as? ConversionUiState.ResultReady
             it.copy(
@@ -2028,13 +2074,7 @@ class ManagerViewModel(
                 showGeneratedCleanupFailure()
                 return false
             }
-            if (ownedReviewToken == reviewToken) {
-                clearSavedReviewAndSession()
-            }
-            if (generatedResultReviewToken == reviewToken) {
-                generatedResultReviewToken = null
-                savedStateHandle[RESULT_OWNER_REVIEW_TOKEN_KEY] = null
-            }
+            afterGeneratedReviewCleanupCompleted()
             mutableState.update {
                 val ready = it.conversionState as? ConversionUiState.ResultReady
                 it.copy(
@@ -2042,10 +2082,7 @@ class ManagerViewModel(
                     importState = ImportUiState.Idle,
                 )
             }
-            cleanup = cleanup.copy(
-                reviewToken = null,
-                phase = GeneratedCleanupPhase.CONVERSION,
-            )
+            cleanup = cleanup.copy(phase = GeneratedCleanupPhase.CONVERSION)
             advanceGeneratedCleanup(cleanup)
         }
         if (!repository.discardConversion(cleanup.token)) {
@@ -2186,17 +2223,17 @@ class ManagerViewModel(
                 savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY) == token &&
                 savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY) == installSessionId
         }
-        return true
+        return savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY)
+            .let { it == null || it == token }
     }
 
     private fun PendingGeneratedCleanup.matchesResultOwners(): Boolean {
         if (savedStateHandle.get<String>(RESULT_OWNER_CONVERSION_TOKEN_KEY) != token ||
-            savedStateHandle.get<String>(CONVERSION_TOKEN_KEY) != token ||
-            savedStateHandle.get<String>(RESULT_OWNER_REVIEW_TOKEN_KEY) != reviewToken
+            savedStateHandle.get<String>(CONVERSION_TOKEN_KEY) != token
         ) {
             return false
         }
-        return true
+        return savedStateHandle.get<String>(RESULT_OWNER_REVIEW_TOKEN_KEY) == reviewToken
     }
 
     private fun quarantineGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
@@ -2453,7 +2490,7 @@ class ManagerViewModel(
                 GeneratedCleanupPhase.REVIEW ->
                     reviewToken != null && installSessionId == null
                 GeneratedCleanupPhase.CONVERSION ->
-                    reviewToken == null && installSessionId == null
+                    installSessionId == null
                 GeneratedCleanupPhase.COMMIT_DESTINATION ->
                     reviewToken == null && installSessionId == null
             }
