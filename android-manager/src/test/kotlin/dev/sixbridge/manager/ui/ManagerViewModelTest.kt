@@ -4142,6 +4142,105 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `pending REVIEW initialize 전 conversion action은 owner를 보존하고 stale restore를 무시한다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val savedState = pendingReviewReportSavedState()
+            val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
+            val repository = currentGeneratedInstallRepository().apply {
+                initializeDeferred = initializeResult
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals("REVIEW", generatedCleanupPhase(savedState))
+            assertEquals("REPORT", generatedCleanupDestinationKind(savedState))
+            assertEquals(PACKAGE, generatedCleanupDestinationPackage(savedState))
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(0, repository.cleanupRequestCount())
+
+            initializeResult.complete(repository.restoreResult)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(0, repository.cleanupRequestCount())
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `pending REVIEW conversion restore 중 conversion action은 stale failure를 표시하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val conversionResult = CompletableDeferred<RestoredConversion?>()
+            val savedState = pendingReviewReportSavedState()
+            val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
+            val repository = currentGeneratedInstallRepository().apply {
+                restoreConversionDeferred = conversionResult
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+            assertEquals(1, repository.restoreConversionRequests)
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals(0, repository.cleanupRequestCount())
+
+            conversionResult.complete(repository.restoredConversion)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(0, repository.cleanupRequestCount())
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
     fun `REVIEW discard 뒤 CONVERSION process death는 owner를 유지하고 cleanup만 replay한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -5145,6 +5244,22 @@ class ManagerViewModelTest {
         mapOf(CLEANUP_JOURNAL_KEY to cleanupJournal),
     )
 
+    private fun pendingReviewReportSavedState() = currentGeneratedInstallSavedState(
+        cleanupJournal = """
+            {
+              "version": 1,
+              "token": "$TOKEN",
+              "reviewToken": "$TOKEN",
+              "phase": "REVIEW",
+              "destination": {
+                "kind": "REPORT",
+                "packageName": "$PACKAGE"
+              },
+              "installSessionId": null
+            }
+        """.trimIndent(),
+    )
+
     private fun assertGeneratedOwnersAndSessionPreserved(savedState: SavedStateHandle) {
         assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
         assertEquals(41, savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
@@ -5447,6 +5562,7 @@ private class FakeManagerRepository : ManagerRepository {
         ManagerImportResult.Failure(ImportFailure(ImportFailureCode.SOURCE_UNREADABLE))
     var initialized = false
     var initializeException: RuntimeException? = null
+    var initializeDeferred: CompletableDeferred<ManagerRestoreResult>? = null
     var suspendInitialize = false
     var ignoreInitializeCancellation = false
     var restoreArguments: Pair<String?, Int?>? = null
@@ -5479,6 +5595,7 @@ private class FakeManagerRepository : ManagerRepository {
     var suspendFirstConversionBuild = false
     var ignoreFirstConversionBuildCancellation = false
     var restoredConversion: RestoredConversion? = null
+    var restoreConversionDeferred: CompletableDeferred<RestoredConversion?>? = null
     var restoreConversionFailure: IOException? = null
     var restoreConversionRequests = 0
     val restoreConversionImportReviewRequests = mutableListOf<Boolean>()
@@ -5527,6 +5644,7 @@ private class FakeManagerRepository : ManagerRepository {
         initialized = true
         restoreArguments = reviewToken to installSessionId
         initializeException?.let { throw it }
+        initializeDeferred?.let { return it.await() }
         if (suspendInitialize) {
             if (ignoreInitializeCancellation) {
                 withContext(NonCancellable) { initializeGate.first() }
@@ -5592,6 +5710,7 @@ private class FakeManagerRepository : ManagerRepository {
         restoreConversionRequests += 1
         restoreConversionImportReviewRequests += importReview
         restoreConversionFailure?.let { throw it }
+        restoreConversionDeferred?.let { return it.await() }
         return restoredConversion
     }
 

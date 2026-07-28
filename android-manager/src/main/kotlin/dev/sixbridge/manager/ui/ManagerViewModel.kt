@@ -102,6 +102,7 @@ class ManagerViewModel(
     private var generatedCleanupRestoreInvalid = false
     private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
     private var quarantinedGeneratedCleanup = restoreQuarantinedGeneratedCleanup()
+    private var intermediateGeneratedCleanupRestorePending = false
     private var generatedCleanupJob: Job? = null
     private var quarantinedGeneratedCleanupJob: Job? = null
     private var documentOwnerGeneration =
@@ -121,6 +122,11 @@ class ManagerViewModel(
                     it.matchesResultOwners()
             }
             ?.let(::quarantineGeneratedCleanup)
+        intermediateGeneratedCleanupRestorePending =
+            pendingGeneratedCleanup?.phase in setOf(
+                GeneratedCleanupPhase.REVIEW,
+                GeneratedCleanupPhase.CONVERSION,
+            )
         restoreAndInitialize()
         observeCatalog()
         observeInstallState()
@@ -129,6 +135,16 @@ class ManagerViewModel(
     }
 
     fun accept(action: ManagerAction) {
+        if (intermediateGeneratedCleanupRestorePending &&
+            pendingGeneratedCleanup?.phase in setOf(
+                GeneratedCleanupPhase.REVIEW,
+                GeneratedCleanupPhase.CONVERSION,
+            ) &&
+            action.mutatesGeneratedCleanupOwners()
+        ) {
+            operationGeneration += 1
+            return
+        }
         if (action != ManagerAction.RetryRecovery &&
             action != ManagerAction.RetryGeneratedCleanup &&
             action !is ManagerAction.LaunchSucceeded &&
@@ -939,6 +955,17 @@ class ManagerViewModel(
                 it.phase == GeneratedCleanupPhase.REVIEW ||
                     it.phase == GeneratedCleanupPhase.CONVERSION
             }
+            if (generation != operationGeneration) {
+                deferredInitialTerminal = null
+                if (intermediateCleanup == null) {
+                    restored.review?.token?.let(::queuePendingReviewDiscard)
+                }
+                return@launch
+            }
+            if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
+                deferredInitialTerminal = null
+                return@launch
+            }
             if (intermediateCleanup != null) {
                 restoreConversion(
                     generation = generation,
@@ -950,6 +977,13 @@ class ManagerViewModel(
                         intermediateCleanup.phase == GeneratedCleanupPhase.REVIEW,
                     persistOwners = false,
                 )
+                if (generation != operationGeneration ||
+                    savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken ||
+                    pendingGeneratedCleanup != intermediateCleanup
+                ) {
+                    return@launch
+                }
+                intermediateGeneratedCleanupRestorePending = false
                 if (intermediateCleanup.phase == GeneratedCleanupPhase.CONVERSION &&
                     mutableState.value.conversionState !is ConversionUiState.ResultReady
                 ) {
@@ -959,15 +993,6 @@ class ManagerViewModel(
                 } else {
                     showGeneratedCleanupFailure()
                 }
-                return@launch
-            }
-            if (generation != operationGeneration) {
-                deferredInitialTerminal = null
-                restored.review?.token?.let(::queuePendingReviewDiscard)
-                return@launch
-            }
-            if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
-                deferredInitialTerminal = null
                 return@launch
             }
             val resultOwner = generatedResultOwnerToken
@@ -1470,6 +1495,16 @@ class ManagerViewModel(
         ) {
             mutableState.update { it.copy(message = null) }
         }
+    }
+
+    private fun ManagerAction.mutatesGeneratedCleanupOwners(): Boolean = when (this) {
+        is ManagerAction.ImportSelected,
+        ManagerAction.OpenConversionInput,
+        ManagerAction.FinishConversion,
+        ManagerAction.CancelConversion,
+        ManagerAction.CancelReview,
+        -> true
+        else -> false
     }
 
     private fun invalidateUninstallAttempt() {
