@@ -76,6 +76,9 @@ class ManagerViewModel(
     private var deferredReplacementTerminal: Pair<Long, InstallState>? = null
     private var generatedInstallOwnerToken: String? =
         savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY]
+    private var generatedResultOwnerToken: String? =
+        savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY]
+    private var pendingGeneratedCleanup = restorePendingGeneratedCleanup()
     private var generatedTerminalJob: Job? = null
     private var documentOwnerGeneration =
         savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
@@ -581,6 +584,25 @@ class ManagerViewModel(
             ?.review
             ?.token
         val generatedInstallOwned = generatedInstallOwnerToken == token
+        val generatedCleanup = if (
+            stateBeforeCancel is ConversionUiState.ResultReady &&
+            token != null
+        ) {
+            beginGeneratedCleanup(
+                token = token,
+                reviewToken = reviewToken,
+                phase = if (generatedInstallOwned) {
+                    GeneratedCleanupPhase.INSTALL
+                } else if (reviewToken != null) {
+                    GeneratedCleanupPhase.REVIEW
+                } else {
+                    GeneratedCleanupPhase.CONVERSION
+                },
+                destination = GeneratedCleanupDestination.fromRoute(destination),
+            )
+        } else {
+            null
+        }
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
         val supersededInstall = if (generatedInstallOwned) detachInstallJob() else null
@@ -605,15 +627,32 @@ class ManagerViewModel(
                     showGeneratedCleanupFailure()
                     return@enqueueRouteCleanup false
                 }
+                generatedCleanup?.let {
+                    advanceGeneratedCleanup(
+                        it.copy(
+                            phase = if (it.reviewToken != null) {
+                                GeneratedCleanupPhase.REVIEW
+                            } else {
+                                GeneratedCleanupPhase.CONVERSION
+                            },
+                        ),
+                    )
+                }
             }
             conversionIoJob?.cancelAndJoin()
             conversionIoJob = null
+            if (generatedCleanup != null) {
+                return@enqueueRouteCleanup performPendingGeneratedCleanup()
+            }
             if (token != null &&
                 token !in scheduledConversionCleanupTokens &&
                 !repository.discardConversion(token)
             ) {
                 showGeneratedCleanupFailure()
                 return@enqueueRouteCleanup false
+            }
+            if (ownedReviewToken == reviewToken) {
+                clearSavedReviewAndSession()
             }
             if (reviewToken != null &&
                 token !in scheduledConversionCleanupTokens &&
@@ -622,10 +661,8 @@ class ManagerViewModel(
                 showGeneratedCleanupFailure()
                 return@enqueueRouteCleanup false
             }
-            if (ownedReviewToken == reviewToken) {
-                clearSavedReviewAndSession()
-            }
             clearGeneratedInstallOwner()
+            clearGeneratedResultOwner()
             clearSavedConversion()
             mutableState.update {
                 it.copy(
@@ -673,6 +710,8 @@ class ManagerViewModel(
         installOwnerActive: Boolean = generatedInstallOwnerToken == generated.token,
     ) {
         saveConversionRoute(generated.token, "result")
+        generatedResultOwnerToken = generated.token
+        savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = generated.token
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionResult(generated.token),
@@ -764,7 +803,10 @@ class ManagerViewModel(
 
     private suspend fun restoreConversion(generation: Long) {
         val restored = try {
-            repository.restoreConversion()
+            repository.restoreConversion(
+                importReview =
+                    pendingGeneratedCleanup?.phase != GeneratedCleanupPhase.CONVERSION,
+            )
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
@@ -1455,27 +1497,20 @@ class ManagerViewModel(
         when (installState) {
             is InstallState.Installed -> {
                 if (generatedTerminalJob?.isActive == true) return
+                beginGeneratedCleanup(
+                    token = token,
+                    reviewToken = result.review?.token,
+                    phase = if (result.review != null) {
+                        GeneratedCleanupPhase.REVIEW
+                    } else {
+                        GeneratedCleanupPhase.CONVERSION
+                    },
+                    destination = GeneratedCleanupDestination.fromRoute(
+                        ManagerRoute.Report(installState.packageName),
+                    ),
+                )
                 generatedTerminalJob = viewModelScope.launch {
-                    if (!repository.discardConversion(token)) {
-                        showGeneratedCleanupFailure()
-                        return@launch
-                    }
-                    val reviewToken = result.review?.token
-                    if (reviewToken != null && !repository.discardReview(reviewToken)) {
-                        showGeneratedCleanupFailure()
-                        return@launch
-                    }
-                    clearGeneratedInstallOwner()
-                    clearSavedReviewAndSession()
-                    clearSavedConversion()
-                    mutableState.update {
-                        it.copy(
-                            route = ManagerRoute.Report(installState.packageName),
-                            importState = ImportUiState.Idle,
-                            conversionState = ConversionUiState.Idle,
-                            message = null,
-                        )
-                    }
+                    performPendingGeneratedCleanup()
                 }
             }
             InstallState.Cancelled -> returnGeneratedInstallToResult(
@@ -1531,9 +1566,115 @@ class ManagerViewModel(
         }
     }
 
+    private fun beginGeneratedCleanup(
+        token: String,
+        reviewToken: String?,
+        phase: GeneratedCleanupPhase,
+        destination: GeneratedCleanupDestination,
+    ): PendingGeneratedCleanup {
+        pendingGeneratedCleanup?.let { return it }
+        return PendingGeneratedCleanup(
+            token = token,
+            reviewToken = reviewToken,
+            phase = phase,
+            destination = destination,
+        ).also(::advanceGeneratedCleanup)
+    }
+
+    private fun advanceGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+        pendingGeneratedCleanup = cleanup
+        savedStateHandle[GENERATED_CLEANUP_TOKEN_KEY] = cleanup.token
+        savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = cleanup.reviewToken
+        savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = cleanup.phase.name
+        savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY] = cleanup.destination.kind
+        savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = cleanup.destination.packageName
+    }
+
+    private suspend fun performPendingGeneratedCleanup(): Boolean {
+        var cleanup = pendingGeneratedCleanup ?: return false
+        if (cleanup.phase == GeneratedCleanupPhase.INSTALL) return false
+        if (cleanup.phase == GeneratedCleanupPhase.REVIEW) {
+            val reviewToken = cleanup.reviewToken
+            if (reviewToken != null && !repository.discardReview(reviewToken)) {
+                showGeneratedCleanupFailure()
+                return false
+            }
+            if (ownedReviewToken == reviewToken) {
+                clearSavedReviewAndSession()
+            }
+            mutableState.update {
+                val ready = it.conversionState as? ConversionUiState.ResultReady
+                it.copy(
+                    conversionState = ready?.copy(review = null) ?: it.conversionState,
+                    importState = ImportUiState.Idle,
+                )
+            }
+            cleanup = cleanup.copy(
+                reviewToken = null,
+                phase = GeneratedCleanupPhase.CONVERSION,
+            )
+            advanceGeneratedCleanup(cleanup)
+        }
+        if (!repository.discardConversion(cleanup.token)) {
+            showGeneratedCleanupFailure()
+            return false
+        }
+        completeGeneratedCleanup(cleanup)
+        return true
+    }
+
+    private fun completeGeneratedCleanup(cleanup: PendingGeneratedCleanup) {
+        clearGeneratedInstallOwner()
+        clearGeneratedResultOwner()
+        clearSavedReviewAndSession()
+        clearSavedConversion()
+        clearPendingGeneratedCleanup()
+        mutableState.update {
+            it.copy(
+                route = cleanup.destination.toRoute(),
+                conversionState = ConversionUiState.Idle,
+                conversionUrl = "",
+                importState = ImportUiState.Idle,
+                message = null,
+            )
+        }
+    }
+
+    private fun restorePendingGeneratedCleanup(): PendingGeneratedCleanup? {
+        val token = savedStateHandle.get<String>(GENERATED_CLEANUP_TOKEN_KEY)
+            ?: return null
+        val phase = savedStateHandle.get<String>(GENERATED_CLEANUP_PHASE_KEY)
+            ?.let { runCatching { GeneratedCleanupPhase.valueOf(it) }.getOrNull() }
+            ?: return null
+        val destination = GeneratedCleanupDestination.restore(
+            kind = savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY],
+            packageName = savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY],
+        ) ?: return null
+        return PendingGeneratedCleanup(
+            token = token,
+            reviewToken = savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY],
+            phase = phase,
+            destination = destination,
+        )
+    }
+
+    private fun clearPendingGeneratedCleanup() {
+        pendingGeneratedCleanup = null
+        savedStateHandle[GENERATED_CLEANUP_TOKEN_KEY] = null
+        savedStateHandle[GENERATED_CLEANUP_REVIEW_TOKEN_KEY] = null
+        savedStateHandle[GENERATED_CLEANUP_PHASE_KEY] = null
+        savedStateHandle[GENERATED_CLEANUP_DESTINATION_KEY] = null
+        savedStateHandle[GENERATED_CLEANUP_PACKAGE_KEY] = null
+    }
+
     private fun clearGeneratedInstallOwner() {
         generatedInstallOwnerToken = null
         savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY] = null
+    }
+
+    private fun clearGeneratedResultOwner() {
+        generatedResultOwnerToken = null
+        savedStateHandle[RESULT_OWNER_CONVERSION_TOKEN_KEY] = null
     }
 
     private fun enqueueEffect(effect: ManagerEffect) {
@@ -1613,6 +1754,12 @@ class ManagerViewModel(
         const val CONVERSION_TOKEN_KEY = "conversion_token"
         const val CONVERSION_ROUTE_KEY = "conversion_route"
         const val INSTALL_OWNER_CONVERSION_TOKEN_KEY = "install_owner_conversion_token"
+        const val RESULT_OWNER_CONVERSION_TOKEN_KEY = "result_owner_conversion_token"
+        const val GENERATED_CLEANUP_TOKEN_KEY = "generated_cleanup_token"
+        const val GENERATED_CLEANUP_REVIEW_TOKEN_KEY = "generated_cleanup_review_token"
+        const val GENERATED_CLEANUP_PHASE_KEY = "generated_cleanup_phase"
+        const val GENERATED_CLEANUP_DESTINATION_KEY = "generated_cleanup_destination"
+        const val GENERATED_CLEANUP_PACKAGE_KEY = "generated_cleanup_package"
         const val DOCUMENT_OWNER_GENERATION_KEY = "document_owner_generation"
         const val DOCUMENT_LAUNCH_SEQUENCE_KEY = "document_launch_sequence"
         const val PENDING_PICKER_OWNER_GENERATION_KEY = "pending_picker_owner_generation"
@@ -1626,6 +1773,52 @@ class ManagerViewModel(
             "SESSION_RECOVERY_FAILED",
             "MISSING_OBSERVATION_RESET_FAILED",
         )
+    }
+}
+
+private enum class GeneratedCleanupPhase {
+    INSTALL,
+    REVIEW,
+    CONVERSION,
+}
+
+private data class PendingGeneratedCleanup(
+    val token: String,
+    val reviewToken: String?,
+    val phase: GeneratedCleanupPhase,
+    val destination: GeneratedCleanupDestination,
+)
+
+private data class GeneratedCleanupDestination(
+    val kind: String,
+    val packageName: String? = null,
+) {
+    fun toRoute(): ManagerRoute = when (kind) {
+        HOME -> ManagerRoute.Home
+        INPUT -> ManagerRoute.ConversionInput
+        REPORT -> ManagerRoute.Report(requireNotNull(packageName))
+        else -> error("지원하지 않는 generated cleanup destination입니다.")
+    }
+
+    companion object {
+        private const val HOME = "HOME"
+        private const val INPUT = "INPUT"
+        private const val REPORT = "REPORT"
+
+        fun fromRoute(route: ManagerRoute): GeneratedCleanupDestination = when (route) {
+            ManagerRoute.Home -> GeneratedCleanupDestination(HOME)
+            ManagerRoute.ConversionInput -> GeneratedCleanupDestination(INPUT)
+            is ManagerRoute.Report -> GeneratedCleanupDestination(REPORT, route.packageName)
+            else -> error("generated cleanup destination으로 사용할 수 없는 route입니다.")
+        }
+
+        fun restore(kind: String?, packageName: String?): GeneratedCleanupDestination? =
+            when (kind) {
+                HOME -> GeneratedCleanupDestination(HOME)
+                INPUT -> GeneratedCleanupDestination(INPUT)
+                REPORT -> packageName?.let { GeneratedCleanupDestination(REPORT, it) }
+                else -> null
+            }
     }
 }
 

@@ -1862,6 +1862,143 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `Finish cleanup은 review first 실패에서 conversion proof를 건드리지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            assertEquals(listOf("discardReview:$TOKEN"), repository.lifecycleEvents)
+            assertTrue(repository.generatedExists)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).review?.token,
+            )
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+        }
+
+    @Test
+    fun `새 변환 cleanup은 review first 실패에서 conversion proof를 건드리지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            advanceUntilIdle()
+
+            assertEquals(listOf("discardReview:$TOKEN"), repository.lifecycleEvents)
+            assertTrue(repository.generatedExists)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).review?.token,
+            )
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+        }
+
+    @Test
+    fun `Installed cleanup은 review first 실패에서 conversion proof를 건드리지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                discardReviewResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+
+            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            advanceUntilIdle()
+
+            assertEquals(listOf("discardReview:$TOKEN"), repository.lifecycleEvents)
+            assertTrue(repository.generatedExists)
+            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `review 성공 conversion 실패는 CONVERSION phase와 physical generated를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val generated = generatedBundle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generated,
+                )
+                discardConversionResult = false
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.FinishConversion)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                repository.lifecycleEvents,
+            )
+            val ready = assertIs<ConversionUiState.ResultReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertNull(ready.review)
+            assertTrue(repository.generatedExists)
+            assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+            )
+
+            repository.lifecycleEvents.clear()
+            repository.restoreResult = ManagerRestoreResult()
+            repository.restoredConversion = RestoredConversion.GeneratedPending(generated)
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            val restoredReady = assertIs<ConversionUiState.ResultReady>(
+                recreated.state.value.conversionState,
+            )
+            assertEquals(TOKEN, restoredReady.token)
+            assertNull(restoredReady.review)
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), recreated.state.value.route)
+            assertTrue(repository.generatedExists)
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+            )
+            assertEquals(false, repository.restoreConversionImportReviewRequests.last())
+        }
+
+    @Test
     fun `generated active install 중 완료는 owner와 결과를 유지한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
@@ -2013,8 +2150,8 @@ class ManagerViewModelTest {
                     "install:start",
                     "install:end",
                     "cancelInstall",
-                    "discardConversion:$TOKEN",
                     "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
                 ),
                 repository.lifecycleEvents,
             )
@@ -2095,7 +2232,7 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(
-                listOf("discardConversion:$TOKEN", "discardReview:$TOKEN"),
+                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
@@ -2121,9 +2258,18 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
-            assertIs<ConversionUiState.ResultReady>(viewModel.state.value.conversionState)
+            assertNull(
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).review,
+            )
             assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
-            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(ManagerViewModel.GENERATED_CLEANUP_PHASE_KEY),
+            )
+            assertTrue(repository.generatedExists)
         }
 
     @Test
@@ -2698,10 +2844,12 @@ private class FakeManagerRepository : ManagerRepository {
     var ignoreFirstConversionBuildCancellation = false
     var restoredConversion: RestoredConversion? = null
     var restoreConversionRequests = 0
+    val restoreConversionImportReviewRequests = mutableListOf<Boolean>()
     val conversionRequests = mutableListOf<OnDeviceInputRequest>()
     val conversionBuildRequests = mutableListOf<ConversionBuildRequest>()
     val discardedConversions = mutableListOf<String>()
     var discardConversionResult = true
+    var generatedExists = true
     var copiedConversionHash: String? = null
     val copiedConversionTokens = mutableListOf<String>()
     val lifecycleEvents = mutableListOf<String>()
@@ -2793,14 +2941,16 @@ private class FakeManagerRepository : ManagerRepository {
         firstConversionBuildGate.emit(Unit)
     }
 
-    override suspend fun restoreConversion(): RestoredConversion? {
+    override suspend fun restoreConversion(importReview: Boolean): RestoredConversion? {
         restoreConversionRequests += 1
+        restoreConversionImportReviewRequests += importReview
         return restoredConversion
     }
 
     override suspend fun discardConversion(token: String): Boolean {
         lifecycleEvents += "discardConversion:$token"
         discardedConversions += token
+        if (discardConversionResult) generatedExists = false
         return discardConversionResult
     }
 

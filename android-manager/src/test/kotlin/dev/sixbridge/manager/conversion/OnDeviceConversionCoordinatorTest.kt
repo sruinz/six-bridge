@@ -672,6 +672,34 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `conversion cleanup 복원은 generated를 새 review로 import하지 않는다`() = runTest {
+        val events = mutableListOf<String>()
+        val fixture = Fixture(temporaryFolder, events)
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        val ready = assertIs<ConversionBuildResult.BundleReady>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+        events.clear()
+
+        val restored = assertIs<RestoredConversion.GeneratedPending>(
+            coordinator.restore(importReview = false),
+        )
+
+        assertEquals(ready.generated, restored.generated)
+        assertTrue("import" !in events)
+    }
+
+    @Test
     fun `import 실패 결과를 취소하면 owner generated work를 함께 정리한다`() = runTest {
         val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
             importFailuresRemaining = 1

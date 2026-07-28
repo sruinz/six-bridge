@@ -141,7 +141,7 @@ interface ManagerRepository {
     ): ConversionBuildResult = ConversionBuildResult.Failure(
         dev.sixbridge.manager.conversion.ConversionFailureCode.INPUT_INVALID,
     )
-    suspend fun restoreConversion(): RestoredConversion? = null
+    suspend fun restoreConversion(importReview: Boolean = true): RestoredConversion? = null
     suspend fun discardConversion(token: String): Boolean = false
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
@@ -273,8 +273,8 @@ internal class DefaultManagerRepository(
         "온디바이스 변환 coordinator가 구성되지 않았습니다."
     }.build(token, approvedAdapterIds, partialConfirmed, identitySelection)
 
-    override suspend fun restoreConversion(): RestoredConversion? =
-        conversionCoordinator?.restore()
+    override suspend fun restoreConversion(importReview: Boolean): RestoredConversion? =
+        conversionCoordinator?.restore(importReview)
 
     override suspend fun discardConversion(token: String): Boolean =
         conversionCoordinator?.discard(token) ?: false

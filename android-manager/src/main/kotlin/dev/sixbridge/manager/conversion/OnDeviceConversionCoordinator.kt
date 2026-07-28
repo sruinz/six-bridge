@@ -257,13 +257,14 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 
-    override suspend fun restore(): RestoredConversion? {
+    override suspend fun restore(importReview: Boolean): RestoredConversion? {
         val job = work.restoreBuildAware() ?: return null
         if (job.stage == ConversionJobStage.BUILDING) {
-            return reconcileBuilding(job)
+            return reconcileBuilding(job, importReview)
         }
         if (job.stage == ConversionJobStage.BUNDLE_READY) {
             val generated = bundles.recover(job.token) ?: return null
+            if (!importReview) return RestoredConversion.GeneratedPending(generated)
             val review = imports.importGenerated(generated) ?: return null
             return RestoredConversion.BundleReady(review, generated)
         }
@@ -284,9 +285,13 @@ internal class OnDeviceConversionCoordinator(
     override fun copyGenerated(token: String, output: OutputStream): String? =
         bundles.recover(token)?.let { bundles.copyTo(token, output) }
 
-    private suspend fun reconcileBuilding(job: RestoredConversionJob): RestoredConversion? {
+    private suspend fun reconcileBuilding(
+        job: RestoredConversionJob,
+        importReview: Boolean = true,
+    ): RestoredConversion? {
         val generated = bundles.recover(job.token)
         if (generated != null) {
+            if (!importReview) return RestoredConversion.GeneratedPending(generated)
             val review = imports.importGenerated(generated)
                 ?: return RestoredConversion.GeneratedPending(generated)
             abortOwner(job.token)

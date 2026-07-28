@@ -256,7 +256,7 @@ internal interface ConversionCoordinatorPort {
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
     ): ConversionBuildResult
-    suspend fun restore(): RestoredConversion?
+    suspend fun restore(importReview: Boolean = true): RestoredConversion?
     suspend fun discard(token: String): Boolean
     fun copyGenerated(token: String, output: OutputStream): String?
 }

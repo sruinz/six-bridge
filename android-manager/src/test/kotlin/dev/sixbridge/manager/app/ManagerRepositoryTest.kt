@@ -369,7 +369,7 @@ class ManagerRepositoryTest {
                     return buildFailure
                 }
 
-                override suspend fun restore(): RestoredConversion {
+                override suspend fun restore(importReview: Boolean): RestoredConversion {
                     calls += "restore"
                     return restored
                 }
