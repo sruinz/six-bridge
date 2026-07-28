@@ -342,31 +342,7 @@ class ManagerAppTest {
             review = review,
             generated = ready.generated,
         )
-        val savedState = SavedStateHandle(
-            mapOf(
-                ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
-                ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
-                ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
-                ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
-                ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
-                ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
-                ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
-                ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY to
-                    """
-                        {
-                          "version": 1,
-                          "token": "$TOKEN",
-                          "reviewToken": "$TOKEN",
-                          "phase": "REVIEW",
-                          "destination": {
-                            "kind": "REPORT",
-                            "packageName": "$PACKAGE"
-                          },
-                          "installSessionId": null
-                        }
-                    """.trimIndent(),
-            ),
-        )
+        val savedState = cleanupRestoreSavedState()
         val viewModel = ManagerViewModel(repository, savedState)
         composeRule.setContent {
             SixBridgeManagerApp(
@@ -419,6 +395,88 @@ class ManagerAppTest {
         }
 
         composeRule.onNodeWithText("다시 확인").performClick()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
+        }
+        composeRule.runOnIdle {
+            assertEquals(listOf(TOKEN), repository.discardedReviews)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+    }
+
+    @Test
+    fun pending_review_initialize_failure_home_retry_completes_exact_report() {
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        val review = requireNotNull(ready.review)
+        val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+        val repository = CleanupRestoreUiRepository(
+            initializeResult = initializeResult,
+            review = review,
+            generated = ready.generated,
+        )
+        val viewModel = ManagerViewModel(repository, cleanupRestoreSavedState())
+        composeRule.setContent {
+            SixBridgeManagerApp(
+                viewModel = viewModel,
+                onAddSix = {},
+                onInstallReviewed = {},
+            )
+        }
+
+        composeRule.runOnIdle {
+            initializeResult.completeExceptionally(
+                IllegalStateException("transient"),
+            )
+        }
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.message?.kind ==
+                UserMessageKind.CONVERSION_CLEANUP_FAILED
+        }
+        composeRule.onNodeWithText("다시 확인").assertIsDisplayed().performClick()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
+        }
+        composeRule.runOnIdle {
+            assertEquals(listOf(TOKEN), repository.discardedReviews)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+    }
+
+    @Test
+    fun pending_review_restore_null_home_retry_completes_exact_report() {
+        val initial = conversionResultState()
+        val ready = initial.conversionState as ConversionUiState.ResultReady
+        val review = requireNotNull(ready.review)
+        val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+        val repository = CleanupRestoreUiRepository(
+            initializeResult = initializeResult,
+            review = review,
+            generated = ready.generated,
+            restoredConversion = null,
+        )
+        val viewModel = ManagerViewModel(repository, cleanupRestoreSavedState())
+        composeRule.setContent {
+            SixBridgeManagerApp(
+                viewModel = viewModel,
+                onAddSix = {},
+                onInstallReviewed = {},
+            )
+        }
+
+        composeRule.runOnIdle {
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = review,
+                    installSessionId = 41,
+                ),
+            )
+        }
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            viewModel.state.value.message?.kind ==
+                UserMessageKind.CONVERSION_CLEANUP_FAILED
+        }
+        composeRule.onNodeWithText("다시 확인").assertIsDisplayed().performClick()
         composeRule.waitUntil(timeoutMillis = 5_000) {
             viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
         }
@@ -1086,6 +1144,32 @@ class ManagerAppTest {
         return revision
     }
 
+    private fun cleanupRestoreSavedState() = SavedStateHandle(
+        mapOf(
+            ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+            ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+            ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+            ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY to
+                """
+                    {
+                      "version": 1,
+                      "token": "$TOKEN",
+                      "reviewToken": "$TOKEN",
+                      "phase": "REVIEW",
+                      "destination": {
+                        "kind": "REPORT",
+                        "packageName": "$PACKAGE"
+                      },
+                      "installSessionId": null
+                    }
+                """.trimIndent(),
+        ),
+    )
+
     private fun corruptPngSignatureWithoutChangingContentHash(iconPng: ByteArray) {
         iconPng[0] = (iconPng[0] + 1).toByte()
         iconPng[1] = (iconPng[1] - 31).toByte()
@@ -1103,6 +1187,8 @@ private class CleanupRestoreUiRepository(
     private val initializeResult: CompletableDeferred<ManagerRestoreResult>,
     private val review: ReviewBundle,
     private val generated: GeneratedBundle,
+    private val restoredConversion: RestoredConversion? =
+        RestoredConversion.BundleReady(review, generated),
 ) : ManagerRepository {
     override val catalog: Flow<List<CatalogRecord>> =
         MutableStateFlow(emptyList())
@@ -1124,7 +1210,7 @@ private class CleanupRestoreUiRepository(
 
     override suspend fun restoreConversion(
         importReview: Boolean,
-    ): RestoredConversion = RestoredConversion.BundleReady(review, generated)
+    ): RestoredConversion? = restoredConversion
 
     override fun discardReview(token: String): Boolean {
         discardedReviews += token

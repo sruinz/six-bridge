@@ -923,6 +923,10 @@ class ManagerViewModel(
 
     private fun restoreAndInitialize() {
         val generation = operationGeneration
+        val initialIntermediateCleanup = pendingGeneratedCleanup?.takeIf {
+            it.phase == GeneratedCleanupPhase.REVIEW ||
+                it.phase == GeneratedCleanupPhase.CONVERSION
+        }
         viewModelScope.launch {
             savedStateHandle["conversion_url"] = null
             val committedDestination = pendingGeneratedCleanup?.takeIf {
@@ -941,6 +945,13 @@ class ManagerViewModel(
                     showGeneratedCleanupRestoreBlocked()
                 } else if (committedDestination != null) {
                     initialized = true
+                } else if (initialIntermediateCleanup != null &&
+                    generation == operationGeneration &&
+                    savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == savedToken &&
+                    pendingGeneratedCleanup == initialIntermediateCleanup
+                ) {
+                    intermediateGeneratedCleanupRestorePending = false
+                    showGeneratedCleanupFailure()
                 }
                 return@launch
             }

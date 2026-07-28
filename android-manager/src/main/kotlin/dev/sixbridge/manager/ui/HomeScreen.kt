@@ -102,7 +102,15 @@ fun HomeScreen(
                             onAction(ManagerAction.ConfirmPartial)
                         RecoveryAction.SELECT_ANOTHER_FILE,
                         -> onAddSix()
-                        RecoveryAction.RETRY -> onAction(ManagerAction.RetryRecovery)
+                        RecoveryAction.RETRY -> onAction(
+                            if (message.kind ==
+                                UserMessageKind.CONVERSION_CLEANUP_FAILED
+                            ) {
+                                ManagerAction.RetryGeneratedCleanup
+                            } else {
+                                ManagerAction.RetryRecovery
+                            },
+                        )
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)
                     }
                 },

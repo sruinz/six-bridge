@@ -4267,6 +4267,175 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `pending REVIEW initialize exception은 Home Retry로 exact Report를 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = pendingReviewReportSavedState()
+            val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
+            val repository = currentGeneratedInstallRepository().apply {
+                initializeException = IllegalStateException("transient")
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                viewModel.state.value.message?.recoveryAction,
+            )
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals(0, repository.cleanupRequestCount())
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `pending REVIEW restore null과 exception은 Home Retry로 exact Report를 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf("null", "exception").forEach { caseName ->
+                val savedState = pendingReviewReportSavedState()
+                val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
+                val repository = currentGeneratedInstallRepository().apply {
+                    restoredConversion = null
+                    restoreConversionFailure = if (caseName == "exception") {
+                        IOException("transient")
+                    } else {
+                        null
+                    }
+                }
+                val viewModel = ManagerViewModel(repository, savedState)
+
+                advanceUntilIdle()
+
+                assertEquals(ManagerRoute.Home, viewModel.state.value.route, caseName)
+                assertEquals(
+                    UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                    viewModel.state.value.message?.kind,
+                    caseName,
+                )
+                assertEquals(
+                    RecoveryAction.RETRY,
+                    viewModel.state.value.message?.recoveryAction,
+                    caseName,
+                )
+                assertGeneratedOwnersAndSessionPreserved(savedState)
+                assertEquals(
+                    journalBefore,
+                    savedState.get<String>(CLEANUP_JOURNAL_KEY),
+                    caseName,
+                )
+                assertEquals(0, repository.cleanupRequestCount(), caseName)
+
+                viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+                advanceUntilIdle()
+
+                assertEquals(
+                    ManagerRoute.Report(PACKAGE),
+                    viewModel.state.value.route,
+                    caseName,
+                )
+                assertEquals(
+                    TOKEN,
+                    viewModel.state.value.destinationCommitToken,
+                    caseName,
+                )
+                assertEquals(listOf(TOKEN), repository.discardedTokens, caseName)
+                assertEquals(listOf(TOKEN), repository.discardedConversions, caseName)
+            }
+        }
+
+    @Test
+    fun `pending REVIEW stale initialize exception은 현재 상태를 오염시키지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val savedState = pendingReviewReportSavedState()
+            val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
+            val repository = currentGeneratedInstallRepository().apply {
+                initializeDeferred = initializeResult
+                cancelInstallResult = false
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.startImport {
+                error("stale import operation must not start")
+            }
+            dispatcher.scheduler.runCurrent()
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+
+            initializeResult.completeExceptionally(
+                IllegalStateException("late transient"),
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertEquals(1, repository.cancelInstallRequests)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `pending REVIEW initialize 중 CONVERSION 전환은 현재 phase로 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val savedState = pendingReviewReportSavedState()
+            val repository = currentGeneratedInstallRepository().apply {
+                initializeDeferred = initializeResult
+                beforeDiscardConversion = {
+                    error("stop after conversion phase commit")
+                }
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals("CONVERSION", generatedCleanupPhase(savedState))
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+
+            repository.beforeDiscardConversion = null
+            initializeResult.complete(repository.restoreResult)
+            advanceUntilIdle()
+
+            assertEquals(listOf(false), repository.restoreConversionImportReviewRequests)
+            assertEquals(
+                null,
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).review,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                RecoveryAction.RETRY,
+                viewModel.state.value.message?.recoveryAction,
+            )
+            assertEquals("CONVERSION", generatedCleanupPhase(savedState))
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+        }
+
+    @Test
     fun `REVIEW discard 뒤 CONVERSION process death는 owner를 유지하고 cleanup만 replay한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
