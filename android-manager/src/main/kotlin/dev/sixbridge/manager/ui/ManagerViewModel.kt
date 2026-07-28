@@ -1076,6 +1076,10 @@ class ManagerViewModel(
                 val changed = installState != lastInstallState
                 lastInstallState = installState
                 mutableState.update { it.copy(installState = installState) }
+                if (generatedCleanupRestoreInvalid) {
+                    showGeneratedCleanupRestoreBlocked()
+                    return@collect
+                }
                 if (firstEmission &&
                     installState == installStateAtInitialization &&
                     installState.isTerminalState() &&
@@ -1135,6 +1139,7 @@ class ManagerViewModel(
     private fun observeRepositoryLaunches() {
         viewModelScope.launch {
             repository.launches.collect { launch ->
+                if (generatedCleanupRestoreInvalid) return@collect
                 enqueueEffect(currentLaunchEffect(launch))
             }
         }
@@ -2151,6 +2156,7 @@ class ManagerViewModel(
     }
 
     private fun reconcileQuarantinedGeneratedCleanup() {
+        if (generatedCleanupRestoreInvalid) return
         quarantinedGeneratedCleanup ?: return
         quarantinedGeneratedCleanupJob
             ?.takeIf { it.isActive }

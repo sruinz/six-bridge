@@ -3691,6 +3691,102 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `invalid cleanup journal은 restored quarantine과 repository artifact를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = currentGeneratedInstallSavedState(
+                cleanupJournal = "{broken",
+            ).apply {
+                this[ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY] = SECOND_TOKEN
+                this[ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY] = "CONVERSION"
+                this[
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY
+                ] = false
+            }
+            val repository = currentGeneratedInstallRepository()
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertGeneratedOwnersAndSessionPreserved(savedState)
+            assertGeneratedCleanupRestoreBlocked(viewModel)
+            assertEquals(0, repository.cleanupRequestCount())
+            assertTrue(repository.generatedExists)
+            assertEquals(
+                SECOND_TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                "CONVERSION",
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+                ),
+            )
+            assertEquals(
+                false,
+                savedState.get<Boolean>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY,
+                ),
+            )
+        }
+
+    @Test
+    fun `invalid cleanup journal은 initialize 성공과 exception 모두 install observer를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                "initialize success" to null,
+                "initialize exception" to IllegalStateException("transient"),
+            ).forEach { (caseName, initializeFailure) ->
+                val savedState = currentGeneratedInstallSavedState(
+                    cleanupJournal = "{broken",
+                )
+                val repository = currentGeneratedInstallRepository().apply {
+                    initializeException = initializeFailure
+                }
+                val viewModel = ManagerViewModel(repository, savedState)
+                val effects = mutableListOf<ManagerEffect>()
+                backgroundScope.launch {
+                    viewModel.effects.collect(effects::add)
+                }
+                advanceUntilIdle()
+
+                assertGeneratedOwnersAndSessionPreserved(savedState)
+                assertGeneratedCleanupRestoreBlocked(viewModel)
+
+                repository.installFlow.value = InstallState.AwaitingUserApproval(99)
+                repository.emitLaunch(
+                    LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                    installSessionId = 99,
+                )
+                advanceUntilIdle()
+
+                assertGeneratedOwnersAndSessionPreserved(savedState)
+                assertGeneratedCleanupRestoreBlocked(viewModel)
+
+                repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+                advanceUntilIdle()
+
+                assertGeneratedOwnersAndSessionPreserved(savedState)
+                assertGeneratedCleanupRestoreBlocked(viewModel)
+
+                listOf(
+                    InstallState.Installed(PACKAGE),
+                    InstallState.Cancelled,
+                    InstallState.Failed("WRITE_FAILED", "terminal"),
+                ).forEach { terminal ->
+                    repository.installFlow.value = terminal
+                    advanceUntilIdle()
+
+                    assertGeneratedOwnersAndSessionPreserved(savedState)
+                    assertGeneratedCleanupRestoreBlocked(viewModel)
+                }
+                assertTrue(effects.isEmpty(), "case=$caseName, effects=$effects")
+                assertEquals(0, repository.cleanupRequestCount(), "case=$caseName")
+            }
+        }
+
+    @Test
     fun `single cleanup journal absent valid legacy는 migration 뒤 old keys를 지운다`() =
         runTest(dispatcher.scheduler) {
             val legacy = mapOf<String, Any?>(
@@ -4735,6 +4831,15 @@ class ManagerViewModelTest {
             TOKEN,
             savedState.get<String>(ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY),
         )
+    }
+
+    private fun assertGeneratedCleanupRestoreBlocked(viewModel: ManagerViewModel) {
+        assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        assertEquals(
+            UserMessageKind.CONVERSION_CLEANUP_FAILED,
+            viewModel.state.value.message?.kind,
+        )
+        assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
     }
 
     private fun currentGeneratedInstallRepository() = FakeManagerRepository().apply {
