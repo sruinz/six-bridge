@@ -1449,6 +1449,66 @@ class ManagerRepositoryTest {
             assertNull(pendingStore.finalReceipt)
         }
 
+    @Test
+    fun `repository current raw ready proof는 exact package owner만 투영한다`() = runBlocking {
+        val root = temporaryFolder.newFolder("raw-ready-owner-proof")
+        val bundle = importedBundle(root)
+        val retainedImports = RetainedImportStore(root) { _, _, _ ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        val pendingStore = StartupPendingStore(null, root).apply {
+            terminal = PendingInstallResult(
+                result = PackageInstallResult.Failure(
+                    sessionId = 41,
+                    code = "LATE_FAILURE",
+                    message = "late failure",
+                ),
+                terminalAtEpochMillis = 2,
+                packageName = PACKAGE,
+                importToken = TOKEN,
+            )
+        }
+        val gateway = StartupGateway(emptyList())
+        val installed = FakeInstalledWrappers(emptyList())
+        val catalog = FakeCatalog(emptyList())
+        val coordinator = InstallCoordinator(
+            InstallPolicy(),
+            gateway,
+            pendingStore,
+            installed,
+            catalog,
+        )
+        val repository = managerRepository(
+            root,
+            retainedImports,
+            gateway,
+            pendingStore,
+            installed,
+            catalog,
+            coordinator,
+        )
+
+        assertEquals(
+            RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Failed("LATE_FAILURE", "late failure"),
+                stage = FinalReceiptStage.READY,
+            ),
+            repository.rawReadyTerminalForOwner(TOKEN, 41, PACKAGE),
+        )
+        assertNull(repository.rawReadyTerminalForOwner(TOKEN, 41, "foreign.package"))
+        assertNull(repository.rawReadyTerminalForOwner(TOKEN, 42, PACKAGE))
+        assertNull(
+            repository.rawReadyTerminalForOwner(
+                "22222222-2222-2222-2222-222222222222",
+                41,
+                PACKAGE,
+            ),
+        )
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `동일한 pre-claim 실패도 이번 B attempt 결과로 review와 token을 정리한다`() {

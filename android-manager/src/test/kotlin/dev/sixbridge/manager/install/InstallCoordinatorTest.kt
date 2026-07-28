@@ -887,6 +887,128 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `current raw ready proof rejects stale program cancel acknowledged and foreign owners`() =
+        runBlocking {
+            val results = listOf(
+                PackageInstallResult.Success(SESSION_ID),
+                PackageInstallResult.Failure(
+                    SESSION_ID,
+                    "LATE_FAILURE",
+                    "late failure",
+                ),
+                PackageInstallResult.Cancelled(SESSION_ID),
+            )
+            results.forEach { result ->
+                val fixture = fixture()
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+                if (result is PackageInstallResult.Success) {
+                    fixture.installedWrappers.installed = installedWrapper()
+                }
+                fixture.coordinator.cancel(TOKEN, SESSION_ID)
+                assertTrue(fixture.coordinator.onPackageInstallerResult(result))
+
+                val expected = when (result) {
+                    is PackageInstallResult.Success -> InstallState.Installed(PACKAGE_NAME)
+                    is PackageInstallResult.Failure ->
+                        InstallState.Failed(result.code, result.message)
+                    is PackageInstallResult.Cancelled -> InstallState.Cancelled
+                    is PackageInstallResult.PendingUserAction -> error("terminal만 사용")
+                }
+                val proof = fixture.coordinator.rawReadyTerminalForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                )
+                assertEquals(expected, proof?.state)
+                assertEquals(FinalReceiptOrigin.RAW_TERMINAL, proof?.origin)
+                assertEquals(FinalReceiptStage.READY, proof?.stage)
+                assertNull(
+                    fixture.coordinator.rawReadyTerminalForOwner(
+                        expectedImportToken =
+                            "22222222-2222-2222-2222-222222222222",
+                        expectedSessionId = SESSION_ID,
+                        expectedPackageName = PACKAGE_NAME,
+                    ),
+                )
+                assertNull(
+                    fixture.coordinator.rawReadyTerminalForOwner(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID + 1,
+                        expectedPackageName = PACKAGE_NAME,
+                    ),
+                )
+                assertNull(
+                    fixture.coordinator.rawReadyTerminalForOwner(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID,
+                        expectedPackageName =
+                            "dev.sixbridge.ext.${"b".repeat(32)}",
+                    ),
+                )
+
+                assertFalse(
+                    fixture.coordinator.onPackageInstallerResult(
+                        PackageInstallResult.Failure(
+                            SESSION_ID,
+                            "DUPLICATE",
+                            "must not replace",
+                        ),
+                    ),
+                )
+                assertEquals(
+                    proof,
+                    fixture.coordinator.rawReadyTerminalForOwner(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID,
+                        expectedPackageName = PACKAGE_NAME,
+                    ),
+                )
+
+                assertTrue(
+                    fixture.coordinator.acknowledgeTerminal(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID,
+                        expectedState = expected,
+                    ),
+                )
+                assertNull(
+                    fixture.coordinator.rawReadyTerminalForOwner(
+                        expectedImportToken = TOKEN,
+                        expectedSessionId = SESSION_ID,
+                        expectedPackageName = PACKAGE_NAME,
+                    ),
+                )
+            }
+
+            val programCancel = fixture()
+            programCancel.coordinator.request(programCancel.bundle, partialConfirmed = false)
+            programCancel.coordinator.cancel(TOKEN, SESSION_ID)
+            assertNull(
+                programCancel.coordinator.rawReadyTerminalForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            )
+
+            val tokenless = fixture(
+                terminalResult = PendingInstallResult(
+                    result = PackageInstallResult.Cancelled(SESSION_ID),
+                    terminalAtEpochMillis = FINISHED_AT,
+                    packageName = PACKAGE_NAME,
+                    importToken = null,
+                ),
+            )
+            assertNull(
+                tokenless.coordinator.rawReadyTerminalForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            )
+        }
+
+    @Test
     fun `cancelling torn states require exact owned session and package before convergence`() =
         runBlocking {
             data class Case(

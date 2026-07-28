@@ -168,6 +168,11 @@ interface ManagerRepository {
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult
+    suspend fun rawReadyTerminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): RestoredInstallTerminal? = null
     suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -181,6 +186,10 @@ interface ManagerRepository {
     fun compareAndSetNormalHandoff(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
+    ): Boolean = false
+    fun rebaseNormalHandoff(
+        expected: NormalInstallHandoff,
+        replacement: NormalInstallHandoff,
     ): Boolean = false
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
@@ -398,6 +407,25 @@ internal class DefaultManagerRepository(
         expectedSessionId = expectedSessionId,
     )
 
+    override suspend fun rawReadyTerminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): RestoredInstallTerminal? =
+        installCoordinator.rawReadyTerminalForOwner(
+            expectedImportToken = expectedReviewToken,
+            expectedSessionId = expectedSessionId,
+            expectedPackageName = expectedPackageName,
+        )?.let { receipt ->
+            RestoredInstallTerminal(
+                importToken = receipt.importToken,
+                sessionId = receipt.sessionId,
+                packageName = receipt.packageName,
+                state = receipt.state,
+                stage = receipt.stage,
+            )
+        }
+
     override suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -422,6 +450,11 @@ internal class DefaultManagerRepository(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
     ): Boolean = pendingStore.compareAndSetNormalHandoff(expected, replacement)
+
+    override fun rebaseNormalHandoff(
+        expected: NormalInstallHandoff,
+        replacement: NormalInstallHandoff,
+    ): Boolean = pendingStore.rebaseNormalHandoff(expected, replacement)
 
     override fun discardReview(token: String): Boolean =
         runCatching { pendingStore.discardImport(token) }.isSuccess

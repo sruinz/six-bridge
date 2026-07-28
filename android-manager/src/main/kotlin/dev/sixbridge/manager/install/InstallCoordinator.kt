@@ -213,6 +213,21 @@ class InstallCoordinator(
         }
     }
 
+    suspend fun rawReadyTerminalForOwner(
+        expectedImportToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): FinalInstallReceipt? = mutex.withLock {
+        restoreTerminalResultLocked()
+        pendingStore.loadFinalReceipt()?.takeIf { receipt ->
+            receipt.origin == FinalReceiptOrigin.RAW_TERMINAL &&
+                receipt.stage == FinalReceiptStage.READY &&
+                receipt.importToken == expectedImportToken &&
+                receipt.sessionId == expectedSessionId &&
+                receipt.packageName == expectedPackageName
+        }
+    }
+
     suspend fun acknowledgeTerminal(
         expectedImportToken: String,
         expectedSessionId: Int?,

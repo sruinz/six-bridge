@@ -5035,6 +5035,198 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `normal PREPARED는 current raw ready state로 exact rebase한 뒤 복구한다`() =
+        runTest(dispatcher.scheduler) {
+            val old = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.PREPARED,
+            )
+            val current = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Failed("LATE_FAILURE", "late failure"),
+                stage = FinalReceiptStage.READY,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    terminal = current,
+                    normalHandoff = old,
+                )
+                normalHandoff = old
+                rawReadyTerminal = current
+                installFlow.value = current.state
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = current.state
+                terminalOwnerProofConfigured = true
+            }
+
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            assertEquals(
+                old.copy(
+                    state = current.state,
+                    stage = NormalHandoffStage.OUTCOME_READY,
+                ),
+                repository.normalHandoff,
+            )
+            assertEquals(
+                listOf(
+                    Triple<String, Int?, InstallState>(
+                        TOKEN,
+                        41,
+                        current.state,
+                    ),
+                    Triple<String, Int?, InstallState>(
+                        TOKEN,
+                        41,
+                        current.state,
+                    ),
+                ),
+                repository.terminalFinalizeArguments,
+            )
+            assertEquals(listOf(TOKEN), repository.discardAttempts)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            assertEquals(
+                listOf(
+                    Triple<NormalInstallHandoff, NormalInstallHandoff, Boolean>(
+                        old,
+                        old.copy(state = current.state),
+                        true,
+                    ),
+                ),
+                repository.normalRebaseAttempts,
+            )
+        }
+
+    @Test
+    fun `normal cancelled와 failed OUTCOME은 DismissMessage exact CAS 뒤에만 소비한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.Cancelled,
+                InstallState.Failed("INSTALL_FAILED", "failed"),
+            ).forEach { terminal ->
+                val handoff = NormalInstallHandoff(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = terminal,
+                    stage = NormalHandoffStage.OUTCOME_READY,
+                )
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(normalHandoff = handoff)
+                    normalHandoff = handoff
+                    failNextNormalHandoffCompare = true
+                }
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                val before = viewModel.state.value
+
+                viewModel.accept(ManagerAction.DismissMessage)
+                advanceUntilIdle()
+
+                assertEquals(before.route, viewModel.state.value.route, "terminal=$terminal")
+                assertEquals(before.message, viewModel.state.value.message, "terminal=$terminal")
+                assertEquals(handoff, repository.normalHandoff, "terminal=$terminal")
+
+                viewModel.accept(ManagerAction.DismissMessage)
+                advanceUntilIdle()
+
+                assertNull(viewModel.state.value.message, "terminal=$terminal")
+                assertNull(repository.normalHandoff, "terminal=$terminal")
+                viewModel.accept(ManagerAction.DismissMessage)
+                assertNull(viewModel.state.value.message, "terminal=$terminal duplicate")
+
+                repository.restoreResult = ManagerRestoreResult()
+                val recreated = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                assertNull(recreated.state.value.message, "terminal=$terminal recreation")
+            }
+        }
+
+    @Test
+    fun `normal installed OUTCOME은 matching Report ReturnHome exact CAS 뒤에만 소비한다`() =
+        runTest(dispatcher.scheduler) {
+            val installed = InstallState.Installed(PACKAGE)
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = installed,
+                stage = NormalHandoffStage.OUTCOME_READY,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(normalHandoff = handoff)
+                normalHandoff = handoff
+                failNextNormalHandoffCompare = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(handoff, repository.normalHandoff)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(repository.normalHandoff)
+            viewModel.accept(ManagerAction.ReturnHome)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `normal terminal과 무관한 표시 메시지 Dismiss는 OUTCOME을 소비하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.Cancelled,
+                InstallState.Failed("INSTALL_FAILED", "failed"),
+            ).forEach { terminal ->
+                val handoff = NormalInstallHandoff(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = terminal,
+                    stage = NormalHandoffStage.OUTCOME_READY,
+                )
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(normalHandoff = handoff)
+                    normalHandoff = handoff
+                    navigationResult =
+                        RepositoryNavigationResult.SamsungBrowserMissing
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+
+                viewModel.accept(ManagerAction.OpenSamsungAddOns)
+                advanceUntilIdle()
+                assertEquals(
+                    UserMessageKind.SAMSUNG_BROWSER_MISSING,
+                    viewModel.state.value.message?.kind,
+                    "terminal=$terminal",
+                )
+
+                viewModel.accept(ManagerAction.DismissMessage)
+                advanceUntilIdle()
+
+                assertNull(viewModel.state.value.message, "terminal=$terminal")
+                assertEquals(handoff, repository.normalHandoff, "terminal=$terminal")
+            }
+        }
+
+    @Test
     fun `program cancel terminal은 normal PREPARED를 거쳐 review를 한 번 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -6048,6 +6240,149 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated terminal handoff는 current raw ready state로 SavedState를 교체해 복구한다`() =
+        runTest(dispatcher.scheduler) {
+            val retainedReview = review(ContractCompatibilityStatus.COMPATIBLE)
+            val generated = generatedBundle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    retainedReview,
+                    generated,
+                )
+            }
+            val savedState = SavedStateHandle()
+            val source = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedTerminalHandoffPersisted = {
+                    throw CancellationException("simulated process death")
+                },
+            )
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            repository.installFlow.value = InstallState.Cancelled
+            advanceUntilIdle()
+
+            assertNotNull(
+                savedState.get<String>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+
+            val current = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Failed("LATE_FAILURE", "late failure"),
+                stage = FinalReceiptStage.READY,
+            )
+            repository.restoreResult = ManagerRestoreResult(
+                review = retainedReview,
+                terminal = current,
+            )
+            repository.restoredConversion = RestoredConversion.GeneratedPending(generated)
+            repository.installFlow.value = current.state
+            repository.rawReadyTerminal = current
+            repository.terminalOwnerImportToken = TOKEN
+            repository.terminalOwnerSessionId = 41
+            repository.terminalOwnerState = current.state
+            repository.terminalOwnerProofConfigured = true
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertNull(
+                savedState.get<String>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                recreated.state.value.route,
+            )
+            assertEquals(
+                UserMessageKind.INSTALL_FAILED,
+                recreated.state.value.message?.kind,
+            )
+            assertFalse(repository.terminalReceiptActive)
+            assertEquals(
+                listOf(Triple<String, Int?, String>(TOKEN, 41, PACKAGE)),
+                repository.rawReadyTerminalArguments,
+            )
+        }
+
+    @Test
+    fun `generated terminal handoff의 late success는 Report cleanup journal로 승계한다`() =
+        runTest(dispatcher.scheduler) {
+            val retainedReview = review(ContractCompatibilityStatus.COMPATIBLE)
+            val generated = generatedBundle()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    retainedReview,
+                    generated,
+                )
+            }
+            val savedState = SavedStateHandle()
+            val source = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedTerminalHandoffPersisted = {
+                    throw CancellationException("simulated process death")
+                },
+            )
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareGeneratedInstall)
+            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
+            dispatcher.scheduler.runCurrent()
+            repository.installFlow.value = InstallState.Cancelled
+            advanceUntilIdle()
+
+            val current = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Installed(PACKAGE),
+                stage = FinalReceiptStage.READY,
+            )
+            repository.restoreResult = ManagerRestoreResult(
+                review = retainedReview,
+                terminal = current,
+            )
+            repository.restoredConversion = RestoredConversion.GeneratedPending(generated)
+            repository.installFlow.value = current.state
+            repository.rawReadyTerminal = current
+            repository.terminalOwnerImportToken = TOKEN
+            repository.terminalOwnerSessionId = 41
+            repository.terminalOwnerState = current.state
+            repository.terminalOwnerProofConfigured = true
+
+            val interrupted = ManagerViewModel(
+                repository = repository,
+                savedStateHandle = savedState,
+                afterGeneratedTerminalHandoffCleared = {
+                    throw CancellationException("simulated process death")
+                },
+            )
+            advanceUntilIdle()
+
+            assertNull(
+                savedState.get<String>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+            assertTrue(repository.lifecycleEvents.isEmpty())
+            assertFalse(repository.terminalReceiptActive)
+
+            repository.restoreResult = ManagerRestoreResult(review = retainedReview)
+            repository.rawReadyTerminal = null
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                repository.lifecycleEvents,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), recreated.state.value.route)
+            assertFalse(repository.terminalReceiptActive)
+        }
+
+    @Test
     fun `result owner review mismatch는 generated와 결합하지 않고 기존 Review로 fallback한다`() =
         runTest(dispatcher.scheduler) {
             val otherReview = review(
@@ -6901,6 +7236,9 @@ private class FakeManagerRepository : ManagerRepository {
     var terminalOwnerState: InstallState? = null
     var terminalOwnerProofConfigured = false
     val terminalOwnerArguments = mutableListOf<Pair<String, Int?>>()
+    var rawReadyTerminal: RestoredInstallTerminal? = null
+    val rawReadyTerminalArguments =
+        mutableListOf<Triple<String, Int?, String>>()
     var terminalReceiptActive = true
     var terminalReceiptAcknowledged = false
     var terminalAcknowledgeResult = true
@@ -6910,6 +7248,10 @@ private class FakeManagerRepository : ManagerRepository {
         mutableListOf<Triple<String, Int?, InstallState>>()
     var terminalFinalizeResult = true
     var normalHandoff: NormalInstallHandoff? = null
+    var failNextNormalHandoffCompare = false
+    var normalHandoffRebaseResult = true
+    val normalRebaseAttempts =
+        mutableListOf<Triple<NormalInstallHandoff, NormalInstallHandoff, Boolean>>()
     var cancelInstallResult = true
     var cancelInstallOutcome: InstallCleanupResult? = null
     val cancelInstallOutcomes = mutableListOf<InstallCleanupResult>()
@@ -7143,6 +7485,23 @@ private class FakeManagerRepository : ManagerRepository {
         }
     }
 
+    override suspend fun rawReadyTerminalForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): RestoredInstallTerminal? {
+        rawReadyTerminalArguments += Triple(
+            expectedReviewToken,
+            expectedSessionId,
+            expectedPackageName,
+        )
+        return rawReadyTerminal?.takeIf {
+            it.importToken == expectedReviewToken &&
+                it.sessionId == expectedSessionId &&
+                it.packageName == expectedPackageName
+        }
+    }
+
     override suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -7189,9 +7548,23 @@ private class FakeManagerRepository : ManagerRepository {
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
     ): Boolean {
+        if (failNextNormalHandoffCompare) {
+            failNextNormalHandoffCompare = false
+            return false
+        }
         if (normalHandoff != expected) return false
         normalHandoff = replacement
         return true
+    }
+
+    override fun rebaseNormalHandoff(
+        expected: NormalInstallHandoff,
+        replacement: NormalInstallHandoff,
+    ): Boolean {
+        val succeeded = normalHandoffRebaseResult && normalHandoff == expected
+        normalRebaseAttempts += Triple(expected, replacement, succeeded)
+        if (succeeded) normalHandoff = replacement
+        return succeeded
     }
 
     suspend fun completeCancelInstall() {

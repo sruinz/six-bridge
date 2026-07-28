@@ -47,6 +47,10 @@ interface PendingInstallStore {
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
     ): Boolean = false
+    fun rebaseNormalHandoff(
+        expected: NormalInstallHandoff,
+        replacement: NormalInstallHandoff,
+    ): Boolean = false
     fun quarantineTerminalResult(
         expectedRaw: PendingInstallResult,
         expectedPending: PendingInstall?,
@@ -397,6 +401,30 @@ class SharedPreferencesPendingInstallStore internal constructor(
         } else {
             writeNormalHandoffLocked(replacement)
         }
+    }
+
+    override fun rebaseNormalHandoff(
+        expected: NormalInstallHandoff,
+        replacement: NormalInstallHandoff,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        val currentFinal = loadFinalReceiptLocked()
+        if (loadNormalHandoffLocked() != expected ||
+            !isValid(replacement) ||
+            expected.stage != NormalHandoffStage.PREPARED ||
+            replacement.stage != NormalHandoffStage.PREPARED ||
+            expected.importToken != replacement.importToken ||
+            expected.sessionId != replacement.sessionId ||
+            expected.packageName != replacement.packageName ||
+            currentFinal?.origin != FinalReceiptOrigin.RAW_TERMINAL ||
+            currentFinal.stage != FinalReceiptStage.READY ||
+            currentFinal.importToken != replacement.importToken ||
+            currentFinal.sessionId != replacement.sessionId ||
+            currentFinal.packageName != replacement.packageName ||
+            currentFinal.state != replacement.state
+        ) {
+            return@synchronized false
+        }
+        writeNormalHandoffLocked(replacement)
     }
 
     override fun quarantineTerminalResult(

@@ -70,7 +70,10 @@ class ManagerViewModel(
         GeneratedCleanupCompletionStep,
     ) -> Unit = {},
     private val afterGeneratedTerminalHandoffPersisted: () -> Unit = {},
+    private val afterGeneratedTerminalHandoffRebased: () -> Unit = {},
     private val afterTerminalReceiptFinalized: () -> Unit = {},
+    private val afterNormalHandoffPersisted: () -> Unit = {},
+    private val afterGeneratedTerminalHandoffCleared: () -> Unit = {},
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
@@ -154,6 +157,7 @@ class ManagerViewModel(
         ) {
             return
         }
+        if (!acknowledgeNormalOutcome(action)) return
         if (action != ManagerAction.RetryRecovery &&
             action != ManagerAction.RetryGeneratedCleanup &&
             action !is ManagerAction.LaunchSucceeded &&
@@ -236,6 +240,27 @@ class ManagerViewModel(
             is ManagerAction.LaunchSucceeded -> recordLaunchSuccess(action.effect)
             is ManagerAction.LaunchFailed -> recordLaunchFailure(action.effect)
         }
+    }
+
+    private fun acknowledgeNormalOutcome(action: ManagerAction): Boolean {
+        val handoff = pendingNormalHandoff ?: return true
+        if (handoff.stage != NormalHandoffStage.OUTCOME_READY) return true
+        val acknowledges = when (val terminal = handoff.state) {
+            InstallState.Cancelled,
+            is InstallState.Failed,
+            -> action == ManagerAction.DismissMessage &&
+                mutableState.value.route == ManagerRoute.Home &&
+                mutableState.value.message == normalOutcomeMessage(terminal)
+            is InstallState.Installed ->
+                action == ManagerAction.ReturnHome &&
+                    mutableState.value.route == ManagerRoute.Report(terminal.packageName)
+            else -> false
+        }
+        if (!acknowledges) return true
+        if (!repository.compareAndSetNormalHandoff(handoff, null)) return false
+        pendingNormalHandoff = null
+        pendingReviewDiscards.remove(handoff.importToken)
+        return true
     }
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
@@ -988,7 +1013,9 @@ class ManagerViewModel(
                 deferredInitialTerminal = null
                 return@launch
             }
-            if (intermediateCleanup != null) {
+            if (intermediateCleanup != null &&
+                pendingGeneratedTerminalHandoff?.state !is InstallState.Installed
+            ) {
                 if (!reconcilePersistedGeneratedTerminal(
                         cleanup = intermediateCleanup,
                         savedReviewToken = savedToken,
@@ -1016,8 +1043,12 @@ class ManagerViewModel(
                     return@launch
                 }
                 intermediateGeneratedCleanupRestorePending = false
-                if (intermediateCleanup.phase == GeneratedCleanupPhase.CONVERSION &&
-                    mutableState.value.conversionState !is ConversionUiState.ResultReady
+                val replayDeletedConversion =
+                    intermediateCleanup.phase == GeneratedCleanupPhase.CONVERSION &&
+                        mutableState.value.conversionState !is ConversionUiState.ResultReady
+                if ((intermediateCleanup.autoReplayPending ||
+                        replayDeletedConversion) &&
+                    intermediateCleanup.matchesSavedOwners()
                 ) {
                     enqueueGeneratedCleanup {
                         performPendingGeneratedCleanup()
@@ -2240,6 +2271,7 @@ class ManagerViewModel(
             return false
         }
         pendingNormalHandoff = handoff
+        afterNormalHandoffPersisted()
         return resumeNormalHandoff(
             handoff,
             RestoredInstallTerminal(
@@ -2261,23 +2293,25 @@ class ManagerViewModel(
             presentNormalHandoff(handoff)
             return true
         }
-        if (terminal != null &&
-            (terminal.importToken != handoff.importToken ||
+        if (terminal != null) {
+            if (terminal.importToken != handoff.importToken ||
                 terminal.sessionId != handoff.sessionId ||
                 terminal.packageName != handoff.packageName ||
-                terminal.state != handoff.state ||
-                terminal.stage == FinalReceiptStage.CANCELLING)
-        ) {
-            return false
+                terminal.stage == FinalReceiptStage.CANCELLING
+            ) {
+                return false
+            }
+            if (terminal.state != handoff.state) {
+                return rebaseAndResumeNormalHandoff(handoff)
+            }
         }
-        if (terminal != null &&
-            !completeTerminalReceipt(
+        if (terminal != null && !completeTerminalReceipt(
                 expectedReviewToken = handoff.importToken,
                 expectedSessionId = handoff.sessionId,
                 expectedState = handoff.state,
             )
         ) {
-            return false
+            return rebaseAndResumeNormalHandoff(handoff)
         }
         afterTerminalReceiptFinalized()
         if (!repository.discardReview(handoff.importToken)) return false
@@ -2286,6 +2320,22 @@ class ManagerViewModel(
         pendingNormalHandoff = ready
         presentNormalHandoff(ready)
         return true
+    }
+
+    private suspend fun rebaseAndResumeNormalHandoff(
+        handoff: NormalInstallHandoff,
+    ): Boolean {
+        val current = repository.rawReadyTerminalForOwner(
+            expectedReviewToken = handoff.importToken,
+            expectedSessionId = handoff.sessionId,
+            expectedPackageName = handoff.packageName,
+        ) ?: return false
+        if (current.state == handoff.state) return false
+        val replacement = handoff.copy(state = current.state)
+        if (!repository.rebaseNormalHandoff(handoff, replacement)) return false
+        pendingNormalHandoff = replacement
+        afterNormalHandoffPersisted()
+        return resumeNormalHandoff(replacement, current)
     }
 
     private suspend fun completePendingNormalHandoffForNewWork(): Boolean {
@@ -2320,20 +2370,26 @@ class ManagerViewModel(
                 InstallState.Cancelled -> it.copy(
                     route = ManagerRoute.Home,
                     importState = ImportUiState.Idle,
-                    message = UserMessage(
-                        UserMessageKind.INSTALL_CANCELLED,
-                        "시스템 설치가 취소되었습니다.",
-                        RecoveryAction.SELECT_ANOTHER_FILE,
-                    ),
+                    message = normalOutcomeMessage(terminal),
                 )
                 is InstallState.Failed -> it.copy(
                     route = ManagerRoute.Home,
                     importState = ImportUiState.Idle,
-                    message = installFailureMessage(terminal.code),
+                    message = normalOutcomeMessage(terminal),
                 )
                 else -> it
             }
         }
+    }
+
+    private fun normalOutcomeMessage(state: InstallState): UserMessage? = when (state) {
+        InstallState.Cancelled -> UserMessage(
+            UserMessageKind.INSTALL_CANCELLED,
+            "시스템 설치가 취소되었습니다.",
+            RecoveryAction.SELECT_ANOTHER_FILE,
+        )
+        is InstallState.Failed -> installFailureMessage(state.code)
+        else -> null
     }
 
     private fun showTerminalHandoffFailure() {
@@ -2431,6 +2487,7 @@ class ManagerViewModel(
                     destination = GeneratedCleanupDestination.fromRoute(
                         ManagerRoute.Report(installState.packageName),
                     ),
+                    autoReplayPending = true,
                 )
                 afterGeneratedInstallCleanupTransitionPersisted()
                 if (!completeTerminalReceipt(
@@ -2551,6 +2608,7 @@ class ManagerViewModel(
             },
             destination = destination,
             installSessionId = null,
+            autoReplayPending = terminalReceipt?.state is InstallState.Installed,
         )
         advanceGeneratedCleanup(next)
         afterGeneratedInstallCleanupTransitionPersisted()
@@ -2605,24 +2663,118 @@ class ManagerViewModel(
         if (terminal != null &&
             (terminal.importToken != handoff.reviewToken ||
                 terminal.sessionId != handoff.sessionId ||
-                terminal.state != handoff.state ||
+                terminal.packageName != result.review.packageName ||
                 terminal.stage == FinalReceiptStage.CANCELLING)
         ) {
             return false
         }
-        if (terminal != null &&
-            !completeTerminalReceipt(
+        if (terminal != null && terminal.state != handoff.state) {
+            return rebaseAndResumeGeneratedTerminalHandoff(handoff, result)
+        }
+        if (handoff.state is InstallState.Installed) {
+            return resumeGeneratedInstalledHandoff(
+                handoff = handoff,
+                result = result,
+                terminalAvailable = terminal != null,
+            )
+        }
+        if (terminal != null && !completeTerminalReceipt(
                 handoff.reviewToken,
                 handoff.sessionId,
                 handoff.state,
             )
         ) {
-            return false
+            return rebaseAndResumeGeneratedTerminalHandoff(handoff, result)
         }
         if (terminal != null) afterTerminalReceiptFinalized()
         returnGeneratedInstallToResult(generatedTerminalMessage(handoff.state))
         clearGeneratedTerminalHandoff(handoff)
         return true
+    }
+
+    private suspend fun resumeGeneratedInstalledHandoff(
+        handoff: PendingGeneratedTerminalHandoff,
+        result: ConversionUiState.ResultReady,
+        terminalAvailable: Boolean,
+    ): Boolean {
+        val installed = handoff.state as? InstallState.Installed ?: return false
+        val destination = GeneratedCleanupDestination.fromRoute(
+            ManagerRoute.Report(installed.packageName),
+        )
+        val cleanup = pendingGeneratedCleanup?.takeIf { existing ->
+            existing.token == handoff.token &&
+                existing.reviewToken == handoff.reviewToken &&
+                existing.destination == destination &&
+                existing.installSessionId == null &&
+                existing.autoReplayPending &&
+                existing.phase in setOf(
+                    GeneratedCleanupPhase.REVIEW,
+                    GeneratedCleanupPhase.CONVERSION,
+                )
+        } ?: run {
+            if (pendingGeneratedCleanup != null) return false
+            beginGeneratedCleanup(
+                token = handoff.token,
+                reviewToken = handoff.reviewToken,
+                phase = if (result.review != null) {
+                    GeneratedCleanupPhase.REVIEW
+                } else {
+                    GeneratedCleanupPhase.CONVERSION
+                },
+                destination = destination,
+                autoReplayPending = true,
+            )
+        }
+        afterGeneratedInstallCleanupTransitionPersisted()
+        if (terminalAvailable &&
+            !completeTerminalReceipt(
+                expectedReviewToken = handoff.reviewToken,
+                expectedSessionId = handoff.sessionId,
+                expectedState = installed,
+            )
+        ) {
+            return false
+        }
+        if (terminalAvailable) afterTerminalReceiptFinalized()
+        if (pendingGeneratedCleanup != cleanup) return false
+        clearGeneratedInstallOwner()
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        mutableState.update {
+            val ready = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                conversionState = ready?.copy(installOwnerActive = false)
+                    ?: it.conversionState,
+                message = null,
+            )
+        }
+        clearGeneratedTerminalHandoff(handoff)
+        afterGeneratedTerminalHandoffCleared()
+        enqueueGeneratedCleanup {
+            performPendingGeneratedCleanup()
+        }
+        return true
+    }
+
+    private suspend fun rebaseAndResumeGeneratedTerminalHandoff(
+        handoff: PendingGeneratedTerminalHandoff,
+        result: ConversionUiState.ResultReady,
+    ): Boolean {
+        val packageName = result.review?.packageName ?: return false
+        val current = repository.rawReadyTerminalForOwner(
+            expectedReviewToken = handoff.reviewToken,
+            expectedSessionId = handoff.sessionId,
+            expectedPackageName = packageName,
+        ) ?: return false
+        val supportedTerminal = current.state is InstallState.Failed ||
+            current.state == InstallState.Cancelled ||
+            current.state is InstallState.Installed
+        if (current.state == handoff.state || !supportedTerminal) {
+            return false
+        }
+        val replacement = handoff.copy(state = current.state)
+        if (!replaceGeneratedTerminalHandoff(handoff, replacement)) return false
+        afterGeneratedTerminalHandoffRebased()
+        return resumeGeneratedTerminalHandoff(replacement, current)
     }
 
     private fun generatedTerminalMessage(state: InstallState): UserMessage = when (state) {
@@ -2659,6 +2811,21 @@ class ManagerViewModel(
         if (pendingGeneratedTerminalHandoff != expected) return
         savedStateHandle[GENERATED_TERMINAL_HANDOFF_KEY] = null
         pendingGeneratedTerminalHandoff = null
+    }
+
+    private fun replaceGeneratedTerminalHandoff(
+        expected: PendingGeneratedTerminalHandoff,
+        replacement: PendingGeneratedTerminalHandoff,
+    ): Boolean {
+        if (pendingGeneratedTerminalHandoff != expected ||
+            restoreGeneratedTerminalHandoff() != expected
+        ) {
+            return false
+        }
+        savedStateHandle[GENERATED_TERMINAL_HANDOFF_KEY] =
+            encodeGeneratedTerminalHandoff(replacement)
+        pendingGeneratedTerminalHandoff = replacement
+        return true
     }
 
     private fun showGeneratedCleanupFailure() {
@@ -2709,6 +2876,7 @@ class ManagerViewModel(
         phase: GeneratedCleanupPhase,
         destination: GeneratedCleanupDestination,
         installSessionId: Int? = null,
+        autoReplayPending: Boolean = false,
     ): PendingGeneratedCleanup {
         pendingGeneratedCleanup?.let { existing ->
             if (existing.token == token &&
@@ -2726,6 +2894,7 @@ class ManagerViewModel(
             phase = phase,
             destination = destination,
             installSessionId = installSessionId,
+            autoReplayPending = autoReplayPending,
         ).also {
             advanceGeneratedCleanup(it)
             updateGeneratedCleanupState(
@@ -2744,6 +2913,9 @@ class ManagerViewModel(
         updateGeneratedCleanupState(token, pending = true, inProgress = true)
         return enqueueRouteCleanup {
             try {
+                pendingGeneratedCleanup
+                    ?.takeIf { it.token == token && it.autoReplayPending }
+                    ?.let { advanceGeneratedCleanup(it.copy(autoReplayPending = false)) }
                 cleanup()
             } finally {
                 updateGeneratedCleanupState(
@@ -3251,7 +3423,11 @@ class ManagerViewModel(
                 put("code", state.code)
                 put("message", state.message)
             }
-            else -> error("generated result handoff는 취소 또는 실패만 허용합니다.")
+            is InstallState.Installed -> {
+                put("state", "INSTALLED")
+                put("packageName", state.packageName)
+            }
+            else -> error("generated result handoff는 terminal state만 허용합니다.")
         }
     }.toString()
 
@@ -3266,6 +3442,9 @@ class ManagerViewModel(
             "FAILED" -> InstallState.Failed(
                 root.requiredString("code"),
                 root.requiredString("message"),
+            )
+            "INSTALLED" -> InstallState.Installed(
+                root.requiredString("packageName"),
             )
             else -> error("generated terminal handoff state")
         }
@@ -3305,6 +3484,7 @@ class ManagerViewModel(
                 "installSessionId",
                 cleanup.installSessionId?.let(::JsonPrimitive) ?: JsonNull,
             )
+            put("autoReplayPending", cleanup.autoReplayPending)
         }.toString()
     }
 
@@ -3312,7 +3492,11 @@ class ManagerViewModel(
         runCatching {
             val root = Json.parseToJsonElement(encoded) as? JsonObject
                 ?: error("cleanup journal root")
-            require(root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS)
+            require(
+                root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS ||
+                    root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS +
+                    GENERATED_CLEANUP_AUTO_REPLAY_FIELD,
+            )
             require(
                 root.requiredInt("version") == GENERATED_CLEANUP_JOURNAL_VERSION,
             )
@@ -3330,6 +3514,8 @@ class ManagerViewModel(
                     ),
                 ),
                 installSessionId = root.nullableInt("installSessionId"),
+                autoReplayPending =
+                    root.optionalBoolean(GENERATED_CLEANUP_AUTO_REPLAY_FIELD),
             ).also { require(it.isValid()) }
         }.getOrNull()
 
@@ -3476,6 +3662,8 @@ class ManagerViewModel(
         )
         private const val GENERATED_CLEANUP_JOURNAL_VERSION = 1
         private const val GENERATED_TERMINAL_HANDOFF_VERSION = 1
+        private const val GENERATED_CLEANUP_AUTO_REPLAY_FIELD =
+            "autoReplayPending"
         private val GENERATED_CLEANUP_JOURNAL_FIELDS = setOf(
             "version",
             "token",
@@ -3520,6 +3708,7 @@ private data class PendingGeneratedCleanup(
     val phase: GeneratedCleanupPhase,
     val destination: GeneratedCleanupDestination,
     val installSessionId: Int? = null,
+    val autoReplayPending: Boolean = false,
 )
 
 private data class GeneratedTerminalReceipt(
@@ -3615,6 +3804,12 @@ private fun JsonObject.nullableInt(key: String): Int? {
     val primitive = value as? JsonPrimitive ?: error("nullable int: $key")
     require(!primitive.isString)
     return requireNotNull(primitive.intOrNull)
+}
+
+private fun JsonObject.optionalBoolean(key: String): Boolean {
+    val primitive = get(key) as? JsonPrimitive ?: return false
+    require(!primitive.isString)
+    return primitive.content.toBooleanStrict()
 }
 
 private fun String.isCanonicalUuid(): Boolean =

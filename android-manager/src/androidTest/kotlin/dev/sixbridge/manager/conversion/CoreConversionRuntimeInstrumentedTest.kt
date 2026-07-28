@@ -320,6 +320,84 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
+    fun normalHandoffRebaseRequiresExactCurrentRawReadyReceipt() {
+        val fixture = normalRebaseFixture(includeLateRaw = true)
+        val replacement = fixture.prepared.copy(state = fixture.currentRaw.state)
+
+        fixture.recoveryControl.failNextCommit = true
+        assertFalse(fixture.store.rebaseNormalHandoff(fixture.prepared, replacement))
+        assertEquals(fixture.prepared, fixture.store.loadNormalHandoff())
+        assertEquals(fixture.currentRaw, fixture.store.loadFinalReceipt())
+
+        assertFalse(
+            fixture.store.rebaseNormalHandoff(
+                fixture.prepared,
+                replacement.copy(importToken = "22222222-2222-2222-2222-222222222222"),
+            ),
+        )
+        assertFalse(
+            fixture.store.rebaseNormalHandoff(
+                fixture.prepared,
+                replacement.copy(sessionId = 42),
+            ),
+        )
+        assertFalse(
+            fixture.store.rebaseNormalHandoff(
+                fixture.prepared,
+                replacement.copy(
+                    packageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+                ),
+            ),
+        )
+        assertFalse(
+            fixture.store.rebaseNormalHandoff(
+                fixture.prepared,
+                replacement.copy(stage = NormalHandoffStage.OUTCOME_READY),
+            ),
+        )
+
+        assertTrue(fixture.store.rebaseNormalHandoff(fixture.prepared, replacement))
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = fixture.pendingPreferences,
+            recoveryPreferences = fixture.recoveryPreferences,
+            importDirectory = fixture.importRoot,
+        )
+        assertEquals(replacement, recreated.loadNormalHandoff())
+        assertEquals(fixture.currentRaw, recreated.loadFinalReceipt())
+        assertFalse(recreated.rebaseNormalHandoff(fixture.prepared, replacement))
+
+        val programFixture = normalRebaseFixture(includeLateRaw = false)
+        assertFalse(
+            programFixture.store.rebaseNormalHandoff(
+                programFixture.prepared,
+                programFixture.prepared.copy(
+                    state = InstallState.Installed(programFixture.prepared.packageName),
+                ),
+            ),
+        )
+
+        val acknowledgedFixture = normalRebaseFixture(includeLateRaw = true)
+        val raw = requireNotNull(acknowledgedFixture.store.loadTerminalResult())
+        val acknowledged = requireNotNull(
+            acknowledgedFixture.store.acknowledgeFinalReceipt(
+                acknowledgedFixture.currentRaw,
+                raw,
+            ),
+        )
+        assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged.stage)
+        assertFalse(
+            acknowledgedFixture.store.rebaseNormalHandoff(
+                acknowledgedFixture.prepared,
+                acknowledgedFixture.prepared.copy(state = acknowledged.state),
+            ),
+        )
+
+        fixture.importRoot.deleteRecursively()
+        programFixture.importRoot.deleteRecursively()
+        acknowledgedFixture.importRoot.deleteRecursively()
+    }
+
+    @Test
     fun tokenlessRawQuarantineCommitFaultPreservesExactPendingAndImport() {
         val pendingPreferences = memorySharedPreferences()
         val recoveryControl = MemoryPreferenceControl()
@@ -910,13 +988,103 @@ class CoreConversionRuntimeInstrumentedTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private fun normalRebaseFixture(includeLateRaw: Boolean): NormalRebaseFixture {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryControl = MemoryPreferenceControl()
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val importRoot = Files.createTempDirectory("sixbridge-normal-rebase").toFile()
+        val token = "11111111-1111-1111-1111-111111111111"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .putString("package_name", packageName)
+                .putString("import_token", token)
+                .putLong("started_at", 1)
+                .commit(),
+        )
+        val pending = requireNotNull(store.load())
+        val cancelling = FinalInstallReceipt(
+            importToken = token,
+            sessionId = 41,
+            packageName = packageName,
+            state = InstallState.Cancelled,
+            stage = FinalReceiptStage.CANCELLING,
+            origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+            rawTerminalAtEpochMillis = null,
+            terminalAtEpochMillis = 2,
+        )
+        assertTrue(store.createFinalReceipt(pending, null, cancelling))
+        assertTrue(store.clearPendingPreservingImport(pending))
+        val programReady = cancelling.copy(
+            stage = FinalReceiptStage.READY,
+            terminalAtEpochMillis = 3,
+        )
+        assertTrue(store.replaceFinalReceipt(cancelling, null, programReady))
+        val prepared = NormalInstallHandoff(
+            importToken = token,
+            sessionId = 41,
+            packageName = packageName,
+            state = InstallState.Cancelled,
+            stage = NormalHandoffStage.PREPARED,
+        )
+        assertTrue(store.compareAndSetNormalHandoff(null, prepared))
+        val current = if (includeLateRaw) {
+            assertTrue(
+                store.recordTerminalResult(
+                    PackageInstallResult.Failure(
+                        sessionId = 41,
+                        code = "INSTALL_FAILED",
+                        message = "late raw failed",
+                    ),
+                    terminalAtEpochMillis = 4,
+                ),
+            )
+            val raw = requireNotNull(store.loadTerminalResult())
+            val rawReady = programReady.copy(
+                state = InstallState.Failed("INSTALL_FAILED", "late raw failed"),
+                origin = FinalReceiptOrigin.RAW_TERMINAL,
+                rawTerminalAtEpochMillis = raw.terminalAtEpochMillis,
+                terminalAtEpochMillis = 5,
+            )
+            assertTrue(store.replaceFinalReceipt(programReady, raw, rawReady))
+            rawReady
+        } else {
+            programReady
+        }
+        return NormalRebaseFixture(
+            store = store,
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            recoveryControl = recoveryControl,
+            importRoot = importRoot,
+            prepared = prepared,
+            currentRaw = current,
+        )
+    }
 }
 
-private class MemoryPreferenceControl {
+private data class NormalRebaseFixture(
+    val store: SharedPreferencesPendingInstallStore,
+    val pendingPreferences: SharedPreferences,
+    val recoveryPreferences: SharedPreferences,
+    val recoveryControl: MemoryPreferenceControl,
+    val importRoot: File,
+    val prepared: NormalInstallHandoff,
+    val currentRaw: FinalInstallReceipt,
+)
+
+internal class MemoryPreferenceControl {
     var failNextCommit: Boolean = false
 }
 
-private fun memorySharedPreferences(
+internal fun memorySharedPreferences(
     control: MemoryPreferenceControl = MemoryPreferenceControl(),
 ): SharedPreferences {
     val values = linkedMapOf<String, Any?>()
