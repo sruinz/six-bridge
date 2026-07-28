@@ -24,6 +24,7 @@ import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
@@ -41,7 +42,7 @@ import kotlinx.coroutines.withContext
 class ManagerViewModel(
     private val repository: ManagerRepository,
     private val savedStateHandle: SavedStateHandle,
-    private val saveGeneratedDocument: (
+    private val saveGeneratedDocument: suspend (
         destination: String,
         expectedHash: String,
         copy: (OutputStream) -> String?,
@@ -56,6 +57,7 @@ class ManagerViewModel(
     private var routeCleanupFailed = false
     private val scheduledConversionCleanupTokens = mutableSetOf<String>()
     private var conversionIoJob: Job? = null
+    private var conversionIoResult: CompletableDeferred<GeneratedDocumentSaveResult>? = null
     private var installJob: Job? = null
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -470,7 +472,9 @@ class ManagerViewModel(
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
         if (result.token != token) return
         if (conversionIoJob?.isActive == true) return
-        conversionIoJob = viewModelScope.launch {
+        val completion = CompletableDeferred<GeneratedDocumentSaveResult>()
+        conversionIoResult = completion
+        val job = viewModelScope.launch {
             val saveResult = try {
                 saveGeneratedDocument(
                     destination,
@@ -478,11 +482,12 @@ class ManagerViewModel(
                 ) { output ->
                     repository.copyGeneratedConversion(result.token, output)
                 }
-            } catch (error: CancellationException) {
-                throw error
+            } catch (_: CancellationException) {
+                GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true)
             } catch (_: Exception) {
                 GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
             }
+            completion.complete(saveResult)
             if (mutableState.value.conversionState !is ConversionUiState.ResultReady) return@launch
             mutableState.update {
                 it.copy(
@@ -506,9 +511,27 @@ class ManagerViewModel(
                                     RecoveryAction.RETRY,
                                 )
                             }
+                        is GeneratedDocumentSaveResult.Cancelled ->
+                            if (saveResult.cleanupFailed) {
+                                UserMessage(
+                                    UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+                                    "부분 파일 삭제를 완료하지 못했습니다. 저장 위치에서 파일을 직접 삭제한 뒤 다시 시도해 주세요.",
+                                    RecoveryAction.RETRY,
+                                )
+                            } else {
+                                UserMessage(
+                                    UserMessageKind.CONVERSION_SAVE_FAILED,
+                                    "파일 저장이 취소되었습니다.",
+                                    RecoveryAction.RETRY,
+                                )
+                            }
                     },
                 )
             }
+        }
+        conversionIoJob = job
+        job.invokeOnCompletion {
+            completion.complete(GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true))
         }
     }
 
@@ -654,8 +677,29 @@ class ManagerViewModel(
                     )
                 }
             }
-            conversionIoJob?.cancelAndJoin()
-            conversionIoJob = null
+            val saveJob = conversionIoJob
+            val saveResult = conversionIoResult
+            saveJob?.cancel()
+            val completedSave = saveResult?.await()
+            saveJob?.join()
+            if (conversionIoJob === saveJob) {
+                conversionIoJob = null
+                conversionIoResult = null
+            }
+            if (completedSave is GeneratedDocumentSaveResult.Cancelled &&
+                completedSave.cleanupFailed
+            ) {
+                generatedCleanup?.let {
+                    clearPendingGeneratedCleanup()
+                    updateGeneratedCleanupState(
+                        token = it.token,
+                        pending = false,
+                        inProgress = false,
+                    )
+                }
+                showConversionSaveCleanupFailure()
+                return@cleanup true
+            }
             if (generatedCleanup != null) {
                 return@cleanup performPendingGeneratedCleanup()
             }
@@ -1621,6 +1665,21 @@ class ManagerViewModel(
                 message = UserMessage(
                     UserMessageKind.CONVERSION_CLEANUP_FAILED,
                     "설치 작업 정리를 완료하지 못했습니다. 생성 결과를 보존했으니 다시 시도해 주세요.",
+                    RecoveryAction.RETRY,
+                ),
+            )
+        }
+    }
+
+    private fun showConversionSaveCleanupFailure() {
+        mutableState.update {
+            val result = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                route = result?.let { ready -> ManagerRoute.ConversionResult(ready.token) }
+                    ?: it.route,
+                message = UserMessage(
+                    UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+                    "부분 파일 삭제를 완료하지 못했습니다. 저장 위치에서 파일을 직접 삭제한 뒤 다시 시도해 주세요.",
                     RecoveryAction.RETRY,
                 ),
             )

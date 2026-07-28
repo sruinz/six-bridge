@@ -36,6 +36,7 @@ import dev.sixbridge.core.profile.WrapperContract
 import java.io.OutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.CancellationException
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -1842,6 +1843,74 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `save cancellation delete failure는 typed 결과까지 기다리고 generated owner를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val saveStarted = CompletableDeferred<Unit>()
+            val cancellationResult =
+                CompletableDeferred<GeneratedDocumentSaveResult.Cancelled>()
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(
+                repository,
+                savedState,
+                saveGeneratedDocument = { _, _, _ ->
+                    saveStarted.complete(Unit)
+                    try {
+                        CompletableDeferred<Unit>().await()
+                        error("save gate가 취소되어야 합니다.")
+                    } catch (_: CancellationException) {
+                        withContext(NonCancellable) {
+                            cancellationResult.await()
+                        }
+                    }
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.SaveGeneratedConversion)
+            val effect = assertIs<ManagerEffect.CreateConversionDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(
+                ManagerAction.SaveGeneratedConversionTo(
+                    token = effect.token,
+                    destination = "content://save/cancel-delete-failure.six",
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            saveStarted.await()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            cancellationResult.complete(
+                GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true),
+            )
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                UserMessageKind.CONVERSION_SAVE_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY),
+            )
+        }
+
+    @Test
     fun `결과 완료는 generated work와 retained review를 명시적으로 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -2966,7 +3035,7 @@ class ManagerViewModelTest {
 
     private fun documentSaver(
         output: OutputStream,
-    ): (String, String, (OutputStream) -> String?) -> GeneratedDocumentSaveResult =
+    ): suspend (String, String, (OutputStream) -> String?) -> GeneratedDocumentSaveResult =
         { _, expectedHash, copy ->
             if (copy(output) == expectedHash) {
                 GeneratedDocumentSaveResult.Success

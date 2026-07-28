@@ -24,9 +24,17 @@ import dev.sixbridge.manager.install.ManagerAppVisibility
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerEffect
 import dev.sixbridge.manager.ui.ManagerViewModel
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FilterOutputStream
 import java.io.OutputStream
 import java.nio.file.Files
 import java.util.concurrent.CancellationException
@@ -294,22 +302,34 @@ sealed interface GeneratedDocumentSaveResult {
     data class Failure(
         val cleanupFailed: Boolean,
     ) : GeneratedDocumentSaveResult
+
+    data class Cancelled(
+        val cleanupFailed: Boolean,
+    ) : GeneratedDocumentSaveResult
 }
 
-internal fun writeGeneratedDocument(
+internal suspend fun writeGeneratedDocument(
     resolver: ContentResolver,
     uri: Uri,
     expectedHash: String,
     copy: (OutputStream) -> String?,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ): GeneratedDocumentSaveResult {
+    val callerJob = currentCoroutineContext()[Job]
     try {
-        val descriptor = resolver.openFileDescriptor(uri, "rwt")
-            ?: return generatedDocumentFailure(resolver, uri)
-        val copiedHash = descriptor.use {
-            FileOutputStream(it.fileDescriptor).use { output ->
-                copy(output).also {
+        val copiedHash = withContext(ioDispatcher) {
+            val descriptor = resolver.openFileDescriptor(uri, "rwt")
+                ?: throw GeneratedDocumentOpenException()
+            descriptor.use {
+                FileOutputStream(it.fileDescriptor).use { output ->
+                    callerJob?.ensureActive()
+                    val copiedHash = copy(CancellationAwareOutputStream(output, callerJob))
+                    callerJob?.ensureActive()
                     output.flush()
+                    callerJob?.ensureActive()
                     descriptor.checkError()
+                    callerJob?.ensureActive()
+                    copiedHash
                 }
             }
         }
@@ -317,12 +337,39 @@ internal fun writeGeneratedDocument(
             return GeneratedDocumentSaveResult.Success
         }
     } catch (error: CancellationException) {
-        resolver.deleteGeneratedDocument(uri)
-        throw error
+        return withContext(NonCancellable) {
+            val cleanupFailed = withContext(ioDispatcher) {
+                !resolver.deleteGeneratedDocument(uri)
+            }
+            GeneratedDocumentSaveResult.Cancelled(
+                cleanupFailed = cleanupFailed,
+            )
+        }
     } catch (_: Exception) {
         // The partial destination is removed below.
     }
-    return generatedDocumentFailure(resolver, uri)
+    return withContext(NonCancellable) {
+        withContext(ioDispatcher) {
+            generatedDocumentFailure(resolver, uri)
+        }
+    }
+}
+
+private class GeneratedDocumentOpenException : IllegalStateException()
+
+private class CancellationAwareOutputStream(
+    output: OutputStream,
+    private val callerJob: Job?,
+) : FilterOutputStream(output) {
+    override fun write(value: Int) {
+        callerJob?.ensureActive()
+        out.write(value)
+    }
+
+    override fun write(bytes: ByteArray, offset: Int, length: Int) {
+        callerJob?.ensureActive()
+        out.write(bytes, offset, length)
+    }
 }
 
 private fun generatedDocumentFailure(

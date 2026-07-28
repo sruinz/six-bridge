@@ -91,7 +91,7 @@ public final class TestConversionDocumentProvider extends ContentProvider {
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
         String name = name(uri);
-        if ("delete-fail".equals(name)) {
+        if ("delete-fail".equals(name) || "cancel-delete-fail".equals(name)) {
             return 0;
         }
         if ("mid-write".equals(name) || "close-error".equals(name)) {
