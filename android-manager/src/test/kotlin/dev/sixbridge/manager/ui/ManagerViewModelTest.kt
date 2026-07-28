@@ -18,6 +18,7 @@ import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
@@ -1592,6 +1593,105 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `build는 exact approval set과 partial 확인 payload를 전달한다`() =
+        runTest(dispatcher.scheduler) {
+            val approvals = setOf("action-popup-entry", "tabs")
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis().copy(
+                    report = conversionAnalysis().report.copy(
+                        status = CompatibilityStatus.PARTIAL,
+                    ),
+                    requiredApprovals = approvals,
+                )
+                conversionBuildResult =
+                    ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            approvals.forEach {
+                viewModel.accept(ManagerAction.ToggleConversionAdapter(it))
+            }
+            viewModel.accept(ManagerAction.ConfirmConversionPartial)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            assertEquals(
+                ConversionBuildRequest(
+                    token = TOKEN,
+                    approvedAdapterIds = approvals,
+                    partialConfirmed = true,
+                    identitySelection = null,
+                ),
+                repository.conversionBuildRequests.single(),
+            )
+        }
+
+    @Test
+    fun `markerless CreateNew payload 값을 그대로 전달한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis().copy(
+                    identityRequirement =
+                        IdentityRequirement.UserSelectionRequired(listOf(existingTarget())),
+                )
+                conversionBuildResult =
+                    ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.SelectNewConversionIdentity)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            assertEquals(
+                InstallationIdentitySelection.CreateNew,
+                repository.conversionBuildRequests.single().identitySelection,
+            )
+        }
+
+    @Test
+    fun `markerless UseExisting payload는 확인한 identity hash를 그대로 전달한다`() =
+        runTest(dispatcher.scheduler) {
+            val target = existingTarget()
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis().copy(
+                    identityRequirement =
+                        IdentityRequirement.UserSelectionRequired(listOf(target)),
+                )
+                conversionBuildResult =
+                    ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.SelectExistingConversionIdentity(target.identitySha256),
+            )
+            viewModel.accept(ManagerAction.ConfirmExistingConversionIdentity)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            assertEquals(
+                InstallationIdentitySelection.UseExisting(target.identitySha256),
+                repository.conversionBuildRequests.single().identitySelection,
+            )
+        }
+
+    @Test
     fun `generated proof가 있는 모든 build failure는 원래 code와 retry 동작을 유지한다`() =
         runTest(dispatcher.scheduler) {
             ConversionFailureCode.entries.forEach { code ->
@@ -2388,6 +2488,14 @@ class ManagerViewModelTest {
         selectedAutomaticAdapters = emptySet(),
         requiredApprovals = emptySet(),
         identityRequirement = IdentityRequirement.Stable("0123456789ab"),
+    )
+
+    private fun existingTarget() = ExistingConversionTarget(
+        identitySha256 = "e".repeat(64),
+        displayName = "기존 대상",
+        extensionId = EXTENSION_ID,
+        packageName = PACKAGE,
+        wrapperSignerSha256 = "f".repeat(64),
     )
 
     private fun review(
