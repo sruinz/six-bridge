@@ -26,6 +26,9 @@ interface PendingInstallStore {
     fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult?
     fun clearTerminalResult(expected: PendingInstallResult): Boolean
     fun loadFinalReceipt(): FinalInstallReceipt? = null
+    fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
+        loadFinalReceipt()?.let { RecoveryRecordSnapshot.Present(it) }
+            ?: RecoveryRecordSnapshot.Absent
     fun createFinalReceipt(
         expectedPending: PendingInstall?,
         expectedRaw: PendingInstallResult?,
@@ -43,6 +46,9 @@ interface PendingInstallStore {
     fun finalizeFinalReceipt(expected: FinalInstallReceipt): Boolean = false
     fun clearPendingPreservingImport(expected: PendingInstall): Boolean = false
     fun loadNormalHandoff(): NormalInstallHandoff? = null
+    fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
+        loadNormalHandoff()?.let { RecoveryRecordSnapshot.Present(it) }
+            ?: RecoveryRecordSnapshot.Absent
     fun compareAndSetNormalHandoff(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
@@ -82,8 +88,8 @@ class SharedPreferencesPendingInstallStore internal constructor(
     ): PendingInstall? = synchronized(PROCESS_LOCK) {
         if (loadPendingLocked() != null ||
             loadTerminalLocked() != null ||
-            loadFinalReceiptLocked() != null ||
-            loadNormalHandoffLocked() != null
+            finalReceiptSnapshotLocked() != RecoveryRecordSnapshot.Absent ||
+            normalHandoffSnapshotLocked() != RecoveryRecordSnapshot.Absent
         ) {
             return@synchronized null
         }
@@ -147,7 +153,9 @@ class SharedPreferencesPendingInstallStore internal constructor(
         expected: PendingInstall,
     ): PendingCleanupResult = synchronized(PROCESS_LOCK) {
         if (loadPendingLocked() != expected) return@synchronized PendingCleanupResult.Failed
-        if (loadTerminalLocked() != null || loadFinalReceiptLocked() != null) {
+        if (loadTerminalLocked() != null ||
+            finalReceiptSnapshotLocked() != RecoveryRecordSnapshot.Absent
+        ) {
             return@synchronized PendingCleanupResult.TerminalAvailable
         }
         val importDiscarded = runCatching {
@@ -251,7 +259,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
     override fun clearTerminalResult(expected: PendingInstallResult): Boolean =
         synchronized(PROCESS_LOCK) {
             if (loadTerminalLocked() != expected ||
-                loadFinalReceiptLocked() != null
+                finalReceiptSnapshotLocked() != RecoveryRecordSnapshot.Absent
             ) {
                 return@synchronized false
             }
@@ -262,6 +270,11 @@ class SharedPreferencesPendingInstallStore internal constructor(
         loadFinalReceiptLocked()
     }
 
+    override fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
+        synchronized(PROCESS_LOCK) {
+            finalReceiptSnapshotLocked()
+        }
+
     override fun createFinalReceipt(
         expectedPending: PendingInstall?,
         expectedRaw: PendingInstallResult?,
@@ -271,7 +284,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             !receipt.matchesRaw(expectedRaw) ||
             loadPendingLocked() != expectedPending ||
             loadTerminalLocked() != expectedRaw ||
-            loadFinalReceiptLocked() != null
+            finalReceiptSnapshotLocked() != RecoveryRecordSnapshot.Absent
         ) {
             return@synchronized false
         }
@@ -340,8 +353,11 @@ class SharedPreferencesPendingInstallStore internal constructor(
     override fun finalizeFinalReceipt(
         expected: FinalInstallReceipt,
     ): Boolean = synchronized(PROCESS_LOCK) {
-        val current = loadFinalReceiptLocked()
-        if (current == null) return@synchronized true
+        val current = when (val snapshot = finalReceiptSnapshotLocked()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> return@synchronized true
+            RecoveryRecordSnapshot.Invalid -> return@synchronized false
+        }
         if (current != expected || current.stage != FinalReceiptStage.ACKNOWLEDGED) {
             return@synchronized false
         }
@@ -369,11 +385,21 @@ class SharedPreferencesPendingInstallStore internal constructor(
             loadNormalHandoffLocked()
         }
 
+    override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
+        synchronized(PROCESS_LOCK) {
+            normalHandoffSnapshotLocked()
+        }
+
     override fun compareAndSetNormalHandoff(
         expected: NormalInstallHandoff?,
         replacement: NormalInstallHandoff?,
     ): Boolean = synchronized(PROCESS_LOCK) {
-        if (loadNormalHandoffLocked() != expected ||
+        val current = when (val snapshot = normalHandoffSnapshotLocked()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return@synchronized false
+        }
+        if (current != expected ||
             replacement?.let(::isValid) == false
         ) {
             return@synchronized false
@@ -432,10 +458,15 @@ class SharedPreferencesPendingInstallStore internal constructor(
         expectedPending: PendingInstall?,
         expectedFinal: FinalInstallReceipt?,
     ): Boolean = synchronized(PROCESS_LOCK) {
+        val currentFinal = when (val snapshot = finalReceiptSnapshotLocked()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return@synchronized false
+        }
         if (expectedRaw.importToken != null ||
             loadTerminalLocked() != expectedRaw ||
             loadPendingLocked() != expectedPending ||
-            loadFinalReceiptLocked() != expectedFinal
+            currentFinal != expectedFinal
         ) {
             return@synchronized false
         }
@@ -606,6 +637,14 @@ class SharedPreferencesPendingInstallStore internal constructor(
         }.getOrNull()?.takeIf(::isValid)
     }
 
+    private fun finalReceiptSnapshotLocked(): RecoveryRecordSnapshot<FinalInstallReceipt> {
+        if (!recoveryPreferences.contains(KEY_FINAL_VERSION)) {
+            return RecoveryRecordSnapshot.Absent
+        }
+        return loadFinalReceiptLocked()?.let { RecoveryRecordSnapshot.Present(it) }
+            ?: RecoveryRecordSnapshot.Invalid
+    }
+
     private fun writeFinalReceiptLocked(receipt: FinalInstallReceipt): Boolean {
         val editor = recoveryPreferences.edit()
             .putInt(KEY_FINAL_VERSION, receipt.version)
@@ -657,6 +696,14 @@ class SharedPreferencesPendingInstallStore internal constructor(
                 version = version,
             )
         }.getOrNull()?.takeIf(::isValid)
+    }
+
+    private fun normalHandoffSnapshotLocked(): RecoveryRecordSnapshot<NormalInstallHandoff> {
+        if (!recoveryPreferences.contains(KEY_HANDOFF_VERSION)) {
+            return RecoveryRecordSnapshot.Absent
+        }
+        return loadNormalHandoffLocked()?.let { RecoveryRecordSnapshot.Present(it) }
+            ?: RecoveryRecordSnapshot.Invalid
     }
 
     private fun writeNormalHandoffLocked(handoff: NormalInstallHandoff): Boolean {

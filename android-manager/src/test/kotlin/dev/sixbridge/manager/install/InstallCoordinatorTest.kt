@@ -735,6 +735,67 @@ class InstallCoordinatorTest {
     }
 
     @Test
+    fun `malformed final marker는 finalize와 cancel에서 absent로 처리하지 않는다`() =
+        runBlocking {
+            val fixture = fixture()
+            fixture.pendingStore.finalSnapshot = RecoveryRecordSnapshot.Invalid
+
+            assertFalse(
+                fixture.coordinator.finalizeTerminal(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
+            assertEquals(
+                InstallCleanupResult.CleanupFailed,
+                fixture.coordinator.cancel(TOKEN, SESSION_ID),
+            )
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        }
+
+    @Test
+    fun `normal handoff marker가 남으면 cancel cleanup은 completed가 아니다`() =
+        runBlocking {
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = SESSION_ID,
+                packageName = PACKAGE_NAME,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.PREPARED,
+            )
+            listOf(
+                RecoveryRecordSnapshot.Present(handoff),
+                RecoveryRecordSnapshot.Invalid,
+            ).forEach { snapshot ->
+                val raw = PendingInstallResult(
+                    result = PackageInstallResult.Cancelled(SESSION_ID),
+                    terminalAtEpochMillis = FINISHED_AT,
+                    packageName = PACKAGE_NAME,
+                    importToken = TOKEN,
+                )
+                val fixture = fixture(
+                    pending = pendingInstall(),
+                    terminalResult = raw,
+                ).apply {
+                    pendingStore.normalSnapshot = snapshot
+                    pendingStore.createFinalSuccessWithoutWrite = true
+                    pendingStore.clearRawWhenPendingPreserved = true
+                }
+
+                assertEquals(
+                    InstallCleanupResult.CleanupFailed,
+                    fixture.coordinator.cancel(TOKEN, SESSION_ID),
+                    "snapshot=$snapshot",
+                )
+                assertTrue(
+                    fixture.pendingStore.discardedTokens.isEmpty(),
+                    "snapshot=$snapshot",
+                )
+            }
+        }
+
+    @Test
     fun `restores completed success when terminal inbox deletion must be retried`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
@@ -1006,6 +1067,104 @@ class InstallCoordinatorTest {
                     expectedPackageName = PACKAGE_NAME,
                 ),
             )
+        }
+
+    @Test
+    fun `current final receipt proof distinguishes owned assigned mismatch and absent`() =
+        runBlocking {
+            val raw = fixture()
+            raw.coordinator.request(raw.bundle, partialConfirmed = false)
+            val failure = InstallState.Failed("LATE_FAILURE", "late failure")
+            assertTrue(
+                raw.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.Failure(
+                        SESSION_ID,
+                        failure.code,
+                        failure.message,
+                    ),
+                ),
+            )
+
+            val ready = assertIs<FinalReceiptOwnerResult.Owned>(
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            ).receipt
+            assertEquals(failure, ready.state)
+            assertEquals(FinalReceiptOrigin.RAW_TERMINAL, ready.origin)
+            assertEquals(FinalReceiptStage.READY, ready.stage)
+            assertEquals(
+                FinalReceiptOwnerResult.OwnerSessionAssigned(SESSION_ID),
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = null,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            )
+            assertEquals(
+                FinalReceiptOwnerResult.OwnerMismatch,
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken =
+                        "22222222-2222-2222-2222-222222222222",
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            )
+            assertEquals(
+                FinalReceiptOwnerResult.OwnerMismatch,
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+                ),
+            )
+
+            assertTrue(
+                raw.coordinator.acknowledgeTerminal(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedState = failure,
+                ),
+            )
+            val acknowledged = assertIs<FinalReceiptOwnerResult.Owned>(
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            ).receipt
+            assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged.stage)
+            assertTrue(
+                raw.coordinator.finalizeTerminal(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedState = failure,
+                ),
+            )
+            assertEquals(
+                FinalReceiptOwnerResult.Absent,
+                raw.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            )
+
+            val program = fixture()
+            program.coordinator.request(program.bundle, partialConfirmed = false)
+            program.coordinator.cancel(TOKEN, SESSION_ID)
+            val programReady = assertIs<FinalReceiptOwnerResult.Owned>(
+                program.coordinator.currentFinalReceiptForOwner(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedPackageName = PACKAGE_NAME,
+                ),
+            ).receipt
+            assertEquals(FinalReceiptOrigin.PROGRAM_CANCEL, programReady.origin)
+            assertEquals(FinalReceiptStage.READY, programReady.stage)
+            assertEquals(InstallState.Cancelled, programReady.state)
         }
 
     @Test
@@ -2146,7 +2305,9 @@ class InstallCoordinatorTest {
         var record: PendingInstall? = initial
         var terminalResult: PendingInstallResult? = null
         var finalReceipt: FinalInstallReceipt? = null
+        var finalSnapshot: RecoveryRecordSnapshot<FinalInstallReceipt>? = null
         var normalHandoff: NormalInstallHandoff? = null
+        var normalSnapshot: RecoveryRecordSnapshot<NormalInstallHandoff>? = null
         var missingObservedAt: Long? = null
         val discardedTokens = mutableListOf<String>()
         val clearedTerminalResults = mutableListOf<PendingInstallResult>()
@@ -2165,10 +2326,12 @@ class InstallCoordinatorTest {
         var confirmationMarkFailure = false
         var loadFailure: Throwable? = null
         var createFinalFailure = false
+        var createFinalSuccessWithoutWrite = false
         var replaceFinalFailure = false
         var acknowledgeFinalFailure = false
         var finalizeFinalFailure = false
         var clearPreservingImportFailure = false
+        var clearRawWhenPendingPreserved = false
         var afterFinalReplace: ((FinalInstallReceipt) -> Unit)? = null
         var beforeFinalAcknowledge: (() -> Unit)? = null
         private var barrierLoadsRemaining = 2
@@ -2350,6 +2513,11 @@ class InstallCoordinatorTest {
             finalReceipt
         }
 
+        override fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
+            synchronized(this) {
+                finalSnapshot ?: super.finalReceiptSnapshot()
+            }
+
         override fun createFinalReceipt(
             expectedPending: PendingInstall?,
             expectedRaw: PendingInstallResult?,
@@ -2362,6 +2530,7 @@ class InstallCoordinatorTest {
             ) {
                 return@synchronized false
             }
+            if (createFinalSuccessWithoutWrite) return@synchronized true
             finalReceipt = receipt
             true
         }
@@ -2419,12 +2588,18 @@ class InstallCoordinatorTest {
                     return@synchronized false
                 }
                 record = null
+                if (clearRawWhenPendingPreserved) terminalResult = null
                 true
             }
 
         override fun loadNormalHandoff(): NormalInstallHandoff? = synchronized(this) {
             normalHandoff
         }
+
+        override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
+            synchronized(this) {
+                normalSnapshot ?: super.normalHandoffSnapshot()
+            }
 
         override fun compareAndSetNormalHandoff(
             expected: NormalInstallHandoff?,

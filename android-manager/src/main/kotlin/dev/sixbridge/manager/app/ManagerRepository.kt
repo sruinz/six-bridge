@@ -31,6 +31,7 @@ import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.FinalReceiptStage
+import dev.sixbridge.manager.install.FinalReceiptOwnerResult
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalInstallHandoff
@@ -122,6 +123,15 @@ data class RestoredInstallTerminal(
     val stage: FinalReceiptStage,
 )
 
+sealed interface TerminalReceiptOwnerResult {
+    data class Owned(
+        val terminal: RestoredInstallTerminal,
+    ) : TerminalReceiptOwnerResult
+    data class OwnerSessionAssigned(val sessionId: Int) : TerminalReceiptOwnerResult
+    data object OwnerMismatch : TerminalReceiptOwnerResult
+    data object Absent : TerminalReceiptOwnerResult
+}
+
 class RepositoryLaunch(
     val destination: LaunchDestination,
     val intentFactory: () -> Intent,
@@ -168,6 +178,11 @@ interface ManagerRepository {
         expectedReviewToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult
+    suspend fun currentTerminalReceiptForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): TerminalReceiptOwnerResult = TerminalReceiptOwnerResult.OwnerMismatch
     suspend fun rawReadyTerminalForOwner(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -406,6 +421,33 @@ internal class DefaultManagerRepository(
         expectedImportToken = expectedReviewToken,
         expectedSessionId = expectedSessionId,
     )
+
+    override suspend fun currentTerminalReceiptForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): TerminalReceiptOwnerResult =
+        when (val proof = installCoordinator.currentFinalReceiptForOwner(
+            expectedImportToken = expectedReviewToken,
+            expectedSessionId = expectedSessionId,
+            expectedPackageName = expectedPackageName,
+        )) {
+            is FinalReceiptOwnerResult.Owned ->
+                TerminalReceiptOwnerResult.Owned(
+                    RestoredInstallTerminal(
+                        importToken = proof.receipt.importToken,
+                        sessionId = proof.receipt.sessionId,
+                        packageName = proof.receipt.packageName,
+                        state = proof.receipt.state,
+                        stage = proof.receipt.stage,
+                    ),
+                )
+            is FinalReceiptOwnerResult.OwnerSessionAssigned ->
+                TerminalReceiptOwnerResult.OwnerSessionAssigned(proof.sessionId)
+            FinalReceiptOwnerResult.OwnerMismatch ->
+                TerminalReceiptOwnerResult.OwnerMismatch
+            FinalReceiptOwnerResult.Absent -> TerminalReceiptOwnerResult.Absent
+        }
 
     override suspend fun rawReadyTerminalForOwner(
         expectedReviewToken: String,

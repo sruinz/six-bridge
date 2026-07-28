@@ -15,6 +15,7 @@ import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
@@ -5107,6 +5108,209 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `normal rebase commit fault 뒤 새 import는 current receipt를 다시 증명해야 진행한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                InstallState.Installed(PACKAGE),
+                InstallState.Failed("LATE_FAILURE", "late failure"),
+            ).forEach { currentState ->
+                val old = NormalInstallHandoff(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = InstallState.Cancelled,
+                    stage = NormalHandoffStage.PREPARED,
+                )
+                val current = RestoredInstallTerminal(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = currentState,
+                    stage = FinalReceiptStage.READY,
+                )
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                        terminal = current,
+                        normalHandoff = old,
+                    )
+                    normalHandoff = old
+                    rawReadyTerminal = current
+                    installFlow.value = currentState
+                    terminalOwnerImportToken = TOKEN
+                    terminalOwnerSessionId = 41
+                    terminalOwnerState = currentState
+                    terminalOwnerProofConfigured = true
+                    normalHandoffRebaseResult = false
+                    importResult = ManagerImportResult.Success(
+                        review(
+                            status = ContractCompatibilityStatus.COMPATIBLE,
+                            token = SECOND_TOKEN,
+                        ),
+                    )
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+
+                assertEquals(old, repository.normalHandoff, "state=$currentState")
+                assertTrue(repository.terminalReceiptActive, "state=$currentState")
+
+                viewModel.startImport(repository::nextImport)
+                advanceUntilIdle()
+
+                assertEquals(old, repository.normalHandoff, "state=$currentState")
+                assertTrue(repository.terminalReceiptActive, "state=$currentState")
+                assertTrue(repository.discardedTokens.isEmpty(), "state=$currentState")
+                assertEquals(
+                    ManagerRoute.Review(TOKEN),
+                    viewModel.state.value.route,
+                    "state=$currentState",
+                )
+                assertEquals(
+                    TOKEN,
+                    assertIs<ImportUiState.ReviewReady>(
+                        viewModel.state.value.importState,
+                    ).review.token,
+                    "state=$currentState",
+                )
+
+                repository.normalHandoffRebaseResult = true
+                viewModel.startImport(repository::nextImport)
+                advanceUntilIdle()
+
+                assertNull(repository.normalHandoff, "state=$currentState")
+                assertFalse(repository.terminalReceiptActive, "state=$currentState")
+                assertEquals(listOf(TOKEN), repository.discardedTokens, "state=$currentState")
+                assertEquals(
+                    SECOND_TOKEN,
+                    assertIs<ImportUiState.ReviewReady>(
+                        viewModel.state.value.importState,
+                    ).review.token,
+                    "state=$currentState",
+                )
+            }
+        }
+
+    @Test
+    fun `normal PREPARED 새 작업은 READY ACK absent의 exact current receipt proof에서만 열린다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                FinalReceiptStage.READY,
+                FinalReceiptStage.ACKNOWLEDGED,
+                null,
+            ).forEach { stage ->
+                val handoff = NormalInstallHandoff(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = InstallState.Cancelled,
+                    stage = NormalHandoffStage.PREPARED,
+                )
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                        normalHandoff = handoff,
+                    )
+                    normalHandoff = handoff
+                    terminalOwnerImportToken = TOKEN
+                    terminalOwnerSessionId = 41
+                    terminalOwnerPackageName = PACKAGE
+                    terminalOwnerState = InstallState.Cancelled
+                    terminalOwnerProofConfigured = true
+                    installFlow.value = InstallState.Cancelled
+                    terminalReceiptActive = stage != null
+                    terminalReceiptAcknowledged =
+                        stage == FinalReceiptStage.ACKNOWLEDGED
+                    currentTerminalReceiptResult = stage?.let {
+                        TerminalReceiptOwnerResult.Owned(
+                            RestoredInstallTerminal(
+                                importToken = TOKEN,
+                                sessionId = 41,
+                                packageName = PACKAGE,
+                                state = InstallState.Cancelled,
+                                stage = it,
+                            ),
+                        )
+                    } ?: TerminalReceiptOwnerResult.Absent
+                    importResult = ManagerImportResult.Success(
+                        review(
+                            status = ContractCompatibilityStatus.COMPATIBLE,
+                            token = SECOND_TOKEN,
+                        ),
+                    )
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+
+                viewModel.startImport(repository::nextImport)
+                advanceUntilIdle()
+
+                assertNull(repository.normalHandoff, "stage=$stage")
+                assertFalse(repository.terminalReceiptActive, "stage=$stage")
+                assertEquals(listOf(TOKEN), repository.discardedTokens, "stage=$stage")
+                assertEquals(
+                    SECOND_TOKEN,
+                    assertIs<ImportUiState.ReviewReady>(
+                        viewModel.state.value.importState,
+                    ).review.token,
+                    "stage=$stage",
+                )
+            }
+        }
+
+    @Test
+    fun `normal PREPARED 새 작업은 foreign receipt와 null session assignment에서 fail closed한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                41 to TerminalReceiptOwnerResult.OwnerMismatch,
+                null to TerminalReceiptOwnerResult.OwnerSessionAssigned(41),
+            ).forEach { (handoffSession, proof) ->
+                val handoff = NormalInstallHandoff(
+                    importToken = TOKEN,
+                    sessionId = handoffSession,
+                    packageName = PACKAGE,
+                    state = InstallState.Cancelled,
+                    stage = NormalHandoffStage.PREPARED,
+                )
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                        normalHandoff = handoff,
+                    )
+                    normalHandoff = handoff
+                    currentTerminalReceiptResult = proof
+                    importResult = ManagerImportResult.Success(
+                        review(
+                            status = ContractCompatibilityStatus.COMPATIBLE,
+                            token = SECOND_TOKEN,
+                        ),
+                    )
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+
+                viewModel.startImport(repository::nextImport)
+                advanceUntilIdle()
+
+                assertEquals(handoff, repository.normalHandoff, "proof=$proof")
+                assertTrue(repository.discardedTokens.isEmpty(), "proof=$proof")
+                assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+                assertEquals(
+                    TOKEN,
+                    assertIs<ImportUiState.ReviewReady>(
+                        viewModel.state.value.importState,
+                    ).review.token,
+                )
+                assertTrue(
+                    repository.currentTerminalReceiptArguments.all {
+                        it == Triple(TOKEN, handoffSession, PACKAGE)
+                    },
+                    "proof=$proof",
+                )
+            }
+        }
+
+    @Test
     fun `normal cancelled와 failed OUTCOME은 DismissMessage exact CAS 뒤에만 소비한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
@@ -7233,9 +7437,13 @@ private class FakeManagerRepository : ManagerRepository {
     var yieldAfterTerminalStateOnCancelInstall = false
     var terminalOwnerImportToken: String? = null
     var terminalOwnerSessionId: Int? = null
+    var terminalOwnerPackageName: String? = null
     var terminalOwnerState: InstallState? = null
     var terminalOwnerProofConfigured = false
     val terminalOwnerArguments = mutableListOf<Pair<String, Int?>>()
+    val currentTerminalReceiptArguments =
+        mutableListOf<Triple<String, Int?, String>>()
+    var currentTerminalReceiptResult: TerminalReceiptOwnerResult? = null
     var rawReadyTerminal: RestoredInstallTerminal? = null
     val rawReadyTerminalArguments =
         mutableListOf<Triple<String, Int?, String>>()
@@ -7500,6 +7708,52 @@ private class FakeManagerRepository : ManagerRepository {
                 it.sessionId == expectedSessionId &&
                 it.packageName == expectedPackageName
         }
+    }
+
+    override suspend fun currentTerminalReceiptForOwner(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): TerminalReceiptOwnerResult {
+        currentTerminalReceiptArguments += Triple(
+            expectedReviewToken,
+            expectedSessionId,
+            expectedPackageName,
+        )
+        currentTerminalReceiptResult?.let { return it }
+        if (!terminalReceiptActive) return TerminalReceiptOwnerResult.Absent
+        if (!terminalOwnerProofConfigured ||
+            terminalOwnerImportToken != expectedReviewToken ||
+            terminalOwnerState != installFlow.value ||
+            expectedPackageName != (
+                terminalOwnerPackageName
+                    ?: rawReadyTerminal?.packageName
+                    ?: normalHandoff?.packageName
+                    ?: restoreResult.terminal?.packageName
+                )
+        ) {
+            return TerminalReceiptOwnerResult.OwnerMismatch
+        }
+        val sessionId = terminalOwnerSessionId
+        if (expectedSessionId == null && sessionId != null) {
+            return TerminalReceiptOwnerResult.OwnerSessionAssigned(sessionId)
+        }
+        if (expectedSessionId != sessionId) {
+            return TerminalReceiptOwnerResult.OwnerMismatch
+        }
+        return TerminalReceiptOwnerResult.Owned(
+            RestoredInstallTerminal(
+                importToken = expectedReviewToken,
+                sessionId = sessionId,
+                packageName = expectedPackageName,
+                state = requireNotNull(terminalOwnerState),
+                stage = if (terminalReceiptAcknowledged) {
+                    FinalReceiptStage.ACKNOWLEDGED
+                } else {
+                    FinalReceiptStage.READY
+                },
+            ),
+        )
     }
 
     override suspend fun acknowledgeTerminal(

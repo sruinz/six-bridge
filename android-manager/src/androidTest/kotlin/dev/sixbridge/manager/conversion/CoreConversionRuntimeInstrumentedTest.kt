@@ -19,6 +19,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallResult
+import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
@@ -395,6 +396,64 @@ class CoreConversionRuntimeInstrumentedTest {
         fixture.importRoot.deleteRecursively()
         programFixture.importRoot.deleteRecursively()
         acknowledgedFixture.importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun malformedFinalReceiptMarkerBlocksClaimAndReportsInvalid() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryPreferences = memorySharedPreferences()
+        val importRoot = Files.createTempDirectory("sixbridge-malformed-final").toFile()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            recoveryPreferences.edit()
+                .putInt("final_version", 1)
+                .putString("final_stage", "BROKEN")
+                .commit(),
+        )
+
+        assertEquals(RecoveryRecordSnapshot.Invalid, store.finalReceiptSnapshot())
+        assertNull(
+            store.tryClaim(
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                importToken = "11111111-1111-1111-1111-111111111111",
+                startedAtEpochMillis = 1,
+            ),
+        )
+        assertTrue(pendingPreferences.all.isEmpty())
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun malformedNormalHandoffMarkerBlocksClaimAndReportsInvalid() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryPreferences = memorySharedPreferences()
+        val importRoot = Files.createTempDirectory("sixbridge-malformed-handoff").toFile()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            recoveryPreferences.edit()
+                .putInt("handoff_version", 1)
+                .putString("handoff_stage", "BROKEN")
+                .commit(),
+        )
+
+        assertEquals(RecoveryRecordSnapshot.Invalid, store.normalHandoffSnapshot())
+        assertNull(
+            store.tryClaim(
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                importToken = "11111111-1111-1111-1111-111111111111",
+                startedAtEpochMillis = 1,
+            ),
+        )
+        assertTrue(pendingPreferences.all.isEmpty())
+        importRoot.deleteRecursively()
     }
 
     @Test

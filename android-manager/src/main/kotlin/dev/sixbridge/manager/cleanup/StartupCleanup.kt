@@ -4,6 +4,7 @@ import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PendingCleanupResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
+import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import java.io.File
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
@@ -30,9 +31,17 @@ class StartupCleanup(
         context.ensureActive()
         val terminal = pendingStore.loadTerminalResult()
         context.ensureActive()
-        val finalReceipt = pendingStore.loadFinalReceipt()
+        val finalReceipt = when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return
+        }
         context.ensureActive()
-        val normalHandoff = pendingStore.loadNormalHandoff()
+        val normalHandoff = when (val snapshot = pendingStore.normalHandoffSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return
+        }
         val durableProtectedTokens = setOfNotNull(
             terminal?.importToken,
             finalReceipt?.importToken,

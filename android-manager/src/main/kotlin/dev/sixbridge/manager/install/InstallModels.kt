@@ -141,3 +141,16 @@ sealed interface InstallTerminalOwnerResult {
     ) : InstallTerminalOwnerResult
     data object OwnerMismatch : InstallTerminalOwnerResult
 }
+
+sealed interface FinalReceiptOwnerResult {
+    data class Owned(val receipt: FinalInstallReceipt) : FinalReceiptOwnerResult
+    data class OwnerSessionAssigned(val sessionId: Int) : FinalReceiptOwnerResult
+    data object OwnerMismatch : FinalReceiptOwnerResult
+    data object Absent : FinalReceiptOwnerResult
+}
+
+sealed interface RecoveryRecordSnapshot<out T> {
+    data class Present<T>(val value: T) : RecoveryRecordSnapshot<T>
+    data object Absent : RecoveryRecordSnapshot<Nothing>
+    data object Invalid : RecoveryRecordSnapshot<Nothing>
+}

@@ -1509,6 +1509,85 @@ class ManagerRepositoryTest {
         )
     }
 
+    @Test
+    fun `repository current receipt proof는 owned assigned mismatch absent를 구분한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("current-receipt-owner-proof")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            val pendingStore = StartupPendingStore(null, root).apply {
+                terminal = PendingInstallResult(
+                    result = PackageInstallResult.Failure(
+                        sessionId = 41,
+                        code = "LATE_FAILURE",
+                        message = "late failure",
+                    ),
+                    terminalAtEpochMillis = 2,
+                    packageName = PACKAGE,
+                    importToken = TOKEN,
+                )
+            }
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+            val failure = InstallState.Failed("LATE_FAILURE", "late failure")
+
+            assertEquals(
+                TerminalReceiptOwnerResult.Owned(
+                    RestoredInstallTerminal(
+                        importToken = TOKEN,
+                        sessionId = 41,
+                        packageName = PACKAGE,
+                        state = failure,
+                        stage = FinalReceiptStage.READY,
+                    ),
+                ),
+                repository.currentTerminalReceiptForOwner(TOKEN, 41, PACKAGE),
+            )
+            assertEquals(
+                TerminalReceiptOwnerResult.OwnerSessionAssigned(41),
+                repository.currentTerminalReceiptForOwner(TOKEN, null, PACKAGE),
+            )
+            assertEquals(
+                TerminalReceiptOwnerResult.OwnerMismatch,
+                repository.currentTerminalReceiptForOwner(
+                    TOKEN,
+                    41,
+                    "foreign.package",
+                ),
+            )
+            assertTrue(repository.acknowledgeTerminal(TOKEN, 41, failure))
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                assertIs<TerminalReceiptOwnerResult.Owned>(
+                    repository.currentTerminalReceiptForOwner(TOKEN, 41, PACKAGE),
+                ).terminal.stage,
+            )
+            assertTrue(repository.finalizeTerminal(TOKEN, 41, failure))
+            assertEquals(
+                TerminalReceiptOwnerResult.Absent,
+                repository.currentTerminalReceiptForOwner(TOKEN, 41, PACKAGE),
+            )
+        }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `동일한 pre-claim 실패도 이번 B attempt 결과로 review와 token을 정리한다`() {

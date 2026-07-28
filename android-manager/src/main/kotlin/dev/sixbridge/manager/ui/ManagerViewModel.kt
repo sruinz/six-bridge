@@ -11,6 +11,7 @@ import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
@@ -1092,7 +1093,11 @@ class ManagerViewModel(
             }
             restored.normalHandoff?.let { handoff ->
                 pendingNormalHandoff = handoff
-                if (!resumeNormalHandoff(handoff, restored.terminal)) {
+                if (!resumeNormalHandoffWithCurrentReceipt(
+                        handoff,
+                        restored.terminal,
+                    )
+                ) {
                     showTerminalHandoffFailure()
                 }
                 return@launch
@@ -2338,10 +2343,34 @@ class ManagerViewModel(
         return resumeNormalHandoff(replacement, current)
     }
 
+    private suspend fun resumeNormalHandoffWithCurrentReceipt(
+        handoff: NormalInstallHandoff,
+        restoredTerminal: RestoredInstallTerminal? = null,
+    ): Boolean {
+        if (handoff.stage == NormalHandoffStage.OUTCOME_READY ||
+            restoredTerminal != null
+        ) {
+            return resumeNormalHandoff(handoff, restoredTerminal)
+        }
+        return when (val proof = repository.currentTerminalReceiptForOwner(
+            expectedReviewToken = handoff.importToken,
+            expectedSessionId = handoff.sessionId,
+            expectedPackageName = handoff.packageName,
+        )) {
+            is TerminalReceiptOwnerResult.Owned ->
+                resumeNormalHandoff(handoff, proof.terminal)
+            TerminalReceiptOwnerResult.Absent ->
+                resumeNormalHandoff(handoff, terminal = null)
+            is TerminalReceiptOwnerResult.OwnerSessionAssigned,
+            TerminalReceiptOwnerResult.OwnerMismatch,
+            -> false
+        }
+    }
+
     private suspend fun completePendingNormalHandoffForNewWork(): Boolean {
         var handoff = pendingNormalHandoff ?: return true
         if (handoff.stage == NormalHandoffStage.PREPARED) {
-            if (!resumeNormalHandoff(handoff, terminal = null)) {
+            if (!resumeNormalHandoffWithCurrentReceipt(handoff)) {
                 showTerminalHandoffFailure()
                 return false
             }

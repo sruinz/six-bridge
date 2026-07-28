@@ -14,6 +14,7 @@ import dev.sixbridge.manager.install.PendingCleanupResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallResult
 import dev.sixbridge.manager.install.PendingInstallStore
+import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import java.io.File
 import java.nio.file.Files
 import java.time.Clock
@@ -215,6 +216,28 @@ class StartupCleanupTest {
         }
 
     @Test
+    fun `손상된 final 또는 normal handoff marker가 있으면 startup cleanup은 아무 소유권도 정리하지 않는다`() =
+        runBlocking {
+            listOf(
+                RecoveryRecordSnapshot.Invalid to RecoveryRecordSnapshot.Absent,
+                RecoveryRecordSnapshot.Absent to RecoveryRecordSnapshot.Invalid,
+            ).forEach { (finalSnapshot, handoffSnapshot) ->
+                val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+                val gateway = FakeGateway(owned = mutableListOf(41))
+                val store = FakePendingStore(
+                    finalSnapshot = finalSnapshot,
+                    normalHandoffSnapshot = handoffSnapshot,
+                )
+
+                cleanup(gateway = gateway, store = store).run()
+
+                assertTrue(expired.exists())
+                assertTrue(gateway.abandoned.isEmpty())
+                expired.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `abandons only owned sessions that are not the recoverable pending session`() = runBlocking {
         val pending = pending(sessionId = 41, startedAt = now)
         val gateway = FakeGateway(owned = mutableListOf(41, 77))
@@ -380,6 +403,8 @@ class StartupCleanupTest {
         var loadFailure: Throwable? = null,
         var terminalLoadFailure: Throwable? = null,
         var missingObservationFailure: Throwable? = null,
+        var finalSnapshot: RecoveryRecordSnapshot<FinalInstallReceipt>? = null,
+        var normalHandoffSnapshot: RecoveryRecordSnapshot<NormalInstallHandoff>? = null,
     ) : PendingInstallStore {
         var terminalLoads = 0
         var clearWithoutTerminalCalls = 0
@@ -410,7 +435,11 @@ class StartupCleanupTest {
         override fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult? = null
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean = false
         override fun loadFinalReceipt(): FinalInstallReceipt? = finalReceipt
+        override fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
+            finalSnapshot ?: super.finalReceiptSnapshot()
         override fun loadNormalHandoff(): NormalInstallHandoff? = normalHandoff
+        override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
+            normalHandoffSnapshot ?: super.normalHandoffSnapshot()
         override fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long =
             missingObservationFailure?.let { throw it }
                 ?: missingObservedAt ?: observedAtEpochMillis.also { missingObservedAt = it }

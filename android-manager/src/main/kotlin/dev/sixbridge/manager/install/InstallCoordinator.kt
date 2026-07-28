@@ -46,9 +46,20 @@ class InstallCoordinator(
         bundle: ImportedBundle,
         partialConfirmed: Boolean,
     ): InstallState = mutex.withLock {
-        pendingStore.loadFinalReceipt()?.let { receipt ->
-            discardCompetingImport(bundle.token, receipt.importToken)
-            restoreTerminalResultLocked()
+        when (val final = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> {
+                discardCompetingImport(bundle.token, final.value.importToken)
+                restoreTerminalResultLocked()
+                return@withLock mutableState.value
+            }
+            RecoveryRecordSnapshot.Invalid -> {
+                mutableState.value = cleanupFailed()
+                return@withLock mutableState.value
+            }
+            RecoveryRecordSnapshot.Absent -> Unit
+        }
+        if (pendingStore.normalHandoffSnapshot() == RecoveryRecordSnapshot.Invalid) {
+            mutableState.value = cleanupFailed()
             return@withLock mutableState.value
         }
         val existing = pendingStore.load()
@@ -213,6 +224,34 @@ class InstallCoordinator(
         }
     }
 
+    suspend fun currentFinalReceiptForOwner(
+        expectedImportToken: String,
+        expectedSessionId: Int?,
+        expectedPackageName: String,
+    ): FinalReceiptOwnerResult = mutex.withLock {
+        restoreTerminalResultLocked()
+        val receipt = when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> return FinalReceiptOwnerResult.Absent
+            RecoveryRecordSnapshot.Invalid -> return FinalReceiptOwnerResult.OwnerMismatch
+        }
+        if (receipt.importToken != expectedImportToken ||
+            receipt.packageName != expectedPackageName
+        ) {
+            return FinalReceiptOwnerResult.OwnerMismatch
+        }
+        if (expectedSessionId == null) {
+            return receipt.sessionId?.let {
+                FinalReceiptOwnerResult.OwnerSessionAssigned(it)
+            } ?: FinalReceiptOwnerResult.Owned(receipt)
+        }
+        return if (receipt.sessionId == expectedSessionId) {
+            FinalReceiptOwnerResult.Owned(receipt)
+        } else {
+            FinalReceiptOwnerResult.OwnerMismatch
+        }
+    }
+
     suspend fun rawReadyTerminalForOwner(
         expectedImportToken: String,
         expectedSessionId: Int?,
@@ -252,7 +291,11 @@ class InstallCoordinator(
         expectedSessionId: Int?,
         expectedState: InstallState,
     ): Boolean = mutex.withLock {
-        val receipt = pendingStore.loadFinalReceipt() ?: return@withLock true
+        val receipt = when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> return@withLock true
+            RecoveryRecordSnapshot.Invalid -> return@withLock false
+        }
         if (receipt.importToken != expectedImportToken ||
             receipt.sessionId != expectedSessionId ||
             receipt.state != expectedState ||
@@ -269,18 +312,27 @@ class InstallCoordinator(
         expectedImportToken: String,
         expectedSessionId: Int?,
     ): InstallCleanupResult = mutex.withLock {
-        pendingStore.loadFinalReceipt()?.let { receipt ->
-            if (receipt.importToken != expectedImportToken) {
-                return@withLock InstallCleanupResult.OwnerMismatch
-            }
-            if (expectedSessionId == null && receipt.sessionId != null) {
-                return@withLock InstallCleanupResult.OwnerSessionAssigned(receipt.sessionId)
-            }
-            if (expectedSessionId != receipt.sessionId) {
-                return@withLock InstallCleanupResult.OwnerMismatch
-            }
-            restoreTerminalResultLocked()
+        if (pendingStore.normalHandoffSnapshot() != RecoveryRecordSnapshot.Absent) {
             return@withLock InstallCleanupResult.CleanupFailed
+        }
+        when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> {
+                val receipt = snapshot.value
+                if (receipt.importToken != expectedImportToken) {
+                    return@withLock InstallCleanupResult.OwnerMismatch
+                }
+                if (expectedSessionId == null && receipt.sessionId != null) {
+                    return@withLock InstallCleanupResult.OwnerSessionAssigned(receipt.sessionId)
+                }
+                if (expectedSessionId != receipt.sessionId) {
+                    return@withLock InstallCleanupResult.OwnerMismatch
+                }
+                restoreTerminalResultLocked()
+                return@withLock InstallCleanupResult.CleanupFailed
+            }
+            RecoveryRecordSnapshot.Invalid ->
+                return@withLock InstallCleanupResult.CleanupFailed
+            RecoveryRecordSnapshot.Absent -> Unit
         }
         val pending = try {
             pendingStore.load()
@@ -663,7 +715,14 @@ class InstallCoordinator(
     }
 
     private suspend fun restoreTerminalResultLocked() {
-        val receipt = pendingStore.loadFinalReceipt()
+        val receipt = when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> {
+                mutableState.value = cleanupFailed()
+                return
+            }
+        }
         var inbox = pendingStore.loadTerminalResult()
         val pending = pendingStore.load()
         if (inbox?.importToken == null && inbox != null) {
@@ -934,9 +993,14 @@ class InstallCoordinator(
     }
 
     private fun restoreState(): InstallState {
-        val receipt = pendingStore.loadFinalReceipt()
-        if (receipt != null && receipt.stage != FinalReceiptStage.CANCELLING) {
-            return receipt.state
+        when (val snapshot = pendingStore.finalReceiptSnapshot()) {
+            is RecoveryRecordSnapshot.Present -> {
+                if (snapshot.value.stage != FinalReceiptStage.CANCELLING) {
+                    return snapshot.value.state
+                }
+            }
+            RecoveryRecordSnapshot.Invalid -> return cleanupFailed()
+            RecoveryRecordSnapshot.Absent -> Unit
         }
         return pendingStore.load()?.toState() ?: InstallState.Idle
     }
@@ -1058,7 +1122,8 @@ class InstallCoordinator(
         val complete = activeBundle == null &&
             pendingStore.load() == null &&
             pendingStore.loadTerminalResult() == null &&
-            pendingStore.loadFinalReceipt() == null
+            pendingStore.finalReceiptSnapshot() == RecoveryRecordSnapshot.Absent &&
+            pendingStore.normalHandoffSnapshot() == RecoveryRecordSnapshot.Absent
         if (complete) volatileConfirmation = null
         return complete
     }

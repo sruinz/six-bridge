@@ -38,6 +38,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PackageInstallResult
+import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
@@ -265,6 +266,207 @@ class TerminalHandoffRaceInstrumentedTest {
             }
         }
 
+    @Test
+    fun normalRebasePersistedBeforeProcessDeathResumesWithoutLosingCurrentRawReceipt() =
+        runBlocking {
+            val fixture = ActualFixture()
+            try {
+                val savedState = SavedStateHandle(
+                    mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to REVIEW_TOKEN),
+                )
+                val source = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterNormalHandoffPersisted = {
+                        throw CancellationException("PREPARED 직후 process death")
+                    },
+                )
+                val sourceStore = ViewModelStore().apply { put("source", source) }
+                fixture.awaitReview(source, savedState)
+                source.accept(ManagerAction.InstallReviewedBundle)
+                fixture.awaitSession(savedState, source)
+                source.accept(ManagerAction.CancelReview)
+                fixture.await("normal PREPARED", source, savedState) {
+                    fixture.store.loadNormalHandoff()?.stage ==
+                        NormalHandoffStage.PREPARED
+                }
+                sourceStore.clear()
+
+                val late = PackageInstallResult.Failure(
+                    SESSION_ID,
+                    "LATE_FAILURE",
+                    "late failure",
+                )
+                val lateState = InstallState.Failed("LATE_FAILURE", "late failure")
+                assertTrue(fixture.coordinator.onPackageInstallerResult(late))
+                val firstRecreated = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterNormalHandoffPersisted = {
+                        throw CancellationException("rebase 저장 직후 process death")
+                    },
+                )
+                val firstStore = ViewModelStore().apply {
+                    put("firstRecreated", firstRecreated)
+                }
+                fixture.await("normal rebase persisted", firstRecreated, savedState) {
+                    fixture.store.loadNormalHandoff()?.state == lateState
+                }
+                assertEquals(
+                    FinalReceiptStage.READY,
+                    fixture.store.loadFinalReceipt()?.stage,
+                )
+                firstStore.clear()
+
+                val finalRecreated = ManagerViewModel(fixture.repository, savedState)
+                fixture.await("normal rebase resumed", finalRecreated, savedState) {
+                    fixture.store.loadNormalHandoff()?.stage ==
+                        NormalHandoffStage.OUTCOME_READY
+                }
+                assertEquals(
+                    lateState,
+                    fixture.store.loadNormalHandoff()?.state,
+                )
+                assertNull(fixture.store.loadFinalReceipt())
+                assertFalse(fixture.retainedReviewExists())
+            } finally {
+                fixture.close()
+            }
+        }
+
+    @Test
+    fun generatedRebasePersistedBeforeProcessDeathResumesWithoutLosingCurrentRawReceipt() =
+        runBlocking {
+            val fixture = ActualFixture()
+            try {
+                val savedState = SavedStateHandle()
+                val source = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterGeneratedTerminalHandoffPersisted = {
+                        throw CancellationException("generated handoff 직후 process death")
+                    },
+                )
+                val sourceStore = ViewModelStore().apply { put("source", source) }
+                fixture.awaitGeneratedResult(source, savedState)
+                source.accept(ManagerAction.PrepareGeneratedInstall)
+                source.accept(ManagerAction.InstallReviewedBundle)
+                fixture.awaitSession(savedState, source)
+                source.accept(ManagerAction.CancelReview)
+                fixture.await("generated PREPARED", source, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                    ) != null
+                }
+                sourceStore.clear()
+
+                val late = PackageInstallResult.Failure(
+                    SESSION_ID,
+                    "LATE_FAILURE",
+                    "late failure",
+                )
+                assertTrue(fixture.coordinator.onPackageInstallerResult(late))
+                val firstRecreated = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterGeneratedTerminalHandoffRebased = {
+                        throw CancellationException("generated rebase 직후 process death")
+                    },
+                )
+                val firstStore = ViewModelStore().apply {
+                    put("firstRecreated", firstRecreated)
+                }
+                fixture.await("generated rebase persisted", firstRecreated, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                    ) != null && fixture.store.loadFinalReceipt()?.state ==
+                        InstallState.Failed("LATE_FAILURE", "late failure")
+                }
+                firstStore.clear()
+
+                val finalRecreated = ManagerViewModel(fixture.repository, savedState)
+                fixture.await("generated rebase resumed", finalRecreated, savedState) {
+                    savedState.get<String>(
+                        ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                    ) == null
+                }
+                assertEquals(
+                    ManagerRoute.ConversionResult(CONVERSION_TOKEN),
+                    finalRecreated.state.value.route,
+                )
+                assertEquals(
+                    UserMessageKind.INSTALL_FAILED,
+                    finalRecreated.state.value.message?.kind,
+                )
+                assertNull(fixture.store.loadFinalReceipt())
+            } finally {
+                fixture.close()
+            }
+        }
+
+    @Test
+    fun malformedCurrentFinalReceiptPreservesPreparedOwnerReviewAndBlocksNewClaim() =
+        runBlocking {
+            val fixture = ActualFixture()
+            try {
+                val savedState = SavedStateHandle(
+                    mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to REVIEW_TOKEN),
+                )
+                val source = ManagerViewModel(
+                    repository = fixture.repository,
+                    savedStateHandle = savedState,
+                    afterNormalHandoffPersisted = {
+                        throw CancellationException("PREPARED 직후 process death")
+                    },
+                )
+                val sourceStore = ViewModelStore().apply { put("source", source) }
+                fixture.awaitReview(source, savedState)
+                source.accept(ManagerAction.InstallReviewedBundle)
+                fixture.awaitSession(savedState, source)
+                source.accept(ManagerAction.CancelReview)
+                fixture.await("normal PREPARED", source, savedState) {
+                    fixture.store.loadNormalHandoff()?.stage ==
+                        NormalHandoffStage.PREPARED
+                }
+                sourceStore.clear()
+                assertTrue(fixture.corruptFinalStage())
+                assertEquals(
+                    RecoveryRecordSnapshot.Invalid,
+                    fixture.store.finalReceiptSnapshot(),
+                )
+
+                val recreated = ManagerViewModel(fixture.repository, savedState)
+                fixture.await("malformed final fail closed", recreated, savedState) {
+                    recreated.state.value.route == ManagerRoute.Review(REVIEW_TOKEN) &&
+                        recreated.state.value.message?.kind ==
+                        UserMessageKind.INSTALL_FAILED
+                }
+                var imported = false
+                recreated.startImport {
+                    imported = true
+                    ManagerImportResult.Success(fixture.secondReview())
+                }
+                delay(50)
+
+                assertFalse(imported)
+                assertEquals(
+                    NormalHandoffStage.PREPARED,
+                    fixture.store.loadNormalHandoff()?.stage,
+                )
+                assertTrue(fixture.retainedReviewExists())
+                assertEquals(ManagerRoute.Review(REVIEW_TOKEN), recreated.state.value.route)
+                assertNull(
+                    fixture.store.tryClaim(
+                        packageName = PACKAGE,
+                        importToken = SECOND_TOKEN,
+                        startedAtEpochMillis = 20,
+                    ),
+                )
+            } finally {
+                fixture.close()
+            }
+        }
+
     private fun terminalCases(): List<TerminalCase> = listOf(
         TerminalCase(
             name = "Success",
@@ -462,6 +664,13 @@ class TerminalHandoffRaceInstrumentedTest {
         )
 
         fun retainedReviewExists(): Boolean = File(root, REVIEW_TOKEN).exists()
+
+        fun corruptFinalStage(): Boolean =
+            recoveryPreferences.edit()
+                .putString("final_stage", "BROKEN")
+                .commit()
+
+        fun secondReview(): ReviewBundle = bundle.toReview().copy(token = SECOND_TOKEN)
 
         fun close() {
             scope.cancel()
