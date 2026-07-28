@@ -38,6 +38,88 @@ data class PendingInstallResult(
     val processed: Boolean = false,
 )
 
+enum class FinalReceiptStage {
+    CANCELLING,
+    READY,
+    ACKNOWLEDGED,
+}
+
+enum class FinalReceiptOrigin {
+    PROGRAM_CANCEL,
+    RAW_TERMINAL,
+}
+
+data class FinalInstallReceipt(
+    val importToken: String,
+    val sessionId: Int?,
+    val packageName: String,
+    val state: InstallState,
+    val stage: FinalReceiptStage,
+    val origin: FinalReceiptOrigin,
+    val rawTerminalAtEpochMillis: Long?,
+    val terminalAtEpochMillis: Long,
+    val version: Int = CURRENT_VERSION,
+) {
+    init {
+        require(sessionId == null || sessionId >= 0)
+        require(
+            state is InstallState.Installed ||
+                state is InstallState.Cancelled ||
+                state is InstallState.Failed,
+        )
+        require(
+            when (origin) {
+                FinalReceiptOrigin.PROGRAM_CANCEL ->
+                    state is InstallState.Cancelled &&
+                        rawTerminalAtEpochMillis == null
+                FinalReceiptOrigin.RAW_TERMINAL ->
+                    sessionId != null &&
+                        rawTerminalAtEpochMillis != null &&
+                        rawTerminalAtEpochMillis > 0 &&
+                        stage != FinalReceiptStage.CANCELLING
+            },
+        )
+        require(
+            stage != FinalReceiptStage.CANCELLING ||
+                origin == FinalReceiptOrigin.PROGRAM_CANCEL,
+        )
+        require(terminalAtEpochMillis > 0)
+        require(version == CURRENT_VERSION)
+    }
+
+    companion object {
+        const val CURRENT_VERSION = 1
+    }
+}
+
+enum class NormalHandoffStage {
+    PREPARED,
+    OUTCOME_READY,
+}
+
+data class NormalInstallHandoff(
+    val importToken: String,
+    val sessionId: Int?,
+    val packageName: String,
+    val state: InstallState,
+    val stage: NormalHandoffStage,
+    val version: Int = CURRENT_VERSION,
+) {
+    init {
+        require(sessionId == null || sessionId >= 0)
+        require(
+            state is InstallState.Installed ||
+                state is InstallState.Cancelled ||
+                state is InstallState.Failed,
+        )
+        require(version == CURRENT_VERSION)
+    }
+
+    companion object {
+        const val CURRENT_VERSION = 1
+    }
+}
+
 sealed interface PendingCleanupResult {
     data object Cleared : PendingCleanupResult
     data object TerminalAvailable : PendingCleanupResult

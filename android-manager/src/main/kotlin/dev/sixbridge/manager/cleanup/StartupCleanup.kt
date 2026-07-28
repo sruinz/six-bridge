@@ -29,18 +29,30 @@ class StartupCleanup(
         val pending = pendingStore.load()
         context.ensureActive()
         val terminal = pendingStore.loadTerminalResult()
-        val terminalAvailable = terminal != null
+        context.ensureActive()
+        val finalReceipt = pendingStore.loadFinalReceipt()
+        context.ensureActive()
+        val normalHandoff = pendingStore.loadNormalHandoff()
+        val durableProtectedTokens = setOfNotNull(
+            terminal?.importToken,
+            finalReceipt?.importToken,
+            normalHandoff?.importToken,
+        )
+        val terminalAvailable = terminal?.importToken != null || finalReceipt != null
         context.ensureActive()
         val ownedSessions = bestEffort { installGateway.ownedSessions().toSet() }
 
         if (ownedSessions == null) {
-            cleanupExpiredImports(pending?.importToken ?: terminal?.importToken, context)
+            cleanupExpiredImports(
+                durableProtectedTokens + setOfNotNull(pending?.importToken),
+                context,
+            )
             return
         }
 
         val cleanup = if (terminalAvailable) {
             CleanupDecision(
-                pending?.importToken ?: terminal.importToken,
+                setOfNotNull(pending?.importToken),
                 ownedSessions,
             )
         } else {
@@ -54,7 +66,10 @@ class StartupCleanup(
             }
         }
         context.ensureActive()
-        cleanupExpiredImports(cleanup.protectedImportToken, context)
+        cleanupExpiredImports(
+            durableProtectedTokens + cleanup.protectedImportTokens,
+            context,
+        )
     }
 
     private fun decidePendingCleanup(
@@ -63,7 +78,7 @@ class StartupCleanup(
         context: CoroutineContext,
     ): CleanupDecision {
         context.ensureActive()
-        if (pending == null) return CleanupDecision(null, emptySet())
+        if (pending == null) return CleanupDecision(emptySet(), emptySet())
         val recoverableSessions = when {
             pending.sessionId in ownedSessions -> setOf(pending.sessionId)
             pending.sessionId < 0 && ownedSessions.size == 1 -> ownedSessions
@@ -72,26 +87,29 @@ class StartupCleanup(
         }
         if (recoverableSessions.isNotEmpty()) {
             bestEffort { pendingStore.clearSessionMissingObservation(pending) }
-            return CleanupDecision(pending.importToken, recoverableSessions)
+            return CleanupDecision(setOf(pending.importToken), recoverableSessions)
         }
 
         val now = clock.millis()
         val missingSince = bestEffort {
             pendingStore.firstSessionMissingAt(pending, now)
-        } ?: return CleanupDecision(pending.importToken, ownedSessions)
+        } ?: return CleanupDecision(setOf(pending.importToken), ownedSessions)
         if (now < missingSince || now - missingSince <= STALE_AFTER_MILLIS) {
-            return CleanupDecision(pending.importToken, ownedSessions)
+            return CleanupDecision(setOf(pending.importToken), ownedSessions)
         }
         return when (bestEffort { pendingStore.clearWithoutTerminal(pending) }
             ?: PendingCleanupResult.Failed) {
-            PendingCleanupResult.Cleared -> CleanupDecision(null, emptySet())
+            PendingCleanupResult.Cleared -> CleanupDecision(emptySet(), emptySet())
             PendingCleanupResult.TerminalAvailable,
             PendingCleanupResult.Failed,
-            -> CleanupDecision(pending.importToken, ownedSessions)
+            -> CleanupDecision(setOf(pending.importToken), ownedSessions)
         }
     }
 
-    private fun cleanupExpiredImports(protectedToken: String?, context: CoroutineContext) {
+    private fun cleanupExpiredImports(
+        protectedTokens: Set<String>,
+        context: CoroutineContext,
+    ) {
         context.ensureActive()
         if (Files.isSymbolicLink(importRoot.toPath())) return
         val root = bestEffort { importRoot.canonicalFile } ?: return
@@ -100,7 +118,9 @@ class StartupCleanup(
         val cutoff = clock.millis() - STALE_AFTER_MILLIS
         root.listFiles()?.forEach { candidate ->
             context.ensureActive()
-            if (candidate.name == protectedToken || !isExpiredTokenDirectory(candidate, root, cutoff)) {
+            if (candidate.name in protectedTokens ||
+                !isExpiredTokenDirectory(candidate, root, cutoff)
+            ) {
                 return@forEach
             }
             context.ensureActive()
@@ -154,7 +174,7 @@ class StartupCleanup(
     }
 
     private data class CleanupDecision(
-        val protectedImportToken: String?,
+        val protectedImportTokens: Set<String>,
         val sessionsToRetain: Set<Int>,
     )
 

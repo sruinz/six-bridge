@@ -96,7 +96,7 @@ class InstallCoordinatorTest {
         assertNotNull(fixture.pendingStore.terminalResult)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         fixture.acknowledgeTerminal(InstallState.Installed(PACKAGE_NAME))
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -181,18 +181,18 @@ class InstallCoordinatorTest {
         }
 
     @Test
-    fun `cancelling from package installer abandons the session and clears pending import`() = runBlocking {
+    fun `cancelling from package installer preserves retained import until result handoff`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
 
         fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Cancelled(SESSION_ID))
 
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
-        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
         assertNull(fixture.pendingStore.record)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         fixture.acknowledgeTerminal(InstallState.Cancelled)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -200,7 +200,7 @@ class InstallCoordinatorTest {
         runBlocking {
             val fixture = fixture(canInstallPackages = false)
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
-            fixture.pendingStore.discardFailure = true
+            fixture.pendingStore.createFinalFailure = true
 
             assertEquals(
                 InstallCleanupResult.CleanupFailed,
@@ -208,14 +208,14 @@ class InstallCoordinatorTest {
             )
             assertEquals("CLEANUP_FAILED", assertIs<InstallState.Failed>(fixture.coordinator.state.value).code)
 
-            fixture.pendingStore.discardFailure = false
+            fixture.pendingStore.createFinalFailure = false
 
             assertEquals(
-                InstallCleanupResult.Cleaned,
+                InstallCleanupResult.CleanupFailed,
                 fixture.coordinator.cancel(TOKEN, null),
             )
             assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
-            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         }
 
     @Test
@@ -228,9 +228,10 @@ class InstallCoordinatorTest {
             expectedSessionId = null,
         )
 
-        assertEquals(InstallCleanupResult.Cleaned, result)
+        assertEquals(InstallCleanupResult.CleanupFailed, result)
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertEquals(FinalReceiptStage.READY, fixture.pendingStore.finalReceipt?.stage)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -290,9 +291,10 @@ class InstallCoordinatorTest {
         )
 
         assertEquals(InstallCleanupResult.OwnerMismatch, mismatch)
-        assertEquals(InstallCleanupResult.Cleaned, cleaned)
+        assertEquals(InstallCleanupResult.CleanupFailed, cleaned)
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertEquals(FinalReceiptStage.READY, fixture.pendingStore.finalReceipt?.stage)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -300,23 +302,23 @@ class InstallCoordinatorTest {
         runBlocking {
             val fixture = fixture()
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
-            fixture.pendingStore.clearPendingAfterFailure = true
+            fixture.pendingStore.clearPreservingImportFailure = true
 
             assertEquals(
                 InstallCleanupResult.CleanupFailed,
                 fixture.coordinator.cancel(TOKEN, SESSION_ID),
             )
-            assertNull(fixture.pendingStore.record)
+            assertEquals(pendingInstall(), fixture.pendingStore.record)
             assertEquals(
                 "CLEANUP_FAILED",
                 assertIs<InstallState.Failed>(fixture.coordinator.state.value).code,
             )
 
-            fixture.pendingStore.clearPendingAfterFailure = false
+            fixture.pendingStore.clearPreservingImportFailure = false
 
             assertEquals(
-                InstallCleanupResult.Cleaned,
-                fixture.coordinator.cancel(TOKEN, null),
+                InstallCleanupResult.CleanupFailed,
+                fixture.coordinator.cancel(TOKEN, SESSION_ID),
             )
             assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         }
@@ -474,7 +476,8 @@ class InstallCoordinatorTest {
 
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.record)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertEquals(FinalReceiptStage.READY, fixture.pendingStore.finalReceipt?.stage)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         assertTrue(fixture.gateway.abandonedSessions.isEmpty())
     }
 
@@ -553,7 +556,7 @@ class InstallCoordinatorTest {
         assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
         assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
         assertNull(fixture.pendingStore.record)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -662,7 +665,7 @@ class InstallCoordinatorTest {
     }
 
     @Test
-    fun `system failure abandons the session and clears pending import`() = runBlocking {
+    fun `system failure preserves raw proof and retained import for handoff`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
 
@@ -678,20 +681,20 @@ class InstallCoordinatorTest {
             InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
             fixture.coordinator.state.value,
         )
-        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
         assertNull(fixture.pendingStore.record)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         fixture.acknowledgeTerminal(
             InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
         )
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
-    fun `cleanup failure is reported after both pending and temp cleanup are attempted`() = runBlocking {
+    fun `pending clear failure preserves final raw pending and retained import`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
-        fixture.pendingStore.clearFailure = true
+        fixture.pendingStore.clearPreservingImportFailure = true
 
         fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Cancelled(SESSION_ID))
 
@@ -699,15 +702,17 @@ class InstallCoordinatorTest {
             InstallState.Failed("CLEANUP_FAILED", "설치 임시 데이터를 정리하지 못했습니다."),
             fixture.coordinator.state.value,
         )
-        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        assertNotNull(fixture.pendingStore.finalReceipt)
+        assertNotNull(fixture.pendingStore.terminalResult)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
-    fun `retries terminal cleanup without losing ledger when temp deletion fails`() = runBlocking {
+    fun `acknowledge and finalize preserve retained import`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
-        fixture.pendingStore.discardFailure = true
         val result = PackageInstallResult.Failure(
             sessionId = SESSION_ID,
             code = "SYSTEM_FAILURE",
@@ -721,14 +726,12 @@ class InstallCoordinatorTest {
         assertEquals(terminalState, fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.record)
         assertEquals(result, fixture.pendingStore.terminalResult?.result)
-        assertFalse(
-            fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState),
-        )
+        assertTrue(fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState))
         assertNotNull(fixture.pendingStore.terminalResult)
 
-        fixture.pendingStore.discardFailure = false
-        fixture.acknowledgeTerminal(terminalState)
+        assertTrue(fixture.coordinator.finalizeTerminal(TOKEN, SESSION_ID, terminalState))
         assertNull(fixture.pendingStore.terminalResult)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -736,7 +739,7 @@ class InstallCoordinatorTest {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
         fixture.installedWrappers.installed = installedWrapper()
-        fixture.pendingStore.clearTerminalFailure = true
+        fixture.pendingStore.finalizeFinalFailure = true
 
         fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID))
 
@@ -745,13 +748,13 @@ class InstallCoordinatorTest {
         assertNull(fixture.pendingStore.record)
         assertEquals(PACKAGE_NAME, fixture.pendingStore.terminalResult?.packageName)
         assertEquals(PACKAGE_NAME, fixture.catalog.replaced?.packageName)
-        assertFalse(
-            fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState),
-        )
+        assertTrue(fixture.coordinator.acknowledgeTerminal(TOKEN, SESSION_ID, terminalState))
         assertNotNull(fixture.pendingStore.terminalResult)
+        assertFalse(fixture.coordinator.finalizeTerminal(TOKEN, SESSION_ID, terminalState))
+        assertNotNull(fixture.pendingStore.finalReceipt)
 
-        fixture.pendingStore.clearTerminalFailure = false
-        fixture.acknowledgeTerminal(terminalState)
+        fixture.pendingStore.finalizeFinalFailure = false
+        assertTrue(fixture.coordinator.finalizeTerminal(TOKEN, SESSION_ID, terminalState))
 
         assertEquals(InstallState.Installed(PACKAGE_NAME), fixture.coordinator.state.value)
         assertNull(fixture.pendingStore.terminalResult)
@@ -771,10 +774,284 @@ class InstallCoordinatorTest {
             ),
             fixture.coordinator.state.value,
         )
-        assertEquals(listOf(SESSION_ID), fixture.gateway.abandonedSessions)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
         assertNull(fixture.catalog.replaced)
         assertNull(fixture.pendingStore.record)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+    }
+
+    @Test
+    fun `derived failures persist exact raw receipt before pending clear and survive recreation`() =
+        runBlocking {
+            val cases = listOf(
+                "POST_INSTALL_VERIFICATION_FAILED" to
+                    "설치된 래퍼를 검증할 수 없습니다.",
+                "CATALOG_UPDATE_FAILED" to
+                    "설치 catalog를 갱신하지 못했습니다.",
+            )
+            cases.forEach { (code, message) ->
+                val fixture = fixture()
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+                if (code == "CATALOG_UPDATE_FAILED") {
+                    fixture.installedWrappers.installed = installedWrapper()
+                    fixture.catalog.replaceFailure = IllegalStateException("catalog failed")
+                }
+
+                fixture.coordinator.onPackageInstallerResult(
+                    PackageInstallResult.Success(SESSION_ID),
+                )
+
+                val expected = InstallState.Failed(code, message)
+                val receipt = requireNotNull(fixture.pendingStore.finalReceipt)
+                assertEquals(TOKEN, receipt.importToken)
+                assertEquals(SESSION_ID, receipt.sessionId)
+                assertEquals(PACKAGE_NAME, receipt.packageName)
+                assertEquals(expected, receipt.state)
+                assertEquals(FinalReceiptStage.READY, receipt.stage)
+                assertEquals(FinalReceiptOrigin.RAW_TERMINAL, receipt.origin)
+                assertEquals(FINISHED_AT, receipt.rawTerminalAtEpochMillis)
+                assertNull(fixture.pendingStore.record)
+                assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+
+                val recreated = coordinator(
+                    gateway = fixture.gateway,
+                    pendingStore = fixture.pendingStore,
+                    installedWrappers = fixture.installedWrappers,
+                    catalog = fixture.catalog,
+                )
+                recreated.restore(fixture.bundle)
+                assertEquals(expected, recreated.state.value)
+                assertEquals(receipt, fixture.pendingStore.finalReceipt)
+                assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+            }
+        }
+
+    @Test
+    fun `derived receipt commit failure preserves raw pending and retained import`() = runBlocking {
+        val fixture = fixture()
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        fixture.pendingStore.createFinalFailure = true
+
+        fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Success(SESSION_ID))
+
+        assertNull(fixture.pendingStore.finalReceipt)
+        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        assertIs<PackageInstallResult.Success>(fixture.pendingStore.terminalResult?.result)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+    }
+
+    @Test
+    fun `late raw after program cancel ready wins for success failure and cancelled`() = runBlocking {
+        val results = listOf(
+            PackageInstallResult.Success(SESSION_ID),
+            PackageInstallResult.Failure(SESSION_ID, "LATE_FAILURE", "late failure"),
+            PackageInstallResult.Cancelled(SESSION_ID),
+        )
+        results.forEach { result ->
+            val fixture = fixture()
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+            if (result is PackageInstallResult.Success) {
+                fixture.installedWrappers.installed = installedWrapper()
+            }
+            fixture.pendingStore.afterFinalReplace = { replacement ->
+                if (replacement.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                    replacement.stage == FinalReceiptStage.READY
+                ) {
+                    fixture.pendingStore.afterFinalReplace = null
+                    assertTrue(
+                        fixture.pendingStore.recordTerminalResult(
+                            result,
+                            FINISHED_AT + 1,
+                        ),
+                    )
+                }
+            }
+
+            fixture.coordinator.cancel(TOKEN, SESSION_ID)
+
+            val receipt = requireNotNull(fixture.pendingStore.finalReceipt)
+            val expected = when (result) {
+                is PackageInstallResult.Success -> InstallState.Installed(PACKAGE_NAME)
+                is PackageInstallResult.Failure ->
+                    InstallState.Failed(result.code, result.message)
+                is PackageInstallResult.Cancelled -> InstallState.Cancelled
+                is PackageInstallResult.PendingUserAction -> error("terminal만 사용")
+            }
+            assertEquals(expected, receipt.state)
+            assertEquals(FinalReceiptOrigin.RAW_TERMINAL, receipt.origin)
+            assertEquals(FINISHED_AT + 1, receipt.rawTerminalAtEpochMillis)
+            assertEquals(FinalReceiptStage.READY, receipt.stage)
+            assertEquals(expected, fixture.coordinator.state.value)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+        }
+    }
+
+    @Test
+    fun `cancelling torn states require exact owned session and package before convergence`() =
+        runBlocking {
+            data class Case(
+                val name: String,
+                val pending: PendingInstall?,
+                val configure: (FakePackageInstallGateway) -> Unit,
+                val ready: Boolean,
+                val abandoned: Boolean,
+            )
+            val cases = listOf(
+                Case(
+                    name = "abandon 직후 pending 유지",
+                    pending = pendingInstall(),
+                    configure = { it.replaceOwnedSessions(emptyList()) },
+                    ready = true,
+                    abandoned = false,
+                ),
+                Case(
+                    name = "pending clear 직후 session absent",
+                    pending = null,
+                    configure = { it.replaceOwnedSessions(emptyList()) },
+                    ready = true,
+                    abandoned = false,
+                ),
+                Case(
+                    name = "exact owned session",
+                    pending = null,
+                    configure = { it.replaceOwnedSessions(listOf(SESSION_ID)) },
+                    ready = true,
+                    abandoned = true,
+                ),
+                Case(
+                    name = "same package foreign session",
+                    pending = null,
+                    configure = {
+                        it.foreignSession = InstallSessionSnapshot(
+                            SESSION_ID,
+                            PACKAGE_NAME,
+                            ownedByCaller = false,
+                        )
+                    },
+                    ready = false,
+                    abandoned = false,
+                ),
+                Case(
+                    name = "different package reused session",
+                    pending = null,
+                    configure = {
+                        it.foreignSession = InstallSessionSnapshot(
+                            SESSION_ID,
+                            "dev.sixbridge.ext.${"b".repeat(32)}",
+                            ownedByCaller = true,
+                        )
+                    },
+                    ready = false,
+                    abandoned = false,
+                ),
+                Case(
+                    name = "query failure",
+                    pending = null,
+                    configure = {
+                        it.sessionSnapshotFailure = IllegalStateException("query failed")
+                    },
+                    ready = false,
+                    abandoned = false,
+                ),
+            )
+            cases.forEach { case ->
+                val fixture = fixture(
+                    pending = case.pending,
+                    ownedSessions = emptyList(),
+                )
+                case.configure(fixture.gateway)
+                fixture.pendingStore.finalReceipt = FinalInstallReceipt(
+                    importToken = TOKEN,
+                    sessionId = SESSION_ID,
+                    packageName = PACKAGE_NAME,
+                    state = InstallState.Cancelled,
+                    stage = FinalReceiptStage.CANCELLING,
+                    origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+                    rawTerminalAtEpochMillis = null,
+                    terminalAtEpochMillis = FINISHED_AT,
+                )
+
+                fixture.coordinator.restore(fixture.bundle)
+
+                assertEquals(
+                    case.ready,
+                    fixture.pendingStore.finalReceipt?.stage == FinalReceiptStage.READY,
+                    case.name,
+                )
+                assertEquals(
+                    case.abandoned,
+                    SESSION_ID in fixture.gateway.abandonedSessions,
+                    case.name,
+                )
+                if (!case.ready) {
+                    assertEquals(
+                        FinalReceiptStage.CANCELLING,
+                        fixture.pendingStore.finalReceipt?.stage,
+                        case.name,
+                    )
+                }
+                assertTrue(fixture.pendingStore.discardedTokens.isEmpty(), case.name)
+            }
+        }
+
+    @Test
+    fun `nullable cancelling receipt converges without destructive session action`() = runBlocking {
+        val fixture = fixture()
+        fixture.pendingStore.finalReceipt = FinalInstallReceipt(
+            importToken = TOKEN,
+            sessionId = null,
+            packageName = PACKAGE_NAME,
+            state = InstallState.Cancelled,
+            stage = FinalReceiptStage.CANCELLING,
+            origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+            rawTerminalAtEpochMillis = null,
+            terminalAtEpochMillis = FINISHED_AT,
+        )
+
+        fixture.coordinator.restore(fixture.bundle)
+
+        assertEquals(FinalReceiptStage.READY, fixture.pendingStore.finalReceipt?.stage)
+        assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+        assertTrue(fixture.gateway.abandonedSessions.isEmpty())
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
+    }
+
+    @Test
+    fun `raw inbox commit wins acknowledge race against program cancel ready`() = runBlocking {
+        val fixture = fixture()
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+        fixture.coordinator.cancel(TOKEN, SESSION_ID)
+        val programReady = requireNotNull(fixture.pendingStore.finalReceipt)
+        assertEquals(FinalReceiptOrigin.PROGRAM_CANCEL, programReady.origin)
+        fixture.pendingStore.beforeFinalAcknowledge = {
+            assertTrue(
+                fixture.pendingStore.recordTerminalResult(
+                    PackageInstallResult.Failure(
+                        SESSION_ID,
+                        "RAW_WON",
+                        "raw committed first",
+                    ),
+                    FINISHED_AT + 1,
+                ),
+            )
+        }
+
+        assertFalse(
+            fixture.coordinator.acknowledgeTerminal(
+                expectedImportToken = TOKEN,
+                expectedSessionId = SESSION_ID,
+                expectedState = InstallState.Cancelled,
+            ),
+        )
+        fixture.coordinator.restore(fixture.bundle)
+
+        val receipt = requireNotNull(fixture.pendingStore.finalReceipt)
+        assertEquals(FinalReceiptOrigin.RAW_TERMINAL, receipt.origin)
+        assertEquals(
+            InstallState.Failed("RAW_WON", "raw committed first"),
+            receipt.state,
+        )
+        assertEquals(FinalReceiptStage.READY, receipt.stage)
     }
 
     @Test
@@ -793,7 +1070,7 @@ class InstallCoordinatorTest {
 
             assertIs<InstallState.Failed>(fixture.coordinator.state.value)
             assertNull(fixture.catalog.replaced)
-            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         }
     }
 
@@ -945,6 +1222,13 @@ class InstallCoordinatorTest {
                     InstallState.Installed(PACKAGE_NAME),
                 ),
             )
+            assertTrue(
+                coordinator.finalizeTerminal(
+                    TOKEN,
+                    SESSION_ID,
+                    InstallState.Installed(PACKAGE_NAME),
+                ),
+            )
             assertNull(fixture.pendingStore.terminalResult)
         }
 
@@ -1063,7 +1347,7 @@ class InstallCoordinatorTest {
             InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
         )
         assertNull(fixture.pendingStore.terminalResult)
-        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+        assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
     @Test
@@ -1114,7 +1398,7 @@ class InstallCoordinatorTest {
             InstallState.Failed("SYSTEM_FAILURE", "installer rejected package"),
         )
         assertNull(fixture.pendingStore.terminalResult)
-        assertEquals(listOf(terminal), fixture.pendingStore.clearedTerminalResults)
+        assertNull(fixture.pendingStore.finalReceipt)
     }
 
     @Test
@@ -1146,6 +1430,8 @@ class InstallCoordinatorTest {
         val terminal = PendingInstallResult(
             result = PackageInstallResult.Success(SESSION_ID),
             terminalAtEpochMillis = FINISHED_AT,
+            packageName = PACKAGE_NAME,
+            importToken = TOKEN,
         )
         val fixture = fixture(
             pending = pendingInstall(),
@@ -1164,7 +1450,7 @@ class InstallCoordinatorTest {
     }
 
     @Test
-    fun `ignores and clears a foreign durable terminal result without touching pending session`() = runBlocking {
+    fun `quarantines a foreign tokenless terminal without touching pending session`() = runBlocking {
         val foreign = PendingInstallResult(
             result = PackageInstallResult.Cancelled(SESSION_ID + 1),
             terminalAtEpochMillis = FINISHED_AT,
@@ -1290,8 +1576,16 @@ class InstallCoordinatorTest {
                     expectedState = InstallState.Cancelled,
                 ),
             )
+            assertNotNull(fixture.pendingStore.terminalResult)
+            assertTrue(
+                recreated.finalizeTerminal(
+                    expectedImportToken = TOKEN,
+                    expectedSessionId = SESSION_ID,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
             assertNull(fixture.pendingStore.terminalResult)
-            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+            assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
         }
 
     @Test
@@ -1316,7 +1610,8 @@ class InstallCoordinatorTest {
                 expectedState = InstallState.Cancelled,
             ),
         )
-        assertEquals(terminal, fixture.pendingStore.terminalResult)
+        assertNull(fixture.pendingStore.terminalResult)
+        assertEquals(listOf(terminal), fixture.pendingStore.clearedTerminalResults)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
@@ -1442,31 +1737,32 @@ class InstallCoordinatorTest {
 
         fixture.coordinator.restore()
 
+        assertEquals(InstallState.Idle, fixture.coordinator.state.value)
+        assertNull(fixture.pendingStore.terminalResult)
+        assertEquals(listOf(terminal), fixture.pendingStore.clearedTerminalResults)
+        assertNull(fixture.catalog.replaced)
+
+        fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
         assertEquals(
-            InstallState.Failed(
-                "TERMINAL_RECOVERY_FAILED",
-                "검증 완료 표지가 없는 설치 결과를 복구하지 못했습니다.",
-            ),
+            InstallState.AwaitingUserApproval(SESSION_ID),
             fixture.coordinator.state.value,
         )
-        assertEquals(terminal, fixture.pendingStore.terminalResult)
-        assertNull(fixture.catalog.replaced)
+        assertEquals(TOKEN, fixture.pendingStore.record?.importToken)
     }
 
     @Test
-    fun `retains ledger temp and inbox when abandon fails and session is still owned`() = runBlocking {
+    fun `raw terminal does not depend on abandon and preserves retained import`() = runBlocking {
         val fixture = fixture()
         fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
         fixture.gateway.abandonFailure = IllegalStateException("abandon failed")
 
         fixture.coordinator.onPackageInstallerResult(PackageInstallResult.Cancelled(SESSION_ID))
 
-        assertEquals(
-            InstallState.Failed("ABANDON_FAILED", "설치 session을 정리하지 못했습니다."),
-            fixture.coordinator.state.value,
-        )
-        assertEquals(pendingInstall(), fixture.pendingStore.record)
+        assertEquals(InstallState.Cancelled, fixture.coordinator.state.value)
+        assertNull(fixture.pendingStore.record)
         assertIs<PackageInstallResult.Cancelled>(fixture.pendingStore.terminalResult?.result)
+        assertNotNull(fixture.pendingStore.finalReceipt)
         assertTrue(fixture.pendingStore.discardedTokens.isEmpty())
     }
 
@@ -1629,6 +1925,13 @@ class InstallCoordinatorTest {
                 expectedState = state,
             ),
         )
+        assertTrue(
+            coordinator.finalizeTerminal(
+                expectedImportToken = TOKEN,
+                expectedSessionId = SESSION_ID,
+                expectedState = state,
+            ),
+        )
     }
 
     private data class Fixture(
@@ -1656,6 +1959,9 @@ class InstallCoordinatorTest {
         var onAbandon: (() -> Unit)? = null
         var onWrite: ((Int) -> Unit)? = null
         private val owned = ownedSessions.toMutableList()
+        private val ownedPackages = ownedSessions.associateWith { PACKAGE_NAME }.toMutableMap()
+        var sessionSnapshotFailure: Throwable? = null
+        var foreignSession: InstallSessionSnapshot? = null
 
         override fun canRequestPackageInstalls(): Boolean = canInstallPackages
 
@@ -1666,6 +1972,7 @@ class InstallCoordinatorTest {
             createFailure?.let { throw it }
             createdPackages += packageName
             owned += SESSION_ID
+            ownedPackages[SESSION_ID] = packageName
             createFailureAfterAllocation?.let { throw it }
             return SESSION_ID
         }
@@ -1686,13 +1993,28 @@ class InstallCoordinatorTest {
             onAbandon?.invoke()
             abandonedSessions += sessionId
             owned -= sessionId
+            ownedPackages.remove(sessionId)
         }
 
         override fun ownedSessions(): List<Int> = owned.toList()
 
+        override fun sessionSnapshot(sessionId: Int): InstallSessionSnapshot? {
+            sessionSnapshotFailure?.let { throw it }
+            foreignSession?.takeIf { it.sessionId == sessionId }?.let { return it }
+            return sessionId.takeIf(owned::contains)?.let {
+                InstallSessionSnapshot(
+                    sessionId = it,
+                    packageName = ownedPackages[it],
+                    ownedByCaller = true,
+                )
+            }
+        }
+
         fun replaceOwnedSessions(sessionIds: List<Int>) {
             owned.clear()
             owned += sessionIds
+            ownedPackages.clear()
+            sessionIds.forEach { ownedPackages[it] = PACKAGE_NAME }
         }
     }
 
@@ -1701,6 +2023,8 @@ class InstallCoordinatorTest {
     ) : PendingInstallStore {
         var record: PendingInstall? = initial
         var terminalResult: PendingInstallResult? = null
+        var finalReceipt: FinalInstallReceipt? = null
+        var normalHandoff: NormalInstallHandoff? = null
         var missingObservedAt: Long? = null
         val discardedTokens = mutableListOf<String>()
         val clearedTerminalResults = mutableListOf<PendingInstallResult>()
@@ -1718,6 +2042,13 @@ class InstallCoordinatorTest {
         var confirmationDeliveredSessionId: Int? = null
         var confirmationMarkFailure = false
         var loadFailure: Throwable? = null
+        var createFinalFailure = false
+        var replaceFinalFailure = false
+        var acknowledgeFinalFailure = false
+        var finalizeFinalFailure = false
+        var clearPreservingImportFailure = false
+        var afterFinalReplace: ((FinalInstallReceipt) -> Unit)? = null
+        var beforeFinalAcknowledge: (() -> Unit)? = null
         private var barrierLoadsRemaining = 2
 
         override fun load(): PendingInstall? {
@@ -1737,7 +2068,9 @@ class InstallCoordinatorTest {
             importToken: String,
             startedAtEpochMillis: Long,
         ): PendingInstall? = synchronized(this) {
-            if (record != null) return@synchronized null
+            if (record != null || terminalResult != null || finalReceipt != null) {
+                return@synchronized null
+            }
             confirmationDeliveredSessionId = null
             PendingInstall(
                 sessionId = -1,
@@ -1832,16 +2165,22 @@ class InstallCoordinatorTest {
             result: PackageInstallResult,
             terminalAtEpochMillis: Long,
         ): Boolean = synchronized(this) {
+            val lateCancel = finalReceipt?.takeIf {
+                record == null &&
+                    it.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                    it.stage != FinalReceiptStage.ACKNOWLEDGED &&
+                    it.sessionId == result.sessionId
+            }
             if (result is PackageInstallResult.PendingUserAction ||
-                record?.sessionId != result.sessionId
+                record?.sessionId != result.sessionId && lateCancel == null
             ) {
                 return@synchronized false
             }
             val pendingResult = PendingInstallResult(
                 result = result,
                 terminalAtEpochMillis = terminalAtEpochMillis,
-                packageName = record?.packageName.orEmpty(),
-                importToken = record?.importToken,
+                packageName = record?.packageName ?: requireNotNull(lateCancel).packageName,
+                importToken = record?.importToken ?: requireNotNull(lateCancel).importToken,
             )
             val existing = terminalResult
             if (existing != null) return@synchronized false
@@ -1866,6 +2205,113 @@ class InstallCoordinatorTest {
                 confirmationDeliveredSessionId = null
                 true
             }
+
+        override fun quarantineTerminalResult(
+            expectedRaw: PendingInstallResult,
+            expectedPending: PendingInstall?,
+            expectedFinal: FinalInstallReceipt?,
+        ): Boolean = synchronized(this) {
+            if (expectedRaw.importToken != null ||
+                terminalResult != expectedRaw ||
+                record != expectedPending ||
+                finalReceipt != expectedFinal
+            ) {
+                return@synchronized false
+            }
+            clearedTerminalResults += expectedRaw
+            terminalResult = null
+            confirmationDeliveredSessionId = null
+            true
+        }
+
+        override fun loadFinalReceipt(): FinalInstallReceipt? = synchronized(this) {
+            finalReceipt
+        }
+
+        override fun createFinalReceipt(
+            expectedPending: PendingInstall?,
+            expectedRaw: PendingInstallResult?,
+            receipt: FinalInstallReceipt,
+        ): Boolean = synchronized(this) {
+            if (createFinalFailure ||
+                record != expectedPending ||
+                terminalResult != expectedRaw ||
+                finalReceipt != null
+            ) {
+                return@synchronized false
+            }
+            finalReceipt = receipt
+            true
+        }
+
+        override fun replaceFinalReceipt(
+            expected: FinalInstallReceipt,
+            expectedRaw: PendingInstallResult?,
+            replacement: FinalInstallReceipt,
+        ): Boolean = synchronized(this) {
+            if (replaceFinalFailure ||
+                finalReceipt != expected ||
+                terminalResult != expectedRaw
+            ) {
+                return@synchronized false
+            }
+            finalReceipt = replacement
+            afterFinalReplace?.invoke(replacement)
+            true
+        }
+
+        override fun acknowledgeFinalReceipt(
+            expected: FinalInstallReceipt,
+            expectedRaw: PendingInstallResult?,
+        ): FinalInstallReceipt? = synchronized(this) {
+            beforeFinalAcknowledge?.invoke()
+            beforeFinalAcknowledge = null
+            if (acknowledgeFinalFailure ||
+                finalReceipt != expected ||
+                terminalResult != expectedRaw ||
+                expected.stage != FinalReceiptStage.READY
+            ) {
+                return@synchronized null
+            }
+            expected.copy(stage = FinalReceiptStage.ACKNOWLEDGED)
+                .also { finalReceipt = it }
+        }
+
+        override fun finalizeFinalReceipt(expected: FinalInstallReceipt): Boolean =
+            synchronized(this) {
+                if (finalizeFinalFailure) return@synchronized false
+                val current = finalReceipt ?: return@synchronized true
+                if (current != expected ||
+                    current.stage != FinalReceiptStage.ACKNOWLEDGED
+                ) {
+                    return@synchronized false
+                }
+                finalReceipt = null
+                terminalResult = null
+                true
+            }
+
+        override fun clearPendingPreservingImport(expected: PendingInstall): Boolean =
+            synchronized(this) {
+                if (clearPreservingImportFailure || record != expected) {
+                    return@synchronized false
+                }
+                record = null
+                true
+            }
+
+        override fun loadNormalHandoff(): NormalInstallHandoff? = synchronized(this) {
+            normalHandoff
+        }
+
+        override fun compareAndSetNormalHandoff(
+            expected: NormalInstallHandoff?,
+            replacement: NormalInstallHandoff?,
+        ): Boolean = synchronized(this) {
+            if (normalHandoff != expected) return@synchronized false
+            normalHandoff = replacement
+            true
+        }
 
         override fun firstSessionMissingAt(
             pending: PendingInstall,
@@ -2008,10 +2454,12 @@ class InstallCoordinatorTest {
 
     private class FakeManagerCatalog : ManagerCatalog {
         var replaced: CatalogRecord? = null
+        var replaceFailure: Throwable? = null
 
         override fun observe(): Flow<List<CatalogRecord>> = flowOf(listOfNotNull(replaced))
 
         override suspend fun replaceVerified(record: CatalogRecord) {
+            replaceFailure?.let { throw it }
             replaced = record
         }
 

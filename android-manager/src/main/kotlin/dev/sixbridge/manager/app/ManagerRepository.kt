@@ -30,8 +30,10 @@ import dev.sixbridge.manager.importer.ImportResult
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallCleanupResult
+import dev.sixbridge.manager.install.FinalReceiptStage
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
+import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallCallback
 import dev.sixbridge.manager.install.PackageInstallEvents
 import dev.sixbridge.manager.install.PackageInstallResult
@@ -108,6 +110,16 @@ sealed interface ManagerImportResult {
 data class ManagerRestoreResult(
     val review: ReviewBundle? = null,
     val installSessionId: Int? = null,
+    val terminal: RestoredInstallTerminal? = null,
+    val normalHandoff: NormalInstallHandoff? = null,
+)
+
+data class RestoredInstallTerminal(
+    val importToken: String,
+    val sessionId: Int?,
+    val packageName: String,
+    val state: InstallState,
+    val stage: FinalReceiptStage,
 )
 
 class RepositoryLaunch(
@@ -158,9 +170,18 @@ interface ManagerRepository {
     ): InstallTerminalOwnerResult
     suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
-        expectedSessionId: Int,
+        expectedSessionId: Int?,
         expectedState: InstallState,
     ): Boolean
+    suspend fun finalizeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedState: InstallState,
+    ): Boolean = false
+    fun compareAndSetNormalHandoff(
+        expected: NormalInstallHandoff?,
+        replacement: NormalInstallHandoff?,
+    ): Boolean = false
     fun discardReview(token: String): Boolean
     fun unknownSourcesSettings(): RepositoryLaunch
     suspend fun resumeAfterUnknownSourcesSettings()
@@ -228,7 +249,28 @@ internal class DefaultManagerRepository(
         val startupSnapshot = startup.awaitReady()
         val currentSnapshot = installCoordinator.currentRecoverySnapshot()
         val pending = currentSnapshot.pending
-        val retained = reviewToken?.let { token ->
+        val finalReceipt = pendingStore.loadFinalReceipt()
+        val normalHandoff = pendingStore.loadNormalHandoff()
+        val raw = pendingStore.loadTerminalResult()
+        val durableOwnerTokens = setOfNotNull(
+            finalReceipt?.importToken,
+            normalHandoff?.importToken,
+            pending?.importToken,
+            raw?.importToken,
+        )
+        val targetToken = reviewToken ?: finalReceipt?.importToken
+            ?: normalHandoff?.importToken
+            ?: pending?.importToken
+            ?: raw?.importToken
+        val expectedPackage = targetToken?.let { token ->
+            finalReceipt?.takeIf { it.importToken == token }?.packageName
+                ?: normalHandoff?.takeIf { it.importToken == token }?.packageName
+                ?: pending?.takeIf { it.importToken == token }?.packageName
+                ?: raw?.takeIf { it.importToken == token }?.packageName
+        }
+        val targetAllowed = targetToken != null &&
+            (durableOwnerTokens.isEmpty() || targetToken in durableOwnerTokens)
+        val retained = targetToken?.takeIf { targetAllowed }?.let { token ->
             when {
                 pending?.importToken == token && pending == startupSnapshot.pending ->
                     currentSnapshot.activeBundle
@@ -244,26 +286,35 @@ internal class DefaultManagerRepository(
                 pending?.importToken == token ->
                     withContext(ioDispatcher) { retainedImports.load(token) }
                         ?.takeIf { it.verifiedApk.packageName == pending.packageName }
-                pending == null -> currentSnapshot.activeBundle
+                else -> currentSnapshot.activeBundle
                     ?.takeIf { it.token == token }
-                    ?: if (startupSnapshot.pending?.importToken != token) {
-                        withContext(ioDispatcher) { retainedImports.load(token) }
-                    } else {
-                        null
-                    }
-                else -> null
+                    ?: startupSnapshot.restoredBundle?.takeIf { it.token == token }
+                    ?: withContext(ioDispatcher) { retainedImports.load(token) }
             }
         }
         val restoredSession = installSessionId?.takeIf { pending?.sessionId == it }
         val review = retained
             ?.takeIf {
-                it.token == reviewToken &&
-                    (pending == null ||
-                        pending.importToken == reviewToken &&
-                        pending.packageName == it.verifiedApk.packageName)
+                it.token == targetToken &&
+                    (expectedPackage == null ||
+                        expectedPackage == it.verifiedApk.packageName)
             }
             ?.toReview()
-        return ManagerRestoreResult(review, restoredSession)
+        val terminal = finalReceipt?.let {
+            RestoredInstallTerminal(
+                importToken = it.importToken,
+                sessionId = it.sessionId,
+                packageName = it.packageName,
+                state = it.state,
+                stage = it.stage,
+            )
+        }
+        return ManagerRestoreResult(
+            review = review,
+            installSessionId = restoredSession,
+            terminal = terminal,
+            normalHandoff = normalHandoff,
+        )
     }
 
     override suspend fun import(uri: Uri): ManagerImportResult {
@@ -349,13 +400,28 @@ internal class DefaultManagerRepository(
 
     override suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
-        expectedSessionId: Int,
+        expectedSessionId: Int?,
         expectedState: InstallState,
     ): Boolean = installCoordinator.acknowledgeTerminal(
         expectedImportToken = expectedReviewToken,
         expectedSessionId = expectedSessionId,
         expectedState = expectedState,
     )
+
+    override suspend fun finalizeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
+        expectedState: InstallState,
+    ): Boolean = installCoordinator.finalizeTerminal(
+        expectedImportToken = expectedReviewToken,
+        expectedSessionId = expectedSessionId,
+        expectedState = expectedState,
+    )
+
+    override fun compareAndSetNormalHandoff(
+        expected: NormalInstallHandoff?,
+        replacement: NormalInstallHandoff?,
+    ): Boolean = pendingStore.compareAndSetNormalHandoff(expected, replacement)
 
     override fun discardReview(token: String): Boolean =
         runCatching { pendingStore.discardImport(token) }.isSuccess
@@ -450,7 +516,11 @@ internal class RepositoryStartup(
                 if (!ready.isCompleted) {
                     startupCleanup.run()
                     val pending = pendingStore.load()
-                    val retained = pending?.importToken?.let { token ->
+                    val recoveryToken = pendingStore.loadFinalReceipt()?.importToken
+                        ?: pending?.importToken
+                        ?: pendingStore.loadTerminalResult()?.importToken
+                        ?: pendingStore.loadNormalHandoff()?.importToken
+                    val retained = recoveryToken?.let { token ->
                         withContext(ioDispatcher) { retainedImports.load(token) }
                     }
                     installCoordinator.restore(retained)

@@ -1321,7 +1321,13 @@ private class CleanupRestoreUiRepository(
 
     override suspend fun acknowledgeTerminal(
         expectedReviewToken: String,
-        expectedSessionId: Int,
+        expectedSessionId: Int?,
+        expectedState: InstallState,
+    ): Boolean = false
+
+    override suspend fun finalizeTerminal(
+        expectedReviewToken: String,
+        expectedSessionId: Int?,
         expectedState: InstallState,
     ): Boolean = false
 

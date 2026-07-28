@@ -12,6 +12,12 @@ import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
 import dev.sixbridge.manager.importer.ImportResult
+import dev.sixbridge.manager.install.FinalInstallReceipt
+import dev.sixbridge.manager.install.FinalReceiptOrigin
+import dev.sixbridge.manager.install.FinalReceiptStage
+import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.NormalHandoffStage
+import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
@@ -103,6 +109,275 @@ class CoreConversionRuntimeInstrumentedTest {
         assertNull(legacy.importToken)
         assertTrue(store.clearTerminalResult(legacy))
         assertFalse(recoveryPreferences.contains("result_import_token"))
+    }
+
+    @Test
+    fun finalReceiptAckFaultPreservesReceiptAndRetainedImportAcrossStoreRecreation() {
+        val pendingControl = MemoryPreferenceControl()
+        val pendingPreferences = memorySharedPreferences(pendingControl)
+        val recoveryControl = MemoryPreferenceControl()
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val importRoot = Files.createTempDirectory("sixbridge-final-receipt").toFile()
+        val token = "11111111-1111-1111-1111-111111111111"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        val retainedImport = File(importRoot, token).apply {
+            mkdirs()
+            File(this, "wrapper.apk").writeBytes(byteArrayOf(1, 2, 3))
+        }
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .putString("package_name", packageName)
+                .putString("import_token", token)
+                .putLong("started_at", 1)
+                .commit(),
+        )
+        val pending = requireNotNull(store.load())
+        assertTrue(
+            store.recordTerminalResult(
+                PackageInstallResult.Success(41),
+                terminalAtEpochMillis = 2,
+            ),
+        )
+        val raw = requireNotNull(store.loadTerminalResult())
+        val ready = FinalInstallReceipt(
+            importToken = token,
+            sessionId = 41,
+            packageName = packageName,
+            state = InstallState.Failed(
+                "POST_INSTALL_VERIFICATION_FAILED",
+                "설치된 래퍼를 검증할 수 없습니다.",
+            ),
+            stage = FinalReceiptStage.READY,
+            origin = FinalReceiptOrigin.RAW_TERMINAL,
+            rawTerminalAtEpochMillis = raw.terminalAtEpochMillis,
+            terminalAtEpochMillis = 3,
+        )
+
+        assertTrue(store.createFinalReceipt(pending, raw, ready))
+        pendingControl.failNextCommit = true
+        assertFalse(store.clearPendingPreservingImport(pending))
+        assertEquals(pending, store.load())
+        assertEquals(ready, store.loadFinalReceipt())
+        assertEquals(raw, store.loadTerminalResult())
+        assertTrue(retainedImport.exists())
+        assertTrue(store.clearPendingPreservingImport(pending))
+        assertTrue(retainedImport.exists())
+        recoveryControl.failNextCommit = true
+        assertNull(store.acknowledgeFinalReceipt(ready, raw))
+        assertEquals(ready, store.loadFinalReceipt())
+        assertTrue(retainedImport.exists())
+
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        val acknowledged = requireNotNull(recreated.acknowledgeFinalReceipt(ready, raw))
+        assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged.stage)
+        recoveryControl.failNextCommit = true
+        assertFalse(recreated.finalizeFinalReceipt(acknowledged))
+        assertEquals(acknowledged, recreated.loadFinalReceipt())
+        assertEquals(raw, recreated.loadTerminalResult())
+        assertTrue(retainedImport.exists())
+        assertTrue(recreated.finalizeFinalReceipt(acknowledged))
+        assertNull(recreated.loadFinalReceipt())
+        assertNull(recreated.loadTerminalResult())
+        assertTrue(retainedImport.exists())
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun programCancelReadyAcceptsExactLateRawAfterPendingClearAndReplacesProvenance() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryControl = MemoryPreferenceControl()
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val importRoot = Files.createTempDirectory("sixbridge-late-raw").toFile()
+        val token = "11111111-1111-1111-1111-111111111111"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        val retainedImport = File(importRoot, token).apply { mkdirs() }
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .putString("package_name", packageName)
+                .putString("import_token", token)
+                .putLong("started_at", 1)
+                .commit(),
+        )
+        val pending = requireNotNull(store.load())
+        val cancelling = FinalInstallReceipt(
+            importToken = token,
+            sessionId = 41,
+            packageName = packageName,
+            state = InstallState.Cancelled,
+            stage = FinalReceiptStage.CANCELLING,
+            origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+            rawTerminalAtEpochMillis = null,
+            terminalAtEpochMillis = 2,
+        )
+        recoveryControl.failNextCommit = true
+        assertFalse(store.createFinalReceipt(pending, null, cancelling))
+        assertNull(store.loadFinalReceipt())
+        assertEquals(pending, store.load())
+        assertTrue(retainedImport.exists())
+        assertTrue(store.createFinalReceipt(pending, null, cancelling))
+        assertTrue(store.clearPendingPreservingImport(pending))
+        val programReady = cancelling.copy(
+            stage = FinalReceiptStage.READY,
+            terminalAtEpochMillis = 3,
+        )
+        recoveryControl.failNextCommit = true
+        assertFalse(store.replaceFinalReceipt(cancelling, null, programReady))
+        assertEquals(cancelling, store.loadFinalReceipt())
+        assertTrue(retainedImport.exists())
+        assertTrue(store.replaceFinalReceipt(cancelling, null, programReady))
+
+        assertTrue(
+            store.recordTerminalResult(
+                PackageInstallResult.Success(41),
+                terminalAtEpochMillis = 4,
+            ),
+        )
+        val lateRaw = requireNotNull(store.loadTerminalResult())
+        assertNull(store.acknowledgeFinalReceipt(programReady, null))
+        assertEquals(programReady, store.loadFinalReceipt())
+        val rawReady = programReady.copy(
+            state = InstallState.Installed(packageName),
+            origin = FinalReceiptOrigin.RAW_TERMINAL,
+            rawTerminalAtEpochMillis = lateRaw.terminalAtEpochMillis,
+            terminalAtEpochMillis = 5,
+        )
+        recoveryControl.failNextCommit = true
+        assertFalse(store.replaceFinalReceipt(programReady, lateRaw, rawReady))
+        assertEquals(programReady, store.loadFinalReceipt())
+        assertEquals(lateRaw, store.loadTerminalResult())
+        assertTrue(retainedImport.exists())
+        assertTrue(store.replaceFinalReceipt(programReady, lateRaw, rawReady))
+        val acknowledged = requireNotNull(
+            store.acknowledgeFinalReceipt(rawReady, lateRaw),
+        )
+        assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged.stage)
+        assertEquals(acknowledged, store.loadFinalReceipt())
+        assertTrue(retainedImport.exists())
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun normalHandoffRoundTripsTerminalOutcomeWithoutBlockingImportCleanupOwner() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryControl = MemoryPreferenceControl()
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val importRoot = Files.createTempDirectory("sixbridge-normal-handoff").toFile()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        val token = "11111111-1111-1111-1111-111111111111"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        val prepared = NormalInstallHandoff(
+            importToken = token,
+            sessionId = null,
+            packageName = packageName,
+            state = InstallState.Cancelled,
+            stage = NormalHandoffStage.PREPARED,
+        )
+
+        recoveryControl.failNextCommit = true
+        assertFalse(store.compareAndSetNormalHandoff(null, prepared))
+        assertNull(store.loadNormalHandoff())
+        assertTrue(store.compareAndSetNormalHandoff(null, prepared))
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertEquals(prepared, recreated.loadNormalHandoff())
+        assertFalse(recreated.compareAndSetNormalHandoff(prepared, null))
+        assertEquals(prepared, recreated.loadNormalHandoff())
+        val ready = prepared.copy(stage = NormalHandoffStage.OUTCOME_READY)
+        recoveryControl.failNextCommit = true
+        assertFalse(recreated.compareAndSetNormalHandoff(prepared, ready))
+        assertEquals(prepared, recreated.loadNormalHandoff())
+        assertTrue(recreated.compareAndSetNormalHandoff(prepared, ready))
+        assertEquals(ready, recreated.loadNormalHandoff())
+        recoveryControl.failNextCommit = true
+        assertFalse(recreated.compareAndSetNormalHandoff(ready, null))
+        assertEquals(ready, recreated.loadNormalHandoff())
+        assertTrue(recreated.compareAndSetNormalHandoff(ready, null))
+        assertNull(recreated.loadNormalHandoff())
+        importRoot.deleteRecursively()
+    }
+
+    @Test
+    fun tokenlessRawQuarantineCommitFaultPreservesExactPendingAndImport() {
+        val pendingPreferences = memorySharedPreferences()
+        val recoveryControl = MemoryPreferenceControl()
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val importRoot = Files.createTempDirectory("sixbridge-tokenless-raw").toFile()
+        val token = "11111111-1111-1111-1111-111111111111"
+        val nextToken = "22222222-2222-2222-2222-222222222222"
+        val packageName = "dev.sixbridge.ext.${"a".repeat(32)}"
+        val retainedImport = File(importRoot, token).apply { mkdirs() }
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertTrue(
+            pendingPreferences.edit()
+                .putInt("session_id", 41)
+                .putString("package_name", packageName)
+                .putString("import_token", token)
+                .putLong("started_at", 1)
+                .commit(),
+        )
+        assertTrue(
+            recoveryPreferences.edit()
+                .putInt("result_session_id", 41)
+                .putString("result_kind", "cancelled")
+                .putString("result_package_name", packageName)
+                .putLong("terminal_at", 2)
+                .commit(),
+        )
+        val pending = requireNotNull(store.load())
+        val legacyRaw = requireNotNull(store.loadTerminalResult())
+        assertNull(legacyRaw.importToken)
+
+        recoveryControl.failNextCommit = true
+        assertFalse(store.quarantineTerminalResult(legacyRaw, pending, null))
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pendingPreferences,
+            recoveryPreferences = recoveryPreferences,
+            importDirectory = importRoot,
+        )
+        assertEquals(pending, recreated.load())
+        assertEquals(legacyRaw, recreated.loadTerminalResult())
+        assertTrue(retainedImport.exists())
+
+        assertTrue(recreated.quarantineTerminalResult(legacyRaw, pending, null))
+        assertNull(recreated.loadTerminalResult())
+        assertEquals(pending, recreated.load())
+        assertTrue(retainedImport.exists())
+        assertTrue(recreated.clearPendingPreservingImport(pending))
+        assertNotNull(
+            recreated.tryClaim(
+                packageName = packageName,
+                importToken = nextToken,
+                startedAtEpochMillis = 3,
+            ),
+        )
+        importRoot.deleteRecursively()
     }
 
     @Test
@@ -637,7 +912,13 @@ class CoreConversionRuntimeInstrumentedTest {
             .joinToString("") { "%02x".format(it) }
 }
 
-private fun memorySharedPreferences(): SharedPreferences {
+private class MemoryPreferenceControl {
+    var failNextCommit: Boolean = false
+}
+
+private fun memorySharedPreferences(
+    control: MemoryPreferenceControl = MemoryPreferenceControl(),
+): SharedPreferences {
     val values = linkedMapOf<String, Any?>()
 
     fun editor(): SharedPreferences.Editor {
@@ -682,8 +963,13 @@ private fun memorySharedPreferences(): SharedPreferences {
                 }
 
                 "commit" -> {
-                    applyChanges()
-                    true
+                    if (control.failNextCommit) {
+                        control.failNextCommit = false
+                        false
+                    } else {
+                        applyChanges()
+                        true
+                    }
                 }
 
                 "apply" -> {

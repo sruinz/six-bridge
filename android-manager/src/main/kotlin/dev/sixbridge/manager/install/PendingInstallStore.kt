@@ -25,6 +25,33 @@ interface PendingInstallStore {
     fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean
     fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult?
     fun clearTerminalResult(expected: PendingInstallResult): Boolean
+    fun loadFinalReceipt(): FinalInstallReceipt? = null
+    fun createFinalReceipt(
+        expectedPending: PendingInstall?,
+        expectedRaw: PendingInstallResult?,
+        receipt: FinalInstallReceipt,
+    ): Boolean = false
+    fun replaceFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+        replacement: FinalInstallReceipt,
+    ): Boolean = false
+    fun acknowledgeFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+    ): FinalInstallReceipt? = null
+    fun finalizeFinalReceipt(expected: FinalInstallReceipt): Boolean = false
+    fun clearPendingPreservingImport(expected: PendingInstall): Boolean = false
+    fun loadNormalHandoff(): NormalInstallHandoff? = null
+    fun compareAndSetNormalHandoff(
+        expected: NormalInstallHandoff?,
+        replacement: NormalInstallHandoff?,
+    ): Boolean = false
+    fun quarantineTerminalResult(
+        expectedRaw: PendingInstallResult,
+        expectedPending: PendingInstall?,
+        expectedFinal: FinalInstallReceipt?,
+    ): Boolean = false
     fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long
     fun clearSessionMissingObservation(pending: PendingInstall): Boolean
 }
@@ -49,7 +76,13 @@ class SharedPreferencesPendingInstallStore internal constructor(
         importToken: String,
         startedAtEpochMillis: Long,
     ): PendingInstall? = synchronized(PROCESS_LOCK) {
-        if (loadPendingLocked() != null || loadTerminalLocked() != null) return@synchronized null
+        if (loadPendingLocked() != null ||
+            loadTerminalLocked() != null ||
+            loadFinalReceiptLocked() != null ||
+            loadNormalHandoffLocked() != null
+        ) {
+            return@synchronized null
+        }
         if (!recoveryPreferences.edit().remove(KEY_CONFIRMATION_SESSION_ID).commit()) {
             return@synchronized null
         }
@@ -110,7 +143,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
         expected: PendingInstall,
     ): PendingCleanupResult = synchronized(PROCESS_LOCK) {
         if (loadPendingLocked() != expected) return@synchronized PendingCleanupResult.Failed
-        if (loadTerminalLocked() != null) {
+        if (loadTerminalLocked() != null || loadFinalReceiptLocked() != null) {
             return@synchronized PendingCleanupResult.TerminalAvailable
         }
         val importDiscarded = runCatching {
@@ -161,12 +194,20 @@ class SharedPreferencesPendingInstallStore internal constructor(
             return@synchronized false
         }
         val pending = loadPendingLocked()
-        if (pending == null || pending.sessionId != result.sessionId) return@synchronized false
+        val lateProgramCancel = loadFinalReceiptLocked()?.takeIf { receipt ->
+            pending == null &&
+                receipt.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                receipt.stage != FinalReceiptStage.ACKNOWLEDGED &&
+                receipt.sessionId == result.sessionId
+        }
+        if (pending?.sessionId != result.sessionId && lateProgramCancel == null) {
+            return@synchronized false
+        }
         val sanitized = PendingInstallResult(
             result = sanitize(result),
             terminalAtEpochMillis = terminalAtEpochMillis,
-            packageName = pending.packageName,
-            importToken = pending.importToken,
+            packageName = pending?.packageName ?: requireNotNull(lateProgramCancel).packageName,
+            importToken = pending?.importToken ?: requireNotNull(lateProgramCancel).importToken,
         )
         val existing = loadTerminalLocked()
         if (existing != null) {
@@ -205,19 +246,173 @@ class SharedPreferencesPendingInstallStore internal constructor(
 
     override fun clearTerminalResult(expected: PendingInstallResult): Boolean =
         synchronized(PROCESS_LOCK) {
-            if (loadTerminalLocked() != expected) return@synchronized false
-            recoveryPreferences.edit()
-                .remove(KEY_RESULT_SESSION_ID)
-                .remove(KEY_RESULT_KIND)
-                .remove(KEY_RESULT_CODE)
-                .remove(KEY_RESULT_MESSAGE)
-                .remove(KEY_RESULT_PACKAGE_NAME)
-                .remove(KEY_RESULT_IMPORT_TOKEN)
-                .remove(KEY_RESULT_PROCESSED)
-                .remove(KEY_CONFIRMATION_SESSION_ID)
-                .remove(KEY_TERMINAL_AT)
-                .commit()
+            if (loadTerminalLocked() != expected ||
+                loadFinalReceiptLocked() != null
+            ) {
+                return@synchronized false
+            }
+            clearRawTerminal(recoveryPreferences.edit()).commit()
         }
+
+    override fun loadFinalReceipt(): FinalInstallReceipt? = synchronized(PROCESS_LOCK) {
+        loadFinalReceiptLocked()
+    }
+
+    override fun createFinalReceipt(
+        expectedPending: PendingInstall?,
+        expectedRaw: PendingInstallResult?,
+        receipt: FinalInstallReceipt,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (!isValid(receipt) ||
+            !receipt.matchesRaw(expectedRaw) ||
+            loadPendingLocked() != expectedPending ||
+            loadTerminalLocked() != expectedRaw ||
+            loadFinalReceiptLocked() != null
+        ) {
+            return@synchronized false
+        }
+        writeFinalReceiptLocked(receipt)
+    }
+
+    override fun replaceFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+        replacement: FinalInstallReceipt,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (!isValid(replacement) ||
+            loadFinalReceiptLocked() != expected ||
+            loadTerminalLocked() != expectedRaw ||
+            expected.importToken != replacement.importToken ||
+            expected.packageName != replacement.packageName
+        ) {
+            return@synchronized false
+        }
+        if (!replacement.matchesRaw(expectedRaw)) return@synchronized false
+        val validTransition = when {
+            expected.stage == FinalReceiptStage.CANCELLING &&
+                expected.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                replacement.stage == FinalReceiptStage.READY &&
+                replacement.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                expectedRaw == null &&
+                expected.sessionId == replacement.sessionId -> true
+            expected.stage == FinalReceiptStage.CANCELLING &&
+                expected.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                replacement.stage == FinalReceiptStage.READY &&
+                replacement.origin == FinalReceiptOrigin.RAW_TERMINAL &&
+                expectedRaw != null &&
+                (expected.sessionId == null ||
+                    expected.sessionId == replacement.sessionId) -> true
+            expected.stage == FinalReceiptStage.READY &&
+                expected.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                replacement.stage == FinalReceiptStage.READY &&
+                replacement.origin == FinalReceiptOrigin.RAW_TERMINAL &&
+                expectedRaw != null &&
+                expected.sessionId == replacement.sessionId -> true
+            else -> false
+        }
+        if (!validTransition) return@synchronized false
+        writeFinalReceiptLocked(replacement)
+    }
+
+    override fun acknowledgeFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+    ): FinalInstallReceipt? = synchronized(PROCESS_LOCK) {
+        val current = loadFinalReceiptLocked()
+        if (current != expected ||
+            loadTerminalLocked() != expectedRaw ||
+            !current.matchesRaw(expectedRaw)
+        ) {
+            return@synchronized null
+        }
+        if (current.stage == FinalReceiptStage.ACKNOWLEDGED) {
+            return@synchronized current
+        }
+        if (current.stage != FinalReceiptStage.READY) return@synchronized null
+        val acknowledged = current.copy(stage = FinalReceiptStage.ACKNOWLEDGED)
+        acknowledged.takeIf { writeFinalReceiptLocked(it) }
+    }
+
+    override fun finalizeFinalReceipt(
+        expected: FinalInstallReceipt,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        val current = loadFinalReceiptLocked()
+        if (current == null) return@synchronized true
+        if (current != expected || current.stage != FinalReceiptStage.ACKNOWLEDGED) {
+            return@synchronized false
+        }
+        val raw = loadTerminalLocked()
+        if (raw != null && !raw.matches(current)) return@synchronized false
+        val editor = clearFinalReceipt(recoveryPreferences.edit())
+        if (raw != null) clearRawTerminal(editor)
+        editor.commit()
+    }
+
+    override fun clearPendingPreservingImport(
+        expected: PendingInstall,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (loadPendingLocked() != expected) return@synchronized false
+        pendingPreferences.edit()
+            .remove(KEY_SESSION_ID)
+            .remove(KEY_PACKAGE_NAME)
+            .remove(KEY_IMPORT_TOKEN)
+            .remove(KEY_STARTED_AT)
+            .commit()
+    }
+
+    override fun loadNormalHandoff(): NormalInstallHandoff? =
+        synchronized(PROCESS_LOCK) {
+            loadNormalHandoffLocked()
+        }
+
+    override fun compareAndSetNormalHandoff(
+        expected: NormalInstallHandoff?,
+        replacement: NormalInstallHandoff?,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (loadNormalHandoffLocked() != expected ||
+            replacement?.let(::isValid) == false
+        ) {
+            return@synchronized false
+        }
+        val validTransition = when {
+            expected == null ->
+                replacement?.stage == NormalHandoffStage.PREPARED
+            expected.stage == NormalHandoffStage.PREPARED ->
+                replacement?.stage == NormalHandoffStage.OUTCOME_READY
+            expected.stage == NormalHandoffStage.OUTCOME_READY ->
+                replacement == null
+            else -> false
+        }
+        if (!validTransition) return@synchronized false
+        if (expected != null && replacement != null &&
+            (expected.importToken != replacement.importToken ||
+                expected.sessionId != replacement.sessionId ||
+                expected.packageName != replacement.packageName ||
+                expected.state != replacement.state)
+        ) {
+            return@synchronized false
+        }
+        if (replacement == null) {
+            clearNormalHandoff(recoveryPreferences.edit()).commit()
+        } else {
+            writeNormalHandoffLocked(replacement)
+        }
+    }
+
+    override fun quarantineTerminalResult(
+        expectedRaw: PendingInstallResult,
+        expectedPending: PendingInstall?,
+        expectedFinal: FinalInstallReceipt?,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (expectedRaw.importToken != null ||
+            loadTerminalLocked() != expectedRaw ||
+            loadPendingLocked() != expectedPending ||
+            loadFinalReceiptLocked() != expectedFinal
+        ) {
+            return@synchronized false
+        }
+        clearRawTerminal(recoveryPreferences.edit()).commit()
+    }
 
     override fun firstSessionMissingAt(
         pending: PendingInstall,
@@ -345,6 +540,217 @@ class SharedPreferencesPendingInstallStore internal constructor(
         )
     }
 
+    private fun loadFinalReceiptLocked(): FinalInstallReceipt? {
+        if (!recoveryPreferences.contains(KEY_FINAL_VERSION)) return null
+        val version = recoveryPreferences.getInt(KEY_FINAL_VERSION, -1)
+        val token = recoveryPreferences.getString(KEY_FINAL_IMPORT_TOKEN, null).orEmpty()
+        val packageName = recoveryPreferences.getString(KEY_FINAL_PACKAGE_NAME, null).orEmpty()
+        val hasSession = recoveryPreferences.getBoolean(KEY_FINAL_HAS_SESSION, false)
+        val sessionId = recoveryPreferences.getInt(KEY_FINAL_SESSION_ID, -1)
+            .takeIf { hasSession }
+        val stage = enumValueOrNull<FinalReceiptStage>(
+            recoveryPreferences.getString(KEY_FINAL_STAGE, null),
+        ) ?: return null
+        val origin = enumValueOrNull<FinalReceiptOrigin>(
+            recoveryPreferences.getString(KEY_FINAL_ORIGIN, null),
+        ) ?: return null
+        val rawTerminalAt = recoveryPreferences.getLong(KEY_FINAL_RAW_TERMINAL_AT, -1)
+            .takeIf { it > 0 }
+        val terminalAt = recoveryPreferences.getLong(KEY_FINAL_TERMINAL_AT, -1)
+        val state = loadInstallState(
+            kindKey = KEY_FINAL_STATE_KIND,
+            codeKey = KEY_FINAL_STATE_CODE,
+            messageKey = KEY_FINAL_STATE_MESSAGE,
+            packageName = packageName,
+        ) ?: return null
+        return runCatching {
+            FinalInstallReceipt(
+                importToken = token,
+                sessionId = sessionId,
+                packageName = packageName,
+                state = state,
+                stage = stage,
+                origin = origin,
+                rawTerminalAtEpochMillis = rawTerminalAt,
+                terminalAtEpochMillis = terminalAt,
+                version = version,
+            )
+        }.getOrNull()?.takeIf(::isValid)
+    }
+
+    private fun writeFinalReceiptLocked(receipt: FinalInstallReceipt): Boolean {
+        val editor = recoveryPreferences.edit()
+            .putInt(KEY_FINAL_VERSION, receipt.version)
+            .putString(KEY_FINAL_IMPORT_TOKEN, receipt.importToken)
+            .putBoolean(KEY_FINAL_HAS_SESSION, receipt.sessionId != null)
+            .putString(KEY_FINAL_PACKAGE_NAME, receipt.packageName)
+            .putString(KEY_FINAL_STAGE, receipt.stage.name)
+            .putString(KEY_FINAL_ORIGIN, receipt.origin.name)
+            .putLong(KEY_FINAL_TERMINAL_AT, receipt.terminalAtEpochMillis)
+        receipt.sessionId?.let { editor.putInt(KEY_FINAL_SESSION_ID, it) }
+            ?: editor.remove(KEY_FINAL_SESSION_ID)
+        receipt.rawTerminalAtEpochMillis?.let {
+            editor.putLong(KEY_FINAL_RAW_TERMINAL_AT, it)
+        } ?: editor.remove(KEY_FINAL_RAW_TERMINAL_AT)
+        writeInstallState(
+            editor = editor,
+            state = receipt.state,
+            kindKey = KEY_FINAL_STATE_KIND,
+            codeKey = KEY_FINAL_STATE_CODE,
+            messageKey = KEY_FINAL_STATE_MESSAGE,
+        )
+        return editor.commit()
+    }
+
+    private fun loadNormalHandoffLocked(): NormalInstallHandoff? {
+        if (!recoveryPreferences.contains(KEY_HANDOFF_VERSION)) return null
+        val version = recoveryPreferences.getInt(KEY_HANDOFF_VERSION, -1)
+        val token = recoveryPreferences.getString(KEY_HANDOFF_IMPORT_TOKEN, null).orEmpty()
+        val packageName = recoveryPreferences.getString(KEY_HANDOFF_PACKAGE_NAME, null).orEmpty()
+        val hasSession = recoveryPreferences.getBoolean(KEY_HANDOFF_HAS_SESSION, false)
+        val sessionId = recoveryPreferences.getInt(KEY_HANDOFF_SESSION_ID, -1)
+            .takeIf { hasSession }
+        val stage = enumValueOrNull<NormalHandoffStage>(
+            recoveryPreferences.getString(KEY_HANDOFF_STAGE, null),
+        ) ?: return null
+        val state = loadInstallState(
+            kindKey = KEY_HANDOFF_STATE_KIND,
+            codeKey = KEY_HANDOFF_STATE_CODE,
+            messageKey = KEY_HANDOFF_STATE_MESSAGE,
+            packageName = packageName,
+        ) ?: return null
+        return runCatching {
+            NormalInstallHandoff(
+                importToken = token,
+                sessionId = sessionId,
+                packageName = packageName,
+                state = state,
+                stage = stage,
+                version = version,
+            )
+        }.getOrNull()?.takeIf(::isValid)
+    }
+
+    private fun writeNormalHandoffLocked(handoff: NormalInstallHandoff): Boolean {
+        val editor = recoveryPreferences.edit()
+            .putInt(KEY_HANDOFF_VERSION, handoff.version)
+            .putString(KEY_HANDOFF_IMPORT_TOKEN, handoff.importToken)
+            .putBoolean(KEY_HANDOFF_HAS_SESSION, handoff.sessionId != null)
+            .putString(KEY_HANDOFF_PACKAGE_NAME, handoff.packageName)
+            .putString(KEY_HANDOFF_STAGE, handoff.stage.name)
+        handoff.sessionId?.let { editor.putInt(KEY_HANDOFF_SESSION_ID, it) }
+            ?: editor.remove(KEY_HANDOFF_SESSION_ID)
+        writeInstallState(
+            editor = editor,
+            state = handoff.state,
+            kindKey = KEY_HANDOFF_STATE_KIND,
+            codeKey = KEY_HANDOFF_STATE_CODE,
+            messageKey = KEY_HANDOFF_STATE_MESSAGE,
+        )
+        return editor.commit()
+    }
+
+    private fun loadInstallState(
+        kindKey: String,
+        codeKey: String,
+        messageKey: String,
+        packageName: String,
+    ): InstallState? = when (recoveryPreferences.getString(kindKey, null)) {
+        STATE_INSTALLED -> InstallState.Installed(packageName)
+        STATE_CANCELLED -> InstallState.Cancelled
+        STATE_FAILED -> InstallState.Failed(
+            code = recoveryPreferences.getString(codeKey, null)
+                ?.takeIf(String::isNotBlank)
+                ?: return null,
+            message = recoveryPreferences.getString(messageKey, null)
+                ?.takeIf(String::isNotBlank)
+                ?: return null,
+        )
+        else -> null
+    }
+
+    private fun writeInstallState(
+        editor: SharedPreferences.Editor,
+        state: InstallState,
+        kindKey: String,
+        codeKey: String,
+        messageKey: String,
+    ) {
+        when (state) {
+            is InstallState.Installed -> editor
+                .putString(kindKey, STATE_INSTALLED)
+                .remove(codeKey)
+                .remove(messageKey)
+            is InstallState.Cancelled -> editor
+                .putString(kindKey, STATE_CANCELLED)
+                .remove(codeKey)
+                .remove(messageKey)
+            is InstallState.Failed -> editor
+                .putString(kindKey, STATE_FAILED)
+                .putString(codeKey, state.code)
+                .putString(messageKey, state.message)
+            else -> error("terminal install state만 저장할 수 있습니다.")
+        }
+    }
+
+    private inline fun <reified T : Enum<T>> enumValueOrNull(value: String?): T? =
+        value?.let { candidate ->
+            enumValues<T>().firstOrNull { it.name == candidate }
+        }
+
+    private fun clearRawTerminal(editor: SharedPreferences.Editor): SharedPreferences.Editor =
+        editor
+            .remove(KEY_RESULT_SESSION_ID)
+            .remove(KEY_RESULT_KIND)
+            .remove(KEY_RESULT_CODE)
+            .remove(KEY_RESULT_MESSAGE)
+            .remove(KEY_RESULT_PACKAGE_NAME)
+            .remove(KEY_RESULT_IMPORT_TOKEN)
+            .remove(KEY_RESULT_PROCESSED)
+            .remove(KEY_TERMINAL_AT)
+
+    private fun clearFinalReceipt(editor: SharedPreferences.Editor): SharedPreferences.Editor =
+        editor
+            .remove(KEY_FINAL_VERSION)
+            .remove(KEY_FINAL_IMPORT_TOKEN)
+            .remove(KEY_FINAL_HAS_SESSION)
+            .remove(KEY_FINAL_SESSION_ID)
+            .remove(KEY_FINAL_PACKAGE_NAME)
+            .remove(KEY_FINAL_STATE_KIND)
+            .remove(KEY_FINAL_STATE_CODE)
+            .remove(KEY_FINAL_STATE_MESSAGE)
+            .remove(KEY_FINAL_STAGE)
+            .remove(KEY_FINAL_ORIGIN)
+            .remove(KEY_FINAL_RAW_TERMINAL_AT)
+            .remove(KEY_FINAL_TERMINAL_AT)
+
+    private fun clearNormalHandoff(editor: SharedPreferences.Editor): SharedPreferences.Editor =
+        editor
+            .remove(KEY_HANDOFF_VERSION)
+            .remove(KEY_HANDOFF_IMPORT_TOKEN)
+            .remove(KEY_HANDOFF_HAS_SESSION)
+            .remove(KEY_HANDOFF_SESSION_ID)
+            .remove(KEY_HANDOFF_PACKAGE_NAME)
+            .remove(KEY_HANDOFF_STATE_KIND)
+            .remove(KEY_HANDOFF_STATE_CODE)
+            .remove(KEY_HANDOFF_STATE_MESSAGE)
+            .remove(KEY_HANDOFF_STAGE)
+
+    private fun FinalInstallReceipt.matchesRaw(raw: PendingInstallResult?): Boolean =
+        when (origin) {
+            FinalReceiptOrigin.PROGRAM_CANCEL -> raw == null
+            FinalReceiptOrigin.RAW_TERMINAL ->
+                raw != null &&
+                    raw.result.sessionId == sessionId &&
+                    raw.packageName == packageName &&
+                    raw.importToken == importToken &&
+                    raw.terminalAtEpochMillis == rawTerminalAtEpochMillis
+        }
+
+    private fun PendingInstallResult.matches(receipt: FinalInstallReceipt): Boolean =
+        receipt.origin == FinalReceiptOrigin.RAW_TERMINAL &&
+            receipt.matchesRaw(this)
+
     private fun sanitize(result: PackageInstallResult): PackageInstallResult = when (result) {
         is PackageInstallResult.Success -> result
         is PackageInstallResult.Cancelled -> result
@@ -373,6 +779,18 @@ class SharedPreferencesPendingInstallStore internal constructor(
             PACKAGE_NAME.matches(pending.packageName) &&
             isCanonicalToken(pending.importToken) &&
             pending.startedAtEpochMillis > 0
+
+    private fun isValid(receipt: FinalInstallReceipt): Boolean =
+        PACKAGE_NAME.matches(receipt.packageName) &&
+            isCanonicalToken(receipt.importToken) &&
+            (receipt.state !is InstallState.Installed ||
+                receipt.state.packageName == receipt.packageName)
+
+    private fun isValid(handoff: NormalInstallHandoff): Boolean =
+        PACKAGE_NAME.matches(handoff.packageName) &&
+            isCanonicalToken(handoff.importToken) &&
+            (handoff.state !is InstallState.Installed ||
+                handoff.state.packageName == handoff.packageName)
 
     private fun isCanonicalToken(token: String): Boolean =
         runCatching { UUID.fromString(token).toString() == token }.getOrDefault(false)
@@ -436,9 +854,33 @@ class SharedPreferencesPendingInstallStore internal constructor(
         const val KEY_MISSING_SESSION_ID = "missing_session_id"
         const val KEY_MISSING_IMPORT_TOKEN = "missing_import_token"
         const val KEY_MISSING_OBSERVED_AT = "missing_observed_at"
+        const val KEY_FINAL_VERSION = "final_version"
+        const val KEY_FINAL_IMPORT_TOKEN = "final_import_token"
+        const val KEY_FINAL_HAS_SESSION = "final_has_session"
+        const val KEY_FINAL_SESSION_ID = "final_session_id"
+        const val KEY_FINAL_PACKAGE_NAME = "final_package_name"
+        const val KEY_FINAL_STATE_KIND = "final_state_kind"
+        const val KEY_FINAL_STATE_CODE = "final_state_code"
+        const val KEY_FINAL_STATE_MESSAGE = "final_state_message"
+        const val KEY_FINAL_STAGE = "final_stage"
+        const val KEY_FINAL_ORIGIN = "final_origin"
+        const val KEY_FINAL_RAW_TERMINAL_AT = "final_raw_terminal_at"
+        const val KEY_FINAL_TERMINAL_AT = "final_terminal_at"
+        const val KEY_HANDOFF_VERSION = "handoff_version"
+        const val KEY_HANDOFF_IMPORT_TOKEN = "handoff_import_token"
+        const val KEY_HANDOFF_HAS_SESSION = "handoff_has_session"
+        const val KEY_HANDOFF_SESSION_ID = "handoff_session_id"
+        const val KEY_HANDOFF_PACKAGE_NAME = "handoff_package_name"
+        const val KEY_HANDOFF_STATE_KIND = "handoff_state_kind"
+        const val KEY_HANDOFF_STATE_CODE = "handoff_state_code"
+        const val KEY_HANDOFF_STATE_MESSAGE = "handoff_state_message"
+        const val KEY_HANDOFF_STAGE = "handoff_stage"
         const val RESULT_SUCCESS = "success"
         const val RESULT_CANCELLED = "cancelled"
         const val RESULT_FAILURE = "failure"
+        const val STATE_INSTALLED = "installed"
+        const val STATE_CANCELLED = "cancelled"
+        const val STATE_FAILED = "failed"
         const val DEFAULT_FAILURE_CODE = "PACKAGE_INSTALLER_FAILURE"
         const val DEFAULT_FAILURE_MESSAGE = "PackageInstaller가 설치를 완료하지 못했습니다."
         const val MAX_CODE_LENGTH = 64

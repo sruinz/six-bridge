@@ -2,6 +2,13 @@ package dev.sixbridge.manager.cleanup
 
 import android.content.Intent
 import dev.sixbridge.manager.install.PackageInstallGateway
+import dev.sixbridge.manager.install.FinalInstallReceipt
+import dev.sixbridge.manager.install.FinalReceiptOrigin
+import dev.sixbridge.manager.install.FinalReceiptStage
+import dev.sixbridge.manager.install.InstallSessionSnapshot
+import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.NormalHandoffStage
+import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.PendingCleanupResult
 import dev.sixbridge.manager.install.PendingInstall
@@ -165,6 +172,49 @@ class StartupCleanupTest {
         }
 
     @Test
+    fun `startup cleanup은 final handoff pending raw의 모든 import token을 보호한다`() =
+        runBlocking {
+            val pending = PendingInstall(41, PACKAGE_NAME, EXPIRED_TOKEN, now)
+            val terminal = PendingInstallResult(
+                result = PackageInstallResult.Cancelled(42),
+                terminalAtEpochMillis = now,
+                packageName = PACKAGE_NAME,
+                importToken = OTHER_TOKEN,
+            )
+            val finalReceipt = FinalInstallReceipt(
+                importToken = FINAL_TOKEN,
+                sessionId = null,
+                packageName = PACKAGE_NAME,
+                state = InstallState.Cancelled,
+                stage = FinalReceiptStage.READY,
+                origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+                rawTerminalAtEpochMillis = null,
+                terminalAtEpochMillis = now,
+            )
+            val handoff = NormalInstallHandoff(
+                importToken = HANDOFF_TOKEN,
+                sessionId = null,
+                packageName = PACKAGE_NAME,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.OUTCOME_READY,
+            )
+            val store = FakePendingStore(
+                record = pending,
+                terminal = terminal,
+                finalReceipt = finalReceipt,
+                normalHandoff = handoff,
+            )
+            val protected = listOf(EXPIRED_TOKEN, OTHER_TOKEN, FINAL_TOKEN, HANDOFF_TOKEN)
+                .map { tokenDirectory(it, now - DAY_MILLIS - 1) }
+            val unprotected = tokenDirectory(UNPROTECTED_TOKEN, now - DAY_MILLIS - 1)
+
+            cleanup(store = store).run()
+
+            assertTrue(protected.all(File::exists))
+            assertFalse(unprotected.exists())
+        }
+
+    @Test
     fun `abandons only owned sessions that are not the recoverable pending session`() = runBlocking {
         val pending = pending(sessionId = 41, startedAt = now)
         val gateway = FakeGateway(owned = mutableListOf(41, 77))
@@ -314,11 +364,18 @@ class StartupCleanupTest {
             ownedFailure?.let { throw it }
             return owned.toList()
         }
+
+        override fun sessionSnapshot(sessionId: Int): InstallSessionSnapshot? =
+            sessionId.takeIf(owned::contains)?.let {
+                InstallSessionSnapshot(it, PACKAGE_NAME, ownedByCaller = true)
+            }
     }
 
     private class FakePendingStore(
         var record: PendingInstall? = null,
         var terminal: PendingInstallResult? = null,
+        var finalReceipt: FinalInstallReceipt? = null,
+        var normalHandoff: NormalInstallHandoff? = null,
         var missingObservedAt: Long? = null,
         var loadFailure: Throwable? = null,
         var terminalLoadFailure: Throwable? = null,
@@ -352,6 +409,8 @@ class StartupCleanupTest {
         override fun recordTerminalResult(result: PackageInstallResult, terminalAtEpochMillis: Long): Boolean = false
         override fun markTerminalProcessed(expected: PendingInstallResult): PendingInstallResult? = null
         override fun clearTerminalResult(expected: PendingInstallResult): Boolean = false
+        override fun loadFinalReceipt(): FinalInstallReceipt? = finalReceipt
+        override fun loadNormalHandoff(): NormalInstallHandoff? = normalHandoff
         override fun firstSessionMissingAt(pending: PendingInstall, observedAtEpochMillis: Long): Long =
             missingObservationFailure?.let { throw it }
                 ?: missingObservedAt ?: observedAtEpochMillis.also { missingObservedAt = it }
@@ -385,6 +444,9 @@ class StartupCleanupTest {
         const val EXPIRED_TOKEN = "123e4567-e89b-12d3-a456-426614174000"
         const val RECENT_TOKEN = "123e4567-e89b-12d3-a456-426614174001"
         const val OTHER_TOKEN = "123e4567-e89b-12d3-a456-426614174002"
+        const val FINAL_TOKEN = "123e4567-e89b-12d3-a456-426614174003"
+        const val HANDOFF_TOKEN = "123e4567-e89b-12d3-a456-426614174004"
+        const val UNPROTECTED_TOKEN = "123e4567-e89b-12d3-a456-426614174005"
         const val PACKAGE_NAME = "dev.sixbridge.ext.aabbccddeeffgghhiijjkkllmmnnoopp"
     }
 }

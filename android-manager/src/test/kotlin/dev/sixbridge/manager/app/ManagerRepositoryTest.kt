@@ -32,9 +32,15 @@ import dev.sixbridge.manager.importer.BundleSource
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallCleanupResult
+import dev.sixbridge.manager.install.FinalInstallReceipt
+import dev.sixbridge.manager.install.FinalReceiptOrigin
+import dev.sixbridge.manager.install.FinalReceiptStage
 import dev.sixbridge.manager.install.InstallPolicy
+import dev.sixbridge.manager.install.InstallSessionSnapshot
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
+import dev.sixbridge.manager.install.NormalHandoffStage
+import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.PackageInstallCallback
@@ -436,6 +442,189 @@ class ManagerRepositoryTest {
             )
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `generated terminal finalize death 뒤 실제 retained review로 같은 설치를 다시 시작한다`() {
+        val dispatcher = StandardTestDispatcher()
+        Dispatchers.setMain(dispatcher)
+        try {
+            runTest(dispatcher.scheduler) {
+                listOf(
+                    PackageInstallResult.Cancelled(41),
+                    PackageInstallResult.Failure(
+                        41,
+                        "SYSTEM_FAILURE",
+                        "installer rejected package",
+                    ),
+                ).forEachIndexed { index, terminal ->
+                    val root = temporaryFolder.newFolder("generated-terminal-retry-$index")
+                    val bundle = importedBundle(root)
+                    val verifier = {
+                            _: File,
+                            _: ContractExtensionDescriptor,
+                            _: ContractCompatibilityReport,
+                        ->
+                        WrapperVerificationResult.Success(bundle.verifiedApk)
+                    }
+                    assertTrue(RetainedImportStore(root, verifier).save(bundle))
+                    var retainedLoadCalls = 0
+                    val retainedImports = RetainedImportStore(
+                        root,
+                        RetainedImportIo(
+                            openSidecar = { sidecar ->
+                                retainedLoadCalls += 1
+                                sidecar.inputStream()
+                            },
+                        ),
+                        verifier,
+                    )
+                    val generated = GeneratedBundle(
+                        token = TOKEN,
+                        file = temporaryFolder.newFile("generated-terminal-$index.six")
+                            .apply { writeText("bundle") },
+                        sha256 = "f".repeat(64),
+                        suggestedFileName = "$TOKEN.six",
+                    )
+                    var restoredConversion: RestoredConversion =
+                        RestoredConversion.BundleReady(bundle.toReview(), generated)
+                    val conversion = object : ConversionCoordinatorPort {
+                        override suspend fun begin(
+                            request: OnDeviceInputRequest,
+                        ) = ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+
+                        override suspend fun build(
+                            token: String,
+                            approvedAdapterIds: Set<String>,
+                            partialConfirmed: Boolean,
+                            identitySelection: InstallationIdentitySelection?,
+                        ) = ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+
+                        override suspend fun restore(
+                            importReview: Boolean,
+                        ): RestoredConversion = restoredConversion
+
+                        override suspend fun discard(token: String): Boolean = true
+
+                        override fun copyGenerated(
+                            token: String,
+                            output: OutputStream,
+                        ): String? = null
+                    }
+                    val pendingStore = StartupPendingStore(null, root)
+                    val sourceGateway = StartupGateway(emptyList())
+                    val installed = FakeInstalledWrappers(emptyList())
+                    val catalog = FakeCatalog(emptyList())
+                    val sourceCoordinator = InstallCoordinator(
+                        InstallPolicy(),
+                        sourceGateway,
+                        pendingStore,
+                        installed,
+                        catalog,
+                        clock = { 2 },
+                        retainedWrapperSha256 = { sha256(it) },
+                    )
+                    val sourceRepository = managerRepository(
+                        root = root,
+                        retainedImports = retainedImports,
+                        gateway = sourceGateway,
+                        pendingStore = pendingStore,
+                        installed = installed,
+                        catalog = catalog,
+                        coordinator = sourceCoordinator,
+                        conversionCoordinator = conversion,
+                    )
+                    val savedState = SavedStateHandle(
+                        mapOf(
+                            ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                            ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                            ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                            ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                            ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to TOKEN,
+                        ),
+                    )
+                    val source = ManagerViewModel(
+                        sourceRepository,
+                        savedState,
+                        afterTerminalReceiptFinalized = {
+                            throw CancellationException("simulated process death")
+                        },
+                    )
+                    advanceUntilIdle()
+                    source.accept(ManagerAction.PrepareGeneratedInstall)
+                    source.accept(ManagerAction.InstallReviewedBundle)
+                    advanceUntilIdle()
+                    assertEquals(
+                        InstallState.AwaitingUserApproval(41),
+                        sourceCoordinator.state.value,
+                    )
+
+                    sourceCoordinator.onPackageInstallerResult(terminal)
+                    advanceUntilIdle()
+
+                    assertNotNull(
+                        savedState.get<String>(
+                            ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                        ),
+                    )
+                    assertNull(pendingStore.finalReceipt)
+                    assertNull(pendingStore.terminal)
+                    assertTrue(File(root, TOKEN).exists())
+                    sourceGateway.replaceOwnedSessions()
+
+                    restoredConversion = RestoredConversion.GeneratedPending(generated)
+                    val retryGateway = StartupGateway(emptyList())
+                    val retryCoordinator = InstallCoordinator(
+                        InstallPolicy(),
+                        retryGateway,
+                        pendingStore,
+                        installed,
+                        catalog,
+                        clock = { 3 },
+                        retainedWrapperSha256 = { sha256(it) },
+                    )
+                    val retryRepository = managerRepository(
+                        root = root,
+                        retainedImports = retainedImports,
+                        gateway = retryGateway,
+                        pendingStore = pendingStore,
+                        installed = installed,
+                        catalog = catalog,
+                        coordinator = retryCoordinator,
+                        conversionCoordinator = conversion,
+                    )
+                    val recreated = ManagerViewModel(retryRepository, savedState)
+                    advanceUntilIdle()
+
+                    assertNull(
+                        savedState.get<String>(
+                            ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                        ),
+                    )
+                    assertTrue(retainedLoadCalls >= 2)
+                    assertEquals(
+                        TOKEN,
+                        assertIs<ImportUiState.ReviewReady>(
+                            recreated.state.value.importState,
+                        ).review.token,
+                    )
+
+                    recreated.accept(ManagerAction.PrepareGeneratedInstall)
+                    recreated.accept(ManagerAction.InstallReviewedBundle)
+                    advanceUntilIdle()
+
+                    assertEquals(
+                        InstallState.AwaitingUserApproval(41),
+                        retryCoordinator.state.value,
+                    )
+                    assertEquals(TOKEN, pendingStore.record?.importToken)
+                    assertTrue(File(root, TOKEN).exists())
+                }
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
     @Test
     fun `callback router는 confirmation을 launch하지 않고 terminal result만 전달한다`() =
         runBlocking {
@@ -553,8 +742,9 @@ class ManagerRepositoryTest {
                     importToken = TOKEN,
                     startedAtEpochMillis = 1,
                 ),
+                root,
             )
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(
                 listOf(
                     InstalledWrapper(
@@ -614,7 +804,24 @@ class ManagerRepositoryTest {
                     InstallState.Installed(PACKAGE),
                 ),
             )
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertNotNull(pendingStore.terminal)
+            assertTrue(File(root, TOKEN).exists())
+            assertTrue(
+                coordinator.finalizeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
             assertNull(pendingStore.terminal)
+            assertNull(pendingStore.finalReceipt)
+            assertTrue(File(root, TOKEN).exists())
+            pendingStore.discardImport(TOKEN)
+            assertFalse(File(root, TOKEN).exists())
             scope.cancel()
         }
 
@@ -631,7 +838,7 @@ class ManagerRepositoryTest {
                     importToken = TOKEN,
                 )
             }
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(emptyList())
             val catalog = FakeCatalog(emptyList())
             val publisher = catalogPublisher(catalog, installed)
@@ -687,7 +894,7 @@ class ManagerRepositoryTest {
                     importToken = TOKEN,
                 )
             }
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(
                 listOf(
                     InstalledWrapper(
@@ -737,11 +944,28 @@ class ManagerRepositoryTest {
                     InstallState.Installed(PACKAGE),
                 ),
             )
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertNotNull(pendingStore.terminal)
+            assertTrue(File(root, TOKEN).exists())
+            assertTrue(
+                coordinator.finalizeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
+            assertNull(pendingStore.terminal)
+            assertNull(pendingStore.finalReceipt)
+            assertTrue(File(root, TOKEN).exists())
+            pendingStore.discardImport(TOKEN)
             assertFalse(File(root, TOKEN).exists())
         }
 
     @Test
-    fun `readiness 뒤 terminal cleanup은 이전 review와 session을 다시 복원하지 않는다`() =
+    fun `readiness 뒤 final owner는 review와 terminal을 함께 복원한다`() =
         runBlocking {
             val root = temporaryFolder.newFolder("current-recovery-after-terminal")
             val bundle = importedBundle(root)
@@ -753,7 +977,7 @@ class ManagerRepositoryTest {
                 PendingInstall(41, PACKAGE, TOKEN, 1),
                 root,
             )
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(emptyList())
             val catalog = FakeCatalog(emptyList())
             val coordinator = InstallCoordinator(
@@ -781,9 +1005,142 @@ class ManagerRepositoryTest {
 
             val restored = repository.initialize(TOKEN, 41)
 
-            assertNull(restored.review)
+            assertEquals(TOKEN, restored.review?.token)
             assertNull(restored.installSessionId)
+            assertEquals(
+                RestoredInstallTerminal(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = InstallState.Installed(PACKAGE),
+                    stage = FinalReceiptStage.READY,
+                ),
+                restored.terminal,
+            )
             assertNull(pendingStore.record)
+        }
+
+    @Test
+    fun `빈 SavedState cold start는 durable final owner와 review를 함께 복원한다`() =
+        runBlocking {
+            val outcomes = listOf(
+                InstallState.Installed(PACKAGE) to PackageInstallResult.Success(41),
+                InstallState.Cancelled to PackageInstallResult.Cancelled(41),
+                InstallState.Failed("SYSTEM_FAILURE", "installer rejected package") to
+                    PackageInstallResult.Failure(
+                        41,
+                        "SYSTEM_FAILURE",
+                        "installer rejected package",
+                    ),
+            )
+            outcomes.forEachIndexed { index, (state, rawResult) ->
+                val root = temporaryFolder.newFolder("cold-start-final-$index")
+                val bundle = importedBundle(root)
+                val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                    WrapperVerificationResult.Success(bundle.verifiedApk)
+                }
+                assertTrue(retainedImports.save(bundle))
+                val raw = PendingInstallResult(
+                    result = rawResult,
+                    terminalAtEpochMillis = 2,
+                    packageName = PACKAGE,
+                    importToken = TOKEN,
+                )
+                val receipt = FinalInstallReceipt(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = state,
+                    stage = FinalReceiptStage.READY,
+                    origin = FinalReceiptOrigin.RAW_TERMINAL,
+                    rawTerminalAtEpochMillis = 2,
+                    terminalAtEpochMillis = 2,
+                )
+                val pendingStore = StartupPendingStore(null, root).apply {
+                    terminal = raw
+                    finalReceipt = receipt
+                }
+                val gateway = StartupGateway(emptyList())
+                val installed = FakeInstalledWrappers(emptyList())
+                val catalog = FakeCatalog(emptyList())
+                val coordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    clock = { 2 },
+                    retainedWrapperSha256 = { sha256(it) },
+                )
+                val repository = managerRepository(
+                    root,
+                    retainedImports,
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                    coordinator,
+                )
+
+                val restored = repository.initialize(null, null)
+
+                assertEquals(TOKEN, restored.review?.token)
+                assertEquals(
+                    RestoredInstallTerminal(
+                        importToken = TOKEN,
+                        sessionId = 41,
+                        packageName = PACKAGE,
+                        state = state,
+                        stage = FinalReceiptStage.READY,
+                    ),
+                    restored.terminal,
+                )
+            }
+        }
+
+    @Test
+    fun `빈 SavedState cold start는 durable normal handoff와 review를 함께 복원한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("cold-start-normal-handoff")
+            val bundle = importedBundle(root)
+            val retainedImports = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retainedImports.save(bundle))
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.OUTCOME_READY,
+            )
+            val pendingStore = StartupPendingStore(null, root).apply {
+                normalHandoff = handoff
+            }
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root,
+                retainedImports,
+                gateway,
+                pendingStore,
+                installed,
+                catalog,
+                coordinator,
+            )
+
+            val restored = repository.initialize(null, null)
+
+            assertEquals(TOKEN, restored.review?.token)
+            assertEquals(handoff, restored.normalHandoff)
         }
 
     @Test
@@ -850,7 +1207,7 @@ class ManagerRepositoryTest {
                 PendingInstall(41, PACKAGE, TOKEN, 1),
                 root,
             )
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(emptyList())
             val catalog = FakeCatalog(emptyList())
             val coordinator = InstallCoordinator(
@@ -896,7 +1253,7 @@ class ManagerRepositoryTest {
                 PendingInstall(41, PACKAGE, TOKEN, 1),
                 root,
             )
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(emptyList())
             val catalog = FakeCatalog(emptyList())
             val coordinator = InstallCoordinator(
@@ -919,9 +1276,43 @@ class ManagerRepositoryTest {
             )
             assertEquals(TOKEN, repository.initialize(TOKEN, 41).review?.token)
             assertEquals(
-                InstallCleanupResult.Cleaned,
+                InstallCleanupResult.CleanupFailed,
                 coordinator.cancel(TOKEN, 41),
             )
+            assertNull(pendingStore.record)
+            assertEquals(
+                FinalInstallReceipt(
+                    importToken = TOKEN,
+                    sessionId = 41,
+                    packageName = PACKAGE,
+                    state = InstallState.Cancelled,
+                    stage = FinalReceiptStage.READY,
+                    origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+                    rawTerminalAtEpochMillis = null,
+                    terminalAtEpochMillis = 2,
+                ),
+                pendingStore.finalReceipt,
+            )
+            assertTrue(
+                coordinator.acknowledgeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Cancelled,
+                ),
+            )
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertTrue(
+                coordinator.finalizeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Cancelled,
+                ),
+            )
+            assertNull(pendingStore.finalReceipt)
+            pendingStore.discardImport(TOKEN)
             val bundleB = importedBundle(root, SECOND_TOKEN)
             assertTrue(retainedImports.save(bundleB))
 
@@ -968,8 +1359,23 @@ class ManagerRepositoryTest {
             val cleaned = repository.cancelInstall(TOKEN, null)
 
             assertEquals(InstallCleanupResult.OwnerMismatch, foreign)
-            assertEquals(InstallCleanupResult.Cleaned, cleaned)
+            assertEquals(InstallCleanupResult.CleanupFailed, cleaned)
             assertNull(pendingStore.record)
+            assertEquals(FinalReceiptStage.READY, pendingStore.finalReceipt?.stage)
+            assertEquals(FinalReceiptOrigin.PROGRAM_CANCEL, pendingStore.finalReceipt?.origin)
+            assertNull(pendingStore.finalReceipt?.sessionId)
+            assertEquals(
+                InstallTerminalOwnerResult.Owned(InstallState.Cancelled),
+                repository.terminalForOwner(TOKEN, null),
+            )
+            assertTrue(repository.acknowledgeTerminal(TOKEN, null, InstallState.Cancelled))
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertTrue(repository.finalizeTerminal(TOKEN, null, InstallState.Cancelled))
+            assertNull(pendingStore.finalReceipt)
+            pendingStore.discardImport(TOKEN)
         }
 
     @Test
@@ -1027,7 +1433,20 @@ class ManagerRepositoryTest {
                     expectedState = InstallState.Cancelled,
                 ),
             )
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertNotNull(pendingStore.terminal)
+            assertTrue(
+                repository.finalizeTerminal(
+                    expectedReviewToken = TOKEN,
+                    expectedSessionId = 41,
+                    expectedState = InstallState.Cancelled,
+                ),
+            )
             assertNull(pendingStore.terminal)
+            assertNull(pendingStore.finalReceipt)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1168,7 +1587,7 @@ class ManagerRepositoryTest {
             val pendingStore = StartupPendingStore(
                 PendingInstall(41, PACKAGE, TOKEN, 1),
             )
-            val gateway = StartupGateway(listOf(41))
+            val gateway = StartupGateway(listOf(41), PACKAGE)
             val installed = FakeInstalledWrappers(
                 listOf(
                     InstalledWrapper(
@@ -1238,7 +1657,20 @@ class ManagerRepositoryTest {
                     InstallState.Installed(PACKAGE),
                 ),
             )
+            assertEquals(
+                FinalReceiptStage.ACKNOWLEDGED,
+                pendingStore.finalReceipt?.stage,
+            )
+            assertNotNull(pendingStore.terminal)
+            assertTrue(
+                coordinator.finalizeTerminal(
+                    TOKEN,
+                    41,
+                    InstallState.Installed(PACKAGE),
+                ),
+            )
             assertNull(pendingStore.terminal)
+            assertNull(pendingStore.finalReceipt)
             assertEquals(PACKAGE, catalog.records.single().packageName)
             val snapshot = foregroundInitialization.await()
             assertEquals(TOKEN, snapshot.pending?.importToken)
@@ -1409,7 +1841,7 @@ class ManagerRepositoryTest {
                 val pendingStore = StartupPendingStore(pending, root).apply {
                     discardFailure = true
                 }
-                val gateway = StartupGateway(listOf(41))
+                val gateway = StartupGateway(listOf(41), PACKAGE)
                 val installed = FakeInstalledWrappers(emptyList())
                 val catalog = FakeCatalog(emptyList())
                 val firstCoordinator = InstallCoordinator(
@@ -1427,11 +1859,21 @@ class ManagerRepositoryTest {
                     InstallCleanupResult.CleanupFailed,
                     firstCoordinator.cancel(TOKEN, 41),
                 )
+                assertEquals(InstallState.Cancelled, firstCoordinator.state.value)
                 assertEquals(
-                    "CLEANUP_FAILED",
-                    assertIs<InstallState.Failed>(firstCoordinator.state.value).code,
+                    FinalInstallReceipt(
+                        importToken = TOKEN,
+                        sessionId = 41,
+                        packageName = PACKAGE,
+                        state = InstallState.Cancelled,
+                        stage = FinalReceiptStage.READY,
+                        origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+                        rawTerminalAtEpochMillis = null,
+                        terminalAtEpochMillis = 2,
+                    ),
+                    pendingStore.finalReceipt,
                 )
-                assertEquals(pending, pendingStore.record)
+                assertNull(pendingStore.record)
                 assertTrue(File(root, TOKEN).exists())
 
                 val restoredCoordinator = InstallCoordinator(
@@ -1481,11 +1923,19 @@ class ManagerRepositoryTest {
 
                 assertEquals(1, retainedLoadCalls)
                 assertEquals(1, verifierCalls)
+                assertEquals(InstallState.Cancelled, restoredCoordinator.state.value)
+                assertNull(pendingStore.record)
+                assertNull(pendingStore.finalReceipt)
                 assertEquals(
-                    InstallState.AwaitingUserApproval(41),
-                    restoredCoordinator.state.value,
+                    NormalInstallHandoff(
+                        importToken = TOKEN,
+                        sessionId = 41,
+                        packageName = PACKAGE,
+                        state = InstallState.Cancelled,
+                        stage = NormalHandoffStage.PREPARED,
+                    ),
+                    pendingStore.normalHandoff,
                 )
-                assertEquals(pending, pendingStore.record)
                 assertTrue(File(root, TOKEN).exists())
                 assertEquals(TOKEN, savedState.get<String>("review_token"))
                 assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
@@ -2632,25 +3082,38 @@ private class LateReturningInstalledWrappers(
 
 private class StartupGateway(
     owned: List<Int>,
+    ownedPackageName: String? = null,
 ) : PackageInstallGateway {
-    private val sessions = owned.toMutableList()
+    private val sessions = owned.associateWith { ownedPackageName }.toMutableMap()
+    private var defaultPackageName = ownedPackageName
     var canInstallPackages = true
 
     override fun canRequestPackageInstalls(): Boolean = canInstallPackages
     override fun unknownSourcesSettingsIntent() =
         error("startup test에서는 설정 Intent를 만들지 않습니다.")
     override suspend fun createSession(packageName: String): Int = 41.also { sessionId ->
-        if (sessionId !in sessions) sessions += sessionId
+        defaultPackageName = packageName
+        sessions[sessionId] = packageName
     }
     override suspend fun writeSession(sessionId: Int, apk: File) = Unit
     override fun commit(sessionId: Int) = Unit
     override fun abandon(sessionId: Int) {
-        sessions -= sessionId
+        sessions.remove(sessionId)
     }
-    override fun ownedSessions(): List<Int> = sessions.toList()
+    override fun ownedSessions(): List<Int> = sessions.keys.toList()
+    override fun sessionSnapshot(sessionId: Int): InstallSessionSnapshot? =
+        if (sessions.containsKey(sessionId)) {
+            InstallSessionSnapshot(
+                sessionId,
+                sessions[sessionId],
+                ownedByCaller = true,
+            )
+        } else {
+            null
+        }
     fun replaceOwnedSessions(vararg sessionIds: Int) {
         sessions.clear()
-        sessions += sessionIds.toList()
+        sessionIds.forEach { sessions[it] = defaultPackageName }
     }
 }
 
@@ -2660,6 +3123,8 @@ private class StartupPendingStore(
 ) : PendingInstallStore {
     var record = initial
     var terminal: PendingInstallResult? = null
+    var finalReceipt: FinalInstallReceipt? = null
+    var normalHandoff: NormalInstallHandoff? = null
     var discardFailure = false
     var discardAttempts = 0
     var loadFailures = 0
@@ -2676,7 +3141,9 @@ private class StartupPendingStore(
         importToken: String,
         startedAtEpochMillis: Long,
     ): PendingInstall? {
-        if (record != null) return null
+        if (record != null || terminal != null || finalReceipt != null || normalHandoff != null) {
+            return null
+        }
         return PendingInstall(-1, packageName, importToken, startedAtEpochMillis)
             .also { record = it }
     }
@@ -2715,16 +3182,24 @@ private class StartupPendingStore(
         result: PackageInstallResult,
         terminalAtEpochMillis: Long,
     ): Boolean {
-        val pending = record ?: return false
-        if (pending.sessionId != result.sessionId || result is PackageInstallResult.PendingUserAction) {
+        val pending = record
+        val lateCancel = finalReceipt?.takeIf {
+            pending == null &&
+                it.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                it.stage != FinalReceiptStage.ACKNOWLEDGED &&
+                it.sessionId == result.sessionId
+        }
+        if (result is PackageInstallResult.PendingUserAction ||
+            pending?.sessionId != result.sessionId && lateCancel == null
+        ) {
             return false
         }
         if (terminal != null) return false
         terminal = PendingInstallResult(
             result = result,
             terminalAtEpochMillis = terminalAtEpochMillis,
-            packageName = pending.packageName,
-            importToken = pending.importToken,
+            packageName = pending?.packageName ?: requireNotNull(lateCancel).packageName,
+            importToken = pending?.importToken ?: requireNotNull(lateCancel).importToken,
         )
         return true
     }
@@ -2735,6 +3210,63 @@ private class StartupPendingStore(
     override fun clearTerminalResult(expected: PendingInstallResult): Boolean {
         if (terminal != expected) return false
         terminal = null
+        return true
+    }
+    override fun loadFinalReceipt(): FinalInstallReceipt? = finalReceipt
+    override fun createFinalReceipt(
+        expectedPending: PendingInstall?,
+        expectedRaw: PendingInstallResult?,
+        receipt: FinalInstallReceipt,
+    ): Boolean {
+        if (record != expectedPending || terminal != expectedRaw || finalReceipt != null) {
+            return false
+        }
+        finalReceipt = receipt
+        return true
+    }
+    override fun replaceFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+        replacement: FinalInstallReceipt,
+    ): Boolean {
+        if (finalReceipt != expected || terminal != expectedRaw) return false
+        finalReceipt = replacement
+        return true
+    }
+    override fun acknowledgeFinalReceipt(
+        expected: FinalInstallReceipt,
+        expectedRaw: PendingInstallResult?,
+    ): FinalInstallReceipt? {
+        if (finalReceipt != expected ||
+            terminal != expectedRaw ||
+            expected.stage != FinalReceiptStage.READY
+        ) {
+            return null
+        }
+        return expected.copy(stage = FinalReceiptStage.ACKNOWLEDGED)
+            .also { finalReceipt = it }
+    }
+    override fun finalizeFinalReceipt(expected: FinalInstallReceipt): Boolean {
+        val current = finalReceipt ?: return true
+        if (current != expected || current.stage != FinalReceiptStage.ACKNOWLEDGED) {
+            return false
+        }
+        finalReceipt = null
+        terminal = null
+        return true
+    }
+    override fun clearPendingPreservingImport(expected: PendingInstall): Boolean {
+        if (record != expected) return false
+        record = null
+        return true
+    }
+    override fun loadNormalHandoff(): NormalInstallHandoff? = normalHandoff
+    override fun compareAndSetNormalHandoff(
+        expected: NormalInstallHandoff?,
+        replacement: NormalInstallHandoff?,
+    ): Boolean {
+        if (normalHandoff != expected) return false
+        normalHandoff = replacement
         return true
     }
     override fun firstSessionMissingAt(

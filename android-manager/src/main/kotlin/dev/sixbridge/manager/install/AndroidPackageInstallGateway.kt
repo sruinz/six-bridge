@@ -99,6 +99,16 @@ class AndroidPackageInstallGateway(
     override fun ownedSessions(): List<Int> =
         installer.mySessions.map(PackageInstaller.SessionInfo::getSessionId)
 
+    override fun sessionSnapshot(sessionId: Int): InstallSessionSnapshot? {
+        val session = installer.getSessionInfo(sessionId) ?: return null
+        val owned = installer.mySessions.any { it.sessionId == sessionId }
+        return InstallSessionSnapshot(
+            sessionId = session.sessionId,
+            packageName = session.appPackageName,
+            ownedByCaller = owned,
+        )
+    }
+
     private companion object {
         const val BASE_APK_NAME = "base.apk"
     }

@@ -46,6 +46,11 @@ class InstallCoordinator(
         bundle: ImportedBundle,
         partialConfirmed: Boolean,
     ): InstallState = mutex.withLock {
+        pendingStore.loadFinalReceipt()?.let { receipt ->
+            discardCompetingImport(bundle.token, receipt.importToken)
+            restoreTerminalResultLocked()
+            return@withLock mutableState.value
+        }
         val existing = pendingStore.load()
         if (activeBundle != null || existing != null) {
             discardCompetingImport(bundle.token, existing?.importToken ?: activeBundle?.token)
@@ -134,9 +139,12 @@ class InstallCoordinator(
 
     suspend fun restore(bundle: ImportedBundle? = null) = mutex.withLock {
         val pending = pendingStore.load()
+        val receipt = pendingStore.loadFinalReceipt()
         if (bundle != null &&
-            pending?.importToken == bundle.token &&
-            pending.packageName == bundle.verifiedApk.packageName &&
+            ((pending?.importToken == bundle.token &&
+                pending.packageName == bundle.verifiedApk.packageName) ||
+                (receipt?.importToken == bundle.token &&
+                    receipt.packageName == bundle.verifiedApk.packageName)) &&
             matchesRetainedWrapper(bundle)
         ) {
             activeBundle = bundle
@@ -159,10 +167,12 @@ class InstallCoordinator(
             return@withLock accepted
         }
         volatileConfirmation = null
-        val accepted = pendingStore.load()?.sessionId == result.sessionId
-        runCatching { pendingStore.recordTerminalResult(result, clock()) }
+        val pendingMatch = pendingStore.load()?.sessionId == result.sessionId
+        val accepted = runCatching {
+            pendingStore.recordTerminalResult(result, clock())
+        }.getOrDefault(false)
         restoreTerminalResultLocked()
-        accepted
+        accepted || pendingMatch
     }
 
     suspend fun markConfirmationDelivered(sessionId: Int): Boolean = mutex.withLock {
@@ -179,24 +189,25 @@ class InstallCoordinator(
         expectedImportToken: String,
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult = mutex.withLock {
-        val inbox = pendingStore.loadTerminalResult()
+        restoreTerminalResultLocked()
+        val receipt = pendingStore.loadFinalReceipt()
             ?: return InstallTerminalOwnerResult.OwnerMismatch
-        val state = inbox.toTerminalState()
-            ?: return InstallTerminalOwnerResult.OwnerMismatch
-        if (inbox.importToken == null ||
-            inbox.importToken != expectedImportToken ||
-            mutableState.value != state
+        if (receipt.stage == FinalReceiptStage.CANCELLING ||
+            receipt.importToken != expectedImportToken ||
+            mutableState.value != receipt.state
         ) {
             return InstallTerminalOwnerResult.OwnerMismatch
         }
         if (expectedSessionId == null) {
-            return InstallTerminalOwnerResult.OwnerSessionAssigned(
-                sessionId = inbox.result.sessionId,
-                state = state,
-            )
+            return receipt.sessionId?.let {
+                InstallTerminalOwnerResult.OwnerSessionAssigned(
+                    sessionId = it,
+                    state = receipt.state,
+                )
+            } ?: InstallTerminalOwnerResult.Owned(receipt.state)
         }
-        return if (expectedSessionId == inbox.result.sessionId) {
-            InstallTerminalOwnerResult.Owned(state)
+        return if (expectedSessionId == receipt.sessionId) {
+            InstallTerminalOwnerResult.Owned(receipt.state)
         } else {
             InstallTerminalOwnerResult.OwnerMismatch
         }
@@ -204,29 +215,58 @@ class InstallCoordinator(
 
     suspend fun acknowledgeTerminal(
         expectedImportToken: String,
-        expectedSessionId: Int,
+        expectedSessionId: Int?,
         expectedState: InstallState,
     ): Boolean = mutex.withLock {
-        val inbox = pendingStore.loadTerminalResult() ?: return@withLock false
-        val state = inbox.toTerminalState() ?: return@withLock false
-        if (inbox.importToken == null ||
-            inbox.importToken != expectedImportToken ||
-            inbox.result.sessionId != expectedSessionId ||
-            state != expectedState ||
+        restoreTerminalResultLocked()
+        val receipt = pendingStore.loadFinalReceipt() ?: return@withLock false
+        if (receipt.importToken != expectedImportToken ||
+            receipt.sessionId != expectedSessionId ||
+            receipt.state != expectedState ||
+            receipt.stage == FinalReceiptStage.CANCELLING ||
             mutableState.value != expectedState
         ) {
             return@withLock false
         }
-        if (!pendingStore.discardImportSafely(expectedImportToken)) {
+        val raw = pendingStore.loadTerminalResult()
+        pendingStore.acknowledgeFinalReceipt(receipt, raw) != null
+    }
+
+    suspend fun finalizeTerminal(
+        expectedImportToken: String,
+        expectedSessionId: Int?,
+        expectedState: InstallState,
+    ): Boolean = mutex.withLock {
+        val receipt = pendingStore.loadFinalReceipt() ?: return@withLock true
+        if (receipt.importToken != expectedImportToken ||
+            receipt.sessionId != expectedSessionId ||
+            receipt.state != expectedState ||
+            receipt.stage != FinalReceiptStage.ACKNOWLEDGED
+        ) {
             return@withLock false
         }
-        pendingStore.clearTerminalResult(inbox)
+        pendingStore.finalizeFinalReceipt(receipt).also { finalized ->
+            if (finalized) activeBundle = null
+        }
     }
 
     suspend fun cancel(
         expectedImportToken: String,
         expectedSessionId: Int?,
     ): InstallCleanupResult = mutex.withLock {
+        pendingStore.loadFinalReceipt()?.let { receipt ->
+            if (receipt.importToken != expectedImportToken) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            if (expectedSessionId == null && receipt.sessionId != null) {
+                return@withLock InstallCleanupResult.OwnerSessionAssigned(receipt.sessionId)
+            }
+            if (expectedSessionId != receipt.sessionId) {
+                return@withLock InstallCleanupResult.OwnerMismatch
+            }
+            restoreTerminalResultLocked()
+            return@withLock InstallCleanupResult.CleanupFailed
+        }
         val pending = try {
             pendingStore.load()
         } catch (_: Exception) {
@@ -247,13 +287,7 @@ class InstallCoordinator(
                 return@withLock cleanupResult()
             }
             if (pending.sessionId >= 0) {
-                finishSession(
-                    pending = pending,
-                    next = InstallState.Cancelled,
-                    abandon = true,
-                    inbox = null,
-                )
-                return@withLock cleanupResult()
+                return@withLock beginProgramCancel(pending)
             }
             val owned = try {
                 gateway.ownedSessions()
@@ -272,13 +306,7 @@ class InstallCoordinator(
             if (owned.isNotEmpty()) {
                 return@withLock InstallCleanupResult.CleanupFailed
             }
-            finishSession(
-                pending = pending,
-                next = InstallState.Cancelled,
-                abandon = false,
-                inbox = null,
-            )
-            return@withLock cleanupResult()
+            return@withLock beginProgramCancel(pending)
         }
 
         val terminalResult = pendingStore.loadTerminalResult()
@@ -306,17 +334,155 @@ class InstallCoordinator(
         if (expectedSessionId != null) {
             return@withLock InstallCleanupResult.OwnerMismatch
         }
-        val discarded = pendingStore.discardImportSafely(bundle.token)
-        mutableState.value = if (discarded) {
-            activeBundle = null
-            InstallState.Cancelled
-        } else {
-            cleanupFailed()
+        val cancelling = programCancelReceipt(
+            importToken = bundle.token,
+            sessionId = null,
+            packageName = bundle.verifiedApk.packageName,
+            stage = FinalReceiptStage.CANCELLING,
+        )
+        if (!pendingStore.createFinalReceipt(null, null, cancelling)) {
+            mutableState.value = cleanupFailed()
+            return@withLock InstallCleanupResult.CleanupFailed
         }
-        cleanupResult()
+        activeBundle = null
+        settleProgramCancellation(cancelling, pending = null)
+        InstallCleanupResult.CleanupFailed
     }
 
     fun unknownSourcesSettingsIntent() = gateway.unknownSourcesSettingsIntent()
+
+    private suspend fun beginProgramCancel(
+        pending: PendingInstall,
+    ): InstallCleanupResult {
+        val receipt = programCancelReceipt(
+            importToken = pending.importToken,
+            sessionId = pending.sessionId.takeIf { it >= 0 },
+            packageName = pending.packageName,
+            stage = FinalReceiptStage.CANCELLING,
+        )
+        if (!pendingStore.createFinalReceipt(pending, null, receipt)) {
+            restoreTerminalResultLocked()
+            return InstallCleanupResult.CleanupFailed
+        }
+        settleProgramCancellation(receipt, pending)
+        return InstallCleanupResult.CleanupFailed
+    }
+
+    private suspend fun settleProgramCancellation(
+        receipt: FinalInstallReceipt,
+        pending: PendingInstall?,
+    ) {
+        if (receipt.origin != FinalReceiptOrigin.PROGRAM_CANCEL ||
+            receipt.stage != FinalReceiptStage.CANCELLING
+        ) {
+            return
+        }
+        pendingStore.loadTerminalResult()?.let { raw ->
+            reconcileRawWithFinal(receipt, pending, raw)
+            return
+        }
+        if (!settleOwnedSessionForCancellation(receipt)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        if (pending != null &&
+            !pendingStore.clearPendingPreservingImport(pending)
+        ) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        pendingStore.loadTerminalResult()?.let { raw ->
+            reconcileRawWithFinal(receipt, pending = null, inbox = raw)
+            return
+        }
+        val ready = receipt.copy(
+            stage = FinalReceiptStage.READY,
+            terminalAtEpochMillis = maxOf(receipt.terminalAtEpochMillis, clock()),
+        )
+        if (!pendingStore.replaceFinalReceipt(receipt, null, ready)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        pendingStore.loadTerminalResult()?.let { raw ->
+            reconcileRawWithFinal(ready, pending = null, inbox = raw)
+            return
+        }
+        publishDurableReceipt(ready, pending = null)
+    }
+
+    private fun settleOwnedSessionForCancellation(
+        receipt: FinalInstallReceipt,
+    ): Boolean {
+        val sessionId = receipt.sessionId ?: return true
+        val before = try {
+            gateway.sessionSnapshot(sessionId)
+        } catch (_: Exception) {
+            return false
+        }
+        if (before == null) return true
+        if (!before.ownedByCaller ||
+            before.sessionId != sessionId ||
+            before.packageName != receipt.packageName
+        ) {
+            return false
+        }
+        try {
+            gateway.abandon(sessionId)
+        } catch (_: Exception) {
+            return false
+        }
+        val after = try {
+            gateway.sessionSnapshot(sessionId)
+        } catch (_: Exception) {
+            return false
+        }
+        return after == null
+    }
+
+    private fun programCancelReceipt(
+        importToken: String,
+        sessionId: Int?,
+        packageName: String,
+        stage: FinalReceiptStage,
+    ) = FinalInstallReceipt(
+        importToken = importToken,
+        sessionId = sessionId,
+        packageName = packageName,
+        state = InstallState.Cancelled,
+        stage = stage,
+        origin = FinalReceiptOrigin.PROGRAM_CANCEL,
+        rawTerminalAtEpochMillis = null,
+        terminalAtEpochMillis = clock(),
+    )
+
+    private fun rawReceipt(
+        importToken: String,
+        sessionId: Int,
+        packageName: String,
+        inbox: PendingInstallResult,
+        state: InstallState,
+    ) = FinalInstallReceipt(
+        importToken = importToken,
+        sessionId = sessionId,
+        packageName = packageName,
+        state = state,
+        stage = FinalReceiptStage.READY,
+        origin = FinalReceiptOrigin.RAW_TERMINAL,
+        rawTerminalAtEpochMillis = inbox.terminalAtEpochMillis,
+        terminalAtEpochMillis = maxOf(inbox.terminalAtEpochMillis, clock()),
+    )
+
+    private fun rawReceipt(
+        existing: FinalInstallReceipt,
+        inbox: PendingInstallResult,
+        state: InstallState,
+    ): FinalInstallReceipt = rawReceipt(
+        importToken = existing.importToken,
+        sessionId = inbox.result.sessionId,
+        packageName = existing.packageName,
+        inbox = inbox,
+        state = state,
+    )
 
     private suspend fun createAndCommit(bundle: ImportedBundle) {
         if (!matchesRetainedWrapper(bundle)) {
@@ -482,34 +648,197 @@ class InstallCoordinator(
     }
 
     private suspend fun restoreTerminalResultLocked() {
-        val inbox = pendingStore.loadTerminalResult() ?: return
+        val receipt = pendingStore.loadFinalReceipt()
+        var inbox = pendingStore.loadTerminalResult()
         val pending = pendingStore.load()
+        if (inbox?.importToken == null && inbox != null) {
+            if (!pendingStore.quarantineTerminalResult(inbox, pending, receipt)) {
+                mutableState.value = cleanupFailed()
+                return
+            }
+            inbox = null
+        }
+        if (receipt != null) {
+            if (receipt.stage == FinalReceiptStage.CANCELLING) {
+                if (inbox != null) {
+                    reconcileRawWithFinal(receipt, pending, inbox)
+                } else {
+                    settleProgramCancellation(receipt, pending)
+                }
+                return
+            }
+            if (receipt.origin == FinalReceiptOrigin.PROGRAM_CANCEL &&
+                receipt.stage == FinalReceiptStage.READY &&
+                inbox != null
+            ) {
+                reconcileRawWithFinal(receipt, pending, inbox)
+                return
+            }
+            publishDurableReceipt(receipt, pending)
+            return
+        }
+        if (inbox == null) return
         if (pending == null) {
-            finishCompletedTerminalCleanup(inbox)
+            val next = inbox.toLegacyTerminalState()
+            if (next == null) {
+                mutableState.value = InstallState.Failed(
+                    "TERMINAL_RECOVERY_FAILED",
+                    "검증 완료 표지가 없는 설치 결과를 복구하지 못했습니다.",
+                )
+                return
+            }
+            persistRawReceipt(pending = null, inbox = inbox, next = next)
             return
         }
         if (pending.sessionId != inbox.result.sessionId ||
-            inbox.importToken?.let { it != pending.importToken } == true
+            inbox.importToken != pending.importToken ||
+            inbox.packageName != pending.packageName
         ) {
-            pendingStore.clearTerminalResult(inbox)
             return
         }
         when (val result = inbox.result) {
-            is PackageInstallResult.Success -> verifyAndRecord(pending, inbox)
-            is PackageInstallResult.Cancelled -> finishSession(
-                pending = pending,
-                next = InstallState.Cancelled,
-                abandon = true,
-                inbox = inbox,
-            )
-            is PackageInstallResult.Failure -> finishSession(
-                pending = pending,
-                next = InstallState.Failed(result.code, result.message),
-                abandon = true,
-                inbox = inbox,
-            )
+            is PackageInstallResult.Success ->
+                resolveSuccessfulRaw(pending, inbox)?.let { next ->
+                    persistRawReceipt(pending, inbox, next)
+                }
+            is PackageInstallResult.Cancelled ->
+                persistRawReceipt(pending, inbox, InstallState.Cancelled)
+            is PackageInstallResult.Failure ->
+                persistRawReceipt(
+                    pending,
+                    inbox,
+                    InstallState.Failed(result.code, result.message),
+                )
             is PackageInstallResult.PendingUserAction -> Unit
         }
+    }
+
+    private suspend fun reconcileRawWithFinal(
+        receipt: FinalInstallReceipt,
+        pending: PendingInstall?,
+        inbox: PendingInstallResult,
+    ) {
+        if (receipt.stage == FinalReceiptStage.ACKNOWLEDGED ||
+            inbox.importToken != receipt.importToken ||
+            inbox.packageName != receipt.packageName ||
+            receipt.sessionId != null &&
+            receipt.sessionId != inbox.result.sessionId ||
+            pending != null &&
+            (pending.importToken != receipt.importToken ||
+                pending.packageName != receipt.packageName ||
+                pending.sessionId != inbox.result.sessionId)
+        ) {
+            return
+        }
+        val next = when (val result = inbox.result) {
+            is PackageInstallResult.Success -> {
+                val rawPending = pending ?: PendingInstall(
+                    sessionId = inbox.result.sessionId,
+                    packageName = receipt.packageName,
+                    importToken = receipt.importToken,
+                    startedAtEpochMillis = receipt.terminalAtEpochMillis,
+                )
+                resolveSuccessfulRaw(rawPending, inbox)
+            }
+            is PackageInstallResult.Cancelled -> InstallState.Cancelled
+            is PackageInstallResult.Failure -> InstallState.Failed(result.code, result.message)
+            is PackageInstallResult.PendingUserAction -> null
+        } ?: return
+        val replacement = rawReceipt(receipt, inbox, next)
+        if (!pendingStore.replaceFinalReceipt(receipt, inbox, replacement)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        publishDurableReceipt(replacement, pending)
+    }
+
+    private suspend fun persistRawReceipt(
+        pending: PendingInstall?,
+        inbox: PendingInstallResult,
+        next: InstallState,
+    ) {
+        val receipt = rawReceipt(
+            importToken = requireNotNull(inbox.importToken),
+            sessionId = inbox.result.sessionId,
+            packageName = inbox.packageName,
+            inbox = inbox,
+            state = next,
+        )
+        if (!pendingStore.createFinalReceipt(pending, inbox, receipt)) {
+            mutableState.value = cleanupFailed()
+            return
+        }
+        publishDurableReceipt(receipt, pending)
+    }
+
+    private fun publishDurableReceipt(
+        receipt: FinalInstallReceipt,
+        pending: PendingInstall?,
+    ) {
+        if (pending != null) {
+            if (pending.importToken != receipt.importToken ||
+                pending.packageName != receipt.packageName ||
+                receipt.sessionId != null && pending.sessionId != receipt.sessionId ||
+                !pendingStore.clearPendingPreservingImport(pending)
+            ) {
+                mutableState.value = cleanupFailed()
+                return
+            }
+        }
+        if (receipt.origin == FinalReceiptOrigin.RAW_TERMINAL) {
+            activeBundle = null
+        }
+        publishTerminal(receipt.state)
+    }
+
+    private suspend fun resolveSuccessfulRaw(
+        pending: PendingInstall,
+        inbox: PendingInstallResult,
+    ): InstallState? {
+        val bundle = activeBundle
+        if (bundle == null) {
+            mutableState.value = InstallState.Failed(
+                "IMPORT_NOT_AVAILABLE",
+                "설치 결과를 검증할 임시 래퍼를 복원하지 못했습니다.",
+            )
+            return null
+        }
+        val installed = try {
+            installedWrappers.find(pending.packageName)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+        if (!isExpectedInstall(pending, installed, bundle)) {
+            return InstallState.Failed(
+                "POST_INSTALL_VERIFICATION_FAILED",
+                "설치된 래퍼를 검증할 수 없습니다.",
+            )
+        }
+        val verified = requireNotNull(installed)
+        val record = CatalogRecord(
+            packageName = verified.packageName,
+            extensionId = verified.extensionId,
+            name = verified.name,
+            iconPng = null,
+            installedVersionCode = verified.versionCode,
+            signerSha256 = verified.signerSha256,
+            compatibilityStatus = bundle.report.status.name,
+            reportJson = BundleJson.encodeCompatibility(bundle.report),
+            lastVerifiedAtEpochMillis = clock(),
+        )
+        try {
+            catalog.replaceVerified(record)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            return InstallState.Failed(
+                "CATALOG_UPDATE_FAILED",
+                "설치 catalog를 갱신하지 못했습니다.",
+            )
+        }
+        return InstallState.Installed(verified.packageName)
     }
 
     private suspend fun restoreMissingSessionLocked() {
@@ -562,86 +891,6 @@ class InstallCoordinator(
         }
     }
 
-    private fun finishCompletedTerminalCleanup(inbox: PendingInstallResult) {
-        if (inbox.result is PackageInstallResult.Success && !inbox.processed) {
-            mutableState.value = InstallState.Failed(
-                "TERMINAL_RECOVERY_FAILED",
-                "검증 완료 표지가 없는 설치 결과를 복구하지 못했습니다.",
-            )
-            return
-        }
-        activeBundle = null
-        val next = inbox.toTerminalState() ?: return
-        publishTerminal(next)
-    }
-
-    private suspend fun verifyAndRecord(
-        pending: PendingInstall,
-        inbox: PendingInstallResult,
-    ) {
-        val bundle = activeBundle
-        if (bundle == null) {
-            mutableState.value = InstallState.Failed(
-                "IMPORT_NOT_AVAILABLE",
-                "설치 결과를 검증할 임시 래퍼를 복원하지 못했습니다.",
-            )
-            return
-        }
-        val installed = try {
-            installedWrappers.find(pending.packageName)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
-        }
-        if (!isExpectedInstall(pending, installed, bundle)) {
-            finishSession(
-                pending = pending,
-                next = InstallState.Failed(
-                    "POST_INSTALL_VERIFICATION_FAILED",
-                    "설치된 래퍼를 검증할 수 없습니다.",
-                ),
-                abandon = true,
-                inbox = inbox,
-            )
-            return
-        }
-        val verified = requireNotNull(installed)
-        val record = CatalogRecord(
-            packageName = verified.packageName,
-            extensionId = verified.extensionId,
-            name = verified.name,
-            iconPng = null,
-            installedVersionCode = verified.versionCode,
-            signerSha256 = verified.signerSha256,
-            compatibilityStatus = requireNotNull(bundle).report.status.name,
-            reportJson = BundleJson.encodeCompatibility(bundle.report),
-            lastVerifiedAtEpochMillis = clock(),
-        )
-        try {
-            catalog.replaceVerified(record)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            finishSession(
-                pending = pending,
-                next = InstallState.Failed(
-                    "CATALOG_UPDATE_FAILED",
-                    "설치 catalog를 갱신하지 못했습니다.",
-                ),
-                abandon = true,
-                inbox = inbox,
-            )
-            return
-        }
-        finishSession(
-            pending = pending,
-            next = InstallState.Installed(verified.packageName),
-            abandon = false,
-            inbox = inbox,
-        )
-    }
-
     private fun isExpectedInstall(
         pending: PendingInstall,
         installed: InstalledWrapper?,
@@ -670,6 +919,10 @@ class InstallCoordinator(
     }
 
     private fun restoreState(): InstallState {
+        val receipt = pendingStore.loadFinalReceipt()
+        if (receipt != null && receipt.stage != FinalReceiptStage.CANCELLING) {
+            return receipt.state
+        }
         return pendingStore.load()?.toState() ?: InstallState.Idle
     }
 
@@ -789,7 +1042,8 @@ class InstallCoordinator(
     private fun cleanupComplete(): Boolean {
         val complete = activeBundle == null &&
             pendingStore.load() == null &&
-            pendingStore.loadTerminalResult() == null
+            pendingStore.loadTerminalResult() == null &&
+            pendingStore.loadFinalReceipt() == null
         if (complete) volatileConfirmation = null
         return complete
     }
@@ -818,6 +1072,9 @@ class InstallCoordinator(
                 InstallState.Failed(terminal.code, terminal.message)
             is PackageInstallResult.PendingUserAction -> null
         }
+
+    private fun PendingInstallResult.toLegacyTerminalState(): InstallState? =
+        toTerminalState()
 
     private fun PendingInstall.toState(): InstallState =
         if (sessionId >= 0) InstallState.AwaitingUserApproval(sessionId)

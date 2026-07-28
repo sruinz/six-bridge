@@ -11,7 +11,14 @@ interface PackageInstallGateway {
     fun commit(sessionId: Int)
     fun abandon(sessionId: Int)
     fun ownedSessions(): List<Int>
+    fun sessionSnapshot(sessionId: Int): InstallSessionSnapshot?
 }
+
+data class InstallSessionSnapshot(
+    val sessionId: Int,
+    val packageName: String?,
+    val ownedByCaller: Boolean,
+)
 
 class PackageInstallSessionException(
     val sessionId: Int?,
