@@ -453,6 +453,44 @@ class GeneratedBundleStoreTest {
     }
 
     @Test
+    fun `startup은 fresh share temporary만 oldest first bounded 정리한다`() {
+        val root = File(filesDir, "generated-bundles").apply { mkdirs() }
+        val shareRoot = File(root, "share-handoff").apply { mkdir() }
+        val temporary = List(34) {
+            File(shareRoot, ".share-${UUID.randomUUID()}.tmp").apply {
+                writeText("temporary-$it")
+                Files.setLastModifiedTime(
+                    toPath(),
+                    FileTime.fromMillis(System.currentTimeMillis() + it),
+                )
+            }
+        }
+        val unrelated = File(shareRoot, "keep-${UUID.randomUUID()}.tmp").apply {
+            writeText("keep")
+        }
+        val symlinkTarget = File(filesDir, "outside-share-temp").apply {
+            writeText("outside")
+        }
+        val symlink = File(shareRoot, ".share-${UUID.randomUUID()}.tmp")
+        Files.createSymbolicLink(symlink.toPath(), symlinkTarget.toPath())
+
+        store()
+
+        temporary.take(32).forEach { assertFalse(it.exists()) }
+        temporary.takeLast(2).forEach { assertTrue(it.exists()) }
+        assertTrue(unrelated.exists())
+        assertTrue(Files.isSymbolicLink(symlink.toPath()))
+        assertEquals("outside", symlinkTarget.readText())
+
+        store()
+
+        temporary.forEach { assertFalse(it.exists()) }
+        assertTrue(unrelated.exists())
+        assertTrue(Files.isSymbolicLink(symlink.toPath()))
+        assertEquals("outside", symlinkTarget.readText())
+    }
+
+    @Test
     fun `share snapshot은 verified original cleanup 뒤에도 exact bytes를 유지한다`() = runTest {
         val store = store()
         val generated = store.publish(token, result())
@@ -483,6 +521,73 @@ class GeneratedBundleStoreTest {
         store.publish(token, result())
 
         assertEquals(null, store.createShareSnapshot(token))
+        val shareRoot = File(filesDir, "generated-bundles/share-handoff")
+        assertTrue(shareRoot.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `share snapshot boundary I O 실패는 null로 닫힌다`() = runTest {
+        val directoryFailureToken = UUID.randomUUID().toString()
+        val directoryFailureStore = store()
+        directoryFailureStore.publish(directoryFailureToken, result("directory-failure.apk"))
+        File(filesDir, "generated-bundles/share-handoff").writeText("not a directory")
+        assertEquals(null, directoryFailureStore.createShareSnapshot(directoryFailureToken))
+
+        File(filesDir, "generated-bundles/share-handoff").delete()
+        val missingOriginalToken = UUID.randomUUID().toString()
+        val missingOriginalStore = store()
+        val missing = missingOriginalStore.publish(
+            missingOriginalToken,
+            result("missing-original.apk"),
+        )
+        assertTrue(missing.file.delete())
+        assertEquals(null, missingOriginalStore.createShareSnapshot(missingOriginalToken))
+
+        val temporaryFailureToken = UUID.randomUUID().toString()
+        val temporaryFailureStore = store(
+            hooks = GeneratedBundleStoreHooks(
+                createShareTemporary = {
+                    throw IOException("temporary create failure")
+                },
+            ),
+        )
+        temporaryFailureStore.publish(
+            temporaryFailureToken,
+            result("temporary-failure.apk"),
+        )
+        assertEquals(null, temporaryFailureStore.createShareSnapshot(temporaryFailureToken))
+    }
+
+    @Test
+    fun `share snapshot cleanup 실패는 typed cleanup failure로 닫힌다`() = runTest {
+        val failing = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterCopyChunk = { throw IOException("copy failure") },
+                deleteShareArtifact = { false },
+            ),
+        )
+        failing.publish(token, result())
+
+        val error = assertFailsWith<GeneratedBundleStoreException> {
+            failing.createShareSnapshot(token)
+        }
+
+        assertEquals(GeneratedBundleStoreErrorCode.CLEANUP_FAILED, error.code)
+    }
+
+    @Test
+    fun `share snapshot cancellation은 temporary 정리 뒤 재전파한다`() = runTest {
+        val cancelling = store(
+            hooks = GeneratedBundleStoreHooks(
+                afterCopyChunk = { throw CancellationException("cancel snapshot") },
+            ),
+        )
+        cancelling.publish(token, result())
+
+        assertFailsWith<CancellationException> {
+            cancelling.createShareSnapshot(token)
+        }
+
         val shareRoot = File(filesDir, "generated-bundles/share-handoff")
         assertTrue(shareRoot.listFiles().orEmpty().isEmpty())
     }

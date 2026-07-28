@@ -549,7 +549,13 @@ class ManagerViewModel(
         if (result.cleanupPending || result.cleanupInProgress) return
         if (generatedShareJob?.isActive == true) return
         generatedShareJob = viewModelScope.launch {
-            val snapshot = repository.createGeneratedShareSnapshot(result.token)
+            val snapshot = try {
+                repository.createGeneratedShareSnapshot(result.token)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
             if (snapshot == null) {
                 mutableState.update {
                     it.copy(

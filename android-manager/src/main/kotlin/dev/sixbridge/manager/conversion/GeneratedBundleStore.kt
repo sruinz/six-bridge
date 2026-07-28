@@ -71,6 +71,8 @@ internal data class GeneratedBundleStoreHooks(
     val afterShareSnapshotPublished: (File) -> Unit = {},
     val deleteFile: ((File) -> Boolean)? = null,
     val deletePublishedFile: ((File) -> Boolean)? = null,
+    val createShareTemporary: ((Path) -> Path)? = null,
+    val deleteShareArtifact: ((Path) -> Boolean)? = null,
 )
 
 class GeneratedBundleStore internal constructor(
@@ -95,6 +97,7 @@ class GeneratedBundleStore internal constructor(
     init {
         synchronized(lock) {
             cleanupOrphanTemporaryFiles()
+            cleanupOrphanShareTemporaryFiles()
             cleanupExpiredShareSnapshots()
         }
     }
@@ -309,21 +312,36 @@ class GeneratedBundleStore internal constructor(
 
     suspend fun createShareSnapshot(token: String): File? = withContext(Dispatchers.IO) {
         synchronized(lock) {
-            val (_, record) = requirePublished(token)
-            val directory = requireShareDirectory()
-            val snapshot = directory.resolve("share-${UUID.randomUUID()}.six")
-            val temporary = Files.createTempFile(directory, ".share-", ".tmp")
+            var temporary: Path? = null
             var publishedSnapshot: Path? = null
             try {
-                val copiedHash = Files.newOutputStream(temporary, WRITE).use { output ->
+                val (_, record) = requirePublished(token)
+                val directory = requireShareDirectory()
+                val snapshot = directory.resolve("share-${UUID.randomUUID()}.six")
+                temporary = hooks.createShareTemporary?.invoke(directory)
+                    ?: Files.createTempFile(directory, ".share-", ".tmp")
+                val activeTemporary = requireNotNull(temporary)
+                require(
+                    activeTemporary.parent == directory &&
+                        Files.isRegularFile(activeTemporary, NOFOLLOW_LINKS) &&
+                        !Files.isSymbolicLink(activeTemporary),
+                ) {
+                    "공유 snapshot temporary 파일이 direct regular file이 아닙니다."
+                }
+                val copiedHash = Files.newOutputStream(
+                    activeTemporary,
+                    WRITE,
+                    NOFOLLOW_LINKS,
+                ).use { output ->
                     copyTo(token, output)
                 }
                 require(copiedHash == record.sha256) {
                     "공유 snapshot hash가 생성 bundle과 일치하지 않습니다."
                 }
-                forceFile(temporary)
-                Files.move(temporary, snapshot, ATOMIC_MOVE)
+                forceFile(activeTemporary)
+                Files.move(activeTemporary, snapshot, ATOMIC_MOVE)
                 publishedSnapshot = snapshot
+                temporary = null
                 hooks.afterShareSnapshotPublished(snapshot.toFile())
                 val snapshotFile = snapshot.toFile()
                 val snapshotState = requireRegularFile(snapshotFile, "공유 snapshot")
@@ -338,7 +356,7 @@ class GeneratedBundleStore internal constructor(
                 }
                     .also { forceDirectory(directory) }
             } catch (error: Throwable) {
-                val temporaryDeleted = deleteShareArtifact(temporary)
+                val temporaryDeleted = temporary?.let(::deleteShareArtifact) ?: true
                 val snapshotDeleted = publishedSnapshot?.let(::deleteShareArtifact) ?: true
                 if (!temporaryDeleted || !snapshotDeleted) {
                     throw GeneratedBundleStoreException(
@@ -353,10 +371,18 @@ class GeneratedBundleStore internal constructor(
         }
     }
 
-    private fun deleteShareArtifact(path: Path): Boolean = runCatching {
-        Files.deleteIfExists(path)
-        !Files.exists(path, NOFOLLOW_LINKS)
-    }.getOrDefault(false)
+    private fun deleteShareArtifact(path: Path): Boolean {
+        if (!Files.exists(path, NOFOLLOW_LINKS)) return true
+        hooks.deleteShareArtifact?.let { delete ->
+            return runCatching {
+                delete(path) && !Files.exists(path, NOFOLLOW_LINKS)
+            }.getOrDefault(false)
+        }
+        return runCatching {
+            Files.deleteIfExists(path)
+            !Files.exists(path, NOFOLLOW_LINKS)
+        }.getOrDefault(false)
+    }
 
     private fun requireShareDirectory(): Path {
         root.verifyUnchanged()
@@ -388,6 +414,27 @@ class GeneratedBundleStore internal constructor(
                         Files.getLastModifiedTime(path, NOFOLLOW_LINKS).toMillis() < cutoff
                 }
                 .sortedBy { Files.getLastModifiedTime(it, NOFOLLOW_LINKS).toMillis() }
+                .take(MAX_STARTUP_SHARE_DELETES)
+                .forEach(Files::deleteIfExists)
+        }
+    }
+
+    private fun cleanupOrphanShareTemporaryFiles() {
+        val directory = root.path.resolve(SHARE_DIRECTORY)
+        if (!Files.isDirectory(directory, NOFOLLOW_LINKS) || Files.isSymbolicLink(directory)) return
+        Files.newDirectoryStream(directory).use { entries ->
+            entries.asSequence()
+                .filter { path ->
+                    SHARE_TEMP_NAME.matches(path.fileName.toString()) &&
+                        Files.isRegularFile(path, NOFOLLOW_LINKS) &&
+                        !Files.isSymbolicLink(path)
+                }
+                .sortedWith(
+                    compareBy<Path>(
+                        { Files.getLastModifiedTime(it, NOFOLLOW_LINKS).toMillis() },
+                        { it.fileName.toString() },
+                    ),
+                )
                 .take(MAX_STARTUP_SHARE_DELETES)
                 .forEach(Files::deleteIfExists)
         }
@@ -889,6 +936,7 @@ class GeneratedBundleStore internal constructor(
         private val SHARE_NAME = Regex(
             """share-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.six""",
         )
+        private val SHARE_TEMP_NAME = Regex("""\.share-.+\.tmp""")
         private val ORPHAN_TEMP_NAME = Regex(
             """\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\..+\.tmp""",
         )

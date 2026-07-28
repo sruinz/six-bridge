@@ -36,6 +36,7 @@ import dev.sixbridge.core.profile.WrapperContract
 import java.io.OutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CancellationException
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -2170,6 +2171,37 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `share snapshot exception becomes message without effect`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+                generatedShareSnapshotException = IOException("snapshot failure")
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch {
+                viewModel.effects.collect(effects::add)
+            }
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ShareGeneratedConversion)
+            advanceUntilIdle()
+
+            assertTrue(effects.isEmpty())
+            assertEquals(
+                UserMessageKind.CONVERSION_SHARE_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                ManagerRoute.ConversionResult(TOKEN),
+                viewModel.state.value.route,
+            )
+        }
+
+    @Test
     fun `결과 완료는 generated work와 retained review를 명시적으로 정리한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -4290,6 +4322,7 @@ private class FakeManagerRepository : ManagerRepository {
     val generatedShareSnapshotRequests = mutableListOf<String>()
     var generatedShareSnapshot: File? = null
     var suspendGeneratedShareSnapshot = false
+    var generatedShareSnapshotException: Throwable? = null
     val lifecycleEvents = mutableListOf<String>()
     var suspendImport = false
     var suspendInstall = false
@@ -4410,6 +4443,7 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun createGeneratedShareSnapshot(token: String): File? {
         generatedShareSnapshotRequests += token
         if (suspendGeneratedShareSnapshot) generatedShareSnapshotGate.first()
+        generatedShareSnapshotException?.let { throw it }
         return generatedShareSnapshot ?: when (val restored = restoredConversion) {
             is RestoredConversion.BundleReady -> restored.generated.file
             is RestoredConversion.GeneratedPending -> restored.generated.file
