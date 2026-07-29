@@ -128,18 +128,21 @@ class MainActivity : ComponentActivity() {
             SixBridgeManagerApp(
                 viewModel = managerViewModel,
                 onAddSix = {
-                    openSixFilePicker(
-                        onAction = managerViewModel::accept,
-                        launchPicker = { openDocument.launch(SIX_MIME_TYPES) },
-                    )
+                    managerViewModel.accept(ManagerAction.OpenSixFilePicker)
                 },
-                onInstallReviewed = notificationInstallGate::requestInstall,
+                onInstallReviewed = {
+                    managerViewModel.accept(ManagerAction.PrepareReviewedInstall)
+                },
             )
         }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 managerViewModel.effects.collect { effect ->
                     when (effect) {
+                        ManagerEffect.PickSixDocument ->
+                            openDocument.launch(SIX_MIME_TYPES)
+                        ManagerEffect.RequestInstallNotificationPermission ->
+                            notificationInstallGate.requestInstall()
                         is ManagerEffect.LaunchIntent -> executeLaunch(
                             effect = effect,
                             resolveIntent = { it.intentFactory() },
@@ -424,14 +427,6 @@ internal fun generatedBundleShareChooser(context: Context, file: File): Intent {
         generatedBundleSendIntent(context.contentResolver, uri),
         context.getString(dev.sixbridge.manager.R.string.conversion_share_chooser),
     )
-}
-
-internal fun openSixFilePicker(
-    onAction: (ManagerAction) -> Unit,
-    launchPicker: () -> Unit,
-) {
-    onAction(ManagerAction.FilePickerOpened)
-    launchPicker()
 }
 
 internal fun <T> executeGeneratedShareLaunch(

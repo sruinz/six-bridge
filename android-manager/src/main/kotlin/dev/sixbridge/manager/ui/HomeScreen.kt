@@ -42,6 +42,8 @@ fun HomeScreen(
     onAddSix: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val mutationsEnabled =
+        state.startupRecoveryState == StartupRecoveryUiState.READY
     CenteredScrollableColumn(
         modifier = modifier,
         testTagModifier = Modifier.testTag("home:scroll"),
@@ -52,19 +54,21 @@ fun HomeScreen(
         )
         Button(
             onClick = { onAction(ManagerAction.OpenConversionInput) },
+            enabled = mutationsEnabled,
             modifier = Modifier.fillMaxWidth().testTag("home:convert-on-device"),
         ) {
             Text(text = stringResource(R.string.home_convert_on_device))
         }
         Button(
             onClick = onAddSix,
-            enabled = state.importState != ImportUiState.Importing,
+            enabled = mutationsEnabled && state.importState != ImportUiState.Importing,
             modifier = Modifier.fillMaxWidth().testTag("home:add-six"),
         ) {
             Text(text = stringResource(R.string.home_add_six))
         }
         Button(
             onClick = { onAction(ManagerAction.OpenSamsungAddOns) },
+            enabled = mutationsEnabled,
             modifier = Modifier.fillMaxWidth().testTag("home:open-addons"),
         ) {
             Text(text = stringResource(R.string.home_open_addons))
@@ -82,7 +86,11 @@ fun HomeScreen(
             Text(text = stringResource(R.string.home_empty))
         } else {
             state.installed.forEach { item ->
-                InstalledExtensionCard(item = item, onAction = onAction)
+                InstalledExtensionCard(
+                    item = item,
+                    mutationsEnabled = mutationsEnabled,
+                    onAction = onAction,
+                )
             }
         }
         if (state.importState == ImportUiState.Importing) {
@@ -123,6 +131,7 @@ fun HomeScreen(
 @Composable
 private fun InstalledExtensionCard(
     item: ManagedExtensionItem,
+    mutationsEnabled: Boolean,
     onAction: (ManagerAction) -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -164,6 +173,7 @@ private fun InstalledExtensionCard(
                 }
                 OutlinedButton(
                     onClick = { onAction(ManagerAction.Remove(item.packageName)) },
+                    enabled = mutationsEnabled,
                     modifier = Modifier
                         .weight(1f)
                         .testTag("extension:${item.packageName}:remove"),

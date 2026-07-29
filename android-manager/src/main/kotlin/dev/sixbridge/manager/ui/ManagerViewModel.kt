@@ -184,7 +184,8 @@ class ManagerViewModel(
             )
         }
         when (action) {
-            ManagerAction.FilePickerOpened -> Unit
+            ManagerAction.OpenSixFilePicker ->
+                enqueueEffect(ManagerEffect.PickSixDocument)
             is ManagerAction.ImportSelected -> startImport { repository.import(action.uri) }
             ManagerAction.OpenConversionInput -> openConversionInput()
             is ManagerAction.ConversionUrlChanged -> updateConversionUrl(action.value)
@@ -235,6 +236,7 @@ class ManagerViewModel(
             is ManagerAction.GeneratedCleanupDestinationPresented ->
                 acknowledgeGeneratedCleanupDestination(action.token)
             ManagerAction.ConfirmPartial -> confirmPartial()
+            ManagerAction.PrepareReviewedInstall -> prepareReviewedInstall()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             ManagerAction.CancelReview -> cancelReview()
             is ManagerAction.Remove -> remove(action.packageName)
@@ -1498,6 +1500,12 @@ class ManagerViewModel(
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
         if (ready.review.status != ContractCompatibilityStatus.PARTIAL) return
         mutableState.update { it.copy(importState = ready.copy(partialConfirmed = true), message = null) }
+    }
+
+    private fun prepareReviewedInstall() {
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        if (mutableState.value.route != ManagerRoute.Review(ready.review.token)) return
+        enqueueEffect(ManagerEffect.RequestInstallNotificationPermission)
     }
 
     private fun installReviewedBundle() {
@@ -3770,6 +3778,13 @@ class ManagerViewModel(
             return false
         }
         when (effect) {
+            ManagerEffect.PickSixDocument -> return true
+            ManagerEffect.RequestInstallNotificationPermission -> {
+                val ready =
+                    mutableState.value.importState as? ImportUiState.ReviewReady
+                        ?: return false
+                return mutableState.value.route == ManagerRoute.Review(ready.review.token)
+            }
             is ManagerEffect.PickConversionDocument -> {
                 val pending = pendingConversionPicker ?: return false
                 return mutableState.value.route == ManagerRoute.ConversionInput &&

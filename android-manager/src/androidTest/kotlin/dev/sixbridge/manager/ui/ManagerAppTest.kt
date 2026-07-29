@@ -94,7 +94,10 @@ class ManagerAppTest {
         var addFileRequests = 0
         composeRule.setContent {
             ManagerAppContent(
-                state = ManagerUiState(installed = listOf(installedItem())),
+                state = ManagerUiState(
+                    installed = listOf(installedItem()),
+                    startupRecoveryState = StartupRecoveryUiState.READY,
+                ),
                 onAction = { actions.add(it) },
                 onAddSix = { addFileRequests += 1 },
             )
@@ -122,6 +125,38 @@ class ManagerAppTest {
             actions,
         )
         assertEquals(1, addFileRequests)
+    }
+
+    @Test
+    fun startup_gate_disables_mutations_but_keeps_report_readable() {
+        var startupState by mutableStateOf(StartupRecoveryUiState.INITIALIZING)
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    installed = listOf(installedItem()),
+                    startupRecoveryState = startupState,
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        listOf(
+            StartupRecoveryUiState.INITIALIZING,
+            StartupRecoveryUiState.RECOVERY_BLOCKED,
+        ).forEach { expectedState ->
+            composeRule.runOnIdle { startupState = expectedState }
+            listOf(
+                "home:convert-on-device",
+                "home:add-six",
+                "home:open-addons",
+                "extension:$PACKAGE:remove",
+            ).forEach { tag ->
+                composeRule.onNodeWithTag("home:scroll").performScrollToNode(hasTestTag(tag))
+                composeRule.onNodeWithTag(tag).assertIsNotEnabled()
+            }
+            composeRule.onNodeWithTag("extension:$PACKAGE:report").assertIsEnabled()
+        }
     }
 
     @Test

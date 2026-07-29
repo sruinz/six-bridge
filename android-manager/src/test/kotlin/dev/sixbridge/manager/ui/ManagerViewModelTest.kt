@@ -209,6 +209,109 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `OpenSixFilePicker는 READY에서 PickSixDocument를 발생시키고 blocked에서는 차단된다`() =
+        runTest(dispatcher.scheduler) {
+            val viewModel = ManagerViewModel(FakeManagerRepository(), SavedStateHandle())
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.effects.toList(effects)
+            }
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(listOf<ManagerEffect>(ManagerEffect.PickSixDocument), effects)
+
+            val blocked = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+                },
+                SavedStateHandle(),
+            )
+            val blockedEffects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                blocked.effects.toList(blockedEffects)
+            }
+            advanceUntilIdle()
+
+            blocked.accept(ManagerAction.OpenSixFilePicker)
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(blockedEffects.isEmpty())
+        }
+
+    @Test
+    fun `PrepareReviewedInstall은 exact review에서 RequestInstallNotificationPermission을 발생시킨다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.effects.toList(effects)
+            }
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                listOf<ManagerEffect>(
+                    ManagerEffect.RequestInstallNotificationPermission,
+                ),
+                effects,
+            )
+
+            val blocked = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+                },
+                SavedStateHandle(),
+            )
+            val blockedEffects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                blocked.effects.toList(blockedEffects)
+            }
+            advanceUntilIdle()
+
+            blocked.accept(ManagerAction.PrepareReviewedInstall)
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(blockedEffects.isEmpty())
+        }
+
+    @Test
+    fun `RequestInstallNotificationPermission은 수집 전에 review owner가 바뀌면 폐기된다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            viewModel.accept(ManagerAction.ReturnHome)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(effects.isEmpty())
+            collector.cancel()
+        }
+
+    @Test
     fun `conversion restore suspend 중 도착한 exact generated terminal은 READY 전에 reconcile한다`() =
         runTest(dispatcher.scheduler) {
             val conversionResult = CompletableDeferred<RestoredConversion?>()
@@ -1305,7 +1408,7 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             settingsRepository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
             advanceUntilIdle()
-            settingsViewModel.accept(ManagerAction.FilePickerOpened)
+            settingsViewModel.accept(ManagerAction.ReturnHome)
             val settingsEffects = mutableListOf<ManagerEffect>()
             val settingsCollector = launch { settingsViewModel.effects.collect(settingsEffects::add) }
             dispatcher.scheduler.runCurrent()
@@ -1364,7 +1467,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `파일 선택기를 연 뒤 늦은 uninstall reconcile은 취소 카드와 RETRY를 만들지 않는다`() =
+    fun `새 작업 뒤 늦은 uninstall reconcile은 취소 카드와 RETRY를 만들지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 suspendUninstallReconcile = true
@@ -1380,7 +1483,7 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.ReturnedToForeground)
             dispatcher.scheduler.runCurrent()
 
-            viewModel.accept(ManagerAction.FilePickerOpened)
+            viewModel.accept(ManagerAction.ReturnHome)
             repository.completeUninstallReconcile()
             advanceUntilIdle()
 
@@ -1404,7 +1507,7 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.Remove(PACKAGE))
             val stale = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            viewModel.accept(ManagerAction.FilePickerOpened)
+            viewModel.accept(ManagerAction.ReturnHome)
             viewModel.accept(ManagerAction.LaunchSucceeded(stale))
             viewModel.accept(ManagerAction.LaunchFailed(stale))
             viewModel.accept(ManagerAction.ReturnedToForeground)

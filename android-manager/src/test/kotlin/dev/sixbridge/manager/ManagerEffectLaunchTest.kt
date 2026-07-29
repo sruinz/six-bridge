@@ -1,7 +1,6 @@
 package dev.sixbridge.manager
 
 import dev.sixbridge.manager.ui.LaunchDestination
-import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerEffect
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -10,21 +9,6 @@ import kotlin.test.assertTrue
 import org.junit.Test
 
 class ManagerEffectLaunchTest {
-    @Test
-    fun `파일 선택기는 picker 실행 전에 현재 작업을 무효화한다`() {
-        val events = mutableListOf<String>()
-
-        openSixFilePicker(
-            onAction = { action ->
-                assertEquals(ManagerAction.FilePickerOpened, action)
-                events += "action"
-            },
-            launchPicker = { events += "picker" },
-        )
-
-        assertEquals(listOf("action", "picker"), events)
-    }
-
     @Test
     fun `intent 생성 예외는 같은 effect를 실패 callback에 전달한다`() {
         val effect = launchEffect()
