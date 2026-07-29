@@ -60,10 +60,12 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -110,6 +112,101 @@ class ManagerViewModelTest {
             viewModel.state.value.installed.single().iconPng,
         )
     }
+
+    @Test
+    fun `initialize 전 import와 conversion은 PREPARED normal handoff보다 먼저 시작하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.PREPARED,
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeDeferred = initializeResult
+                normalHandoff = handoff
+                currentTerminalReceiptResult = TerminalReceiptOwnerResult.OwnerMismatch
+            }
+            var importCalled = false
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.startImport {
+                importCalled = true
+                ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
+                )
+            }
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            dispatcher.scheduler.runCurrent()
+
+            assertFalse(importCalled)
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(0, repository.cancelInstallRequests)
+
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    normalHandoff = handoff,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(handoff, repository.normalHandoff)
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertFalse(importCalled)
+        }
+
+    @Test
+    fun `recovery blocked는 보고서 외 mutation과 callback을 모두 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val savedState = SavedStateHandle()
+            val effects = mutableListOf<ManagerEffect>()
+            val viewModel = ManagerViewModel(repository, savedState)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.effects.toList(effects)
+            }
+            advanceUntilIdle()
+
+            listOf(
+                ManagerAction.OpenConversionInput,
+                ManagerAction.OpenSamsungAddOns,
+                ManagerAction.Remove(PACKAGE),
+                ManagerAction.InstallReviewedBundle,
+                ManagerAction.ReturnedToForeground,
+                ManagerAction.DismissMessage,
+                ManagerAction.RetryRecovery,
+            ).forEach(viewModel::accept)
+            viewModel.startImport { error("blocked import must not run") }
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                UserMessageKind.RECOVERY_BLOCKED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+            assertTrue(effects.isEmpty())
+            assertEquals(0, repository.cleanupRequestCount())
+            assertTrue(repository.discardedTokens.isEmpty())
+
+            viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
 
     @Test
     fun `설치 목록의 보고서만 열고 홈으로 돌아온다`() = runTest(dispatcher.scheduler) {
@@ -1218,7 +1315,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `느린 초기 restore는 새 import를 덮지 않고 old token을 폐기한다`() =
+    fun `느린 초기 restore 중 새 import는 무시하고 restored review를 유지한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 suspendInitialize = true
@@ -1232,16 +1329,27 @@ class ManagerViewModelTest {
             val viewModel = ManagerViewModel(repository, SavedStateHandle())
             dispatcher.scheduler.runCurrent()
 
-            viewModel.startImport(repository::nextImport)
+            var importCalled = false
+            viewModel.startImport {
+                importCalled = true
+                repository.nextImport()
+            }
             advanceUntilIdle()
+            assertFalse(importCalled)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+
             repository.completeInitialize()
             advanceUntilIdle()
 
             assertEquals(
-                SECOND_TOKEN,
+                TOKEN,
                 assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState).review.token,
             )
-            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
         }
 
     @Test
@@ -1384,7 +1492,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `cleanup 실패 뒤 늦은 stale token은 현재 review 파일을 자동 또는 부분 삭제하지 않는다`() =
+    fun `느린 초기 restore 중 import와 cancel은 무시하고 restored review를 유지한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 suspendInitialize = true
@@ -1400,32 +1508,30 @@ class ManagerViewModelTest {
             val viewModel = ManagerViewModel(repository, savedState)
             dispatcher.scheduler.runCurrent()
 
+            var importCalled = false
             viewModel.startImport {
+                importCalled = true
                 ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
             }
             dispatcher.scheduler.runCurrent()
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertFalse(importCalled)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
 
             viewModel.accept(ManagerAction.CancelReview)
             dispatcher.scheduler.runCurrent()
-            assertEquals(listOf(TOKEN), repository.discardAttempts)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertNull(savedState.get<String>("review_token"))
 
-            repository.discardReviewResults[TOKEN] = true
-            repository.discardReviewResults[SECOND_TOKEN] = false
             repository.completeInitialize()
-            dispatcher.scheduler.runCurrent()
+            advanceUntilIdle()
 
             assertTrue(repository.discardedTokens.isEmpty())
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
-
-            viewModel.accept(ManagerAction.CancelReview)
-            dispatcher.scheduler.runCurrent()
-
-            assertTrue(repository.discardedTokens.isEmpty())
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+            assertEquals(SECOND_TOKEN, savedState.get<String>("review_token"))
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
         }
 
     @Test
@@ -4411,7 +4517,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `pending REVIEW stale initialize exception은 현재 상태를 오염시키지 않는다`() =
+    fun `pending REVIEW initialize 전 import는 무시하고 exception Retry를 표시한다`() =
         runTest(dispatcher.scheduler) {
             val initializeResult = CompletableDeferred<ManagerRestoreResult>()
             val savedState = pendingReviewReportSavedState()
@@ -4437,12 +4543,20 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-            assertNull(viewModel.state.value.message)
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
             assertGeneratedOwnersAndSessionPreserved(savedState)
             assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
-            assertEquals(1, repository.cancelInstallRequests)
+            assertEquals(0, repository.cancelInstallRequests)
             assertTrue(repository.discardedTokens.isEmpty())
             assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
         }
 
     @Test
@@ -4463,18 +4577,28 @@ class ManagerViewModelTest {
             dispatcher.scheduler.runCurrent()
 
             viewModel.accept(ManagerAction.RetryGeneratedCleanup)
-            advanceUntilIdle()
+            dispatcher.scheduler.runCurrent()
 
-            assertEquals("CONVERSION", generatedCleanupPhase(savedState))
+            assertEquals("REVIEW", generatedCleanupPhase(savedState))
             assertGeneratedOwnersAndSessionPreserved(savedState)
-            assertEquals(listOf(TOKEN), repository.discardedTokens)
-            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
 
-            repository.beforeDiscardConversion = null
             initializeResult.complete(repository.restoreResult)
             advanceUntilIdle()
 
-            assertEquals(listOf(false), repository.restoreConversionImportReviewRequests)
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals("CONVERSION", generatedCleanupPhase(savedState))
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(listOf(true), repository.restoreConversionImportReviewRequests)
             assertEquals(
                 null,
                 assertIs<ConversionUiState.ResultReady>(

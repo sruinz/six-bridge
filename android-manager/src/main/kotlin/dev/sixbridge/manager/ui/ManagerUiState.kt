@@ -153,6 +153,7 @@ enum class RecoveryAction {
 }
 
 enum class UserMessageKind {
+    RECOVERY_BLOCKED,
     FILE_READ_OR_SIZE,
     ZIP_OR_SCHEMA,
     IDENTITY_VERIFICATION,
@@ -175,6 +176,12 @@ enum class UserMessageKind {
     CONVERSION_CLEANUP_FAILED,
 }
 
+enum class StartupRecoveryUiState {
+    INITIALIZING,
+    READY,
+    RECOVERY_BLOCKED,
+}
+
 data class UserMessage(
     val kind: UserMessageKind,
     val text: String,
@@ -190,6 +197,8 @@ data class ManagerUiState(
     val installState: InstallState = InstallState.Idle,
     val message: UserMessage? = null,
     val destinationCommitToken: String? = null,
+    val startupRecoveryState: StartupRecoveryUiState =
+        StartupRecoveryUiState.INITIALIZING,
 )
 
 sealed interface ManagerAction {

@@ -7,6 +7,7 @@ import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
+import dev.sixbridge.manager.app.ManagerRestoreResult
 import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
@@ -149,6 +150,11 @@ class ManagerViewModel(
     }
 
     fun accept(action: ManagerAction) {
+        if (generatedCleanupRestoreInvalid) {
+            showGeneratedCleanupRestoreBlocked()
+            return
+        }
+        if (!gateStartupAction(action)) return
         if (intermediateGeneratedCleanupRestorePending &&
             pendingGeneratedCleanup?.phase in setOf(
                 GeneratedCleanupPhase.REVIEW,
@@ -159,7 +165,8 @@ class ManagerViewModel(
             return
         }
         if (!acknowledgeNormalOutcome(action)) return
-        if (action != ManagerAction.RetryRecovery &&
+        if (mutableState.value.startupRecoveryState == StartupRecoveryUiState.READY &&
+            action != ManagerAction.RetryRecovery &&
             action != ManagerAction.RetryGeneratedCleanup &&
             action !is ManagerAction.LaunchSucceeded &&
             action !is ManagerAction.LaunchFailed &&
@@ -243,6 +250,18 @@ class ManagerViewModel(
         }
     }
 
+    private fun gateStartupAction(action: ManagerAction): Boolean {
+        if (action is ManagerAction.OpenReport || action == ManagerAction.ReturnHome) return true
+        return when (mutableState.value.startupRecoveryState) {
+            StartupRecoveryUiState.READY -> true
+            StartupRecoveryUiState.INITIALIZING -> false
+            StartupRecoveryUiState.RECOVERY_BLOCKED -> {
+                showStartupRecoveryBlocked()
+                false
+            }
+        }
+    }
+
     private fun acknowledgeNormalOutcome(action: ManagerAction): Boolean {
         val handoff = pendingNormalHandoff ?: return true
         if (handoff.stage != NormalHandoffStage.OUTCOME_READY) return true
@@ -265,6 +284,7 @@ class ManagerViewModel(
     }
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
+        if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
@@ -320,6 +340,7 @@ class ManagerViewModel(
     }
 
     private fun openConversionInput() {
+        if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
         if (mutableState.value.conversionState is ConversionUiState.Building &&
             routeCleanup?.isActive != true
         ) {
@@ -980,7 +1001,8 @@ class ManagerViewModel(
             val committedDestination = pendingGeneratedCleanup?.takeIf {
                 it.phase == GeneratedCleanupPhase.COMMIT_DESTINATION
             }
-            committedDestination?.let(::completeGeneratedCleanup)
+            val committedDestinationCompleted =
+                committedDestination?.let(::completeGeneratedCleanup) == true
             val savedToken = savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
             val savedSession = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
             val restored = try {
@@ -991,8 +1013,9 @@ class ManagerViewModel(
                 if (generatedCleanupRestoreInvalid) {
                     initialized = true
                     showGeneratedCleanupRestoreBlocked()
-                } else if (committedDestination != null) {
+                } else if (committedDestinationCompleted) {
                     initialized = true
+                    markStartupRecoveryReady()
                 } else if (initialIntermediateCleanup != null &&
                     generation == operationGeneration &&
                     savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == savedToken &&
@@ -1000,6 +1023,7 @@ class ManagerViewModel(
                 ) {
                     intermediateGeneratedCleanupRestorePending = false
                     showGeneratedCleanupFailure()
+                    markStartupRecoveryReady()
                 }
                 return@launch
             }
@@ -1008,7 +1032,18 @@ class ManagerViewModel(
                 showGeneratedCleanupRestoreBlocked()
                 return@launch
             }
-            if (committedDestination != null) return@launch
+            if (restored.recoveryBlocked) {
+                showStartupRecoveryBlocked()
+                return@launch
+            }
+            if (committedDestination != null) {
+                if (committedDestinationCompleted) {
+                    markStartupRecoveryReady()
+                } else {
+                    showStartupRecoveryBlocked()
+                }
+                return@launch
+            }
             val intermediateCleanup = pendingGeneratedCleanup?.takeIf {
                 it.phase == GeneratedCleanupPhase.REVIEW ||
                     it.phase == GeneratedCleanupPhase.CONVERSION
@@ -1018,10 +1053,16 @@ class ManagerViewModel(
                 if (intermediateCleanup == null) {
                     restored.review?.token?.let(::queuePendingReviewDiscard)
                 }
+                if (reconcileRestoredNormalHandoffAfterStartupMismatch(restored)) {
+                    markStartupRecoveryReady()
+                }
                 return@launch
             }
             if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
                 deferredInitialTerminal = null
+                if (reconcileRestoredNormalHandoffAfterStartupMismatch(restored)) {
+                    markStartupRecoveryReady()
+                }
                 return@launch
             }
             if (intermediateCleanup != null &&
@@ -1035,6 +1076,7 @@ class ManagerViewModel(
                 ) {
                     intermediateGeneratedCleanupRestorePending = false
                     showGeneratedCleanupFailure()
+                    markStartupRecoveryReady()
                     return@launch
                 }
                 restoreConversion(
@@ -1051,6 +1093,9 @@ class ManagerViewModel(
                     savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken ||
                     pendingGeneratedCleanup != intermediateCleanup
                 ) {
+                    if (reconcileRestoredNormalHandoffAfterStartupMismatch(restored)) {
+                        markStartupRecoveryReady()
+                    }
                     return@launch
                 }
                 intermediateGeneratedCleanupRestorePending = false
@@ -1067,6 +1112,7 @@ class ManagerViewModel(
                 } else {
                     showGeneratedCleanupFailure()
                 }
+                markStartupRecoveryReady()
                 return@launch
             }
             val resultOwner = generatedResultOwnerToken
@@ -1110,6 +1156,7 @@ class ManagerViewModel(
                 ) {
                     showTerminalHandoffFailure()
                 }
+                markStartupRecoveryReady()
                 return@launch
             }
             restored.terminal?.let { terminal ->
@@ -1127,6 +1174,7 @@ class ManagerViewModel(
                     ) {
                         showTerminalHandoffFailure()
                     }
+                    markStartupRecoveryReady()
                     return@launch
                 }
             }
@@ -1141,6 +1189,7 @@ class ManagerViewModel(
                     it.copy(conversionState = ConversionUiState.Idle)
                 }
                 showReview(restored.review)
+                markStartupRecoveryReady()
                 return@launch
             }
             val deferredTerminal = deferredInitialTerminal
@@ -1184,10 +1233,18 @@ class ManagerViewModel(
                     applyObservedInstallTerminal(deferredTerminal)
                 }
             }
+            if (deferredTerminal != null &&
+                generatedInstallOwnerToken == null &&
+                resultOwner == null &&
+                restored.review != null
+            ) {
+                applyObservedInstallTerminal(deferredTerminal)
+            }
             pendingGeneratedTerminalHandoff?.let { handoff ->
                 if (!resumeGeneratedTerminalHandoff(handoff, restored.terminal)) {
                     showGeneratedCleanupFailure()
                 }
+                markStartupRecoveryReady()
                 return@launch
             }
             val pendingCleanup = pendingGeneratedCleanup
@@ -1212,7 +1269,18 @@ class ManagerViewModel(
                     performPendingGeneratedCleanup()
                 }
             }
+            markStartupRecoveryReady()
         }
+    }
+
+    private suspend fun reconcileRestoredNormalHandoffAfterStartupMismatch(
+        restored: ManagerRestoreResult,
+    ): Boolean {
+        val handoff = restored.normalHandoff ?: return true
+        pendingNormalHandoff = handoff
+        if (resumeNormalHandoffWithCurrentReceipt(handoff, restored.terminal)) return true
+        showStartupRecoveryBlocked()
+        return false
     }
 
     private suspend fun reconcilePersistedGeneratedTerminal(
@@ -1311,11 +1379,26 @@ class ManagerViewModel(
                     showGeneratedCleanupRestoreBlocked()
                     return@collect
                 }
+                if (mutableState.value.startupRecoveryState ==
+                    StartupRecoveryUiState.RECOVERY_BLOCKED
+                ) {
+                    return@collect
+                }
                 if (pendingGeneratedCleanup?.phase in setOf(
                         GeneratedCleanupPhase.REVIEW,
                         GeneratedCleanupPhase.CONVERSION,
                     )
                 ) {
+                    return@collect
+                }
+                if (mutableState.value.startupRecoveryState ==
+                    StartupRecoveryUiState.INITIALIZING
+                ) {
+                    if (installState.isTerminalState() &&
+                        savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
+                    ) {
+                        deferredInitialTerminal = installState
+                    }
                     return@collect
                 }
                 if (firstEmission &&
@@ -1383,6 +1466,11 @@ class ManagerViewModel(
         viewModelScope.launch {
             repository.launches.collect { launch ->
                 if (generatedCleanupRestoreInvalid) return@collect
+                if (mutableState.value.startupRecoveryState !=
+                    StartupRecoveryUiState.READY
+                ) {
+                    return@collect
+                }
                 enqueueEffect(currentLaunchEffect(launch))
             }
         }
@@ -2882,6 +2970,31 @@ class ManagerViewModel(
         }
     }
 
+    private fun showStartupRecoveryBlocked() {
+        mutableState.update {
+            it.copy(
+                startupRecoveryState = StartupRecoveryUiState.RECOVERY_BLOCKED,
+                message = UserMessage(
+                    kind = UserMessageKind.RECOVERY_BLOCKED,
+                    text = "저장된 설치 복구 정보를 읽을 수 없어 복구 자료를 보존했습니다. " +
+                        "앱을 업데이트한 뒤 다시 확인해 주세요.",
+                    recoveryAction = RecoveryAction.NONE,
+                ),
+            )
+        }
+    }
+
+    private fun markStartupRecoveryReady() {
+        if (mutableState.value.startupRecoveryState ==
+            StartupRecoveryUiState.RECOVERY_BLOCKED
+        ) {
+            return
+        }
+        mutableState.update {
+            it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
+        }
+    }
+
     private fun showGeneratedCleanupRestoreBlocked() {
         mutableState.update {
             it.copy(
@@ -3612,6 +3725,9 @@ class ManagerViewModel(
     }
 
     private fun isEffectCurrent(effect: ManagerEffect): Boolean {
+        if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) {
+            return false
+        }
         when (effect) {
             is ManagerEffect.PickConversionDocument -> {
                 val pending = pendingConversionPicker ?: return false
