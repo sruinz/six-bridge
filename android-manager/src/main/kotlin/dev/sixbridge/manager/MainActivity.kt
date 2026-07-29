@@ -141,7 +141,7 @@ class MainActivity : ComponentActivity() {
                     when (effect) {
                         ManagerEffect.PickSixDocument ->
                             openDocument.launch(SIX_MIME_TYPES)
-                        ManagerEffect.RequestInstallNotificationPermission ->
+                        is ManagerEffect.RequestInstallNotificationPermission ->
                             notificationInstallGate.requestInstall()
                         is ManagerEffect.LaunchIntent -> executeLaunch(
                             effect = effect,

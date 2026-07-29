@@ -528,6 +528,7 @@ class ManagerViewModel(
 
     private fun prepareGeneratedInstall() {
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
+        if (mutableState.value.route != ManagerRoute.ConversionResult(result.token)) return
         if (result.installOwnerActive || result.cleanupPending || result.cleanupInProgress) return
         val review = result.review ?: run {
             mutableState.update {
@@ -553,6 +554,12 @@ class ManagerViewModel(
                 message = null,
             )
         }
+        enqueueEffect(
+            ManagerEffect.RequestInstallNotificationPermission(
+                reviewToken = review.token,
+                generatedToken = result.token,
+            ),
+        )
     }
 
     private fun requestGeneratedSave() {
@@ -1505,7 +1512,12 @@ class ManagerViewModel(
     private fun prepareReviewedInstall() {
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
         if (mutableState.value.route != ManagerRoute.Review(ready.review.token)) return
-        enqueueEffect(ManagerEffect.RequestInstallNotificationPermission)
+        if (generatedInstallOwnerToken != null) return
+        enqueueEffect(
+            ManagerEffect.RequestInstallNotificationPermission(
+                reviewToken = ready.review.token,
+            ),
+        )
     }
 
     private fun installReviewedBundle() {
@@ -3779,11 +3791,31 @@ class ManagerViewModel(
         }
         when (effect) {
             ManagerEffect.PickSixDocument -> return true
-            ManagerEffect.RequestInstallNotificationPermission -> {
+            is ManagerEffect.RequestInstallNotificationPermission -> {
                 val ready =
                     mutableState.value.importState as? ImportUiState.ReviewReady
                         ?: return false
-                return mutableState.value.route == ManagerRoute.Review(ready.review.token)
+                if (ready.review.token != effect.reviewToken ||
+                    ownedReviewToken != effect.reviewToken ||
+                    savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != effect.reviewToken
+                ) {
+                    return false
+                }
+                val generatedToken = effect.generatedToken
+                if (generatedToken == null) {
+                    return generatedInstallOwnerToken == null &&
+                        mutableState.value.route ==
+                        ManagerRoute.Review(effect.reviewToken)
+                }
+                val result =
+                    mutableState.value.conversionState as? ConversionUiState.ResultReady
+                        ?: return false
+                return generatedInstallOwnerToken == generatedToken &&
+                    result.installOwnerActive &&
+                    result.token == generatedToken &&
+                    result.review?.token == effect.reviewToken &&
+                    mutableState.value.route ==
+                    ManagerRoute.ConversionResult(generatedToken)
             }
             is ManagerEffect.PickConversionDocument -> {
                 val pending = pendingConversionPicker ?: return false

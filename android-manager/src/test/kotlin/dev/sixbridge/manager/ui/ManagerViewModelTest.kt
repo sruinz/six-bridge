@@ -264,7 +264,7 @@ class ManagerViewModelTest {
 
             assertEquals(
                 listOf<ManagerEffect>(
-                    ManagerEffect.RequestInstallNotificationPermission,
+                    ManagerEffect.RequestInstallNotificationPermission(TOKEN),
                 ),
                 effects,
             )
@@ -309,6 +309,101 @@ class ManagerViewModelTest {
 
             assertTrue(effects.isEmpty())
             collector.cancel()
+        }
+
+    @Test
+    fun `stale permission owner A는 exact review B로 교체되면 폐기되고 A 유지 시 전달된다`() =
+        runTest(dispatcher.scheduler) {
+            fun restoredReviewRepository() = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+
+            val current = ManagerViewModel(
+                restoredReviewRepository(),
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            current.accept(ManagerAction.PrepareReviewedInstall)
+            val currentEffects = mutableListOf<ManagerEffect>()
+            val currentCollector = launch { current.effects.collect(currentEffects::add) }
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                ManagerEffect.RequestInstallNotificationPermission(TOKEN),
+                currentEffects.single(),
+            )
+            currentCollector.cancel()
+
+            val staleRepository = restoredReviewRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
+                )
+            }
+            val stale = ManagerViewModel(
+                staleRepository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            stale.accept(ManagerAction.PrepareReviewedInstall)
+            stale.startImport(staleRepository::nextImport)
+            advanceUntilIdle()
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), stale.state.value.route)
+
+            val staleEffects = mutableListOf<ManagerEffect>()
+            val staleCollector = launch { stale.effects.collect(staleEffects::add) }
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(staleEffects.isEmpty())
+            staleCollector.cancel()
+        }
+
+    @Test
+    fun `generated install permission callback sequence는 effect 뒤 기존 install action을 진행한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(
+                    mapOf(
+                        ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                        ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.effects.toList(effects)
+            }
+
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                ManagerEffect.RequestInstallNotificationPermission(
+                    reviewToken = TOKEN,
+                    generatedToken = TOKEN,
+                ),
+                effects.single(),
+            )
+            assertTrue(
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).installOwnerActive,
+            )
+
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.installRequests)
         }
 
     @Test
@@ -3012,6 +3107,13 @@ class ManagerViewModelTest {
                 advanceUntilIdle()
                 if (gate == "Retry") {
                     viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                    assertEquals(
+                        ManagerEffect.RequestInstallNotificationPermission(
+                            reviewToken = TOKEN,
+                            generatedToken = TOKEN,
+                        ),
+                        viewModel.effects.first(),
+                    )
                     repository.installFlow.value =
                         InstallState.Failed("ABANDON_FAILED", "cleanup retry")
                     advanceUntilIdle()

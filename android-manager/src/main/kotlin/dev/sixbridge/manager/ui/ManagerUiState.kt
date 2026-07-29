@@ -265,7 +265,10 @@ enum class LaunchDestination {
 
 sealed interface ManagerEffect {
     data object PickSixDocument : ManagerEffect
-    data object RequestInstallNotificationPermission : ManagerEffect
+    data class RequestInstallNotificationPermission(
+        val reviewToken: String,
+        val generatedToken: String? = null,
+    ) : ManagerEffect
 
     data class PickConversionDocument(
         val ownerGeneration: Long,
