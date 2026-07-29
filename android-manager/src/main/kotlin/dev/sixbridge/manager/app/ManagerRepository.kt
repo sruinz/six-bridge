@@ -504,10 +504,17 @@ internal class DefaultManagerRepository(
     override suspend fun cancelInstall(
         expectedReviewToken: String,
         expectedSessionId: Int?,
-    ): InstallCleanupResult = installCoordinator.cancel(
-        expectedImportToken = expectedReviewToken,
-        expectedSessionId = expectedSessionId,
-    )
+    ): InstallCleanupResult =
+        if (expectedSessionId == null &&
+            systemInstallCoordinator.ownsHandoff(expectedReviewToken)
+        ) {
+            systemInstallCoordinator.cancel(expectedReviewToken)
+        } else {
+            installCoordinator.cancel(
+                expectedImportToken = expectedReviewToken,
+                expectedSessionId = expectedSessionId,
+            )
+        }
 
     override suspend fun terminalForOwner(
         expectedReviewToken: String,

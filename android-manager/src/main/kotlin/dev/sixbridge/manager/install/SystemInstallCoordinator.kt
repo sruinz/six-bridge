@@ -75,6 +75,14 @@ class SystemInstallCoordinator(
 
     val state: StateFlow<InstallState> = mutableState.asStateFlow()
 
+    fun ownsHandoff(importToken: String): Boolean =
+        when (val snapshot = handoffStore.snapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value.importToken == importToken
+            RecoveryRecordSnapshot.Absent,
+            RecoveryRecordSnapshot.Invalid,
+            -> false
+        }
+
     fun ownsPreparedFallback(importToken: String): Boolean {
         val prepared = when (val snapshot = handoffStore.snapshot()) {
             is RecoveryRecordSnapshot.Present -> snapshot.value
@@ -334,10 +342,10 @@ class SystemInstallCoordinator(
         if (record.importToken != expectedImportToken) {
             return@withLock InstallCleanupResult.OwnerMismatch
         }
-        if (!handoffStore.clear(record)) {
+        if (!discardPrivateImport(expectedImportToken)) {
             return@withLock InstallCleanupResult.CleanupFailed
         }
-        if (!discardPrivateImport(expectedImportToken)) {
+        if (!handoffStore.clear(record)) {
             return@withLock InstallCleanupResult.CleanupFailed
         }
         mutableState.value = InstallState.Idle

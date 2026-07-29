@@ -235,6 +235,49 @@ class ManagerRepositoryTest {
         }
 
     @Test
+    fun `repository cancel은 PREPARED system handoff와 private import를 정리한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("cancel-prepared-export")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+            assertEquals(
+                SystemInstallStage.PREPARED,
+                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                    fixture.handoffStore.snapshot(),
+                ).value.stage,
+            )
+
+            assertEquals(
+                InstallCleanupResult.Cleaned,
+                fixture.repository.cancelInstall(TOKEN, null),
+            )
+            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+            assertFalse(File(fixture.root, TOKEN).exists())
+        }
+
+    @Test
+    fun `repository cancel은 EXPORTED system handoff와 private import를 정리한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("cancel-exported-export")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+            assertTrue(fixture.repository.markSystemInstallApkExported(TOKEN))
+            assertEquals(
+                SystemInstallStage.EXPORTED,
+                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                    fixture.handoffStore.snapshot(),
+                ).value.stage,
+            )
+
+            assertEquals(
+                InstallCleanupResult.Cleaned,
+                fixture.repository.cancelInstall(TOKEN, null),
+            )
+            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+            assertFalse(File(fixture.root, TOKEN).exists())
+        }
+
+    @Test
     fun `recovery store snapshot은 하나의 Invalid도 전체 Invalid로 보존한다`() {
         val pending = PendingInstall(41, PACKAGE, TOKEN, 1)
         val store = StartupPendingStore(pending).apply {

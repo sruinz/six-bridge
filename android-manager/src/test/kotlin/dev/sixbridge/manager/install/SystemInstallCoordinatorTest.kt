@@ -415,6 +415,54 @@ class SystemInstallCoordinatorTest {
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
 
+    @Test
+    fun `PREPARED cancel은 import 정리 실패 시 handoff를 보존하고 재시도한다`() = runTest {
+        val fixture = fixture()
+        assertIs<SystemInstallRequestResult.ExportRequired>(
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
+        )
+        fixture.pendingStore.discardFailure = true
+
+        assertEquals(
+            InstallCleanupResult.CleanupFailed,
+            fixture.coordinator.cancel(TOKEN),
+        )
+        assertEquals(
+            SystemInstallStage.PREPARED,
+            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                fixture.handoffStore.snapshot(),
+            ).value.stage,
+        )
+
+        fixture.pendingStore.discardFailure = false
+        assertEquals(InstallCleanupResult.Cleaned, fixture.coordinator.cancel(TOKEN))
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
+    @Test
+    fun `EXPORTED cancel은 import 정리 실패 시 handoff를 보존하고 재시도한다`() = runTest {
+        val fixture = fixture()
+        fixture.export()
+        fixture.pendingStore.discardFailure = true
+
+        assertEquals(
+            InstallCleanupResult.CleanupFailed,
+            fixture.coordinator.cancel(TOKEN),
+        )
+        assertEquals(
+            SystemInstallStage.EXPORTED,
+            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                fixture.handoffStore.snapshot(),
+            ).value.stage,
+        )
+
+        fixture.pendingStore.discardFailure = false
+        assertEquals(InstallCleanupResult.Cleaned, fixture.coordinator.cancel(TOKEN))
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
+
     private fun fixture(
         previous: InstalledWrapper? = null,
         actual: InstalledWrapper? = previous,
@@ -664,6 +712,7 @@ class SystemInstallCoordinatorTest {
         var pending: PendingInstall? = null
         var receipt: FinalInstallReceipt? = null
         var createFinalFailure = false
+        var discardFailure = false
         val discardedTokens = mutableListOf<String>()
 
         override fun load(): PendingInstall? = pending
@@ -684,6 +733,7 @@ class SystemInstallCoordinatorTest {
             PendingCleanupResult.Failed
 
         override fun discardImport(importToken: String) {
+            if (discardFailure) error("discard failed")
             discardedTokens += importToken
         }
 
