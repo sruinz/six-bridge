@@ -241,11 +241,59 @@ case "$*" in
       "$SIXBRIDGE_TEST_PACKAGE" "$version"
     ;;
   *'dump xmltree'*)
-    printf 'extension-id "%s"\n' "$SIXBRIDGE_TEST_EXTENSION"
-    if [ "${AAPT2_CONTRACT:-complete}" = complete ]; then
-      printf 'authority "%s.contentprovider"\n' "$SIXBRIDGE_TEST_PACKAGE"
-      printf 'scheme="six" host="ex"\n'
-      printf 'dev_ext\n'
+    printf 'E: manifest\n'
+    printf '  A: package="%s" (Raw: "%s")\n' \
+      "$SIXBRIDGE_TEST_PACKAGE" "$SIXBRIDGE_TEST_PACKAGE"
+    printf '    E: application\n'
+    if [ "${AAPT2_CONTRACT:-complete}" != missing-metadata ]; then
+      printf '      E: meta-data\n'
+      if [ "${AAPT2_CONTRACT:-complete}" = metadata-wrong-namespace ]; then
+        printf '        A: custom:name="extension-id" (Raw: "extension-id")\n'
+        printf '        A: custom:value="%s" (Raw: "%s")\n' \
+          "$SIXBRIDGE_TEST_EXTENSION" "$SIXBRIDGE_TEST_EXTENSION"
+      else
+        printf '        A: http://schemas.android.com/apk/res/android:name(0x01010003)="extension-id" (Raw: "extension-id")\n'
+        printf '        A: http://schemas.android.com/apk/res/android:value(0x01010024)="%s" (Raw: "%s")\n' \
+          "$SIXBRIDGE_TEST_EXTENSION" "$SIXBRIDGE_TEST_EXTENSION"
+      fi
+    fi
+    if [ "${AAPT2_CONTRACT:-complete}" != missing ]; then
+      printf '      E: activity\n'
+      printf '        A: http://schemas.android.com/apk/res/android:name(0x01010003)="dev.sixbridge.runtime.SixDiscoveryActivity"\n'
+      printf '        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true\n'
+      printf '        E: intent-filter\n'
+      printf '          E: action\n'
+      printf '            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.VIEW"\n'
+      if [ "${AAPT2_CONTRACT:-complete}" != missing-default ]; then
+        printf '          E: category\n'
+        printf '            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.DEFAULT"\n'
+      fi
+      printf '          E: category\n'
+      printf '            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.BROWSABLE"\n'
+      printf '          E: data\n'
+      printf '            A: http://schemas.android.com/apk/res/android:scheme(0x01010027)="six"\n'
+      printf '            A: http://schemas.android.com/apk/res/android:host(0x01010028)="ex"\n'
+      if [ "${AAPT2_CONTRACT:-complete}" = extra-filter ]; then
+        printf '        E: intent-filter\n'
+      fi
+      if [ "${AAPT2_CONTRACT:-complete}" = extra-activity ]; then
+        printf '      E: activity\n'
+        printf '        A: http://schemas.android.com/apk/res/android:name(0x01010003)="example.OtherActivity"\n'
+        printf '        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false\n'
+      fi
+      printf '      E: provider\n'
+      if [ "${AAPT2_CONTRACT:-complete}" = provider-wrong-class ]; then
+        printf '        A: http://schemas.android.com/apk/res/android:name(0x01010003)="example.OtherProvider"\n'
+      else
+        printf '        A: http://schemas.android.com/apk/res/android:name(0x01010003)="dev.sixbridge.runtime.ExtensionProvider"\n'
+      fi
+      if [ "${AAPT2_CONTRACT:-complete}" = provider-not-exported ]; then
+        printf '        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false\n'
+      else
+        printf '        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true\n'
+      fi
+      printf '        A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="%s.contentprovider"\n' \
+        "$SIXBRIDGE_TEST_PACKAGE"
     fi
     ;;
   *) exit 2;;
@@ -344,8 +392,29 @@ main() {
     expect_failure 'versionCode가 증가하지 않았습니다.' version-not-higher run_gate env
     write_phase update 18
 
-    expect_failure 'wrapper 계약이 없습니다.' wrapper-contract \
+    expect_failure 'Provider 계약이 없습니다.' wrapper-contract \
         run_gate env AAPT2_CONTRACT=missing
+
+    expect_failure 'metadata 계약이 없습니다.' metadata-missing \
+        run_gate env AAPT2_CONTRACT=missing-metadata
+
+    expect_failure 'metadata 계약이 없습니다.' metadata-namespace \
+        run_gate env AAPT2_CONTRACT=metadata-wrong-namespace
+
+    expect_failure 'Provider 계약이 없습니다.' provider-class \
+        run_gate env AAPT2_CONTRACT=provider-wrong-class
+
+    expect_failure 'Provider 계약이 없습니다.' provider-exported \
+        run_gate env AAPT2_CONTRACT=provider-not-exported
+
+    expect_failure 'discovery Activity 계약이 없습니다.' discovery-default \
+        run_gate env AAPT2_CONTRACT=missing-default
+
+    expect_failure 'discovery Activity 계약이 없습니다.' discovery-activity-count \
+        run_gate env AAPT2_CONTRACT=extra-activity
+
+    expect_failure 'discovery Activity 계약이 없습니다.' discovery-filter-count \
+        run_gate env AAPT2_CONTRACT=extra-filter
 
     expect_failure 'CRX3 검증에 실패했습니다.' invalid-crx \
         run_gate env CRX_VERIFY_FAIL=1

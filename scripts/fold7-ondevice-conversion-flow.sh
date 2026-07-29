@@ -105,11 +105,168 @@ assert_evidence_schema() {
         fail "$phase evidence schema가 올바르지 않습니다." 3
 }
 
+manifest_contract_facts() {
+    local xmltree=$1
+    local extension_id=$2
+    local package_name=$3
+    awk -v extension_id="$extension_id" -v package_name="$package_name" '
+      BEGIN {
+        provider_authority = package_name ".contentprovider"
+        discovery_activity = "dev.sixbridge.runtime.SixDiscoveryActivity"
+        content_provider = "dev.sixbridge.runtime.ExtensionProvider"
+        view_action = "android.intent.action.VIEW"
+        default_category = "android.intent.category.DEFAULT"
+        browsable_category = "android.intent.category.BROWSABLE"
+        android_attribute = "http://schemas.android.com/apk/res/android:"
+        android_name = android_attribute "name(0x01010003)="
+        android_value = android_attribute "value(0x01010024)="
+        android_exported = android_attribute "exported(0x01010010)="
+        android_authorities = android_attribute "authorities(0x01010018)="
+        android_scheme = android_attribute "scheme(0x01010027)="
+        android_host = android_attribute "host(0x01010028)="
+      }
+      function attribute_value(line, value) {
+        value = line
+        sub(/^.*=/, "", value)
+        sub(/ \(Raw:.*$/, "", value)
+        gsub(/^"|"$/, "", value)
+        return value
+      }
+      /^[[:space:]]*E: / {
+        match($0, /[^ ]/)
+        indent = RSTART - 1
+        while (depth > 0 && indent <= node_indent[depth]) {
+          depth--
+        }
+        depth++
+        node_indent[depth] = indent
+        node_count++
+        current = node_count
+        node_id[depth] = current
+        parent[current] = depth > 1 ? node_id[depth - 1] : 0
+        name = $0
+        sub(/^[[:space:]]*E: /, "", name)
+        sub(/[[:space:]].*$/, "", name)
+        node_name[current] = name
+        next
+      }
+      /^[[:space:]]*A: / {
+        if (current == 0) {
+          next
+        }
+        if (index($0, android_name) > 0) {
+          attribute[current, "name"] = attribute_value($0)
+        } else if (index($0, android_value) > 0) {
+          attribute[current, "value"] = attribute_value($0)
+        } else if (index($0, android_exported) > 0) {
+          attribute[current, "exported"] = attribute_value($0)
+        } else if (index($0, android_authorities) > 0) {
+          attribute[current, "authorities"] = attribute_value($0)
+        } else if (index($0, android_scheme) > 0) {
+          attribute[current, "scheme"] = attribute_value($0)
+        } else if (index($0, android_host) > 0) {
+          attribute[current, "host"] = attribute_value($0)
+        }
+      }
+      END {
+        for (i = 1; i <= node_count; i++) {
+          if (node_name[i] == "application" &&
+              node_name[parent[i]] == "manifest") {
+            application_count++
+          }
+          if (node_name[parent[i]] != "application") {
+            continue
+          }
+          if (node_name[i] == "meta-data") {
+            metadata_count++
+            if (attribute[i, "name"] == "extension-id" &&
+                attribute[i, "value"] == extension_id) {
+              metadata_matches++
+            }
+          }
+          if (node_name[i] == "provider") {
+            provider_count++
+            if (attribute[i, "name"] == content_provider &&
+                attribute[i, "authorities"] == provider_authority &&
+                attribute[i, "exported"] == "true") {
+              provider_matches++
+            }
+          }
+          if (node_name[i] == "activity") {
+            activity_count++
+            if (attribute[i, "name"] == discovery_activity &&
+                attribute[i, "exported"] == "true") {
+              discovery_activity_id = i
+              activity_matches++
+            }
+          }
+        }
+        for (i = 1; i <= node_count; i++) {
+          activity = parent[i]
+          if (node_name[i] != "intent-filter" ||
+              activity != discovery_activity_id) {
+            continue
+          }
+          filter_count++
+          action_count = 0
+          category_count = 0
+          data_count = 0
+          view_count = 0
+          default_count = 0
+          browsable_count = 0
+          endpoint_count = 0
+          for (j = 1; j <= node_count; j++) {
+            if (parent[j] != i) {
+              continue
+            }
+            if (node_name[j] == "action") {
+              action_count++
+              if (attribute[j, "name"] == view_action) {
+                view_count++
+              }
+            }
+            if (node_name[j] == "category") {
+              category_count++
+              if (attribute[j, "name"] == default_category) {
+                default_count++
+              }
+              if (attribute[j, "name"] == browsable_category) {
+                browsable_count++
+              }
+            }
+            if (node_name[j] == "data") {
+              data_count++
+              if (attribute[j, "scheme"] == "six" &&
+                  attribute[j, "host"] == "ex") {
+                endpoint_count++
+              }
+            }
+          }
+          if (action_count == 1 && view_count == 1 &&
+              category_count == 2 && default_count == 1 &&
+              browsable_count == 1 &&
+              data_count == 1 && endpoint_count == 1) {
+            valid_filter_count++
+          }
+        }
+        metadata = application_count == 1 &&
+          metadata_count == 1 && metadata_matches == 1
+        provider = application_count == 1 &&
+          provider_count == 1 && provider_matches == 1
+        discovery = application_count == 1 &&
+          activity_count == 1 && activity_matches == 1 &&
+          filter_count == 1 && valid_filter_count == 1
+        printf "%d %d %d\n", metadata, provider, discovery
+      }
+    ' "$xmltree"
+}
+
 verify_wrapper() {
     local phase=$1
     local evidence=$2
     local wrapper=$3
     local extension_id package_name signer version crx_sha actual_signer
+    local metadata_contract provider_contract discovery_contract
     local v2_signer_output="${RUN_DIR}/${phase}-apksigner-v2.txt"
     local v3_signer_output="${RUN_DIR}/${phase}-apksigner-v3.txt"
     local badging="${RUN_DIR}/${phase}-badging.txt"
@@ -145,14 +302,15 @@ verify_wrapper() {
         fail "$phase wrapper package/versionCode가 evidence와 다릅니다." 3
     "$AAPT2" dump xmltree "$wrapper" --file AndroidManifest.xml >"$xmltree" ||
         fail "$phase wrapper manifest를 읽지 못했습니다." 3
-    grep -Fq "$extension_id" "$xmltree" &&
-        grep -Fq "${package_name}.contentprovider" "$xmltree" ||
-        fail "$phase wrapper 계약이 없습니다." 3
-    if ! grep -Fq 'six://ex' "$xmltree"; then
-        grep -Fq '="six"' "$xmltree" &&
-            grep -Fq '="ex"' "$xmltree" ||
-            fail "$phase wrapper 계약이 없습니다." 3
-    fi
+    read -r metadata_contract provider_contract discovery_contract <<<"$(
+        manifest_contract_facts "$xmltree" "$extension_id" "$package_name"
+    )" || fail "$phase wrapper manifest 계약을 해석하지 못했습니다." 3
+    [ "$metadata_contract" = 1 ] ||
+        fail "$phase wrapper metadata 계약이 없습니다." 3
+    [ "$provider_contract" = 1 ] ||
+        fail "$phase wrapper Provider 계약이 없습니다." 3
+    [ "$discovery_contract" = 1 ] ||
+        fail "$phase wrapper discovery Activity 계약이 없습니다." 3
 
     unzip -p "$wrapper" assets/extension.crx >"${RUN_DIR}/${phase}.crx" ||
         fail "$phase wrapper에서 CRX3를 추출하지 못했습니다." 3
