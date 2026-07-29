@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.app
 
 import android.content.Intent
+import android.content.SharedPreferences
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelStore
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -39,6 +40,7 @@ import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
+import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
@@ -71,6 +73,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -81,6 +84,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -89,10 +93,48 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class TerminalHandoffRaceInstrumentedTest {
     @Test
+    fun wrongTypedRecoveryRecordsCompleteStartupBlockedAndPreserveOriginalKeys() =
+        runBlocking {
+            wrongTypeCases().forEach { case ->
+                val durable = ActualDurableState()
+                try {
+                    case.writeWrongType(
+                        durable.pendingPreferences,
+                        durable.recoveryPreferences,
+                    )
+                    val process = durable.newProcess()
+                    try {
+                        val restored = withTimeout(1_000) {
+                            process.repository.initialize(null, null)
+                        }
+
+                        assertTrue(case.name, restored.recoveryBlocked)
+                        assertEquals(
+                            case.name,
+                            RecoveryStoreSnapshot.Invalid,
+                            process.store.recoveryStoreSnapshot(),
+                        )
+                        assertEquals(
+                            case.name,
+                            "wrong",
+                            case.preferences(durable).all[case.key],
+                        )
+                        assertTrue(case.name, durable.gateway.abandonedSessions.isEmpty())
+                    } finally {
+                        process.close()
+                    }
+                } finally {
+                    durable.close()
+                }
+            }
+        }
+
+    @Test
     fun normalSourceViewModelPreparedHandoffRebasesAllLateRawOutcomesAndAcksExactly() =
         runBlocking {
             terminalCases().forEach { case ->
-                val fixture = ActualFixture()
+                val durable = ActualDurableState()
+                val fixture = durable.newProcess()
                 try {
                     val savedState = SavedStateHandle(
                         mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to REVIEW_TOKEN),
@@ -159,6 +201,7 @@ class TerminalHandoffRaceInstrumentedTest {
                     )
                 } finally {
                     fixture.close()
+                    durable.close()
                 }
             }
         }
@@ -167,7 +210,8 @@ class TerminalHandoffRaceInstrumentedTest {
     fun generatedSourceViewModelSavedHandoffRebasesAllLateRawOutcomesAndInstalledGap() =
         runBlocking {
             terminalCases().forEach { case ->
-                val fixture = ActualFixture()
+                val durable = ActualDurableState()
+                val fixture = durable.newProcess()
                 try {
                     val savedState = SavedStateHandle()
                     val source = ManagerViewModel(
@@ -268,6 +312,7 @@ class TerminalHandoffRaceInstrumentedTest {
                     assertNull(case.name, fixture.store.loadFinalReceipt())
                 } finally {
                     fixture.close()
+                    durable.close()
                 }
             }
         }
@@ -275,7 +320,8 @@ class TerminalHandoffRaceInstrumentedTest {
     @Test
     fun normalRebasePersistedBeforeProcessDeathResumesWithoutLosingCurrentRawReceipt() =
         runBlocking {
-            val fixture = ActualFixture()
+            val durable = ActualDurableState()
+            val fixture = durable.newProcess()
             try {
                 val savedState = SavedStateHandle(
                     mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to REVIEW_TOKEN),
@@ -337,13 +383,15 @@ class TerminalHandoffRaceInstrumentedTest {
                 assertFalse(fixture.retainedReviewExists())
             } finally {
                 fixture.close()
+                durable.close()
             }
         }
 
     @Test
     fun generatedRebasePersistedBeforeProcessDeathResumesWithoutLosingCurrentRawReceipt() =
         runBlocking {
-            val fixture = ActualFixture()
+            val durable = ActualDurableState()
+            val fixture = durable.newProcess()
             try {
                 val savedState = SavedStateHandle()
                 val source = ManagerViewModel(
@@ -407,111 +455,213 @@ class TerminalHandoffRaceInstrumentedTest {
                 assertNull(fixture.store.loadFinalReceipt())
             } finally {
                 fixture.close()
+                durable.close()
             }
         }
 
     @Test
     fun generatedInstalledCleanupJournalPersistedBeforeProcessDeathResumesExactRecovery() =
         runBlocking {
-            val fixture = ActualFixture()
+            val durable = ActualDurableState()
             try {
+                val dyingProcess = durable.newProcess()
                 val savedState = SavedStateHandle()
-                fixture.prepareGeneratedLateSuccess(savedState)
+                try {
+                    dyingProcess.prepareGeneratedLateSuccess(savedState)
 
-                val dying = ManagerViewModel(
-                    repository = fixture.repository,
-                    savedStateHandle = savedState,
-                    afterGeneratedInstallCleanupTransitionPersisted = {
-                        throw CancellationException("cleanup journal 저장 직후 process death")
-                    },
-                )
-                val dyingStore = ViewModelStore().apply { put("dying", dying) }
-                fixture.await("generated cleanup journal persisted", dying, savedState) {
-                    savedState.get<String>(
-                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
-                    ) != null
+                    val dying = ManagerViewModel(
+                        repository = dyingProcess.repository,
+                        savedStateHandle = savedState,
+                        afterGeneratedInstallCleanupTransitionPersisted = {
+                            throw CancellationException(
+                                "cleanup journal 저장 직후 process death",
+                            )
+                        },
+                    )
+                    val dyingStore = ViewModelStore().apply { put("dying", dying) }
+                    dyingProcess.await(
+                        "generated cleanup journal persisted",
+                        dying,
+                        savedState,
+                    ) {
+                        savedState.get<String>(
+                            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                        ) != null
+                    }
+                    assertGeneratedInstalledRecovery(
+                        fixture = dyingProcess,
+                        savedState = savedState,
+                        expectedFinalStage = FinalReceiptStage.READY,
+                        expectedRawPresent = true,
+                    )
+                    dyingStore.clear()
+                } finally {
+                    dyingProcess.close()
                 }
-                assertGeneratedInstalledRecovery(
-                    fixture = fixture,
-                    savedState = savedState,
-                    expectedFinalStage = FinalReceiptStage.READY,
-                    expectedRawPresent = true,
-                )
-                dyingStore.clear()
 
-                val recreated = ManagerViewModel(fixture.repository, savedState)
-                fixture.await("generated cleanup journal resumed", recreated, savedState) {
-                    recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
-                        fixture.conversion.discardedTokens == listOf(CONVERSION_TOKEN)
+                val recreatedSavedState = savedState.processSnapshot()
+                assertNotSame(savedState, recreatedSavedState)
+                val recreatedProcess = durable.newProcess()
+                try {
+                    assertNotSame(dyingProcess.repository, recreatedProcess.repository)
+                    assertNotSame(dyingProcess.coordinator, recreatedProcess.coordinator)
+                    assertNotSame(dyingProcess.store, recreatedProcess.store)
+                    assertNotSame(dyingProcess.scope, recreatedProcess.scope)
+                    assertGeneratedInstalledRecovery(
+                        fixture = recreatedProcess,
+                        savedState = recreatedSavedState,
+                        expectedFinalStage = FinalReceiptStage.READY,
+                        expectedRawPresent = true,
+                    )
+                    assertEquals(
+                        RecoveryRecordSnapshot.Absent,
+                        recreatedProcess.store.pendingInstallSnapshot(),
+                    )
+                    assertEquals(
+                        InstallState.Installed(PACKAGE),
+                        recreatedProcess.coordinator.state.value,
+                    )
+
+                    val recreated = ManagerViewModel(
+                        recreatedProcess.repository,
+                        recreatedSavedState,
+                    )
+                    recreatedProcess.await(
+                        "generated cleanup journal resumed",
+                        recreated,
+                        recreatedSavedState,
+                    ) {
+                        recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
+                            recreatedProcess.conversion.discardedTokens ==
+                            listOf(CONVERSION_TOKEN)
+                    }
+                    recreated.accept(
+                        ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
+                    )
+                    recreatedProcess.await(
+                        "generated cleanup destination committed",
+                        recreated,
+                        recreatedSavedState,
+                    ) {
+                        recreatedSavedState.get<String>(
+                            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                        ) == null
+                    }
+                    assertGeneratedRecoveryCompleted(
+                        recreatedProcess,
+                        recreatedSavedState,
+                    )
+                } finally {
+                    recreatedProcess.close()
                 }
-                recreated.accept(
-                    ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
-                )
-                fixture.await("generated cleanup destination committed", recreated, savedState) {
-                    savedState.get<String>(
-                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
-                    ) == null
-                }
-                assertGeneratedRecoveryCompleted(fixture, savedState)
             } finally {
-                fixture.close()
+                durable.close()
             }
         }
 
     @Test
     fun generatedInstalledReceiptFinalizedBeforeProcessDeathResumesExactRecovery() =
         runBlocking {
-            val fixture = ActualFixture()
+            val durable = ActualDurableState()
             try {
+                val dyingProcess = durable.newProcess()
                 val savedState = SavedStateHandle()
-                fixture.prepareGeneratedLateSuccess(savedState)
+                try {
+                    dyingProcess.prepareGeneratedLateSuccess(savedState)
 
-                val dying = ManagerViewModel(
-                    repository = fixture.repository,
-                    savedStateHandle = savedState,
-                    afterTerminalReceiptFinalized = {
-                        throw CancellationException("terminal receipt finalize 직후 process death")
-                    },
-                )
-                val dyingStore = ViewModelStore().apply { put("dying", dying) }
-                fixture.await("generated receipt finalized", dying, savedState) {
-                    savedState.get<String>(
-                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
-                    ) != null &&
-                        fixture.store.finalReceiptSnapshot() ==
-                        RecoveryRecordSnapshot.Absent
+                    val dying = ManagerViewModel(
+                        repository = dyingProcess.repository,
+                        savedStateHandle = savedState,
+                        afterTerminalReceiptFinalized = {
+                            throw CancellationException(
+                                "terminal receipt finalize 직후 process death",
+                            )
+                        },
+                    )
+                    val dyingStore = ViewModelStore().apply { put("dying", dying) }
+                    dyingProcess.await("generated receipt finalized", dying, savedState) {
+                        savedState.get<String>(
+                            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                        ) != null &&
+                            dyingProcess.store.finalReceiptSnapshot() ==
+                            RecoveryRecordSnapshot.Absent
+                    }
+                    assertGeneratedInstalledRecovery(
+                        fixture = dyingProcess,
+                        savedState = savedState,
+                        expectedFinalStage = null,
+                        expectedRawPresent = false,
+                    )
+                    dyingStore.clear()
+                } finally {
+                    dyingProcess.close()
                 }
-                assertGeneratedInstalledRecovery(
-                    fixture = fixture,
-                    savedState = savedState,
-                    expectedFinalStage = null,
-                    expectedRawPresent = false,
-                )
-                dyingStore.clear()
 
-                val recreated = ManagerViewModel(fixture.repository, savedState)
-                fixture.await("generated finalized receipt resumed", recreated, savedState) {
-                    recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
-                        fixture.conversion.discardedTokens == listOf(CONVERSION_TOKEN)
+                val recreatedSavedState = savedState.processSnapshot()
+                assertNotSame(savedState, recreatedSavedState)
+                val recreatedProcess = durable.newProcess()
+                try {
+                    assertNotSame(dyingProcess.repository, recreatedProcess.repository)
+                    assertNotSame(dyingProcess.coordinator, recreatedProcess.coordinator)
+                    assertNotSame(dyingProcess.store, recreatedProcess.store)
+                    assertNotSame(dyingProcess.scope, recreatedProcess.scope)
+                    assertGeneratedInstalledRecovery(
+                        fixture = recreatedProcess,
+                        savedState = recreatedSavedState,
+                        expectedFinalStage = null,
+                        expectedRawPresent = false,
+                    )
+                    assertEquals(
+                        RecoveryRecordSnapshot.Absent,
+                        recreatedProcess.store.pendingInstallSnapshot(),
+                    )
+                    assertEquals(
+                        InstallState.Idle,
+                        recreatedProcess.coordinator.state.value,
+                    )
+
+                    val recreated = ManagerViewModel(
+                        recreatedProcess.repository,
+                        recreatedSavedState,
+                    )
+                    recreatedProcess.await(
+                        "generated finalized receipt resumed",
+                        recreated,
+                        recreatedSavedState,
+                    ) {
+                        recreated.state.value.route == ManagerRoute.Report(PACKAGE) &&
+                            recreatedProcess.conversion.discardedTokens ==
+                            listOf(CONVERSION_TOKEN)
+                    }
+                    recreated.accept(
+                        ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
+                    )
+                    recreatedProcess.await(
+                        "generated finalized destination committed",
+                        recreated,
+                        recreatedSavedState,
+                    ) {
+                        recreatedSavedState.get<String>(
+                            ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
+                        ) == null
+                    }
+                    assertGeneratedRecoveryCompleted(
+                        recreatedProcess,
+                        recreatedSavedState,
+                    )
+                } finally {
+                    recreatedProcess.close()
                 }
-                recreated.accept(
-                    ManagerAction.GeneratedCleanupDestinationPresented(CONVERSION_TOKEN),
-                )
-                fixture.await("generated finalized destination committed", recreated, savedState) {
-                    savedState.get<String>(
-                        ManagerViewModel.GENERATED_CLEANUP_JOURNAL_KEY,
-                    ) == null
-                }
-                assertGeneratedRecoveryCompleted(fixture, savedState)
             } finally {
-                fixture.close()
+                durable.close()
             }
         }
 
     @Test
-    fun malformedCurrentFinalReceiptPreservesPreparedOwnerReviewAndBlocksNewClaim() =
+    fun malformedCurrentFinalReceiptBlocksStartupPreservesOwnerAndBlocksNewClaim() =
         runBlocking {
-            val fixture = ActualFixture()
+            val durable = ActualDurableState()
+            val fixture = durable.newProcess()
             try {
                 val savedState = SavedStateHandle(
                     mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to REVIEW_TOKEN),
@@ -538,12 +688,14 @@ class TerminalHandoffRaceInstrumentedTest {
                     RecoveryRecordSnapshot.Invalid,
                     fixture.store.finalReceiptSnapshot(),
                 )
+                val abandonedBeforeStartup =
+                    durable.gateway.abandonedSessions.toList()
 
                 val recreated = ManagerViewModel(fixture.repository, savedState)
                 fixture.await("malformed final fail closed", recreated, savedState) {
-                    recreated.state.value.route == ManagerRoute.Review(REVIEW_TOKEN) &&
+                    recreated.state.value.route == ManagerRoute.Home &&
                         recreated.state.value.message?.kind ==
-                        UserMessageKind.INSTALL_FAILED
+                        UserMessageKind.RECOVERY_BLOCKED
                 }
                 var imported = false
                 recreated.startImport {
@@ -558,7 +710,11 @@ class TerminalHandoffRaceInstrumentedTest {
                     fixture.store.loadNormalHandoff()?.stage,
                 )
                 assertTrue(fixture.retainedReviewExists())
-                assertEquals(ManagerRoute.Review(REVIEW_TOKEN), recreated.state.value.route)
+                assertEquals(ManagerRoute.Home, recreated.state.value.route)
+                assertEquals(
+                    abandonedBeforeStartup,
+                    durable.gateway.abandonedSessions,
+                )
                 assertNull(
                     fixture.store.tryClaim(
                         packageName = PACKAGE,
@@ -568,10 +724,11 @@ class TerminalHandoffRaceInstrumentedTest {
                 )
             } finally {
                 fixture.close()
+                durable.close()
             }
         }
 
-    private suspend fun ActualFixture.prepareGeneratedLateSuccess(
+    private suspend fun ActualProcessFixture.prepareGeneratedLateSuccess(
         savedState: SavedStateHandle,
     ) {
         val source = ManagerViewModel(
@@ -598,7 +755,7 @@ class TerminalHandoffRaceInstrumentedTest {
     }
 
     private fun assertGeneratedInstalledRecovery(
-        fixture: ActualFixture,
+        fixture: ActualProcessFixture,
         savedState: SavedStateHandle,
         expectedFinalStage: FinalReceiptStage?,
         expectedRawPresent: Boolean,
@@ -652,7 +809,7 @@ class TerminalHandoffRaceInstrumentedTest {
     }
 
     private fun assertGeneratedRecoveryCompleted(
-        fixture: ActualFixture,
+        fixture: ActualProcessFixture,
         savedState: SavedStateHandle,
     ) {
         assertNull(
@@ -670,6 +827,13 @@ class TerminalHandoffRaceInstrumentedTest {
         assertEquals(RecoveryRecordSnapshot.Absent, fixture.store.finalReceiptSnapshot())
         assertFalse(fixture.retainedReviewExists())
     }
+
+    private fun SavedStateHandle.processSnapshot(): SavedStateHandle =
+        SavedStateHandle(
+            keys().associateWith { key ->
+                get<Any?>(key)
+            },
+        )
 
     private fun terminalCases(): List<TerminalCase> = listOf(
         TerminalCase(
@@ -711,22 +875,56 @@ class TerminalHandoffRaceInstrumentedTest {
         val messageKind: UserMessageKind?,
     )
 
-    private class ActualFixture {
+    private data class WrongTypeCase(
+        val name: String,
+        val key: String,
+        val preferences: (ActualDurableState) -> SharedPreferences,
+        val writeWrongType: (SharedPreferences, SharedPreferences) -> Unit,
+    )
+
+    private fun wrongTypeCases() = listOf(
+        WrongTypeCase(
+            "pending",
+            "session_id",
+            ActualDurableState::pendingPreferences,
+        ) { pending, _ ->
+            assertTrue(pending.edit().putString("session_id", "wrong").commit())
+        },
+        WrongTypeCase(
+            "terminal",
+            "result_session_id",
+            ActualDurableState::recoveryPreferences,
+        ) { _, recovery ->
+            assertTrue(
+                recovery.edit().putString("result_session_id", "wrong").commit(),
+            )
+        },
+        WrongTypeCase(
+            "final",
+            "final_version",
+            ActualDurableState::recoveryPreferences,
+        ) { _, recovery ->
+            assertTrue(recovery.edit().putString("final_version", "wrong").commit())
+        },
+        WrongTypeCase(
+            "handoff",
+            "handoff_version",
+            ActualDurableState::recoveryPreferences,
+        ) { _, recovery ->
+            assertTrue(recovery.edit().putString("handoff_version", "wrong").commit())
+        },
+    )
+
+    private class ActualDurableState {
         val root: File = Files.createTempDirectory("sixbridge-race-actual").toFile()
-        private val pendingPreferences = memorySharedPreferences()
+        val pendingPreferences = memorySharedPreferences()
         val recoveryControl = MemoryPreferenceControl()
-        private val recoveryPreferences = memorySharedPreferences(recoveryControl)
-        val store = SharedPreferencesPendingInstallStore(
-            pendingPreferences = pendingPreferences,
-            recoveryPreferences = recoveryPreferences,
-            importDirectory = root,
-        )
+        val recoveryPreferences = memorySharedPreferences(recoveryControl)
         val gateway = TestPackageInstallGateway()
         val installed = MutableInstalledWrappers()
         val catalog = TestCatalog()
-        val conversion = TestConversionCoordinator()
-        private val bundle = importedBundle(root)
-        private val generated = GeneratedBundle(
+        val bundle = importedBundle(root)
+        val generated = GeneratedBundle(
             token = CONVERSION_TOKEN,
             file = File(root, "generated.six").apply {
                 writeBytes(byteArrayOf(4, 5, 6))
@@ -734,72 +932,81 @@ class TerminalHandoffRaceInstrumentedTest {
             sha256 = sha256(byteArrayOf(4, 5, 6)),
             suggestedFileName = "generated.six",
         )
+        init {
+            val retained = RetainedImportStore(root) { _, _, _ ->
+                WrapperVerificationResult.Success(bundle.verifiedApk)
+            }
+            assertTrue(retained.save(bundle))
+        }
+
+        fun newProcess(): ActualProcessFixture = ActualProcessFixture(this)
+
+        fun close() {
+            root.deleteRecursively()
+        }
+    }
+
+    private class ActualProcessFixture(
+        private val durable: ActualDurableState,
+    ) {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = durable.pendingPreferences,
+            recoveryPreferences = durable.recoveryPreferences,
+            importDirectory = durable.root,
+        )
         val coordinator = InstallCoordinator(
             policy = InstallPolicy(),
-            gateway = gateway,
+            gateway = durable.gateway,
             pendingStore = store,
-            installedWrappers = installed,
-            catalog = catalog,
+            installedWrappers = durable.installed,
+            catalog = durable.catalog,
             clock = { 10 },
         )
-        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-        private val retained = RetainedImportStore(root) { _, _, _ ->
-            WrapperVerificationResult.Success(bundle.verifiedApk)
+        val conversion = TestConversionCoordinator().apply {
+            configure(durable.bundle.toReview(), durable.generated)
         }
-        val repository: DefaultManagerRepository
+        private val retained = RetainedImportStore(durable.root) { _, _, _ ->
+            WrapperVerificationResult.Success(durable.bundle.verifiedApk)
+        }
+        private val publisher = CatalogPublisher(
+            catalog = durable.catalog,
+            installedWrappers = durable.installed,
+            reconciler = CatalogReconciler(),
+            iconEnricher = CatalogIconEnricher(
+                durable.catalog,
+                InstalledExtensionIconSource { null },
+            ),
+            scope = scope,
+        )
+        val repository = DefaultManagerRepository(
+            importer = BundleImportService(
+                BundleSource { error("직접 import하지 않습니다.") },
+                AndroidWrapperVerifier(
+                    ArchiveInspector { error("wrapper를 다시 검증하지 않습니다.") },
+                ),
+                durable.root,
+                ioDispatcher = Dispatchers.Unconfined,
+            ),
+            retainedImports = retained,
+            startupCleanup = StartupCleanup(
+                durable.root,
+                durable.gateway,
+                store,
+                Clock.fixed(Instant.ofEpochMilli(11), ZoneOffset.UTC),
+            ),
+            installCoordinator = coordinator,
+            pendingStore = store,
+            uninstallCoordinator = noOpUninstallCoordinator(),
+            samsungBrowserNavigator = missingSamsungBrowserNavigator(),
+            catalogPublisher = publisher,
+            installEvents = emptyFlow(),
+            ioDispatcher = Dispatchers.Unconfined,
+            conversionCoordinator = conversion,
+        )
 
         init {
-            conversion.configure(bundle.toReview(), generated)
-            assertTrue(retained.save(bundle))
-            val publisher = CatalogPublisher(
-                catalog = catalog,
-                installedWrappers = installed,
-                reconciler = CatalogReconciler(),
-                iconEnricher = CatalogIconEnricher(
-                    catalog,
-                    InstalledExtensionIconSource { null },
-                ),
-                scope = scope,
-            )
-            repository = DefaultManagerRepository(
-                importer = BundleImportService(
-                    BundleSource { error("직접 import하지 않습니다.") },
-                    AndroidWrapperVerifier(
-                        ArchiveInspector { error("wrapper를 다시 검증하지 않습니다.") },
-                    ),
-                    root,
-                    ioDispatcher = Dispatchers.Unconfined,
-                ),
-                retainedImports = retained,
-                startupCleanup = StartupCleanup(
-                    root,
-                    gateway,
-                    store,
-                    Clock.fixed(Instant.ofEpochMilli(11), ZoneOffset.UTC),
-                ),
-                installCoordinator = coordinator,
-                pendingStore = store,
-                uninstallCoordinator = object : UninstallCoordinator {
-                    override fun intent(packageName: String): Intent =
-                        error("제거하지 않습니다.")
-
-                    override suspend fun reconcileAfterReturn(
-                        packageName: String,
-                    ): UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
-                },
-                samsungBrowserNavigator = object : SamsungBrowserNavigator {
-                    override fun addOnsIntent(): Intent =
-                        error("추가 기능 화면을 열지 않습니다.")
-
-                    override fun availability(): SamsungBrowserAvailability =
-                        SamsungBrowserAvailability.SamsungBrowserMissing
-                },
-                catalogPublisher = publisher,
-                installEvents = emptyFlow(),
-                ioDispatcher = Dispatchers.Unconfined,
-                conversionCoordinator = conversion,
-            )
-            repository.start(scope, catalog)
+            repository.start(scope, durable.catalog)
         }
 
         suspend fun awaitReview(
@@ -867,23 +1074,30 @@ class TerminalHandoffRaceInstrumentedTest {
             signerSha256 = "a".repeat(64),
         )
 
-        fun retainedReviewExists(): Boolean = File(root, REVIEW_TOKEN).exists()
+        val recoveryControl: MemoryPreferenceControl
+            get() = durable.recoveryControl
+
+        val installed: MutableInstalledWrappers
+            get() = durable.installed
+
+        fun retainedReviewExists(): Boolean = File(durable.root, REVIEW_TOKEN).exists()
 
         fun corruptFinalStage(): Boolean =
-            recoveryPreferences.edit()
+            durable.recoveryPreferences.edit()
                 .putString("final_stage", "BROKEN")
                 .commit()
 
-        fun secondReview(): ReviewBundle = bundle.toReview().copy(token = SECOND_TOKEN)
+        fun secondReview(): ReviewBundle =
+            durable.bundle.toReview().copy(token = SECOND_TOKEN)
 
         fun close() {
             scope.cancel()
-            root.deleteRecursively()
         }
     }
 
     private class TestPackageInstallGateway : PackageInstallGateway {
         private val owned = linkedSetOf<Int>()
+        val abandonedSessions = mutableListOf<Int>()
         override fun canRequestPackageInstalls(): Boolean = true
         override fun unknownSourcesSettingsIntent(): Intent =
             error("설정 화면을 열지 않습니다.")
@@ -896,6 +1110,7 @@ class TerminalHandoffRaceInstrumentedTest {
         override suspend fun writeSession(sessionId: Int, apk: File) = Unit
         override fun commit(sessionId: Int) = Unit
         override fun abandon(sessionId: Int) {
+            abandonedSessions += sessionId
             owned -= sessionId
         }
 
@@ -992,6 +1207,24 @@ class TerminalHandoffRaceInstrumentedTest {
         const val SESSION_ID = 41
         val EXTENSION_ID = "a".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
+
+        private fun noOpUninstallCoordinator() = object : UninstallCoordinator {
+            override fun intent(packageName: String): Intent =
+                error("제거하지 않습니다.")
+
+            override suspend fun reconcileAfterReturn(
+                packageName: String,
+            ): UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
+        }
+
+        private fun missingSamsungBrowserNavigator() =
+            object : SamsungBrowserNavigator {
+                override fun addOnsIntent(): Intent =
+                    error("추가 기능 화면을 열지 않습니다.")
+
+                override fun availability(): SamsungBrowserAvailability =
+                    SamsungBrowserAvailability.SamsungBrowserMissing
+            }
 
         fun importedBundle(root: File): ImportedBundle {
             val directory = File(root, REVIEW_TOKEN).apply { mkdirs() }
