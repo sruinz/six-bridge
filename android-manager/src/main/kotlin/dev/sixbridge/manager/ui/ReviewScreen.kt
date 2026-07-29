@@ -148,12 +148,16 @@ fun ReviewScreen(
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }
-        Button(
-            onClick = onInstall,
-            enabled = ready.installEnabled && !installBusy,
-            modifier = Modifier.fillMaxWidth().testTag("review:install"),
-        ) {
-            Text(text = stringResource(R.string.review_install))
+        if (installState is InstallState.AwaitingManualInstall) {
+            ManualInstallHandoff(onAction)
+        } else {
+            Button(
+                onClick = onInstall,
+                enabled = ready.installEnabled && !installBusy,
+                modifier = Modifier.fillMaxWidth().testTag("review:install"),
+            ) {
+                Text(text = stringResource(R.string.review_install))
+            }
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.CancelReview) },
@@ -161,6 +165,34 @@ fun ReviewScreen(
         ) {
             Text(text = stringResource(R.string.review_cancel))
         }
+    }
+}
+
+@Composable
+internal fun ManualInstallHandoff(
+    onAction: (ManagerAction) -> Unit,
+) {
+    SectionCard(
+        title = stringResource(R.string.manual_install_title),
+        modifier = Modifier.testTag("manual-install:instructions"),
+    ) {
+        Text(text = stringResource(R.string.manual_install_instruction))
+        Text(
+            text = stringResource(R.string.manual_install_warning),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Button(
+        onClick = { onAction(ManagerAction.OpenSamsungMyFiles) },
+        modifier = Modifier.fillMaxWidth().testTag("manual-install:open-my-files"),
+    ) {
+        Text(text = stringResource(R.string.manual_install_open_my_files))
+    }
+    OutlinedButton(
+        onClick = { onAction(ManagerAction.ConfirmManualInstallStatus) },
+        modifier = Modifier.fillMaxWidth().testTag("manual-install:check-status"),
+    ) {
+        Text(text = stringResource(R.string.manual_install_check_status))
     }
 }
 

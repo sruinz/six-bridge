@@ -66,18 +66,47 @@ class ActivityDocumentLaunchGateTest {
             suggestedFileName = "smart-context-wrapper.apk",
         )
         val destination = Uri.parse("content://documents/export.apk")
-        val handoff = SystemInstallApkDocumentHandoff().apply {
+        val handoff = InstallApkExportDocumentHandoff().apply {
             begin(effect)
             selectDestination(destination)
         }
         val saved = Bundle().also(handoff::save)
 
-        val restored = SystemInstallApkDocumentHandoff.restore(saved)
+        val restored = InstallApkExportDocumentHandoff.restore(saved)
 
-        assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+        assertIs<ManagerEffect.CreateInstallApkDocument>(
             restored.pending?.effect,
         )
         assertEquals(effect, restored.pending?.effect)
         assertEquals(destination, restored.pending?.destination)
+    }
+
+    @Test
+    fun `APK export handoff는 SHA 확인 성공 결과를 exact owner에게 전달한 뒤 acknowledge한다`() {
+        val effect = ManagerEffect.CreateInstallApkDocument(
+            importToken = "11111111-1111-1111-1111-111111111111",
+            source = File("/retained/11111111-1111-1111-1111-111111111111/wrapper.apk"),
+            expectedSha256 = "b".repeat(64),
+            suggestedFileName = "확장-1.0.0-aaaaaa.apk",
+        )
+        val destination = Uri.parse("content://documents/export.apk")
+        val handoff = InstallApkExportDocumentHandoff().apply {
+            begin(effect)
+            selectDestination(destination)
+        }
+
+        val completion = kotlinx.coroutines.runBlocking {
+            handoff.prepareCompletion {
+                assertEquals(effect.expectedSha256, it.effect.expectedSha256)
+                GeneratedDocumentSaveResult.Success
+            }
+        }
+
+        val exact = requireNotNull(completion)
+        assertEquals(effect.importToken, exact.action.importToken)
+        assertEquals(destination, exact.action.uri)
+        assertEquals(effect, handoff.pending?.effect)
+        kotlin.test.assertTrue(handoff.acknowledge(exact))
+        assertNull(handoff.pending)
     }
 }

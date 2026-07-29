@@ -333,12 +333,12 @@ class ConversionDocumentIoTest {
                 suggestedFileName = "smart-context-wrapper.apk",
             )
             val destination = uri("system-install-recreated")
-            val source = SystemInstallApkDocumentHandoff().apply {
+            val source = InstallApkExportDocumentHandoff().apply {
                 begin(effect)
                 selectDestination(destination)
             }
             val saved = Bundle().also(source::save)
-            val recreated = SystemInstallApkDocumentHandoff.restore(saved)
+            val recreated = InstallApkExportDocumentHandoff.restore(saved)
 
             val completion = recreated.prepareCompletion {
                 GeneratedDocumentSaveResult.Success
@@ -369,7 +369,7 @@ class ConversionDocumentIoTest {
                 expectedSha256 = "b".repeat(64),
                 suggestedFileName = "second-wrapper.apk",
             )
-            val handoff = SystemInstallApkDocumentHandoff().apply {
+            val handoff = InstallApkExportDocumentHandoff().apply {
                 begin(first)
                 selectDestination(uri("system-install-cancelled"))
             }
@@ -381,7 +381,10 @@ class ConversionDocumentIoTest {
                 // Expected: the exact handoff remains pending for recreation.
             }
             val saved = Bundle().also(handoff::save)
-            assertEquals(first, SystemInstallApkDocumentHandoff.restore(saved).pending?.effect)
+            assertEquals(
+                first,
+                InstallApkExportDocumentHandoff.restore(saved).pending?.effect,
+            )
 
             val stale = handoff.prepareCompletion {
                 GeneratedDocumentSaveResult.Failure(cleanupFailed = false)

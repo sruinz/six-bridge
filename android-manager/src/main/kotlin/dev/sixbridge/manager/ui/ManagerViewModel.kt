@@ -8,6 +8,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
 import dev.sixbridge.manager.app.ManagerRestoreResult
+import dev.sixbridge.manager.app.suggestedWrapperApkName
 import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
@@ -28,6 +29,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
+import dev.sixbridge.manager.navigation.SamsungMyFilesNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.File
@@ -78,6 +80,10 @@ class ManagerViewModel(
     private val afterTerminalReceiptFinalized: () -> Unit = {},
     private val afterNormalHandoffPersisted: () -> Unit = {},
     private val afterGeneratedTerminalHandoffCleared: () -> Unit = {},
+    private val samsungMyFilesNavigator: SamsungMyFilesNavigator =
+        object : SamsungMyFilesNavigator {
+            override fun launcherIntent() = null
+        },
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ManagerUiState())
     private val effectChannel = Channel<ManagerEffect>(Channel.UNLIMITED)
@@ -270,6 +276,7 @@ class ManagerViewModel(
             is ManagerAction.OpenReport -> openReport(action.packageName)
             ManagerAction.ReturnHome -> mutableState.update { it.copy(route = ManagerRoute.Home) }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
+            ManagerAction.OpenSamsungMyFiles -> openSamsungMyFiles()
             ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
             ManagerAction.ReturnedToForeground -> returnedToForeground()
             ManagerAction.DismissMessage -> mutableState.update { it.copy(message = null) }
@@ -1648,7 +1655,13 @@ class ManagerViewModel(
                     importToken = export.importToken,
                     source = export.source,
                     expectedSha256 = export.expectedSha256,
-                    suggestedFileName = suggestedWrapperApkName(export.extensionName),
+                    suggestedFileName = suggestedWrapperApkName(
+                        extensionName = export.extensionName,
+                        extensionVersion = export.extensionVersion.ifBlank {
+                            ready.review.wrapperVersionCode.toString()
+                        },
+                        extensionId = export.extensionId,
+                    ),
                 )
                 setPendingSystemInstallApkDocument(effect)
                 enqueueEffect(effect)
@@ -1703,7 +1716,7 @@ class ManagerViewModel(
         }
         clearPendingSystemInstallApkDocument()
         pendingRecovery = null
-        showManualSystemInstallMessage()
+        showManualInstallUi()
     }
 
     private fun confirmManualInstallStatus() {
@@ -1715,17 +1728,8 @@ class ManagerViewModel(
         }
     }
 
-    private fun showManualSystemInstallMessage() {
-        mutableState.update {
-            it.copy(
-                message = UserMessage(
-                    UserMessageKind.INSTALL_FAILED,
-                    "시스템 설치 프로그램을 직접 열 수 없습니다.\n" +
-                        "저장한 APK를 내 파일에서 열어 설치한 뒤 ‘설치 상태 확인’을 눌러 주세요.",
-                    RecoveryAction.CHECK_INSTALL_STATUS,
-                ),
-            )
-        }
+    private fun showManualInstallUi() {
+        mutableState.update { it.copy(message = null) }
     }
 
     private fun continueInstallAfterNotificationPermission(
@@ -1873,6 +1877,30 @@ class ManagerViewModel(
                 }
             }
         }
+    }
+
+    private fun openSamsungMyFiles() {
+        val intent = samsungMyFilesNavigator.launcherIntent()
+        if (intent == null) {
+            mutableState.update {
+                it.copy(
+                    message = UserMessage(
+                        UserMessageKind.SAMSUNG_MY_FILES_MISSING,
+                        "삼성 내 파일 앱을 찾을 수 없습니다.",
+                        RecoveryAction.NONE,
+                    ),
+                )
+            }
+            return
+        }
+        enqueueEffect(
+            currentLaunchEffect(
+                RepositoryLaunch(
+                    destination = LaunchDestination.SAMSUNG_MY_FILES,
+                    intentFactory = { intent },
+                ),
+            ),
+        )
     }
 
     private fun openReport(packageName: String) {
@@ -3299,10 +3327,10 @@ class ManagerViewModel(
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
         }
-        val reviewToken =
+        val readyReview =
             (mutableState.value.importState as? ImportUiState.ReviewReady)
                 ?.review
-                ?.token
+        val reviewToken = readyReview?.token
         val preparingExportToken = when (installState) {
             is InstallState.PreparingApkExport -> installState.importToken
             InstallState.PreparingSystemInstaller -> reviewToken
@@ -3319,8 +3347,13 @@ class ManagerViewModel(
                             importToken = export.importToken,
                             source = export.source,
                             expectedSha256 = export.expectedSha256,
-                            suggestedFileName =
-                                suggestedWrapperApkName(export.extensionName),
+                            suggestedFileName = suggestedWrapperApkName(
+                                extensionName = export.extensionName,
+                                extensionVersion = export.extensionVersion.ifBlank {
+                                    readyReview.wrapperVersionCode.toString()
+                                },
+                                extensionId = export.extensionId,
+                            ),
                         ),
                     )
                 }
@@ -3343,7 +3376,7 @@ class ManagerViewModel(
             isCurrentReviewOwner(installState.importToken)
         ) {
             clearPendingSystemInstallApkDocument()
-            showManualSystemInstallMessage()
+            showManualInstallUi()
         }
         reconcileQuarantinedGeneratedCleanup()
     }
@@ -4613,15 +4646,6 @@ private fun CatalogRecord.toItem(): ManagedExtensionItem {
 
 private fun InstallState.isTerminalState(): Boolean =
     this is InstallState.Installed || this == InstallState.Cancelled || this is InstallState.Failed
-
-internal fun suggestedWrapperApkName(extensionName: String): String {
-    val safeName = extensionName
-        .trim()
-        .replace(Regex("""[\\/:*?"<>|\p{Cc}]"""), "-")
-        .trim('.', ' ')
-        .ifBlank { "extension" }
-    return "$safeName-wrapper.apk"
-}
 
 private fun importFailureMessage(code: ImportFailureCode): UserMessage = when (code) {
     ImportFailureCode.SOURCE_UNREADABLE,

@@ -19,6 +19,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.core.content.FileProvider
 import dev.sixbridge.manager.app.ManagerDependencies
 import dev.sixbridge.manager.install.ManagerAppVisibility
+import dev.sixbridge.manager.navigation.AndroidSamsungMyFilesNavigator
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerEffect
 import dev.sixbridge.manager.ui.ManagerViewModel
@@ -45,8 +46,8 @@ class MainActivity : ComponentActivity() {
     private var sixPickerLaunchGate = ActivityDocumentLaunchGate()
     private var pendingConversionPicker: PendingActivityDocumentLaunch? = null
     private var pendingConversionSave: PendingActivityDocumentLaunch? = null
-    private var systemInstallApkHandoff = SystemInstallApkDocumentHandoff()
-    private var systemInstallApkCopyJob: Job? = null
+    private var installApkExportHandoff = InstallApkExportDocumentHandoff()
+    private var installApkExportCopyJob: Job? = null
 
     private val openDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -80,38 +81,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val createSystemInstallApkDocument = registerForActivityResult(
+    private val createInstallApkExportDocument = registerForActivityResult(
         ActivityResultContracts.CreateDocument(APK_MIME_TYPE),
     ) { uri ->
         if (uri == null) {
-            systemInstallApkHandoff.cancelSelection()?.let { completion ->
+            installApkExportHandoff.cancelSelection()?.let { completion ->
                 if (managerViewModel.ownsSystemInstallApkDocument(
                         completion.pending.effect,
                     )
                 ) {
                     managerViewModel.accept(completion.action)
                 }
-                systemInstallApkHandoff.acknowledge(completion)
+                installApkExportHandoff.acknowledge(completion)
             }
         } else {
-            systemInstallApkHandoff.selectDestination(uri)
-            resumeSystemInstallApkCopy()
+            installApkExportHandoff.selectDestination(uri)
+            resumeInstallApkExportCopy()
         }
     }
 
-    private fun resumeSystemInstallApkCopy() {
-        if (systemInstallApkCopyJob?.isActive == true) return
-        systemInstallApkCopyJob = lifecycleScope.launch {
+    private fun resumeInstallApkExportCopy() {
+        if (installApkExportCopyJob?.isActive == true) return
+        installApkExportCopyJob = lifecycleScope.launch {
             managerViewModel.state.first {
                 it.startupRecoveryState != StartupRecoveryUiState.INITIALIZING
             }
-            val pending = systemInstallApkHandoff.pending ?: return@launch
+            val pending = installApkExportHandoff.pending ?: return@launch
             if (pending.destination == null) return@launch
             if (!managerViewModel.ownsSystemInstallApkDocument(pending.effect)) {
-                systemInstallApkHandoff.clear(pending)
+                installApkExportHandoff.clear(pending)
                 return@launch
             }
-            val completion = systemInstallApkHandoff.prepareCompletion { exact ->
+            val completion = installApkExportHandoff.prepareCompletion { exact ->
                 writeGeneratedDocument(
                     resolver = contentResolver,
                     uri = requireNotNull(exact.destination),
@@ -127,7 +128,7 @@ class MainActivity : ComponentActivity() {
                     completion.action,
                 )
             }
-            systemInstallApkHandoff.acknowledge(completion)
+            installApkExportHandoff.acknowledge(completion)
         }
     }
 
@@ -156,8 +157,8 @@ class MainActivity : ComponentActivity() {
             ownerKey = PENDING_CONVERSION_SAVE_OWNER,
             launchKey = PENDING_CONVERSION_SAVE_LAUNCH_ID,
         )
-        systemInstallApkHandoff =
-            SystemInstallApkDocumentHandoff.restore(savedInstanceState)
+        installApkExportHandoff =
+            InstallApkExportDocumentHandoff.restore(savedInstanceState)
         managerViewModel = ViewModelProvider(
             this,
             viewModelFactory {
@@ -173,6 +174,8 @@ class MainActivity : ComponentActivity() {
                                 copy = copy,
                             )
                         },
+                        samsungMyFilesNavigator =
+                            AndroidSamsungMyFilesNavigator(packageManager),
                     )
                 }
             },
@@ -231,8 +234,8 @@ class MainActivity : ComponentActivity() {
                             createConversionDocument.launch(effect.suggestedFileName)
                         }
                         is ManagerEffect.CreateSystemInstallApkDocument -> {
-                            systemInstallApkHandoff.begin(effect)
-                            createSystemInstallApkDocument.launch(effect.suggestedFileName)
+                            installApkExportHandoff.begin(effect)
+                            createInstallApkExportDocument.launch(effect.suggestedFileName)
                         }
                         is ManagerEffect.ShareGeneratedBundle -> {
                             executeGeneratedShareLaunch(
@@ -251,7 +254,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        resumeSystemInstallApkCopy()
+        resumeInstallApkExportCopy()
     }
 
     override fun onResume() {
@@ -262,7 +265,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        systemInstallApkHandoff.save(outState)
+        installApkExportHandoff.save(outState)
         sixPickerLaunchGate.active?.save(
             outState = outState,
             tokenKey = null,
@@ -333,35 +336,35 @@ private const val PENDING_SYSTEM_APK_SHA256 = "pending_system_apk_sha256"
 private const val PENDING_SYSTEM_APK_NAME = "pending_system_apk_name"
 private const val PENDING_SYSTEM_APK_DESTINATION = "pending_system_apk_destination"
 
-internal data class PendingSystemInstallApkDocument(
+internal data class PendingInstallApkExportDocument(
     val effect: ManagerEffect.CreateSystemInstallApkDocument,
     val destination: Uri? = null,
 )
 
-internal data class SystemInstallApkDocumentCompletion(
-    val pending: PendingSystemInstallApkDocument,
-    val action: ManagerAction.SystemInstallApkCreated,
+internal data class InstallApkExportDocumentCompletion(
+    val pending: PendingInstallApkExportDocument,
+    val action: ManagerAction.InstallApkCreated,
 )
 
-internal class SystemInstallApkDocumentHandoff(
-    pending: PendingSystemInstallApkDocument? = null,
+internal class InstallApkExportDocumentHandoff(
+    pending: PendingInstallApkExportDocument? = null,
 ) {
-    var pending: PendingSystemInstallApkDocument? = pending
+    var pending: PendingInstallApkExportDocument? = pending
         private set
 
     fun begin(effect: ManagerEffect.CreateSystemInstallApkDocument) {
-        pending = PendingSystemInstallApkDocument(effect)
+        pending = PendingInstallApkExportDocument(effect)
     }
 
     fun selectDestination(destination: Uri) {
         pending = pending?.copy(destination = destination)
     }
 
-    fun cancelSelection(): SystemInstallApkDocumentCompletion? {
+    fun cancelSelection(): InstallApkExportDocumentCompletion? {
         val exact = pending ?: return null
-        return SystemInstallApkDocumentCompletion(
+        return InstallApkExportDocumentCompletion(
             pending = exact,
-            action = ManagerAction.SystemInstallApkCreated(
+            action = ManagerAction.InstallApkCreated(
                 importToken = exact.effect.importToken,
                 uri = null,
             ),
@@ -369,15 +372,15 @@ internal class SystemInstallApkDocumentHandoff(
     }
 
     suspend fun prepareCompletion(
-        copy: suspend (PendingSystemInstallApkDocument) ->
+        copy: suspend (PendingInstallApkExportDocument) ->
             GeneratedDocumentSaveResult,
-    ): SystemInstallApkDocumentCompletion? {
+    ): InstallApkExportDocumentCompletion? {
         val exact = pending?.takeIf { it.destination != null } ?: return null
         val result = copy(exact)
         if (pending != exact) return null
-        return SystemInstallApkDocumentCompletion(
+        return InstallApkExportDocumentCompletion(
             pending = exact,
-            action = ManagerAction.SystemInstallApkCreated(
+            action = ManagerAction.InstallApkCreated(
                 importToken = exact.effect.importToken,
                 uri = exact.destination.takeIf {
                     result == GeneratedDocumentSaveResult.Success
@@ -386,13 +389,13 @@ internal class SystemInstallApkDocumentHandoff(
         )
     }
 
-    fun acknowledge(completion: SystemInstallApkDocumentCompletion): Boolean {
+    fun acknowledge(completion: InstallApkExportDocumentCompletion): Boolean {
         if (pending != completion.pending) return false
         pending = null
         return true
     }
 
-    fun clear(expected: PendingSystemInstallApkDocument): Boolean {
+    fun clear(expected: PendingInstallApkExportDocument): Boolean {
         if (pending != expected) return false
         pending = null
         return true
@@ -416,22 +419,22 @@ internal class SystemInstallApkDocumentHandoff(
     }
 
     companion object {
-        fun restore(savedState: Bundle?): SystemInstallApkDocumentHandoff {
-            savedState ?: return SystemInstallApkDocumentHandoff()
+        fun restore(savedState: Bundle?): InstallApkExportDocumentHandoff {
+            savedState ?: return InstallApkExportDocumentHandoff()
             val token = savedState.getString(PENDING_SYSTEM_APK_TOKEN)
-                ?: return SystemInstallApkDocumentHandoff()
+                ?: return InstallApkExportDocumentHandoff()
             val source = savedState.getString(PENDING_SYSTEM_APK_SOURCE)
-                ?: return SystemInstallApkDocumentHandoff()
+                ?: return InstallApkExportDocumentHandoff()
             val sha256 = savedState.getString(PENDING_SYSTEM_APK_SHA256)
-                ?: return SystemInstallApkDocumentHandoff()
+                ?: return InstallApkExportDocumentHandoff()
             val name = savedState.getString(PENDING_SYSTEM_APK_NAME)
-                ?: return SystemInstallApkDocumentHandoff()
+                ?: return InstallApkExportDocumentHandoff()
             val destination = savedState
                 .getString(PENDING_SYSTEM_APK_DESTINATION)
                 ?.let(Uri::parse)
-            return SystemInstallApkDocumentHandoff(
-                PendingSystemInstallApkDocument(
-                    effect = ManagerEffect.CreateSystemInstallApkDocument(
+            return InstallApkExportDocumentHandoff(
+                PendingInstallApkExportDocument(
+                    effect = ManagerEffect.CreateInstallApkDocument(
                         importToken = token,
                         source = File(source),
                         expectedSha256 = sha256,

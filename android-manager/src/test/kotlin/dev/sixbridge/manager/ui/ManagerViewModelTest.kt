@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.ui
 
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import dev.sixbridge.contract.bundle.BundleJson
@@ -35,6 +36,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
+import dev.sixbridge.manager.navigation.SamsungMyFilesNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -1614,7 +1616,9 @@ class ManagerViewModelTest {
             val source = File("/retained/$TOKEN/wrapper.apk")
             val repository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    review = review(ContractCompatibilityStatus.COMPATIBLE).copy(
+                        wrapperVersionCode = 7,
+                    ),
                 )
                 installResult = InstallState.PreparingApkExport(TOKEN)
                 installApkExport = InstallApkExport(
@@ -1622,7 +1626,7 @@ class ManagerViewModelTest {
                     source = source,
                     expectedSha256 = "a".repeat(64),
                     extensionName = "smart:context/menu",
-                    extensionVersion = "1.0.0",
+                    extensionVersion = "",
                     extensionId = EXTENSION_ID,
                 )
                 manualSystemInstallResult = InstallState.Installed(PACKAGE)
@@ -1645,7 +1649,10 @@ class ManagerViewModelTest {
             assertEquals(TOKEN, effect.importToken)
             assertEquals(source, effect.source)
             assertEquals("a".repeat(64), effect.expectedSha256)
-            assertEquals("smart-context-menu-wrapper.apk", effect.suggestedFileName)
+            assertEquals(
+                "smart_context_menu-7-aaaaaa.apk",
+                effect.suggestedFileName,
+            )
 
             viewModel.accept(
                 ManagerAction.InstallApkCreated(
@@ -1654,15 +1661,7 @@ class ManagerViewModelTest {
                 ),
             )
             assertEquals(listOf(TOKEN), repository.installApkExportedTokens)
-            assertEquals(
-                "시스템 설치 프로그램을 직접 열 수 없습니다.\n" +
-                    "저장한 APK를 내 파일에서 열어 설치한 뒤 ‘설치 상태 확인’을 눌러 주세요.",
-                viewModel.state.value.message?.text,
-            )
-            assertEquals(
-                RecoveryAction.CHECK_INSTALL_STATUS,
-                viewModel.state.value.message?.recoveryAction,
-            )
+            assertNull(viewModel.state.value.message)
 
             viewModel.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
@@ -1708,6 +1707,52 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `삼성 내 파일 열기는 전용 launcher만 현재 세대 effect로 발행한다`() =
+        runTest(dispatcher.scheduler) {
+            val launcher = Intent()
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository(),
+                SavedStateHandle(),
+                samsungMyFilesNavigator = object : SamsungMyFilesNavigator {
+                    override fun launcherIntent(): Intent = launcher
+                },
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenSamsungMyFiles)
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+
+            assertEquals(LaunchDestination.SAMSUNG_MY_FILES, effect.destination)
+            assertTrue(launcher === effect.intentFactory())
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `삼성 내 파일이 없으면 다른 관리자를 열지 않고 지정 메시지만 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository(),
+                SavedStateHandle(),
+                samsungMyFilesNavigator = object : SamsungMyFilesNavigator {
+                    override fun launcherIntent(): Intent? = null
+                },
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenSamsungMyFiles)
+
+            assertEquals(
+                UserMessageKind.SAMSUNG_MY_FILES_MISSING,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                "삼성 내 파일 앱을 찾을 수 없습니다.",
+                viewModel.state.value.message?.text,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
     fun `process recreation은 EXPORTED manual install 확인 버튼을 복원하고 자동 조정하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -1723,10 +1768,7 @@ class ManagerViewModelTest {
             )
             advanceUntilIdle()
 
-            assertEquals(
-                RecoveryAction.CHECK_INSTALL_STATUS,
-                recreated.state.value.message?.recoveryAction,
-            )
+            assertNull(recreated.state.value.message)
             recreated.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
             assertEquals(0, repository.reconcileManualCalls)
@@ -1817,7 +1859,7 @@ class ManagerViewModelTest {
             assertEquals(TOKEN, effect.importToken)
             assertEquals(source, effect.source)
             assertEquals("b".repeat(64), effect.expectedSha256)
-            assertEquals("복구-확장-wrapper.apk", effect.suggestedFileName)
+            assertEquals("복구_확장-1.0.0-aaaaaa.apk", effect.suggestedFileName)
         }
 
     @Test

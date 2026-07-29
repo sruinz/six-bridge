@@ -56,16 +56,20 @@ fun ConversionResultScreen(
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }
-        Button(
-            onClick = onInstall,
-            enabled = ready.review != null &&
-                !ready.installOwnerActive &&
-                !ready.cleanupPending &&
-                !ready.cleanupInProgress &&
-                !installState.isActiveInstall(),
-            modifier = Modifier.fillMaxWidth().testTag("conversion:install"),
-        ) {
-            Text(stringResource(R.string.review_install))
+        if (installState is dev.sixbridge.manager.install.InstallState.AwaitingManualInstall) {
+            ManualInstallHandoff(onAction)
+        } else {
+            Button(
+                onClick = onInstall,
+                enabled = ready.review != null &&
+                    !ready.installOwnerActive &&
+                    !ready.cleanupPending &&
+                    !ready.cleanupInProgress &&
+                    !installState.isActiveInstall(),
+                modifier = Modifier.fillMaxWidth().testTag("conversion:install"),
+            ) {
+                Text(stringResource(R.string.review_install))
+            }
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.SaveGeneratedConversion) },

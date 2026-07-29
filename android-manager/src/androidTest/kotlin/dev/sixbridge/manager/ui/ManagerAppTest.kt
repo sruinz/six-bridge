@@ -801,6 +801,68 @@ class ManagerAppTest {
     }
 
     @Test
+    fun awaiting_manual_install_review_shows_my_files_handoff_actions_only() {
+        val actionNames = mutableListOf<String>()
+        composeRule.setContent {
+            ManagerAppContent(
+                state = reviewState(ContractCompatibilityStatus.COMPATIBLE).copy(
+                    installState = InstallState.AwaitingManualInstall(TOKEN),
+                    message = null,
+                ),
+                onAction = { actionNames += it.javaClass.simpleName },
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("review:scroll")
+            .performScrollToNode(hasTestTag("manual-install:open-my-files"))
+        composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
+        composeRule.onNodeWithText(
+            "삼성 내 파일에서 저장한 APK를 직접 눌러 설치해 주세요.",
+        ).assertExists()
+        composeRule.onNodeWithText(
+            "다른 앱에서 열면 삼성 인터넷이 지원하지 않는 확장으로 분류할 수 있습니다.",
+        ).assertExists()
+        composeRule.onNodeWithTag("manual-install:open-my-files").performClick()
+        composeRule.onNodeWithTag("review:scroll")
+            .performScrollToNode(hasTestTag("manual-install:check-status"))
+        composeRule.onNodeWithTag("manual-install:check-status").performClick()
+
+        assertEquals(
+            listOf("OpenSamsungMyFiles", "ConfirmManualInstallStatus"),
+            actionNames,
+        )
+        composeRule.onNodeWithTag("review:install").assertDoesNotExist()
+    }
+
+    @Test
+    fun awaiting_manual_install_conversion_result_shows_my_files_handoff_actions_only() {
+        val actionNames = mutableListOf<String>()
+        composeRule.setContent {
+            ManagerAppContent(
+                state = conversionResultState().copy(
+                    installState = InstallState.AwaitingManualInstall(TOKEN),
+                    message = null,
+                ),
+                onAction = { actionNames += it.javaClass.simpleName },
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("conversion:result-screen")
+            .performScrollToNode(hasTestTag("manual-install:open-my-files"))
+        composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
+        composeRule.onNodeWithTag("manual-install:open-my-files").performClick()
+        composeRule.onNodeWithTag("manual-install:check-status").performClick()
+
+        assertEquals(
+            listOf("OpenSamsungMyFiles", "ConfirmManualInstallStatus"),
+            actionNames,
+        )
+        composeRule.onNodeWithTag("conversion:install").assertDoesNotExist()
+    }
+
+    @Test
     fun blocked_and_unknown_reviews_cannot_be_installed() {
         var state by mutableStateOf(reviewState(ContractCompatibilityStatus.BLOCKED))
         composeRule.setContent {
