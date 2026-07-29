@@ -40,6 +40,7 @@ import dev.sixbridge.manager.install.PackageInstallEvents
 import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
+import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
 import dev.sixbridge.manager.ui.LaunchDestination
@@ -113,7 +114,18 @@ data class ManagerRestoreResult(
     val installSessionId: Int? = null,
     val terminal: RestoredInstallTerminal? = null,
     val normalHandoff: NormalInstallHandoff? = null,
-)
+    val recoveryBlocked: Boolean = false,
+) {
+    init {
+        require(
+            !recoveryBlocked ||
+                review == null &&
+                installSessionId == null &&
+                terminal == null &&
+                normalHandoff == null,
+        )
+    }
+}
 
 data class RestoredInstallTerminal(
     val importToken: String,
@@ -270,12 +282,21 @@ internal class DefaultManagerRepository(
         reviewToken: String?,
         installSessionId: Int?,
     ): ManagerRestoreResult {
-        val startupSnapshot = startup.awaitReady()
+        val startupSnapshot = when (val snapshot = startup.awaitReady()) {
+            is StartupSnapshot.Ready -> snapshot
+            StartupSnapshot.RecoveryBlocked ->
+                return ManagerRestoreResult(recoveryBlocked = true)
+        }
+        val recovery = when (val snapshot = pendingStore.recoveryStoreSnapshot()) {
+            is RecoveryStoreSnapshot.Valid -> snapshot
+            RecoveryStoreSnapshot.Invalid ->
+                return ManagerRestoreResult(recoveryBlocked = true)
+        }
         val currentSnapshot = installCoordinator.currentRecoverySnapshot()
-        val pending = currentSnapshot.pending
-        val finalReceipt = pendingStore.loadFinalReceipt()
-        val normalHandoff = pendingStore.loadNormalHandoff()
-        val raw = pendingStore.loadTerminalResult()
+        val pending = recovery.pending
+        val finalReceipt = recovery.finalReceipt
+        val normalHandoff = recovery.normalHandoff
+        val raw = recovery.terminal
         val durableOwnerTokens = setOfNotNull(
             finalReceipt?.importToken,
             normalHandoff?.importToken,
@@ -296,7 +317,7 @@ internal class DefaultManagerRepository(
             (durableOwnerTokens.isEmpty() || targetToken in durableOwnerTokens)
         val retained = targetToken?.takeIf { targetAllowed }?.let { token ->
             when {
-                pending?.importToken == token && pending == startupSnapshot.pending ->
+                pending?.importToken == token && pending == startupSnapshot.recovery.pending ->
                     currentSnapshot.activeBundle
                         ?.takeIf {
                             it.token == token &&
@@ -567,8 +588,11 @@ internal class RepositoryStartup(
     ) {
         if (!started.compareAndSet(false, true)) return
         applicationScope.launch {
-            awaitReady()
-            collectPackageInstallEvents(installEvents, callbackRouter)
+            when (awaitReady()) {
+                is StartupSnapshot.Ready ->
+                    collectPackageInstallEvents(installEvents, callbackRouter)
+                StartupSnapshot.RecoveryBlocked -> Unit
+            }
         }
     }
 
@@ -589,22 +613,48 @@ internal class RepositoryStartup(
         if (!ready.isCompleted) {
             mutex.withLock {
                 if (!ready.isCompleted) {
+                    when (pendingStore.recoveryStoreSnapshot()) {
+                        is RecoveryStoreSnapshot.Valid -> Unit
+                        RecoveryStoreSnapshot.Invalid -> {
+                            ready.complete(StartupSnapshot.RecoveryBlocked)
+                            return@withLock
+                        }
+                    }
                     startupCleanup.run()
-                    val pending = pendingStore.load()
-                    val recoveryToken = pendingStore.loadFinalReceipt()?.importToken
-                        ?: pending?.importToken
-                        ?: pendingStore.loadTerminalResult()?.importToken
-                        ?: pendingStore.loadNormalHandoff()?.importToken
+                    val recovery = when (val snapshot = pendingStore.recoveryStoreSnapshot()) {
+                        is RecoveryStoreSnapshot.Valid -> snapshot
+                        RecoveryStoreSnapshot.Invalid -> {
+                            ready.complete(StartupSnapshot.RecoveryBlocked)
+                            return@withLock
+                        }
+                    }
+                    val recoveryToken = recovery.finalReceipt?.importToken
+                        ?: recovery.pending?.importToken
+                        ?: recovery.terminal?.importToken
+                        ?: recovery.normalHandoff?.importToken
                     val retained = recoveryToken?.let { token ->
                         withContext(ioDispatcher) { retainedImports.load(token) }
                     }
                     installCoordinator.restore(retained)
-                    val restoredPending = pendingStore.load()
+                    val restoredRecovery = when (
+                        val snapshot = pendingStore.recoveryStoreSnapshot()
+                    ) {
+                        is RecoveryStoreSnapshot.Valid -> snapshot
+                        RecoveryStoreSnapshot.Invalid -> {
+                            ready.complete(StartupSnapshot.RecoveryBlocked)
+                            return@withLock
+                        }
+                    }
                     val restoredBundle = retained?.takeIf { bundle ->
-                        restoredPending?.importToken == bundle.token
+                        restoredRecovery.pending?.importToken == bundle.token
                     }
                     runBestEffortStartupStep { catalogPublisher.reconcile() }
-                    ready.complete(StartupSnapshot(restoredPending, restoredBundle))
+                    ready.complete(
+                        StartupSnapshot.Ready(
+                            recovery = restoredRecovery,
+                            restoredBundle = restoredBundle,
+                        ),
+                    )
                 }
             }
         }
@@ -622,10 +672,14 @@ internal class RepositoryStartup(
     }
 }
 
-internal data class StartupSnapshot(
-    val pending: PendingInstall?,
-    val restoredBundle: ImportedBundle?,
-)
+internal sealed interface StartupSnapshot {
+    data class Ready(
+        val recovery: RecoveryStoreSnapshot.Valid,
+        val restoredBundle: ImportedBundle?,
+    ) : StartupSnapshot
+
+    data object RecoveryBlocked : StartupSnapshot
+}
 
 internal suspend fun collectPackageInstallEvents(
     events: Flow<PackageInstallCallback>,

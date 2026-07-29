@@ -80,6 +80,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -159,6 +160,88 @@ class ManagerRepositoryTest {
             store.recoveryStoreSnapshot(),
         )
     }
+
+    @Test
+    fun `durable Invalid recovery는 retry 없이 readiness를 blocked로 완료한다`() =
+        runTest {
+            listOf("pending", "terminal", "final", "handoff").forEach { invalidRecord ->
+                val fixture = startupFixture(
+                    invalidRecord = invalidRecord,
+                    retryDelayMillis = 1,
+                )
+
+                val result = withTimeout(500) { fixture.startup.awaitReady() }
+
+                assertEquals(StartupSnapshot.RecoveryBlocked, result, invalidRecord)
+                assertEquals(1, fixture.store.recoverySnapshotReads, invalidRecord)
+                assertEquals(0, fixture.store.nullableLoadReads, invalidRecord)
+                assertEquals(0, fixture.store.discardAttempts, invalidRecord)
+                assertEquals(InstallState.Idle, fixture.coordinator.state.value, invalidRecord)
+            }
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `blocked startup은 PackageInstaller callback collector를 시작하지 않는다`() =
+        runTest {
+            val fixture = startupFixture(invalidRecord = "pending", retryDelayMillis = 1)
+            val events = Channel<PackageInstallCallback>(Channel.UNLIMITED)
+            fixture.startup.start(backgroundScope, events.receiveAsFlow(), fixture.router)
+            runCurrent()
+
+            events.send(PackageInstallCallback(PackageInstallResult.Success(41)))
+            advanceTimeBy(10)
+            runCurrent()
+
+            assertEquals(0, fixture.routerCalls.get())
+            assertEquals(InstallState.Idle, fixture.coordinator.state.value)
+        }
+
+    @Test
+    fun `repository initialize는 Invalid recovery에서 owner를 읽거나 복원하지 않는다`() =
+        runTest {
+            val root = temporaryFolder.newFolder("blocked-repository")
+            val store = StartupPendingStore(null).apply {
+                pendingSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                terminalSnapshotOverride = RecoveryRecordSnapshot.Absent
+                finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Absent
+                normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Absent
+            }
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val retained = RetainedImportStore(root) { _, _, _ ->
+                error("blocked startup은 retained import를 읽지 않습니다.")
+            }
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                store,
+                installed,
+                catalog,
+            )
+            val repository = managerRepository(
+                root = root,
+                retainedImports = retained,
+                gateway = gateway,
+                pendingStore = store,
+                installed = installed,
+                catalog = catalog,
+                coordinator = coordinator,
+            )
+
+            val restored = withTimeout(500) {
+                repository.initialize(TOKEN, 41)
+            }
+
+            assertTrue(restored.recoveryBlocked)
+            assertNull(restored.review)
+            assertNull(restored.installSessionId)
+            assertNull(restored.terminal)
+            assertNull(restored.normalHandoff)
+            assertEquals(0, store.nullableLoadReads)
+            assertEquals(0, store.discardAttempts)
+        }
 
     @Test
     fun `새 repository 인스턴스가 bounded sidecar와 wrapper identity를 검증해 bundle을 복원한다`() {
@@ -966,11 +1049,11 @@ class ManagerRepositoryTest {
                 Dispatchers.Unconfined,
             )
 
-            val snapshot = startup.ensureReady()
+            val ready = assertIs<StartupSnapshot.Ready>(startup.ensureReady())
 
             assertEquals(InstallState.Installed(PACKAGE), coordinator.state.value)
-            assertNull(snapshot.pending)
-            assertNull(snapshot.restoredBundle)
+            assertNull(ready.recovery.pending)
+            assertNull(ready.restoredBundle)
             assertNull(pendingStore.record)
             assertTrue(File(root, TOKEN).exists())
             assertTrue(
@@ -1847,9 +1930,9 @@ class ManagerRepositoryTest {
             assertNull(pendingStore.terminal)
             assertNull(pendingStore.finalReceipt)
             assertEquals(PACKAGE, catalog.records.single().packageName)
-            val snapshot = foregroundInitialization.await()
-            assertEquals(TOKEN, snapshot.pending?.importToken)
-            assertEquals(TOKEN, snapshot.restoredBundle?.token)
+            val ready = assertIs<StartupSnapshot.Ready>(foregroundInitialization.await())
+            assertEquals(TOKEN, ready.recovery.pending?.importToken)
+            assertEquals(TOKEN, ready.restoredBundle?.token)
             assertEquals(1, verifierCalls)
             scope.cancel()
         }
@@ -3061,6 +3144,75 @@ class ManagerRepositoryTest {
         generatedImporter = generatedImporter,
     )
 
+    private data class StartupTestFixture(
+        val startup: RepositoryStartup,
+        val store: StartupPendingStore,
+        val coordinator: InstallCoordinator,
+        val router: InstallCallbackRouter,
+        val routerCalls: AtomicInteger,
+    )
+
+    private fun startupFixture(
+        invalidRecord: String,
+        retryDelayMillis: Long,
+    ): StartupTestFixture {
+        val root = temporaryFolder.newFolder("blocked-startup-$invalidRecord")
+        val store = StartupPendingStore(null)
+        val gateway = StartupGateway(emptyList())
+        val installed = FakeInstalledWrappers(emptyList())
+        val catalog = FakeCatalog(emptyList())
+        val publisher = catalogPublisher(catalog, installed)
+        val coordinator = InstallCoordinator(
+            InstallPolicy(),
+            gateway,
+            store,
+            installed,
+            catalog,
+        )
+        store.apply {
+            pendingSnapshotOverride = RecoveryRecordSnapshot.Absent
+            terminalSnapshotOverride = RecoveryRecordSnapshot.Absent
+            finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Absent
+            normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Absent
+            when (invalidRecord) {
+                "pending" -> pendingSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                "terminal" -> terminalSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                "final" -> finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                "handoff" -> normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                else -> error("unknown record: $invalidRecord")
+            }
+            nullableLoadReads = 0
+        }
+        val calls = AtomicInteger()
+        val router = InstallCallbackRouter(
+            onResult = {
+                calls.incrementAndGet()
+                coordinator.onPackageInstallerResult(it)
+            },
+            onRefresh = {
+                calls.incrementAndGet()
+                publisher.reconcile()
+            },
+        )
+        val startup = RepositoryStartup(
+            retainedImports = RetainedImportStore(root) { _, _, _ ->
+                error("blocked startup은 retained import를 읽지 않습니다.")
+            },
+            startupCleanup = StartupCleanup(
+                root,
+                gateway,
+                store,
+                Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+            ),
+            installCoordinator = coordinator,
+            pendingStore = store,
+            catalogPublisher = publisher,
+            ioDispatcher = Dispatchers.Unconfined,
+            retryDelayMillis = retryDelayMillis,
+        )
+        return StartupTestFixture(startup, store, coordinator, router, calls)
+    }
+
     private fun catalogPublisher(
         catalog: ManagerCatalog,
         installed: InstalledWrapperRepository,
@@ -3307,8 +3459,11 @@ private class StartupPendingStore(
     var discardFailure = false
     var discardAttempts = 0
     var loadFailures = 0
+    var recoverySnapshotReads = 0
+    var nullableLoadReads = 0
 
     override fun load(): PendingInstall? {
+        nullableLoadReads += 1
         if (loadFailures > 0) {
             loadFailures -= 1
             error("transient pending load failure")
@@ -3317,6 +3472,10 @@ private class StartupPendingStore(
     }
     override fun pendingInstallSnapshot(): RecoveryRecordSnapshot<PendingInstall> =
         pendingSnapshotOverride ?: super<PendingInstallStore>.pendingInstallSnapshot()
+    override fun recoveryStoreSnapshot(): RecoveryStoreSnapshot {
+        recoverySnapshotReads += 1
+        return super<PendingInstallStore>.recoveryStoreSnapshot()
+    }
     override fun tryClaim(
         packageName: String,
         importToken: String,
@@ -3358,7 +3517,10 @@ private class StartupPendingStore(
             check(File(root, importToken).deleteRecursively())
         }
     }
-    override fun loadTerminalResult(): PendingInstallResult? = terminal
+    override fun loadTerminalResult(): PendingInstallResult? {
+        nullableLoadReads += 1
+        return terminal
+    }
     override fun terminalResultSnapshot(): RecoveryRecordSnapshot<PendingInstallResult> =
         terminalSnapshotOverride ?: super<PendingInstallStore>.terminalResultSnapshot()
     override fun recordTerminalResult(
@@ -3395,7 +3557,10 @@ private class StartupPendingStore(
         terminal = null
         return true
     }
-    override fun loadFinalReceipt(): FinalInstallReceipt? = finalReceipt
+    override fun loadFinalReceipt(): FinalInstallReceipt? {
+        nullableLoadReads += 1
+        return finalReceipt
+    }
     override fun finalReceiptSnapshot(): RecoveryRecordSnapshot<FinalInstallReceipt> =
         finalReceiptSnapshotOverride ?: super<PendingInstallStore>.finalReceiptSnapshot()
     override fun createFinalReceipt(
@@ -3445,7 +3610,10 @@ private class StartupPendingStore(
         record = null
         return true
     }
-    override fun loadNormalHandoff(): NormalInstallHandoff? = normalHandoff
+    override fun loadNormalHandoff(): NormalInstallHandoff? {
+        nullableLoadReads += 1
+        return normalHandoff
+    }
     override fun normalHandoffSnapshot(): RecoveryRecordSnapshot<NormalInstallHandoff> =
         normalHandoffSnapshotOverride ?: super<PendingInstallStore>.normalHandoffSnapshot()
     override fun compareAndSetNormalHandoff(
