@@ -987,6 +987,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
                     raw.packageName == packageName &&
                     raw.importToken == importToken &&
                     raw.terminalAtEpochMillis == rawTerminalAtEpochMillis
+            FinalReceiptOrigin.SYSTEM_INSTALLER -> raw == null
         }
 
     private fun PendingInstallResult.matches(receipt: FinalInstallReceipt): Boolean =

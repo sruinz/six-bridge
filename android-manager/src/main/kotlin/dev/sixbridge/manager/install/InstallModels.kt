@@ -71,6 +71,7 @@ enum class FinalReceiptStage {
 enum class FinalReceiptOrigin {
     PROGRAM_CANCEL,
     RAW_TERMINAL,
+    SYSTEM_INSTALLER,
 }
 
 data class FinalInstallReceipt(
@@ -100,6 +101,10 @@ data class FinalInstallReceipt(
                     sessionId != null &&
                         rawTerminalAtEpochMillis != null &&
                         rawTerminalAtEpochMillis > 0 &&
+                        stage != FinalReceiptStage.CANCELLING
+                FinalReceiptOrigin.SYSTEM_INSTALLER ->
+                    sessionId == null &&
+                        rawTerminalAtEpochMillis == null &&
                         stage != FinalReceiptStage.CANCELLING
             },
         )

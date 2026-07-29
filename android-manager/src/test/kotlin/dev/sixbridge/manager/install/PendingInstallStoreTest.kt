@@ -1,18 +1,77 @@
 package dev.sixbridge.manager.install
 
+import android.content.Context
 import android.content.SharedPreferences
 import java.io.File
 import java.lang.reflect.Proxy
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 
+@RunWith(RobolectricTestRunner::class)
 class PendingInstallStoreTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `SYSTEM_INSTALLER receipt는 raw 없이 READY ACKNOWLEDGED finalize로 전이한다`() {
+        val store = mutableStore()
+        val ready = systemInstallerReceipt()
+
+        assertTrue(store.createFinalReceipt(null, null, ready))
+        assertEquals(ready, store.loadFinalReceipt())
+        val acknowledged = store.acknowledgeFinalReceipt(ready, null)
+        assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged?.stage)
+        assertTrue(store.finalizeFinalReceipt(requireNotNull(acknowledged)))
+        assertNull(store.loadFinalReceipt())
+    }
+
+    @Test
+    fun `SYSTEM_INSTALLER receipt는 session raw timestamp CANCELLING을 허용하지 않는다`() {
+        assertFailsWith<IllegalArgumentException> {
+            systemInstallerReceipt().copy(sessionId = 41)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            systemInstallerReceipt().copy(rawTerminalAtEpochMillis = 2)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            systemInstallerReceipt().copy(stage = FinalReceiptStage.CANCELLING)
+        }
+    }
+
+    @Test
+    fun `SYSTEM_INSTALLER receipt는 raw terminal이 존재하면 생성하지 않는다`() {
+        val store = mutableStore()
+        val claim = requireNotNull(
+            store.tryClaim(PACKAGE, TOKEN, startedAtEpochMillis = 1),
+        )
+        val pending = requireNotNull(store.assignSession(claim, 41))
+        assertTrue(
+            store.recordTerminalResult(
+                PackageInstallResult.Cancelled(41),
+                terminalAtEpochMillis = 2,
+            ),
+        )
+        val raw = requireNotNull(store.loadTerminalResult())
+
+        assertFalse(
+            store.createFinalReceipt(
+                expectedPending = pending,
+                expectedRaw = raw,
+                receipt = systemInstallerReceipt(),
+            ),
+        )
+        assertNull(store.loadFinalReceipt())
+    }
 
     @Test
     fun `present malformed terminal identity and failure fields make the whole recovery snapshot Invalid`() {
@@ -102,6 +161,30 @@ class PendingInstallStoreTest {
             recoveryPreferences = readOnlyPreferences(rawRecovery),
             importDirectory = File(temporaryFolder.root, "imports"),
         )
+
+    private fun mutableStore(): SharedPreferencesPendingInstallStore {
+        val context = RuntimeEnvironment.getApplication()
+        val pending = context.getSharedPreferences("pending_install_store_test", Context.MODE_PRIVATE)
+        val recovery = context.getSharedPreferences("install_recovery_test", Context.MODE_PRIVATE)
+        pending.edit().clear().commit()
+        recovery.edit().clear().commit()
+        return SharedPreferencesPendingInstallStore(
+            pendingPreferences = pending,
+            recoveryPreferences = recovery,
+            importDirectory = File(temporaryFolder.root, "imports"),
+        )
+    }
+
+    private fun systemInstallerReceipt() = FinalInstallReceipt(
+        importToken = TOKEN,
+        sessionId = null,
+        packageName = PACKAGE,
+        state = InstallState.Installed(PACKAGE),
+        stage = FinalReceiptStage.READY,
+        origin = FinalReceiptOrigin.SYSTEM_INSTALLER,
+        rawTerminalAtEpochMillis = null,
+        terminalAtEpochMillis = 3,
+    )
 
     private fun validLegacyFailureRecord(): MutableMap<String, Any> = mutableMapOf(
         "result_session_id" to 41,
