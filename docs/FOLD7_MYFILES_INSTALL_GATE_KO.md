@@ -1,0 +1,135 @@
+# Fold7 삼성 내 파일 설치 게이트
+
+## 목적
+
+이 절차는 SIX Bridge가 만든 래퍼를 삼성 `내 파일`에서 사용자가 직접
+설치했는지 검증한다. gate는 설치를 대신하지 않는다. 특히 `adb install`,
+`PackageInstaller` session, APK URI를 연 installer Intent로 수동 승인 단계를
+우회하지 않는다.
+
+지원 기준 기기는 Fold7 `SM-F966N`, 기준 브라우저는 Samsung Internet
+30.0.2.61이다.
+
+## `.six`와 APK의 역할
+
+- `.six`는 변환 결과의 보관·공유·백업·전송 파일이다. `wrapper.apk`,
+  `extension.json`, `compatibility.json`을 함께 보존한다. `.six` 자체를
+  Android installer에서 열지 않는다.
+- APK는 `.six` 안의 검증된 `wrapper.apk` 바이트를 그대로 내보낸 설치
+  파일이다. 재패키징하거나 다시 서명하지 않는다. 삼성 `내 파일`에서
+  사용자가 직접 선택할 때만 설치에 사용한다.
+- `pre` gate가 출력하는 `preparedApk`는 비교용 기준 APK다. 제품 흐름에서는
+  SIX Bridge의 `설치 APK 내보내기`로 Downloads에 저장한 APK를 사용한다.
+  두 APK의 SHA-256은 같아야 한다.
+
+## 준비
+
+1. Fold7에서 `개발자 옵션 > 무선 디버깅`을 켜고 host의 `adb devices -l`에서
+   상태가 `device`, model이 `SM-F966N`인 serial 하나만 선택한다.
+2. 다음 도구를 준비한다.
+
+   - `adb`
+   - `jq`
+   - `rg`
+   - `zipinfo`, `unzip`
+   - Android SDK 36의 `apkanalyzer`, `apksigner`
+
+3. manager debug APK를 최신 코드로 빌드한다.
+
+```bash
+JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
+GRADLE_USER_HOME="$PWD/.local/gradle-home" \
+gradle :android-manager:assembleDebug
+```
+
+4. 검증할 `.six`의 절대 경로와 예상 wrapper package를 확인한다. wrapper
+   package 형식은 `dev.sixbridge.ext.<32자 extension ID>`다.
+
+## 사용자 절차 8단계
+
+1. SIX Bridge에서 `.six`를 가져오거나 Fold7에서 온디바이스 변환을 완료한다.
+2. 검토 화면에서 `설치 APK 내보내기`를 누른다.
+3. Android 문서 저장 화면에서 APK를 `Downloads`에 저장한다.
+4. SIX Bridge의 `삼성 내 파일 열기`를 눌러 삼성 `내 파일` 런처를 연다.
+5. 삼성 `내 파일`의 Downloads에서 방금 저장한 APK를 직접 선택한다.
+6. Android 설치 화면에서 설치 또는 업데이트를 사용자가 승인한다.
+7. SIX Bridge로 돌아와 정확한 항목의 `설치 상태 확인`을 누른다.
+8. Samsung Internet의 추가 기능 화면에서 `지원 안 함` 표시가 없고 확장을
+   활성화할 수 있는지 확인한다.
+
+4~6단계에서 다른 파일 관리자, 브라우저 다운로드 화면이나 host ADB로 APK를
+열거나 설치하면 정상 My Files origin 증거가 남지 않는다.
+
+## Gate 실행
+
+사용자 설치 전에 `pre`를 한 번 실행한다.
+
+```bash
+export SIXBRIDGE_ADB_SERIAL='192.0.2.10:39359'
+export SIXBRIDGE_TEST_BUNDLE='/absolute/path/to/result.six'
+
+scripts/fold7-myfiles-install-gate.sh pre \
+  "$SIXBRIDGE_ADB_SERIAL" \
+  "$SIXBRIDGE_TEST_BUNDLE"
+```
+
+`pre`는 다음 항목을 확인하고 `.local/evidence/<시각>-myfiles-install-gate/`에
+baseline을 기록한다.
+
+- manager final manifest에 `REQUEST_INSTALL_PACKAGES`와
+  `dev.sixbridge.manager.install` authority가 없음
+- manager final manifest에 `com.sec.android.app.myfiles` query가 있음
+- `SystemInstallCoordinator`, `DefaultManagerRepository` dex에 직접 installer
+  session·APK `ACTION_VIEW`·gateway 참조가 없음
+- `.six`에 symlink, 중복 entry, 경로 이탈이 없고 정확한 세 entry만 있음
+- wrapper package, `versionCode`, signer, extension ID와 SHA-256
+- pre 시점의 Fold7 epoch와 비교용 `preparedApk`
+
+`pre` 성공 뒤 위 사용자 절차 2~6단계를 수행한다. 사용자가 설치 또는
+업데이트를 승인하기 전에는 `post`를 실행하지 않는다.
+
+```bash
+scripts/fold7-myfiles-install-gate.sh post \
+  "$SIXBRIDGE_ADB_SERIAL" \
+  dev.sixbridge.ext.ddcpmlcaanjillmjmnlmngimhbbojgam
+```
+
+합격 출력은 다음 다섯 값을 모두 포함한다.
+
+```text
+installer=com.google.android.packageinstaller
+originating=com.sec.android.app.myfiles
+classification=dev_ext
+support=Allowed to be supported
+wrapperByteIdentity=matched
+```
+
+`post`는 같은 serial의 마지막 성공 `pre`만 사용한다. 설치된 `base.apk`를
+회수해 package, `versionCode`, signer, extension ID와 SHA-256을 baseline과
+비교한다. 또한 pre 이후의 다음 삼성 로그 두 줄과 Samsung Internet Add-ons,
+wrapper `six://ex` discovery resolve 결과를 증거 디렉터리에 저장한다.
+
+```text
+SixPkgUpdater: isDevSixPkg - MyFiles case
+SixAppDataUpdater: updateSixAppData - Allowed to be supported
+```
+
+계약 또는 증거 불일치는 exit code 3, 잘못된 사용법이나 필수 도구 누락은 exit
+code 2다. 실패한 설치를 성공으로 해석하지 말고 같은 APK를 삼성 `내 파일`에서
+다시 선택해 사용자 승인을 반복한다.
+
+## 수동 회귀 확인
+
+gate 합격 뒤 다음 항목은 사람이 Fold7 UI에서 확인한다.
+
+- Samsung Internet 추가 기능 목록에 대상 확장의 `지원 안 함` 표시가 없다.
+- 확장을 활성화한 뒤 일반 HTTPS 페이지에서 텍스트 선택 동작이 실행된다.
+- 설정 변경과 활성 상태가 Samsung Internet 재시작 뒤 유지된다.
+- SIX Bridge 관리자 목록의 호환성 보고서, 아이콘과 제거 기능이 정상이다.
+- 기존 AI 레시피, Video Download to NAS, 스마트 컨텍스트 메뉴의 package와
+  설치 APK SHA-256이 검증 전 기준값에서 바뀌지 않았다.
+- 같은 APK의 업데이트를 다시 삼성 `내 파일`에서 승인해도 My Files origin과
+  확장 신원이 유지된다.
+
+수동 회귀 결과와 화면 증거는 gate evidence 디렉터리 옆에 별도 기록한다.
