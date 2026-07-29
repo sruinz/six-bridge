@@ -105,7 +105,6 @@ class ManagerViewModel(
     private var uninstallGeneration = 0L
     private var pendingUninstallLaunch: PendingUninstallLaunch? = null
     private var pendingUninstallReturn: PendingUninstallReturn? = null
-    private var systemInstallReturnToken: String? = null
     private var pendingRecovery: PendingRecovery? = null
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
@@ -1529,7 +1528,6 @@ class ManagerViewModel(
                     }
                 }
                 if (installState.isTerminalState()) {
-                    systemInstallReturnToken = null
                     replacementCancelGeneration?.let { generation ->
                         deferredReplacementTerminal = generation to installState
                         return@collect
@@ -1538,9 +1536,7 @@ class ManagerViewModel(
                 val suppressedTerminal = installState == suppressedInstallTerminal
                 if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
-                    InstallState.PreparingSystemInstaller,
                     is InstallState.PreparingApkExport,
-                    is InstallState.AwaitingSystemInstaller,
                     is InstallState.AwaitingManualInstall,
                     -> Unit
                     is InstallState.WritingSession -> {
@@ -1827,18 +1823,6 @@ class ManagerViewModel(
             }
             return
         }
-        val systemToken = systemInstallReturnToken
-        val systemState = mutableState.value.installState
-        if (systemToken != null &&
-            systemState == InstallState.AwaitingSystemInstaller(systemToken) &&
-            isCurrentReviewOwner(systemToken)
-        ) {
-            systemInstallReturnToken = null
-            viewModelScope.launch {
-                repository.reconcileSystemInstallAfterReturn()
-            }
-            return
-        }
         viewModelScope.launch {
             try {
                 if (mutableState.value.installState == InstallState.UnknownSourcesPermissionRequired) {
@@ -1925,14 +1909,6 @@ class ManagerViewModel(
 
     private fun recordLaunchFailure(effect: ManagerEffect.LaunchIntent) {
         if (!isEffectCurrent(effect)) return
-        val systemInstallToken =
-            effect.installImportToken.takeIf {
-                effect.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
-            }
-        if (systemInstallToken != null) {
-            if (!repository.markSystemInstallLaunchFailed(systemInstallToken)) return
-            systemInstallReturnToken = null
-        }
         val uninstallPackage = if (effect.destination == LaunchDestination.UNINSTALL) {
             val pendingLaunch = pendingUninstallLaunch
                 ?.takeIf {
@@ -1948,7 +1924,6 @@ class ManagerViewModel(
         }
         val failureText = when {
             uninstallPackage != null -> "시스템 제거 화면을 열 수 없습니다."
-            systemInstallToken != null -> "시스템 설치 화면을 열 수 없습니다."
             else -> "시스템 화면을 열 수 없습니다."
         }
         pendingRecovery = PendingRecovery.Launch(effect, uninstallPackage)
@@ -1965,13 +1940,6 @@ class ManagerViewModel(
 
     private fun recordLaunchSuccess(effect: ManagerEffect.LaunchIntent) {
         if (!isEffectCurrent(effect)) return
-        if (effect.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION) {
-            val importToken = effect.installImportToken ?: return
-            if (repository.markSystemInstallLaunchSucceeded(importToken)) {
-                systemInstallReturnToken = importToken
-            }
-            return
-        }
         if (effect.destination != LaunchDestination.UNINSTALL) return
         val pendingLaunch = pendingUninstallLaunch
             ?.takeIf {
@@ -2000,7 +1968,6 @@ class ManagerViewModel(
                     destination = recovery.effect.destination,
                     intentFactory = recovery.effect.intentFactory,
                     installSessionId = recovery.effect.installSessionId,
-                    installImportToken = recovery.effect.installImportToken,
                     ownerGeneration = launchGeneration,
                 )
                 recovery.uninstallPackage?.let { packageName ->
@@ -3318,11 +3285,6 @@ class ManagerViewModel(
         }
         deferredInitialTerminals = null
         val installState = repository.installState.value
-        if (installState is InstallState.AwaitingSystemInstaller &&
-            isCurrentReviewOwner(installState.importToken)
-        ) {
-            systemInstallReturnToken = installState.importToken
-        }
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
         }
@@ -3332,7 +3294,6 @@ class ManagerViewModel(
         val reviewToken = readyReview?.token
         val preparingExportToken = when (installState) {
             is InstallState.PreparingApkExport -> installState.importToken
-            InstallState.PreparingSystemInstaller -> reviewToken
             else -> null
         }
         if (preparingExportToken == reviewToken &&
@@ -4184,13 +4145,7 @@ class ManagerViewModel(
     private fun currentLaunchEffect(launch: RepositoryLaunch) =
         ManagerEffect.LaunchIntent(
             launch = launch,
-            ownerGeneration = if (
-                launch.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
-            ) {
-                null
-            } else {
-                launchGeneration
-            },
+            ownerGeneration = launchGeneration,
         )
 
     private fun supersedeRecoveryForTerminal() {
@@ -4256,9 +4211,7 @@ class ManagerViewModel(
             is ManagerEffect.LaunchIntent -> Unit
         }
         if (effect.ownerGeneration?.let { it != launchGeneration } == true) return false
-        if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION &&
-            effect.ownerGeneration == null
-        ) {
+        if (effect.ownerGeneration == null) {
             return false
         }
         if (effect.destination == LaunchDestination.UNKNOWN_SOURCES_SETTINGS &&
@@ -4266,11 +4219,7 @@ class ManagerViewModel(
         ) {
             return false
         }
-        if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION) return true
-        val importToken = effect.installImportToken ?: return false
-        return repository.installState.value ==
-            InstallState.AwaitingSystemInstaller(importToken) &&
-            isCurrentReviewOwner(importToken)
+        return true
     }
 
     private fun isCurrentReviewOwner(importToken: String): Boolean {

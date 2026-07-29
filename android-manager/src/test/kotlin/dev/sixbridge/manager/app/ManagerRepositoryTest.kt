@@ -55,9 +55,6 @@ import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SystemInstallCoordinator
 import dev.sixbridge.manager.install.SystemInstallHandoffStore
 import dev.sixbridge.manager.install.SystemInstallStage
-import dev.sixbridge.manager.install.SystemInstallerGateway
-import dev.sixbridge.manager.install.SystemInstallerLaunch
-import dev.sixbridge.manager.install.SystemInstallerLaunchResult
 import dev.sixbridge.manager.install.PendingSystemInstall
 import dev.sixbridge.manager.ui.LaunchDestination
 import dev.sixbridge.manager.ui.ImportUiState
@@ -157,7 +154,6 @@ class ManagerRepositoryTest {
             )
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
-            assertTrue(fixture.systemGateway.revoked.isEmpty())
         }
 
     @Test
@@ -196,16 +192,14 @@ class ManagerRepositoryTest {
         }
 
     @Test
-    fun `PREPARED 내보내기는 재생성 뒤 보존되고 검증된 APK metadata를 반환한다`() =
+    fun `PREPARED 내보내기는 재생성 startup에서 record만 정리하고 private import를 보존한다`() =
         runTest {
             val fixture = systemRepositoryFixture("apk-export-recreated")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
             fixture.repository.install(review, partialConfirmed = true)
             val recreatedSystemCoordinator = systemInstallCoordinator(
-                root = fixture.root,
                 pendingStore = fixture.pendingStore,
                 installed = fixture.installed,
-                gateway = fixture.systemGateway,
                 handoffStore = fixture.handoffStore,
             )
             val recreated = managerRepository(
@@ -222,19 +216,9 @@ class ManagerRepositoryTest {
 
             assertNotNull(recreated.initialize(TOKEN, null).review)
 
-            assertEquals(
-                InstallState.PreparingApkExport(TOKEN),
-                recreated.installState.value,
-            )
             assertTrue(File(fixture.root, TOKEN).exists())
-            val export = assertNotNull(recreated.installApkExport(TOKEN))
-
-            assertEquals(TOKEN, export.importToken)
-            assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), export.source)
-            assertEquals(sha256(export.source), export.expectedSha256)
-            assertEquals("Example", export.extensionName)
-            assertEquals("1.0", export.extensionVersion)
-            assertEquals(EXTENSION_ID, export.extensionId)
+            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+            assertNull(recreated.installApkExport(TOKEN))
             assertNull(recreated.installApkExport("other"))
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
@@ -2270,10 +2254,8 @@ class ManagerRepositoryTest {
                     ),
                     installCoordinator = coordinator,
                     systemInstallCoordinator = systemInstallCoordinator(
-                        root = root,
                         pendingStore = pendingStore,
                         installed = installed,
-                        gateway = FakeSystemInstallerGateway(canInstallPackages = false),
                     ),
                     pendingStore = pendingStore,
                     uninstallCoordinator = object : UninstallCoordinator {
@@ -2454,7 +2436,6 @@ class ManagerRepositoryTest {
                     ),
                     installCoordinator = restoredCoordinator,
                     systemInstallCoordinator = systemInstallCoordinator(
-                        root = root,
                         pendingStore = pendingStore,
                         installed = installed,
                     ),
@@ -3441,7 +3422,6 @@ class ManagerRepositoryTest {
         ),
         installCoordinator = coordinator,
         systemInstallCoordinator = systemCoordinator ?: systemInstallCoordinator(
-            root = root,
             pendingStore = pendingStore,
             installed = installed,
         ),
@@ -3475,10 +3455,7 @@ class ManagerRepositoryTest {
         }
     }
 
-    private fun systemRepositoryFixture(
-        name: String,
-        systemGateway: FakeSystemInstallerGateway = FakeSystemInstallerGateway(),
-    ): SystemRepositoryFixture {
+    private fun systemRepositoryFixture(name: String): SystemRepositoryFixture {
         val root = temporaryFolder.newFolder(name)
         val bundle = importedBundle(root)
         val retainedImports = RetainedImportStore(root) { _, _, _ ->
@@ -3498,10 +3475,8 @@ class ManagerRepositoryTest {
         )
         val handoffStore = InMemorySystemInstallHandoffStore()
         val systemCoordinator = systemInstallCoordinator(
-            root = root,
             pendingStore = pendingStore,
             installed = installed,
-            gateway = systemGateway,
             handoffStore = handoffStore,
         )
         val repository = managerRepository(
@@ -3521,7 +3496,6 @@ class ManagerRepositoryTest {
             retainedImports = retainedImports,
             legacyGateway = legacyGateway,
             legacyCoordinator = legacyCoordinator,
-            systemGateway = systemGateway,
             handoffStore = handoffStore,
             pendingStore = pendingStore,
             installed = installed,
@@ -3530,18 +3504,14 @@ class ManagerRepositoryTest {
     }
 
     private fun systemInstallCoordinator(
-        root: File,
         pendingStore: PendingInstallStore,
         installed: InstalledWrapperRepository,
-        gateway: SystemInstallerGateway = FakeSystemInstallerGateway(),
         handoffStore: SystemInstallHandoffStore = InMemorySystemInstallHandoffStore(),
     ) = SystemInstallCoordinator(
         policy = InstallPolicy(),
-        gateway = gateway,
         handoffStore = handoffStore,
         installedWrappers = installed,
         pendingStore = pendingStore,
-        retainedWrapperFile = { token -> File(root, token).resolve("wrapper.apk") },
         retainedWrapperSha256 = { sha256(it) },
     )
 
@@ -3754,36 +3724,11 @@ private data class SystemRepositoryFixture(
     val retainedImports: RetainedImportStore,
     val legacyGateway: StartupGateway,
     val legacyCoordinator: InstallCoordinator,
-    val systemGateway: FakeSystemInstallerGateway,
     val handoffStore: InMemorySystemInstallHandoffStore,
     val pendingStore: StartupPendingStore,
     val installed: FakeInstalledWrappers,
     val catalog: FakeCatalog,
 )
-
-private class FakeSystemInstallerGateway(
-    private val canInstallPackages: Boolean = true,
-    private val launchResult: SystemInstallerLaunchResult? = null,
-) : SystemInstallerGateway {
-    val revoked = mutableListOf<File>()
-    private val readyLaunchResult = SystemInstallerLaunchResult.Ready(
-        SystemInstallerLaunch(
-            uri = Uri.parse("content://dev.sixbridge.manager.install/import/wrapper.apk"),
-            intent = Intent(Intent.ACTION_VIEW),
-        ),
-    )
-
-    override fun canRequestPackageInstalls(): Boolean = canInstallPackages
-
-    override fun unknownSourcesSettingsIntent(): Intent = Intent()
-
-    override fun createLaunch(apk: File): SystemInstallerLaunchResult =
-        launchResult ?: readyLaunchResult
-
-    override fun revoke(apk: File) {
-        revoked += apk
-    }
-}
 
 private class InMemorySystemInstallHandoffStore : SystemInstallHandoffStore {
     private var record: PendingSystemInstall? = null

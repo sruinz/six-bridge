@@ -1,7 +1,6 @@
 package dev.sixbridge.manager.install
 
 import android.content.Intent
-import android.net.Uri
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
@@ -44,7 +43,6 @@ class SystemInstallCoordinatorTest {
                 fixture.handoffStore.snapshot(),
             ).value.stage,
         )
-        assertEquals(0, fixture.gateway.createLaunchCalls)
     }
 
     @Test
@@ -61,7 +59,6 @@ class SystemInstallCoordinatorTest {
             fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
         )
         assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-        assertEquals(0, fixture.gateway.createLaunchCalls)
     }
 
     @Test
@@ -198,7 +195,6 @@ class SystemInstallCoordinatorTest {
                 fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
             )
             assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-            assertEquals(0, fixture.gateway.createLaunchCalls)
         }
 
     @Test
@@ -217,17 +213,15 @@ class SystemInstallCoordinatorTest {
                 fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
             )
             assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-            assertEquals(0, fixture.gateway.createLaunchCalls)
         }
 
     @Test
     fun `unknown sources 권한과 무관하게 직접 installer 없이 내보내기를 준비한다`() = runTest {
-        val fixture = fixture(canRequestPackageInstalls = false)
+        val fixture = fixture()
 
         assertIs<SystemInstallRequestResult.ExportRequired>(
             fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
         )
-        assertEquals(0, fixture.gateway.createLaunchCalls)
     }
 
     @Test
@@ -269,8 +263,6 @@ class SystemInstallCoordinatorTest {
             ),
             fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
         )
-        assertEquals(0, fixture.gateway.createLaunchCalls)
-        assertTrue(fixture.gateway.revoked.isEmpty())
         assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
     }
 
@@ -288,7 +280,6 @@ class SystemInstallCoordinatorTest {
             assertIs<SystemInstallRequestResult.Failed>(
                 fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
             )
-            assertEquals(0, fixture.gateway.createLaunchCalls)
             assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
         }
 
@@ -325,7 +316,6 @@ class SystemInstallCoordinatorTest {
         assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
             fixture.handoffStore.snapshot(),
         )
-        assertTrue(fixture.gateway.revoked.isEmpty())
     }
 
     @Test
@@ -411,7 +401,6 @@ class SystemInstallCoordinatorTest {
             InstallCleanupResult.Cleaned,
             fixture.coordinator.cancel(TOKEN),
         )
-        assertTrue(fixture.gateway.revoked.isEmpty())
         assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
     }
 
@@ -466,16 +455,9 @@ class SystemInstallCoordinatorTest {
     private fun fixture(
         previous: InstalledWrapper? = null,
         actual: InstalledWrapper? = previous,
-        canRequestPackageInstalls: Boolean = true,
-        launchResult: SystemInstallerLaunchResult = readyLaunch(),
         events: MutableList<String> = mutableListOf(),
     ): Fixture {
         val bundle = importedBundle()
-        val gateway = FakeSystemInstallerGateway(
-            canRequest = canRequestPackageInstalls,
-            launchResult = launchResult,
-            events = events,
-        )
         val handoffStore = FakeSystemInstallHandoffStore(events)
         val pendingStore = FakePendingInstallStore(events)
         val installedWrappers = FakeInstalledWrapperRepository(
@@ -485,16 +467,13 @@ class SystemInstallCoordinatorTest {
         var now = NOW
         fun coordinator() = SystemInstallCoordinator(
             policy = InstallPolicy(),
-            gateway = gateway,
             handoffStore = handoffStore,
             installedWrappers = installedWrappers,
             pendingStore = pendingStore,
             clock = { now++ },
-            retainedWrapperFile = { bundle.wrapperFile },
         )
         return Fixture(
             bundle = bundle,
-            gateway = gateway,
             handoffStore = handoffStore,
             pendingStore = pendingStore,
             coordinator = coordinator(),
@@ -580,7 +559,6 @@ class SystemInstallCoordinatorTest {
 
     private data class Fixture(
         val bundle: ImportedBundle,
-        val gateway: FakeSystemInstallerGateway,
         val handoffStore: FakeSystemInstallHandoffStore,
         val pendingStore: FakePendingInstallStore,
         val coordinator: SystemInstallCoordinator,
@@ -591,36 +569,6 @@ class SystemInstallCoordinatorTest {
                 coordinator.request(bundle, partialConfirmed = true),
             )
             assertTrue(coordinator.markManualExportSucceeded(bundle.token))
-        }
-    }
-
-    private class FakeSystemInstallerGateway(
-        private val canRequest: Boolean,
-        private val launchResult: SystemInstallerLaunchResult,
-        private val events: MutableList<String>,
-    ) : SystemInstallerGateway {
-        var createLaunchCalls = 0
-        var revokeAttempts = 0
-        var revokeFailuresRemaining = 0
-        val revoked = mutableListOf<File>()
-
-        override fun canRequestPackageInstalls(): Boolean = canRequest
-
-        override fun unknownSourcesSettingsIntent(): Intent = Intent("settings")
-
-        override fun createLaunch(apk: File): SystemInstallerLaunchResult {
-            createLaunchCalls += 1
-            return launchResult
-        }
-
-        override fun revoke(apk: File) {
-            revokeAttempts += 1
-            if (revokeFailuresRemaining > 0) {
-                revokeFailuresRemaining -= 1
-                throw IllegalStateException("revoke failed")
-            }
-            events += "revoke"
-            revoked += apk
         }
     }
 
@@ -788,11 +736,5 @@ class SystemInstallCoordinatorTest {
         const val WRAPPER_SHA = "dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04"
         const val NOW = 123L
 
-        fun readyLaunch() = SystemInstallerLaunchResult.Ready(
-            SystemInstallerLaunch(
-                uri = Uri.parse("content://dev.sixbridge.manager.install/import/wrapper.apk"),
-                intent = Intent(Intent.ACTION_VIEW),
-            ),
-        )
     }
 }

@@ -1495,122 +1495,6 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `system installer launch 성공 뒤 foreground 복귀에서 설치 결과를 조정한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-                reconcileSystemInstallResult = InstallState.Installed(PACKAGE)
-                terminalOwnerProofConfigured = true
-                terminalOwnerImportToken = TOKEN
-                terminalOwnerPackageName = PACKAGE
-                terminalOwnerState = InstallState.Installed(PACKAGE)
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-
-            repository.emitLaunch(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                installImportToken = TOKEN,
-            )
-            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            assertEquals(TOKEN, effect.installImportToken)
-
-            viewModel.accept(ManagerAction.LaunchSucceeded(effect))
-            viewModel.accept(ManagerAction.ReturnedToForeground)
-            advanceUntilIdle()
-
-            assertEquals(listOf(TOKEN), repository.systemLaunchSucceededTokens)
-            assertEquals(1, repository.reconcileSystemInstallCalls)
-            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
-        }
-
-    @Test
-    fun `system installer effect token이 current review owner와 다르면 launch 결과를 무시한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            val unrelated = ManagerEffect.LaunchIntent(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                intentFactory = { error("unit test에서는 Intent를 만들지 않습니다.") },
-                installImportToken = SECOND_TOKEN,
-            )
-
-            viewModel.accept(ManagerAction.LaunchSucceeded(unrelated))
-            viewModel.accept(ManagerAction.LaunchFailed(unrelated))
-            advanceUntilIdle()
-
-            assertTrue(repository.systemLaunchSucceededTokens.isEmpty())
-            assertTrue(repository.systemLaunchFailedTokens.isEmpty())
-            assertNull(viewModel.state.value.message)
-        }
-
-    @Test
-    fun `system installer PREPARED와 initial resume은 설치 취소를 조정하지 않는다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.PreparingSystemInstaller
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-                reconcileSystemInstallResult = InstallState.Cancelled
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-
-            viewModel.accept(ManagerAction.ReturnedToForeground)
-            advanceUntilIdle()
-
-            assertEquals(0, repository.reconcileSystemInstallCalls)
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-            assertNull(viewModel.state.value.message)
-        }
-
-    @Test
-    fun `system installer launch 실패는 정확한 owner로 기록하고 전용 재시도 메시지를 표시한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            repository.emitLaunch(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                installImportToken = TOKEN,
-            )
-            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-
-            viewModel.accept(ManagerAction.LaunchFailed(effect))
-
-            assertEquals(listOf(TOKEN), repository.systemLaunchFailedTokens)
-            assertEquals("시스템 설치 화면을 열 수 없습니다.", viewModel.state.value.message?.text)
-            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
-        }
-
-    @Test
     fun `정규화 후 빈 export 버전은 wrapper version code로 파일명을 만든다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -2082,44 +1966,6 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `system launch 실패 RETRY는 저장한 factory와 token으로 현재 세대 effect를 새로 만든다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            repository.emitLaunch(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                installImportToken = TOKEN,
-            )
-            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-
-            viewModel.accept(ManagerAction.LaunchFailed(effect))
-            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
-            viewModel.accept(ManagerAction.RetryRecovery)
-            val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            assertFalse(effect === retried)
-            assertTrue(effect.intentFactory === retried.intentFactory)
-            assertEquals(TOKEN, retried.installImportToken)
-            assertNull(viewModel.state.value.message)
-
-            viewModel.accept(ManagerAction.LaunchFailed(retried))
-            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
-            viewModel.accept(ManagerAction.RetryRecovery)
-            val retriedAgain = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-            assertFalse(retried === retriedAgain)
-            assertTrue(retried.intentFactory === retriedAgain.intentFactory)
-            assertEquals(TOKEN, retriedAgain.installImportToken)
-        }
-
-    @Test
     fun `unknown sources launch 실패는 writing 또는 approval 진행 시 message와 RETRY를 지운다`() =
         runTest(dispatcher.scheduler) {
             for (progressed in listOf(
@@ -2158,48 +2004,33 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `terminal install은 settings와 confirmation launch recovery만 제거한다`() =
+    fun `terminal install은 settings launch recovery를 제거한다`() =
         runTest(dispatcher.scheduler) {
-            for (destination in listOf(
-                LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
-                LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-            )) {
-                val repository = FakeManagerRepository().apply {
-                    restoreResult = ManagerRestoreResult(
-                        review = review(ContractCompatibilityStatus.COMPATIBLE),
-                    )
-                }
-                val viewModel = ManagerViewModel(
-                    repository,
-                    SavedStateHandle(mapOf("review_token" to TOKEN)),
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
-                advanceUntilIdle()
-                val effect = if (destination == LaunchDestination.UNKNOWN_SOURCES_SETTINGS) {
-                    repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
-                    advanceUntilIdle()
-                    assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-                } else {
-                    repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-                    repository.emitLaunch(
-                        destination = destination,
-                        installImportToken = TOKEN,
-                    )
-                    advanceUntilIdle()
-                    assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
-                }
-                viewModel.accept(ManagerAction.LaunchFailed(effect))
-
-                repository.installFlow.value = InstallState.Cancelled
-                advanceUntilIdle()
-                assertEquals(UserMessageKind.INSTALL_CANCELLED, viewModel.state.value.message?.kind)
-                val effects = mutableListOf<ManagerEffect>()
-                val collector = launch { viewModel.effects.collect(effects::add) }
-                dispatcher.scheduler.runCurrent()
-                viewModel.accept(ManagerAction.RetryRecovery)
-                dispatcher.scheduler.runCurrent()
-                assertTrue(effects.isEmpty())
-                collector.cancel()
             }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf("review_token" to TOKEN)),
+            )
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.UnknownSourcesPermissionRequired
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(effect))
+
+            repository.installFlow.value = InstallState.Cancelled
+            advanceUntilIdle()
+            assertEquals(UserMessageKind.INSTALL_CANCELLED, viewModel.state.value.message?.kind)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.RetryRecovery)
+            dispatcher.scheduler.runCurrent()
+            assertTrue(effects.isEmpty())
+            collector.cancel()
         }
 
     @Test
@@ -2980,68 +2811,6 @@ class ManagerViewModelTest {
 
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
             assertNull(viewModel.state.value.message)
-        }
-
-    @Test
-    fun `구독자보다 먼저 발생한 Add-ons와 confirmation effect를 각각 한 번 전달한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-
-            viewModel.accept(ManagerAction.OpenSamsungAddOns)
-            repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-            repository.emitLaunch(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                installImportToken = TOKEN,
-            )
-            advanceUntilIdle()
-
-            assertEquals(
-                LaunchDestination.SAMSUNG_ADD_ONS,
-                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
-            )
-            assertEquals(
-                LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
-            )
-        }
-
-    @Test
-    fun `terminal 상태가 된 뒤 구독하면 stale install confirmation을 건너뛴다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-
-            repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
-            repository.emitLaunch(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                installImportToken = TOKEN,
-            )
-            advanceUntilIdle()
-            repository.installFlow.value = InstallState.Cancelled
-            viewModel.accept(ManagerAction.OpenSamsungAddOns)
-            advanceUntilIdle()
-
-            assertEquals(
-                LaunchDestination.SAMSUNG_ADD_ONS,
-                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
-            )
         }
 
     @Test
@@ -5622,7 +5391,7 @@ class ManagerViewModelTest {
 
                 repository.installFlow.value = InstallState.AwaitingUserApproval(99)
                 repository.emitLaunch(
-                    LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                    LaunchDestination.UNKNOWN_SOURCES_SETTINGS,
                     installSessionId = 99,
                 )
                 advanceUntilIdle()
@@ -9136,10 +8905,6 @@ private class FakeManagerRepository : ManagerRepository {
     var lastPartialConfirmed = false
     var resumeRequests = 0
     var reconcileRequests = 0
-    val systemLaunchSucceededTokens = mutableListOf<String>()
-    val systemLaunchFailedTokens = mutableListOf<String>()
-    var reconcileSystemInstallCalls = 0
-    var reconcileSystemInstallResult: InstallState? = null
     var installApkExport: InstallApkExport? = null
     val installApkExportedTokens = mutableListOf<String>()
     var reconcileManualCalls = 0
@@ -9389,23 +9154,6 @@ private class FakeManagerRepository : ManagerRepository {
             return installResult
         } finally {
             lifecycleEvents += "install:end"
-        }
-    }
-
-    override fun markSystemInstallLaunchSucceeded(importToken: String): Boolean {
-        systemLaunchSucceededTokens += importToken
-        return true
-    }
-
-    override fun markSystemInstallLaunchFailed(importToken: String): Boolean {
-        systemLaunchFailedTokens += importToken
-        return true
-    }
-
-    override suspend fun reconcileSystemInstallAfterReturn(): InstallState? {
-        reconcileSystemInstallCalls += 1
-        return reconcileSystemInstallResult?.also {
-            installFlow.value = it
         }
     }
 
@@ -9691,14 +9439,12 @@ private class FakeManagerRepository : ManagerRepository {
     fun emitLaunch(
         destination: LaunchDestination,
         installSessionId: Int? = null,
-        installImportToken: String? = null,
     ) {
         launchChannel.trySend(
             RepositoryLaunch(
                 destination = destination,
                 intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
                 installSessionId = installSessionId,
-                installImportToken = installImportToken,
             ),
         )
     }

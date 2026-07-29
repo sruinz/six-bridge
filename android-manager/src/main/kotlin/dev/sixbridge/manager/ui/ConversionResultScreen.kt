@@ -120,9 +120,7 @@ private fun resultRecoveryAction(message: UserMessage): ManagerAction? {
 
 private fun dev.sixbridge.manager.install.InstallState.isActiveInstall(): Boolean =
         this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||
-        this == dev.sixbridge.manager.install.InstallState.PreparingSystemInstaller ||
         this is dev.sixbridge.manager.install.InstallState.PreparingApkExport ||
-        this is dev.sixbridge.manager.install.InstallState.AwaitingSystemInstaller ||
         this is dev.sixbridge.manager.install.InstallState.AwaitingManualInstall ||
         this is dev.sixbridge.manager.install.InstallState.Failed &&
         code in setOf(

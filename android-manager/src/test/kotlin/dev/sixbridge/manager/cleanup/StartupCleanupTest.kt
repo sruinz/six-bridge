@@ -220,59 +220,56 @@ class StartupCleanupTest {
         }
 
     @Test
-    fun `startup cleanup은 신규 handoff를 보존하면서 legacy pending과 session만 정리한다`() =
+    fun `legacy PREPARED와 LAUNCHED는 import를 보존하고 record만 CAS 정리한다`() =
         runBlocking {
             listOf(
                 SystemInstallStage.PREPARED,
                 SystemInstallStage.LAUNCHED,
-                SystemInstallStage.EXPORTED,
             ).forEach { stage ->
-                val handoff = PendingSystemInstall(
-                    importToken = HANDOFF_TOKEN,
-                    expected = ExpectedInstalledWrapper(
-                        packageName = PACKAGE_NAME,
-                        extensionId = EXTENSION_ID,
-                        versionCode = 2,
-                        signerSha256 = "a".repeat(64),
-                    ),
-                    wrapperSha256 = "b".repeat(64),
-                    previous = null,
-                    startedAtEpochMillis = now,
-                    stage = stage,
-                )
+                val handoff = systemInstallHandoff(stage)
                 val handoffStore = FakeSystemInstallHandoffStore(handoff)
                 val handoffImport = tokenDirectory(HANDOFF_TOKEN, now - DAY_MILLIS - 1)
-                val legacyPending = pending(
-                    sessionId = 41,
-                    startedAt = now - DAY_MILLIS - 1,
-                )
-                val legacyImport = tokenDirectory(
-                    legacyPending.importToken,
-                    now - DAY_MILLIS - 1,
-                )
-                val pendingStore = FakePendingStore(
-                    record = legacyPending,
-                    missingObservedAt = now - DAY_MILLIS - 1,
-                )
-                val gateway = FakeGateway(owned = mutableListOf(77))
 
-                cleanup(
-                    gateway = gateway,
-                    store = pendingStore,
-                    systemInstallStore = handoffStore,
-                ).run()
+                cleanup(systemInstallStore = handoffStore).run()
 
                 assertTrue(handoffImport.exists())
-                assertEquals(
-                    RecoveryRecordSnapshot.Present(handoff),
-                    handoffStore.snapshot(),
-                )
-                assertEquals(0, handoffStore.mutationCalls)
-                assertNull(pendingStore.record)
-                assertFalse(legacyImport.exists())
-                assertEquals(listOf(77), gateway.abandoned)
+                assertEquals(RecoveryRecordSnapshot.Absent, handoffStore.snapshot())
+                assertEquals(1, handoffStore.mutationCalls)
                 handoffImport.deleteRecursively()
             }
+        }
+
+    @Test
+    fun `legacy EXPORTED는 수동 설치 확인을 위해 record와 import를 보존한다`() =
+        runBlocking {
+            val handoff = systemInstallHandoff(SystemInstallStage.EXPORTED)
+            val handoffStore = FakeSystemInstallHandoffStore(handoff)
+            val handoffImport = tokenDirectory(HANDOFF_TOKEN, now - DAY_MILLIS - 1)
+
+            cleanup(systemInstallStore = handoffStore).run()
+
+            assertTrue(handoffImport.exists())
+            assertEquals(
+                RecoveryRecordSnapshot.Present(handoff),
+                handoffStore.snapshot(),
+            )
+            assertEquals(0, handoffStore.mutationCalls)
+        }
+
+    @Test
+    fun `손상된 system handoff marker가 있으면 startup cleanup은 아무 소유권도 정리하지 않는다`() =
+        runBlocking {
+            val expired = tokenDirectory(EXPIRED_TOKEN, now - DAY_MILLIS - 1)
+            val gateway = FakeGateway(owned = mutableListOf(41))
+            val handoffStore = FakeSystemInstallHandoffStore(
+                snapshotOverride = RecoveryRecordSnapshot.Invalid,
+            )
+
+            cleanup(gateway = gateway, systemInstallStore = handoffStore).run()
+
+            assertTrue(expired.exists())
+            assertTrue(gateway.abandoned.isEmpty())
+            assertEquals(0, handoffStore.mutationCalls)
         }
 
     @Test
@@ -447,6 +444,20 @@ class StartupCleanupTest {
         startedAtEpochMillis = startedAt,
     )
 
+    private fun systemInstallHandoff(stage: SystemInstallStage) = PendingSystemInstall(
+        importToken = HANDOFF_TOKEN,
+        expected = ExpectedInstalledWrapper(
+            packageName = PACKAGE_NAME,
+            extensionId = EXTENSION_ID,
+            versionCode = 2,
+            signerSha256 = "a".repeat(64),
+        ),
+        wrapperSha256 = "b".repeat(64),
+        previous = null,
+        startedAtEpochMillis = now,
+        stage = stage,
+    )
+
     private class FakeGateway(
         val owned: MutableList<Int> = mutableListOf(),
         var ownedFailure: Throwable? = null,
@@ -541,12 +552,15 @@ class StartupCleanupTest {
     }
 
     private class FakeSystemInstallHandoffStore(
-        private val record: PendingSystemInstall? = null,
+        private var record: PendingSystemInstall? = null,
+        private val snapshotOverride: RecoveryRecordSnapshot<PendingSystemInstall>? = null,
     ) : SystemInstallHandoffStore {
         var mutationCalls = 0
 
         override fun snapshot(): RecoveryRecordSnapshot<PendingSystemInstall> =
-            record?.let { RecoveryRecordSnapshot.Present(it) } ?: RecoveryRecordSnapshot.Absent
+            snapshotOverride
+                ?: record?.let { RecoveryRecordSnapshot.Present(it) }
+                ?: RecoveryRecordSnapshot.Absent
 
         override fun tryPrepare(record: PendingSystemInstall): Boolean {
             mutationCalls += 1
@@ -565,7 +579,9 @@ class StartupCleanupTest {
 
         override fun clear(expected: PendingSystemInstall): Boolean {
             mutationCalls += 1
-            return false
+            if (record != expected) return false
+            record = null
+            return true
         }
     }
 

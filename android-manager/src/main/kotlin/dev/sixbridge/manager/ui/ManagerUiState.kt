@@ -284,7 +284,6 @@ enum class LaunchDestination {
     UNINSTALL,
     SAMSUNG_ADD_ONS,
     SAMSUNG_MY_FILES,
-    SYSTEM_INSTALL_CONFIRMATION,
 }
 
 sealed interface ManagerEffect {
@@ -377,7 +376,6 @@ sealed interface ManagerEffect {
         val destination: LaunchDestination,
         val intentFactory: () -> Intent,
         val installSessionId: Int? = null,
-        val installImportToken: String? = null,
         val ownerGeneration: Long? = null,
     ) : ManagerEffect {
         constructor(
@@ -387,7 +385,6 @@ sealed interface ManagerEffect {
             launch.destination,
             launch.intentFactory,
             launch.installSessionId,
-            launch.installImportToken,
             ownerGeneration,
         )
     }

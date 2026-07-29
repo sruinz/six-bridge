@@ -199,9 +199,7 @@ internal fun ManualInstallHandoff(
 @Composable
 private fun InstallProgress(installState: InstallState) {
     val label = when (installState) {
-        InstallState.PreparingSystemInstaller -> R.string.install_preparing_system
         is InstallState.PreparingApkExport -> R.string.install_preparing_system
-        is InstallState.AwaitingSystemInstaller -> R.string.install_awaiting_system
         is InstallState.AwaitingManualInstall -> return
         InstallState.UnknownSourcesPermissionRequired -> R.string.install_unknown_sources
         else -> return

@@ -2,9 +2,7 @@ package dev.sixbridge.manager.install
 
 sealed interface InstallState {
     data object Idle : InstallState
-    data object PreparingSystemInstaller : InstallState
     data class PreparingApkExport(val importToken: String) : InstallState
-    data class AwaitingSystemInstaller(val importToken: String) : InstallState
     data class AwaitingManualInstall(val importToken: String) : InstallState
     data object UnknownSourcesPermissionRequired : InstallState
     data class WritingSession(val sessionId: Int) : InstallState

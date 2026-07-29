@@ -20,16 +20,6 @@ sealed interface SystemInstallRequestResult {
         val state: InstallState.PreparingApkExport,
     ) : SystemInstallRequestResult
 
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    data class Launch(
-        val state: InstallState.AwaitingSystemInstaller,
-        val launch: SystemInstallerLaunch,
-    ) : SystemInstallRequestResult
-
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    data object UnknownSourcesPermissionRequired : SystemInstallRequestResult
-    @Deprecated("ExportRequired를 사용합니다.")
-    data object MyFilesFallbackRequired : SystemInstallRequestResult
     data class Failed(val state: InstallState.Failed) : SystemInstallRequestResult
 }
 
@@ -49,27 +39,6 @@ class SystemInstallCoordinator(
         withContext(Dispatchers.IO) { sha256(file) }
     },
 ) {
-    @Suppress("UNUSED_PARAMETER")
-    constructor(
-        policy: InstallPolicy,
-        gateway: SystemInstallerGateway,
-        handoffStore: SystemInstallHandoffStore,
-        installedWrappers: InstalledWrapperRepository,
-        pendingStore: PendingInstallStore,
-        retainedWrapperFile: (String) -> File,
-        clock: () -> Long = System::currentTimeMillis,
-        retainedWrapperSha256: suspend (File) -> String = { file ->
-            withContext(Dispatchers.IO) { sha256(file) }
-        },
-    ) : this(
-        policy = policy,
-        handoffStore = handoffStore,
-        installedWrappers = installedWrappers,
-        pendingStore = pendingStore,
-        clock = clock,
-        retainedWrapperSha256 = retainedWrapperSha256,
-    )
-
     private val mutex = Mutex()
     private val mutableState = MutableStateFlow(restoreState())
 
@@ -196,16 +165,6 @@ class SystemInstallCoordinator(
         val preparing = InstallState.PreparingApkExport(bundle.token)
         mutableState.value = preparing
         SystemInstallRequestResult.ExportRequired(preparing)
-    }
-
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    fun markLaunchSucceeded(importToken: String): Boolean {
-        return false
-    }
-
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    fun markLaunchFailed(importToken: String): Boolean {
-        return false
     }
 
     fun markManualExportSucceeded(importToken: String): Boolean {
@@ -387,8 +346,7 @@ class SystemInstallCoordinator(
         return when (val handoff = handoffStore.snapshot()) {
             is RecoveryRecordSnapshot.Present ->
                 when (handoff.value.stage) {
-                    SystemInstallStage.LAUNCHED ->
-                        InstallState.AwaitingSystemInstaller(handoff.value.importToken)
+                    SystemInstallStage.LAUNCHED -> InstallState.Idle
                     SystemInstallStage.EXPORTED ->
                         InstallState.AwaitingManualInstall(handoff.value.importToken)
                     SystemInstallStage.PREPARED ->

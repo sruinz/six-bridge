@@ -6,6 +6,7 @@ import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.SystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallStage
 import java.io.File
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
@@ -57,7 +58,15 @@ class StartupCleanup(
             val snapshot = systemInstallHandoffStore?.snapshot()
                 ?: RecoveryRecordSnapshot.Absent
         ) {
-            is RecoveryRecordSnapshot.Present -> snapshot.value
+            is RecoveryRecordSnapshot.Present -> when (snapshot.value.stage) {
+                SystemInstallStage.PREPARED,
+                SystemInstallStage.LAUNCHED,
+                -> {
+                    if (systemInstallHandoffStore?.clear(snapshot.value) != true) return
+                    snapshot.value
+                }
+                SystemInstallStage.EXPORTED -> snapshot.value
+            }
             RecoveryRecordSnapshot.Absent -> null
             RecoveryRecordSnapshot.Invalid -> return
         }

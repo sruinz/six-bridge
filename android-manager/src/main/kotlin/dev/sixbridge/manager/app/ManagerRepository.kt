@@ -160,7 +160,6 @@ class RepositoryLaunch(
     val destination: LaunchDestination,
     val intentFactory: () -> Intent,
     val installSessionId: Int? = null,
-    val installImportToken: String? = null,
 )
 
 sealed interface RepositoryNavigationResult {
@@ -200,10 +199,6 @@ interface ManagerRepository {
     ): InstallApkExport? = null
     fun markInstallApkExported(importToken: String): Boolean = false
     suspend fun reconcileManualInstall(importToken: String): InstallState? = null
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    fun markSystemInstallLaunchSucceeded(importToken: String): Boolean = false
-    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
-    fun markSystemInstallLaunchFailed(importToken: String): Boolean = false
     @Deprecated("installApkExport를 사용합니다.")
     suspend fun systemInstallApkFallback(
         importToken: String,
@@ -211,8 +206,6 @@ interface ManagerRepository {
     @Deprecated("markInstallApkExported를 사용합니다.")
     fun markSystemInstallApkExported(importToken: String): Boolean =
         markInstallApkExported(importToken)
-    @Deprecated("foreground 복귀로 설치를 확정하지 않습니다.")
-    suspend fun reconcileSystemInstallAfterReturn(): InstallState? = null
     @Deprecated("reconcileManualInstall을 사용합니다.")
     suspend fun reconcileManualSystemInstall(importToken: String): InstallState? =
         reconcileManualInstall(importToken)
@@ -462,22 +455,6 @@ internal class DefaultManagerRepository(
             val result = systemInstallCoordinator.request(bundle, partialConfirmed)
         ) {
             is SystemInstallRequestResult.ExportRequired -> result.state
-            is SystemInstallRequestResult.Launch -> {
-                launchChannel.send(
-                    RepositoryLaunch(
-                        destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                        intentFactory = { result.launch.intent },
-                        installImportToken = result.state.importToken,
-                    ),
-                )
-                result.state
-            }
-            SystemInstallRequestResult.UnknownSourcesPermissionRequired -> {
-                InstallState.UnknownSourcesPermissionRequired
-            }
-            SystemInstallRequestResult.MyFilesFallbackRequired -> {
-                InstallState.PreparingSystemInstaller
-            }
             is SystemInstallRequestResult.Failed -> {
                 result.state
             }
@@ -485,12 +462,6 @@ internal class DefaultManagerRepository(
         afterInstallRequest(requestState)
         return requestState
     }
-
-    override fun markSystemInstallLaunchSucceeded(importToken: String): Boolean =
-        systemInstallCoordinator.markLaunchSucceeded(importToken)
-
-    override fun markSystemInstallLaunchFailed(importToken: String): Boolean =
-        systemInstallCoordinator.markLaunchFailed(importToken)
 
     override suspend fun installApkExport(
         importToken: String,
