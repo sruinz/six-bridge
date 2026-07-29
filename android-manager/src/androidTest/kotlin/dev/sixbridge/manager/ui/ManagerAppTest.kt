@@ -492,7 +492,7 @@ class ManagerAppTest {
     }
 
     @Test
-    fun pending_review_initialize_failure_home_retry_completes_exact_report() {
+    fun pending_review_initialize_failure_blocks_startup_and_preserves_owners() {
         val initial = conversionResultState()
         val ready = initial.conversionState as ConversionUiState.ResultReady
         val review = requireNotNull(ready.review)
@@ -502,7 +502,8 @@ class ManagerAppTest {
             review = review,
             generated = ready.generated,
         )
-        val viewModel = ManagerViewModel(repository, cleanupRestoreSavedState())
+        val savedState = cleanupRestoreSavedState()
+        val viewModel = ManagerViewModel(repository, savedState)
         composeRule.setContent {
             SixBridgeManagerApp(
                 viewModel = viewModel,
@@ -517,17 +518,27 @@ class ManagerAppTest {
             )
         }
         composeRule.waitUntil(timeoutMillis = 5_000) {
-            viewModel.state.value.message?.kind ==
-                UserMessageKind.CONVERSION_CLEANUP_FAILED
-        }
-        composeRule.onNodeWithText("다시 확인").assertIsDisplayed().performClick()
-        composeRule.waitUntil(timeoutMillis = 5_000) {
-            viewModel.state.value.route == ManagerRoute.Report(PACKAGE)
+            viewModel.state.value.startupRecoveryState ==
+                StartupRecoveryUiState.RECOVERY_BLOCKED
         }
         composeRule.runOnIdle {
-            assertEquals(listOf(TOKEN), repository.discardedReviews)
-            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(
+                UserMessageKind.RECOVERY_BLOCKED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY),
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY),
+            )
+            assertEquals(emptyList<String>(), repository.discardedReviews)
+            assertEquals(emptyList<String>(), repository.discardedConversions)
         }
+        composeRule.onNodeWithText("다시 확인").assertDoesNotExist()
     }
 
     @Test
