@@ -16,6 +16,7 @@
         </intent>
 
         <package android:name="com.sec.android.app.sbrowser" />
+        <package android:name="com.google.android.packageinstaller" />
 
         <intent>
             <action android:name="android.intent.action.VIEW" />
@@ -53,6 +54,15 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/generated_bundle_paths" />
+        </provider>
+        <provider
+            android:name=".install.InstallHandoffFileProvider"
+            android:authorities="${applicationId}.install"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/install_handoff_paths" />
         </provider>
     </application>
 
