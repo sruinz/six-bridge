@@ -180,8 +180,13 @@ OWNER
   logcat)
     if [ "${ADB_LOG_MARKER:-present}" = present ] &&
         [ -f "$SIXBRIDGE_TEST_MARKER_FILE" ]; then
-      printf '1722225600.123 1 1 I SixBridgeMyFilesGate: %s\n' \
-        "$(<"$SIXBRIDGE_TEST_MARKER_FILE")"
+      if [ "${ADB_LOG_MARKER_FORMAT:-compact}" = padded ]; then
+        printf '         1722225600.123 13001 13001 I SixBridgeMyFilesGate: %s\n' \
+          "$(<"$SIXBRIDGE_TEST_MARKER_FILE")"
+      else
+        printf '1722225600.123 1 1 I SixBridgeMyFilesGate: %s\n' \
+          "$(<"$SIXBRIDGE_TEST_MARKER_FILE")"
+      fi
     fi
     if [ "${ADB_SAMSUNG_LOGS:-complete}" = complete ]; then
       if [ "${ADB_LOG_TARGET:-target}" = target ]; then
@@ -469,6 +474,17 @@ test_saved_marker_boundary_survives_logcat_rollover() {
         '저장된 marker 경계 post 성공 요약이 없습니다.'
 }
 
+test_saved_marker_boundary_accepts_logcat_padding() {
+    local output="${FIXTURE_ROOT}/marker-padding.log"
+    run_pre ADB_LOG_MARKER_FORMAT=padded >/dev/null
+    if ! run_post ADB_LOG_MARKER=missing >"$output" 2>&1; then
+        cat "$output" >&2
+        fail '공백이 있는 저장 marker의 rollover post가 거부됐습니다.'
+    fi
+    assert_contains "$output" 'wrapperByteIdentity=matched' \
+        '공백이 있는 저장 marker post 성공 요약이 없습니다.'
+}
+
 test_saved_marker_evidence_is_fail_closed() {
     local pointer run_dir marker original epoch nonce
     pointer=$(current_pointer)
@@ -511,6 +527,18 @@ test_saved_marker_evidence_is_fail_closed() {
     expect_exit_3 \
         '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
         marker-extra-record run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s unexpected-field\n' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-extra-field run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s \n' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-trailing-space run_post ADB_LOG_MARKER=missing
 
     printf '%s 1 1 I SixBridgeMyFilesGate: %s\r\n' \
         "$epoch" "$nonce" >"$marker"
@@ -738,11 +766,13 @@ main() {
             ;;
         marker-boundary)
             test_saved_marker_boundary_survives_logcat_rollover
+            test_saved_marker_boundary_accepts_logcat_padding
             test_saved_marker_evidence_is_fail_closed
             test_target_logs_before_marker_are_rejected
             ;;
         marker-rollover)
             test_saved_marker_boundary_survives_logcat_rollover
+            test_saved_marker_boundary_accepts_logcat_padding
             ;;
         marker-validation)
             test_saved_marker_evidence_is_fail_closed
@@ -760,6 +790,7 @@ main() {
             test_fresh_target_with_unrelated_logs_is_rejected
             test_target_logs_before_marker_are_rejected
             test_saved_marker_boundary_survives_logcat_rollover
+            test_saved_marker_boundary_accepts_logcat_padding
             test_saved_marker_evidence_is_fail_closed
             test_fresh_target_with_target_bound_logs_succeeds
             test_failed_pre_preserves_previous_pointer

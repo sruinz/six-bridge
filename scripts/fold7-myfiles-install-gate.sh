@@ -751,7 +751,8 @@ capture_samsung_logs() {
         ! rg -a -q '\r|\x00' "$marker_file" &&
         awk -v epoch="$marker_epoch" -v nonce="$nonce" '
           NR == 1 &&
-          $0 == epoch " " $2 " " $3 " I SixBridgeMyFilesGate: " nonce &&
+          NF == 6 &&
+          $0 !~ /[[:space:]]$/ &&
           $1 == epoch &&
           $2 ~ /^[0-9]+$/ &&
           $3 ~ /^[0-9]+$/ &&

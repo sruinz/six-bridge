@@ -126,7 +126,8 @@ APK와 My Files origin이 있어도 합격하지 않는다.
 직후 같은 logcat에서 캡처한 `pre-log-marker.txt`는 symlink가 아닌 일반 파일의
 LF-종결 단일 `logcat -v epoch` record여야 한다. CR, NUL, 추가 record 또는
 추가 byte를 거부하고, record 전체의 sub-second epoch·decimal PID/TID·`I`·tag·
-baseline nonce가 정확히 일치해야 한다. `post` 시점 ring buffer에서 marker
+baseline nonce가 정확히 일치해야 한다. 실제 logcat의 선행·필드 사이 가변
+space는 허용하지만 trailing whitespace는 허용하지 않는다. `post` 시점 ring buffer에서 marker
 줄이 rollover됐더라도 이 저장 증거를 경계로 사용하며, 현재 로그의 timestamp가
 `preLogEpoch`보다 큰지 검사한다. 첫 줄은 정확한 target package, 둘째 줄은
 정확한 extension ID를 포함해야 하므로 다른 확장의 일반적인 성공 로그로
