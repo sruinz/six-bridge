@@ -209,6 +209,102 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `conversion restore suspend 중 도착한 exact generated terminal은 READY 전에 reconcile한다`() =
+        runTest(dispatcher.scheduler) {
+            val conversionResult = CompletableDeferred<RestoredConversion?>()
+            val installed = InstallState.Installed(PACKAGE)
+            val savedState = generatedInstallSavedState(emptyMap())
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                )
+                restoreConversionDeferred = conversionResult
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = installed
+                terminalOwnerProofConfigured = true
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.restoreConversionRequests)
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+
+            repository.installFlow.value = installed
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            conversionResult.complete(
+                RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(savedState))
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `recovery blocked 보고서 왕복은 고정 메시지를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(
+                UserMessageKind.RECOVERY_BLOCKED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                "저장된 설치 복구 정보를 읽을 수 없어 복구 자료를 보존했습니다. " +
+                    "앱을 업데이트한 뒤 다시 확인해 주세요.",
+                viewModel.state.value.message?.text,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(
+                UserMessageKind.RECOVERY_BLOCKED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(
+                "저장된 설치 복구 정보를 읽을 수 없어 복구 자료를 보존했습니다. " +
+                    "앱을 업데이트한 뒤 다시 확인해 주세요.",
+                viewModel.state.value.message?.text,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
     fun `설치 목록의 보고서만 열고 홈으로 돌아온다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository().apply {
             catalogFlow.tryEmit(listOf(catalogRecord()))

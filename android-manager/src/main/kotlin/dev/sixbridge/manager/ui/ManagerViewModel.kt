@@ -1192,10 +1192,11 @@ class ManagerViewModel(
                 markStartupRecoveryReady()
                 return@launch
             }
-            val deferredTerminal = deferredInitialTerminal
+            var deferredTerminal = deferredInitialTerminal
             deferredInitialTerminal = null
             if (restored.review == null && deferredTerminal != null) {
-                applyObservedInstallTerminal(deferredTerminal)
+                reconcileDeferredInitialTerminals(deferredTerminal)
+                deferredTerminal = null
             }
             if (restored.review == null ||
                 generatedInstallOwnerToken != null ||
@@ -1229,16 +1230,15 @@ class ManagerViewModel(
                 if (ready?.token != generatedOwner || restored.review == null) {
                     clearGeneratedInstallOwner()
                     restored.review?.let(::showReview)
-                } else if (deferredTerminal != null) {
-                    applyObservedInstallTerminal(deferredTerminal)
+                } else {
+                    reconcileDeferredInitialTerminals(deferredTerminal)
                 }
             }
-            if (deferredTerminal != null &&
-                generatedInstallOwnerToken == null &&
+            if (generatedInstallOwnerToken == null &&
                 resultOwner == null &&
                 restored.review != null
             ) {
-                applyObservedInstallTerminal(deferredTerminal)
+                reconcileDeferredInitialTerminals(deferredTerminal)
             }
             pendingGeneratedTerminalHandoff?.let { handoff ->
                 if (!resumeGeneratedTerminalHandoff(handoff, restored.terminal)) {
@@ -1270,6 +1270,18 @@ class ManagerViewModel(
                 }
             }
             markStartupRecoveryReady()
+        }
+    }
+
+    private suspend fun reconcileDeferredInitialTerminals(
+        initialTerminal: InstallState?,
+    ) {
+        var terminal = deferredInitialTerminal ?: initialTerminal
+        deferredInitialTerminal = null
+        while (terminal != null) {
+            applyObservedInstallTerminal(terminal)
+            terminal = deferredInitialTerminal
+            deferredInitialTerminal = null
         }
     }
 
@@ -1657,7 +1669,18 @@ class ManagerViewModel(
 
     private fun openReport(packageName: String) {
         if (mutableState.value.installed.none { it.packageName == packageName }) return
-        mutableState.update { it.copy(route = ManagerRoute.Report(packageName), message = null) }
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.Report(packageName),
+                message = if (
+                    it.startupRecoveryState == StartupRecoveryUiState.RECOVERY_BLOCKED
+                ) {
+                    it.message
+                } else {
+                    null
+                },
+            )
+        }
     }
 
     private fun openUnknownSourcesSettings() {
