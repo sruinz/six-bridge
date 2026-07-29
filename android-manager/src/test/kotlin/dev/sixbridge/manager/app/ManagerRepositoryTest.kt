@@ -264,8 +264,26 @@ class ManagerRepositoryTest {
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
 
             val result = fixture.repository.install(review, partialConfirmed = true)
+            val recreatedSystemCoordinator = systemInstallCoordinator(
+                root = fixture.root,
+                pendingStore = fixture.pendingStore,
+                installed = fixture.installed,
+                gateway = fixture.systemGateway,
+                handoffStore = fixture.handoffStore,
+            )
+            val recreated = managerRepository(
+                root = fixture.root,
+                retainedImports = fixture.retainedImports,
+                gateway = fixture.legacyGateway,
+                pendingStore = fixture.pendingStore,
+                installed = fixture.installed,
+                catalog = fixture.catalog,
+                coordinator = fixture.legacyCoordinator,
+                systemCoordinator = recreatedSystemCoordinator,
+                systemInstallStore = fixture.handoffStore,
+            )
             val fallback = assertNotNull(
-                fixture.repository.systemInstallApkFallback(TOKEN),
+                recreated.systemInstallApkFallback(TOKEN),
             )
 
             assertEquals(InstallState.PreparingSystemInstaller, result)
@@ -273,7 +291,7 @@ class ManagerRepositoryTest {
             assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), fallback.source)
             assertEquals(sha256(fallback.source), fallback.expectedSha256)
             assertEquals("Example", fallback.extensionName)
-            assertNull(fixture.repository.systemInstallApkFallback("other"))
+            assertNull(recreated.systemInstallApkFallback("other"))
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
         }

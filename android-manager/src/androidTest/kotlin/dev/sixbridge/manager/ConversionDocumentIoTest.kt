@@ -12,6 +12,7 @@ import dev.sixbridge.manager.conversion.GeneratedBundleStore
 import dev.sixbridge.manager.conversion.GeneratedBundleStoreHooks
 import dev.sixbridge.manager.conversion.GeneratedWrapperVerifier
 import dev.sixbridge.manager.packager.OnDeviceWrapperResult
+import dev.sixbridge.manager.ui.ManagerEffect
 import java.io.File
 import java.io.IOException
 import java.io.OutputStream
@@ -21,6 +22,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,7 +33,10 @@ import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class ConversionDocumentIoTest {
@@ -319,6 +324,76 @@ class ConversionDocumentIoTest {
     }
 
     @Test
+    fun system_install_copy_handoff_survives_recreation_until_exact_completion_ack() =
+        runBlocking {
+            val effect = ManagerEffect.CreateSystemInstallApkDocument(
+                importToken = TOKEN,
+                source = File("/retained/$TOKEN/wrapper.apk"),
+                expectedSha256 = "a".repeat(64),
+                suggestedFileName = "smart-context-wrapper.apk",
+            )
+            val destination = uri("system-install-recreated")
+            val source = SystemInstallApkDocumentHandoff().apply {
+                begin(effect)
+                selectDestination(destination)
+            }
+            val saved = Bundle().also(source::save)
+            val recreated = SystemInstallApkDocumentHandoff.restore(saved)
+
+            val completion = recreated.prepareCompletion {
+                GeneratedDocumentSaveResult.Success
+            }
+            assertNotNull(completion)
+            val exactCompletion = requireNotNull(completion)
+
+            assertEquals(effect, recreated.pending?.effect)
+            assertEquals(destination, recreated.pending?.destination)
+            assertEquals(TOKEN, exactCompletion.action.importToken)
+            assertEquals(destination, exactCompletion.action.uri)
+            assertTrue(recreated.acknowledge(exactCompletion))
+            assertNull(recreated.pending)
+        }
+
+    @Test
+    fun system_install_copy_cancellation_preserves_exact_resume_and_stale_completion_is_rejected() =
+        runBlocking {
+            val first = ManagerEffect.CreateSystemInstallApkDocument(
+                importToken = TOKEN,
+                source = File("/retained/$TOKEN/wrapper.apk"),
+                expectedSha256 = "a".repeat(64),
+                suggestedFileName = "first-wrapper.apk",
+            )
+            val second = first.copy(
+                importToken = SECOND_TOKEN,
+                source = File("/retained/$SECOND_TOKEN/wrapper.apk"),
+                expectedSha256 = "b".repeat(64),
+                suggestedFileName = "second-wrapper.apk",
+            )
+            val handoff = SystemInstallApkDocumentHandoff().apply {
+                begin(first)
+                selectDestination(uri("system-install-cancelled"))
+            }
+
+            try {
+                handoff.prepareCompletion { throw CancellationException("rotation") }
+                fail("copy cancellation이 전달되어야 합니다.")
+            } catch (_: CancellationException) {
+                // Expected: the exact handoff remains pending for recreation.
+            }
+            val saved = Bundle().also(handoff::save)
+            assertEquals(first, SystemInstallApkDocumentHandoff.restore(saved).pending?.effect)
+
+            val stale = handoff.prepareCompletion {
+                GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
+            }
+            assertNotNull(stale)
+            handoff.begin(second)
+
+            assertFalse(handoff.acknowledge(requireNotNull(stale)))
+            assertEquals(second, handoff.pending?.effect)
+        }
+
+    @Test
     fun null_descriptor_reports_cleanup_failure() = runBlocking {
         val result = writeGeneratedDocument(
             resolver = resolver,
@@ -476,5 +551,7 @@ class ConversionDocumentIoTest {
 
     private companion object {
         const val ACTUAL_STORE_TOKEN = "11111111-1111-4111-8111-111111111111"
+        const val TOKEN = "11111111-1111-1111-1111-111111111111"
+        const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
     }
 }

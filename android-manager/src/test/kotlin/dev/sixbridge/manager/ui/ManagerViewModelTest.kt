@@ -1705,6 +1705,79 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `picker 대기 중 process recreation은 exact fallback metadata를 복원해 결과를 한 번 수락한다`() =
+        runTest(dispatcher.scheduler) {
+            val source = File("/retained/$TOKEN/wrapper.apk")
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingSystemInstaller
+                systemInstallFallback = SystemInstallApkFallback(
+                    importToken = TOKEN,
+                    source = source,
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "smart/context",
+                )
+            }
+            val savedState = SavedStateHandle(
+                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
+            )
+            val sourceViewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            sourceViewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+                sourceViewModel.effects.first(),
+            )
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            recreated.accept(ManagerAction.SystemInstallApkCreated(SECOND_TOKEN, unitTestUri()))
+            recreated.accept(ManagerAction.SystemInstallApkCreated(TOKEN, unitTestUri()))
+            recreated.accept(ManagerAction.SystemInstallApkCreated(TOKEN, unitTestUri()))
+            advanceUntilIdle()
+
+            assertEquals(TOKEN, effect.importToken)
+            assertEquals(source, effect.source)
+            assertEquals("a".repeat(64), effect.expectedSha256)
+            assertEquals(listOf(TOKEN), repository.systemInstallExportedTokens)
+        }
+
+    @Test
+    fun `PREPARED fallback cold start는 retained metadata로 exact retry UX를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val source = File("/retained/$TOKEN/wrapper.apk")
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.PreparingSystemInstaller
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                systemInstallFallback = SystemInstallApkFallback(
+                    importToken = TOKEN,
+                    source = source,
+                    expectedSha256 = "b".repeat(64),
+                    extensionName = "복구/확장",
+                )
+            }
+            val recreated = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            assertEquals(RecoveryAction.RETRY, recreated.state.value.message?.recoveryAction)
+            recreated.accept(ManagerAction.RetryRecovery)
+            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+                recreated.effects.first(),
+            )
+            assertEquals(TOKEN, effect.importToken)
+            assertEquals(source, effect.source)
+            assertEquals("b".repeat(64), effect.expectedSha256)
+            assertEquals("복구-확장-wrapper.apk", effect.suggestedFileName)
+        }
+
+    @Test
     fun `제거 화면 복귀 뒤 실제 재조회 결과만 반영한다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository()
         val viewModel = ManagerViewModel(repository, SavedStateHandle())
@@ -9217,7 +9290,9 @@ private class FakeManagerRepository : ManagerRepository {
         }
     }
 
-    override fun systemInstallApkFallback(importToken: String): SystemInstallApkFallback? =
+    override suspend fun systemInstallApkFallback(
+        importToken: String,
+    ): SystemInstallApkFallback? =
         systemInstallFallback?.takeIf { it.importToken == importToken }
 
     override fun markSystemInstallApkExported(importToken: String): Boolean {

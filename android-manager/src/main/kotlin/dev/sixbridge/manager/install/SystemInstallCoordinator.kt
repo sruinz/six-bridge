@@ -49,6 +49,17 @@ class SystemInstallCoordinator(
 
     val state: StateFlow<InstallState> = mutableState.asStateFlow()
 
+    fun ownsPreparedFallback(importToken: String): Boolean {
+        val prepared = when (val snapshot = handoffStore.snapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent,
+            RecoveryRecordSnapshot.Invalid,
+            -> return false
+        }
+        return prepared.importToken == importToken &&
+            prepared.stage == SystemInstallStage.PREPARED
+    }
+
     suspend fun request(
         bundle: ImportedBundle,
         partialConfirmed: Boolean,

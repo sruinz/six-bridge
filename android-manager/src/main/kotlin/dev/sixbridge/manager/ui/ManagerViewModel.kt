@@ -30,6 +30,7 @@ import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
+import java.io.File
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -91,7 +92,8 @@ class ManagerViewModel(
     private var generatedShareHandoffSequence = 0L
     private var installJob: Job? = null
     private var pendingSystemInstallApkDocument:
-        ManagerEffect.CreateSystemInstallApkDocument? = null
+        ManagerEffect.CreateSystemInstallApkDocument? =
+        restorePendingSystemInstallApkDocument()
     private var operationGeneration = 0L
     private var launchGeneration = 0L
     private var uninstallGeneration = 0L
@@ -1644,7 +1646,7 @@ class ManagerViewModel(
                     expectedSha256 = fallback.expectedSha256,
                     suggestedFileName = suggestedWrapperApkName(fallback.extensionName),
                 )
-                pendingSystemInstallApkDocument = effect
+                setPendingSystemInstallApkDocument(effect)
                 enqueueEffect(effect)
                 return@launch
             }
@@ -1695,7 +1697,7 @@ class ManagerViewModel(
             }
             return
         }
-        pendingSystemInstallApkDocument = null
+        clearPendingSystemInstallApkDocument()
         pendingRecovery = null
         showManualSystemInstallMessage()
     }
@@ -1980,7 +1982,7 @@ class ManagerViewModel(
                 enqueueEffect(retriedEffect)
             }
             is PendingRecovery.SystemInstallApk -> {
-                pendingSystemInstallApkDocument = recovery.effect
+                setPendingSystemInstallApkDocument(recovery.effect)
                 enqueueEffect(recovery.effect)
             }
         }
@@ -2150,7 +2152,7 @@ class ManagerViewModel(
         clearPendingSixPicker()
         clearPendingConversionPicker()
         clearPendingConversionSave()
-        pendingSystemInstallApkDocument = null
+        clearPendingSystemInstallApkDocument()
     }
 
     private fun savePendingSixPicker(launch: PendingDocumentLaunch) {
@@ -3269,7 +3271,7 @@ class ManagerViewModel(
         }
     }
 
-    private fun markStartupRecoveryReady() {
+    private suspend fun markStartupRecoveryReady() {
         if (mutableState.value.startupRecoveryState ==
             StartupRecoveryUiState.RECOVERY_BLOCKED
         ) {
@@ -3293,12 +3295,89 @@ class ManagerViewModel(
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
         }
+        val reviewToken =
+            (mutableState.value.importState as? ImportUiState.ReviewReady)
+                ?.review
+                ?.token
+        if (installState == InstallState.PreparingSystemInstaller &&
+            reviewToken != null &&
+            isCurrentReviewOwner(reviewToken)
+        ) {
+            repository.systemInstallApkFallback(reviewToken)
+                ?.let { fallback ->
+                    setPendingSystemInstallApkDocument(
+                        ManagerEffect.CreateSystemInstallApkDocument(
+                            importToken = fallback.importToken,
+                            source = fallback.source,
+                            expectedSha256 = fallback.expectedSha256,
+                            suggestedFileName =
+                                suggestedWrapperApkName(fallback.extensionName),
+                        ),
+                    )
+                }
+            pendingSystemInstallApkDocument
+                ?.takeIf { it.importToken == reviewToken }
+                ?.let { effect ->
+                    pendingRecovery = PendingRecovery.SystemInstallApk(effect)
+                    mutableState.update {
+                        it.copy(
+                            message = UserMessage(
+                                UserMessageKind.LAUNCH_FAILED,
+                                "APK 저장을 다시 시도해 주세요.",
+                                RecoveryAction.RETRY,
+                            ),
+                        )
+                    }
+                }
+        }
         if (installState is InstallState.AwaitingManualInstall &&
             isCurrentReviewOwner(installState.importToken)
         ) {
+            clearPendingSystemInstallApkDocument()
             showManualSystemInstallMessage()
         }
         reconcileQuarantinedGeneratedCleanup()
+    }
+
+    internal fun ownsSystemInstallApkDocument(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+    ): Boolean = pendingSystemInstallApkDocument == effect &&
+        isCurrentReviewOwner(effect.importToken)
+
+    private fun setPendingSystemInstallApkDocument(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+    ) {
+        pendingSystemInstallApkDocument = effect
+        savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = effect.importToken
+        savedStateHandle[PENDING_SYSTEM_APK_SOURCE_KEY] = effect.source.path
+        savedStateHandle[PENDING_SYSTEM_APK_SHA256_KEY] = effect.expectedSha256
+        savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = effect.suggestedFileName
+    }
+
+    private fun clearPendingSystemInstallApkDocument() {
+        pendingSystemInstallApkDocument = null
+        savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = null
+        savedStateHandle[PENDING_SYSTEM_APK_SOURCE_KEY] = null
+        savedStateHandle[PENDING_SYSTEM_APK_SHA256_KEY] = null
+        savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = null
+    }
+
+    private fun restorePendingSystemInstallApkDocument():
+        ManagerEffect.CreateSystemInstallApkDocument? {
+        val token = savedStateHandle.get<String>(PENDING_SYSTEM_APK_TOKEN_KEY)
+            ?: return null
+        val source = savedStateHandle.get<String>(PENDING_SYSTEM_APK_SOURCE_KEY)
+            ?: return null
+        val sha256 = savedStateHandle.get<String>(PENDING_SYSTEM_APK_SHA256_KEY)
+            ?: return null
+        val name = savedStateHandle.get<String>(PENDING_SYSTEM_APK_NAME_KEY)
+            ?: return null
+        return ManagerEffect.CreateSystemInstallApkDocument(
+            importToken = token,
+            source = File(source),
+            expectedSha256 = sha256,
+            suggestedFileName = name,
+        )
     }
 
     private fun showGeneratedCleanupRestoreBlocked() {
@@ -4224,6 +4303,10 @@ class ManagerViewModel(
         const val PENDING_SAVE_TOKEN_KEY = "pending_save_token"
         const val PENDING_SAVE_OWNER_GENERATION_KEY = "pending_save_owner_generation"
         const val PENDING_SAVE_LAUNCH_ID_KEY = "pending_save_launch_id"
+        const val PENDING_SYSTEM_APK_TOKEN_KEY = "pending_system_apk_token"
+        const val PENDING_SYSTEM_APK_SOURCE_KEY = "pending_system_apk_source"
+        const val PENDING_SYSTEM_APK_SHA256_KEY = "pending_system_apk_sha256"
+        const val PENDING_SYSTEM_APK_NAME_KEY = "pending_system_apk_name"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",
