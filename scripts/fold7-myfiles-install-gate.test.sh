@@ -178,7 +178,8 @@ OWNER
     fi
     ;;
   logcat)
-    if [ -f "$SIXBRIDGE_TEST_MARKER_FILE" ]; then
+    if [ "${ADB_LOG_MARKER:-present}" = present ] &&
+        [ -f "$SIXBRIDGE_TEST_MARKER_FILE" ]; then
       printf '1722225600.123 1 1 I SixBridgeMyFilesGate: %s\n' \
         "$(<"$SIXBRIDGE_TEST_MARKER_FILE")"
     fi
@@ -453,7 +454,57 @@ test_fresh_target_with_unrelated_logs_is_rejected() {
 test_target_logs_before_marker_are_rejected() {
     run_pre >/dev/null
     expect_exit_3 'target-bound 삼성 지원 로그를 찾지 못했습니다.' \
-        target-before-marker run_post ADB_LOG_TIMING=before
+        target-before-marker run_post \
+        ADB_LOG_TIMING=before ADB_LOG_MARKER=missing
+}
+
+test_saved_marker_boundary_survives_logcat_rollover() {
+    local output="${FIXTURE_ROOT}/marker-rollover.log"
+    run_pre >/dev/null
+    if ! run_post ADB_LOG_MARKER=missing >"$output" 2>&1; then
+        cat "$output" >&2
+        fail 'current logcat에서 marker가 rollover된 정상 post가 거부됐습니다.'
+    fi
+    assert_contains "$output" 'wrapperByteIdentity=matched' \
+        '저장된 marker 경계 post 성공 요약이 없습니다.'
+}
+
+test_saved_marker_evidence_is_fail_closed() {
+    local pointer run_dir marker original epoch nonce
+    pointer=$(current_pointer)
+    run_pre >/dev/null
+    run_dir=$(<"$pointer")
+    marker="${run_dir}/pre-log-marker.txt"
+    original="${FIXTURE_ROOT}/pre-log-marker.original"
+    cp "$marker" "$original"
+    epoch=$(sed -n 's/^preLogEpoch=//p' "${run_dir}/baseline.env")
+    nonce=$(sed -n 's/^preLogNonce=//p' "${run_dir}/baseline.env")
+
+    rm "$marker"
+    expect_exit_3 '저장된 pre log marker evidence를 찾지 못했습니다.' \
+        marker-missing run_post ADB_LOG_MARKER=missing
+
+    ln -s "$original" "$marker"
+    expect_exit_3 '저장된 pre log marker evidence를 찾지 못했습니다.' \
+        marker-symlink run_post ADB_LOG_MARKER=missing
+    rm "$marker"
+
+    printf 'malformed marker\n' >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-malformed run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: other-nonce\n' \
+        "$epoch" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-nonce-mismatch run_post ADB_LOG_MARKER=missing
+
+    printf '1722225599.999 1 1 I SixBridgeMyFilesGate: %s\n' \
+        "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-epoch-mismatch run_post ADB_LOG_MARKER=missing
 }
 
 test_fresh_target_with_target_bound_logs_succeeds() {
@@ -661,6 +712,20 @@ main() {
             test_fresh_target_with_unrelated_logs_is_rejected
             test_target_logs_before_marker_are_rejected
             ;;
+        marker-boundary)
+            test_saved_marker_boundary_survives_logcat_rollover
+            test_saved_marker_evidence_is_fail_closed
+            test_target_logs_before_marker_are_rejected
+            ;;
+        marker-rollover)
+            test_saved_marker_boundary_survives_logcat_rollover
+            ;;
+        marker-validation)
+            test_saved_marker_evidence_is_fail_closed
+            ;;
+        marker-before)
+            test_target_logs_before_marker_are_rejected
+            ;;
         retry)
             test_failed_post_can_retry_same_pointer
             ;;
@@ -670,6 +735,8 @@ main() {
             test_unchanged_target_with_unrelated_logs_is_rejected
             test_fresh_target_with_unrelated_logs_is_rejected
             test_target_logs_before_marker_are_rejected
+            test_saved_marker_boundary_survives_logcat_rollover
+            test_saved_marker_evidence_is_fail_closed
             test_fresh_target_with_target_bound_logs_succeeds
             test_failed_pre_preserves_previous_pointer
             test_successful_post_consumes_pointer

@@ -122,10 +122,16 @@ package, `versionCode`, signer, extension ID와 SHA-256을 baseline과 비교하
 stat 중 하나 이상이 달라졌는지 확인한다. 기존 설치 세대가 그대로면 같은
 APK와 My Files origin이 있어도 합격하지 않는다.
 
-삼성 로그는 고유 pre marker보다 뒤에 있어야 한다. 첫 줄은 정확한 target
-package, 둘째 줄은 정확한 extension ID를 포함해야 하므로 다른 확장의
-일반적인 성공 로그로 대신할 수 없다. Samsung Internet Add-ons와 wrapper
-`six://ex` discovery resolve 결과도 증거 디렉터리에 저장한다.
+삼성 로그는 고유 pre marker보다 뒤에 있어야 한다. `pre`가 marker를 기록한
+직후 같은 logcat에서 캡처한 `pre-log-marker.txt`는 일반 파일·단일행 형식과
+baseline nonce·sub-second epoch가 정확히 일치해야 한다. `post` 시점 ring
+buffer에서 marker 줄이 rollover됐더라도 이 저장 증거를 경계로 사용하며,
+현재 로그의 timestamp가 `preLogEpoch`보다 큰지 검사한다. 첫 줄은 정확한
+target package, 둘째 줄은 정확한 extension ID를 포함해야 하므로 다른 확장의
+일반적인 성공 로그로 대신할 수 없다. 저장 marker가 없거나 변조됐거나,
+target 로그가 경계 이전이면 fail-closed 처리한다. Samsung Internet
+Add-ons와 wrapper `six://ex` discovery resolve 결과도 증거 디렉터리에
+저장한다.
 
 ```text
 SixPkgUpdater: isDevSixPkg - MyFiles case

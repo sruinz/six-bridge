@@ -729,18 +729,38 @@ EOF
 }
 
 capture_samsung_logs() {
-    local marker_epoch nonce package_name extension_id
+    local marker_epoch nonce package_name extension_id marker_file
+    local expected_nonce marker_lines
     marker_epoch=$(baseline_value preLogEpoch)
     nonce=$(baseline_value preLogNonce)
     package_name=$(baseline_value package)
     extension_id=$(baseline_value extensionId)
+    marker_file="${RUN_DIR}/pre-log-marker.txt"
+    expected_nonce="pre:${SAFE_SERIAL}:$(basename "$RUN_DIR")"
     [[ "$marker_epoch" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
         fail "pre log marker epoch baseline이 올바르지 않습니다."
-    [ -n "$nonce" ] ||
-        fail "pre log marker nonce baseline이 없습니다."
+    [ "$nonce" = "$expected_nonce" ] ||
+        fail "pre log marker nonce baseline이 올바르지 않습니다."
+    [ -f "$marker_file" ] && [ ! -L "$marker_file" ] ||
+        fail "저장된 pre log marker evidence를 찾지 못했습니다."
+    marker_lines=$(wc -l <"$marker_file" | tr -d '[:space:]')
+    [ "$marker_lines" = 1 ] &&
+        awk -v epoch="$marker_epoch" -v nonce="$nonce" '
+          NF == 6 &&
+          $1 == epoch &&
+          $2 ~ /^[0-9]+$/ &&
+          $3 ~ /^[0-9]+$/ &&
+          $4 == "I" &&
+          $5 == "SixBridgeMyFilesGate:" &&
+          $6 == nonce {
+            valid=1
+          }
+          END {
+            exit(valid ? 0 : 1)
+          }
+        ' "$marker_file" ||
+        fail "저장된 pre log marker evidence가 baseline과 일치하지 않습니다."
     adb -s "$SERIAL" logcat -d -v epoch >"${RUN_DIR}/logcat-raw.txt"
-    rg -Fq "SixBridgeMyFilesGate: ${nonce}" "${RUN_DIR}/logcat-raw.txt" ||
-        fail "pre log marker가 post logcat에 남아 있지 않습니다."
     awk -v start="$marker_epoch" '$1 + 0 > start + 0' \
         "${RUN_DIR}/logcat-raw.txt" >"${RUN_DIR}/logcat-since-pre.txt"
     rg 'SixPkgUpdater|SixAppDataUpdater' "${RUN_DIR}/logcat-since-pre.txt" \
