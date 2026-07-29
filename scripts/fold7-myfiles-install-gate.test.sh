@@ -6,6 +6,9 @@ readonly GATE_SCRIPT="${ROOT_DIR}/scripts/fold7-myfiles-install-gate.sh"
 readonly EXTENSION_ID="abcdefghijklmnopabcdefghijklmnop"
 readonly PACKAGE_NAME="dev.sixbridge.ext.${EXTENSION_ID}"
 readonly SIGNER_SHA256="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+readonly OTHER_EXTENSION_ID="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+readonly OTHER_PACKAGE_NAME="dev.sixbridge.ext.${OTHER_EXTENSION_ID}"
+readonly OTHER_SIGNER_SHA256="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -86,6 +89,18 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$SIXBRIDGE_TEST_ADB_LOG"
 [ "${1:-}" = -s ] || exit 20
 shift 2
+phase=${ADB_PHASE:-post}
+generation=${ADB_TARGET_GENERATION:-}
+if [ -z "$generation" ]; then
+  if [ "$phase" = pre ]; then generation=old; else generation=new; fi
+fi
+if [ "$generation" = old ]; then
+  last_update='2026-07-29 11:59:00'
+  generation_number=100
+else
+  last_update='2026-07-29 12:01:00'
+  generation_number=200
+fi
 case "${1:-}" in
   get-state)
     printf 'device\n'
@@ -99,17 +114,35 @@ case "${1:-}" in
       'date +%s')
         printf '1722225600\n'
         ;;
+      log\ -t\ SixBridgeMyFilesGate\ *)
+        printf '%s\n' "${!#}" \
+          >"$SIXBRIDGE_TEST_MARKER_FILE"
+        ;;
       "dumpsys package ${SIXBRIDGE_TEST_PACKAGE}")
+        if [ "${ADB_TARGET_PRESENT:-1}" = 0 ]; then
+          printf 'Unable to find package: %s\n' "$SIXBRIDGE_TEST_PACKAGE"
+          exit 0
+        fi
         printf 'Packages:\n'
         printf '  Package [%s]\n' "$SIXBRIDGE_TEST_PACKAGE"
-        printf '    installerPackageName=com.google.android.packageinstaller\n'
+        printf '    codePath=/data/app/%s\n' "$generation"
+        printf '    lastUpdateTime=%s\n' "$last_update"
+        printf '    installerPackageName=%s\n' \
+          "${ADB_INSTALLER_PACKAGE:-com.google.android.packageinstaller}"
         printf '    initiatingPackageName=com.google.android.packageinstaller\n'
+        if [ -n "${ADB_INITIATING_PACKAGE+x}" ]; then
+          printf '    initiatingPackageName=%s\n' "$ADB_INITIATING_PACKAGE"
+        fi
         printf '    originatingPackageName=%s\n' \
           "${ADB_ORIGINATING_PACKAGE:-com.sec.android.app.myfiles}"
-        printf '    packageSource=1\n'
+        printf '    packageSource=%s\n' "${ADB_PACKAGE_SOURCE:-3}"
         ;;
       "pm path ${SIXBRIDGE_TEST_PACKAGE}")
-        printf 'package:/data/app/fixture/base.apk\n'
+        [ "${ADB_TARGET_PRESENT:-1}" != 0 ] || exit 1
+        printf 'package:/data/app/%s/base.apk\n' "$generation"
+        ;;
+      stat\ -c\ %i:%s:%Y\ /data/app/*/base.apk)
+        printf '%s:22:%s\n' "$generation_number" "$generation_number"
         ;;
       *'cmd package resolve-activity --brief --user 0'*'-d internet://extension'*)
         printf 'com.sec.android.app.sbrowser/com.sec.android.app.sbrowser.SBrowserMainActivity\n'
@@ -134,9 +167,22 @@ case "${1:-}" in
     fi
     ;;
   logcat)
+    if [ -f "$SIXBRIDGE_TEST_MARKER_FILE" ]; then
+      printf '1722225600.123 1 1 I SixBridgeMyFilesGate: %s\n' \
+        "$(<"$SIXBRIDGE_TEST_MARKER_FILE")"
+    fi
     if [ "${ADB_SAMSUNG_LOGS:-complete}" = complete ]; then
-      printf '1722225601.000 1 1 I SixPkgUpdater: isDevSixPkg - MyFiles case\n'
-      printf '1722225602.000 1 1 I SixAppDataUpdater: updateSixAppData - Allowed to be supported\n'
+      if [ "${ADB_LOG_TARGET:-target}" = target ]; then
+        log_package=$SIXBRIDGE_TEST_PACKAGE
+        log_extension=$SIXBRIDGE_TEST_EXTENSION
+      else
+        log_package=$SIXBRIDGE_TEST_OTHER_PACKAGE
+        log_extension=$SIXBRIDGE_TEST_OTHER_EXTENSION
+      fi
+      printf '1722225601.000 1 1 I SixPkgUpdater: isDevSixPkg - MyFiles case: %s\n' \
+        "$log_package"
+      printf '1722225602.000 1 1 I SixAppDataUpdater: updateSixAppData - Allowed to be supported: %s\n' \
+        "$log_extension"
     else
       printf '1722225601.000 1 1 I SixPkgUpdater: unrelated\n'
     fi
@@ -168,19 +214,30 @@ MANIFEST
     printf '.class DefaultManagerRepository\n'
     ;;
   manifest\ print\ *)
-    cat <<MANIFEST
+    if [ "${APKANALYZER_EXTENSION_ASSOCIATION:-valid}" = split ]; then
+      cat <<MANIFEST
+<manifest android:versionCode="${APKANALYZER_VERSION:-7}" package="${APKANALYZER_PACKAGE:-$SIXBRIDGE_TEST_PACKAGE}">
+  <application>
+    <meta-data android:name="extension-id" android:value="${SIXBRIDGE_TEST_OTHER_EXTENSION}" />
+    <meta-data android:name="other-id" android:value="${SIXBRIDGE_TEST_EXTENSION}" />
+  </application>
+</manifest>
+MANIFEST
+    else
+      cat <<MANIFEST
 <manifest android:versionCode="7" package="${SIXBRIDGE_TEST_PACKAGE}">
   <application>
     <meta-data android:name="extension-id" android:value="${SIXBRIDGE_TEST_EXTENSION}" />
   </application>
 </manifest>
 MANIFEST
+    fi
     ;;
   manifest\ application-id\ *)
-    printf '%s\n' "$SIXBRIDGE_TEST_PACKAGE"
+    printf '%s\n' "${APKANALYZER_PACKAGE:-$SIXBRIDGE_TEST_PACKAGE}"
     ;;
   manifest\ version-code\ *)
-    printf '7\n'
+    printf '%s\n' "${APKANALYZER_VERSION:-7}"
     ;;
   *)
     printf 'unexpected apkanalyzer: %s\n' "$*" >&2
@@ -193,7 +250,8 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'Verifies\n'
-printf 'Signer #1 certificate SHA-256 digest: %s\n' "$SIXBRIDGE_TEST_SIGNER"
+printf 'Signer #1 certificate SHA-256 digest: %s\n' \
+  "${APKSIGNER_SIGNER:-$SIXBRIDGE_TEST_SIGNER}"
 EOF
     chmod +x \
         "${FIXTURE_ROOT}/bin/date" \
@@ -214,7 +272,11 @@ run_gate() {
     local mode=$1
     local serial=$2
     local input=$3
+    local bash_trace=
     shift 3
+    if [ "${SIXBRIDGE_TEST_XTRACE:-0}" = 1 ]; then
+        bash_trace=-x
+    fi
     env \
         PATH="${FIXTURE_ROOT}/bin:${PATH}" \
         TMPDIR="${FIXTURE_ROOT}/tmp" \
@@ -224,19 +286,26 @@ run_gate() {
         SIXBRIDGE_TEST_ADB_LOG="${FIXTURE_ROOT}/adb.log" \
         SIXBRIDGE_TEST_PACKAGE="$PACKAGE_NAME" \
         SIXBRIDGE_TEST_EXTENSION="$EXTENSION_ID" \
+        SIXBRIDGE_TEST_OTHER_PACKAGE="$OTHER_PACKAGE_NAME" \
+        SIXBRIDGE_TEST_OTHER_EXTENSION="$OTHER_EXTENSION_ID" \
         SIXBRIDGE_TEST_SIGNER="$SIGNER_SHA256" \
         SIXBRIDGE_TEST_MANAGER_APK="${FIXTURE_ROOT}/manager.apk" \
         SIXBRIDGE_TEST_INSTALLED_APK="${FIXTURE_ROOT}/device-installed.apk" \
+        SIXBRIDGE_TEST_MARKER_FILE="${FIXTURE_ROOT}/marker.log" \
         "$@" \
-        bash "$GATE_SCRIPT" "$mode" "$serial" "$input"
+        bash ${bash_trace:+"$bash_trace"} "$GATE_SCRIPT" "$mode" "$serial" "$input"
 }
 
 run_pre() {
-    run_gate pre serial-1 "${FIXTURE_ROOT}/fixture.six" "$@"
+    run_gate pre serial-1 "${FIXTURE_ROOT}/fixture.six" ADB_PHASE=pre "$@"
 }
 
 run_post() {
-    run_gate post serial-1 "$PACKAGE_NAME" "$@"
+    run_gate post serial-1 "$PACKAGE_NAME" ADB_PHASE=post "$@"
+}
+
+current_pointer() {
+    printf '%s/evidence/.myfiles-install-gate-current-serial-1\n' "$FIXTURE_ROOT"
 }
 
 test_success_and_required_failures() {
@@ -316,13 +385,143 @@ test_unsafe_bundles_are_rejected() {
         run_gate pre serial-1 "${malformed}/duplicate.six"
 }
 
+test_unchanged_target_with_unrelated_logs_is_rejected() {
+    run_pre >/dev/null
+    expect_exit_3 'target 설치 세대가 pre 이후 변경되지 않았습니다.' \
+        unchanged-unrelated \
+        run_post ADB_TARGET_GENERATION=old ADB_LOG_TARGET=other
+}
+
+test_fresh_target_with_target_bound_logs_succeeds() {
+    local pre_output="${FIXTURE_ROOT}/fresh-pre.log"
+    local output="${FIXTURE_ROOT}/fresh-target.log"
+    local absent_output="${FIXTURE_ROOT}/absent-target.log"
+    if ! run_pre >"$pre_output" 2>&1; then
+        cat "$pre_output" >&2
+        fail 'fresh target pre가 실패했습니다.'
+    fi
+    if ! run_post >"$output" 2>&1; then
+        cat "$output" >&2
+        fail 'fresh target과 target-bound 삼성 로그가 거부됐습니다.'
+    fi
+    assert_contains "$output" 'wrapperByteIdentity=matched' \
+        'fresh target 성공 요약이 없습니다.'
+
+    run_pre ADB_TARGET_PRESENT=0 >/dev/null
+    if ! run_post >"$absent_output" 2>&1; then
+        cat "$absent_output" >&2
+        fail 'pre 때 없던 target의 신규 설치가 거부됐습니다.'
+    fi
+    assert_contains "$absent_output" 'wrapperByteIdentity=matched' \
+        'pre absent 신규 설치 성공 요약이 없습니다.'
+}
+
+test_failed_pre_preserves_previous_pointer() {
+    local pointer previous
+    pointer=$(current_pointer)
+    run_pre >/dev/null
+    previous=$(<"$pointer")
+    expect_exit_3 '.six bundle을 찾지 못했거나 symlink입니다:' failed-pre \
+        run_gate pre serial-1 "${FIXTURE_ROOT}/missing.six" ADB_PHASE=pre
+    [ -f "$pointer" ] || fail '실패한 pre가 기존 pointer를 삭제했습니다.'
+    [ "$(<"$pointer")" = "$previous" ] ||
+        fail '실패한 pre가 기존 pointer를 변경했습니다.'
+}
+
+test_successful_post_consumes_pointer() {
+    local pointer
+    pointer=$(current_pointer)
+    run_pre >/dev/null
+    run_post >/dev/null
+    [ ! -e "$pointer" ] ||
+        fail '성공한 post가 current pointer를 소비하지 않았습니다.'
+    expect_exit_3 '성공한 My Files pre evidence를 찾지 못했습니다.' \
+        repeated-post run_post
+}
+
+test_held_serial_lock_is_rejected() {
+    local lock="${FIXTURE_ROOT}/evidence/.myfiles-install-gate-lock-serial-1"
+    mkdir "$lock"
+    expect_exit_3 '같은 serial의 gate가 이미 실행 중입니다:' \
+        held-lock run_pre
+    rmdir "$lock"
+
+    run_pre >/dev/null
+    mkdir "$lock"
+    expect_exit_3 '같은 serial의 gate가 이미 실행 중입니다:' \
+        held-post-lock run_post
+    [ -f "$(current_pointer)" ] ||
+        fail 'lock으로 거부된 post가 current pointer를 삭제했습니다.'
+    rmdir "$lock"
+}
+
+expect_post_contract_failure() {
+    local expected=$1
+    local label=$2
+    shift 2
+    run_pre >/dev/null
+    expect_exit_3 "$expected" "$label" run_post "$@"
+}
+
+test_post_identity_and_source_contracts() {
+    expect_post_contract_failure \
+        '설치 APK package가 pre baseline과 다릅니다.' package-mismatch \
+        APKANALYZER_PACKAGE="$OTHER_PACKAGE_NAME"
+    expect_post_contract_failure \
+        '설치 APK versionCode가 pre baseline과 다릅니다.' version-mismatch \
+        APKANALYZER_VERSION=8
+    expect_post_contract_failure \
+        '설치 APK signer가 pre baseline과 다릅니다.' signer-mismatch \
+        APKSIGNER_SIGNER="$OTHER_SIGNER_SHA256"
+    expect_post_contract_failure \
+        '설치 APK extension ID를 확인하지 못했습니다.' extension-association \
+        APKANALYZER_EXTENSION_ASSOCIATION=split
+    expect_post_contract_failure \
+        'Google package installer 설치 기록이 아닙니다:' installer-mismatch \
+        ADB_INSTALLER_PACKAGE=other.installer
+    expect_post_contract_failure \
+        'Google package installer initiating 기록이 아닙니다:' initiating-mismatch \
+        ADB_INITIATING_PACKAGE=other.installer
+    expect_post_contract_failure \
+        'packageSource가 사용자 설치 값 3이 아닙니다.' package-source \
+        ADB_PACKAGE_SOURCE=99
+}
+
 main() {
     [ -f "$GATE_SCRIPT" ] || fail "host gate script가 없습니다: $GATE_SCRIPT"
     make_fixture
     trap 'rm -rf -- "${FIXTURE_ROOT:-}"' EXIT
-    test_success_and_required_failures
-    test_unsafe_bundles_are_rejected
+    case "${1:-all}" in
+        unchanged)
+            test_unchanged_target_with_unrelated_logs_is_rejected
+            ;;
+        fresh)
+            test_fresh_target_with_target_bound_logs_succeeds
+            ;;
+        atomic-pre)
+            test_failed_pre_preserves_previous_pointer
+            ;;
+        consume)
+            test_successful_post_consumes_pointer
+            ;;
+        lock)
+            test_held_serial_lock_is_rejected
+            ;;
+        all)
+            test_success_and_required_failures
+            test_unsafe_bundles_are_rejected
+            test_unchanged_target_with_unrelated_logs_is_rejected
+            test_fresh_target_with_target_bound_logs_succeeds
+            test_failed_pre_preserves_previous_pointer
+            test_successful_post_consumes_pointer
+            test_held_serial_lock_is_rejected
+            test_post_identity_and_source_contracts
+            ;;
+        *)
+            fail "알 수 없는 fixture case: $1"
+            ;;
+    esac
     printf 'PASS: Fold7 삼성 내 파일 설치 gate fixture\n'
 }
 
-main
+main "$@"

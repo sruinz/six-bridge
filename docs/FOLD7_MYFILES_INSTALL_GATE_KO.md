@@ -84,10 +84,15 @@ baseline을 기록한다.
   session·APK `ACTION_VIEW`·gateway 참조가 없음
 - `.six`에 symlink, 중복 entry, 경로 이탈이 없고 정확한 세 entry만 있음
 - wrapper package, `versionCode`, signer, extension ID와 SHA-256
-- pre 시점의 Fold7 epoch와 비교용 `preparedApk`
+- pre 시점 대상 package의 설치 유무, `lastUpdateTime`, `codePath`,
+  `base.apk` 경로·inode/크기/mtime
+- 고유 nonce가 붙은 `SixBridgeMyFilesGate` log marker의 sub-second epoch와
+  비교용 `preparedApk`
 
 `pre` 성공 뒤 위 사용자 절차 2~6단계를 수행한다. 사용자가 설치 또는
-업데이트를 승인하기 전에는 `post`를 실행하지 않는다.
+업데이트를 승인하기 전에는 `post`를 실행하지 않는다. 설치 뒤 `pre`를 다시
+실행하면 새 설치 세대가 baseline이 되므로 반드시 설치 전에 실행한 `pre`를
+그대로 사용한다.
 
 ```bash
 scripts/fold7-myfiles-install-gate.sh post \
@@ -105,19 +110,36 @@ support=Allowed to be supported
 wrapperByteIdentity=matched
 ```
 
-`post`는 같은 serial의 마지막 성공 `pre`만 사용한다. 설치된 `base.apk`를
-회수해 package, `versionCode`, signer, extension ID와 SHA-256을 baseline과
-비교한다. 또한 pre 이후의 다음 삼성 로그 두 줄과 Samsung Internet Add-ons,
-wrapper `six://ex` discovery resolve 결과를 증거 디렉터리에 저장한다.
+`post`는 같은 serial의 마지막 성공 `pre`만 사용한다. pre와 post는 serial별
+lock으로 직렬화한다. 설치된 `base.apk`를 회수해 package, `versionCode`,
+signer, extension ID와 SHA-256을 baseline과 비교하며, 대상이 pre 때 없었다가
+생겼거나 `lastUpdateTime`, `codePath`, `base.apk` stat 중 하나 이상이
+달라졌는지 확인한다. 기존 설치 세대가 그대로면 같은 APK와 My Files origin이
+있어도 합격하지 않는다.
+
+삼성 로그는 고유 pre marker보다 뒤에 있어야 한다. 첫 줄은 정확한 target
+package, 둘째 줄은 정확한 extension ID를 포함해야 하므로 다른 확장의
+일반적인 성공 로그로 대신할 수 없다. Samsung Internet Add-ons와 wrapper
+`six://ex` discovery resolve 결과도 증거 디렉터리에 저장한다.
 
 ```text
 SixPkgUpdater: isDevSixPkg - MyFiles case
 SixAppDataUpdater: updateSixAppData - Allowed to be supported
 ```
 
+installer와 initiating package는
+`com.google.android.packageinstaller`, originating package는
+`com.sec.android.app.myfiles`, `packageSource`는 Fold7 사용자 설치 값 `3`이어야
+한다.
+
 계약 또는 증거 불일치는 exit code 3, 잘못된 사용법이나 필수 도구 누락은 exit
-code 2다. 실패한 설치를 성공으로 해석하지 말고 같은 APK를 삼성 `내 파일`에서
-다시 선택해 사용자 승인을 반복한다.
+code 2다. 실패한 `pre`는 직전 성공 pointer를 변경하지 않는다. 실패한 `post`는
+같은 설치의 증거를 다시 수집할 수 있도록 pointer를 남긴다. 성공한 `post`는
+pointer를 원자적으로 소비하므로 같은 `pre`로 두 번째 합격을 만들 수 없다.
+같은 serial에서 gate가 이미 실행 중이면 종료를 기다린 뒤 다시 실행한다.
+
+실패한 설치를 성공으로 해석하지 말고 같은 APK를 삼성 `내 파일`에서 다시
+선택해 사용자 승인을 반복한다. 재설치 전에 새 `pre`를 실행한다.
 
 ## 수동 회귀 확인
 

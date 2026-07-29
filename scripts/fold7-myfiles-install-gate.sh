@@ -41,17 +41,32 @@ readonly APKANALYZER="${APKANALYZER:-${SDK_ROOT}/cmdline-tools/latest/bin/apkana
 readonly APKSIGNER="${APKSIGNER:-${SDK_ROOT}/build-tools/36.0.0/apksigner}"
 readonly SAFE_SERIAL=$(printf '%s' "$SERIAL" | tr -c '[:alnum:]_.-' '_')
 readonly CURRENT_RUN_FILE="${EVIDENCE_ROOT}/.myfiles-install-gate-current-${SAFE_SERIAL}"
+readonly LOCK_DIR="${EVIDENCE_ROOT}/.myfiles-install-gate-lock-${SAFE_SERIAL}"
 
 RUN_DIR=
 EXTRACT_DIR=
+POINTER_TEMP=
+LOCK_ACQUIRED=0
 
 cleanup() {
-    [ -n "$EXTRACT_DIR" ] || return 0
-    case "$EXTRACT_DIR" in
-        "${TMPDIR:-/tmp}/sixbridge-myfiles-gate."*)
-            /bin/rm -rf -- "$EXTRACT_DIR"
-            ;;
-    esac
+    if [ -n "$EXTRACT_DIR" ]; then
+        case "$EXTRACT_DIR" in
+            "${TMPDIR:-/tmp}/sixbridge-myfiles-gate."*)
+                /bin/rm -rf -- "$EXTRACT_DIR"
+                ;;
+        esac
+    fi
+    if [ -n "$POINTER_TEMP" ]; then
+        case "$POINTER_TEMP" in
+            "${EVIDENCE_ROOT}/.myfiles-install-gate-current."*)
+                /bin/rm -f -- "$POINTER_TEMP"
+                ;;
+        esac
+    fi
+    if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+        /bin/rm -f -- "${LOCK_DIR}/owner"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
@@ -100,6 +115,15 @@ ensure_evidence_root() {
         fail "evidence root를 준비하지 못했습니다: $EVIDENCE_ROOT"
 }
 
+acquire_serial_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        fail "같은 serial의 gate가 이미 실행 중입니다: $SERIAL"
+    fi
+    LOCK_ACQUIRED=1
+    printf 'pid=%s\nmode=%s\nserial=%s\n' "$$" "$MODE" "$SERIAL" \
+        >"${LOCK_DIR}/owner"
+}
+
 new_run_directory() {
     local timestamp candidate suffix
     timestamp=$(date +%Y%m%d-%H%M%S)
@@ -115,12 +139,12 @@ new_run_directory() {
 }
 
 publish_current_run() {
-    local temporary
     [ ! -L "$CURRENT_RUN_FILE" ] ||
         fail "현재 pre pointer가 symlink입니다: $CURRENT_RUN_FILE"
-    temporary=$(mktemp "${EVIDENCE_ROOT}/.myfiles-install-gate-current.XXXXXX")
-    printf '%s\n' "$RUN_DIR" >"$temporary"
-    /bin/mv -f -- "$temporary" "$CURRENT_RUN_FILE"
+    POINTER_TEMP=$(mktemp "${EVIDENCE_ROOT}/.myfiles-install-gate-current.XXXXXX")
+    printf '%s\n' "$RUN_DIR" >"$POINTER_TEMP"
+    /bin/mv -f -- "$POINTER_TEMP" "$CURRENT_RUN_FILE"
+    POINTER_TEMP=
 }
 
 load_current_run() {
@@ -144,6 +168,28 @@ load_current_run() {
 baseline_value() {
     local key=$1
     sed -n "s/^${key}=//p" "${RUN_DIR}/baseline.env"
+}
+
+manifest_has_extension_id() {
+    local manifest=$1
+    local expected=$2
+    awk -v expected="$expected" '
+      /<meta-data/ {
+        in_metadata=1
+        block=""
+      }
+      in_metadata {
+        block=block "\n" $0
+      }
+      in_metadata && /\/>/ {
+        if (block ~ /android:name="extension-id"/ &&
+            index(block, "android:value=\"" expected "\"") > 0) {
+          found=1
+        }
+        in_metadata=0
+      }
+      END { exit !found }
+    ' "$manifest"
 }
 
 assert_device() {
@@ -285,8 +331,7 @@ inspect_bundle() {
         fail ".six descriptor와 wrapper SHA-256이 다릅니다."
     [ "${package_name##*.}" = "$extension_id" ] ||
         fail ".six extension ID가 wrapper package suffix와 다릅니다."
-    rg -Fq 'android:name="extension-id"' "$manifest" &&
-        rg -Fq "android:value=\"${extension_id}\"" "$manifest" ||
+    manifest_has_extension_id "$manifest" "$extension_id" ||
         fail ".six wrapper manifest extension ID가 descriptor와 다릅니다."
 
     cp "$wrapper" "${RUN_DIR}/baseline-wrapper.apk"
@@ -302,12 +347,74 @@ preDeviceEpoch=$(tr -d '\r\n' <"${RUN_DIR}/pre-device-epoch.txt")
 EOF
 }
 
+capture_pre_target() {
+    local package_name package_path last_update code_path base_stat
+    package_name=$(baseline_value package)
+    adb -s "$SERIAL" shell dumpsys package "$package_name" \
+        >"${RUN_DIR}/pre-target-package.txt"
+    if ! adb -s "$SERIAL" shell pm path "$package_name" \
+        >"${RUN_DIR}/pre-target-path.txt" 2>&1; then
+        cat >>"${RUN_DIR}/baseline.env" <<EOF
+preTargetPresent=0
+preLastUpdateTime=absent
+preCodePath=absent
+preBaseApkPath=absent
+preBaseApkStat=absent
+EOF
+        return
+    fi
+    package_path=$(sed -n 's/\r$//; s/^package://p' \
+        "${RUN_DIR}/pre-target-path.txt" |
+        awk '/\/base\.apk$/ { print; exit }')
+    [ -n "$package_path" ] ||
+        fail "pre target base.apk 경로를 읽지 못했습니다: $package_name"
+    last_update=$(sed -n 's/^[[:space:]]*lastUpdateTime=//p' \
+        "${RUN_DIR}/pre-target-package.txt" | tail -n 1 | tr -d '\r')
+    code_path=$(sed -n 's/^[[:space:]]*codePath=//p' \
+        "${RUN_DIR}/pre-target-package.txt" | tail -n 1 | tr -d '\r')
+    [ -n "$last_update" ] ||
+        fail "pre target lastUpdateTime을 읽지 못했습니다."
+    [ -n "$code_path" ] ||
+        fail "pre target codePath를 읽지 못했습니다."
+    base_stat=$(adb -s "$SERIAL" shell stat -c '%i:%s:%Y' "$package_path" |
+        tr -d '\r\n')
+    [[ "$base_stat" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] ||
+        fail "pre target base.apk stat을 읽지 못했습니다."
+    cat >>"${RUN_DIR}/baseline.env" <<EOF
+preTargetPresent=1
+preLastUpdateTime=$last_update
+preCodePath=$code_path
+preBaseApkPath=$package_path
+preBaseApkStat=$base_stat
+EOF
+}
+
+mark_pre_log_boundary() {
+    local nonce marker_line marker_epoch
+    nonce="pre:${SAFE_SERIAL}:$(basename "$RUN_DIR")"
+    adb -s "$SERIAL" shell log -t SixBridgeMyFilesGate "$nonce" ||
+        fail "Fold7 pre log marker를 기록하지 못했습니다."
+    adb -s "$SERIAL" logcat -d -v epoch \
+        >"${RUN_DIR}/pre-log-marker-capture.txt"
+    marker_line=$(rg -F "SixBridgeMyFilesGate: ${nonce}" \
+        "${RUN_DIR}/pre-log-marker-capture.txt" | tail -n 1)
+    [ -n "$marker_line" ] ||
+        fail "Fold7 pre log marker를 다시 읽지 못했습니다."
+    marker_epoch=$(printf '%s\n' "$marker_line" | awk '{print $1}')
+    [[ "$marker_epoch" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        fail "Fold7 pre log marker epoch 형식이 올바르지 않습니다."
+    printf '%s\n' "$marker_line" >"${RUN_DIR}/pre-log-marker.txt"
+    cat >>"${RUN_DIR}/baseline.env" <<EOF
+preLogNonce=$nonce
+preLogEpoch=$marker_epoch
+EOF
+}
+
 run_pre() {
     local package_name version_code signer extension_id wrapper_sha
     [ ! -e "$CURRENT_RUN_FILE" ] ||
-        [ -f "$CURRENT_RUN_FILE" ] && [ ! -L "$CURRENT_RUN_FILE" ] ||
+        { [ -f "$CURRENT_RUN_FILE" ] && [ ! -L "$CURRENT_RUN_FILE" ]; } ||
         fail "현재 pre pointer가 안전한 일반 파일이 아닙니다: $CURRENT_RUN_FILE"
-    /bin/rm -f -- "$CURRENT_RUN_FILE"
     new_run_directory
     assert_manager_contract
     assert_device
@@ -316,6 +423,8 @@ run_pre() {
     grep -Eq '^[0-9]+\r?$' "${RUN_DIR}/pre-device-epoch.txt" ||
         fail "Fold7 device epoch를 읽지 못했습니다."
     inspect_bundle "$INPUT"
+    capture_pre_target
+    mark_pre_log_boundary
     package_name=$(baseline_value package)
     version_code=$(baseline_value versionCode)
     signer=$(baseline_value signerSha256)
@@ -355,6 +464,12 @@ extract_installed_apk() {
         awk '/\/base\.apk$/ { print; exit }')
     [ -n "$package_path" ] ||
         fail "설치된 wrapper base.apk 경로를 찾지 못했습니다: $package_name"
+    adb -s "$SERIAL" shell stat -c '%i:%s:%Y' "$package_path" \
+        >"${RUN_DIR}/installed-base-stat.txt" ||
+        fail "설치된 wrapper base.apk stat을 읽지 못했습니다."
+    tr -d '\r\n' <"${RUN_DIR}/installed-base-stat.txt" |
+        grep -Eq '^[0-9]+:[0-9]+:[0-9]+$' ||
+        fail "설치된 wrapper base.apk stat 형식이 올바르지 않습니다."
     adb -s "$SERIAL" exec-out cat "$package_path" \
         >"${RUN_DIR}/installed-wrapper.apk" ||
         fail "설치된 wrapper APK를 회수하지 못했습니다."
@@ -390,8 +505,7 @@ inspect_installed_identity() {
     signer=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
         "$signer_output" | head -n 1 | tr '[:upper:]' '[:lower:]')
     extension_id=${expected_package##*.}
-    rg -Fq 'android:name="extension-id"' "$manifest" &&
-        rg -Fq "android:value=\"${extension_id}\"" "$manifest" ||
+    manifest_has_extension_id "$manifest" "$extension_id" ||
         fail "설치 APK extension ID를 확인하지 못했습니다."
 
     [ "$package_name" = "$expected_package" ] ||
@@ -427,26 +541,83 @@ EOF
         fail "Google package installer initiating 기록이 아닙니다: ${initiating:-없음}"
     [ "$originating" = "$SAMSUNG_MYFILES" ] ||
         fail "삼성 내 파일 origin이 아닙니다."
-    [ -n "$package_source" ] ||
-        fail "packageSource 설치 기록이 없습니다."
+    [ "$package_source" = 3 ] ||
+        fail "packageSource가 사용자 설치 값 3이 아닙니다."
+}
+
+assert_install_freshness() {
+    local pre_present pre_last_update pre_code_path pre_base_path pre_base_stat
+    local post_last_update post_code_path post_base_path post_base_stat
+    pre_present=$(baseline_value preTargetPresent)
+    pre_last_update=$(baseline_value preLastUpdateTime)
+    pre_code_path=$(baseline_value preCodePath)
+    pre_base_path=$(baseline_value preBaseApkPath)
+    pre_base_stat=$(baseline_value preBaseApkStat)
+    post_last_update=$(sed -n 's/^[[:space:]]*lastUpdateTime=//p' \
+        "${RUN_DIR}/wrapper-package.txt" | tail -n 1 | tr -d '\r')
+    post_code_path=$(sed -n 's/^[[:space:]]*codePath=//p' \
+        "${RUN_DIR}/wrapper-package.txt" | tail -n 1 | tr -d '\r')
+    post_base_path=$(sed -n 's/\r$//; s/^package://p' \
+        "${RUN_DIR}/wrapper-package-path.txt" |
+        awk '/\/base\.apk$/ { print; exit }')
+    post_base_stat=$(tr -d '\r\n' <"${RUN_DIR}/installed-base-stat.txt")
+    [ -n "$post_last_update" ] ||
+        fail "post target lastUpdateTime을 읽지 못했습니다."
+    [ -n "$post_code_path" ] ||
+        fail "post target codePath를 읽지 못했습니다."
+    case "$pre_present" in
+        0)
+            ;;
+        1)
+            if [ "$post_last_update" = "$pre_last_update" ] &&
+                [ "$post_code_path" = "$pre_code_path" ] &&
+                [ "$post_base_path" = "$pre_base_path" ] &&
+                [ "$post_base_stat" = "$pre_base_stat" ]; then
+                fail "target 설치 세대가 pre 이후 변경되지 않았습니다."
+            fi
+            ;;
+        *)
+            fail "pre target 설치 상태 baseline이 올바르지 않습니다."
+            ;;
+    esac
+    cat >"${RUN_DIR}/install-freshness.txt" <<EOF
+preTargetPresent=$pre_present
+preLastUpdateTime=$pre_last_update
+preCodePath=$pre_code_path
+preBaseApkPath=$pre_base_path
+preBaseApkStat=$pre_base_stat
+postLastUpdateTime=$post_last_update
+postCodePath=$post_code_path
+postBaseApkPath=$post_base_path
+postBaseApkStat=$post_base_stat
+installGeneration=fresh
+EOF
 }
 
 capture_samsung_logs() {
-    local start_epoch
-    start_epoch=$(baseline_value preDeviceEpoch)
-    [[ "$start_epoch" =~ ^[0-9]+$ ]] ||
-        fail "pre device epoch baseline이 올바르지 않습니다."
+    local marker_epoch nonce package_name extension_id
+    marker_epoch=$(baseline_value preLogEpoch)
+    nonce=$(baseline_value preLogNonce)
+    package_name=$(baseline_value package)
+    extension_id=$(baseline_value extensionId)
+    [[ "$marker_epoch" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        fail "pre log marker epoch baseline이 올바르지 않습니다."
+    [ -n "$nonce" ] ||
+        fail "pre log marker nonce baseline이 없습니다."
     adb -s "$SERIAL" logcat -d -v epoch >"${RUN_DIR}/logcat-raw.txt"
-    awk -v start="$start_epoch" '$1 + 0 >= start + 0' \
+    rg -Fq "SixBridgeMyFilesGate: ${nonce}" "${RUN_DIR}/logcat-raw.txt" ||
+        fail "pre log marker가 post logcat에 남아 있지 않습니다."
+    awk -v start="$marker_epoch" '$1 + 0 > start + 0' \
         "${RUN_DIR}/logcat-raw.txt" >"${RUN_DIR}/logcat-since-pre.txt"
     rg 'SixPkgUpdater|SixAppDataUpdater' "${RUN_DIR}/logcat-since-pre.txt" \
         >"${RUN_DIR}/samsung-extension.log" || true
-    if ! rg -Fq 'SixPkgUpdater: isDevSixPkg - MyFiles case' \
+    if ! rg -Fq \
+        "SixPkgUpdater: isDevSixPkg - MyFiles case: ${package_name}" \
         "${RUN_DIR}/samsung-extension.log" ||
         ! rg -Fq \
-            'SixAppDataUpdater: updateSixAppData - Allowed to be supported' \
+            "SixAppDataUpdater: updateSixAppData - Allowed to be supported: ${extension_id}" \
             "${RUN_DIR}/samsung-extension.log"; then
-        fail "삼성 지원 로그를 찾지 못했습니다."
+        fail "target-bound 삼성 지원 로그를 찾지 못했습니다."
     fi
 }
 
@@ -466,6 +637,18 @@ capture_discovery() {
         fail "wrapper six://ex discovery Activity를 resolve하지 못했습니다."
 }
 
+consume_current_run() {
+    local current
+    current=$(sed -n '1p' "$CURRENT_RUN_FILE")
+    [ "$current" = "$RUN_DIR" ] ||
+        fail "소비할 pre pointer가 현재 evidence와 다릅니다."
+    [ ! -e "${RUN_DIR}/post-consumed-pointer" ] ||
+        fail "pre pointer가 이미 소비됐습니다."
+    /bin/mv -- "$CURRENT_RUN_FILE" "${RUN_DIR}/post-consumed-pointer" ||
+        fail "성공한 post의 pre pointer를 소비하지 못했습니다."
+    printf 'completed\n' >"${RUN_DIR}/post-completed.txt"
+}
+
 run_post() {
     local expected_serial expected_package installer originating
     load_current_run
@@ -478,6 +661,7 @@ run_post() {
     assert_device
     capture_install_source "$INPUT"
     extract_installed_apk "$INPUT"
+    assert_install_freshness
     inspect_installed_identity
     capture_samsung_logs
     capture_discovery "$INPUT"
@@ -493,12 +677,14 @@ classification=dev_ext
 support=Allowed to be supported
 wrapperByteIdentity=matched
 EOF
+    consume_current_run
     cat "${RUN_DIR}/post-summary.txt"
     printf 'evidence=%s\n' "$RUN_DIR"
 }
 
 ensure_tools
 ensure_evidence_root
+acquire_serial_lock
 case "$MODE" in
     pre) run_pre ;;
     post) run_post ;;
