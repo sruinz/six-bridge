@@ -31,6 +31,7 @@ import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
+import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -98,7 +99,7 @@ class ManagerViewModel(
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
     private var firstInstallStateObserved = false
-    private var deferredInitialTerminal: InstallState? = null
+    private val deferredInitialTerminals = ArrayDeque<InstallState>()
     private var lastInstallState: InstallState? = null
     private var ownedReviewToken: String? = null
     private val pendingReviewDiscards = linkedSetOf<String>()
@@ -1049,7 +1050,7 @@ class ManagerViewModel(
                     it.phase == GeneratedCleanupPhase.CONVERSION
             }
             if (generation != operationGeneration) {
-                deferredInitialTerminal = null
+                deferredInitialTerminals.clear()
                 if (intermediateCleanup == null) {
                     restored.review?.token?.let(::queuePendingReviewDiscard)
                 }
@@ -1059,7 +1060,7 @@ class ManagerViewModel(
                 return@launch
             }
             if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
-                deferredInitialTerminal = null
+                deferredInitialTerminals.clear()
                 if (reconcileRestoredNormalHandoffAfterStartupMismatch(restored)) {
                     markStartupRecoveryReady()
                 }
@@ -1192,12 +1193,6 @@ class ManagerViewModel(
                 markStartupRecoveryReady()
                 return@launch
             }
-            var deferredTerminal = deferredInitialTerminal
-            deferredInitialTerminal = null
-            if (restored.review == null && deferredTerminal != null) {
-                reconcileDeferredInitialTerminals(deferredTerminal)
-                deferredTerminal = null
-            }
             if (restored.review == null ||
                 generatedInstallOwnerToken != null ||
                 resultOwner != null
@@ -1227,18 +1222,18 @@ class ManagerViewModel(
             val generatedOwner = generatedInstallOwnerToken
             if (generatedOwner != null) {
                 val ready = mutableState.value.conversionState as? ConversionUiState.ResultReady
-                if (ready?.token != generatedOwner || restored.review == null) {
+                if (ready?.token != generatedOwner || ready.review == null) {
                     clearGeneratedInstallOwner()
                     restored.review?.let(::showReview)
                 } else {
-                    reconcileDeferredInitialTerminals(deferredTerminal)
+                    reconcileDeferredInitialTerminals()
                 }
             }
             if (generatedInstallOwnerToken == null &&
                 resultOwner == null &&
                 restored.review != null
             ) {
-                reconcileDeferredInitialTerminals(deferredTerminal)
+                reconcileDeferredInitialTerminals()
             }
             pendingGeneratedTerminalHandoff?.let { handoff ->
                 if (!resumeGeneratedTerminalHandoff(handoff, restored.terminal)) {
@@ -1273,15 +1268,9 @@ class ManagerViewModel(
         }
     }
 
-    private suspend fun reconcileDeferredInitialTerminals(
-        initialTerminal: InstallState?,
-    ) {
-        var terminal = deferredInitialTerminal ?: initialTerminal
-        deferredInitialTerminal = null
-        while (terminal != null) {
-            applyObservedInstallTerminal(terminal)
-            terminal = deferredInitialTerminal
-            deferredInitialTerminal = null
+    private suspend fun reconcileDeferredInitialTerminals() {
+        while (deferredInitialTerminals.isNotEmpty()) {
+            applyObservedInstallTerminal(deferredInitialTerminals.removeFirst())
         }
     }
 
@@ -1407,9 +1396,10 @@ class ManagerViewModel(
                     StartupRecoveryUiState.INITIALIZING
                 ) {
                     if (installState.isTerminalState() &&
-                        savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
+                        (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null ||
+                            generatedInstallOwnerToken != null)
                     ) {
-                        deferredInitialTerminal = installState
+                        deferredInitialTerminals.addLast(installState)
                     }
                     return@collect
                 }
@@ -1419,7 +1409,7 @@ class ManagerViewModel(
                     savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
                 ) {
                     if (!initialized) {
-                        deferredInitialTerminal = installState
+                        deferredInitialTerminals.addLast(installState)
                         return@collect
                     }
                     if (ownedReviewToken != null && generatedInstallOwnerToken == null) {

@@ -266,6 +266,79 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `초기 terminal snapshot 뒤 conversion restore 중 새 exact terminal은 owner 복원 후 reconcile한다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val conversionResult = CompletableDeferred<RestoredConversion?>()
+            val installed = InstallState.Installed(PACKAGE)
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeDeferred = initializeResult
+                restoreConversionDeferred = conversionResult
+                installFlow.value = InstallState.Cancelled
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = installed
+                terminalOwnerProofConfigured = true
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = null,
+                    installSessionId = 41,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.restoreConversionRequests)
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            repository.installFlow.value = installed
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            conversionResult.complete(
+                RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(savedState))
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
     fun `recovery blocked 보고서 왕복은 고정 메시지를 보존한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
