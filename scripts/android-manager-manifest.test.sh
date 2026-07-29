@@ -169,6 +169,20 @@ apk_permission_contract() {
     done < <(apk_permission_names "${xmltree}")
 }
 
+my_files_query_contract() {
+    local manifest="$1"
+    local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
+
+    assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.myfiles']" 1 \
+        "Samsung My Files package query must be declared once"
+}
+
+source_and_rendered_my_files_query_contract() {
+    my_files_query_contract "$1"
+    my_files_query_contract "$2"
+}
+
 manifest_contract() {
     local manifest="$1"
     local package_check="$2"
@@ -218,9 +232,6 @@ manifest_contract() {
     assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.sbrowser']" 1 \
         "Samsung Internet package query must be declared once"
-    assert_xpath_count "${manifest}" \
-        "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.myfiles']" 1 \
-        "Samsung My Files package query must be declared once"
     assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='intent'][*[local-name()='action'][${attr_name}='android.intent.action.VIEW'] and *[local-name()='data'][@*[local-name()='scheme' and namespace-uri()='${ANDROID_NS}']='internet' and @*[local-name()='host' and namespace-uri()='${ANDROID_NS}']='extension']]" 1 \
         "internet://extension VIEW intent query must be declared once"
@@ -626,6 +637,28 @@ run_permission_self_test() {
         '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '</manifest>' \
         >"${fixture_dir}/source-missing.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '  </queries>' \
+        '</manifest>' \
+        >"${fixture_dir}/my-files-query-present.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.sbrowser" />' \
+        '  </queries>' \
+        '</manifest>' \
+        >"${fixture_dir}/my-files-query-missing.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '  </queries>' \
+        '</manifest>' \
+        >"${fixture_dir}/my-files-query-duplicate.xml"
 
     printf '%s\n' \
         'N: android=http://schemas.android.com/apk/res/android' \
@@ -688,6 +721,26 @@ run_permission_self_test() {
         "${fixture_dir}/apk-missing.xmltree" >"${output_file}" 2>&1; then
         fail "self-test: APK missing required permission was accepted"
     fi
+    if ! bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source and rendered My Files package queries were rejected"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/my-files-query-missing.xml" >"${output_file}" 2>&1; then
+        fail "self-test: rendered manifest missing My Files package query was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+        "${fixture_dir}/my-files-query-missing.xml" \
+        "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source manifest missing My Files package query was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/my-files-query-duplicate.xml" >"${output_file}" 2>&1; then
+        fail "self-test: rendered manifest duplicate My Files package query was accepted"
+    fi
 
     printf 'PASS: permission variant self-test\n'
 }
@@ -710,6 +763,15 @@ if [[ "${1:-}" == "--check-apk-permissions" ]]; then
         fail "usage: $0 --check-apk-permissions <aapt2-xmltree>"
     [[ -f "$2" ]] || fail "APK permission fixture is missing: $2"
     apk_permission_contract "$2"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--check-source-and-rendered-my-files-query" ]]; then
+    [[ "$#" == "3" ]] ||
+        fail "usage: $0 --check-source-and-rendered-my-files-query <source-manifest> <rendered-manifest>"
+    [[ -f "$2" ]] || fail "source manifest fixture is missing: $2"
+    [[ -f "$3" ]] || fail "rendered manifest fixture is missing: $3"
+    source_and_rendered_my_files_query_contract "$2" "$3"
     exit 0
 fi
 
@@ -752,6 +814,8 @@ trap 'rm -rf "${inspection_dir}"' EXIT
 JAVA_HOME="${java_runtime_home}" \
     "${APKANALYZER}" manifest print "${DEBUG_APK}" >"${rendered_manifest}"
 "${AAPT2}" dump xmltree "${DEBUG_APK}" --file AndroidManifest.xml >"${apk_xmltree}"
+source_and_rendered_my_files_query_contract \
+    "${SOURCE_MANIFEST}" "${rendered_manifest}"
 apk_icon_contract "${DEBUG_APK}" "${inspection_dir}" "${rendered_manifest}"
 
 apk_permission_contract "${apk_xmltree}"
