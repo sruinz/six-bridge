@@ -285,6 +285,7 @@ internal class DefaultManagerRepository(
         pendingStore = pendingStore,
         catalogPublisher = catalogPublisher,
         ioDispatcher = ioDispatcher,
+        afterStartupCleanup = systemInstallCoordinator::reconcileAfterStartupCleanup,
     )
 
     override val catalog: Flow<List<CatalogRecord>> = catalogPublisher.state
@@ -643,6 +644,7 @@ internal class RepositoryStartup(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val retryDelayMillis: Long = 250,
     private val maxAttempts: Int = 3,
+    private val afterStartupCleanup: suspend () -> Unit = {},
 ) {
     private val mutex = Mutex()
     private val ready = CompletableDeferred<StartupSnapshot>()
@@ -697,6 +699,7 @@ internal class RepositoryStartup(
                         }
                     }
                     startupCleanup.run()
+                    afterStartupCleanup()
                     val recovery = when (val snapshot = pendingStore.recoveryStoreSnapshot()) {
                         is RecoveryStoreSnapshot.Valid -> snapshot
                         RecoveryStoreSnapshot.Invalid -> {

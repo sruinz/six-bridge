@@ -44,6 +44,10 @@ class SystemInstallCoordinator(
 
     val state: StateFlow<InstallState> = mutableState.asStateFlow()
 
+    suspend fun reconcileAfterStartupCleanup() = mutex.withLock {
+        mutableState.value = restoreState()
+    }
+
     fun ownsHandoff(importToken: String): Boolean =
         when (val snapshot = handoffStore.snapshot()) {
             is RecoveryRecordSnapshot.Present -> snapshot.value.importToken == importToken

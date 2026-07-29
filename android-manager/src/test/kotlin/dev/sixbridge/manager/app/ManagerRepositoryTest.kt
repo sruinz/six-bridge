@@ -225,6 +225,38 @@ class ManagerRepositoryTest {
         }
 
     @Test
+    fun `PREPARED cold start cleanup 뒤 Idle로 동기화되어 다시 내보낼 수 있다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("apk-export-retry-after-recreation")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+            val recreated = managerRepository(
+                root = fixture.root,
+                retainedImports = fixture.retainedImports,
+                gateway = fixture.legacyGateway,
+                pendingStore = fixture.pendingStore,
+                installed = fixture.installed,
+                catalog = fixture.catalog,
+                coordinator = fixture.legacyCoordinator,
+                systemCoordinator = systemInstallCoordinator(
+                    pendingStore = fixture.pendingStore,
+                    installed = fixture.installed,
+                    handoffStore = fixture.handoffStore,
+                ),
+                systemInstallStore = fixture.handoffStore,
+            )
+
+            val restoredReview = assertNotNull(recreated.initialize(TOKEN, null).review)
+
+            assertEquals(InstallState.Idle, recreated.installState.value)
+            assertEquals(
+                InstallState.PreparingApkExport(TOKEN),
+                recreated.install(restoredReview, partialConfirmed = true),
+            )
+            assertNotNull(recreated.installApkExport(TOKEN))
+        }
+
+    @Test
     fun `repository cancel은 PREPARED system handoff와 private import를 정리한다`() =
         runTest {
             val fixture = systemRepositoryFixture("cancel-prepared-export")

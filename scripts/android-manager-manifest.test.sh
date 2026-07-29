@@ -44,14 +44,14 @@ source_permission_contract() {
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
     local permission_elements="/*[local-name()='manifest']/*[starts-with(local-name(), 'uses-permission')]"
     local permission
-    local allowed_permissions="${attr_name}='android.permission.INTERNET' or ${attr_name}='android.permission.REQUEST_INSTALL_PACKAGES' or ${attr_name}='android.permission.REQUEST_DELETE_PACKAGES' or ${attr_name}='android.permission.POST_NOTIFICATIONS'"
+    local allowed_permissions="${attr_name}='android.permission.INTERNET' or ${attr_name}='android.permission.REQUEST_DELETE_PACKAGES' or ${attr_name}='android.permission.POST_NOTIFICATIONS'"
     local -a required_permissions=(
         "android.permission.INTERNET"
-        "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.REQUEST_DELETE_PACKAGES"
         "android.permission.POST_NOTIFICATIONS"
     )
     local -a forbidden_permissions=(
+        "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.DELETE_PACKAGES"
         "android.permission.QUERY_ALL_PACKAGES"
         "android.permission.READ_EXTERNAL_STORAGE"
@@ -124,11 +124,11 @@ apk_permission_contract() {
     local permission_count
     local -a required_permissions=(
         "android.permission.INTERNET"
-        "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.REQUEST_DELETE_PACKAGES"
         "android.permission.POST_NOTIFICATIONS"
     )
     local -a forbidden_permissions=(
+        "android.permission.REQUEST_INSTALL_PACKAGES"
         "android.permission.DELETE_PACKAGES"
         "android.permission.QUERY_ALL_PACKAGES"
         "android.permission.READ_EXTERNAL_STORAGE"
@@ -157,7 +157,6 @@ apk_permission_contract() {
     while IFS= read -r permission; do
         case "${permission}" in
             android.permission.INTERNET|\
-            android.permission.REQUEST_INSTALL_PACKAGES|\
             android.permission.REQUEST_DELETE_PACKAGES|\
             android.permission.POST_NOTIFICATIONS|\
             dev.sixbridge.manager.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION)
@@ -169,18 +168,29 @@ apk_permission_contract() {
     done < <(apk_permission_names "${xmltree}")
 }
 
-my_files_query_contract() {
+install_surface_manifest_contract() {
     local manifest="$1"
     local attr_name="@*[local-name()='name' and namespace-uri()='${ANDROID_NS}']"
+    local attr_authorities="@*[local-name()='authorities' and namespace-uri()='${ANDROID_NS}']"
+    local permission_elements="/*[local-name()='manifest']/*[starts-with(local-name(), 'uses-permission')]"
 
     assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.myfiles']" 1 \
         "Samsung My Files package query must be declared once"
+    assert_xpath_count "${manifest}" \
+        "${permission_elements}[${attr_name}='android.permission.REQUEST_INSTALL_PACKAGES']" 0 \
+        "REQUEST_INSTALL_PACKAGES must not be declared"
+    assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.google.android.packageinstaller']" 0 \
+        "Google package installer query must not be declared"
+    assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='application']/*[local-name()='provider'][substring(${attr_authorities}, string-length(${attr_authorities}) - string-length('.install') + 1)='.install']" 0 \
+        ".install provider must not be declared"
 }
 
-source_and_rendered_my_files_query_contract() {
-    my_files_query_contract "$1"
-    my_files_query_contract "$2"
+source_and_rendered_install_surface_contract() {
+    install_surface_manifest_contract "$1"
+    install_surface_manifest_contract "$2"
 }
 
 manifest_contract() {
@@ -618,7 +628,6 @@ run_permission_self_test() {
     printf '%s\n' \
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
         '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
-        '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_DELETE_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '</manifest>' >"${fixture_dir}/source-allowed.xml"
@@ -628,12 +637,17 @@ run_permission_self_test() {
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_DELETE_PACKAGES" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
-        '  <uses-permission-sdk-23 android:name="android.permission.DELETE_PACKAGES" />' \
         '</manifest>' >"${fixture_dir}/source-forbidden.xml"
     printf '%s\n' \
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
         '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
-        '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.REQUEST_DELETE_PACKAGES" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
+        '  <uses-permission-sdk-23 android:name="android.permission.DELETE_PACKAGES" />' \
+        '</manifest>' >"${fixture_dir}/source-outside-allowlist.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <uses-permission-sdk-23 android:name="android.permission.INTERNET" />' \
         '  <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />' \
         '</manifest>' \
         >"${fixture_dir}/source-missing.xml"
@@ -659,6 +673,32 @@ run_permission_self_test() {
         '  </queries>' \
         '</manifest>' \
         >"${fixture_dir}/my-files-query-duplicate.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '  </queries>' \
+        '</manifest>' \
+        >"${fixture_dir}/request-install-permission.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '    <package android:name="com.google.android.packageinstaller" />' \
+        '  </queries>' \
+        '</manifest>' \
+        >"${fixture_dir}/google-installer-query.xml"
+    printf '%s\n' \
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+        '  <queries>' \
+        '    <package android:name="com.sec.android.app.myfiles" />' \
+        '  </queries>' \
+        '  <application>' \
+        '    <provider android:authorities="${applicationId}.install" />' \
+        '  </application>' \
+        '</manifest>' \
+        >"${fixture_dir}/install-provider.xml"
 
     printf '%s\n' \
         'N: android=http://schemas.android.com/apk/res/android' \
@@ -666,10 +706,8 @@ run_permission_self_test() {
         '    E: uses-permission-sdk-23 (line=3)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
         '    E: uses-permission-sdk-23 (line=4)' \
-        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
-        '    E: uses-permission-sdk-23 (line=5)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_DELETE_PACKAGES" (Raw: "android.permission.REQUEST_DELETE_PACKAGES")' \
-        '    E: uses-permission-sdk-23 (line=6)' \
+        '    E: uses-permission-sdk-23 (line=5)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
         >"${fixture_dir}/apk-allowed.xmltree"
     printf '%s\n' \
@@ -683,8 +721,6 @@ run_permission_self_test() {
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_DELETE_PACKAGES" (Raw: "android.permission.REQUEST_DELETE_PACKAGES")' \
         '    E: uses-permission-sdk-23 (line=6)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
-        '    E: uses-permission-sdk-23 (line=7)' \
-        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.DELETE_PACKAGES" (Raw: "android.permission.DELETE_PACKAGES")' \
         >"${fixture_dir}/apk-forbidden.xmltree"
     printf '%s\n' \
         'N: android=http://schemas.android.com/apk/res/android' \
@@ -692,8 +728,18 @@ run_permission_self_test() {
         '    E: uses-permission-sdk-23 (line=3)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
         '    E: uses-permission-sdk-23 (line=4)' \
-        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_INSTALL_PACKAGES" (Raw: "android.permission.REQUEST_INSTALL_PACKAGES")' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.REQUEST_DELETE_PACKAGES" (Raw: "android.permission.REQUEST_DELETE_PACKAGES")' \
         '    E: uses-permission-sdk-23 (line=5)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
+        '    E: uses-permission-sdk-23 (line=6)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.DELETE_PACKAGES" (Raw: "android.permission.DELETE_PACKAGES")' \
+        >"${fixture_dir}/apk-outside-allowlist.xmltree"
+    printf '%s\n' \
+        'N: android=http://schemas.android.com/apk/res/android' \
+        '  E: manifest (line=2)' \
+        '    E: uses-permission-sdk-23 (line=3)' \
+        '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")' \
+        '    E: uses-permission-sdk-23 (line=4)' \
         '      A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.POST_NOTIFICATIONS" (Raw: "android.permission.POST_NOTIFICATIONS")' \
         >"${fixture_dir}/apk-missing.xmltree"
 
@@ -703,7 +749,11 @@ run_permission_self_test() {
     fi
     if bash "${BASH_SOURCE[0]}" --check-source-permissions \
         "${fixture_dir}/source-forbidden.xml" >"${output_file}" 2>&1; then
-        fail "self-test: source uses-permission-sdk-23 forbidden permission was accepted"
+        fail "self-test: source REQUEST_INSTALL_PACKAGES was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-permissions \
+        "${fixture_dir}/source-outside-allowlist.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source permission outside the allowlist was accepted"
     fi
     if bash "${BASH_SOURCE[0]}" --check-source-permissions \
         "${fixture_dir}/source-missing.xml" >"${output_file}" 2>&1; then
@@ -715,31 +765,65 @@ run_permission_self_test() {
     fi
     if bash "${BASH_SOURCE[0]}" --check-apk-permissions \
         "${fixture_dir}/apk-forbidden.xmltree" >"${output_file}" 2>&1; then
-        fail "self-test: APK uses-permission-sdk-23 forbidden permission was accepted"
+        fail "self-test: APK REQUEST_INSTALL_PACKAGES was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-apk-permissions \
+        "${fixture_dir}/apk-outside-allowlist.xmltree" >"${output_file}" 2>&1; then
+        fail "self-test: APK permission outside the allowlist was accepted"
     fi
     if bash "${BASH_SOURCE[0]}" --check-apk-permissions \
         "${fixture_dir}/apk-missing.xmltree" >"${output_file}" 2>&1; then
         fail "self-test: APK missing required permission was accepted"
     fi
-    if ! bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+    if ! bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
         "${fixture_dir}/my-files-query-present.xml" \
         "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
-        fail "self-test: source and rendered My Files package queries were rejected"
+        fail "self-test: allowed source and rendered install surface was rejected"
     fi
-    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
         "${fixture_dir}/my-files-query-present.xml" \
         "${fixture_dir}/my-files-query-missing.xml" >"${output_file}" 2>&1; then
         fail "self-test: rendered manifest missing My Files package query was accepted"
     fi
-    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
         "${fixture_dir}/my-files-query-missing.xml" \
         "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
         fail "self-test: source manifest missing My Files package query was accepted"
     fi
-    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-my-files-query \
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
         "${fixture_dir}/my-files-query-present.xml" \
         "${fixture_dir}/my-files-query-duplicate.xml" >"${output_file}" 2>&1; then
         fail "self-test: rendered manifest duplicate My Files package query was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/request-install-permission.xml" \
+        "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source REQUEST_INSTALL_PACKAGES surface was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/request-install-permission.xml" >"${output_file}" 2>&1; then
+        fail "self-test: rendered REQUEST_INSTALL_PACKAGES surface was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/google-installer-query.xml" \
+        "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source Google package installer query was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/google-installer-query.xml" >"${output_file}" 2>&1; then
+        fail "self-test: rendered Google package installer query was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/install-provider.xml" \
+        "${fixture_dir}/my-files-query-present.xml" >"${output_file}" 2>&1; then
+        fail "self-test: source .install provider was accepted"
+    fi
+    if bash "${BASH_SOURCE[0]}" --check-source-and-rendered-install-surface \
+        "${fixture_dir}/my-files-query-present.xml" \
+        "${fixture_dir}/install-provider.xml" >"${output_file}" 2>&1; then
+        fail "self-test: rendered .install provider was accepted"
     fi
 
     printf 'PASS: permission variant self-test\n'
@@ -766,12 +850,12 @@ if [[ "${1:-}" == "--check-apk-permissions" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "--check-source-and-rendered-my-files-query" ]]; then
+if [[ "${1:-}" == "--check-source-and-rendered-install-surface" ]]; then
     [[ "$#" == "3" ]] ||
-        fail "usage: $0 --check-source-and-rendered-my-files-query <source-manifest> <rendered-manifest>"
+        fail "usage: $0 --check-source-and-rendered-install-surface <source-manifest> <rendered-manifest>"
     [[ -f "$2" ]] || fail "source manifest fixture is missing: $2"
     [[ -f "$3" ]] || fail "rendered manifest fixture is missing: $3"
-    source_and_rendered_my_files_query_contract "$2" "$3"
+    source_and_rendered_install_surface_contract "$2" "$3"
     exit 0
 fi
 
@@ -814,7 +898,7 @@ trap 'rm -rf "${inspection_dir}"' EXIT
 JAVA_HOME="${java_runtime_home}" \
     "${APKANALYZER}" manifest print "${DEBUG_APK}" >"${rendered_manifest}"
 "${AAPT2}" dump xmltree "${DEBUG_APK}" --file AndroidManifest.xml >"${apk_xmltree}"
-source_and_rendered_my_files_query_contract \
+source_and_rendered_install_surface_contract \
     "${SOURCE_MANIFEST}" "${rendered_manifest}"
 apk_icon_contract "${DEBUG_APK}" "${inspection_dir}" "${rendered_manifest}"
 
