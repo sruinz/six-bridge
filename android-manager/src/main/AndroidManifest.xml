@@ -16,6 +16,7 @@
         </intent>
 
         <package android:name="com.sec.android.app.sbrowser" />
+        <package android:name="com.sec.android.app.myfiles" />
         <package android:name="com.google.android.packageinstaller" />
 
         <intent>

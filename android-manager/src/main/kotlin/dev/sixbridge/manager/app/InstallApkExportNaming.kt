@@ -7,9 +7,12 @@ internal fun suggestedWrapperApkName(
     extensionName: String,
     extensionVersion: String,
     extensionId: String,
+    wrapperVersionCode: Int,
 ): String {
     val safeName = extensionName.safeFileNameSegment().ifBlank { extensionId }
-    val safeVersion = extensionVersion.safeFileNameSegment()
+    val safeVersion = extensionVersion.safeFileNameSegment().ifBlank {
+        wrapperVersionCode.toString()
+    }
     val shortId = extensionId.takeCodePoints(6)
     val suffix = "-$shortId"
     val prefix = "$safeName-$safeVersion"
@@ -19,8 +22,7 @@ internal fun suggestedWrapperApkName(
 }
 
 private fun String.safeFileNameSegment(): String =
-    trim()
-        .replace(unsafeFileNameCharacters, "_")
+    replace(unsafeFileNameCharacters, "_")
         .trim('.', ' ')
 
 private fun String.codePointCount(): Int = codePointCount(0, length)

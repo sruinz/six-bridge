@@ -1611,6 +1611,40 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `정규화 후 빈 export 버전은 wrapper version code로 파일명을 만든다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE).copy(
+                        wrapperVersionCode = 7,
+                    ),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = ".",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+            assertEquals("확장-7-aaaaaa.apk", effect.suggestedFileName)
+        }
+
+    @Test
     fun `검토 설치는 항상 APK 문서 생성 effect를 발행하고 명시 확인에서만 조정한다`() =
         runTest(dispatcher.scheduler) {
             val source = File("/retained/$TOKEN/wrapper.apk")

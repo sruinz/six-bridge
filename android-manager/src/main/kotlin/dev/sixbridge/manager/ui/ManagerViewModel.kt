@@ -1657,10 +1657,9 @@ class ManagerViewModel(
                     expectedSha256 = export.expectedSha256,
                     suggestedFileName = suggestedWrapperApkName(
                         extensionName = export.extensionName,
-                        extensionVersion = export.extensionVersion.ifBlank {
-                            ready.review.wrapperVersionCode.toString()
-                        },
+                        extensionVersion = export.extensionVersion,
                         extensionId = export.extensionId,
+                        wrapperVersionCode = ready.review.wrapperVersionCode,
                     ),
                 )
                 setPendingSystemInstallApkDocument(effect)
@@ -3349,10 +3348,9 @@ class ManagerViewModel(
                             expectedSha256 = export.expectedSha256,
                             suggestedFileName = suggestedWrapperApkName(
                                 extensionName = export.extensionName,
-                                extensionVersion = export.extensionVersion.ifBlank {
-                                    readyReview.wrapperVersionCode.toString()
-                                },
+                                extensionVersion = export.extensionVersion,
                                 extensionId = export.extensionId,
+                                wrapperVersionCode = readyReview.wrapperVersionCode,
                             ),
                         ),
                     )

@@ -219,6 +219,9 @@ manifest_contract() {
         "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.sbrowser']" 1 \
         "Samsung Internet package query must be declared once"
     assert_xpath_count "${manifest}" \
+        "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='package'][${attr_name}='com.sec.android.app.myfiles']" 1 \
+        "Samsung My Files package query must be declared once"
+    assert_xpath_count "${manifest}" \
         "/*[local-name()='manifest']/*[local-name()='queries']/*[local-name()='intent'][*[local-name()='action'][${attr_name}='android.intent.action.VIEW'] and *[local-name()='data'][@*[local-name()='scheme' and namespace-uri()='${ANDROID_NS}']='internet' and @*[local-name()='host' and namespace-uri()='${ANDROID_NS}']='extension']]" 1 \
         "internet://extension VIEW intent query must be declared once"
     assert_xpath_count "${manifest}" "${launcher_activity}[${attr_exported}='true']" 1 \
