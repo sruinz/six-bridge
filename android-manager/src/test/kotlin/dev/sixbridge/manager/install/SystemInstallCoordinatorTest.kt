@@ -9,6 +9,7 @@ import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
+import dev.sixbridge.manager.wrapper.InstallSourceEvidence
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import java.io.File
@@ -30,64 +31,160 @@ class SystemInstallCoordinatorTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `기대 신원이 설치되면 session 없는 SYSTEM_INSTALLER success receipt를 만든다`() =
-        runTest {
-            val fixture = fixture(actual = expectedInstalled())
-            fixture.launch()
+    fun `정상 요청은 installer launch 없이 export required를 반환한다`() = runTest {
+        val fixture = fixture()
 
-            assertEquals(
-                InstallState.Installed(PACKAGE),
-                fixture.coordinator.reconcileAfterReturn(),
+        val result = fixture.coordinator.request(fixture.bundle, partialConfirmed = false)
+
+        val export = assertIs<SystemInstallRequestResult.ExportRequired>(result)
+        assertEquals(TOKEN, export.state.importToken)
+        assertEquals(
+            SystemInstallStage.PREPARED,
+            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                fixture.handoffStore.snapshot(),
+            ).value.stage,
+        )
+        assertEquals(0, fixture.gateway.createLaunchCalls)
+    }
+
+    @Test
+    fun `같은 버전 설치본의 APK hash를 확보하지 못하면 내보내기 전에 거부한다`() = runTest {
+        val fixture = fixture(previous = expectedInstalled())
+
+        assertEquals(
+            SystemInstallRequestResult.Failed(
+                InstallState.Failed(
+                    "INSTALLED_APK_HASH_UNKNOWN",
+                    "설치된 APK의 무결성을 확인하지 못했습니다.",
+                ),
+            ),
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        assertEquals(0, fixture.gateway.createLaunchCalls)
+    }
+
+    @Test
+    fun `같은 버전 설치본의 APK hash가 변환 결과와 다르면 거부한다`() = runTest {
+        val fixture = fixture(
+            previous = expectedInstalled().copy(apkSha256 = OTHER_SHA),
+        )
+
+        assertEquals(
+            SystemInstallRequestResult.Failed(
+                InstallState.Failed(
+                    "SAME_VERSION_APK_MISMATCH",
+                    "같은 버전의 설치 APK가 변환 결과와 일치하지 않습니다.",
+                ),
+            ),
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+    }
+
+    @Test
+    fun `같은 버전 설치본의 APK hash가 변환 결과와 같으면 내보내기를 허용한다`() = runTest {
+        val fixture = fixture(
+            previous = expectedInstalled().copy(apkSha256 = WRAPPER_SHA),
+        )
+
+        assertIs<SystemInstallRequestResult.ExportRequired>(
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+    }
+
+    @Test
+    fun `내 파일 출처와 정확 신원을 함께 확인해야 installed receipt를 만든다`() =
+        runTest {
+            val fixture = fixture(
+                actual = expectedInstalled().copy(
+                    apkSha256 = WRAPPER_SHA,
+                    installSourceEvidence = InstallSourceEvidence.Known(
+                        GOOGLE_PACKAGE_INSTALLER,
+                        SAMSUNG_MY_FILES,
+                    ),
+                ),
+            )
+            assertIs<SystemInstallRequestResult.ExportRequired>(
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+            )
+            assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+
+            assertIs<InstallState.Installed>(
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
             )
             assertEquals(
-                FinalReceiptOrigin.SYSTEM_INSTALLER,
+                FinalReceiptOrigin.MY_FILES,
                 fixture.pendingStore.loadFinalReceipt()?.origin,
             )
-            assertNull(fixture.pendingStore.loadFinalReceipt()?.sessionId)
-            assertNull(fixture.pendingStore.loadFinalReceipt()?.rawTerminalAtEpochMillis)
-            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-            assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
+            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
         }
 
     @Test
-    fun `업데이트 취소로 기존 신원이 남으면 Cancelled로 조정한다`() = runTest {
-        val previous = oldInstalled()
-        val fixture = fixture(previous = previous, actual = previous)
-        fixture.launch()
+    fun `ADB 출처도 정확 신원 확인 뒤 installed로 조정한다`() = runTest {
+        val fixture = fixture(
+            actual = expectedInstalled().copy(
+                apkSha256 = WRAPPER_SHA,
+                installSourceEvidence = InstallSourceEvidence.Known(null, null),
+            ),
+        )
+        assertIs<SystemInstallRequestResult.ExportRequired>(
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+        assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
 
-        assertEquals(InstallState.Cancelled, fixture.coordinator.reconcileAfterReturn())
+        assertIs<InstallState.Installed>(
+            fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+        )
     }
 
     @Test
-    fun `실제 설치본이 없으면 Cancelled로 조정한다`() = runTest {
-        val fixture = fixture(actual = null)
-        fixture.launch()
-
-        assertEquals(InstallState.Cancelled, fixture.coordinator.reconcileAfterReturn())
-    }
-
-    @Test
-    fun `signer version extension ID 중 하나라도 다르면 identity conflict다`() = runTest {
-        listOf(
-            expectedInstalled().copy(signerSha256 = OTHER_SHA),
-            expectedInstalled().copy(versionCode = VERSION + 1),
-            expectedInstalled().copy(extensionId = OTHER_EXTENSION_ID),
-        ).forEach { actual ->
-            val fixture = fixture(actual = actual)
-            fixture.launch()
-
-            assertEquals(
-                InstallState.Failed(
-                    "INSTALLED_IDENTITY_MISMATCH",
-                    "설치된 래퍼 신원이 일치하지 않습니다.",
+    fun `manager origin 설치는 unsupported source로 실패한다`() = runTest {
+        val fixture = fixture(
+            actual = expectedInstalled().copy(
+                apkSha256 = WRAPPER_SHA,
+                installSourceEvidence = InstallSourceEvidence.Known(
+                    GOOGLE_PACKAGE_INSTALLER,
+                    "dev.sixbridge.manager",
                 ),
-                fixture.coordinator.reconcileAfterReturn(),
-            )
-        }
+            ),
+        )
+        assertIs<SystemInstallRequestResult.ExportRequired>(
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+        assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+
+        assertEquals(
+            "UNSUPPORTED_INSTALL_SOURCE",
+            assertIs<InstallState.Failed>(
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            ).code,
+        )
     }
 
     @Test
-    fun `기존 래퍼와 새 래퍼 signer가 다르면 설치 화면을 열기 전에 거부한다`() =
+    fun `설치 출처를 확인하지 못하면 source unknown으로 실패한다`() = runTest {
+        val fixture = fixture(
+            actual = expectedInstalled().copy(
+                apkSha256 = WRAPPER_SHA,
+                installSourceEvidence = InstallSourceEvidence.Unavailable,
+            ),
+        )
+        assertIs<SystemInstallRequestResult.ExportRequired>(
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+        )
+        assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+
+        assertEquals(
+            "INSTALL_SOURCE_UNKNOWN",
+            assertIs<InstallState.Failed>(
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            ).code,
+        )
+    }
+
+    @Test
+    fun `기존 래퍼와 새 래퍼 signer가 다르면 내보내기 전에 거부한다`() =
         runTest {
             val fixture = fixture(previous = oldInstalled().copy(signerSha256 = OTHER_SHA))
 
@@ -105,7 +202,7 @@ class SystemInstallCoordinatorTest {
         }
 
     @Test
-    fun `요청 직전 retained wrapper digest가 달라지면 설치 화면을 만들지 않는다`() =
+    fun `요청 직전 retained wrapper digest가 달라지면 내보내기 record를 만들지 않는다`() =
         runTest {
             val fixture = fixture()
             fixture.bundle.wrapperFile.writeText("tampered")
@@ -124,45 +221,22 @@ class SystemInstallCoordinatorTest {
         }
 
     @Test
-    fun `unknown sources 권한이 없으면 handoff를 준비하지 않는다`() = runTest {
+    fun `unknown sources 권한과 무관하게 직접 installer 없이 내보내기를 준비한다`() = runTest {
         val fixture = fixture(canRequestPackageInstalls = false)
 
-        assertEquals(
-            SystemInstallRequestResult.UnknownSourcesPermissionRequired,
+        assertIs<SystemInstallRequestResult.ExportRequired>(
             fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
         )
-        assertEquals(
-            InstallState.UnknownSourcesPermissionRequired,
-            fixture.coordinator.state.value,
-        )
-        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-    }
-
-    @Test
-    fun `허용된 system installer가 없으면 copy 전 PREPARED handoff를 남긴다`() = runTest {
-        val fixture = fixture(
-            launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
-        )
-
-        assertEquals(
-            SystemInstallRequestResult.MyFilesFallbackRequired,
-            fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
-        )
-        val handoff = assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-            fixture.handoffStore.snapshot(),
-        ).value
-        assertEquals(SystemInstallStage.PREPARED, handoff.stage)
-        assertEquals(InstallState.PreparingSystemInstaller, fixture.coordinator.state.value)
+        assertEquals(0, fixture.gateway.createLaunchCalls)
     }
 
     @Test
     fun `manual export는 foreground에서 조정하지 않고 정확한 token 확인에서만 조정한다`() =
         runTest {
             val fixture = fixture(
-                launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
-                actual = expectedInstalled(),
+                actual = verifiedInstalled(),
             )
-            assertIs<SystemInstallRequestResult.MyFilesFallbackRequired>(
+            assertIs<SystemInstallRequestResult.ExportRequired>(
                 fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
             )
 
@@ -182,7 +256,7 @@ class SystemInstallCoordinatorTest {
         }
 
     @Test
-    fun `launch 생성 뒤 handoff prepare가 실패하면 URI 권한을 즉시 회수한다`() = runTest {
+    fun `handoff prepare가 실패해도 installer URI를 만들거나 회수하지 않는다`() = runTest {
         val fixture = fixture()
         fixture.handoffStore.prepareFailure = true
 
@@ -195,57 +269,13 @@ class SystemInstallCoordinatorTest {
             ),
             fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
         )
-        assertEquals(1, fixture.gateway.createLaunchCalls)
-        assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
+        assertEquals(0, fixture.gateway.createLaunchCalls)
+        assertTrue(fixture.gateway.revoked.isEmpty())
         assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
     }
 
     @Test
-    fun `launch 성공 표시는 정확한 owner의 PREPARED record만 LAUNCHED로 바꾼다`() =
-        runTest {
-            val fixture = fixture()
-            val result = assertIs<SystemInstallRequestResult.Launch>(
-                fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
-            )
-
-            assertEquals(
-                InstallState.AwaitingSystemInstaller(TOKEN),
-                result.state,
-            )
-            assertFalse(fixture.coordinator.markLaunchSucceeded(OTHER_TOKEN))
-            assertTrue(fixture.coordinator.markLaunchSucceeded(TOKEN))
-            assertFalse(fixture.coordinator.markLaunchSucceeded(TOKEN))
-            val record = assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                fixture.handoffStore.snapshot(),
-            ).value
-            assertEquals(SystemInstallStage.LAUNCHED, record.stage)
-        }
-
-    @Test
-    fun `launch 실패 표시는 재시도를 위해 PREPARED record와 상태를 유지한다`() =
-        runTest {
-            val fixture = fixture()
-            assertIs<SystemInstallRequestResult.Launch>(
-                fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
-            )
-
-            assertFalse(fixture.coordinator.markLaunchFailed(OTHER_TOKEN))
-            assertTrue(fixture.coordinator.markLaunchFailed(TOKEN))
-            assertEquals(
-                SystemInstallStage.PREPARED,
-                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                    fixture.handoffStore.snapshot(),
-                ).value.stage,
-            )
-            assertTrue(fixture.gateway.revoked.isEmpty())
-            assertEquals(
-                InstallState.AwaitingSystemInstaller(TOKEN),
-                fixture.coordinator.state.value,
-            )
-        }
-
-    @Test
-    fun `legacy pending recovery가 있으면 신규 시스템 설치 화면을 만들지 않는다`() =
+    fun `legacy pending recovery가 있으면 신규 APK 내보내기를 만들지 않는다`() =
         runTest {
             val fixture = fixture()
             fixture.pendingStore.pending = PendingInstall(
@@ -267,7 +297,7 @@ class SystemInstallCoordinatorTest {
         val legacyGateway = FakeLegacyPackageInstallGateway()
         val fixture = fixture()
 
-        fixture.launch()
+        fixture.export()
 
         assertTrue(
             SystemInstallCoordinator::class.java.declaredConstructors
@@ -280,17 +310,17 @@ class SystemInstallCoordinatorTest {
     }
 
     @Test
-    fun `receipt commit 실패는 launched record를 보존하고 fail closed한다`() = runTest {
-        val fixture = fixture(actual = expectedInstalled())
+    fun `receipt commit 실패는 exported record를 보존하고 fail closed한다`() = runTest {
+        val fixture = fixture(actual = verifiedInstalled())
         fixture.pendingStore.createFinalFailure = true
-        fixture.launch()
+        fixture.export()
 
         assertEquals(
             InstallState.Failed(
                 "RECOVERY_WRITE_FAILED",
                 "시스템 설치 결과를 저장하지 못했습니다.",
             ),
-            fixture.coordinator.reconcileAfterReturn(),
+            fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
         )
         assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
             fixture.handoffStore.snapshot(),
@@ -302,18 +332,18 @@ class SystemInstallCoordinatorTest {
     fun `durable receipt 다음 handoff clear 실패는 재생성 coordinator가 마무리한다`() =
         runTest {
             val events = mutableListOf<String>()
-            val fixture = fixture(actual = expectedInstalled(), events = events)
+            val fixture = fixture(actual = verifiedInstalled(), events = events)
             fixture.handoffStore.clearFailure = true
-            fixture.launch()
+            fixture.export()
 
             assertEquals(
                 InstallState.Failed(
                     "RECOVERY_WRITE_FAILED",
                     "시스템 설치 결과를 저장하지 못했습니다.",
                 ),
-                fixture.coordinator.reconcileAfterReturn(),
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
             )
-            assertEquals(FinalReceiptOrigin.SYSTEM_INSTALLER, fixture.pendingStore.receipt?.origin)
+            assertEquals(FinalReceiptOrigin.MY_FILES, fixture.pendingStore.receipt?.origin)
             assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
                 fixture.handoffStore.snapshot(),
             )
@@ -321,57 +351,69 @@ class SystemInstallCoordinatorTest {
 
             fixture.handoffStore.clearFailure = false
             val recreated = fixture.newCoordinator()
-            assertEquals(InstallState.Installed(PACKAGE), recreated.reconcileAfterReturn())
+            assertEquals(
+                InstallState.Installed(PACKAGE),
+                recreated.reconcileManualAfterUserCheck(TOKEN),
+            )
             assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-            assertEquals(listOf("receipt", "clear", "clear", "revoke"), events)
+            assertEquals(listOf("receipt", "clear", "clear"), events)
+            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
         }
 
     @Test
-    fun `handoff clear 뒤 revoke 실패는 durable receipt token으로 재시도한다`() = runTest {
-        val fixture = fixture(actual = expectedInstalled())
-        fixture.gateway.revokeFailuresRemaining = 1
-        fixture.launch()
+    fun `업데이트 취소로 기존 신원이 남으면 MY_FILES Cancelled receipt를 만든다`() = runTest {
+        val previous = oldInstalled()
+        val fixture = fixture(previous = previous, actual = previous)
+        fixture.export()
 
         assertEquals(
-            InstallState.Failed(
-                "RECOVERY_WRITE_FAILED",
-                "시스템 설치 결과를 저장하지 못했습니다.",
-            ),
-            fixture.coordinator.reconcileAfterReturn(),
+            InstallState.Cancelled,
+            fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
         )
-        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-        assertEquals(FinalReceiptOrigin.SYSTEM_INSTALLER, fixture.pendingStore.receipt?.origin)
-        assertEquals(1, fixture.gateway.revokeAttempts)
-        assertTrue(fixture.gateway.revoked.isEmpty())
-
-        assertEquals(
-            InstallState.Installed(PACKAGE),
-            fixture.newCoordinator().reconcileAfterReturn(),
-        )
-        assertEquals(2, fixture.gateway.revokeAttempts)
-        assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
+        assertEquals(FinalReceiptOrigin.MY_FILES, fixture.pendingStore.receipt?.origin)
     }
 
     @Test
-    fun `cancel은 owner가 일치하는 handoff만 지우고 URI 권한과 import를 정리한다`() =
+    fun `signer version extension ID hash 중 하나라도 다르면 identity conflict다`() =
         runTest {
-            val fixture = fixture()
-            fixture.launch()
+            listOf(
+                verifiedInstalled().copy(signerSha256 = OTHER_SHA),
+                verifiedInstalled().copy(versionCode = VERSION + 1),
+                verifiedInstalled().copy(extensionId = OTHER_EXTENSION_ID),
+                verifiedInstalled().copy(apkSha256 = OTHER_SHA),
+            ).forEach { actual ->
+                val fixture = fixture(actual = actual)
+                fixture.export()
 
-            assertEquals(
-                InstallCleanupResult.OwnerMismatch,
-                fixture.coordinator.cancel(OTHER_TOKEN),
-            )
-            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                fixture.handoffStore.snapshot(),
-            )
-            assertEquals(
-                InstallCleanupResult.Cleaned,
-                fixture.coordinator.cancel(TOKEN),
-            )
-            assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
-            assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+                assertEquals(
+                    InstallState.Failed(
+                        "INSTALLED_IDENTITY_MISMATCH",
+                        "설치된 래퍼 신원이 일치하지 않습니다.",
+                    ),
+                    fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+                )
+            }
         }
+
+    @Test
+    fun `cancel은 owner가 일치하는 handoff와 private import만 정리한다`() = runTest {
+        val fixture = fixture()
+        fixture.export()
+
+        assertEquals(
+            InstallCleanupResult.OwnerMismatch,
+            fixture.coordinator.cancel(OTHER_TOKEN),
+        )
+        assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+            fixture.handoffStore.snapshot(),
+        )
+        assertEquals(
+            InstallCleanupResult.Cleaned,
+            fixture.coordinator.cancel(TOKEN),
+        )
+        assertTrue(fixture.gateway.revoked.isEmpty())
+        assertEquals(listOf(TOKEN), fixture.pendingStore.discardedTokens)
+    }
 
     private fun fixture(
         previous: InstalledWrapper? = null,
@@ -478,6 +520,14 @@ class SystemInstallCoordinatorTest {
         signerSha256 = SIGNER_SHA,
     )
 
+    private fun verifiedInstalled() = expectedInstalled().copy(
+        apkSha256 = WRAPPER_SHA,
+        installSourceEvidence = InstallSourceEvidence.Known(
+            GOOGLE_PACKAGE_INSTALLER,
+            SAMSUNG_MY_FILES,
+        ),
+    )
+
     private fun oldInstalled() = expectedInstalled().copy(versionCode = VERSION - 1)
 
     private data class Fixture(
@@ -488,11 +538,11 @@ class SystemInstallCoordinatorTest {
         val coordinator: SystemInstallCoordinator,
         val newCoordinator: () -> SystemInstallCoordinator,
     ) {
-        suspend fun launch() {
-            assertIs<SystemInstallRequestResult.Launch>(
+        suspend fun export() {
+            assertIs<SystemInstallRequestResult.ExportRequired>(
                 coordinator.request(bundle, partialConfirmed = true),
             )
-            assertTrue(coordinator.markLaunchSucceeded(bundle.token))
+            assertTrue(coordinator.markManualExportSucceeded(bundle.token))
         }
     }
 

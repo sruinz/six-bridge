@@ -3,6 +3,7 @@ package dev.sixbridge.manager.install
 sealed interface InstallState {
     data object Idle : InstallState
     data object PreparingSystemInstaller : InstallState
+    data class PreparingApkExport(val importToken: String) : InstallState
     data class AwaitingSystemInstaller(val importToken: String) : InstallState
     data class AwaitingManualInstall(val importToken: String) : InstallState
     data object UnknownSourcesPermissionRequired : InstallState
@@ -74,6 +75,7 @@ enum class FinalReceiptOrigin {
     PROGRAM_CANCEL,
     RAW_TERMINAL,
     SYSTEM_INSTALLER,
+    MY_FILES,
 }
 
 data class FinalInstallReceipt(
@@ -104,7 +106,9 @@ data class FinalInstallReceipt(
                         rawTerminalAtEpochMillis != null &&
                         rawTerminalAtEpochMillis > 0 &&
                         stage != FinalReceiptStage.CANCELLING
-                FinalReceiptOrigin.SYSTEM_INSTALLER ->
+                FinalReceiptOrigin.SYSTEM_INSTALLER,
+                FinalReceiptOrigin.MY_FILES,
+                ->
                     sessionId == null &&
                         rawTerminalAtEpochMillis == null &&
                         stage != FinalReceiptStage.CANCELLING

@@ -23,6 +23,88 @@ class PendingInstallStoreTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `MY_FILES receipt는 재생성 뒤에도 READY ACKNOWLEDGED finalize로 전이한다`() {
+        val context = RuntimeEnvironment.getApplication()
+        val pending = context.getSharedPreferences(
+            "pending_install_store_my_files_test",
+            Context.MODE_PRIVATE,
+        )
+        val recovery = context.getSharedPreferences(
+            "install_recovery_my_files_test",
+            Context.MODE_PRIVATE,
+        )
+        pending.edit().clear().commit()
+        recovery.edit().clear().commit()
+        val ready = myFilesReceipt()
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pending,
+            recoveryPreferences = recovery,
+            importDirectory = File(temporaryFolder.root, "imports"),
+        )
+
+        assertTrue(store.createFinalReceipt(null, null, ready))
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pending,
+            recoveryPreferences = recovery,
+            importDirectory = File(temporaryFolder.root, "imports"),
+        )
+        assertEquals(ready, recreated.loadFinalReceipt())
+        val acknowledged = recreated.acknowledgeFinalReceipt(ready, null)
+        assertEquals(FinalReceiptStage.ACKNOWLEDGED, acknowledged?.stage)
+        assertTrue(recreated.finalizeFinalReceipt(requireNotNull(acknowledged)))
+        assertNull(recreated.loadFinalReceipt())
+    }
+
+    @Test
+    fun `MY_FILES ACKNOWLEDGED receipt는 최초 record로 직접 생성할 수 없다`() {
+        val store = mutableStore()
+        val acknowledged = myFilesReceipt().copy(
+            stage = FinalReceiptStage.ACKNOWLEDGED,
+        )
+
+        assertFalse(store.createFinalReceipt(null, null, acknowledged))
+        assertNull(store.loadFinalReceipt())
+    }
+
+    @Test
+    fun `MY_FILES receipt는 session raw timestamp CANCELLING을 허용하지 않는다`() {
+        assertFailsWith<IllegalArgumentException> {
+            myFilesReceipt().copy(sessionId = 41)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            myFilesReceipt().copy(rawTerminalAtEpochMillis = 2)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            myFilesReceipt().copy(stage = FinalReceiptStage.CANCELLING)
+        }
+    }
+
+    @Test
+    fun `MY_FILES receipt는 raw terminal이 존재하면 생성하지 않는다`() {
+        val store = mutableStore()
+        val claim = requireNotNull(
+            store.tryClaim(PACKAGE, TOKEN, startedAtEpochMillis = 1),
+        )
+        val pending = requireNotNull(store.assignSession(claim, 41))
+        assertTrue(
+            store.recordTerminalResult(
+                PackageInstallResult.Cancelled(41),
+                terminalAtEpochMillis = 2,
+            ),
+        )
+        val raw = requireNotNull(store.loadTerminalResult())
+
+        assertFalse(
+            store.createFinalReceipt(
+                expectedPending = pending,
+                expectedRaw = raw,
+                receipt = myFilesReceipt(),
+            ),
+        )
+        assertNull(store.loadFinalReceipt())
+    }
+
+    @Test
     fun `SYSTEM_INSTALLER receipt는 raw 없이 READY ACKNOWLEDGED finalize로 전이한다`() {
         val store = mutableStore()
         val ready = systemInstallerReceipt()
@@ -195,6 +277,10 @@ class PendingInstallStoreTest {
         origin = FinalReceiptOrigin.SYSTEM_INSTALLER,
         rawTerminalAtEpochMillis = null,
         terminalAtEpochMillis = 3,
+    )
+
+    private fun myFilesReceipt() = systemInstallerReceipt().copy(
+        origin = FinalReceiptOrigin.MY_FILES,
     )
 
     private fun validLegacyFailureRecord(): MutableMap<String, Any> = mutableMapOf(

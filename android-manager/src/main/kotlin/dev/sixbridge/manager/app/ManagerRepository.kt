@@ -246,6 +246,7 @@ interface ManagerRepository {
     suspend fun reconcileCatalog()
 }
 
+@Suppress("DEPRECATION")
 internal class DefaultManagerRepository(
     private val importer: BundleImportService,
     private val retainedImports: RetainedImportStore,
@@ -445,6 +446,7 @@ internal class DefaultManagerRepository(
         val requestState = when (
             val result = systemInstallCoordinator.request(bundle, partialConfirmed)
         ) {
+            is SystemInstallRequestResult.ExportRequired -> result.state
             is SystemInstallRequestResult.Launch -> {
                 launchChannel.send(
                     RepositoryLaunch(

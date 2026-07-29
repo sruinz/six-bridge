@@ -100,10 +100,25 @@ class InstallPolicyTest {
     }
 
     @Test
-    fun `denies an update that is not newer`() {
+    fun `denies an update that is older`() {
         assertEquals(
             InstallDecision.Denied(InstallDenial.VERSION_NOT_NEWER),
-            policy.decide(report(ContractCompatibilityStatus.COMPATIBLE), candidate, installed(versionCode = 20)),
+            policy.decide(report(ContractCompatibilityStatus.COMPATIBLE), candidate, installed(versionCode = 21)),
+        )
+    }
+
+    @Test
+    fun `같은 versionCode의 같은 signer 업데이트를 출처 교정용으로 허용한다`() {
+        assertEquals(
+            InstallDecision.Allowed(
+                InstallOperation.UPDATE,
+                requiresPartialConfirmation = false,
+            ),
+            policy.decide(
+                report(ContractCompatibilityStatus.COMPATIBLE),
+                candidate,
+                installed(versionCode = candidate.versionCode),
+            ),
         )
     }
 

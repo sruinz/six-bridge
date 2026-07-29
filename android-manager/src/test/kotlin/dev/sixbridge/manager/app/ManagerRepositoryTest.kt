@@ -72,6 +72,7 @@ import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.ArchiveInspector
+import dev.sixbridge.manager.wrapper.InstallSourceEvidence
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import dev.sixbridge.manager.wrapper.WrapperVerificationResult
@@ -142,78 +143,60 @@ class ManagerRepositoryTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `검증된 install 요청은 session 대신 system installer launch를 발행한다`() =
+    fun `검증된 install 요청은 launch 없이 APK 내보내기 준비 상태를 반환한다`() =
         runTest {
-            val fixture = systemRepositoryFixture("system-install-launch")
+            val fixture = systemRepositoryFixture("apk-export-required")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
 
             val requestState = fixture.repository.install(review, partialConfirmed = true)
-            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), requestState)
-            val launch = fixture.repository.launches.first()
 
-            assertEquals(LaunchDestination.SYSTEM_INSTALL_CONFIRMATION, launch.destination)
-            assertEquals(TOKEN, launch.installImportToken)
+            assertEquals(InstallState.PreparingApkExport(TOKEN), requestState)
+            assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
+            assertTrue(fixture.systemGateway.revoked.isEmpty())
         }
 
     @Test
-    fun `system installer launch 결과와 복귀 reconcile은 import token 소유권으로 전달한다`() =
+    fun `APK 내보내기와 명시적 확인은 정확한 import token 소유권으로 전달한다`() =
         runTest {
-            val fixture = systemRepositoryFixture("system-install-return")
+            val fixture = systemRepositoryFixture("apk-export-confirmation")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
             fixture.repository.install(review, partialConfirmed = true)
 
-            assertFalse(fixture.repository.markSystemInstallLaunchSucceeded(SECOND_TOKEN))
-            assertTrue(fixture.repository.markSystemInstallLaunchSucceeded(TOKEN))
+            assertFalse(fixture.repository.markSystemInstallApkExported(SECOND_TOKEN))
+            assertTrue(fixture.repository.markSystemInstallApkExported(TOKEN))
             assertEquals(
-                dev.sixbridge.manager.install.SystemInstallStage.LAUNCHED,
+                SystemInstallStage.EXPORTED,
                 assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
                     fixture.handoffStore.snapshot(),
                 ).value.stage,
             )
 
             fixture.installed.values = listOf(
-                installed(version = 2, signer = "a".repeat(64)),
+                installed(version = 2, signer = "a".repeat(64)).copy(
+                    apkSha256 = sha256(File(fixture.root, "$TOKEN/wrapper.apk")),
+                    installSourceEvidence = InstallSourceEvidence.Known(
+                        "com.google.android.packageinstaller",
+                        "com.sec.android.app.myfiles",
+                    ),
+                ),
             )
             assertEquals(
                 InstallState.Installed(PACKAGE),
-                fixture.repository.reconcileSystemInstallAfterReturn(),
+                fixture.repository.reconcileManualSystemInstall(TOKEN),
             )
             assertEquals(
-                FinalReceiptOrigin.SYSTEM_INSTALLER,
+                FinalReceiptOrigin.MY_FILES,
                 fixture.pendingStore.finalReceipt?.origin,
             )
         }
 
     @Test
-    fun `system installer launch 실패는 정확한 import token의 PREPARED를 유지한다`() =
+    fun `PREPARED 내보내기는 재생성 뒤 보존되고 검증된 APK metadata를 반환한다`() =
         runTest {
-            val fixture = systemRepositoryFixture("system-install-launch-failed")
+            val fixture = systemRepositoryFixture("apk-export-recreated")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
             fixture.repository.install(review, partialConfirmed = true)
-
-            assertFalse(fixture.repository.markSystemInstallLaunchFailed(SECOND_TOKEN))
-            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                fixture.handoffStore.snapshot(),
-            )
-            assertTrue(fixture.repository.markSystemInstallLaunchFailed(TOKEN))
-
-            assertEquals(
-                SystemInstallStage.PREPARED,
-                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                    fixture.handoffStore.snapshot(),
-                ).value.stage,
-            )
-            assertTrue(fixture.systemGateway.revoked.isEmpty())
-        }
-
-    @Test
-    fun `LAUNCHED handoff는 프로세스 재생성 뒤 startup에서 보존되고 reconcile 대상으로 복원된다`() =
-        runTest {
-            val fixture = systemRepositoryFixture("system-install-recreated")
-            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
-            fixture.repository.install(review, partialConfirmed = true)
-            assertTrue(fixture.repository.markSystemInstallLaunchSucceeded(TOKEN))
             val recreatedSystemCoordinator = systemInstallCoordinator(
                 root = fixture.root,
                 pendingStore = fixture.pendingStore,
@@ -236,61 +219,16 @@ class ManagerRepositoryTest {
             assertNotNull(recreated.initialize(TOKEN, null).review)
 
             assertEquals(
-                InstallState.AwaitingSystemInstaller(TOKEN),
+                InstallState.PreparingApkExport(TOKEN),
                 recreated.installState.value,
             )
             assertTrue(File(fixture.root, TOKEN).exists())
-            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
-                fixture.handoffStore.snapshot(),
-            )
-            fixture.installed.values = listOf(
-                installed(version = 2, signer = "a".repeat(64)),
-            )
-            assertEquals(
-                InstallState.Installed(PACKAGE),
-                recreated.reconcileSystemInstallAfterReturn(),
-            )
-        }
+            val export = assertNotNull(recreated.systemInstallApkFallback(TOKEN))
 
-    @Test
-    fun `system installer fallback은 검증된 APK metadata를 명시적으로 반환한다`() =
-        runTest {
-            val fixture = systemRepositoryFixture(
-                name = "system-install-fallback",
-                systemGateway = FakeSystemInstallerGateway(
-                    launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
-                ),
-            )
-            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
-
-            val result = fixture.repository.install(review, partialConfirmed = true)
-            val recreatedSystemCoordinator = systemInstallCoordinator(
-                root = fixture.root,
-                pendingStore = fixture.pendingStore,
-                installed = fixture.installed,
-                gateway = fixture.systemGateway,
-                handoffStore = fixture.handoffStore,
-            )
-            val recreated = managerRepository(
-                root = fixture.root,
-                retainedImports = fixture.retainedImports,
-                gateway = fixture.legacyGateway,
-                pendingStore = fixture.pendingStore,
-                installed = fixture.installed,
-                catalog = fixture.catalog,
-                coordinator = fixture.legacyCoordinator,
-                systemCoordinator = recreatedSystemCoordinator,
-                systemInstallStore = fixture.handoffStore,
-            )
-            val fallback = assertNotNull(
-                recreated.systemInstallApkFallback(TOKEN),
-            )
-
-            assertEquals(InstallState.PreparingSystemInstaller, result)
-            assertEquals(TOKEN, fallback.importToken)
-            assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), fallback.source)
-            assertEquals(sha256(fallback.source), fallback.expectedSha256)
-            assertEquals("Example", fallback.extensionName)
+            assertEquals(TOKEN, export.importToken)
+            assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), export.source)
+            assertEquals(sha256(export.source), export.expectedSha256)
+            assertEquals("Example", export.extensionName)
             assertNull(recreated.systemInstallApkFallback("other"))
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
@@ -2124,8 +2062,8 @@ class ManagerRepositoryTest {
 
             val attemptResult = repository.install(review, partialConfirmed = false)
 
-            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), stateBeforeCallback)
-            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), attemptResult)
+            assertEquals(InstallState.PreparingApkExport(TOKEN), stateBeforeCallback)
+            assertEquals(InstallState.PreparingApkExport(TOKEN), attemptResult)
             assertEquals(InstallState.Idle, coordinator.state.value)
             assertNull(pendingStore.record)
             assertTrue(gateway.ownedSessions().isEmpty())

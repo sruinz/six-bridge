@@ -1529,6 +1529,7 @@ class ManagerViewModel(
                 if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
                     InstallState.PreparingSystemInstaller,
+                    is InstallState.PreparingApkExport,
                     is InstallState.AwaitingSystemInstaller,
                     is InstallState.AwaitingManualInstall,
                     -> Unit

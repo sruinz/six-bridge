@@ -48,8 +48,6 @@ import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.install.SharedPreferencesSystemInstallHandoffStore
 import dev.sixbridge.manager.install.SystemInstallCoordinator
 import dev.sixbridge.manager.install.SystemInstallStage
-import dev.sixbridge.manager.install.SystemInstallerGateway
-import dev.sixbridge.manager.install.SystemInstallerLaunchResult
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
 import dev.sixbridge.manager.ui.ConversionUiState
@@ -1022,19 +1020,9 @@ class TerminalHandoffRaceInstrumentedTest {
         )
         private val systemInstallCoordinator = SystemInstallCoordinator(
             policy = InstallPolicy(),
-            gateway = object : SystemInstallerGateway {
-                override fun canRequestPackageInstalls(): Boolean = true
-                override fun unknownSourcesSettingsIntent(): Intent = Intent()
-                override fun createLaunch(apk: File) =
-                    SystemInstallerLaunchResult.MyFilesFallbackRequired
-                override fun revoke(apk: File) = Unit
-            },
             handoffStore = systemInstallStore,
             installedWrappers = durable.installed,
             pendingStore = store,
-            retainedWrapperFile = { token ->
-                File(durable.root, token).resolve("wrapper.apk")
-            },
         )
         val conversion = TestConversionCoordinator().apply {
             configure(durable.bundle.toReview(), durable.generated)

@@ -16,12 +16,19 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 sealed interface SystemInstallRequestResult {
+    data class ExportRequired(
+        val state: InstallState.PreparingApkExport,
+    ) : SystemInstallRequestResult
+
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     data class Launch(
         val state: InstallState.AwaitingSystemInstaller,
         val launch: SystemInstallerLaunch,
     ) : SystemInstallRequestResult
 
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     data object UnknownSourcesPermissionRequired : SystemInstallRequestResult
+    @Deprecated("ExportRequired를 사용합니다.")
     data object MyFilesFallbackRequired : SystemInstallRequestResult
     data class Failed(val state: InstallState.Failed) : SystemInstallRequestResult
 }
@@ -34,16 +41,35 @@ sealed interface InstalledIdentityDecision {
 
 class SystemInstallCoordinator(
     private val policy: InstallPolicy,
-    private val gateway: SystemInstallerGateway,
     private val handoffStore: SystemInstallHandoffStore,
     private val installedWrappers: InstalledWrapperRepository,
     private val pendingStore: PendingInstallStore,
-    private val retainedWrapperFile: (String) -> File,
     private val clock: () -> Long = System::currentTimeMillis,
     private val retainedWrapperSha256: suspend (File) -> String = { file ->
         withContext(Dispatchers.IO) { sha256(file) }
     },
 ) {
+    @Suppress("UNUSED_PARAMETER")
+    constructor(
+        policy: InstallPolicy,
+        gateway: SystemInstallerGateway,
+        handoffStore: SystemInstallHandoffStore,
+        installedWrappers: InstalledWrapperRepository,
+        pendingStore: PendingInstallStore,
+        retainedWrapperFile: (String) -> File,
+        clock: () -> Long = System::currentTimeMillis,
+        retainedWrapperSha256: suspend (File) -> String = { file ->
+            withContext(Dispatchers.IO) { sha256(file) }
+        },
+    ) : this(
+        policy = policy,
+        handoffStore = handoffStore,
+        installedWrappers = installedWrappers,
+        pendingStore = pendingStore,
+        clock = clock,
+        retainedWrapperSha256 = retainedWrapperSha256,
+    )
+
     private val mutex = Mutex()
     private val mutableState = MutableStateFlow(restoreState())
 
@@ -75,7 +101,7 @@ class SystemInstallCoordinator(
         if (handoffStore.snapshot() != RecoveryRecordSnapshot.Absent || !legacyRecoveryEmpty) {
             return@withLock failed(recoveryWriteFailed())
         }
-        mutableState.value = InstallState.PreparingSystemInstaller
+        mutableState.value = InstallState.PreparingApkExport(bundle.token)
         val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
         } catch (error: CancellationException) {
@@ -114,6 +140,25 @@ class SystemInstallCoordinator(
                 }
             }
         }
+        if (installed != null &&
+            installed.versionCode == bundle.verifiedApk.versionCode
+        ) {
+            when (installed.apkSha256) {
+                null -> return@withLock failed(
+                    InstallState.Failed(
+                        "INSTALLED_APK_HASH_UNKNOWN",
+                        "설치된 APK의 무결성을 확인하지 못했습니다.",
+                    ),
+                )
+                bundle.wrapperSha256 -> Unit
+                else -> return@withLock failed(
+                    InstallState.Failed(
+                        "SAME_VERSION_APK_MISMATCH",
+                        "같은 버전의 설치 APK가 변환 결과와 일치하지 않습니다.",
+                    ),
+                )
+            }
+        }
         val currentSha256 = try {
             retainedWrapperSha256(bundle.wrapperFile)
         } catch (error: CancellationException) {
@@ -129,22 +174,6 @@ class SystemInstallCoordinator(
                 ),
             )
         }
-        if (!gateway.canRequestPackageInstalls()) {
-            mutableState.value = InstallState.UnknownSourcesPermissionRequired
-            return@withLock SystemInstallRequestResult.UnknownSourcesPermissionRequired
-        }
-        val launch = try {
-            gateway.createLaunch(bundle.wrapperFile)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            return@withLock failed(
-                InstallState.Failed(
-                    "SYSTEM_INSTALLER_LAUNCH_FAILED",
-                    "시스템 설치 화면을 준비하지 못했습니다.",
-                ),
-            )
-        }
         val prepared = PendingSystemInstall(
             importToken = bundle.token,
             expected = bundle.verifiedApk.toExpected(),
@@ -154,53 +183,21 @@ class SystemInstallCoordinator(
             stage = SystemInstallStage.PREPARED,
         )
         if (!handoffStore.tryPrepare(prepared)) {
-            if (launch is SystemInstallerLaunchResult.Ready) {
-                runCatching { gateway.revoke(bundle.wrapperFile) }
-            }
             return@withLock failed(recoveryWriteFailed())
         }
-        if (launch == SystemInstallerLaunchResult.MyFilesFallbackRequired) {
-            mutableState.value = InstallState.PreparingSystemInstaller
-            return@withLock SystemInstallRequestResult.MyFilesFallbackRequired
-        }
-        val awaiting = InstallState.AwaitingSystemInstaller(bundle.token)
-        mutableState.value = awaiting
-        SystemInstallRequestResult.Launch(
-            state = awaiting,
-            launch = (launch as SystemInstallerLaunchResult.Ready).launch,
-        )
+        val preparing = InstallState.PreparingApkExport(bundle.token)
+        mutableState.value = preparing
+        SystemInstallRequestResult.ExportRequired(preparing)
     }
 
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     fun markLaunchSucceeded(importToken: String): Boolean {
-        val prepared = when (val snapshot = handoffStore.snapshot()) {
-            is RecoveryRecordSnapshot.Present -> snapshot.value
-            RecoveryRecordSnapshot.Absent,
-            RecoveryRecordSnapshot.Invalid,
-            -> return false
-        }
-        if (prepared.importToken != importToken ||
-            prepared.stage != SystemInstallStage.PREPARED
-        ) {
-            return false
-        }
-        val launched = handoffStore.markLaunched(prepared) ?: return false
-        mutableState.value = InstallState.AwaitingSystemInstaller(launched.importToken)
-        return true
+        return false
     }
 
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     fun markLaunchFailed(importToken: String): Boolean {
-        val prepared = when (val snapshot = handoffStore.snapshot()) {
-            is RecoveryRecordSnapshot.Present -> snapshot.value
-            RecoveryRecordSnapshot.Absent,
-            RecoveryRecordSnapshot.Invalid,
-            -> return false
-        }
-        if (prepared.importToken != importToken ||
-            prepared.stage != SystemInstallStage.PREPARED
-        ) {
-            return false
-        }
-        return true
+        return false
     }
 
     fun markManualExportSucceeded(importToken: String): Boolean {
@@ -221,26 +218,23 @@ class SystemInstallCoordinator(
     }
 
     suspend fun reconcileAfterReturn(): InstallState? = mutex.withLock {
-        val record = when (val snapshot = handoffStore.snapshot()) {
-            is RecoveryRecordSnapshot.Present -> snapshot.value
+        when (handoffStore.snapshot()) {
+            is RecoveryRecordSnapshot.Present -> return@withLock null
             RecoveryRecordSnapshot.Invalid -> {
                 mutableState.value = recoveryWriteFailed()
                 return@withLock mutableState.value
             }
-            RecoveryRecordSnapshot.Absent -> {
-                val receipt = pendingStore.loadFinalReceipt()
-                    ?.takeIf { it.origin == FinalReceiptOrigin.SYSTEM_INSTALLER }
-                    ?: return@withLock null
-                if (!revokeRetainedWrapper(receipt.importToken)) {
-                    mutableState.value = recoveryWriteFailed()
-                    return@withLock mutableState.value
-                }
-                mutableState.value = receipt.state
-                return@withLock receipt.state
-            }
+            RecoveryRecordSnapshot.Absent -> Unit
         }
-        if (record.stage != SystemInstallStage.LAUNCHED) return@withLock null
-        reconcileRecord(record)
+        val receipt = pendingStore.loadFinalReceipt()
+            ?.takeIf { it.origin == FinalReceiptOrigin.MY_FILES }
+            ?: return@withLock null
+        if (!discardPrivateImport(receipt.importToken)) {
+            mutableState.value = recoveryWriteFailed()
+            return@withLock mutableState.value
+        }
+        mutableState.value = receipt.state
+        receipt.state
     }
 
     suspend fun reconcileManualAfterUserCheck(importToken: String): InstallState? =
@@ -271,11 +265,33 @@ class SystemInstallCoordinator(
             )
             return mutableState.value
         }
-        val terminal = when (
+        val identity = when (
             val decision = decideInstalledIdentity(record.expected, record.previous, actual)
         ) {
-            InstalledIdentityDecision.Installed ->
-                InstallState.Installed(record.expected.packageName)
+            InstalledIdentityDecision.Installed -> {
+                if (actual?.apkSha256 != record.wrapperSha256) {
+                    InstallState.Failed(
+                        "INSTALLED_IDENTITY_MISMATCH",
+                        "설치된 래퍼 신원이 일치하지 않습니다.",
+                    )
+                } else {
+                    when (classifySamsungInstallSource(actual.installSourceEvidence)) {
+                        SamsungInstallSourceVerdict.ALLOWED_ADB,
+                        SamsungInstallSourceVerdict.ALLOWED_MY_FILES,
+                        -> InstallState.Installed(record.expected.packageName)
+                        SamsungInstallSourceVerdict.UNSUPPORTED ->
+                            InstallState.Failed(
+                                "UNSUPPORTED_INSTALL_SOURCE",
+                                "내 파일에서 APK를 다시 설치해 주세요.",
+                            )
+                        SamsungInstallSourceVerdict.UNKNOWN ->
+                            InstallState.Failed(
+                                "INSTALL_SOURCE_UNKNOWN",
+                                "설치 출처를 확인하지 못했습니다.",
+                            )
+                    }
+                }
+            }
             InstalledIdentityDecision.Cancelled -> InstallState.Cancelled
             is InstalledIdentityDecision.Conflict ->
                 InstallState.Failed(
@@ -287,9 +303,9 @@ class SystemInstallCoordinator(
             importToken = record.importToken,
             sessionId = null,
             packageName = record.expected.packageName,
-            state = terminal,
+            state = identity,
             stage = FinalReceiptStage.READY,
-            origin = FinalReceiptOrigin.SYSTEM_INSTALLER,
+            origin = FinalReceiptOrigin.MY_FILES,
             rawTerminalAtEpochMillis = null,
             terminalAtEpochMillis = clock(),
         )
@@ -301,12 +317,12 @@ class SystemInstallCoordinator(
             mutableState.value = recoveryWriteFailed()
             return mutableState.value
         }
-        if (!revokeRetainedWrapper(record.importToken)) {
+        if (!discardPrivateImport(record.importToken)) {
             mutableState.value = recoveryWriteFailed()
             return mutableState.value
         }
-        mutableState.value = terminal
-        return terminal
+        mutableState.value = identity
+        return identity
     }
 
     suspend fun cancel(expectedImportToken: String): InstallCleanupResult = mutex.withLock {
@@ -318,23 +334,19 @@ class SystemInstallCoordinator(
         if (record.importToken != expectedImportToken) {
             return@withLock InstallCleanupResult.OwnerMismatch
         }
-        val wrapper = retainedWrapperFile(expectedImportToken)
-        if (!runCatching { gateway.revoke(wrapper) }.isSuccess ||
-            !handoffStore.clear(record)
-        ) {
+        if (!handoffStore.clear(record)) {
             return@withLock InstallCleanupResult.CleanupFailed
         }
-        val discarded = runCatching {
-            pendingStore.discardImport(expectedImportToken)
-        }.isSuccess
-        if (!discarded) return@withLock InstallCleanupResult.CleanupFailed
+        if (!discardPrivateImport(expectedImportToken)) {
+            return@withLock InstallCleanupResult.CleanupFailed
+        }
         mutableState.value = InstallState.Idle
         InstallCleanupResult.Cleaned
     }
 
     private fun ensureDurableReceipt(receipt: FinalInstallReceipt): Boolean =
         when (val snapshot = pendingStore.finalReceiptSnapshot()) {
-            is RecoveryRecordSnapshot.Present -> snapshot.value.matchesSystemOutcome(receipt)
+            is RecoveryRecordSnapshot.Present -> snapshot.value.matchesManualOutcome(receipt)
             RecoveryRecordSnapshot.Invalid -> false
             RecoveryRecordSnapshot.Absent ->
                 pendingStore.createFinalReceipt(
@@ -344,13 +356,13 @@ class SystemInstallCoordinator(
                 ) && pendingStore.loadFinalReceipt() == receipt
         }
 
-    private fun revokeRetainedWrapper(importToken: String): Boolean =
+    private fun discardPrivateImport(importToken: String): Boolean =
         runCatching {
-            gateway.revoke(retainedWrapperFile(importToken))
+            pendingStore.discardImport(importToken)
         }.isSuccess
 
-    private fun FinalInstallReceipt.matchesSystemOutcome(expected: FinalInstallReceipt): Boolean =
-        origin == FinalReceiptOrigin.SYSTEM_INSTALLER &&
+    private fun FinalInstallReceipt.matchesManualOutcome(expected: FinalInstallReceipt): Boolean =
+        origin == FinalReceiptOrigin.MY_FILES &&
             stage != FinalReceiptStage.CANCELLING &&
             importToken == expected.importToken &&
             sessionId == null &&
@@ -372,7 +384,7 @@ class SystemInstallCoordinator(
                     SystemInstallStage.EXPORTED ->
                         InstallState.AwaitingManualInstall(handoff.value.importToken)
                     SystemInstallStage.PREPARED ->
-                        InstallState.PreparingSystemInstaller
+                        InstallState.PreparingApkExport(handoff.value.importToken)
                 }
             RecoveryRecordSnapshot.Invalid -> recoveryWriteFailed()
             RecoveryRecordSnapshot.Absent -> InstallState.Idle

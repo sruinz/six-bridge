@@ -52,7 +52,7 @@ class InstallPolicy {
         if (installed.signerSha256 != candidate.signerSha256) {
             return InstallDecision.Denied(InstallDenial.SIGNER_MISMATCH)
         }
-        if (candidate.versionCode <= installed.versionCode) {
+        if (candidate.versionCode < installed.versionCode) {
             return InstallDecision.Denied(InstallDenial.VERSION_NOT_NEWER)
         }
         return InstallDecision.Allowed(InstallOperation.UPDATE, requiresPartialConfirmation)

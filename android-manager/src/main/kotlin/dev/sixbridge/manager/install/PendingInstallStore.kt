@@ -987,7 +987,9 @@ class SharedPreferencesPendingInstallStore internal constructor(
                     raw.packageName == packageName &&
                     raw.importToken == importToken &&
                     raw.terminalAtEpochMillis == rawTerminalAtEpochMillis
-            FinalReceiptOrigin.SYSTEM_INSTALLER -> raw == null
+            FinalReceiptOrigin.SYSTEM_INSTALLER,
+            FinalReceiptOrigin.MY_FILES,
+            -> raw == null
         }
 
     private fun PendingInstallResult.matches(receipt: FinalInstallReceipt): Boolean =
@@ -1038,7 +1040,10 @@ class SharedPreferencesPendingInstallStore internal constructor(
 
     private fun isValidInitialReceipt(receipt: FinalInstallReceipt): Boolean =
         isValid(receipt) &&
-            (receipt.origin != FinalReceiptOrigin.SYSTEM_INSTALLER ||
+            (receipt.origin !in setOf(
+                FinalReceiptOrigin.SYSTEM_INSTALLER,
+                FinalReceiptOrigin.MY_FILES,
+            ) ||
                 receipt.stage == FinalReceiptStage.READY)
 
     private fun isValid(handoff: NormalInstallHandoff): Boolean =
