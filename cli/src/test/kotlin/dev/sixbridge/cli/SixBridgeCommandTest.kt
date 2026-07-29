@@ -86,6 +86,50 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `hidden CRX verifier checks signature and public key derived identity`() {
+        val workspace = Files.createTempDirectory("six-cli-verify-crx")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Verified","version":"1"}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val crx = workspace.resolve("verified.crx").also {
+            it.writeBytes(packed.bytes)
+        }
+
+        val result = execute(
+            "verify-crx",
+            "--input", crx.toString(),
+            "--expected-id", packed.extensionId,
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        assertTrue("extensionId=${packed.extensionId}" in result.output)
+        assertTrue("CRX3 verified" in result.output)
+    }
+
+    @Test
+    fun `hidden CRX verifier rejects magic-only fake CRX`() {
+        val workspace = Files.createTempDirectory("six-cli-reject-fake-crx")
+        val crx = workspace.resolve("fake.crx").also {
+            it.writeText("Cr24 fixture is not a signed CRX3")
+        }
+
+        val result = execute(
+            "verify-crx",
+            "--input", crx.toString(),
+            "--expected-id", "abcdefghijklmnopabcdefghijklmnop",
+        )
+
+        assertEquals(2, result.exitCode)
+        assertTrue("CRX" in result.error)
+    }
+
+    @Test
     fun `profile writes a reusable browser profile`() {
         val workspace = Files.createTempDirectory("six-cli-profile")
         val apk = workspace.resolve("sbrowser-30.0.2.61-1300261502_test.apk")

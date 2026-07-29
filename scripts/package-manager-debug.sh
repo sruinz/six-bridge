@@ -6,6 +6,7 @@ readonly VERIFY_SCRIPT="${ROOT_DIR}/scripts/verify.sh"
 readonly TEMPLATE_TEST_SCRIPT="${ROOT_DIR}/scripts/android-wrapper-template.test.sh"
 readonly CORE_CONVERSION_GATE_TEST_SCRIPT="${ROOT_DIR}/scripts/fold7-core-conversion-gate.test.sh"
 readonly ONDEVICE_GATE_TEST_SCRIPT="${ROOT_DIR}/scripts/fold7-ondevice-packager-gate.test.sh"
+readonly ONDEVICE_FLOW_TEST_SCRIPT="${ROOT_DIR}/scripts/fold7-ondevice-conversion-flow.test.sh"
 readonly SOURCE_APK="${ROOT_DIR}/android-manager/build/outputs/apk/debug/android-manager-debug.apk"
 readonly DIST_DIR="${ROOT_DIR}/dist"
 readonly OUTPUT_APK="${DIST_DIR}/sixbridge-manager-debug.apk"
@@ -39,10 +40,13 @@ rm -f -- "${OUTPUT_APK}"
     fail "Android core conversion gate 계약 스크립트를 실행할 수 없습니다: ${CORE_CONVERSION_GATE_TEST_SCRIPT}"
 [[ -x "${ONDEVICE_GATE_TEST_SCRIPT}" ]] ||
     fail "온디바이스 packager gate 계약 스크립트를 실행할 수 없습니다: ${ONDEVICE_GATE_TEST_SCRIPT}"
+[[ -x "${ONDEVICE_FLOW_TEST_SCRIPT}" ]] ||
+    fail "온디바이스 변환 흐름 gate 계약 스크립트를 실행할 수 없습니다: ${ONDEVICE_FLOW_TEST_SCRIPT}"
 
 "${TEMPLATE_TEST_SCRIPT}"
 "${CORE_CONVERSION_GATE_TEST_SCRIPT}"
 "${ONDEVICE_GATE_TEST_SCRIPT}"
+"${ONDEVICE_FLOW_TEST_SCRIPT}"
 "${VERIFY_SCRIPT}"
 
 [[ -f "${SOURCE_APK}" ]] ||

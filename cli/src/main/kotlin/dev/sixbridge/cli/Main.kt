@@ -6,6 +6,7 @@ import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.MissingAdapterApprovalException
+import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.InvalidCrxException
 import dev.sixbridge.core.device.AdbDeviceClient
 import dev.sixbridge.core.device.BuildArtifactVerifier
@@ -62,6 +63,7 @@ fun createCommandLine(
         AnalyzeCommand::class,
         DraftCommand::class,
         VerifyDraftCommand::class,
+        VerifyCrxCommand::class,
         VerifyBuildCommand::class,
         BuildCommand::class,
         DeviceCommand::class,
@@ -231,6 +233,45 @@ class VerifyDraftCommand : Callable<Int> {
         SixDraft.read(input)
         spec.commandLine().out.println("SixDraft verified")
         return 0
+    }
+}
+
+@Command(
+    name = "verify-crx",
+    hidden = true,
+    mixinStandardHelpOptions = true,
+    description = ["CRX3 서명과 공개 키 기반 extension ID를 독립 검증합니다."],
+)
+class VerifyCrxCommand : Callable<Int> {
+    @Option(names = ["--input"], required = true)
+    lateinit var input: Path
+
+    @Option(names = ["--expected-id"], required = true)
+    lateinit var expectedId: String
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int {
+        val declaredSize = Files.size(input)
+        require(declaredSize in 1..MAX_CRX_BYTES) {
+            "CRX3 파일 크기가 제한을 초과합니다."
+        }
+        val bytes = Files.readAllBytes(input)
+        require(bytes.size.toLong() == declaredSize) {
+            "CRX3 파일이 검증 중 변경되었습니다."
+        }
+        val proof = Crx3.parse(bytes)
+        require(proof.extensionId == expectedId) {
+            "CRX3 공개 키에서 유도한 extension ID가 예상 ID와 일치하지 않습니다."
+        }
+        spec.commandLine().out.println("extensionId=${proof.extensionId}")
+        spec.commandLine().out.println("CRX3 verified")
+        return 0
+    }
+
+    private companion object {
+        const val MAX_CRX_BYTES = 128L * 1024 * 1024
     }
 }
 

@@ -22,6 +22,24 @@ Android 시스템 설치·제거 승인 흐름을 우회하지 않는다.
 
 구조나 식별자 중 하나라도 맞지 않으면 설치 대상으로 넘기지 않는다.
 
+## 온디바이스 변환 경계
+
+- Chrome Web Store 입력은 명시된 허용 목록 URL만 네트워크에서 읽는다.
+  로컬 ZIP·CRX와 `SixDraft`는 사용자가 파일 선택기로 부여한 범위에서만
+  읽는다.
+- 관리자 `INTERNET` 권한은 이 허용 목록 입력을 가져오는 용도에 한정한다.
+  LAN 수신, 원격 변환 서버나 임의 URL fetch는 제공하지 않는다.
+- 식별한 삼성 인터넷 profile이 지원 목록과 정확히 일치하지 않으면
+  변환을 차단한다.
+- adapter는 분석 결과와 승인 기록에 따라 적용한다. 승인이 없거나 변환
+  의미를 안전하게 보존할 수 없으면 fail-closed하며, 적용 결정과 입력·계획
+  hash를 provenance에 기록한다.
+- CRX와 wrapper 서명 키는 Android Keystore에서 생성·사용한다. 같은 확장의
+  후속 변환은 저장된 extension ID, package와 signer를 유지하고
+  versionCode만 증가시킨다.
+- 기존 identity ledger, Keystore signer 또는 생성 결과가 서로 일치하지
+  않으면 업데이트 산출물을 만들거나 설치로 넘기지 않는다.
+
 ## 임의 signer를 허용하는 이유
 
 SIX Bridge는 특정 제작자나 프로젝트 공식 키만 allowlist로 허용하지 않는다.
@@ -33,9 +51,10 @@ descriptor와 실제 APK signer가 일치해야 한다. 같은 package를 업데
 때는 설치된 APK와 새 wrapper의 signer가 반드시 같아야 하며, 새 versionCode도
 더 높아야 한다. signer가 다르거나 versionCode가 같거나 낮으면 차단한다.
 
-`.local/`의 CRX 키와 wrapper PKCS12 키는 extension ID와 Android 업데이트
-연속성을 유지하는 로컬 식별자다. Git에 포함하거나 배포 문서·로그에 복사하지
-않는다.
+데스크톱 변환에서 `.local/`의 CRX 키와 wrapper PKCS12 키는 extension ID와
+Android 업데이트 연속성을 유지하는 로컬 식별자다. 온디바이스 변환은 이
+데스크톱 키를 복사하지 않고 Android Keystore의 별도 키를 사용한다. 어느
+쪽의 signing secret도 Git에 포함하거나 배포 문서·로그에 복사하지 않는다.
 
 ## 호환성 보고서가 보장하지 않는 것
 
@@ -49,21 +68,24 @@ descriptor와 실제 APK signer가 일치해야 한다. 같은 package를 업데
 
 ## 저장·네트워크 경계
 
-- 원본 `.six`, wrapper APK와 CRX3는 영구 저장하지 않는다.
-- 설치·취소·실패 뒤 임시 파일과 실패한 install session을 정리한다.
+- 가져온 원본 `.six`는 영구 저장하지 않는다. 온디바이스 생성 `.six`는
+  사용자가 저장·공유를 선택한 경우에만 지정 위치로 내보낸다.
+- 설치·취소·실패 뒤 임시 `.six`, wrapper APK, CRX3와 실패한 install
+  session을 정리한다.
 - 프로세스 중단 뒤에는 다음 시작 시 관리자가 소유한 오래된 임시 파일과
   미완료 session을 정리한다.
 - Room catalog에는 package 식별 정보와 검증 보고서 요약만 보관한다.
 - 실제 설치 여부, versionCode와 signer는 `PackageManager` 재조회 결과를
   원본 상태로 사용한다.
-- 1단계 관리자 manifest에는 `INTERNET`와 `QUERY_ALL_PACKAGES` 권한이 없다.
+- 관리자에는 허용 목록 Chrome Web Store 입력을 위한 `INTERNET` 권한만
+  있으며 `QUERY_ALL_PACKAGES` 권한은 없다.
 - 패키지 조회는 `six://ex`, 삼성 인터넷 package와 공개
   `internet://extension` query로 제한한다.
 - 로그에 원본 파일 bytes, CRX bytes, URI grant, 개인 경로와 signing secret을
   남기지 않는다.
 
-1단계 관리자는 LAN 수신, 원격 변환 서버, 온디바이스 분석·변환 기능을
-포함하지 않는다.
+관리자는 LAN 수신이나 원격 변환 서버를 포함하지 않는다. 분석·변환과
+서명·패키징은 기기 안에서 수행한다.
 
 ## 사용자 승인과 삼성 인터넷 경계
 

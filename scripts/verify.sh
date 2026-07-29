@@ -95,13 +95,16 @@ for shell_file in \
   scripts/fold7-ai-recipe.sh \
   scripts/fold7-video-nas.sh \
   scripts/fold7-converted-extension.sh \
+  scripts/fold7-ondevice-conversion-flow.sh \
   scripts/fold7-validation-lib.sh \
   scripts/fold7-extension-validation.test.sh \
-  scripts/fold7-converted-extension.test.sh; do
+  scripts/fold7-converted-extension.test.sh \
+  scripts/fold7-ondevice-conversion-flow.test.sh; do
   bash -n "$shell_file"
 done
 bash scripts/fold7-extension-validation.test.sh
 bash scripts/fold7-converted-extension.test.sh
+bash scripts/fold7-ondevice-conversion-flow.test.sh
 bash scripts/verify-mobile-conversion.sh
 bash scripts/android-manager-manifest.test.sh
 bash scripts/android-manager-distribution.test.sh
