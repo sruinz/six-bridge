@@ -107,6 +107,13 @@ data class ReviewBundle(
     val wrapperVersionCode: Int = 0,
 )
 
+data class SystemInstallApkFallback(
+    val importToken: String,
+    val source: File,
+    val expectedSha256: String,
+    val extensionName: String,
+)
+
 sealed interface ManagerImportResult {
     data class Success(val review: ReviewBundle) : ManagerImportResult
     data class Failure(val reason: ImportFailure) : ManagerImportResult
@@ -188,7 +195,10 @@ interface ManagerRepository {
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
     fun markSystemInstallLaunchSucceeded(importToken: String): Boolean = false
     fun markSystemInstallLaunchFailed(importToken: String): Boolean = false
+    fun systemInstallApkFallback(importToken: String): SystemInstallApkFallback? = null
+    fun markSystemInstallApkExported(importToken: String): Boolean = false
     suspend fun reconcileSystemInstallAfterReturn(): InstallState? = null
+    suspend fun reconcileManualSystemInstall(importToken: String): InstallState? = null
     suspend fun cancelInstall(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -253,6 +263,8 @@ internal class DefaultManagerRepository(
 ) : ManagerRepository {
     private val started = AtomicBoolean()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
+    @Volatile
+    private var pendingSystemInstallApkFallback: SystemInstallApkFallback? = null
     private val callbackRouter = InstallCallbackRouter(
         onResult = installCoordinator::onPackageInstallerResult,
         onRefresh = catalogPublisher::reconcile,
@@ -434,6 +446,7 @@ internal class DefaultManagerRepository(
             val result = systemInstallCoordinator.request(bundle, partialConfirmed)
         ) {
             is SystemInstallRequestResult.Launch -> {
+                pendingSystemInstallApkFallback = null
                 launchChannel.send(
                     RepositoryLaunch(
                         destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
@@ -443,10 +456,23 @@ internal class DefaultManagerRepository(
                 )
                 result.state
             }
-            SystemInstallRequestResult.UnknownSourcesPermissionRequired ->
+            SystemInstallRequestResult.UnknownSourcesPermissionRequired -> {
+                pendingSystemInstallApkFallback = null
                 InstallState.UnknownSourcesPermissionRequired
-            SystemInstallRequestResult.MyFilesFallbackRequired -> InstallState.Idle
-            is SystemInstallRequestResult.Failed -> result.state
+            }
+            SystemInstallRequestResult.MyFilesFallbackRequired -> {
+                pendingSystemInstallApkFallback = SystemInstallApkFallback(
+                    importToken = bundle.token,
+                    source = bundle.wrapperFile,
+                    expectedSha256 = bundle.wrapperSha256,
+                    extensionName = bundle.descriptor.name,
+                )
+                InstallState.PreparingSystemInstaller
+            }
+            is SystemInstallRequestResult.Failed -> {
+                pendingSystemInstallApkFallback = null
+                result.state
+            }
         }
         afterInstallRequest(requestState)
         return requestState
@@ -458,8 +484,25 @@ internal class DefaultManagerRepository(
     override fun markSystemInstallLaunchFailed(importToken: String): Boolean =
         systemInstallCoordinator.markLaunchFailed(importToken)
 
+    override fun systemInstallApkFallback(
+        importToken: String,
+    ): SystemInstallApkFallback? =
+        pendingSystemInstallApkFallback?.takeIf { it.importToken == importToken }
+
+    override fun markSystemInstallApkExported(importToken: String): Boolean =
+        systemInstallCoordinator.markManualExportSucceeded(importToken).also { succeeded ->
+            if (succeeded &&
+                pendingSystemInstallApkFallback?.importToken == importToken
+            ) {
+                pendingSystemInstallApkFallback = null
+            }
+        }
+
     override suspend fun reconcileSystemInstallAfterReturn(): InstallState? =
         systemInstallCoordinator.reconcileAfterReturn()
+
+    override suspend fun reconcileManualSystemInstall(importToken: String): InstallState? =
+        systemInstallCoordinator.reconcileManualAfterUserCheck(importToken)
 
     override suspend fun cancelInstall(
         expectedReviewToken: String,

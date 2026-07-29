@@ -119,6 +119,8 @@ fun HomeScreen(
                                 ManagerAction.RetryRecovery
                             },
                         )
+                        RecoveryAction.CHECK_INSTALL_STATUS ->
+                            onAction(ManagerAction.ConfirmSystemInstallStatus)
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)
                     }
                 },

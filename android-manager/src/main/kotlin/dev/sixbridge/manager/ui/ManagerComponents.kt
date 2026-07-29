@@ -132,6 +132,7 @@ private fun recoveryLabel(action: RecoveryAction): String = stringResource(
         RecoveryAction.CONFIRM_PARTIAL -> R.string.message_recover_confirm
         RecoveryAction.OPEN_SETTINGS -> R.string.message_recover_settings
         RecoveryAction.RETRY -> R.string.message_recover_retry
+        RecoveryAction.CHECK_INSTALL_STATUS -> R.string.message_recover_check_install
         RecoveryAction.NONE -> R.string.message_dismiss
     },
 )

@@ -134,10 +134,6 @@ class SystemInstallCoordinator(
                 ),
             )
         }
-        if (launch == SystemInstallerLaunchResult.MyFilesFallbackRequired) {
-            mutableState.value = InstallState.Idle
-            return@withLock SystemInstallRequestResult.MyFilesFallbackRequired
-        }
         val prepared = PendingSystemInstall(
             importToken = bundle.token,
             expected = bundle.verifiedApk.toExpected(),
@@ -147,8 +143,14 @@ class SystemInstallCoordinator(
             stage = SystemInstallStage.PREPARED,
         )
         if (!handoffStore.tryPrepare(prepared)) {
-            runCatching { gateway.revoke(bundle.wrapperFile) }
+            if (launch is SystemInstallerLaunchResult.Ready) {
+                runCatching { gateway.revoke(bundle.wrapperFile) }
+            }
             return@withLock failed(recoveryWriteFailed())
+        }
+        if (launch == SystemInstallerLaunchResult.MyFilesFallbackRequired) {
+            mutableState.value = InstallState.PreparingSystemInstaller
+            return@withLock SystemInstallRequestResult.MyFilesFallbackRequired
         }
         val awaiting = InstallState.AwaitingSystemInstaller(bundle.token)
         mutableState.value = awaiting
@@ -187,13 +189,23 @@ class SystemInstallCoordinator(
         ) {
             return false
         }
-        val wrapper = retainedWrapperFile(importToken)
-        if (!runCatching { gateway.revoke(wrapper) }.isSuccess) return false
-        if (!handoffStore.clear(prepared)) return false
-        mutableState.value = InstallState.Failed(
-            "SYSTEM_INSTALLER_LAUNCH_FAILED",
-            "시스템 설치 화면을 열지 못했습니다.",
-        )
+        return true
+    }
+
+    fun markManualExportSucceeded(importToken: String): Boolean {
+        val prepared = when (val snapshot = handoffStore.snapshot()) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent,
+            RecoveryRecordSnapshot.Invalid,
+            -> return false
+        }
+        if (prepared.importToken != importToken ||
+            prepared.stage != SystemInstallStage.PREPARED
+        ) {
+            return false
+        }
+        val exported = handoffStore.markExported(prepared) ?: return false
+        mutableState.value = InstallState.AwaitingManualInstall(exported.importToken)
         return true
     }
 
@@ -217,6 +229,26 @@ class SystemInstallCoordinator(
             }
         }
         if (record.stage != SystemInstallStage.LAUNCHED) return@withLock null
+        reconcileRecord(record)
+    }
+
+    suspend fun reconcileManualAfterUserCheck(importToken: String): InstallState? =
+        mutex.withLock {
+            val record = when (val snapshot = handoffStore.snapshot()) {
+                is RecoveryRecordSnapshot.Present -> snapshot.value
+                RecoveryRecordSnapshot.Absent,
+                RecoveryRecordSnapshot.Invalid,
+                -> return@withLock null
+            }
+            if (record.importToken != importToken ||
+                record.stage != SystemInstallStage.EXPORTED
+            ) {
+                return@withLock null
+            }
+            reconcileRecord(record)
+        }
+
+    private suspend fun reconcileRecord(record: PendingSystemInstall): InstallState {
         val actual = try {
             installedWrappers.find(record.expected.packageName)
         } catch (error: CancellationException) {
@@ -226,7 +258,7 @@ class SystemInstallCoordinator(
                 "INSTALLED_QUERY_FAILED",
                 "설치 상태를 확인하지 못했습니다.",
             )
-            return@withLock mutableState.value
+            return mutableState.value
         }
         val terminal = when (
             val decision = decideInstalledIdentity(record.expected, record.previous, actual)
@@ -252,18 +284,18 @@ class SystemInstallCoordinator(
         )
         if (!ensureDurableReceipt(receipt)) {
             mutableState.value = recoveryWriteFailed()
-            return@withLock mutableState.value
+            return mutableState.value
         }
         if (!handoffStore.clear(record)) {
             mutableState.value = recoveryWriteFailed()
-            return@withLock mutableState.value
+            return mutableState.value
         }
         if (!revokeRetainedWrapper(record.importToken)) {
             mutableState.value = recoveryWriteFailed()
-            return@withLock mutableState.value
+            return mutableState.value
         }
         mutableState.value = terminal
-        terminal
+        return terminal
     }
 
     suspend fun cancel(expectedImportToken: String): InstallCleanupResult = mutex.withLock {
@@ -323,10 +355,13 @@ class SystemInstallCoordinator(
         }
         return when (val handoff = handoffStore.snapshot()) {
             is RecoveryRecordSnapshot.Present ->
-                if (handoff.value.stage == SystemInstallStage.LAUNCHED) {
-                    InstallState.AwaitingSystemInstaller(handoff.value.importToken)
-                } else {
-                    InstallState.PreparingSystemInstaller
+                when (handoff.value.stage) {
+                    SystemInstallStage.LAUNCHED ->
+                        InstallState.AwaitingSystemInstaller(handoff.value.importToken)
+                    SystemInstallStage.EXPORTED ->
+                        InstallState.AwaitingManualInstall(handoff.value.importToken)
+                    SystemInstallStage.PREPARED ->
+                        InstallState.PreparingSystemInstaller
                 }
             RecoveryRecordSnapshot.Invalid -> recoveryWriteFailed()
             RecoveryRecordSnapshot.Absent -> InstallState.Idle

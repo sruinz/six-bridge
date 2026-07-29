@@ -150,6 +150,7 @@ enum class RecoveryAction {
     CONFIRM_PARTIAL,
     OPEN_SETTINGS,
     RETRY,
+    CHECK_INSTALL_STATUS,
 }
 
 enum class UserMessageKind {
@@ -247,6 +248,11 @@ sealed interface ManagerAction {
     data object ConfirmPartial : ManagerAction
     data object PrepareReviewedInstall : ManagerAction
     data object InstallReviewedBundle : ManagerAction
+    data class SystemInstallApkCreated(
+        val importToken: String,
+        val uri: Uri?,
+    ) : ManagerAction
+    data object ConfirmSystemInstallStatus : ManagerAction
     data class ContinueInstallAfterNotificationPermission(
         val reviewToken: String,
         val generatedToken: String? = null,
@@ -293,6 +299,13 @@ sealed interface ManagerEffect {
         val launchId: Long,
     ) : ManagerEffect
 
+    data class CreateSystemInstallApkDocument(
+        val importToken: String,
+        val source: File,
+        val expectedSha256: String,
+        val suggestedFileName: String,
+    ) : ManagerEffect
+
     data class ShareGeneratedBundle(
         val token: String,
         val file: File,
@@ -303,6 +316,7 @@ sealed interface ManagerEffect {
         val destination: LaunchDestination,
         val intentFactory: () -> Intent,
         val installSessionId: Int? = null,
+        val installImportToken: String? = null,
         val ownerGeneration: Long? = null,
     ) : ManagerEffect {
         constructor(
@@ -312,6 +326,7 @@ sealed interface ManagerEffect {
             launch.destination,
             launch.intentFactory,
             launch.installSessionId,
+            launch.installImportToken,
             ownerGeneration,
         )
     }

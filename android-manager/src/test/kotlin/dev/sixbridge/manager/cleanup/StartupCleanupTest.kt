@@ -222,7 +222,11 @@ class StartupCleanupTest {
     @Test
     fun `startup cleanup은 신규 handoff를 보존하면서 legacy pending과 session만 정리한다`() =
         runBlocking {
-            listOf(SystemInstallStage.PREPARED, SystemInstallStage.LAUNCHED).forEach { stage ->
+            listOf(
+                SystemInstallStage.PREPARED,
+                SystemInstallStage.LAUNCHED,
+                SystemInstallStage.EXPORTED,
+            ).forEach { stage ->
                 val handoff = PendingSystemInstall(
                     importToken = HANDOFF_TOKEN,
                     expected = ExpectedInstalledWrapper(
@@ -550,6 +554,11 @@ class StartupCleanupTest {
         }
 
         override fun markLaunched(expected: PendingSystemInstall): PendingSystemInstall? {
+            mutationCalls += 1
+            return null
+        }
+
+        override fun markExported(expected: PendingSystemInstall): PendingSystemInstall? {
             mutationCalls += 1
             return null
         }

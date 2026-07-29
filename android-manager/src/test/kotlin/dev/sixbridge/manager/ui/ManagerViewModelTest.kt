@@ -15,6 +15,7 @@ import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.app.SystemInstallApkFallback
 import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
@@ -636,7 +637,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `PrepareReviewedInstall은 exact review에서 RequestInstallNotificationPermission을 발생시킨다`() =
+    fun `PrepareReviewedInstall은 알림 permission 없이 exact review 설치를 시작한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
@@ -654,15 +655,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             viewModel.accept(ManagerAction.PrepareReviewedInstall)
-            dispatcher.scheduler.runCurrent()
+            advanceUntilIdle()
 
-            assertEquals(
-                listOf<ManagerEffect>(
-                    ManagerEffect.RequestInstallNotificationPermission(TOKEN),
-                ),
-                effects,
-            )
-
+            assertEquals(1, repository.installRequests)
+            assertTrue(effects.isEmpty())
             val blocked = ManagerViewModel(
                 FakeManagerRepository().apply {
                     restoreResult = ManagerRestoreResult(recoveryBlocked = true)
@@ -682,12 +678,14 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `RequestInstallNotificationPermission은 수집 전에 review owner가 바뀌면 폐기된다`() =
+    fun `PrepareReviewedInstall 직후 owner가 바뀌면 기존 설치 결과를 적용하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
+                suspendInstall = true
+                installResult = InstallState.Failed("STALE", "stale")
             }
             val viewModel = ManagerViewModel(
                 repository,
@@ -696,65 +694,18 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            dispatcher.scheduler.runCurrent()
             viewModel.accept(ManagerAction.ReturnHome)
-            val effects = mutableListOf<ManagerEffect>()
-            val collector = launch { viewModel.effects.collect(effects::add) }
-            dispatcher.scheduler.runCurrent()
+            repository.completeInstall()
+            advanceUntilIdle()
 
-            assertTrue(effects.isEmpty())
-            collector.cancel()
+            assertEquals(1, repository.installRequests)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
         }
 
     @Test
-    fun `stale permission owner A는 exact review B로 교체되면 폐기되고 A 유지 시 전달된다`() =
-        runTest(dispatcher.scheduler) {
-            fun restoredReviewRepository() = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-
-            val current = ManagerViewModel(
-                restoredReviewRepository(),
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            current.accept(ManagerAction.PrepareReviewedInstall)
-            val currentEffects = mutableListOf<ManagerEffect>()
-            val currentCollector = launch { current.effects.collect(currentEffects::add) }
-            dispatcher.scheduler.runCurrent()
-
-            assertEquals(
-                ManagerEffect.RequestInstallNotificationPermission(TOKEN),
-                currentEffects.single(),
-            )
-            currentCollector.cancel()
-
-            val staleRepository = restoredReviewRepository().apply {
-                importResult = ManagerImportResult.Success(
-                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
-                )
-            }
-            val stale = ManagerViewModel(
-                staleRepository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            stale.accept(ManagerAction.PrepareReviewedInstall)
-            stale.startImport(staleRepository::nextImport)
-            advanceUntilIdle()
-            assertEquals(ManagerRoute.Review(SECOND_TOKEN), stale.state.value.route)
-
-            val staleEffects = mutableListOf<ManagerEffect>()
-            val staleCollector = launch { stale.effects.collect(staleEffects::add) }
-            dispatcher.scheduler.runCurrent()
-
-            assertTrue(staleEffects.isEmpty())
-            staleCollector.cancel()
-        }
-
-    @Test
-    fun `generated install permission callback sequence는 effect 뒤 기존 install action을 진행한다`() =
+    fun `generated install은 알림 permission 없이 기존 install action을 진행한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
                 restoredConversion = RestoredConversion.BundleReady(
@@ -779,95 +730,14 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.PrepareGeneratedInstall)
             viewModel.accept(ManagerAction.PrepareReviewedInstall)
-            dispatcher.scheduler.runCurrent()
+            advanceUntilIdle()
 
-            assertEquals(
-                ManagerEffect.RequestInstallNotificationPermission(
-                    reviewToken = TOKEN,
-                    generatedToken = TOKEN,
-                ),
-                effects.single(),
-            )
+            assertTrue(effects.isEmpty())
             assertTrue(
                 assertIs<ConversionUiState.ResultReady>(
                     viewModel.state.value.conversionState,
                 ).installOwnerActive,
             )
-
-            viewModel.accept(
-                ManagerAction.ContinueInstallAfterNotificationPermission(
-                    reviewToken = TOKEN,
-                    generatedToken = TOKEN,
-                ),
-            )
-            dispatcher.scheduler.runCurrent()
-
-            assertEquals(1, repository.installRequests)
-        }
-
-    @Test
-    fun `permission callback은 exact review owner만 설치하고 stale owner는 무시한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-                importResult = ManagerImportResult.Success(
-                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
-                )
-            }
-            val viewModel = ManagerViewModel(
-                repository,
-                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
-            )
-            advanceUntilIdle()
-            viewModel.accept(ManagerAction.PrepareReviewedInstall)
-            val effect = assertIs<ManagerEffect.RequestInstallNotificationPermission>(
-                viewModel.effects.first(),
-            )
-
-            viewModel.startImport(repository::nextImport)
-            advanceUntilIdle()
-            viewModel.accept(
-                ManagerAction.ContinueInstallAfterNotificationPermission(
-                    reviewToken = effect.reviewToken,
-                    generatedToken = effect.generatedToken,
-                ),
-            )
-            advanceUntilIdle()
-
-            assertEquals(0, repository.installRequests)
-            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
-        }
-
-    @Test
-    fun `permission callback은 recreation 후 exact review identity를 설치한다`() =
-        runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository().apply {
-                restoreResult = ManagerRestoreResult(
-                    review = review(ContractCompatibilityStatus.COMPATIBLE),
-                )
-            }
-            val savedState = SavedStateHandle(
-                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
-            )
-            val source = ManagerViewModel(repository, savedState)
-            advanceUntilIdle()
-            source.accept(ManagerAction.PrepareReviewedInstall)
-            val effect = assertIs<ManagerEffect.RequestInstallNotificationPermission>(
-                source.effects.first(),
-            )
-
-            val recreated = ManagerViewModel(repository, savedState)
-            advanceUntilIdle()
-            recreated.accept(
-                ManagerAction.ContinueInstallAfterNotificationPermission(
-                    reviewToken = effect.reviewToken,
-                    generatedToken = effect.generatedToken,
-                ),
-            )
-            advanceUntilIdle()
-
             assertEquals(1, repository.installRequests)
         }
 
@@ -1595,6 +1465,246 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `system installer launch 성공 뒤 foreground 복귀에서 설치 결과를 조정한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                reconcileSystemInstallResult = InstallState.Installed(PACKAGE)
+                terminalOwnerProofConfigured = true
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerPackageName = PACKAGE
+                terminalOwnerState = InstallState.Installed(PACKAGE)
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            repository.emitLaunch(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                installImportToken = TOKEN,
+            )
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertEquals(TOKEN, effect.installImportToken)
+
+            viewModel.accept(ManagerAction.LaunchSucceeded(effect))
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.systemLaunchSucceededTokens)
+            assertEquals(1, repository.reconcileSystemInstallCalls)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `system installer effect token이 current review owner와 다르면 launch 결과를 무시한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            val unrelated = ManagerEffect.LaunchIntent(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                intentFactory = { error("unit test에서는 Intent를 만들지 않습니다.") },
+                installImportToken = SECOND_TOKEN,
+            )
+
+            viewModel.accept(ManagerAction.LaunchSucceeded(unrelated))
+            viewModel.accept(ManagerAction.LaunchFailed(unrelated))
+            advanceUntilIdle()
+
+            assertTrue(repository.systemLaunchSucceededTokens.isEmpty())
+            assertTrue(repository.systemLaunchFailedTokens.isEmpty())
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `system installer PREPARED와 initial resume은 설치 취소를 조정하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.PreparingSystemInstaller
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                reconcileSystemInstallResult = InstallState.Cancelled
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+
+            assertEquals(0, repository.reconcileSystemInstallCalls)
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `system installer launch 실패는 정확한 owner로 기록하고 전용 재시도 메시지를 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            repository.emitLaunch(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                installImportToken = TOKEN,
+            )
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+
+            viewModel.accept(ManagerAction.LaunchFailed(effect))
+
+            assertEquals(listOf(TOKEN), repository.systemLaunchFailedTokens)
+            assertEquals("시스템 설치 화면을 열 수 없습니다.", viewModel.state.value.message?.text)
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
+    fun `My Files fallback은 검증된 APK document를 요청하고 명시 확인에서만 조정한다`() =
+        runTest(dispatcher.scheduler) {
+            val source = File("/retained/$TOKEN/wrapper.apk")
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingSystemInstaller
+                systemInstallFallback = SystemInstallApkFallback(
+                    importToken = TOKEN,
+                    source = source,
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "smart:context/menu",
+                )
+                manualSystemInstallResult = InstallState.Installed(PACKAGE)
+                terminalOwnerProofConfigured = true
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerPackageName = PACKAGE
+                terminalOwnerState = InstallState.Installed(PACKAGE)
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+            assertEquals(TOKEN, effect.importToken)
+            assertEquals(source, effect.source)
+            assertEquals("a".repeat(64), effect.expectedSha256)
+            assertEquals("smart-context-menu-wrapper.apk", effect.suggestedFileName)
+
+            viewModel.accept(
+                ManagerAction.SystemInstallApkCreated(
+                    importToken = TOKEN,
+                    uri = unitTestUri(),
+                ),
+            )
+            assertEquals(listOf(TOKEN), repository.systemInstallExportedTokens)
+            assertEquals(
+                "시스템 설치 프로그램을 직접 열 수 없습니다.\n" +
+                    "저장한 APK를 내 파일에서 열어 설치한 뒤 ‘설치 상태 확인’을 눌러 주세요.",
+                viewModel.state.value.message?.text,
+            )
+            assertEquals(
+                RecoveryAction.CHECK_INSTALL_STATUS,
+                viewModel.state.value.message?.recoveryAction,
+            )
+
+            viewModel.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+            assertEquals(0, repository.reconcileManualSystemInstallCalls)
+
+            viewModel.accept(ManagerAction.ConfirmSystemInstallStatus)
+            advanceUntilIdle()
+            assertEquals(1, repository.reconcileManualSystemInstallCalls)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `My Files picker 취소와 stale token은 EXPORTED로 전이하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingSystemInstaller
+                systemInstallFallback = SystemInstallApkFallback(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            assertIs<ManagerEffect.CreateSystemInstallApkDocument>(viewModel.effects.first())
+
+            viewModel.accept(ManagerAction.SystemInstallApkCreated(SECOND_TOKEN, null))
+            viewModel.accept(ManagerAction.SystemInstallApkCreated(TOKEN, null))
+
+            assertTrue(repository.systemInstallExportedTokens.isEmpty())
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
+    fun `process recreation은 EXPORTED manual install 확인 버튼을 복원하고 자동 조정하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                installFlow.value = InstallState.AwaitingManualInstall(TOKEN)
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                manualSystemInstallResult = InstallState.Cancelled
+            }
+            val recreated = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                RecoveryAction.CHECK_INSTALL_STATUS,
+                recreated.state.value.message?.recoveryAction,
+            )
+            recreated.accept(ManagerAction.ReturnedToForeground)
+            advanceUntilIdle()
+            assertEquals(0, repository.reconcileManualSystemInstallCalls)
+
+            recreated.accept(ManagerAction.ConfirmSystemInstallStatus)
+            advanceUntilIdle()
+            assertEquals(1, repository.reconcileManualSystemInstallCalls)
+        }
+
+    @Test
     fun `제거 화면 복귀 뒤 실제 재조회 결과만 반영한다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository()
         val viewModel = ManagerViewModel(repository, SavedStateHandle())
@@ -1780,17 +1890,24 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `launch 실패 RETRY는 저장한 factory와 session으로 현재 세대 effect를 새로 만든다`() =
+    fun `system launch 실패 RETRY는 저장한 factory와 token으로 현재 세대 effect를 새로 만든다`() =
         runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository()
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
-            advanceUntilIdle()
-            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
-            val effect = ManagerEffect.LaunchIntent(
-                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
-                intentFactory = { error("launch failure") },
-                installSessionId = 41,
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
             )
+            advanceUntilIdle()
+            repository.emitLaunch(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                installImportToken = TOKEN,
+            )
+            val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
 
             viewModel.accept(ManagerAction.LaunchFailed(effect))
             assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
@@ -1798,7 +1915,7 @@ class ManagerViewModelTest {
             val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
             assertFalse(effect === retried)
             assertTrue(effect.intentFactory === retried.intentFactory)
-            assertEquals(effect.installSessionId, retried.installSessionId)
+            assertEquals(TOKEN, retried.installImportToken)
             assertNull(viewModel.state.value.message)
 
             viewModel.accept(ManagerAction.LaunchFailed(retried))
@@ -1807,7 +1924,7 @@ class ManagerViewModelTest {
             val retriedAgain = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
             assertFalse(retried === retriedAgain)
             assertTrue(retried.intentFactory === retriedAgain.intentFactory)
-            assertEquals(retried.installSessionId, retriedAgain.installSessionId)
+            assertEquals(TOKEN, retriedAgain.installImportToken)
         }
 
     @Test
@@ -1870,8 +1987,11 @@ class ManagerViewModelTest {
                     advanceUntilIdle()
                     assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
                 } else {
-                    repository.installFlow.value = InstallState.AwaitingUserApproval(41)
-                    repository.emitLaunch(destination, 41)
+                    repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+                    repository.emitLaunch(
+                        destination = destination,
+                        installImportToken = TOKEN,
+                    )
                     advanceUntilIdle()
                     assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
                 }
@@ -2673,13 +2793,23 @@ class ManagerViewModelTest {
     @Test
     fun `구독자보다 먼저 발생한 Add-ons와 confirmation effect를 각각 한 번 전달한다`() =
         runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository()
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
             advanceUntilIdle()
 
             viewModel.accept(ManagerAction.OpenSamsungAddOns)
-            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
-            repository.emitLaunch(LaunchDestination.SYSTEM_INSTALL_CONFIRMATION, 41)
+            repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+            repository.emitLaunch(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                installImportToken = TOKEN,
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -2695,12 +2825,22 @@ class ManagerViewModelTest {
     @Test
     fun `terminal 상태가 된 뒤 구독하면 stale install confirmation을 건너뛴다`() =
         runTest(dispatcher.scheduler) {
-            val repository = FakeManagerRepository()
-            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
             advanceUntilIdle()
 
-            repository.installFlow.value = InstallState.AwaitingUserApproval(41)
-            repository.emitLaunch(LaunchDestination.SYSTEM_INSTALL_CONFIRMATION, 41)
+            repository.installFlow.value = InstallState.AwaitingSystemInstaller(TOKEN)
+            repository.emitLaunch(
+                destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                installImportToken = TOKEN,
+            )
             advanceUntilIdle()
             repository.installFlow.value = InstallState.Cancelled
             viewModel.accept(ManagerAction.OpenSamsungAddOns)
@@ -3572,13 +3712,7 @@ class ManagerViewModelTest {
                 advanceUntilIdle()
                 if (gate == "Retry") {
                     viewModel.accept(ManagerAction.PrepareGeneratedInstall)
-                    assertEquals(
-                        ManagerEffect.RequestInstallNotificationPermission(
-                            reviewToken = TOKEN,
-                            generatedToken = TOKEN,
-                        ),
-                        viewModel.effects.first(),
-                    )
+                    dispatcher.scheduler.runCurrent()
                     repository.installFlow.value =
                         InstallState.Failed("ABANDON_FAILED", "cleanup retry")
                     advanceUntilIdle()
@@ -3739,7 +3873,10 @@ class ManagerViewModelTest {
             repository.installFlow.value = InstallState.Installed(PACKAGE)
             advanceUntilIdle()
 
-            assertEquals(listOf("discardReview:$TOKEN"), repository.lifecycleEvents)
+            assertEquals(
+                listOf("install:start", "install:end", "discardReview:$TOKEN"),
+                repository.lifecycleEvents,
+            )
             assertTrue(repository.generatedExists)
             val ready = assertIs<ConversionUiState.ResultReady>(
                 viewModel.state.value.conversionState,
@@ -3777,7 +3914,12 @@ class ManagerViewModelTest {
 
             assertTrue(cleanupInProgressObserved)
             assertEquals(
-                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                listOf(
+                    "install:start",
+                    "install:end",
+                    "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
+                ),
                 repository.lifecycleEvents,
             )
             assertEquals(1, repository.discardAttempts.size)
@@ -3820,7 +3962,12 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(
-                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                listOf(
+                    "install:start",
+                    "install:end",
+                    "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
+                ),
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
@@ -4921,6 +5068,8 @@ class ManagerViewModelTest {
             assertEquals(2, repository.cancelInstallRequests)
             assertEquals(
                 listOf(
+                    "install:start",
+                    "install:end",
                     "cancelInstall",
                     "cancelInstall",
                     "discardReview:$TOKEN",
@@ -7560,7 +7709,12 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(
-                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                listOf(
+                    "install:start",
+                    "install:end",
+                    "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
+                ),
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
@@ -7947,7 +8101,10 @@ class ManagerViewModelTest {
             assertNull(
                 savedState.get<String>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
             )
-            assertTrue(repository.lifecycleEvents.isEmpty())
+            assertEquals(
+                listOf("install:start", "install:end"),
+                repository.lifecycleEvents,
+            )
             assertFalse(repository.terminalReceiptActive)
 
             repository.restoreResult = ManagerRestoreResult(review = retainedReview)
@@ -7956,7 +8113,12 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(
-                listOf("discardReview:$TOKEN", "discardConversion:$TOKEN"),
+                listOf(
+                    "install:start",
+                    "install:end",
+                    "discardReview:$TOKEN",
+                    "discardConversion:$TOKEN",
+                ),
                 repository.lifecycleEvents,
             )
             assertEquals(ManagerRoute.Report(PACKAGE), recreated.state.value.route)
@@ -8782,6 +8944,14 @@ private class FakeManagerRepository : ManagerRepository {
     var lastPartialConfirmed = false
     var resumeRequests = 0
     var reconcileRequests = 0
+    val systemLaunchSucceededTokens = mutableListOf<String>()
+    val systemLaunchFailedTokens = mutableListOf<String>()
+    var reconcileSystemInstallCalls = 0
+    var reconcileSystemInstallResult: InstallState? = null
+    var systemInstallFallback: SystemInstallApkFallback? = null
+    val systemInstallExportedTokens = mutableListOf<String>()
+    var reconcileManualSystemInstallCalls = 0
+    var manualSystemInstallResult: InstallState? = null
     var uninstallOutcome: UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
     val uninstallPackages = mutableListOf<String>()
     val uninstallLaunches = mutableListOf<RepositoryLaunch>()
@@ -9030,6 +9200,37 @@ private class FakeManagerRepository : ManagerRepository {
         }
     }
 
+    override fun markSystemInstallLaunchSucceeded(importToken: String): Boolean {
+        systemLaunchSucceededTokens += importToken
+        return true
+    }
+
+    override fun markSystemInstallLaunchFailed(importToken: String): Boolean {
+        systemLaunchFailedTokens += importToken
+        return true
+    }
+
+    override suspend fun reconcileSystemInstallAfterReturn(): InstallState? {
+        reconcileSystemInstallCalls += 1
+        return reconcileSystemInstallResult?.also {
+            installFlow.value = it
+        }
+    }
+
+    override fun systemInstallApkFallback(importToken: String): SystemInstallApkFallback? =
+        systemInstallFallback?.takeIf { it.importToken == importToken }
+
+    override fun markSystemInstallApkExported(importToken: String): Boolean {
+        systemInstallExportedTokens += importToken
+        installFlow.value = InstallState.AwaitingManualInstall(importToken)
+        return true
+    }
+
+    override suspend fun reconcileManualSystemInstall(importToken: String): InstallState? {
+        reconcileManualSystemInstallCalls += 1
+        return manualSystemInstallResult?.also { installFlow.value = it }
+    }
+
     suspend fun completeInstall() {
         installGate.emit(Unit)
     }
@@ -9091,13 +9292,14 @@ private class FakeManagerRepository : ManagerRepository {
         val state = terminalOwnerState ?: return InstallTerminalOwnerResult.OwnerMismatch
         val importToken =
             terminalOwnerImportToken ?: return InstallTerminalOwnerResult.OwnerMismatch
-        val sessionId =
-            terminalOwnerSessionId ?: return InstallTerminalOwnerResult.OwnerMismatch
+        val sessionId = terminalOwnerSessionId
         if (importToken != expectedReviewToken || installFlow.value != state) {
             return InstallTerminalOwnerResult.OwnerMismatch
         }
         if (expectedSessionId == null) {
-            return InstallTerminalOwnerResult.OwnerSessionAssigned(sessionId, state)
+            return sessionId?.let {
+                InstallTerminalOwnerResult.OwnerSessionAssigned(it, state)
+            } ?: InstallTerminalOwnerResult.Owned(state)
         }
         return if (expectedSessionId == sessionId) {
             InstallTerminalOwnerResult.Owned(state)
@@ -9292,12 +9494,17 @@ private class FakeManagerRepository : ManagerRepository {
     fun cleanupRequestCount(): Int =
         cancelInstallRequests + discardAttempts.size + discardedConversions.size
 
-    fun emitLaunch(destination: LaunchDestination, installSessionId: Int? = null) {
+    fun emitLaunch(
+        destination: LaunchDestination,
+        installSessionId: Int? = null,
+        installImportToken: String? = null,
+    ) {
         launchChannel.trySend(
             RepositoryLaunch(
                 destination = destination,
                 intentFactory = { error("unit test에서 Android Intent를 만들지 않습니다.") },
                 installSessionId = installSessionId,
+                installImportToken = installImportToken,
             ),
         )
     }

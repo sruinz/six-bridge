@@ -1,6 +1,5 @@
 package dev.sixbridge.manager
 
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
@@ -133,7 +132,6 @@ fun ManagerAppContent(
                     onInstall = onInstallReviewed,
                     onAddSix = onAddSix,
                     modifier = modifier,
-                    showNotificationPermissionNotice = Build.VERSION.SDK_INT >= 33,
                 )
             }
         }

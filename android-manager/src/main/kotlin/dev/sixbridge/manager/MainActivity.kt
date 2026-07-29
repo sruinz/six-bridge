@@ -4,9 +4,7 @@ import android.content.ContentResolver
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -37,14 +35,16 @@ import java.io.FileOutputStream
 import java.io.FilterOutputStream
 import java.io.OutputStream
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.concurrent.CancellationException
 
 class MainActivity : ComponentActivity() {
     private lateinit var managerViewModel: ManagerViewModel
-    private lateinit var notificationInstallGate: NotificationPermissionInstallGate
     private var sixPickerLaunchGate = ActivityDocumentLaunchGate()
     private var pendingConversionPicker: PendingActivityDocumentLaunch? = null
     private var pendingConversionSave: PendingActivityDocumentLaunch? = null
+    private var pendingSystemInstallApk:
+        ManagerEffect.CreateSystemInstallApkDocument? = null
 
     private val openDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -78,10 +78,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val requestNotifications = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) {
-        notificationInstallGate.onPermissionResult()
+    private val createSystemInstallApkDocument = registerForActivityResult(
+        ActivityResultContracts.CreateDocument(APK_MIME_TYPE),
+    ) { uri ->
+        val pending = pendingSystemInstallApk
+        pendingSystemInstallApk = null
+        if (pending == null || uri == null) {
+            pending?.let {
+                managerViewModel.accept(
+                    ManagerAction.SystemInstallApkCreated(it.importToken, null),
+                )
+            }
+            return@registerForActivityResult
+        }
+        lifecycleScope.launch {
+            val result = writeGeneratedDocument(
+                resolver = contentResolver,
+                uri = uri,
+                expectedHash = pending.expectedSha256,
+                copy = { output -> copyFileAndSha256(pending.source, output) },
+            )
+            managerViewModel.accept(
+                ManagerAction.SystemInstallApkCreated(
+                    importToken = pending.importToken,
+                    uri = uri.takeIf { result == GeneratedDocumentSaveResult.Success },
+                ),
+            )
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -109,6 +132,7 @@ class MainActivity : ComponentActivity() {
             ownerKey = PENDING_CONVERSION_SAVE_OWNER,
             launchKey = PENDING_CONVERSION_SAVE_LAUNCH_ID,
         )
+        pendingSystemInstallApk = savedInstanceState?.restorePendingSystemInstallApk()
         managerViewModel = ViewModelProvider(
             this,
             viewModelFactory {
@@ -128,33 +152,6 @@ class MainActivity : ComponentActivity() {
                 }
             },
         )[ManagerViewModel::class.java]
-        notificationInstallGate = NotificationPermissionInstallGate(
-            pendingInstall = savedInstanceState
-                ?.getString(PENDING_NOTIFICATION_REVIEW_TOKEN)
-                ?.let { reviewToken ->
-                    ManagerEffect.RequestInstallNotificationPermission(
-                        reviewToken = reviewToken,
-                        generatedToken =
-                            savedInstanceState.getString(PENDING_NOTIFICATION_GENERATED_TOKEN),
-                    )
-                },
-            needsPermission = {
-                Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(POST_NOTIFICATIONS_PERMISSION) !=
-                    PackageManager.PERMISSION_GRANTED
-            },
-            requestPermission = {
-                requestNotificationPermission()
-            },
-            continueInstall = { effect ->
-                managerViewModel.accept(
-                    ManagerAction.ContinueInstallAfterNotificationPermission(
-                        reviewToken = effect.reviewToken,
-                        generatedToken = effect.generatedToken,
-                    ),
-                )
-            },
-        )
         setContent {
             SixBridgeManagerApp(
                 viewModel = managerViewModel,
@@ -180,8 +177,7 @@ class MainActivity : ComponentActivity() {
                                 launchSixDocumentPicker()
                             }
                         }
-                        is ManagerEffect.RequestInstallNotificationPermission ->
-                            notificationInstallGate.requestInstall(effect)
+                        is ManagerEffect.RequestInstallNotificationPermission -> Unit
                         is ManagerEffect.LaunchIntent -> executeLaunch(
                             effect = effect,
                             resolveIntent = { it.intentFactory() },
@@ -208,6 +204,10 @@ class MainActivity : ComponentActivity() {
                                 launchId = effect.launchId,
                             )
                             createConversionDocument.launch(effect.suggestedFileName)
+                        }
+                        is ManagerEffect.CreateSystemInstallApkDocument -> {
+                            pendingSystemInstallApk = effect
+                            createSystemInstallApkDocument.launch(effect.suggestedFileName)
                         }
                         is ManagerEffect.ShareGeneratedBundle -> {
                             executeGeneratedShareLaunch(
@@ -236,14 +236,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        if (::notificationInstallGate.isInitialized) {
-            notificationInstallGate.pendingInstall?.let { pending ->
-                outState.putString(PENDING_NOTIFICATION_REVIEW_TOKEN, pending.reviewToken)
-                pending.generatedToken?.let {
-                    outState.putString(PENDING_NOTIFICATION_GENERATED_TOKEN, it)
-                }
-            }
-        }
+        pendingSystemInstallApk?.save(outState)
         sixPickerLaunchGate.active?.save(
             outState = outState,
             tokenKey = null,
@@ -276,10 +269,6 @@ class MainActivity : ComponentActivity() {
         ManagerAppVisibility.onActivityStarted()
     }
 
-    private fun requestNotificationPermission() {
-        requestNotifications.launch(POST_NOTIFICATIONS_PERMISSION)
-    }
-
     private fun launchSixDocumentPicker() {
         openDocument.launch(SIX_MIME_TYPES)
     }
@@ -290,9 +279,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
-        const val PENDING_NOTIFICATION_REVIEW_TOKEN = "pending_notification_review_token"
-        const val PENDING_NOTIFICATION_GENERATED_TOKEN =
-            "pending_notification_generated_token"
         const val PENDING_SIX_PICKER_OWNER = "pending_six_picker_owner"
         const val PENDING_SIX_PICKER_LAUNCH_ID = "pending_six_picker_launch_id"
         const val QUEUED_SIX_PICKER_OWNER = "queued_six_picker_owner"
@@ -302,7 +288,6 @@ class MainActivity : ComponentActivity() {
         const val PENDING_CONVERSION_SAVE_LAUNCH_ID = "pending_conversion_save_launch_id"
         const val PENDING_CONVERSION_PICKER_OWNER = "pending_conversion_picker_owner"
         const val PENDING_CONVERSION_PICKER_LAUNCH_ID = "pending_conversion_picker_launch_id"
-        const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
         val SIX_MIME_TYPES = arrayOf(
             "application/zip",
             "application/octet-stream",
@@ -314,6 +299,32 @@ class MainActivity : ComponentActivity() {
             "application/vnd.sixbridge.draft",
         )
     }
+}
+
+private const val PENDING_SYSTEM_APK_TOKEN = "pending_system_apk_token"
+private const val PENDING_SYSTEM_APK_SOURCE = "pending_system_apk_source"
+private const val PENDING_SYSTEM_APK_SHA256 = "pending_system_apk_sha256"
+private const val PENDING_SYSTEM_APK_NAME = "pending_system_apk_name"
+
+private fun ManagerEffect.CreateSystemInstallApkDocument.save(outState: Bundle) {
+    outState.putString(PENDING_SYSTEM_APK_TOKEN, importToken)
+    outState.putString(PENDING_SYSTEM_APK_SOURCE, source.path)
+    outState.putString(PENDING_SYSTEM_APK_SHA256, expectedSha256)
+    outState.putString(PENDING_SYSTEM_APK_NAME, suggestedFileName)
+}
+
+private fun Bundle.restorePendingSystemInstallApk():
+    ManagerEffect.CreateSystemInstallApkDocument? {
+    val token = getString(PENDING_SYSTEM_APK_TOKEN) ?: return null
+    val source = getString(PENDING_SYSTEM_APK_SOURCE) ?: return null
+    val sha256 = getString(PENDING_SYSTEM_APK_SHA256) ?: return null
+    val name = getString(PENDING_SYSTEM_APK_NAME) ?: return null
+    return ManagerEffect.CreateSystemInstallApkDocument(
+        importToken = token,
+        source = File(source),
+        expectedSha256 = sha256,
+        suggestedFileName = name,
+    )
 }
 
 internal data class PendingActivityDocumentLaunch(
@@ -412,6 +423,22 @@ internal fun Bundle.restorePendingDocumentLaunch(
 }
 
 internal const val GENERATED_BUNDLE_MIME_TYPE = "application/vnd.sixbridge.bundle"
+internal const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+
+internal fun copyFileAndSha256(source: File, output: OutputStream): String? {
+    if (!source.isFile || Files.isSymbolicLink(source.toPath())) return null
+    val digest = MessageDigest.getInstance("SHA-256")
+    source.inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            digest.update(buffer, 0, count)
+            output.write(buffer, 0, count)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
 
 sealed interface GeneratedDocumentSaveResult {
     data object Success : GeneratedDocumentSaveResult

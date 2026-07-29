@@ -271,6 +271,54 @@ class ConversionDocumentIoTest {
     }
 
     @Test
+    fun system_install_apk_fallback_copies_exact_bytes_and_verifies_sha256() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val source = File(context.cacheDir, "smart-context-menu-wrapper.apk").apply {
+            writeBytes(ByteArray(256 * 1_024) { index -> (index % 251).toByte() })
+        }
+        val expected = sha256(source.readBytes())
+
+        try {
+            val result = writeGeneratedDocument(
+                resolver = resolver,
+                uri = uri("system-install-apk"),
+                expectedHash = expected,
+                copy = { output -> copyFileAndSha256(source, output) },
+            )
+
+            assertEquals(GeneratedDocumentSaveResult.Success, result)
+            assertArrayEquals(source.readBytes(), read("system-install-apk"))
+        } finally {
+            source.delete()
+        }
+    }
+
+    @Test
+    fun system_install_apk_fallback_hash_mismatch_deletes_destination() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val source = File(context.cacheDir, "system-install-mismatch.apk").apply {
+            writeBytes("verified-wrapper".encodeToByteArray())
+        }
+
+        try {
+            val result = writeGeneratedDocument(
+                resolver = resolver,
+                uri = uri("system-install-mismatch"),
+                expectedHash = "0".repeat(64),
+                copy = { output -> copyFileAndSha256(source, output) },
+            )
+
+            assertEquals(
+                GeneratedDocumentSaveResult.Failure(cleanupFailed = false),
+                result,
+            )
+            assertFalse(exists("system-install-mismatch"))
+        } finally {
+            source.delete()
+        }
+    }
+
+    @Test
     fun null_descriptor_reports_cleanup_failure() = runBlocking {
         val result = writeGeneratedDocument(
             resolver = resolver,

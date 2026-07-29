@@ -90,11 +90,14 @@ class ManagerViewModel(
     private var pendingGeneratedShareHandoff: PendingGeneratedShareHandoff? = null
     private var generatedShareHandoffSequence = 0L
     private var installJob: Job? = null
+    private var pendingSystemInstallApkDocument:
+        ManagerEffect.CreateSystemInstallApkDocument? = null
     private var operationGeneration = 0L
     private var launchGeneration = 0L
     private var uninstallGeneration = 0L
     private var pendingUninstallLaunch: PendingUninstallLaunch? = null
     private var pendingUninstallReturn: PendingUninstallReturn? = null
+    private var systemInstallReturnToken: String? = null
     private var pendingRecovery: PendingRecovery? = null
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
@@ -186,6 +189,7 @@ class ManagerViewModel(
             action !is ManagerAction.ImportSelected &&
             action !is ManagerAction.ConversionFileSelected &&
             action !is ManagerAction.SaveGeneratedConversionTo &&
+            action !is ManagerAction.SystemInstallApkCreated &&
             action !is ManagerAction.ContinueInstallAfterNotificationPermission &&
             action !is ManagerAction.GeneratedCleanupDestinationPresented &&
             action != ManagerAction.ReturnedToForeground
@@ -251,6 +255,9 @@ class ManagerViewModel(
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.PrepareReviewedInstall -> prepareReviewedInstall()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
+            is ManagerAction.SystemInstallApkCreated ->
+                acceptSystemInstallApkCreated(action)
+            ManagerAction.ConfirmSystemInstallStatus -> confirmSystemInstallStatus()
             is ManagerAction.ContinueInstallAfterNotificationPermission ->
                 continueInstallAfterNotificationPermission(action)
             ManagerAction.CancelReview -> cancelReview()
@@ -597,12 +604,7 @@ class ManagerViewModel(
                 message = null,
             )
         }
-        enqueueEffect(
-            ManagerEffect.RequestInstallNotificationPermission(
-                reviewToken = review.token,
-                generatedToken = result.token,
-            ),
-        )
+        installReviewedBundle()
     }
 
     private fun requestGeneratedSave() {
@@ -1515,6 +1517,7 @@ class ManagerViewModel(
                     }
                 }
                 if (installState.isTerminalState()) {
+                    systemInstallReturnToken = null
                     replacementCancelGeneration?.let { generation ->
                         deferredReplacementTerminal = generation to installState
                         return@collect
@@ -1524,7 +1527,9 @@ class ManagerViewModel(
                 if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
                     InstallState.PreparingSystemInstaller,
-                    is InstallState.AwaitingSystemInstaller -> Unit
+                    is InstallState.AwaitingSystemInstaller,
+                    is InstallState.AwaitingManualInstall,
+                    -> Unit
                     is InstallState.WritingSession -> {
                         saveSessionIfInitialized(installState.sessionId)
                         clearLaunchRecovery(LaunchDestination.UNKNOWN_SOURCES_SETTINGS)
@@ -1588,11 +1593,7 @@ class ManagerViewModel(
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
         if (mutableState.value.route != ManagerRoute.Review(ready.review.token)) return
         if (generatedInstallOwnerToken != null) return
-        enqueueEffect(
-            ManagerEffect.RequestInstallNotificationPermission(
-                reviewToken = ready.review.token,
-            ),
-        )
+        installReviewedBundle()
     }
 
     private fun installReviewedBundle() {
@@ -1635,6 +1636,18 @@ class ManagerViewModel(
                         mutableState.value.conversionState as? ConversionUiState.ResultReady
                     result?.token == generatedOwner && result.review?.token == reviewToken
                 }
+            val fallback = repository.systemInstallApkFallback(reviewToken)
+            if (fallback != null && stillOwnsAttempt) {
+                val effect = ManagerEffect.CreateSystemInstallApkDocument(
+                    importToken = fallback.importToken,
+                    source = fallback.source,
+                    expectedSha256 = fallback.expectedSha256,
+                    suggestedFileName = suggestedWrapperApkName(fallback.extensionName),
+                )
+                pendingSystemInstallApkDocument = effect
+                enqueueEffect(effect)
+                return@launch
+            }
             if (attemptResult.isTerminalState() && stillOwnsAttempt) {
                 val applied = applyObservedInstallTerminal(attemptResult)
                 if (!applied &&
@@ -1644,6 +1657,68 @@ class ManagerViewModel(
                     applyAttemptOwnedFailure(reviewToken, attemptResult)
                 }
             }
+        }
+    }
+
+    private fun acceptSystemInstallApkCreated(
+        action: ManagerAction.SystemInstallApkCreated,
+    ) {
+        val pending = pendingSystemInstallApkDocument
+            ?.takeIf {
+                it.importToken == action.importToken &&
+                    isCurrentReviewOwner(action.importToken)
+            }
+            ?: return
+        if (action.uri == null) {
+            pendingRecovery = PendingRecovery.SystemInstallApk(pending)
+            mutableState.update {
+                it.copy(
+                    message = UserMessage(
+                        UserMessageKind.LAUNCH_FAILED,
+                        "APK를 저장하지 못했습니다.",
+                        RecoveryAction.RETRY,
+                    ),
+                )
+            }
+            return
+        }
+        if (!repository.markSystemInstallApkExported(action.importToken)) {
+            pendingRecovery = PendingRecovery.SystemInstallApk(pending)
+            mutableState.update {
+                it.copy(
+                    message = UserMessage(
+                        UserMessageKind.INSTALL_FAILED,
+                        "APK 저장 상태를 확인하지 못했습니다.",
+                        RecoveryAction.RETRY,
+                    ),
+                )
+            }
+            return
+        }
+        pendingSystemInstallApkDocument = null
+        pendingRecovery = null
+        showManualSystemInstallMessage()
+    }
+
+    private fun confirmSystemInstallStatus() {
+        val manual = mutableState.value.installState as? InstallState.AwaitingManualInstall
+            ?: return
+        if (!isCurrentReviewOwner(manual.importToken)) return
+        viewModelScope.launch {
+            repository.reconcileManualSystemInstall(manual.importToken)
+        }
+    }
+
+    private fun showManualSystemInstallMessage() {
+        mutableState.update {
+            it.copy(
+                message = UserMessage(
+                    UserMessageKind.INSTALL_FAILED,
+                    "시스템 설치 프로그램을 직접 열 수 없습니다.\n" +
+                        "저장한 APK를 내 파일에서 열어 설치한 뒤 ‘설치 상태 확인’을 눌러 주세요.",
+                    RecoveryAction.CHECK_INSTALL_STATUS,
+                ),
+            )
         }
     }
 
@@ -1743,6 +1818,18 @@ class ManagerViewModel(
             }
             return
         }
+        val systemToken = systemInstallReturnToken
+        val systemState = mutableState.value.installState
+        if (systemToken != null &&
+            systemState == InstallState.AwaitingSystemInstaller(systemToken) &&
+            isCurrentReviewOwner(systemToken)
+        ) {
+            systemInstallReturnToken = null
+            viewModelScope.launch {
+                repository.reconcileSystemInstallAfterReturn()
+            }
+            return
+        }
         viewModelScope.launch {
             try {
                 if (mutableState.value.installState == InstallState.UnknownSourcesPermissionRequired) {
@@ -1805,6 +1892,14 @@ class ManagerViewModel(
 
     private fun recordLaunchFailure(effect: ManagerEffect.LaunchIntent) {
         if (!isEffectCurrent(effect)) return
+        val systemInstallToken =
+            effect.installImportToken.takeIf {
+                effect.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION
+            }
+        if (systemInstallToken != null) {
+            if (!repository.markSystemInstallLaunchFailed(systemInstallToken)) return
+            systemInstallReturnToken = null
+        }
         val uninstallPackage = if (effect.destination == LaunchDestination.UNINSTALL) {
             val pendingLaunch = pendingUninstallLaunch
                 ?.takeIf {
@@ -1818,10 +1913,10 @@ class ManagerViewModel(
         } else {
             null
         }
-        val failureText = if (uninstallPackage != null) {
-            "시스템 제거 화면을 열 수 없습니다."
-        } else {
-            "시스템 화면을 열 수 없습니다."
+        val failureText = when {
+            uninstallPackage != null -> "시스템 제거 화면을 열 수 없습니다."
+            systemInstallToken != null -> "시스템 설치 화면을 열 수 없습니다."
+            else -> "시스템 화면을 열 수 없습니다."
         }
         pendingRecovery = PendingRecovery.Launch(effect, uninstallPackage)
         mutableState.update {
@@ -1837,6 +1932,13 @@ class ManagerViewModel(
 
     private fun recordLaunchSuccess(effect: ManagerEffect.LaunchIntent) {
         if (!isEffectCurrent(effect)) return
+        if (effect.destination == LaunchDestination.SYSTEM_INSTALL_CONFIRMATION) {
+            val importToken = effect.installImportToken ?: return
+            if (repository.markSystemInstallLaunchSucceeded(importToken)) {
+                systemInstallReturnToken = importToken
+            }
+            return
+        }
         if (effect.destination != LaunchDestination.UNINSTALL) return
         val pendingLaunch = pendingUninstallLaunch
             ?.takeIf {
@@ -1865,6 +1967,7 @@ class ManagerViewModel(
                     destination = recovery.effect.destination,
                     intentFactory = recovery.effect.intentFactory,
                     installSessionId = recovery.effect.installSessionId,
+                    installImportToken = recovery.effect.installImportToken,
                     ownerGeneration = launchGeneration,
                 )
                 recovery.uninstallPackage?.let { packageName ->
@@ -1875,6 +1978,10 @@ class ManagerViewModel(
                     )
                 }
                 enqueueEffect(retriedEffect)
+            }
+            is PendingRecovery.SystemInstallApk -> {
+                pendingSystemInstallApkDocument = recovery.effect
+                enqueueEffect(recovery.effect)
             }
         }
     }
@@ -1887,7 +1994,10 @@ class ManagerViewModel(
         launchGeneration += 1
         pendingRecovery = null
         if (!preserveRetryMessage &&
-            mutableState.value.message?.recoveryAction == RecoveryAction.RETRY
+            mutableState.value.message?.recoveryAction in setOf(
+                RecoveryAction.RETRY,
+                RecoveryAction.CHECK_INSTALL_STATUS,
+            )
         ) {
             mutableState.update { it.copy(message = null) }
         }
@@ -2040,6 +2150,7 @@ class ManagerViewModel(
         clearPendingSixPicker()
         clearPendingConversionPicker()
         clearPendingConversionSave()
+        pendingSystemInstallApkDocument = null
     }
 
     private fun savePendingSixPicker(launch: PendingDocumentLaunch) {
@@ -3173,8 +3284,19 @@ class ManagerViewModel(
             return
         }
         deferredInitialTerminals = null
+        val installState = repository.installState.value
+        if (installState is InstallState.AwaitingSystemInstaller &&
+            isCurrentReviewOwner(installState.importToken)
+        ) {
+            systemInstallReturnToken = installState.importToken
+        }
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
+        }
+        if (installState is InstallState.AwaitingManualInstall &&
+            isCurrentReviewOwner(installState.importToken)
+        ) {
+            showManualSystemInstallMessage()
         }
         reconcileQuarantinedGeneratedCleanup()
     }
@@ -3997,6 +4119,10 @@ class ManagerViewModel(
                     pending.launchId == effect.launchId &&
                     pending.ownerGeneration == documentOwnerGeneration
             }
+            is ManagerEffect.CreateSystemInstallApkDocument -> {
+                val pending = pendingSystemInstallApkDocument ?: return false
+                return pending == effect && isCurrentReviewOwner(effect.importToken)
+            }
             is ManagerEffect.ShareGeneratedBundle -> {
                 val handoff = pendingGeneratedShareHandoff ?: return false
                 val result =
@@ -4021,8 +4147,17 @@ class ManagerViewModel(
             return false
         }
         if (effect.destination != LaunchDestination.SYSTEM_INSTALL_CONFIRMATION) return true
-        val sessionId = effect.installSessionId ?: return false
-        return repository.installState.value == InstallState.AwaitingUserApproval(sessionId)
+        val importToken = effect.installImportToken ?: return false
+        return repository.installState.value ==
+            InstallState.AwaitingSystemInstaller(importToken) &&
+            isCurrentReviewOwner(importToken)
+    }
+
+    private fun isCurrentReviewOwner(importToken: String): Boolean {
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return false
+        return ready.review.token == importToken &&
+            ownedReviewToken == importToken &&
+            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == importToken
     }
 
     private fun isInstallPermissionOwnerCurrent(
@@ -4386,6 +4521,15 @@ private fun CatalogRecord.toItem(): ManagedExtensionItem {
 private fun InstallState.isTerminalState(): Boolean =
     this is InstallState.Installed || this == InstallState.Cancelled || this is InstallState.Failed
 
+internal fun suggestedWrapperApkName(extensionName: String): String {
+    val safeName = extensionName
+        .trim()
+        .replace(Regex("""[\\/:*?"<>|\p{Cc}]"""), "-")
+        .trim('.', ' ')
+        .ifBlank { "extension" }
+    return "$safeName-wrapper.apk"
+}
+
 private fun importFailureMessage(code: ImportFailureCode): UserMessage = when (code) {
     ImportFailureCode.SOURCE_UNREADABLE,
     ImportFailureCode.SOURCE_TOO_LARGE,
@@ -4440,6 +4584,9 @@ private sealed interface PendingRecovery {
     data class Launch(
         val effect: ManagerEffect.LaunchIntent,
         val uninstallPackage: String? = null,
+    ) : PendingRecovery
+    data class SystemInstallApk(
+        val effect: ManagerEffect.CreateSystemInstallApkDocument,
     ) : PendingRecovery
 }
 

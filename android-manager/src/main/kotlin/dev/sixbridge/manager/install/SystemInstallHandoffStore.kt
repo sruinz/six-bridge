@@ -8,6 +8,7 @@ interface SystemInstallHandoffStore {
     fun snapshot(): RecoveryRecordSnapshot<PendingSystemInstall>
     fun tryPrepare(record: PendingSystemInstall): Boolean
     fun markLaunched(expected: PendingSystemInstall): PendingSystemInstall?
+    fun markExported(expected: PendingSystemInstall): PendingSystemInstall?
     fun clear(expected: PendingSystemInstall): Boolean
 }
 
@@ -39,6 +40,16 @@ class SharedPreferencesSystemInstallHandoffStore internal constructor(
             return@synchronized null
         }
         expected.copy(stage = SystemInstallStage.LAUNCHED)
+            .takeIf(::writeLocked)
+    }
+
+    override fun markExported(
+        expected: PendingSystemInstall,
+    ): PendingSystemInstall? = synchronized(PROCESS_LOCK) {
+        if (loadLocked() != expected || expected.stage != SystemInstallStage.PREPARED) {
+            return@synchronized null
+        }
+        expected.copy(stage = SystemInstallStage.EXPORTED)
             .takeIf(::writeLocked)
     }
 

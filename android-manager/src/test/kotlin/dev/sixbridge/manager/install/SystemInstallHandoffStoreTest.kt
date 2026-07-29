@@ -46,6 +46,20 @@ class SystemInstallHandoffStoreTest {
     }
 
     @Test
+    fun `prepared 레코드는 같은 소유자의 hash 검증 완료 뒤 exported로 전이한다`() {
+        val store = store()
+        val prepared = pending(stage = SystemInstallStage.PREPARED)
+
+        assertTrue(store.tryPrepare(prepared))
+        assertNull(store.markExported(prepared.copy(importToken = OTHER_TOKEN)))
+        assertEquals(
+            prepared.copy(stage = SystemInstallStage.EXPORTED),
+            store.markExported(prepared),
+        )
+        assertNull(store.markLaunched(prepared))
+    }
+
+    @Test
     fun `동시 prepare는 하나의 소유자만 획득한다`() {
         val store = store()
         val executor = Executors.newFixedThreadPool(2)

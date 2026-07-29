@@ -54,6 +54,7 @@ import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SystemInstallCoordinator
 import dev.sixbridge.manager.install.SystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallStage
 import dev.sixbridge.manager.install.SystemInstallerGateway
 import dev.sixbridge.manager.install.SystemInstallerLaunch
 import dev.sixbridge.manager.install.SystemInstallerLaunchResult
@@ -185,7 +186,7 @@ class ManagerRepositoryTest {
         }
 
     @Test
-    fun `system installer launch 실패는 정확한 import token만 정리한다`() =
+    fun `system installer launch 실패는 정확한 import token의 PREPARED를 유지한다`() =
         runTest {
             val fixture = systemRepositoryFixture("system-install-launch-failed")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
@@ -197,11 +198,13 @@ class ManagerRepositoryTest {
             )
             assertTrue(fixture.repository.markSystemInstallLaunchFailed(TOKEN))
 
-            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
             assertEquals(
-                listOf(File(fixture.root, TOKEN).resolve("wrapper.apk")),
-                fixture.systemGateway.revoked,
+                SystemInstallStage.PREPARED,
+                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                    fixture.handoffStore.snapshot(),
+                ).value.stage,
             )
+            assertTrue(fixture.systemGateway.revoked.isEmpty())
         }
 
     @Test
@@ -250,7 +253,7 @@ class ManagerRepositoryTest {
         }
 
     @Test
-    fun `system installer fallback은 launch나 legacy session 없이 Idle을 반환한다`() =
+    fun `system installer fallback은 검증된 APK metadata를 명시적으로 반환한다`() =
         runTest {
             val fixture = systemRepositoryFixture(
                 name = "system-install-fallback",
@@ -261,8 +264,16 @@ class ManagerRepositoryTest {
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
 
             val result = fixture.repository.install(review, partialConfirmed = true)
+            val fallback = assertNotNull(
+                fixture.repository.systemInstallApkFallback(TOKEN),
+            )
 
-            assertEquals(InstallState.Idle, result)
+            assertEquals(InstallState.PreparingSystemInstaller, result)
+            assertEquals(TOKEN, fallback.importToken)
+            assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), fallback.source)
+            assertEquals(sha256(fallback.source), fallback.expectedSha256)
+            assertEquals("Example", fallback.extensionName)
+            assertNull(fixture.repository.systemInstallApkFallback("other"))
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
         }
@@ -3785,6 +3796,13 @@ private class InMemorySystemInstallHandoffStore : SystemInstallHandoffStore {
         if (record != expected) return null
         return expected.copy(
             stage = dev.sixbridge.manager.install.SystemInstallStage.LAUNCHED,
+        ).also { record = it }
+    }
+
+    override fun markExported(expected: PendingSystemInstall): PendingSystemInstall? {
+        if (record != expected) return null
+        return expected.copy(
+            stage = dev.sixbridge.manager.install.SystemInstallStage.EXPORTED,
         ).also { record = it }
     }
 

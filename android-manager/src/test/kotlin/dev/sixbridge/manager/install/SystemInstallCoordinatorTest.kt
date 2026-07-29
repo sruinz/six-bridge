@@ -139,7 +139,7 @@ class SystemInstallCoordinatorTest {
     }
 
     @Test
-    fun `허용된 system installer가 없으면 prepared handoff를 남기지 않는다`() = runTest {
+    fun `허용된 system installer가 없으면 copy 전 PREPARED handoff를 남긴다`() = runTest {
         val fixture = fixture(
             launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
         )
@@ -148,8 +148,38 @@ class SystemInstallCoordinatorTest {
             SystemInstallRequestResult.MyFilesFallbackRequired,
             fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
         )
-        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        val handoff = assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+            fixture.handoffStore.snapshot(),
+        ).value
+        assertEquals(SystemInstallStage.PREPARED, handoff.stage)
+        assertEquals(InstallState.PreparingSystemInstaller, fixture.coordinator.state.value)
     }
+
+    @Test
+    fun `manual export는 foreground에서 조정하지 않고 정확한 token 확인에서만 조정한다`() =
+        runTest {
+            val fixture = fixture(
+                launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
+                actual = expectedInstalled(),
+            )
+            assertIs<SystemInstallRequestResult.MyFilesFallbackRequired>(
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
+            )
+
+            assertNull(fixture.coordinator.reconcileAfterReturn())
+            assertNull(fixture.coordinator.reconcileManualAfterUserCheck(OTHER_TOKEN))
+            assertFalse(fixture.coordinator.markManualExportSucceeded(OTHER_TOKEN))
+            assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+            assertEquals(
+                InstallState.AwaitingManualInstall(TOKEN),
+                fixture.coordinator.state.value,
+            )
+            assertEquals(
+                InstallState.Installed(PACKAGE),
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            )
+            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        }
 
     @Test
     fun `launch 생성 뒤 handoff prepare가 실패하면 URI 권한을 즉시 회수한다`() = runTest {
@@ -192,7 +222,7 @@ class SystemInstallCoordinatorTest {
         }
 
     @Test
-    fun `launch 실패 표시는 PREPARED record와 URI 권한을 정리하고 실패 상태를 남긴다`() =
+    fun `launch 실패 표시는 재시도를 위해 PREPARED record와 상태를 유지한다`() =
         runTest {
             val fixture = fixture()
             assertIs<SystemInstallRequestResult.Launch>(
@@ -201,13 +231,15 @@ class SystemInstallCoordinatorTest {
 
             assertFalse(fixture.coordinator.markLaunchFailed(OTHER_TOKEN))
             assertTrue(fixture.coordinator.markLaunchFailed(TOKEN))
-            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
-            assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
             assertEquals(
-                InstallState.Failed(
-                    "SYSTEM_INSTALLER_LAUNCH_FAILED",
-                    "시스템 설치 화면을 열지 못했습니다.",
-                ),
+                SystemInstallStage.PREPARED,
+                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                    fixture.handoffStore.snapshot(),
+                ).value.stage,
+            )
+            assertTrue(fixture.gateway.revoked.isEmpty())
+            assertEquals(
+                InstallState.AwaitingSystemInstaller(TOKEN),
                 fixture.coordinator.state.value,
             )
         }
@@ -548,6 +580,11 @@ class SystemInstallCoordinatorTest {
         override fun markLaunched(expected: PendingSystemInstall): PendingSystemInstall? {
             if (current != expected || expected.stage != SystemInstallStage.PREPARED) return null
             return expected.copy(stage = SystemInstallStage.LAUNCHED).also { current = it }
+        }
+
+        override fun markExported(expected: PendingSystemInstall): PendingSystemInstall? {
+            if (current != expected || expected.stage != SystemInstallStage.PREPARED) return null
+            return expected.copy(stage = SystemInstallStage.EXPORTED).also { current = it }
         }
 
         override fun clear(expected: PendingSystemInstall): Boolean {

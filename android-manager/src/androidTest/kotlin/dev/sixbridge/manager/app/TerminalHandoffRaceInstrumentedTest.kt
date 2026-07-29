@@ -4,6 +4,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelStore
+import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
@@ -32,6 +33,7 @@ import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.install.FinalReceiptOrigin
 import dev.sixbridge.manager.install.FinalReceiptStage
+import dev.sixbridge.manager.install.ExpectedInstalledWrapper
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.InstallSessionSnapshot
@@ -39,11 +41,13 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.PackageInstallResult
+import dev.sixbridge.manager.install.PendingSystemInstall
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
 import dev.sixbridge.manager.install.SharedPreferencesSystemInstallHandoffStore
 import dev.sixbridge.manager.install.SystemInstallCoordinator
+import dev.sixbridge.manager.install.SystemInstallStage
 import dev.sixbridge.manager.install.SystemInstallerGateway
 import dev.sixbridge.manager.install.SystemInstallerLaunchResult
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
@@ -67,6 +71,7 @@ import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -96,6 +101,50 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class TerminalHandoffRaceInstrumentedTest {
+    @Test
+    fun exportedSystemInstallHandoffSurvivesStoreRecreationWithExactOwner() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val preferences = context.getSharedPreferences(
+            "system-install-export-${UUID.randomUUID()}",
+            android.content.Context.MODE_PRIVATE,
+        )
+        preferences.edit().clear().commit()
+        try {
+            val prepared = PendingSystemInstall(
+                importToken = UUID.randomUUID().toString(),
+                expected = ExpectedInstalledWrapper(
+                    packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                    extensionId = "b".repeat(32),
+                    versionCode = 1,
+                    signerSha256 = "c".repeat(64),
+                ),
+                wrapperSha256 = "d".repeat(64),
+                previous = null,
+                startedAtEpochMillis = 1,
+                stage = SystemInstallStage.PREPARED,
+            )
+            val source = SharedPreferencesSystemInstallHandoffStore(preferences)
+
+            assertTrue(source.tryPrepare(prepared))
+            val exported = source.markExported(prepared)
+            assertNotNull(exported)
+
+            val recreated = SharedPreferencesSystemInstallHandoffStore(preferences)
+            assertEquals(
+                RecoveryRecordSnapshot.Present(exported),
+                recreated.snapshot(),
+            )
+            assertEquals(SystemInstallStage.EXPORTED, exported?.stage)
+            assertNull(
+                recreated.markExported(
+                    prepared.copy(importToken = UUID.randomUUID().toString()),
+                ),
+            )
+        } finally {
+            preferences.edit().clear().commit()
+        }
+    }
+
     @Test
     fun wrongTypedRecoveryRecordsCompleteStartupBlockedAndPreserveOriginalKeys() =
         runBlocking {

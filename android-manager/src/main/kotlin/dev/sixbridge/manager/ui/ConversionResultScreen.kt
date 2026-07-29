@@ -100,8 +100,11 @@ fun ConversionResultScreen(
     }
 }
 
-private fun resultRecoveryAction(message: UserMessage): ManagerAction? =
-    when (message.kind) {
+private fun resultRecoveryAction(message: UserMessage): ManagerAction? {
+    if (message.recoveryAction == RecoveryAction.CHECK_INSTALL_STATUS) {
+        return ManagerAction.ConfirmSystemInstallStatus
+    }
+    return when (message.kind) {
         UserMessageKind.CONVERSION_CLEANUP_FAILED ->
             ManagerAction.RetryGeneratedCleanup
         UserMessageKind.CONVERSION_SAVE_FAILED,
@@ -109,11 +112,13 @@ private fun resultRecoveryAction(message: UserMessage): ManagerAction? =
         -> ManagerAction.SaveGeneratedConversion
         else -> null
     }
+}
 
 private fun dev.sixbridge.manager.install.InstallState.isActiveInstall(): Boolean =
         this == dev.sixbridge.manager.install.InstallState.UnknownSourcesPermissionRequired ||
-        this is dev.sixbridge.manager.install.InstallState.WritingSession ||
-        this is dev.sixbridge.manager.install.InstallState.AwaitingUserApproval ||
+        this == dev.sixbridge.manager.install.InstallState.PreparingSystemInstaller ||
+        this is dev.sixbridge.manager.install.InstallState.AwaitingSystemInstaller ||
+        this is dev.sixbridge.manager.install.InstallState.AwaitingManualInstall ||
         this is dev.sixbridge.manager.install.InstallState.Failed &&
         code in setOf(
             "CLEANUP_FAILED",

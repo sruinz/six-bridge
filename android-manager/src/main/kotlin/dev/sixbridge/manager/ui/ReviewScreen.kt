@@ -30,7 +30,6 @@ fun ReviewScreen(
     onInstall: () -> Unit,
     onAddSix: () -> Unit,
     modifier: Modifier = Modifier,
-    showNotificationPermissionNotice: Boolean = true,
 ) {
     val review = ready.review
     val installBusy = installState != InstallState.Idle &&
@@ -141,17 +140,12 @@ fun ReviewScreen(
                         RecoveryAction.SELECT_ANOTHER_FILE,
                         -> onAddSix()
                         RecoveryAction.RETRY -> onAction(ManagerAction.RetryRecovery)
+                        RecoveryAction.CHECK_INSTALL_STATUS ->
+                            onAction(ManagerAction.ConfirmSystemInstallStatus)
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)
                     }
                 },
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
-            )
-        }
-        if (showNotificationPermissionNotice) {
-            Text(
-                text = stringResource(R.string.review_notification_notice),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         Button(
@@ -173,8 +167,9 @@ fun ReviewScreen(
 @Composable
 private fun InstallProgress(installState: InstallState) {
     val label = when (installState) {
-        is InstallState.WritingSession -> R.string.install_writing
-        is InstallState.AwaitingUserApproval -> R.string.install_approval
+        InstallState.PreparingSystemInstaller -> R.string.install_preparing_system
+        is InstallState.AwaitingSystemInstaller -> R.string.install_awaiting_system
+        is InstallState.AwaitingManualInstall -> return
         InstallState.UnknownSourcesPermissionRequired -> R.string.install_unknown_sources
         else -> return
     }
