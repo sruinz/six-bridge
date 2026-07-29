@@ -339,6 +339,143 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `conversion restore suspend 중 반복 terminal은 bounded 최신 exact만 owner 복원 뒤 적용한다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val conversionResult = CompletableDeferred<RestoredConversion?>()
+            val installed = InstallState.Installed(PACKAGE)
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeDeferred = initializeResult
+                restoreConversionDeferred = conversionResult
+                installFlow.value = InstallState.Cancelled
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = installed
+                terminalOwnerProofConfigured = true
+                suspendTerminalOwnerAfterRequests = 2
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = null,
+                    installSessionId = 41,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+
+            repeat(12) { index ->
+                repository.installFlow.value = InstallState.Failed(
+                    code = "STALE_$index",
+                    message = "stale terminal $index",
+                )
+                dispatcher.scheduler.runCurrent()
+            }
+            repository.installFlow.value = installed
+            dispatcher.scheduler.runCurrent()
+
+            conversionResult.complete(
+                RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(installed, viewModel.state.value.installState)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals("COMMIT_DESTINATION", generatedCleanupPhase(savedState))
+            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `owner 복원 실패 READY는 deferred terminal을 폐기해 다음 owner를 오염시키지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to TOKEN,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeDeferred = initializeResult
+                restoredConversion = null
+                installFlow.value = InstallState.Cancelled
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = InstallState.Cancelled
+                terminalOwnerProofConfigured = true
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+            initializeResult.complete(
+                ManagerRestoreResult(
+                    review = null,
+                    installSessionId = 41,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertFalse(hasDeferredInitialTerminal(viewModel))
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            viewModel.startImport {
+                ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
+                )
+            }
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.Idle
+            dispatcher.scheduler.runCurrent()
+            repository.installFlow.value = InstallState.Cancelled
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(
+                    viewModel.state.value.importState,
+                ).review.token,
+            )
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
     fun `recovery blocked 보고서 왕복은 고정 메시지를 보존한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -7485,6 +7622,13 @@ class ManagerViewModelTest {
             ?.jsonPrimitive
             ?.contentOrNull
 
+    private fun hasDeferredInitialTerminal(viewModel: ManagerViewModel): Boolean {
+        val field = ManagerViewModel::class.java.getDeclaredField("deferredInitialTerminals")
+        field.isAccessible = true
+        val deferred = field.get(viewModel) ?: return false
+        return (deferred as? Collection<*>)?.isNotEmpty() ?: true
+    }
+
     private fun generatedCleanupInstallSession(savedState: SavedStateHandle): Int? =
         generatedCleanupJournal(savedState)
             ?.get("installSessionId")
@@ -7750,6 +7894,8 @@ private class FakeManagerRepository : ManagerRepository {
     var terminalOwnerPackageName: String? = null
     var terminalOwnerState: InstallState? = null
     var terminalOwnerProofConfigured = false
+    var suspendTerminalOwnerAfterRequests: Int? = null
+    private val terminalOwnerGate = MutableSharedFlow<Unit>()
     val terminalOwnerArguments = mutableListOf<Pair<String, Int?>>()
     val currentTerminalReceiptArguments =
         mutableListOf<Triple<String, Int?, String>>()
@@ -7972,6 +8118,11 @@ private class FakeManagerRepository : ManagerRepository {
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult {
         terminalOwnerArguments += expectedReviewToken to expectedSessionId
+        if (terminalOwnerArguments.size >
+            (suspendTerminalOwnerAfterRequests ?: Int.MAX_VALUE)
+        ) {
+            terminalOwnerGate.first()
+        }
         if (!terminalOwnerProofConfigured) {
             val state = installFlow.value
             return if (!(state is InstallState.Installed ||

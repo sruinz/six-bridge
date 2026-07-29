@@ -31,7 +31,6 @@ import dev.sixbridge.manager.install.NormalInstallHandoff
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.OutputStream
-import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -99,7 +98,7 @@ class ManagerViewModel(
     private var initialized = false
     private val installStateAtInitialization = repository.installState.value
     private var firstInstallStateObserved = false
-    private val deferredInitialTerminals = ArrayDeque<InstallState>()
+    private var deferredInitialTerminals: DeferredInitialTerminals? = null
     private var lastInstallState: InstallState? = null
     private var ownedReviewToken: String? = null
     private val pendingReviewDiscards = linkedSetOf<String>()
@@ -1050,7 +1049,7 @@ class ManagerViewModel(
                     it.phase == GeneratedCleanupPhase.CONVERSION
             }
             if (generation != operationGeneration) {
-                deferredInitialTerminals.clear()
+                deferredInitialTerminals = null
                 if (intermediateCleanup == null) {
                     restored.review?.token?.let(::queuePendingReviewDiscard)
                 }
@@ -1060,7 +1059,7 @@ class ManagerViewModel(
                 return@launch
             }
             if (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != savedToken) {
-                deferredInitialTerminals.clear()
+                deferredInitialTerminals = null
                 if (reconcileRestoredNormalHandoffAfterStartupMismatch(restored)) {
                     markStartupRecoveryReady()
                 }
@@ -1269,8 +1268,21 @@ class ManagerViewModel(
     }
 
     private suspend fun reconcileDeferredInitialTerminals() {
-        while (deferredInitialTerminals.isNotEmpty()) {
-            applyObservedInstallTerminal(deferredInitialTerminals.removeFirst())
+        val terminals = deferredInitialTerminals?.candidates() ?: return
+        deferredInitialTerminals = null
+        try {
+            terminals.forEach { applyObservedInstallTerminal(it) }
+        } finally {
+            deferredInitialTerminals = null
+        }
+    }
+
+    private fun deferInitialTerminal(installState: InstallState) {
+        val deferred = deferredInitialTerminals
+        deferredInitialTerminals = if (deferred == null) {
+            DeferredInitialTerminals(initial = installState)
+        } else {
+            deferred.copy(latest = installState)
         }
     }
 
@@ -1399,7 +1411,7 @@ class ManagerViewModel(
                         (savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null ||
                             generatedInstallOwnerToken != null)
                     ) {
-                        deferredInitialTerminals.addLast(installState)
+                        deferInitialTerminal(installState)
                     }
                     return@collect
                 }
@@ -1409,7 +1421,7 @@ class ManagerViewModel(
                     savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != null
                 ) {
                     if (!initialized) {
-                        deferredInitialTerminals.addLast(installState)
+                        deferInitialTerminal(installState)
                         return@collect
                     }
                     if (ownedReviewToken != null && generatedInstallOwnerToken == null) {
@@ -3003,6 +3015,7 @@ class ManagerViewModel(
         ) {
             return
         }
+        deferredInitialTerminals = null
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
         }
@@ -3868,6 +3881,14 @@ private enum class GeneratedCleanupPhase {
     REVIEW,
     CONVERSION,
     COMMIT_DESTINATION,
+}
+
+private data class DeferredInitialTerminals(
+    val initial: InstallState,
+    val latest: InstallState? = null,
+) {
+    fun candidates(): List<InstallState> =
+        if (latest == null || latest == initial) listOf(initial) else listOf(initial, latest)
 }
 
 private data class PendingGeneratedCleanup(
