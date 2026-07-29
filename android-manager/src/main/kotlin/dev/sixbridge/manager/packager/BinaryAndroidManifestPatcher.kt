@@ -7,6 +7,7 @@ import dev.sixbridge.manager.wrapper.BinaryAndroidManifestReader
 import dev.sixbridge.manager.wrapper.BinaryManifestFacts
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.TreeMap
@@ -14,6 +15,7 @@ import java.util.TreeMap
 data class WrapperManifestRequest(
     val extensionId: String,
     val versionCode: Int,
+    val extensionName: String,
 )
 
 class BinaryAndroidManifestPatcher(
@@ -22,6 +24,9 @@ class BinaryAndroidManifestPatcher(
     fun patch(template: ByteArray, request: WrapperManifestRequest): ByteArray {
         require(EXTENSION_ID.matches(request.extensionId)) { "확장 ID 형식이 올바르지 않습니다." }
         require(request.versionCode > 0) { "versionCode는 0보다 커야 합니다." }
+        require(request.extensionName.isNotBlank() && '\u0000' !in request.extensionName) {
+            "확장 이름이 올바르지 않습니다."
+        }
 
         val immutableTemplate = template.copyOf()
         val templateFacts = reader.read(immutableTemplate)
@@ -52,12 +57,26 @@ class BinaryAndroidManifestPatcher(
             name = "authorities",
             resourceId = AUTHORITIES_RESOURCE_ID,
         )
+        val applicationLabelAttribute = layout.singleAttribute(
+            elementName = "application",
+            parentName = "manifest",
+            namespace = ANDROID_NAMESPACE,
+            name = "label",
+            resourceId = LABEL_RESOURCE_ID,
+        )
 
         val packageSlot = layout.singlePlaceholder(PACKAGE_PREFIX + PLACEHOLDER_ID)
         val extensionIdSlot = layout.singlePlaceholder(PLACEHOLDER_ID)
         val authoritySlot = layout.singlePlaceholder(
             "$PACKAGE_PREFIX$PLACEHOLDER_ID$PROVIDER_SUFFIX",
         )
+        val labelSlot = layout.singleStringAttribute(applicationLabelAttribute)
+        require(
+            labelSlot.value.startsWith(LABEL_PLACEHOLDER_PREFIX) &&
+                labelSlot.payloadLength >= MIN_LABEL_PAYLOAD_BYTES,
+        ) {
+            "템플릿 application label placeholder가 올바르지 않습니다."
+        }
         requireStringAttribute(packageAttribute, packageSlot)
         requireStringAttribute(metadataValueAttribute, extensionIdSlot)
         requireStringAttribute(providerAuthorityAttribute, authoritySlot)
@@ -73,11 +92,26 @@ class BinaryAndroidManifestPatcher(
         packageSlot.replace(patched, packageName)
         extensionIdSlot.replace(patched, request.extensionId)
         authoritySlot.replace(patched, authority)
+        labelSlot.replaceWithinCapacity(patched, request.extensionName)
         patched.writeInt(versionCodeAttribute.offset + ATTRIBUTE_RAW_VALUE_OFFSET, NO_INDEX)
         patched.writeInt(versionCodeAttribute.offset + ATTRIBUTE_TYPED_DATA_OFFSET, request.versionCode)
 
         val facts = reader.read(patched)
         verifyPatchedFacts(facts, request, packageName, authority)
+        val patchedLayout = BinaryManifestLayout.parse(patched)
+        val patchedLabelAttribute = patchedLayout.singleAttribute(
+            elementName = "application",
+            parentName = "manifest",
+            namespace = ANDROID_NAMESPACE,
+            name = "label",
+            resourceId = LABEL_RESOURCE_ID,
+        )
+        require(
+            patchedLayout.singleStringAttribute(patchedLabelAttribute).value ==
+                request.extensionName,
+        ) {
+            "패치된 manifest application label이 요청과 일치하지 않습니다."
+        }
         return patched
     }
 
@@ -173,6 +207,9 @@ class BinaryAndroidManifestPatcher(
         const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
         const val VERSION_CODE_RESOURCE_ID = 0x0101021b
         const val AUTHORITIES_RESOURCE_ID = 0x01010018
+        const val LABEL_RESOURCE_ID = 0x01010001
+        const val LABEL_PLACEHOLDER_PREFIX = "SIXBRIDGE_EXTENSION_NAME_PLACEHOLDER_"
+        const val MIN_LABEL_PAYLOAD_BYTES = 128
         const val TYPE_STRING = 0x03
         const val TYPE_INT_DEC = 0x10
         const val NO_INDEX = -1
@@ -204,6 +241,20 @@ private class BinaryManifestLayout private constructor(
             it.name == name &&
             it.resourceId == resourceId
     } ?: throw IllegalArgumentException("템플릿 manifest attribute가 누락되었거나 중복되었습니다.")
+
+    fun singleStringAttribute(attribute: Attribute): StringSlot {
+        require(attribute.valueType == TYPE_STRING) {
+            "템플릿 string attribute가 올바르지 않습니다."
+        }
+        val slot = string(attribute.valueData)
+        require(
+            attribute.rawValueIndex == NO_INDEX ||
+                attribute.rawValueIndex == slot.index,
+        ) {
+            "템플릿 string attribute의 raw value가 올바르지 않습니다."
+        }
+        return slot
+    }
 
     fun singleMetadataValueAttribute(): Attribute {
         val candidates = attributes.filter {
@@ -250,6 +301,11 @@ private class BinaryManifestLayout private constructor(
         val payloadOffset: Int,
         val payloadLength: Int,
         val charset: java.nio.charset.Charset,
+        val utf16LengthOffset: Int,
+        val utf16LengthWidth: Int,
+        val encodedLengthOffset: Int?,
+        val encodedLengthWidth: Int?,
+        val terminatorSize: Int,
     ) {
         fun replace(bytes: ByteArray, replacement: String) {
             val encoded = replacement.toByteArray(charset)
@@ -257,6 +313,79 @@ private class BinaryManifestLayout private constructor(
                 "템플릿 문자열 길이가 요청값과 일치하지 않습니다."
             }
             encoded.copyInto(bytes, payloadOffset)
+        }
+
+        fun replaceWithinCapacity(bytes: ByteArray, replacement: String) {
+            val encoder = charset.newEncoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            val buffer = encoder.encode(CharBuffer.wrap(replacement))
+            val encoded = ByteArray(buffer.remaining()).also(buffer::get)
+            require(encoded.size <= payloadLength) {
+                "확장 이름이 manifest label placeholder 용량을 초과합니다."
+            }
+            writeLength(
+                bytes,
+                utf16LengthOffset,
+                utf16LengthWidth,
+                replacement.length,
+                utf16 = charset == StandardCharsets.UTF_16LE,
+            )
+            encodedLengthOffset?.let { offset ->
+                writeLength(
+                    bytes,
+                    offset,
+                    requireNotNull(encodedLengthWidth),
+                    encoded.size,
+                    utf16 = false,
+                )
+            }
+            bytes.fill(
+                0,
+                payloadOffset,
+                payloadOffset + payloadLength + terminatorSize,
+            )
+            encoded.copyInto(bytes, payloadOffset)
+        }
+
+        private fun writeLength(
+            bytes: ByteArray,
+            offset: Int,
+            width: Int,
+            length: Int,
+            utf16: Boolean,
+        ) {
+            if (utf16) {
+                when (width) {
+                    2 -> {
+                        require(length <= 0x7fff)
+                        ByteBuffer.wrap(bytes, offset, 2)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .putShort(length.toShort())
+                    }
+                    4 -> {
+                        require(length >= 0)
+                        ByteBuffer.wrap(bytes, offset, 4)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .putShort(((length shr 16) or 0x8000).toShort())
+                            .putShort(length.toShort())
+                    }
+                    else -> error("UTF-16 string length 폭이 올바르지 않습니다.")
+                }
+            } else {
+                when (width) {
+                    1 -> {
+                        require(length < 0x80)
+                        bytes[offset] = length.toByte()
+                    }
+                    2 -> {
+                        require(length <= 0x7fff)
+                        bytes[offset] = ((length shr 8) or 0x80).toByte()
+                        bytes[offset + 1] = length.toByte()
+                    }
+                    else -> error("UTF-8 string length 폭이 올바르지 않습니다.")
+                }
+            }
         }
     }
 
@@ -414,7 +543,18 @@ private class BinaryManifestLayout private constructor(
                     }
                     val value = bytes.decode(payloadOffset, byteLength, StandardCharsets.UTF_8)
                     require(value.length == utf16Length) { "binary Android manifest UTF-8 길이가 올바르지 않습니다." }
-                    StringSlot(index, value, payloadOffset, byteLength, StandardCharsets.UTF_8)
+                    StringSlot(
+                        index = index,
+                        value = value,
+                        payloadOffset = payloadOffset,
+                        payloadLength = byteLength,
+                        charset = StandardCharsets.UTF_8,
+                        utf16LengthOffset = stringOffset.toInt(),
+                        utf16LengthWidth = afterUtf16Length - stringOffset.toInt(),
+                        encodedLengthOffset = afterUtf16Length,
+                        encodedLengthWidth = payloadOffset - afterUtf16Length,
+                        terminatorSize = 1,
+                    )
                 } else {
                     val (length, payloadOffset) = bytes.readUtf16Length(stringOffset.toInt(), chunkEnd)
                     val byteLength = length.toLong() * 2
@@ -425,7 +565,18 @@ private class BinaryManifestLayout private constructor(
                     ) { "binary Android manifest UTF-16 string이 잘렸습니다." }
                     val value = bytes.decode(payloadOffset, byteLength.toInt(), StandardCharsets.UTF_16LE)
                     require(value.length == length) { "binary Android manifest UTF-16 길이가 올바르지 않습니다." }
-                    StringSlot(index, value, payloadOffset, byteLength.toInt(), StandardCharsets.UTF_16LE)
+                    StringSlot(
+                        index = index,
+                        value = value,
+                        payloadOffset = payloadOffset,
+                        payloadLength = byteLength.toInt(),
+                        charset = StandardCharsets.UTF_16LE,
+                        utf16LengthOffset = stringOffset.toInt(),
+                        utf16LengthWidth = payloadOffset - stringOffset.toInt(),
+                        encodedLengthOffset = null,
+                        encodedLengthWidth = null,
+                        terminatorSize = 2,
+                    )
                 }
                 val range = if (utf8) {
                     bytes.utf8PayloadRange(stringOffset.toInt(), chunkEnd)

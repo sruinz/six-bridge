@@ -443,6 +443,7 @@ class OnDeviceWrapperPackager(context: Context) {
                     WrapperManifestRequest(
                         extensionId = identity.extensionId,
                         versionCode = request.reservation.versionCode,
+                        extensionName = request.descriptorName,
                     ),
                 )
                 AlignedApkAssembler(temporaryDirectory.path).assemble(

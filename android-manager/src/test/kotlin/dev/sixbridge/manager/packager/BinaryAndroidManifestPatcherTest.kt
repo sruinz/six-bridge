@@ -24,7 +24,7 @@ class BinaryAndroidManifestPatcherTest {
 
         val patched = BinaryAndroidManifestPatcher().patch(
             templateManifest,
-            WrapperManifestRequest(extensionId, 42),
+            WrapperManifestRequest(extensionId, 42, "SIX 테스트"),
         )
 
         val facts = BinaryAndroidManifestReader().read(patched)
@@ -42,7 +42,7 @@ class BinaryAndroidManifestPatcherTest {
         assertFailsWith<IllegalArgumentException> {
             BinaryAndroidManifestPatcher().patch(
                 templateManifest,
-                WrapperManifestRequest("z".repeat(32), 1),
+                WrapperManifestRequest("z".repeat(32), 1, "SIX 테스트"),
             )
         }
     }
@@ -53,7 +53,11 @@ class BinaryAndroidManifestPatcherTest {
             assertFailsWith<IllegalArgumentException> {
                 BinaryAndroidManifestPatcher().patch(
                     templateManifest,
-                    WrapperManifestRequest("bcdefghijklmnopabcdefghijklmnopa", versionCode),
+                    WrapperManifestRequest(
+                        "bcdefghijklmnopabcdefghijklmnopa",
+                        versionCode,
+                        "SIX 테스트",
+                    ),
                 )
             }
         }
@@ -197,6 +201,7 @@ class BinaryAndroidManifestPatcherTest {
     private fun request() = WrapperManifestRequest(
         extensionId = "bcdefghijklmnopabcdefghijklmnopa",
         versionCode = 42,
+        extensionName = "SIX 테스트",
     )
 
     private fun assertRejectedByReaderAndPatcher(bytes: ByteArray) {
@@ -233,11 +238,7 @@ class BinaryAndroidManifestPatcherTest {
         val stringsStart = original.u32(20)
         require(styleCount == 0 && original.u32(16) and UTF8_FLAG == 0)
         val slots = stringSlots(bytes)
-        val encodedStrings = slots.map { slot ->
-            val encoded = slot.value.encodeToByteArray()
-            require(slot.value.length < 0x80 && encoded.size < 0x80)
-            byteArrayOf(slot.value.length.toByte(), encoded.size.toByte()) + encoded + byteArrayOf(0)
-        }
+        val encodedStrings = slots.map { slot -> utf8String(slot.value) }
         val rebuilt = ByteArray(stringsStart + encodedStrings.sumOf { it.size })
         original.copyInto(rebuilt, endIndex = stringsStart)
         rebuilt.writeInt(4, rebuilt.size)

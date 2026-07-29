@@ -65,7 +65,7 @@ main() {
         *) fail "지원하지 않는 인자입니다: $1" ;;
     esac
     [[ $# -le 1 ]] || fail "인자는 하나만 지정할 수 있습니다."
-    [[ -d "${ROOT_DIR}/.git" ]] || fail "SIX Bridge repository root에서 실행해야 합니다."
+    [[ -e "${ROOT_DIR}/.git" ]] || fail "SIX Bridge repository root에서 실행해야 합니다."
     [[ -x "$ZIPALIGN" ]] || fail "Android SDK zipalign을 찾을 수 없습니다: $ZIPALIGN"
     if [[ -x "${ROOT_DIR}/gradlew" ]]; then
         gradle_command="${ROOT_DIR}/gradlew"

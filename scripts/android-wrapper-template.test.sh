@@ -213,7 +213,7 @@ main() {
     local actual_hash
     local pinned_hash
 
-    [[ -d "${ROOT_DIR}/.git" ]] || fail "SIX Bridge repository root에서 실행해야 합니다."
+    [[ -e "${ROOT_DIR}/.git" ]] || fail "SIX Bridge repository root에서 실행해야 합니다."
     require_tool "$AAPT2"
     require_tool "$APKSIGNER"
     require_tool "$ZIPALIGN"

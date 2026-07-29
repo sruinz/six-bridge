@@ -27,7 +27,7 @@ class AlignedApkAssemblerTest {
     private val manifestBytes = ZipFile(template).use { zip ->
         BinaryAndroidManifestPatcher().patch(
             zip.getInputStream(zip.getEntry("AndroidManifest.xml")).readBytes(),
-            WrapperManifestRequest(extensionId, 42),
+            WrapperManifestRequest(extensionId, 42, "SIX 테스트"),
         )
     }
     private val crxBytes by lazy { validCrx() }

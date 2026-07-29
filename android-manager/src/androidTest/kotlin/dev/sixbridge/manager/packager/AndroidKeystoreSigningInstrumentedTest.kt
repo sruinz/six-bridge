@@ -204,7 +204,11 @@ class AndroidKeystoreSigningInstrumentedTest {
         }
         val patchedManifest = BinaryAndroidManifestPatcher().patch(
             manifest,
-            WrapperManifestRequest(extensionId = extensionId, versionCode = 1),
+            WrapperManifestRequest(
+                extensionId = extensionId,
+                versionCode = 1,
+                extensionName = "SIX 테스트",
+            ),
         )
         return File(work, "unsigned.apk").also { output ->
             AlignedApkAssembler(work.toPath()).assemble(

@@ -160,6 +160,18 @@ class OnDevicePackagerGateInstrumentedTest {
             first.compatibility.adapterDecisions.single().id,
         )
         assertTrue(first.outputApk.isFile)
+        @Suppress("DEPRECATION")
+        val archiveInfo = requireNotNull(
+            context.packageManager.getPackageArchiveInfo(first.outputApk.absolutePath, 0),
+        )
+        val archiveApplication = requireNotNull(archiveInfo.applicationInfo).apply {
+            sourceDir = first.outputApk.absolutePath
+            publicSourceDir = first.outputApk.absolutePath
+        }
+        assertEquals(
+            "SIX Bridge On-Device Gate",
+            archiveApplication.loadLabel(context.packageManager).toString(),
+        )
         val verified = AndroidWrapperVerifier(AndroidArchiveInspector(context.packageManager)).verify(
             first.outputApk,
             first.descriptor,
