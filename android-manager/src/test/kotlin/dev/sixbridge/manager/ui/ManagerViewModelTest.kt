@@ -266,6 +266,78 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `terminal owner proof suspend 중 새 exact terminal은 READY 전에 적용한다`() =
+        runTest(dispatcher.scheduler) {
+            val conversionResult = CompletableDeferred<RestoredConversion?>()
+            val stale = InstallState.Failed("STALE", "stale terminal")
+            val savedState = generatedInstallSavedState(emptyMap())
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                )
+                restoreConversionDeferred = conversionResult
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = InstallState.Cancelled
+                terminalOwnerProofConfigured = true
+                suspendTerminalOwnerAfterRequests = 0
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            val states = mutableListOf<ManagerUiState>()
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.state.toList(states)
+            }
+            dispatcher.scheduler.runCurrent()
+
+            repository.installFlow.value = stale
+            dispatcher.scheduler.runCurrent()
+            conversionResult.complete(
+                RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(TOKEN to 41),
+                repository.terminalOwnerArguments,
+            )
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+
+            repository.installFlow.value = InstallState.Cancelled
+            dispatcher.scheduler.runCurrent()
+            repository.completeTerminalOwnerProof()
+            advanceUntilIdle()
+
+            val firstReady = states.first {
+                it.startupRecoveryState == StartupRecoveryUiState.READY
+            }
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), firstReady.route)
+            assertEquals(UserMessageKind.INSTALL_CANCELLED, firstReady.message?.kind)
+            assertFalse(
+                assertIs<ConversionUiState.ResultReady>(
+                    firstReady.conversionState,
+                ).installOwnerActive,
+            )
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+            assertNull(
+                savedState.get<String>(
+                    ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY,
+                ),
+            )
+        }
+
+    @Test
     fun `초기 terminal snapshot 뒤 conversion restore 중 새 exact terminal은 owner 복원 후 reconcile한다`() =
         runTest(dispatcher.scheduler) {
             val initializeResult = CompletableDeferred<ManagerRestoreResult>()
@@ -8086,6 +8158,10 @@ private class FakeManagerRepository : ManagerRepository {
         installGate.emit(Unit)
     }
 
+    suspend fun completeTerminalOwnerProof() {
+        terminalOwnerGate.emit(Unit)
+    }
+
     override suspend fun cancelInstall(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -8118,10 +8194,10 @@ private class FakeManagerRepository : ManagerRepository {
         expectedSessionId: Int?,
     ): InstallTerminalOwnerResult {
         terminalOwnerArguments += expectedReviewToken to expectedSessionId
-        if (terminalOwnerArguments.size >
-            (suspendTerminalOwnerAfterRequests ?: Int.MAX_VALUE)
-        ) {
-            terminalOwnerGate.first()
+        suspendTerminalOwnerAfterRequests?.let { completedRequests ->
+            if (terminalOwnerArguments.size == completedRequests + 1) {
+                terminalOwnerGate.first()
+            }
         }
         if (!terminalOwnerProofConfigured) {
             val state = installFlow.value

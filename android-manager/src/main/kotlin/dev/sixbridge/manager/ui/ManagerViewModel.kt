@@ -1272,6 +1272,10 @@ class ManagerViewModel(
         deferredInitialTerminals = null
         try {
             terminals.forEach { applyObservedInstallTerminal(it) }
+            if (deferredInitialTerminals != null) {
+                deferredInitialTerminals = null
+                applyCurrentOwnedInstallTerminal()
+            }
         } finally {
             deferredInitialTerminals = null
         }
@@ -2192,7 +2196,16 @@ class ManagerViewModel(
         }
     }
 
-    private suspend fun applyObservedInstallTerminal(installState: InstallState): Boolean {
+    private suspend fun applyObservedInstallTerminal(
+        installState: InstallState,
+    ): Boolean = applyOwnedInstallTerminal(installState)
+
+    private suspend fun applyCurrentOwnedInstallTerminal(): Boolean =
+        applyOwnedInstallTerminal(expectedInstallState = null)
+
+    private suspend fun applyOwnedInstallTerminal(
+        expectedInstallState: InstallState?,
+    ): Boolean {
         val generatedToken = generatedInstallOwnerToken
         val expectedReviewToken = if (generatedToken != null) {
             val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
@@ -2203,31 +2216,33 @@ class ManagerViewModel(
         val expectedSessionId = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
         val proof = repository.terminalForOwner(expectedReviewToken, expectedSessionId)
         var ownedSessionId = expectedSessionId
-        val owned = when (proof) {
+        val ownedInstallState = when (proof) {
             is InstallTerminalOwnerResult.Owned ->
-                proof.state == installState
+                proof.state.takeIf {
+                    expectedInstallState == null || it == expectedInstallState
+                }
             is InstallTerminalOwnerResult.OwnerSessionAssigned -> {
-                if (proof.state != installState ||
+                if ((expectedInstallState != null &&
+                        proof.state != expectedInstallState) ||
                     expectedSessionId != null ||
                     !assignTerminalSessionToCurrentOwner(
                         expectedReviewToken,
                         proof.sessionId,
                     )
                 ) {
-                    false
+                    null
                 } else {
                     ownedSessionId = proof.sessionId
-                    true
+                    proof.state
                 }
             }
-            InstallTerminalOwnerResult.OwnerMismatch -> false
-        }
-        return owned &&
-            applyInstallTerminal(
-                installState = installState,
-                expectedReviewToken = expectedReviewToken,
-                expectedSessionId = ownedSessionId,
-            )
+            InstallTerminalOwnerResult.OwnerMismatch -> null
+        } ?: return false
+        return applyInstallTerminal(
+            installState = ownedInstallState,
+            expectedReviewToken = expectedReviewToken,
+            expectedSessionId = ownedSessionId,
+        )
     }
 
     private suspend fun hasOwnedTerminal(
