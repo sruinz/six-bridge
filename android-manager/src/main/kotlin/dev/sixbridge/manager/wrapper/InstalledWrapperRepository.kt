@@ -6,7 +6,18 @@ data class InstalledWrapper(
     val name: String,
     val versionCode: Long,
     val signerSha256: String,
+    val apkSha256: String? = null,
+    val installSourceEvidence: InstallSourceEvidence = InstallSourceEvidence.Unavailable,
 )
+
+sealed interface InstallSourceEvidence {
+    data object Unavailable : InstallSourceEvidence
+
+    data class Known(
+        val installingPackageName: String?,
+        val originatingPackageName: String?,
+    ) : InstallSourceEvidence
+}
 
 interface InstalledWrapperRepository {
     suspend fun findAll(): List<InstalledWrapper>

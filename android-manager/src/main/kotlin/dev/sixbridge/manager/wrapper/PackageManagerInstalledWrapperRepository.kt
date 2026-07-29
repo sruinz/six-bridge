@@ -5,6 +5,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import java.io.File
 import java.security.MessageDigest
 
 class PackageManagerInstalledWrapperRepository(
@@ -70,6 +71,8 @@ class PackageManagerInstalledWrapperRepository(
             name = facts.applicationLabel.trim().ifEmpty { extensionId },
             versionCode = facts.versionCode,
             signerSha256 = facts.signerSha256.single(),
+            apkSha256 = facts.apkSha256,
+            installSourceEvidence = facts.installSourceEvidence,
         )
     }
 
@@ -101,6 +104,8 @@ data class InstalledWrapperPackageFacts(
     val metadata: Map<String, String>,
     val activities: List<InstalledWrapperActivity>,
     val providers: List<InstalledWrapperProvider>,
+    val apkSha256: String? = null,
+    val installSourceEvidence: InstallSourceEvidence = InstallSourceEvidence.Unavailable,
 )
 
 data class ResolvedDiscoveryActivity(
@@ -165,6 +170,14 @@ private class AndroidInstalledWrapperPackageGateway(
         val info = packageInfo(packageName)
         val application = info.applicationInfo ?: return null
         val signers = info.signingInfo?.apkContentsSigners.orEmpty()
+        val sourceEvidence = runCatching {
+            packageManager.getInstallSourceInfo(packageName).let {
+                InstallSourceEvidence.Known(
+                    installingPackageName = it.installingPackageName,
+                    originatingPackageName = it.originatingPackageName,
+                )
+            }
+        }.getOrDefault(InstallSourceEvidence.Unavailable)
         InstalledWrapperPackageFacts(
             packageName = info.packageName,
             applicationLabel = application.loadLabel(packageManager).toString(),
@@ -187,6 +200,8 @@ private class AndroidInstalledWrapperPackageGateway(
                 val authority = provider.authority ?: return@mapNotNull null
                 InstalledWrapperProvider(name, authority, provider.exported)
             },
+            apkSha256 = apkSha256(application.sourceDir),
+            installSourceEvidence = sourceEvidence,
         )
     }.getOrNull()
 
@@ -223,6 +238,19 @@ private class AndroidInstalledWrapperPackageGateway(
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun apkSha256(sourceDir: String?): String? = runCatching {
+        val digest = MessageDigest.getInstance("SHA-256")
+        File(requireNotNull(sourceDir)).inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val bytesRead = input.read(buffer)
+                if (bytesRead < 0) break
+                digest.update(buffer, 0, bytesRead)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
 
     private companion object {
         const val EXTENSION_ID_METADATA = "extension-id"

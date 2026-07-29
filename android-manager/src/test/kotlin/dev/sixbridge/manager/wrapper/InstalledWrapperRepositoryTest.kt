@@ -8,7 +8,15 @@ import kotlin.test.assertNull
 class InstalledWrapperRepositoryTest {
     @Test
     fun `returns only query candidates satisfying the complete wrapper contract`() = runBlocking {
-        val valid = facts(extensionId = VALID_ID, name = "Installed extension")
+        val valid = facts(
+            extensionId = VALID_ID,
+            name = "Installed extension",
+            apkSha256 = "9".repeat(64),
+            installSourceEvidence = InstallSourceEvidence.Known(
+                installingPackageName = "com.google.android.packageinstaller",
+                originatingPackageName = "com.sec.android.app.myfiles",
+            ),
+        )
         assertEquals(
             setOf(DEFAULT_CATEGORY, BROWSABLE_CATEGORY),
             valid.resolvedIntentFilter.categories,
@@ -108,6 +116,11 @@ class InstalledWrapperRepositoryTest {
                     name = "Installed extension",
                     versionCode = 7,
                     signerSha256 = SIGNER,
+                    apkSha256 = "9".repeat(64),
+                    installSourceEvidence = InstallSourceEvidence.Known(
+                        installingPackageName = "com.google.android.packageinstaller",
+                        originatingPackageName = "com.sec.android.app.myfiles",
+                    ),
                 ),
             ),
             repository.findAll(),
@@ -155,6 +168,8 @@ class InstalledWrapperRepositoryTest {
         metadataExtensionId: String = extensionId,
         name: String = "Example",
         signerSha256: List<String> = listOf(SIGNER),
+        apkSha256: String? = null,
+        installSourceEvidence: InstallSourceEvidence = InstallSourceEvidence.Unavailable,
         matchedActivity: ResolvedDiscoveryActivity = ResolvedDiscoveryActivity(
             packageName = packageName,
             name = DISCOVERY_ACTIVITY,
@@ -181,6 +196,8 @@ class InstalledWrapperRepositoryTest {
         metadata = mapOf("extension-id" to metadataExtensionId),
         activities = activities,
         providers = providers,
+        apkSha256 = apkSha256,
+        installSourceEvidence = installSourceEvidence,
     )
 
     private fun id(character: Char) = character.toString().repeat(32)
