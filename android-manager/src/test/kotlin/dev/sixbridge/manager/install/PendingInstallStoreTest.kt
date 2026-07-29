@@ -36,6 +36,17 @@ class PendingInstallStoreTest {
     }
 
     @Test
+    fun `SYSTEM_INSTALLER ACKNOWLEDGED receipt는 최초 record로 직접 생성할 수 없다`() {
+        val store = mutableStore()
+        val acknowledged = systemInstallerReceipt().copy(
+            stage = FinalReceiptStage.ACKNOWLEDGED,
+        )
+
+        assertFalse(store.createFinalReceipt(null, null, acknowledged))
+        assertNull(store.loadFinalReceipt())
+    }
+
+    @Test
     fun `SYSTEM_INSTALLER receipt는 session raw timestamp CANCELLING을 허용하지 않는다`() {
         assertFailsWith<IllegalArgumentException> {
             systemInstallerReceipt().copy(sessionId = 41)

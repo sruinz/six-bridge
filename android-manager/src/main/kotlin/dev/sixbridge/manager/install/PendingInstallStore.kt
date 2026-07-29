@@ -347,7 +347,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
         expectedRaw: PendingInstallResult?,
         receipt: FinalInstallReceipt,
     ): Boolean = synchronized(PROCESS_LOCK) {
-        if (!isValid(receipt) ||
+        if (!isValidInitialReceipt(receipt) ||
             !receipt.matchesRaw(expectedRaw) ||
             !pendingInstallSnapshotLocked().matchesExpected(expectedPending) ||
             !terminalResultSnapshotLocked().matchesExpected(expectedRaw) ||
@@ -1035,6 +1035,11 @@ class SharedPreferencesPendingInstallStore internal constructor(
             isCanonicalToken(receipt.importToken) &&
             (receipt.state !is InstallState.Installed ||
                 receipt.state.packageName == receipt.packageName)
+
+    private fun isValidInitialReceipt(receipt: FinalInstallReceipt): Boolean =
+        isValid(receipt) &&
+            (receipt.origin != FinalReceiptOrigin.SYSTEM_INSTALLER ||
+                receipt.stage == FinalReceiptStage.READY)
 
     private fun isValid(handoff: NormalInstallHandoff): Boolean =
         PACKAGE_NAME.matches(handoff.packageName) &&

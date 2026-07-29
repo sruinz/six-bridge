@@ -147,6 +147,7 @@ class SystemInstallCoordinator(
             stage = SystemInstallStage.PREPARED,
         )
         if (!handoffStore.tryPrepare(prepared)) {
+            runCatching { gateway.revoke(bundle.wrapperFile) }
             return@withLock failed(recoveryWriteFailed())
         }
         val awaiting = InstallState.AwaitingSystemInstaller(bundle.token)
@@ -207,6 +208,10 @@ class SystemInstallCoordinator(
                 val receipt = pendingStore.loadFinalReceipt()
                     ?.takeIf { it.origin == FinalReceiptOrigin.SYSTEM_INSTALLER }
                     ?: return@withLock null
+                if (!revokeRetainedWrapper(receipt.importToken)) {
+                    mutableState.value = recoveryWriteFailed()
+                    return@withLock mutableState.value
+                }
                 mutableState.value = receipt.state
                 return@withLock receipt.state
             }
@@ -253,8 +258,7 @@ class SystemInstallCoordinator(
             mutableState.value = recoveryWriteFailed()
             return@withLock mutableState.value
         }
-        val wrapper = retainedWrapperFile(record.importToken)
-        if (!runCatching { gateway.revoke(wrapper) }.isSuccess) {
+        if (!revokeRetainedWrapper(record.importToken)) {
             mutableState.value = recoveryWriteFailed()
             return@withLock mutableState.value
         }
@@ -296,6 +300,11 @@ class SystemInstallCoordinator(
                     receipt = receipt,
                 ) && pendingStore.loadFinalReceipt() == receipt
         }
+
+    private fun revokeRetainedWrapper(importToken: String): Boolean =
+        runCatching {
+            gateway.revoke(retainedWrapperFile(importToken))
+        }.isSuccess
 
     private fun FinalInstallReceipt.matchesSystemOutcome(expected: FinalInstallReceipt): Boolean =
         origin == FinalReceiptOrigin.SYSTEM_INSTALLER &&

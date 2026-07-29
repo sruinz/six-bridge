@@ -152,6 +152,25 @@ class SystemInstallCoordinatorTest {
     }
 
     @Test
+    fun `launch 생성 뒤 handoff prepare가 실패하면 URI 권한을 즉시 회수한다`() = runTest {
+        val fixture = fixture()
+        fixture.handoffStore.prepareFailure = true
+
+        assertEquals(
+            SystemInstallRequestResult.Failed(
+                InstallState.Failed(
+                    "RECOVERY_WRITE_FAILED",
+                    "시스템 설치 결과를 저장하지 못했습니다.",
+                ),
+            ),
+            fixture.coordinator.request(fixture.bundle, partialConfirmed = true),
+        )
+        assertEquals(1, fixture.gateway.createLaunchCalls)
+        assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+    }
+
+    @Test
     fun `launch 성공 표시는 정확한 owner의 PREPARED record만 LAUNCHED로 바꾼다`() =
         runTest {
             val fixture = fixture()
@@ -274,6 +293,32 @@ class SystemInstallCoordinatorTest {
             assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
             assertEquals(listOf("receipt", "clear", "clear", "revoke"), events)
         }
+
+    @Test
+    fun `handoff clear 뒤 revoke 실패는 durable receipt token으로 재시도한다`() = runTest {
+        val fixture = fixture(actual = expectedInstalled())
+        fixture.gateway.revokeFailuresRemaining = 1
+        fixture.launch()
+
+        assertEquals(
+            InstallState.Failed(
+                "RECOVERY_WRITE_FAILED",
+                "시스템 설치 결과를 저장하지 못했습니다.",
+            ),
+            fixture.coordinator.reconcileAfterReturn(),
+        )
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        assertEquals(FinalReceiptOrigin.SYSTEM_INSTALLER, fixture.pendingStore.receipt?.origin)
+        assertEquals(1, fixture.gateway.revokeAttempts)
+        assertTrue(fixture.gateway.revoked.isEmpty())
+
+        assertEquals(
+            InstallState.Installed(PACKAGE),
+            fixture.newCoordinator().reconcileAfterReturn(),
+        )
+        assertEquals(2, fixture.gateway.revokeAttempts)
+        assertEquals(listOf(fixture.bundle.wrapperFile), fixture.gateway.revoked)
+    }
 
     @Test
     fun `cancel은 owner가 일치하는 handoff만 지우고 URI 권한과 import를 정리한다`() =
@@ -425,6 +470,8 @@ class SystemInstallCoordinatorTest {
         private val events: MutableList<String>,
     ) : SystemInstallerGateway {
         var createLaunchCalls = 0
+        var revokeAttempts = 0
+        var revokeFailuresRemaining = 0
         val revoked = mutableListOf<File>()
 
         override fun canRequestPackageInstalls(): Boolean = canRequest
@@ -437,6 +484,11 @@ class SystemInstallCoordinatorTest {
         }
 
         override fun revoke(apk: File) {
+            revokeAttempts += 1
+            if (revokeFailuresRemaining > 0) {
+                revokeFailuresRemaining -= 1
+                throw IllegalStateException("revoke failed")
+            }
             events += "revoke"
             revoked += apk
         }
@@ -475,6 +527,7 @@ class SystemInstallCoordinatorTest {
         private val events: MutableList<String>,
     ) : SystemInstallHandoffStore {
         var current: PendingSystemInstall? = null
+        var prepareFailure = false
         var clearFailure = false
 
         override fun snapshot(): RecoveryRecordSnapshot<PendingSystemInstall> =
@@ -482,7 +535,12 @@ class SystemInstallCoordinatorTest {
                 ?: RecoveryRecordSnapshot.Absent
 
         override fun tryPrepare(record: PendingSystemInstall): Boolean {
-            if (current != null || record.stage != SystemInstallStage.PREPARED) return false
+            if (prepareFailure ||
+                current != null ||
+                record.stage != SystemInstallStage.PREPARED
+            ) {
+                return false
+            }
             current = record
             return true
         }
