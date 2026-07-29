@@ -41,14 +41,23 @@ readonly APKANALYZER="${APKANALYZER:-${SDK_ROOT}/cmdline-tools/latest/bin/apkana
 readonly APKSIGNER="${APKSIGNER:-${SDK_ROOT}/build-tools/36.0.0/apksigner}"
 readonly SAFE_SERIAL=$(printf '%s' "$SERIAL" | tr -c '[:alnum:]_.-' '_')
 readonly CURRENT_RUN_FILE="${EVIDENCE_ROOT}/.myfiles-install-gate-current-${SAFE_SERIAL}"
-readonly LOCK_DIR="${EVIDENCE_ROOT}/.myfiles-install-gate-lock-${SAFE_SERIAL}"
+readonly LOCK_FILE="${EVIDENCE_ROOT}/.myfiles-install-gate-lock-${SAFE_SERIAL}"
+readonly LOCK_OWNER_FILE="${LOCK_FILE}.owner"
 
 RUN_DIR=
 EXTRACT_DIR=
 POINTER_TEMP=
+LOCK_CLAIM_FILE=
+LOCK_OWNER_TEMP=
+LOCK_TOKEN=
+HOST_ID=
+SUMMARY_TEMP=
+COMPLETION_TEMP=
 LOCK_ACQUIRED=0
+LOCK_CLAIM_CREATED=0
 
 cleanup() {
+    local lock_pid owner_host owner_pid owner_token claim_host claim_pid claim_token
     if [ -n "$EXTRACT_DIR" ]; then
         case "$EXTRACT_DIR" in
             "${TMPDIR:-/tmp}/sixbridge-myfiles-gate."*)
@@ -63,9 +72,60 @@ cleanup() {
                 ;;
         esac
     fi
+    if [ -n "$LOCK_OWNER_TEMP" ]; then
+        case "$LOCK_OWNER_TEMP" in
+            "${EVIDENCE_ROOT}/.myfiles-install-gate-owner."*)
+                /bin/rm -f -- "$LOCK_OWNER_TEMP"
+                ;;
+        esac
+    fi
+    if [ -n "$SUMMARY_TEMP" ]; then
+        case "$SUMMARY_TEMP" in
+            "${RUN_DIR}/.post-summary."*)
+                /bin/rm -f -- "$SUMMARY_TEMP"
+                ;;
+        esac
+    fi
+    if [ -n "$COMPLETION_TEMP" ]; then
+        case "$COMPLETION_TEMP" in
+            "${RUN_DIR}/.post-completed."*)
+                /bin/rm -f -- "$COMPLETION_TEMP"
+                ;;
+        esac
+    fi
     if [ "$LOCK_ACQUIRED" -eq 1 ]; then
-        /bin/rm -f -- "${LOCK_DIR}/owner"
-        rmdir "$LOCK_DIR" 2>/dev/null || true
+        lock_pid=$(tr -d '[:space:]' <"$LOCK_FILE" 2>/dev/null || true)
+        owner_host=$(sed -n 's/^hostId=//p' "$LOCK_OWNER_FILE" 2>/dev/null)
+        owner_pid=$(sed -n 's/^pid=//p' "$LOCK_OWNER_FILE" 2>/dev/null)
+        owner_token=$(sed -n 's/^token=//p' "$LOCK_OWNER_FILE" 2>/dev/null)
+        claim_host=$(sed -n 's/^hostId=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        claim_pid=$(sed -n 's/^pid=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        claim_token=$(sed -n 's/^token=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        if [ "$lock_pid" = "$$" ] &&
+            [ "$claim_host" = "$HOST_ID" ] &&
+            [ "$claim_pid" = "$$" ] &&
+            [ "$claim_token" = "$LOCK_TOKEN" ]; then
+            if [ "$owner_host" = "$HOST_ID" ] &&
+                [ "$owner_pid" = "$$" ] &&
+                [ "$owner_token" = "$LOCK_TOKEN" ]; then
+                /bin/rm -f -- "$LOCK_OWNER_FILE"
+                /bin/rm -f -- "$LOCK_FILE"
+                /bin/rm -f -- "$LOCK_CLAIM_FILE"
+            elif [ ! -e "$LOCK_OWNER_FILE" ] &&
+                [ ! -L "$LOCK_OWNER_FILE" ]; then
+                /bin/rm -f -- "$LOCK_FILE"
+                /bin/rm -f -- "$LOCK_CLAIM_FILE"
+            fi
+        fi
+    elif [ "$LOCK_CLAIM_CREATED" -eq 1 ]; then
+        claim_host=$(sed -n 's/^hostId=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        claim_pid=$(sed -n 's/^pid=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        claim_token=$(sed -n 's/^token=//p' "$LOCK_CLAIM_FILE" 2>/dev/null)
+        if [ "$claim_host" = "$HOST_ID" ] &&
+            [ "$claim_pid" = "$$" ] &&
+            [ "$claim_token" = "$LOCK_TOKEN" ]; then
+            /bin/rm -f -- "$LOCK_CLAIM_FILE"
+        fi
     fi
 }
 trap cleanup EXIT
@@ -91,9 +151,11 @@ esac
 ensure_tools() {
     require_command adb
     require_command awk
+    require_command hostname
     require_command rg
     require_command sed
     require_command shasum
+    require_command shlock
     [ -x "$APKANALYZER" ] ||
         fail "apkanalyzer를 찾지 못했습니다: $APKANALYZER" 2
     [ -x "$APKSIGNER" ] ||
@@ -116,12 +178,68 @@ ensure_evidence_root() {
 }
 
 acquire_serial_lock() {
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local lock_pid owner_file owner_host owner_pid owner_token owner_lines
+    local published_owner_pid stale_claim_file=
+    HOST_ID=$(hostname)
+    LOCK_TOKEN="${SAFE_SERIAL}:$$:${RANDOM}:${RANDOM}"
+    LOCK_CLAIM_FILE="${LOCK_FILE}.claim.$$"
+    if ! (
+        set -o noclobber
+        printf 'hostId=%s\npid=%s\ntoken=%s\n' \
+            "$HOST_ID" "$$" "$LOCK_TOKEN" >"$LOCK_CLAIM_FILE"
+    ) 2>/dev/null; then
+        fail "현재 process의 lock claim을 만들지 못했습니다: $LOCK_CLAIM_FILE"
+    fi
+    LOCK_CLAIM_CREATED=1
+
+    if [ -e "$LOCK_FILE" ] || [ -L "$LOCK_FILE" ]; then
+        [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] ||
+            fail "serial lock이 안전한 일반 파일이 아닙니다: $LOCK_FILE"
+        lock_pid=$(tr -d '[:space:]' <"$LOCK_FILE")
+        [[ "$lock_pid" =~ ^[1-9][0-9]*$ ]] ||
+            fail "serial lock PID 형식이 올바르지 않습니다: $LOCK_FILE"
+        owner_file=$LOCK_OWNER_FILE
+        published_owner_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
+        if [ ! -f "$owner_file" ] || [ -L "$owner_file" ] ||
+            [ "$published_owner_pid" != "$lock_pid" ]; then
+            owner_file="${LOCK_FILE}.claim.${lock_pid}"
+        fi
+        [ -f "$owner_file" ] && [ ! -L "$owner_file" ] ||
+            fail "serial lock의 로컬 owner를 확인하지 못했습니다."
+        owner_lines=$(wc -l <"$owner_file" | tr -d '[:space:]')
+        owner_host=$(sed -n 's/^hostId=//p' "$owner_file")
+        owner_pid=$(sed -n 's/^pid=//p' "$owner_file")
+        owner_token=$(sed -n 's/^token=//p' "$owner_file")
+        [ "$owner_lines" = 3 ] &&
+            [ "$owner_host" = "$HOST_ID" ] &&
+            [ "$owner_pid" = "$lock_pid" ] &&
+            [[ "$owner_token" =~ ^[[:alnum:]_.:-]+$ ]] ||
+            fail "serial lock의 로컬 owner를 확인하지 못했습니다."
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            fail "같은 serial의 gate가 이미 실행 중입니다: $SERIAL"
+        fi
+        if [ "$owner_file" != "$LOCK_OWNER_FILE" ]; then
+            stale_claim_file=$owner_file
+        fi
+    elif [ -e "$LOCK_OWNER_FILE" ] || [ -L "$LOCK_OWNER_FILE" ]; then
+        fail "serial lock owner만 남아 있어 소유권을 확정하지 못했습니다."
+    fi
+
+    if ! shlock -f "$LOCK_FILE" -p "$$"; then
         fail "같은 serial의 gate가 이미 실행 중입니다: $SERIAL"
     fi
     LOCK_ACQUIRED=1
-    printf 'pid=%s\nmode=%s\nserial=%s\n' "$$" "$MODE" "$SERIAL" \
-        >"${LOCK_DIR}/owner"
+    if [ -n "$stale_claim_file" ]; then
+        /bin/rm -f -- "$stale_claim_file"
+    fi
+    LOCK_OWNER_TEMP=$(mktemp \
+        "${EVIDENCE_ROOT}/.myfiles-install-gate-owner.XXXXXX")
+    printf 'hostId=%s\npid=%s\ntoken=%s\n' \
+        "$HOST_ID" "$$" "$LOCK_TOKEN" >"$LOCK_OWNER_TEMP" ||
+        fail "serial lock owner를 기록하지 못했습니다."
+    /bin/mv -f -- "$LOCK_OWNER_TEMP" "$LOCK_OWNER_FILE" ||
+        fail "serial lock owner를 게시하지 못했습니다."
+    LOCK_OWNER_TEMP=
 }
 
 new_run_directory() {
@@ -349,11 +467,24 @@ EOF
 
 capture_pre_target() {
     local package_name package_path last_update code_path base_stat
+    local dumpsys_output pm_status
     package_name=$(baseline_value package)
-    adb -s "$SERIAL" shell dumpsys package "$package_name" \
-        >"${RUN_DIR}/pre-target-package.txt"
-    if ! adb -s "$SERIAL" shell pm path "$package_name" \
-        >"${RUN_DIR}/pre-target-path.txt" 2>&1; then
+    if ! adb -s "$SERIAL" shell dumpsys package "$package_name" \
+        >"${RUN_DIR}/pre-target-package.txt" \
+        2>"${RUN_DIR}/pre-target-package.stderr.txt"; then
+        fail "pre target 설치 상태를 확정하지 못했습니다."
+    fi
+    set +e
+    adb -s "$SERIAL" shell pm path "$package_name" \
+        >"${RUN_DIR}/pre-target-path.txt" \
+        2>"${RUN_DIR}/pre-target-path.stderr.txt"
+    pm_status=$?
+    set -e
+    dumpsys_output=$(tr -d '\r' <"${RUN_DIR}/pre-target-package.txt")
+    if [ "$pm_status" -ne 0 ]; then
+        [ ! -s "${RUN_DIR}/pre-target-path.txt" ] &&
+            [ "$dumpsys_output" = "Unable to find package: ${package_name}" ] ||
+            fail "pre target 설치 상태를 확정하지 못했습니다."
         cat >>"${RUN_DIR}/baseline.env" <<EOF
 preTargetPresent=0
 preLastUpdateTime=absent
@@ -363,6 +494,9 @@ preBaseApkStat=absent
 EOF
         return
     fi
+    rg -Fq "Package [${package_name}]" \
+        "${RUN_DIR}/pre-target-package.txt" ||
+        fail "pre target 설치 상태를 확정하지 못했습니다."
     package_path=$(sed -n 's/\r$//; s/^package://p' \
         "${RUN_DIR}/pre-target-path.txt" |
         awk '/\/base\.apk$/ { print; exit }')
@@ -646,7 +780,44 @@ consume_current_run() {
         fail "pre pointer가 이미 소비됐습니다."
     /bin/mv -- "$CURRENT_RUN_FILE" "${RUN_DIR}/post-consumed-pointer" ||
         fail "성공한 post의 pre pointer를 소비하지 못했습니다."
-    printf 'completed\n' >"${RUN_DIR}/post-completed.txt"
+}
+
+write_post_completion_evidence() {
+    local summary_file="${RUN_DIR}/post-summary.txt"
+    local completion_file="${RUN_DIR}/post-completed.txt"
+    local installer=$1
+    local originating=$2
+    if [ -e "$summary_file" ] || [ -L "$summary_file" ]; then
+        [ -f "$summary_file" ] && [ ! -L "$summary_file" ] ||
+            fail "post summary evidence를 기록하지 못했습니다."
+    fi
+    if [ -e "$completion_file" ] || [ -L "$completion_file" ]; then
+        [ -f "$completion_file" ] && [ ! -L "$completion_file" ] ||
+            fail "post completion evidence를 기록하지 못했습니다."
+    fi
+    SUMMARY_TEMP=$(mktemp "${RUN_DIR}/.post-summary.XXXXXX") ||
+        fail "post summary evidence를 기록하지 못했습니다."
+    cat >"$SUMMARY_TEMP" <<EOF
+mode=post
+serial=$SERIAL
+package=$INPUT
+installer=$installer
+originating=$originating
+classification=dev_ext
+support=Allowed to be supported
+wrapperByteIdentity=matched
+EOF
+    /bin/mv -f -- "$SUMMARY_TEMP" "$summary_file" ||
+        fail "post summary evidence를 기록하지 못했습니다."
+    SUMMARY_TEMP=
+
+    COMPLETION_TEMP=$(mktemp "${RUN_DIR}/.post-completed.XXXXXX") ||
+        fail "post completion evidence를 기록하지 못했습니다."
+    printf 'completed\n' >"$COMPLETION_TEMP" ||
+        fail "post completion evidence를 기록하지 못했습니다."
+    /bin/mv -f -- "$COMPLETION_TEMP" "$completion_file" ||
+        fail "post completion evidence를 기록하지 못했습니다."
+    COMPLETION_TEMP=
 }
 
 run_post() {
@@ -667,16 +838,7 @@ run_post() {
     capture_discovery "$INPUT"
     installer=$(sed -n 's/^installer=//p' "${RUN_DIR}/install-source.txt")
     originating=$(sed -n 's/^originating=//p' "${RUN_DIR}/install-source.txt")
-    cat >"${RUN_DIR}/post-summary.txt" <<EOF
-mode=post
-serial=$SERIAL
-package=$INPUT
-installer=$installer
-originating=$originating
-classification=dev_ext
-support=Allowed to be supported
-wrapperByteIdentity=matched
-EOF
+    write_post_completion_evidence "$installer" "$originating"
     consume_current_run
     cat "${RUN_DIR}/post-summary.txt"
     printf 'evidence=%s\n' "$RUN_DIR"

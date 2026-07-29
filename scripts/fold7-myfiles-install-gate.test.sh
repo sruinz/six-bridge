@@ -103,6 +103,13 @@ else
 fi
 case "${1:-}" in
   get-state)
+    if [ "${ADB_REPLACE_LOCK_OWNER:-0}" = 1 ]; then
+      cat >"$SIXBRIDGE_TEST_LOCK_OWNER_FILE" <<OWNER
+hostId=$(hostname)
+pid=$PPID
+token=foreign-token
+OWNER
+    fi
     printf 'device\n'
     ;;
   shell)
@@ -138,6 +145,10 @@ case "${1:-}" in
         printf '    packageSource=%s\n' "${ADB_PACKAGE_SOURCE:-3}"
         ;;
       "pm path ${SIXBRIDGE_TEST_PACKAGE}")
+        if [ "${ADB_PM_PATH_MODE:-normal}" = transport-error ]; then
+          printf 'error: device offline\n' >&2
+          exit 1
+        fi
         [ "${ADB_TARGET_PRESENT:-1}" != 0 ] || exit 1
         printf 'package:/data/app/%s/base.apk\n' "$generation"
         ;;
@@ -179,9 +190,18 @@ case "${1:-}" in
         log_package=$SIXBRIDGE_TEST_OTHER_PACKAGE
         log_extension=$SIXBRIDGE_TEST_OTHER_EXTENSION
       fi
-      printf '1722225601.000 1 1 I SixPkgUpdater: isDevSixPkg - MyFiles case: %s\n' \
+      if [ "${ADB_LOG_TIMING:-after}" = before ]; then
+        pkg_epoch=1722225600.100
+        support_epoch=1722225600.110
+      else
+        pkg_epoch=1722225601.000
+        support_epoch=1722225602.000
+      fi
+      printf '%s 1 1 I SixPkgUpdater: isDevSixPkg - MyFiles case: %s\n' \
+        "$pkg_epoch" \
         "$log_package"
-      printf '1722225602.000 1 1 I SixAppDataUpdater: updateSixAppData - Allowed to be supported: %s\n' \
+      printf '%s 1 1 I SixAppDataUpdater: updateSixAppData - Allowed to be supported: %s\n' \
+        "$support_epoch" \
         "$log_extension"
     else
       printf '1722225601.000 1 1 I SixPkgUpdater: unrelated\n'
@@ -292,6 +312,8 @@ run_gate() {
         SIXBRIDGE_TEST_MANAGER_APK="${FIXTURE_ROOT}/manager.apk" \
         SIXBRIDGE_TEST_INSTALLED_APK="${FIXTURE_ROOT}/device-installed.apk" \
         SIXBRIDGE_TEST_MARKER_FILE="${FIXTURE_ROOT}/marker.log" \
+        SIXBRIDGE_TEST_LOCK_FILE="${FIXTURE_ROOT}/evidence/.myfiles-install-gate-lock-serial-1" \
+        SIXBRIDGE_TEST_LOCK_OWNER_FILE="${FIXTURE_ROOT}/evidence/.myfiles-install-gate-lock-serial-1.owner" \
         "$@" \
         bash ${bash_trace:+"$bash_trace"} "$GATE_SCRIPT" "$mode" "$serial" "$input"
 }
@@ -306,6 +328,36 @@ run_post() {
 
 current_pointer() {
     printf '%s/evidence/.myfiles-install-gate-current-serial-1\n' "$FIXTURE_ROOT"
+}
+
+lock_file() {
+    printf '%s/evidence/.myfiles-install-gate-lock-serial-1\n' "$FIXTURE_ROOT"
+}
+
+lock_owner_file() {
+    printf '%s.owner\n' "$(lock_file)"
+}
+
+write_lock_owner() {
+    local pid=$1
+    local token=$2
+    local host_id=${3:-$(hostname)}
+    printf '%s\n' "$pid" >"$(lock_file)"
+    cat >"$(lock_owner_file)" <<EOF
+hostId=${host_id}
+pid=${pid}
+token=${token}
+EOF
+}
+
+write_lock_claim() {
+    local pid=$1
+    local token=$2
+    cat >"$(lock_file).claim.${pid}" <<EOF
+hostId=$(hostname)
+pid=${pid}
+token=${token}
+EOF
 }
 
 test_success_and_required_failures() {
@@ -392,6 +444,18 @@ test_unchanged_target_with_unrelated_logs_is_rejected() {
         run_post ADB_TARGET_GENERATION=old ADB_LOG_TARGET=other
 }
 
+test_fresh_target_with_unrelated_logs_is_rejected() {
+    run_pre >/dev/null
+    expect_exit_3 'target-bound 삼성 지원 로그를 찾지 못했습니다.' \
+        fresh-unrelated run_post ADB_LOG_TARGET=other
+}
+
+test_target_logs_before_marker_are_rejected() {
+    run_pre >/dev/null
+    expect_exit_3 'target-bound 삼성 지원 로그를 찾지 못했습니다.' \
+        target-before-marker run_post ADB_LOG_TIMING=before
+}
+
 test_fresh_target_with_target_bound_logs_succeeds() {
     local pre_output="${FIXTURE_ROOT}/fresh-pre.log"
     local output="${FIXTURE_ROOT}/fresh-target.log"
@@ -439,20 +503,86 @@ test_successful_post_consumes_pointer() {
         repeated-post run_post
 }
 
-test_held_serial_lock_is_rejected() {
-    local lock="${FIXTURE_ROOT}/evidence/.myfiles-install-gate-lock-serial-1"
-    mkdir "$lock"
+test_pm_transport_error_is_rejected() {
+    expect_exit_3 'pre target 설치 상태를 확정하지 못했습니다.' \
+        pm-transport run_pre ADB_PM_PATH_MODE=transport-error
+}
+
+test_known_absent_target_is_allowed() {
+    run_pre ADB_TARGET_PRESENT=0 >/dev/null
+    run_post >/dev/null
+}
+
+test_stale_dead_lock_is_recovered() {
+    write_lock_owner 999999 stale-token
+    sleep 1
+    run_pre >/dev/null
+    [ ! -e "$(lock_file)" ] ||
+        fail 'dead local owner의 stale lock이 정리되지 않았습니다.'
+    [ ! -e "$(lock_owner_file)" ] ||
+        fail 'dead local owner의 stale owner가 정리되지 않았습니다.'
+
+    write_lock_owner 999998 stale-claim
+    write_lock_claim 999998 stale-claim
+    cat >"$(lock_owner_file)" <<EOF
+hostId=$(hostname)
+pid=999997
+token=previous-owner
+EOF
+    sleep 1
+    run_pre >/dev/null
+    [ ! -e "$(lock_file)" ] ||
+        fail 'owner 게시 전 crash의 stale lock이 정리되지 않았습니다.'
+    [ ! -e "$(lock_file).claim.999998" ] ||
+        fail 'owner 게시 전 crash의 stale claim이 정리되지 않았습니다.'
+}
+
+test_live_serial_lock_is_rejected() {
+    write_lock_owner "$$" live-token
     expect_exit_3 '같은 serial의 gate가 이미 실행 중입니다:' \
         held-lock run_pre
-    rmdir "$lock"
+    rm -f -- "$(lock_file)" "$(lock_owner_file)"
+}
 
+test_lock_cleanup_is_token_safe() {
+    run_pre ADB_REPLACE_LOCK_OWNER=1 >/dev/null
+    [ -f "$(lock_file)" ] ||
+        fail '소유권 token이 바뀐 lock을 cleanup이 삭제했습니다.'
+    assert_contains "$(lock_owner_file)" 'token=foreign-token' \
+        '교체된 lock owner token이 보존되지 않았습니다.'
+    rm -f -- "$(lock_file)" "$(lock_owner_file)"
+}
+
+test_completion_failure_preserves_pointer_and_retries() {
+    local pointer run_dir
+    pointer=$(current_pointer)
     run_pre >/dev/null
-    mkdir "$lock"
-    expect_exit_3 '같은 serial의 gate가 이미 실행 중입니다:' \
-        held-post-lock run_post
-    [ -f "$(current_pointer)" ] ||
-        fail 'lock으로 거부된 post가 current pointer를 삭제했습니다.'
-    rmdir "$lock"
+    run_dir=$(<"$pointer")
+    mkdir "${run_dir}/post-completed.txt"
+    expect_exit_3 'post completion evidence를 기록하지 못했습니다.' \
+        completion-write run_post
+    [ -f "$pointer" ] ||
+        fail 'completion 기록 실패가 current pointer를 삭제했습니다.'
+    [ "$(<"$pointer")" = "$run_dir" ] ||
+        fail 'completion 기록 실패가 current pointer를 변경했습니다.'
+    rmdir "${run_dir}/post-completed.txt"
+    run_post >/dev/null
+    [ ! -e "$pointer" ] ||
+        fail 'completion 재시도 성공 후 current pointer가 남았습니다.'
+}
+
+test_failed_post_can_retry_same_pointer() {
+    local pointer run_dir
+    pointer=$(current_pointer)
+    run_pre >/dev/null
+    run_dir=$(<"$pointer")
+    expect_exit_3 '삼성 지원 로그를 찾지 못했습니다.' \
+        retry-first run_post ADB_SAMSUNG_LOGS=missing
+    [ "$(<"$pointer")" = "$run_dir" ] ||
+        fail '실패한 post가 current pointer를 변경했습니다.'
+    run_post >/dev/null
+    [ ! -e "$pointer" ] ||
+        fail '같은 pointer의 post 재시도 성공 후 pointer가 남았습니다.'
 }
 
 expect_post_contract_failure() {
@@ -505,16 +635,51 @@ main() {
             test_successful_post_consumes_pointer
             ;;
         lock)
-            test_held_serial_lock_is_rejected
+            test_stale_dead_lock_is_recovered
+            test_live_serial_lock_is_rejected
+            test_lock_cleanup_is_token_safe
+            ;;
+        pm-error)
+            test_pm_transport_error_is_rejected
+            ;;
+        absent)
+            test_known_absent_target_is_allowed
+            ;;
+        stale-lock)
+            test_stale_dead_lock_is_recovered
+            ;;
+        live-lock)
+            test_live_serial_lock_is_rejected
+            ;;
+        token-cleanup)
+            test_lock_cleanup_is_token_safe
+            ;;
+        completion)
+            test_completion_failure_preserves_pointer_and_retries
+            ;;
+        log-coverage)
+            test_fresh_target_with_unrelated_logs_is_rejected
+            test_target_logs_before_marker_are_rejected
+            ;;
+        retry)
+            test_failed_post_can_retry_same_pointer
             ;;
         all)
             test_success_and_required_failures
             test_unsafe_bundles_are_rejected
             test_unchanged_target_with_unrelated_logs_is_rejected
+            test_fresh_target_with_unrelated_logs_is_rejected
+            test_target_logs_before_marker_are_rejected
             test_fresh_target_with_target_bound_logs_succeeds
             test_failed_pre_preserves_previous_pointer
             test_successful_post_consumes_pointer
-            test_held_serial_lock_is_rejected
+            test_pm_transport_error_is_rejected
+            test_known_absent_target_is_allowed
+            test_stale_dead_lock_is_recovered
+            test_live_serial_lock_is_rejected
+            test_lock_cleanup_is_token_safe
+            test_completion_failure_preserves_pointer_and_retries
+            test_failed_post_can_retry_same_pointer
             test_post_identity_and_source_contracts
             ;;
         *)
