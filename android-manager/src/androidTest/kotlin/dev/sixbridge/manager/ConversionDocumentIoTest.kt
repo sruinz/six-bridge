@@ -326,7 +326,7 @@ class ConversionDocumentIoTest {
     @Test
     fun system_install_copy_handoff_survives_recreation_until_exact_completion_ack() =
         runBlocking {
-            val effect = ManagerEffect.CreateSystemInstallApkDocument(
+            val effect = ManagerEffect.CreateInstallApkDocument(
                 importToken = TOKEN,
                 source = File("/retained/$TOKEN/wrapper.apk"),
                 expectedSha256 = "a".repeat(64),
@@ -357,7 +357,7 @@ class ConversionDocumentIoTest {
     @Test
     fun system_install_copy_cancellation_preserves_exact_resume_and_stale_completion_is_rejected() =
         runBlocking {
-            val first = ManagerEffect.CreateSystemInstallApkDocument(
+            val first = ManagerEffect.CreateInstallApkDocument(
                 importToken = TOKEN,
                 source = File("/retained/$TOKEN/wrapper.apk"),
                 expectedSha256 = "a".repeat(64),

@@ -1767,6 +1767,13 @@ class ManagerViewModelTest {
 
             val recreated = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
+            val activityRestoredEffect = ManagerEffect.CreateSystemInstallApkDocument(
+                importToken = effect.importToken,
+                source = effect.source,
+                expectedSha256 = effect.expectedSha256,
+                suggestedFileName = effect.suggestedFileName,
+            )
+            assertTrue(recreated.ownsSystemInstallApkDocument(activityRestoredEffect))
             recreated.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, unitTestUri()))
             recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
             recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))

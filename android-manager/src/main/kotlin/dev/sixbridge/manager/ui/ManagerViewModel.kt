@@ -3350,8 +3350,7 @@ class ManagerViewModel(
 
     internal fun ownsSystemInstallApkDocument(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
-    ): Boolean = effect is ManagerEffect.CreateInstallApkDocument &&
-        pendingSystemInstallApkDocument == effect &&
+    ): Boolean = pendingSystemInstallApkDocument == effect &&
         isCurrentReviewOwner(effect.importToken)
 
     private fun setPendingSystemInstallApkDocument(

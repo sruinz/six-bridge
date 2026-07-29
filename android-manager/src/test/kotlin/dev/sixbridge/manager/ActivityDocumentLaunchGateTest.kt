@@ -1,9 +1,17 @@
 package dev.sixbridge.manager
 
+import android.net.Uri
+import android.os.Bundle
+import dev.sixbridge.manager.ui.ManagerEffect
+import java.io.File
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class ActivityDocumentLaunchGateTest {
     @Test
     fun `active A 뒤 queued B는 A callback identity를 보존하고 그 다음 B를 launch한다`() {
@@ -47,5 +55,29 @@ class ActivityDocumentLaunchGateTest {
             ActivityDocumentLaunchCompletion(active, queued),
             gate.complete(),
         )
+    }
+
+    @Test
+    fun `APK export handoff recreation은 새 effect의 구조적 소유권을 보존한다`() {
+        val effect = ManagerEffect.CreateInstallApkDocument(
+            importToken = "11111111-1111-1111-1111-111111111111",
+            source = File("/retained/11111111-1111-1111-1111-111111111111/wrapper.apk"),
+            expectedSha256 = "a".repeat(64),
+            suggestedFileName = "smart-context-wrapper.apk",
+        )
+        val destination = Uri.parse("content://documents/export.apk")
+        val handoff = SystemInstallApkDocumentHandoff().apply {
+            begin(effect)
+            selectDestination(destination)
+        }
+        val saved = Bundle().also(handoff::save)
+
+        val restored = SystemInstallApkDocumentHandoff.restore(saved)
+
+        assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+            restored.pending?.effect,
+        )
+        assertEquals(effect, restored.pending?.effect)
+        assertEquals(destination, restored.pending?.destination)
     }
 }

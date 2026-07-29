@@ -312,9 +312,35 @@ sealed interface ManagerEffect {
         open val source: File,
         open val expectedSha256: String,
         open val suggestedFileName: String,
-    ) : ManagerEffect
+    ) : ManagerEffect {
+        open fun copy(
+            importToken: String = this.importToken,
+            source: File = this.source,
+            expectedSha256: String = this.expectedSha256,
+            suggestedFileName: String = this.suggestedFileName,
+        ): CreateSystemInstallApkDocument = CreateSystemInstallApkDocument(
+            importToken,
+            source,
+            expectedSha256,
+            suggestedFileName,
+        )
 
-    data class CreateInstallApkDocument(
+        override fun equals(other: Any?): Boolean =
+            other is CreateSystemInstallApkDocument &&
+                importToken == other.importToken &&
+                source == other.source &&
+                expectedSha256 == other.expectedSha256 &&
+                suggestedFileName == other.suggestedFileName
+
+        override fun hashCode(): Int {
+            var result = importToken.hashCode()
+            result = 31 * result + source.hashCode()
+            result = 31 * result + expectedSha256.hashCode()
+            return 31 * result + suggestedFileName.hashCode()
+        }
+    }
+
+    class CreateInstallApkDocument(
         override val importToken: String,
         override val source: File,
         override val expectedSha256: String,
@@ -324,7 +350,19 @@ sealed interface ManagerEffect {
         source,
         expectedSha256,
         suggestedFileName,
-    )
+    ) {
+        override fun copy(
+            importToken: String,
+            source: File,
+            expectedSha256: String,
+            suggestedFileName: String,
+        ): CreateInstallApkDocument = CreateInstallApkDocument(
+            importToken,
+            source,
+            expectedSha256,
+            suggestedFileName,
+        )
+    }
 
     data class ShareGeneratedBundle(
         val token: String,
