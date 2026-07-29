@@ -151,6 +151,10 @@ class ManagerRepositoryTest {
             val requestState = fixture.repository.install(review, partialConfirmed = true)
 
             assertEquals(InstallState.PreparingApkExport(TOKEN), requestState)
+            assertEquals(
+                sha256(File(fixture.root, "$TOKEN/wrapper.apk")),
+                fixture.repository.installApkExport(TOKEN)?.expectedSha256,
+            )
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
             assertTrue(fixture.systemGateway.revoked.isEmpty())
@@ -163,8 +167,8 @@ class ManagerRepositoryTest {
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
             fixture.repository.install(review, partialConfirmed = true)
 
-            assertFalse(fixture.repository.markSystemInstallApkExported(SECOND_TOKEN))
-            assertTrue(fixture.repository.markSystemInstallApkExported(TOKEN))
+            assertFalse(fixture.repository.markInstallApkExported(SECOND_TOKEN))
+            assertTrue(fixture.repository.markInstallApkExported(TOKEN))
             assertEquals(
                 SystemInstallStage.EXPORTED,
                 assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
@@ -183,7 +187,7 @@ class ManagerRepositoryTest {
             )
             assertEquals(
                 InstallState.Installed(PACKAGE),
-                fixture.repository.reconcileManualSystemInstall(TOKEN),
+                fixture.repository.reconcileManualInstall(TOKEN),
             )
             assertEquals(
                 FinalReceiptOrigin.MY_FILES,
@@ -223,13 +227,15 @@ class ManagerRepositoryTest {
                 recreated.installState.value,
             )
             assertTrue(File(fixture.root, TOKEN).exists())
-            val export = assertNotNull(recreated.systemInstallApkFallback(TOKEN))
+            val export = assertNotNull(recreated.installApkExport(TOKEN))
 
             assertEquals(TOKEN, export.importToken)
             assertEquals(File(fixture.root, "$TOKEN/wrapper.apk"), export.source)
             assertEquals(sha256(export.source), export.expectedSha256)
             assertEquals("Example", export.extensionName)
-            assertNull(recreated.systemInstallApkFallback("other"))
+            assertEquals("1.0", export.extensionVersion)
+            assertEquals(EXTENSION_ID, export.extensionId)
+            assertNull(recreated.installApkExport("other"))
             assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
             assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
         }
@@ -261,7 +267,7 @@ class ManagerRepositoryTest {
             val fixture = systemRepositoryFixture("cancel-exported-export")
             val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
             fixture.repository.install(review, partialConfirmed = true)
-            assertTrue(fixture.repository.markSystemInstallApkExported(TOKEN))
+            assertTrue(fixture.repository.markInstallApkExported(TOKEN))
             assertEquals(
                 SystemInstallStage.EXPORTED,
                 assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(

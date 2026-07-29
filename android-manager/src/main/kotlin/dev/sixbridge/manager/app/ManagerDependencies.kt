@@ -30,7 +30,6 @@ import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
 import dev.sixbridge.manager.importer.ImportResult
 import dev.sixbridge.manager.importer.RoutingBundleSource
 import dev.sixbridge.manager.install.AndroidPackageInstallGateway
-import dev.sixbridge.manager.install.AndroidSystemInstallerGateway
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
@@ -81,7 +80,6 @@ class ManagerDependencies private constructor(
             val pendingStore = SharedPreferencesPendingInstallStore(application)
             val systemInstallStore = SharedPreferencesSystemInstallHandoffStore(application)
             val installGateway = AndroidPackageInstallGateway(application)
-            val systemInstallGateway = AndroidSystemInstallerGateway(application)
             val verifier = AndroidWrapperVerifier(
                 AndroidArchiveInspector(application.packageManager),
                 File(application.cacheDir, "wrapper-verifier"),
@@ -106,13 +104,9 @@ class ManagerDependencies private constructor(
             val retainedImports = RetainedImportStore(importRoot, verifier)
             val systemInstallCoordinator = SystemInstallCoordinator(
                 policy = InstallPolicy(),
-                gateway = systemInstallGateway,
                 handoffStore = systemInstallStore,
                 installedWrappers = installedWrappers,
                 pendingStore = pendingStore,
-                retainedWrapperFile = { token ->
-                    File(importRoot, token).resolve("wrapper.apk")
-                },
             )
             val identityLedger = ConversionIdentityLedger(database.conversionIdentityDao())
             val packager = OnDeviceWrapperPackager(application)

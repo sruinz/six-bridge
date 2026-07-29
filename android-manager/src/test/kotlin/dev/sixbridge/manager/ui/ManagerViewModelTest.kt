@@ -15,7 +15,7 @@ import dev.sixbridge.manager.app.RestoredInstallTerminal
 import dev.sixbridge.manager.app.RepositoryLaunch
 import dev.sixbridge.manager.app.RepositoryNavigationResult
 import dev.sixbridge.manager.app.ReviewBundle
-import dev.sixbridge.manager.app.SystemInstallApkFallback
+import dev.sixbridge.manager.app.InstallApkExport
 import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
@@ -1465,6 +1465,34 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `지원하지 않거나 확인할 수 없는 설치 출처를 구분해 안내한다`() =
+        runTest(dispatcher.scheduler) {
+            val scenarios = listOf(
+                "UNSUPPORTED_INSTALL_SOURCE" to
+                    "확장 APK는 설치됐지만 삼성 인터넷이 허용하는 설치 출처가 아닙니다.\n" +
+                    "저장한 APK를 삼성 내 파일에서 직접 열어 다시 설치해 주세요.",
+                "INSTALL_SOURCE_UNKNOWN" to "설치 출처를 확인하지 못했습니다.",
+            )
+            scenarios.forEach { (code, expectedText) ->
+                val repository = FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    )
+                }
+                val viewModel = ManagerViewModel(
+                    repository,
+                    SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+                )
+                advanceUntilIdle()
+
+                repository.installFlow.value = InstallState.Failed(code, "raw")
+                advanceUntilIdle()
+
+                assertEquals(expectedText, viewModel.state.value.message?.text)
+            }
+        }
+
+    @Test
     fun `system installer launch 성공 뒤 foreground 복귀에서 설치 결과를 조정한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -1581,19 +1609,21 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `My Files fallback은 검증된 APK document를 요청하고 명시 확인에서만 조정한다`() =
+    fun `검토 설치는 항상 APK 문서 생성 effect를 발행하고 명시 확인에서만 조정한다`() =
         runTest(dispatcher.scheduler) {
             val source = File("/retained/$TOKEN/wrapper.apk")
             val repository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
-                installResult = InstallState.PreparingSystemInstaller
-                systemInstallFallback = SystemInstallApkFallback(
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
                     importToken = TOKEN,
                     source = source,
                     expectedSha256 = "a".repeat(64),
                     extensionName = "smart:context/menu",
+                    extensionVersion = "1.0.0",
+                    extensionId = EXTENSION_ID,
                 )
                 manualSystemInstallResult = InstallState.Installed(PACKAGE)
                 terminalOwnerProofConfigured = true
@@ -1609,7 +1639,7 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.InstallReviewedBundle)
             advanceUntilIdle()
-            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
                 viewModel.effects.first(),
             )
             assertEquals(TOKEN, effect.importToken)
@@ -1618,12 +1648,12 @@ class ManagerViewModelTest {
             assertEquals("smart-context-menu-wrapper.apk", effect.suggestedFileName)
 
             viewModel.accept(
-                ManagerAction.SystemInstallApkCreated(
+                ManagerAction.InstallApkCreated(
                     importToken = TOKEN,
                     uri = unitTestUri(),
                 ),
             )
-            assertEquals(listOf(TOKEN), repository.systemInstallExportedTokens)
+            assertEquals(listOf(TOKEN), repository.installApkExportedTokens)
             assertEquals(
                 "시스템 설치 프로그램을 직접 열 수 없습니다.\n" +
                     "저장한 APK를 내 파일에서 열어 설치한 뒤 ‘설치 상태 확인’을 눌러 주세요.",
@@ -1636,11 +1666,11 @@ class ManagerViewModelTest {
 
             viewModel.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
-            assertEquals(0, repository.reconcileManualSystemInstallCalls)
+            assertEquals(0, repository.reconcileManualCalls)
 
-            viewModel.accept(ManagerAction.ConfirmSystemInstallStatus)
+            viewModel.accept(ManagerAction.ConfirmManualInstallStatus)
             advanceUntilIdle()
-            assertEquals(1, repository.reconcileManualSystemInstallCalls)
+            assertEquals(1, repository.reconcileManualCalls)
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
         }
 
@@ -1651,12 +1681,14 @@ class ManagerViewModelTest {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
-                installResult = InstallState.PreparingSystemInstaller
-                systemInstallFallback = SystemInstallApkFallback(
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
                     importToken = TOKEN,
                     source = File("/retained/$TOKEN/wrapper.apk"),
                     expectedSha256 = "a".repeat(64),
                     extensionName = "확장",
+                    extensionVersion = "1.0.0",
+                    extensionId = EXTENSION_ID,
                 )
             }
             val viewModel = ManagerViewModel(
@@ -1666,12 +1698,12 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             viewModel.accept(ManagerAction.InstallReviewedBundle)
             advanceUntilIdle()
-            assertIs<ManagerEffect.CreateSystemInstallApkDocument>(viewModel.effects.first())
+            assertIs<ManagerEffect.CreateInstallApkDocument>(viewModel.effects.first())
 
-            viewModel.accept(ManagerAction.SystemInstallApkCreated(SECOND_TOKEN, null))
-            viewModel.accept(ManagerAction.SystemInstallApkCreated(TOKEN, null))
+            viewModel.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, null))
+            viewModel.accept(ManagerAction.InstallApkCreated(TOKEN, null))
 
-            assertTrue(repository.systemInstallExportedTokens.isEmpty())
+            assertTrue(repository.installApkExportedTokens.isEmpty())
             assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
         }
 
@@ -1697,11 +1729,11 @@ class ManagerViewModelTest {
             )
             recreated.accept(ManagerAction.ReturnedToForeground)
             advanceUntilIdle()
-            assertEquals(0, repository.reconcileManualSystemInstallCalls)
+            assertEquals(0, repository.reconcileManualCalls)
 
-            recreated.accept(ManagerAction.ConfirmSystemInstallStatus)
+            recreated.accept(ManagerAction.ConfirmManualInstallStatus)
             advanceUntilIdle()
-            assertEquals(1, repository.reconcileManualSystemInstallCalls)
+            assertEquals(1, repository.reconcileManualCalls)
         }
 
     @Test
@@ -1712,12 +1744,14 @@ class ManagerViewModelTest {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
-                installResult = InstallState.PreparingSystemInstaller
-                systemInstallFallback = SystemInstallApkFallback(
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
                     importToken = TOKEN,
                     source = source,
                     expectedSha256 = "a".repeat(64),
                     extensionName = "smart/context",
+                    extensionVersion = "1.0.0",
+                    extensionId = EXTENSION_ID,
                 )
             }
             val savedState = SavedStateHandle(
@@ -1727,21 +1761,21 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             sourceViewModel.accept(ManagerAction.InstallReviewedBundle)
             advanceUntilIdle()
-            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
                 sourceViewModel.effects.first(),
             )
 
             val recreated = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
-            recreated.accept(ManagerAction.SystemInstallApkCreated(SECOND_TOKEN, unitTestUri()))
-            recreated.accept(ManagerAction.SystemInstallApkCreated(TOKEN, unitTestUri()))
-            recreated.accept(ManagerAction.SystemInstallApkCreated(TOKEN, unitTestUri()))
+            recreated.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, unitTestUri()))
+            recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
+            recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
             advanceUntilIdle()
 
             assertEquals(TOKEN, effect.importToken)
             assertEquals(source, effect.source)
             assertEquals("a".repeat(64), effect.expectedSha256)
-            assertEquals(listOf(TOKEN), repository.systemInstallExportedTokens)
+            assertEquals(listOf(TOKEN), repository.installApkExportedTokens)
         }
 
     @Test
@@ -1749,15 +1783,17 @@ class ManagerViewModelTest {
         runTest(dispatcher.scheduler) {
             val source = File("/retained/$TOKEN/wrapper.apk")
             val repository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.PreparingSystemInstaller
+                installFlow.value = InstallState.PreparingApkExport(TOKEN)
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
                 )
-                systemInstallFallback = SystemInstallApkFallback(
+                installApkExport = InstallApkExport(
                     importToken = TOKEN,
                     source = source,
                     expectedSha256 = "b".repeat(64),
                     extensionName = "복구/확장",
+                    extensionVersion = "1.0.0",
+                    extensionId = EXTENSION_ID,
                 )
             }
             val recreated = ManagerViewModel(
@@ -1768,7 +1804,7 @@ class ManagerViewModelTest {
 
             assertEquals(RecoveryAction.RETRY, recreated.state.value.message?.recoveryAction)
             recreated.accept(ManagerAction.RetryRecovery)
-            val effect = assertIs<ManagerEffect.CreateSystemInstallApkDocument>(
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
                 recreated.effects.first(),
             )
             assertEquals(TOKEN, effect.importToken)
@@ -9021,9 +9057,9 @@ private class FakeManagerRepository : ManagerRepository {
     val systemLaunchFailedTokens = mutableListOf<String>()
     var reconcileSystemInstallCalls = 0
     var reconcileSystemInstallResult: InstallState? = null
-    var systemInstallFallback: SystemInstallApkFallback? = null
-    val systemInstallExportedTokens = mutableListOf<String>()
-    var reconcileManualSystemInstallCalls = 0
+    var installApkExport: InstallApkExport? = null
+    val installApkExportedTokens = mutableListOf<String>()
+    var reconcileManualCalls = 0
     var manualSystemInstallResult: InstallState? = null
     var uninstallOutcome: UninstallOutcome = UninstallOutcome.CancelledOrStillInstalled
     val uninstallPackages = mutableListOf<String>()
@@ -9290,19 +9326,19 @@ private class FakeManagerRepository : ManagerRepository {
         }
     }
 
-    override suspend fun systemInstallApkFallback(
+    override suspend fun installApkExport(
         importToken: String,
-    ): SystemInstallApkFallback? =
-        systemInstallFallback?.takeIf { it.importToken == importToken }
+    ): InstallApkExport? =
+        installApkExport?.takeIf { it.importToken == importToken }
 
-    override fun markSystemInstallApkExported(importToken: String): Boolean {
-        systemInstallExportedTokens += importToken
+    override fun markInstallApkExported(importToken: String): Boolean {
+        installApkExportedTokens += importToken
         installFlow.value = InstallState.AwaitingManualInstall(importToken)
         return true
     }
 
-    override suspend fun reconcileManualSystemInstall(importToken: String): InstallState? {
-        reconcileManualSystemInstallCalls += 1
+    override suspend fun reconcileManualInstall(importToken: String): InstallState? {
+        reconcileManualCalls += 1
         return manualSystemInstallResult?.also { installFlow.value = it }
     }
 

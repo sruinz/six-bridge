@@ -248,10 +248,17 @@ sealed interface ManagerAction {
     data object ConfirmPartial : ManagerAction
     data object PrepareReviewedInstall : ManagerAction
     data object InstallReviewedBundle : ManagerAction
-    data class SystemInstallApkCreated(
-        val importToken: String,
-        val uri: Uri?,
+    @Deprecated("InstallApkCreated를 사용합니다.")
+    open class SystemInstallApkCreated(
+        open val importToken: String,
+        open val uri: Uri?,
     ) : ManagerAction
+    data class InstallApkCreated(
+        override val importToken: String,
+        override val uri: Uri?,
+    ) : SystemInstallApkCreated(importToken, uri)
+    data object ConfirmManualInstallStatus : ManagerAction
+    @Deprecated("ConfirmManualInstallStatus를 사용합니다.")
     data object ConfirmSystemInstallStatus : ManagerAction
     data class ContinueInstallAfterNotificationPermission(
         val reviewToken: String,
@@ -299,12 +306,25 @@ sealed interface ManagerEffect {
         val launchId: Long,
     ) : ManagerEffect
 
-    data class CreateSystemInstallApkDocument(
-        val importToken: String,
-        val source: File,
-        val expectedSha256: String,
-        val suggestedFileName: String,
+    @Deprecated("CreateInstallApkDocument를 사용합니다.")
+    open class CreateSystemInstallApkDocument(
+        open val importToken: String,
+        open val source: File,
+        open val expectedSha256: String,
+        open val suggestedFileName: String,
     ) : ManagerEffect
+
+    data class CreateInstallApkDocument(
+        override val importToken: String,
+        override val source: File,
+        override val expectedSha256: String,
+        override val suggestedFileName: String,
+    ) : CreateSystemInstallApkDocument(
+        importToken,
+        source,
+        expectedSha256,
+        suggestedFileName,
+    )
 
     data class ShareGeneratedBundle(
         val token: String,

@@ -107,11 +107,13 @@ data class ReviewBundle(
     val wrapperVersionCode: Int = 0,
 )
 
-data class SystemInstallApkFallback(
+data class InstallApkExport(
     val importToken: String,
     val source: File,
     val expectedSha256: String,
     val extensionName: String,
+    val extensionVersion: String,
+    val extensionId: String,
 )
 
 sealed interface ManagerImportResult {
@@ -193,14 +195,27 @@ interface ManagerRepository {
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun createGeneratedShareSnapshot(token: String): File? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
+    suspend fun installApkExport(
+        importToken: String,
+    ): InstallApkExport? = null
+    fun markInstallApkExported(importToken: String): Boolean = false
+    suspend fun reconcileManualInstall(importToken: String): InstallState? = null
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     fun markSystemInstallLaunchSucceeded(importToken: String): Boolean = false
+    @Deprecated("신규 설치 요청은 APK 내보내기만 사용합니다.")
     fun markSystemInstallLaunchFailed(importToken: String): Boolean = false
+    @Deprecated("installApkExport를 사용합니다.")
     suspend fun systemInstallApkFallback(
         importToken: String,
-    ): SystemInstallApkFallback? = null
-    fun markSystemInstallApkExported(importToken: String): Boolean = false
+    ): InstallApkExport? = installApkExport(importToken)
+    @Deprecated("markInstallApkExported를 사용합니다.")
+    fun markSystemInstallApkExported(importToken: String): Boolean =
+        markInstallApkExported(importToken)
+    @Deprecated("foreground 복귀로 설치를 확정하지 않습니다.")
     suspend fun reconcileSystemInstallAfterReturn(): InstallState? = null
-    suspend fun reconcileManualSystemInstall(importToken: String): InstallState? = null
+    @Deprecated("reconcileManualInstall을 사용합니다.")
+    suspend fun reconcileManualSystemInstall(importToken: String): InstallState? =
+        reconcileManualInstall(importToken)
     suspend fun cancelInstall(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -477,28 +492,27 @@ internal class DefaultManagerRepository(
     override fun markSystemInstallLaunchFailed(importToken: String): Boolean =
         systemInstallCoordinator.markLaunchFailed(importToken)
 
-    override suspend fun systemInstallApkFallback(
+    override suspend fun installApkExport(
         importToken: String,
-    ): SystemInstallApkFallback? {
+    ): InstallApkExport? {
         if (!systemInstallCoordinator.ownsPreparedFallback(importToken)) return null
         val bundle = withContext(ioDispatcher) { retainedImports.load(importToken) }
             ?: return null
         if (!systemInstallCoordinator.ownsPreparedFallback(importToken)) return null
-        return SystemInstallApkFallback(
+        return InstallApkExport(
             importToken = bundle.token,
             source = bundle.wrapperFile,
             expectedSha256 = bundle.wrapperSha256,
             extensionName = bundle.descriptor.name,
+            extensionVersion = bundle.descriptor.version,
+            extensionId = bundle.descriptor.extensionId,
         )
     }
 
-    override fun markSystemInstallApkExported(importToken: String): Boolean =
+    override fun markInstallApkExported(importToken: String): Boolean =
         systemInstallCoordinator.markManualExportSucceeded(importToken)
 
-    override suspend fun reconcileSystemInstallAfterReturn(): InstallState? =
-        systemInstallCoordinator.reconcileAfterReturn()
-
-    override suspend fun reconcileManualSystemInstall(importToken: String): InstallState? =
+    override suspend fun reconcileManualInstall(importToken: String): InstallState? =
         systemInstallCoordinator.reconcileManualAfterUserCheck(importToken)
 
     override suspend fun cancelInstall(

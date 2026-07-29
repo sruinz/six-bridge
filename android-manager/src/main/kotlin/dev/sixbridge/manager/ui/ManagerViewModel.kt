@@ -92,7 +92,7 @@ class ManagerViewModel(
     private var generatedShareHandoffSequence = 0L
     private var installJob: Job? = null
     private var pendingSystemInstallApkDocument:
-        ManagerEffect.CreateSystemInstallApkDocument? =
+        ManagerEffect.CreateInstallApkDocument? =
         restorePendingSystemInstallApkDocument()
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -257,9 +257,12 @@ class ManagerViewModel(
             ManagerAction.ConfirmPartial -> confirmPartial()
             ManagerAction.PrepareReviewedInstall -> prepareReviewedInstall()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
+            is ManagerAction.InstallApkCreated ->
+                acceptInstallApkCreated(action)
             is ManagerAction.SystemInstallApkCreated ->
-                acceptSystemInstallApkCreated(action)
-            ManagerAction.ConfirmSystemInstallStatus -> confirmSystemInstallStatus()
+                acceptInstallApkCreated(action)
+            ManagerAction.ConfirmManualInstallStatus -> confirmManualInstallStatus()
+            ManagerAction.ConfirmSystemInstallStatus -> confirmManualInstallStatus()
             is ManagerAction.ContinueInstallAfterNotificationPermission ->
                 continueInstallAfterNotificationPermission(action)
             ManagerAction.CancelReview -> cancelReview()
@@ -1639,13 +1642,13 @@ class ManagerViewModel(
                         mutableState.value.conversionState as? ConversionUiState.ResultReady
                     result?.token == generatedOwner && result.review?.token == reviewToken
                 }
-            val fallback = repository.systemInstallApkFallback(reviewToken)
-            if (fallback != null && stillOwnsAttempt) {
-                val effect = ManagerEffect.CreateSystemInstallApkDocument(
-                    importToken = fallback.importToken,
-                    source = fallback.source,
-                    expectedSha256 = fallback.expectedSha256,
-                    suggestedFileName = suggestedWrapperApkName(fallback.extensionName),
+            val export = repository.installApkExport(reviewToken)
+            if (export != null && stillOwnsAttempt) {
+                val effect = ManagerEffect.CreateInstallApkDocument(
+                    importToken = export.importToken,
+                    source = export.source,
+                    expectedSha256 = export.expectedSha256,
+                    suggestedFileName = suggestedWrapperApkName(export.extensionName),
                 )
                 setPendingSystemInstallApkDocument(effect)
                 enqueueEffect(effect)
@@ -1663,7 +1666,7 @@ class ManagerViewModel(
         }
     }
 
-    private fun acceptSystemInstallApkCreated(
+    private fun acceptInstallApkCreated(
         action: ManagerAction.SystemInstallApkCreated,
     ) {
         val pending = pendingSystemInstallApkDocument
@@ -1685,7 +1688,7 @@ class ManagerViewModel(
             }
             return
         }
-        if (!repository.markSystemInstallApkExported(action.importToken)) {
+        if (!repository.markInstallApkExported(action.importToken)) {
             pendingRecovery = PendingRecovery.SystemInstallApk(pending)
             mutableState.update {
                 it.copy(
@@ -1703,12 +1706,12 @@ class ManagerViewModel(
         showManualSystemInstallMessage()
     }
 
-    private fun confirmSystemInstallStatus() {
+    private fun confirmManualInstallStatus() {
         val manual = mutableState.value.installState as? InstallState.AwaitingManualInstall
             ?: return
         if (!isCurrentReviewOwner(manual.importToken)) return
         viewModelScope.launch {
-            repository.reconcileManualSystemInstall(manual.importToken)
+            repository.reconcileManualInstall(manual.importToken)
         }
     }
 
@@ -3300,19 +3303,24 @@ class ManagerViewModel(
             (mutableState.value.importState as? ImportUiState.ReviewReady)
                 ?.review
                 ?.token
-        if (installState == InstallState.PreparingSystemInstaller &&
+        val preparingExportToken = when (installState) {
+            is InstallState.PreparingApkExport -> installState.importToken
+            InstallState.PreparingSystemInstaller -> reviewToken
+            else -> null
+        }
+        if (preparingExportToken == reviewToken &&
             reviewToken != null &&
             isCurrentReviewOwner(reviewToken)
         ) {
-            repository.systemInstallApkFallback(reviewToken)
-                ?.let { fallback ->
+            repository.installApkExport(reviewToken)
+                ?.let { export ->
                     setPendingSystemInstallApkDocument(
-                        ManagerEffect.CreateSystemInstallApkDocument(
-                            importToken = fallback.importToken,
-                            source = fallback.source,
-                            expectedSha256 = fallback.expectedSha256,
+                        ManagerEffect.CreateInstallApkDocument(
+                            importToken = export.importToken,
+                            source = export.source,
+                            expectedSha256 = export.expectedSha256,
                             suggestedFileName =
-                                suggestedWrapperApkName(fallback.extensionName),
+                                suggestedWrapperApkName(export.extensionName),
                         ),
                     )
                 }
@@ -3342,11 +3350,12 @@ class ManagerViewModel(
 
     internal fun ownsSystemInstallApkDocument(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
-    ): Boolean = pendingSystemInstallApkDocument == effect &&
+    ): Boolean = effect is ManagerEffect.CreateInstallApkDocument &&
+        pendingSystemInstallApkDocument == effect &&
         isCurrentReviewOwner(effect.importToken)
 
     private fun setPendingSystemInstallApkDocument(
-        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        effect: ManagerEffect.CreateInstallApkDocument,
     ) {
         pendingSystemInstallApkDocument = effect
         savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = effect.importToken
@@ -3364,7 +3373,7 @@ class ManagerViewModel(
     }
 
     private fun restorePendingSystemInstallApkDocument():
-        ManagerEffect.CreateSystemInstallApkDocument? {
+        ManagerEffect.CreateInstallApkDocument? {
         val token = savedStateHandle.get<String>(PENDING_SYSTEM_APK_TOKEN_KEY)
             ?: return null
         val source = savedStateHandle.get<String>(PENDING_SYSTEM_APK_SOURCE_KEY)
@@ -3373,7 +3382,7 @@ class ManagerViewModel(
             ?: return null
         val name = savedStateHandle.get<String>(PENDING_SYSTEM_APK_NAME_KEY)
             ?: return null
-        return ManagerEffect.CreateSystemInstallApkDocument(
+        return ManagerEffect.CreateInstallApkDocument(
             importToken = token,
             source = File(source),
             expectedSha256 = sha256,
@@ -4199,10 +4208,11 @@ class ManagerViewModel(
                     pending.launchId == effect.launchId &&
                     pending.ownerGeneration == documentOwnerGeneration
             }
-            is ManagerEffect.CreateSystemInstallApkDocument -> {
+            is ManagerEffect.CreateInstallApkDocument -> {
                 val pending = pendingSystemInstallApkDocument ?: return false
                 return pending == effect && isCurrentReviewOwner(effect.importToken)
             }
+            is ManagerEffect.CreateSystemInstallApkDocument -> return false
             is ManagerEffect.ShareGeneratedBundle -> {
                 val handoff = pendingGeneratedShareHandoff ?: return false
                 val result =
@@ -4655,6 +4665,17 @@ private fun installFailureMessage(code: String): UserMessage = when (code) {
         "호환성을 확인할 수 없어 설치를 차단했습니다.",
         RecoveryAction.SELECT_ANOTHER_FILE,
     )
+    "UNSUPPORTED_INSTALL_SOURCE" -> UserMessage(
+        UserMessageKind.INSTALL_FAILED,
+        "확장 APK는 설치됐지만 삼성 인터넷이 허용하는 설치 출처가 아닙니다.\n" +
+            "저장한 APK를 삼성 내 파일에서 직접 열어 다시 설치해 주세요.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
+    "INSTALL_SOURCE_UNKNOWN" -> UserMessage(
+        UserMessageKind.INSTALL_FAILED,
+        "설치 출처를 확인하지 못했습니다.",
+        RecoveryAction.SELECT_ANOTHER_FILE,
+    )
     else -> UserMessage(
         UserMessageKind.INSTALL_FAILED,
         "시스템 설치를 완료하지 못했습니다.",
@@ -4670,7 +4691,7 @@ private sealed interface PendingRecovery {
         val uninstallPackage: String? = null,
     ) : PendingRecovery
     data class SystemInstallApk(
-        val effect: ManagerEffect.CreateSystemInstallApkDocument,
+        val effect: ManagerEffect.CreateInstallApkDocument,
     ) : PendingRecovery
 }
 
