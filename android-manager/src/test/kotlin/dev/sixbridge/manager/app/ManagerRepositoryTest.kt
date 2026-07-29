@@ -180,6 +180,55 @@ class ManagerRepositoryTest {
             }
         }
 
+    @Test
+    fun `post-cleanup Invalid recovery는 restore 전에 blocked로 완료한다`() =
+        runTest {
+            val fixture = startupFixture(
+                invalidRecord = "post-cleanup",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = listOf(
+                    emptyRecoverySnapshot(),
+                    RecoveryStoreSnapshot.Invalid,
+                    emptyRecoverySnapshot(),
+                ),
+            )
+
+            val result = withTimeout(500) { fixture.startup.awaitReady() }
+
+            assertEquals(StartupSnapshot.RecoveryBlocked, result)
+            assertEquals(2, fixture.store.recoverySnapshotReads)
+            assertEquals(listOf(0, 0), fixture.store.nullableReadsAtRecoverySnapshots)
+            assertEquals(0, fixture.store.nullableLoadReads)
+            assertEquals(0, fixture.installed.findAllCalls)
+            assertEquals(InstallState.Idle, fixture.coordinator.state.value)
+        }
+
+    @Test
+    fun `post-restore Invalid recovery는 catalog reconcile 전에 blocked로 완료한다`() =
+        runTest {
+            val fixture = startupFixture(
+                invalidRecord = "post-restore",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = listOf(
+                    emptyRecoverySnapshot(),
+                    emptyRecoverySnapshot(),
+                    RecoveryStoreSnapshot.Invalid,
+                ),
+            )
+
+            val result = withTimeout(500) { fixture.startup.awaitReady() }
+
+            assertEquals(StartupSnapshot.RecoveryBlocked, result)
+            assertEquals(3, fixture.store.recoverySnapshotReads)
+            assertTrue(fixture.store.nullableLoadReads > 0)
+            assertEquals(
+                fixture.store.nullableReadsAtRecoverySnapshots.last(),
+                fixture.store.nullableLoadReads,
+            )
+            assertEquals(0, fixture.installed.findAllCalls)
+            assertEquals(InstallState.Idle, fixture.coordinator.state.value)
+        }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `blocked startup은 PackageInstaller callback collector를 시작하지 않는다`() =
@@ -240,6 +289,54 @@ class ManagerRepositoryTest {
             assertNull(restored.terminal)
             assertNull(restored.normalHandoff)
             assertEquals(0, store.nullableLoadReads)
+            assertEquals(0, store.discardAttempts)
+        }
+
+    @Test
+    fun `repository initialize는 Ready 뒤 최신 Invalid recovery를 blocked로 반환한다`() =
+        runTest {
+            val root = temporaryFolder.newFolder("latest-blocked-repository")
+            val store = StartupPendingStore(null)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val retained = RetainedImportStore(root) { _, _, _ ->
+                error("durable owner가 없으므로 retained import를 읽지 않습니다.")
+            }
+            val coordinator = InstallCoordinator(
+                InstallPolicy(),
+                gateway,
+                store,
+                installed,
+                catalog,
+            )
+            store.useRecoverySnapshotSequence(
+                emptyRecoverySnapshot(),
+                emptyRecoverySnapshot(),
+                emptyRecoverySnapshot(),
+                RecoveryStoreSnapshot.Invalid,
+            )
+            val repository = managerRepository(
+                root = root,
+                retainedImports = retained,
+                gateway = gateway,
+                pendingStore = store,
+                installed = installed,
+                catalog = catalog,
+                coordinator = coordinator,
+            )
+
+            val restored = withTimeout(500) {
+                repository.initialize(TOKEN, 41)
+            }
+
+            assertTrue(restored.recoveryBlocked)
+            assertNull(restored.review)
+            assertNull(restored.installSessionId)
+            assertNull(restored.terminal)
+            assertNull(restored.normalHandoff)
+            assertEquals(4, store.recoverySnapshotReads)
+            assertEquals(store.nullableReadsAtRecoverySnapshots.last(), store.nullableLoadReads)
             assertEquals(0, store.discardAttempts)
         }
 
@@ -3148,6 +3245,7 @@ class ManagerRepositoryTest {
         val startup: RepositoryStartup,
         val store: StartupPendingStore,
         val coordinator: InstallCoordinator,
+        val installed: FakeInstalledWrappers,
         val router: InstallCallbackRouter,
         val routerCalls: AtomicInteger,
     )
@@ -3155,6 +3253,7 @@ class ManagerRepositoryTest {
     private fun startupFixture(
         invalidRecord: String,
         retryDelayMillis: Long,
+        recoverySnapshotSequence: List<RecoveryStoreSnapshot>? = null,
     ): StartupTestFixture {
         val root = temporaryFolder.newFolder("blocked-startup-$invalidRecord")
         val store = StartupPendingStore(null)
@@ -3174,12 +3273,16 @@ class ManagerRepositoryTest {
             terminalSnapshotOverride = RecoveryRecordSnapshot.Absent
             finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Absent
             normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Absent
-            when (invalidRecord) {
-                "pending" -> pendingSnapshotOverride = RecoveryRecordSnapshot.Invalid
-                "terminal" -> terminalSnapshotOverride = RecoveryRecordSnapshot.Invalid
-                "final" -> finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Invalid
-                "handoff" -> normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Invalid
-                else -> error("unknown record: $invalidRecord")
+            if (recoverySnapshotSequence == null) {
+                when (invalidRecord) {
+                    "pending" -> pendingSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                    "terminal" -> terminalSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                    "final" -> finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                    "handoff" -> normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Invalid
+                    else -> error("unknown record: $invalidRecord")
+                }
+            } else {
+                this.recoverySnapshotSequence = recoverySnapshotSequence
             }
             nullableLoadReads = 0
         }
@@ -3210,7 +3313,27 @@ class ManagerRepositoryTest {
             ioDispatcher = Dispatchers.Unconfined,
             retryDelayMillis = retryDelayMillis,
         )
-        return StartupTestFixture(startup, store, coordinator, router, calls)
+        return StartupTestFixture(startup, store, coordinator, installed, router, calls)
+    }
+
+    private fun emptyRecoverySnapshot() = RecoveryStoreSnapshot.Valid(
+        pending = null,
+        terminal = null,
+        finalReceipt = null,
+        normalHandoff = null,
+    )
+
+    private fun StartupPendingStore.useRecoverySnapshotSequence(
+        vararg snapshots: RecoveryStoreSnapshot,
+    ) {
+        pendingSnapshotOverride = RecoveryRecordSnapshot.Absent
+        terminalSnapshotOverride = RecoveryRecordSnapshot.Absent
+        finalReceiptSnapshotOverride = RecoveryRecordSnapshot.Absent
+        normalHandoffSnapshotOverride = RecoveryRecordSnapshot.Absent
+        recoverySnapshotSequence = snapshots.toList()
+        recoverySnapshotReads = 0
+        nullableLoadReads = 0
+        nullableReadsAtRecoverySnapshots.clear()
     }
 
     private fun catalogPublisher(
@@ -3375,8 +3498,12 @@ private class FakeInstalledWrappers(
     var values: List<InstalledWrapper>,
 ) : InstalledWrapperRepository {
     var findFailure: Throwable? = null
+    var findAllCalls = 0
 
-    override suspend fun findAll(): List<InstalledWrapper> = values
+    override suspend fun findAll(): List<InstalledWrapper> {
+        findAllCalls += 1
+        return values
+    }
     override suspend fun find(packageName: String): InstalledWrapper? {
         findFailure?.let { throw it }
         return values.singleOrNull { it.packageName == packageName }
@@ -3461,6 +3588,13 @@ private class StartupPendingStore(
     var loadFailures = 0
     var recoverySnapshotReads = 0
     var nullableLoadReads = 0
+    var recoverySnapshotSequence: List<RecoveryStoreSnapshot>? = null
+        set(value) {
+            field = value
+            recoverySnapshotIndex = 0
+        }
+    val nullableReadsAtRecoverySnapshots = mutableListOf<Int>()
+    private var recoverySnapshotIndex = 0
 
     override fun load(): PendingInstall? {
         nullableLoadReads += 1
@@ -3474,6 +3608,13 @@ private class StartupPendingStore(
         pendingSnapshotOverride ?: super<PendingInstallStore>.pendingInstallSnapshot()
     override fun recoveryStoreSnapshot(): RecoveryStoreSnapshot {
         recoverySnapshotReads += 1
+        nullableReadsAtRecoverySnapshots += nullableLoadReads
+        recoverySnapshotSequence?.let { snapshots ->
+            check(recoverySnapshotIndex < snapshots.size) {
+                "recovery snapshot sequence exhausted at read $recoverySnapshotReads"
+            }
+            return snapshots[recoverySnapshotIndex++]
+        }
         return super<PendingInstallStore>.recoveryStoreSnapshot()
     }
     override fun tryClaim(
