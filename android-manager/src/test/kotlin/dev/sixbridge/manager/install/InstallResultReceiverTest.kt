@@ -11,6 +11,46 @@ import kotlin.test.assertTrue
 
 class InstallResultReceiverTest {
     @Test
+    fun `invalid recovery snapshot은 receiver side effect 경계를 열지 않는다`() {
+        var notificationWrites = 0
+        var markerWrites = 0
+        var durableWrites = 0
+
+        val accepted = withValidRecoveryStoreSnapshot(RecoveryStoreSnapshot.Invalid) {
+            notificationWrites += 1
+            markerWrites += 1
+            durableWrites += 1
+        }
+
+        assertFalse(accepted)
+        assertEquals(0, notificationWrites)
+        assertEquals(0, markerWrites)
+        assertEquals(0, durableWrites)
+    }
+
+    @Test
+    fun `valid recovery snapshot은 receiver side effect 경계를 정확히 한 번 연다`() {
+        val pending = pendingInstall()
+        val snapshot = RecoveryStoreSnapshot.Valid(
+            pending = pending,
+            terminal = null,
+            finalReceipt = null,
+            normalHandoff = null,
+        )
+        var acceptedPending: PendingInstall? = null
+        var sideEffects = 0
+
+        val accepted = withValidRecoveryStoreSnapshot(snapshot) { valid ->
+            acceptedPending = valid.pending
+            sideEffects += 1
+        }
+
+        assertTrue(accepted)
+        assertEquals(pending, acceptedPending)
+        assertEquals(1, sideEffects)
+    }
+
+    @Test
     fun `rejects missing sessions and unknown package installer statuses`() {
         assertNull(packageInstallResultFromStatus(-1, PackageInstaller.STATUS_SUCCESS, null))
         assertNull(packageInstallResultFromStatus(41, Int.MIN_VALUE, null))

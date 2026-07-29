@@ -203,7 +203,11 @@ data class ManagerUiState(
 
 sealed interface ManagerAction {
     data object OpenSixFilePicker : ManagerAction
-    data class ImportSelected(val uri: Uri) : ManagerAction
+    data class ImportSelected(
+        val uri: Uri?,
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerAction
     data object OpenConversionInput : ManagerAction
     data class ConversionUrlChanged(val value: String) : ManagerAction
     data object OpenConversionFilePicker : ManagerAction
@@ -243,6 +247,10 @@ sealed interface ManagerAction {
     data object ConfirmPartial : ManagerAction
     data object PrepareReviewedInstall : ManagerAction
     data object InstallReviewedBundle : ManagerAction
+    data class ContinueInstallAfterNotificationPermission(
+        val reviewToken: String,
+        val generatedToken: String? = null,
+    ) : ManagerAction
     data object CancelReview : ManagerAction
     data class Remove(val packageName: String) : ManagerAction
     data class OpenReport(val packageName: String) : ManagerAction
@@ -264,7 +272,10 @@ enum class LaunchDestination {
 }
 
 sealed interface ManagerEffect {
-    data object PickSixDocument : ManagerEffect
+    data class PickSixDocument(
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerEffect
     data class RequestInstallNotificationPermission(
         val reviewToken: String,
         val generatedToken: String? = null,

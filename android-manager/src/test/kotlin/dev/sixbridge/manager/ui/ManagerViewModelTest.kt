@@ -165,6 +165,282 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `initialize transient 예외는 bounded retry 뒤 READY로 복구한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                initializeFailuresRemaining = 2
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val savedState = SavedStateHandle(
+                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
+            )
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(3, repository.initializeRequests)
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `initialize persistent 예외는 bounded retry 뒤 owner를 보존하고 fail closed한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_SESSION_ID_KEY to 41,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeException = IllegalStateException("persistent")
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(3, repository.initializeRequests)
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertEquals(41, savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `startup normal handoff proof 실패는 durable owner를 보존하고 READY를 열지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.PREPARED,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    normalHandoff = handoff,
+                )
+                normalHandoff = handoff
+                currentTerminalReceiptResult = TerminalReceiptOwnerResult.OwnerMismatch
+            }
+
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(handoff, repository.normalHandoff)
+            assertTrue(repository.discardAttempts.isEmpty())
+        }
+
+    @Test
+    fun `startup normal handoff rebase 실패는 durable handoff와 receipt를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.PREPARED,
+            )
+            val terminal = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Failed("LATE_FAILURE", "late failure"),
+                stage = FinalReceiptStage.READY,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    terminal = terminal,
+                    normalHandoff = handoff,
+                )
+                normalHandoff = handoff
+                rawReadyTerminal = terminal
+                normalHandoffRebaseResult = false
+                terminalReceiptActive = true
+            }
+
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(handoff, repository.normalHandoff)
+            assertTrue(repository.terminalReceiptActive)
+        }
+
+    @Test
+    fun `startup restored terminal finalize 실패는 receipt와 generated owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val terminal = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = FinalReceiptStage.READY,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                    terminal = terminal,
+                )
+                installFlow.value = InstallState.Cancelled
+                terminalReceiptActive = true
+                terminalFinalizeResult = false
+                terminalAcknowledgeResult = false
+            }
+            val savedState = SavedStateHandle(
+                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
+            )
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.terminalReceiptActive)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+        }
+
+    @Test
+    fun `startup generated terminal handoff finalize 실패는 handoff와 owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val handoffJson = """
+                {
+                  "version": 1,
+                  "token": "$TOKEN",
+                  "reviewToken": "$TOKEN",
+                  "sessionId": 41,
+                  "state": "CANCELLED"
+                }
+            """.trimIndent()
+            val terminal = RestoredInstallTerminal(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = FinalReceiptStage.READY,
+            )
+            val savedState = generatedInstallSavedState(
+                mapOf(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY to handoffJson),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                    terminal = terminal,
+                )
+                restoredConversion = RestoredConversion.GeneratedPending(generatedBundle())
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+                terminalReceiptActive = true
+                terminalFinalizeResult = false
+                terminalAcknowledgeResult = false
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                handoffJson,
+                savedState.get<String>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+                ),
+            )
+            assertTrue(repository.terminalReceiptActive)
+        }
+
+    @Test
+    fun `malformed generated terminal handoff는 repository mutation 전 원본을 보존하고 blocked한다`() =
+        runTest(dispatcher.scheduler) {
+            val malformed = "{not-valid-json"
+            val savedState = generatedInstallSavedState(
+                mapOf(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY to malformed),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                    terminal = restoredCancelledTerminal(),
+                )
+                restoredConversion = RestoredConversion.GeneratedPending(generatedBundle())
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                malformed,
+                savedState.get<Any>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+            assertFalse(repository.initialized)
+            assertTrue(repository.terminalReceiptActive)
+        }
+
+    @Test
+    fun `wrong type generated terminal handoff는 constructor crash 없이 원본을 보존하고 blocked한다`() =
+        runTest(dispatcher.scheduler) {
+            val wrongType: Any = 7
+            val savedState = generatedInstallSavedState(
+                mapOf(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY to wrongType),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    installSessionId = 41,
+                    terminal = restoredCancelledTerminal(),
+                )
+                restoredConversion = RestoredConversion.GeneratedPending(generatedBundle())
+                installFlow.value = InstallState.AwaitingUserApproval(41)
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                wrongType,
+                savedState.get<Any>(ManagerViewModel.GENERATED_TERMINAL_HANDOFF_KEY),
+            )
+            assertFalse(repository.initialized)
+            assertTrue(repository.terminalReceiptActive)
+        }
+
+    @Test
     fun `recovery blocked는 보고서 외 mutation과 callback을 모두 차단한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -221,7 +497,9 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.OpenSixFilePicker)
             dispatcher.scheduler.runCurrent()
 
-            assertEquals(listOf<ManagerEffect>(ManagerEffect.PickSixDocument), effects)
+            val picker = assertIs<ManagerEffect.PickSixDocument>(effects.single())
+            assertTrue(picker.ownerGeneration > 0)
+            assertTrue(picker.launchId > 0)
 
             val blocked = ManagerViewModel(
                 FakeManagerRepository().apply {
@@ -239,6 +517,122 @@ class ManagerViewModelTest {
             dispatcher.scheduler.runCurrent()
 
             assertTrue(blockedEffects.isEmpty())
+        }
+
+    @Test
+    fun `Six OpenDocument callback은 exact launch identity만 한 번 import한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            val effect = assertIs<ManagerEffect.PickSixDocument>(
+                viewModel.effects.first(),
+            )
+            val uri = unitTestUri()
+            val callback = ManagerAction.ImportSelected(
+                uri = uri,
+                ownerGeneration = effect.ownerGeneration,
+                launchId = effect.launchId,
+            )
+
+            viewModel.accept(callback)
+            advanceUntilIdle()
+            viewModel.accept(callback)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.uriImportRequests)
+            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `stale Six picker result는 새 review owner를 덮지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            val stale = assertIs<ManagerEffect.PickSixDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.startImport {
+                ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
+                )
+            }
+            advanceUntilIdle()
+            viewModel.accept(
+                ManagerAction.ImportSelected(
+                    uri = unitTestUri(),
+                    ownerGeneration = stale.ownerGeneration,
+                    launchId = stale.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, repository.uriImportRequests)
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `stale Six picker effect는 새 user action 뒤 수집되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val viewModel = ManagerViewModel(FakeManagerRepository(), SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            viewModel.accept(ManagerAction.ReturnHome)
+            val effects = mutableListOf<ManagerEffect>()
+            val collector = launch { viewModel.effects.collect(effects::add) }
+
+            dispatcher.scheduler.runCurrent()
+
+            assertTrue(effects.isEmpty())
+            collector.cancel()
+        }
+
+    @Test
+    fun `새 Six picker B 뒤 늦은 A callback은 B launch로 오인하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            val first = assertIs<ManagerEffect.PickSixDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(ManagerAction.OpenSixFilePicker)
+            val second = assertIs<ManagerEffect.PickSixDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.ImportSelected(
+                    unitTestUri(),
+                    first.ownerGeneration,
+                    first.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            assertEquals(0, repository.uriImportRequests)
+
+            viewModel.accept(
+                ManagerAction.ImportSelected(
+                    unitTestUri(),
+                    second.ownerGeneration,
+                    second.launchId,
+                ),
+            )
+            advanceUntilIdle()
+            assertEquals(1, repository.uriImportRequests)
         }
 
     @Test
@@ -400,8 +794,79 @@ class ManagerViewModelTest {
                 ).installOwnerActive,
             )
 
-            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            viewModel.accept(
+                ManagerAction.ContinueInstallAfterNotificationPermission(
+                    reviewToken = TOKEN,
+                    generatedToken = TOKEN,
+                ),
+            )
             dispatcher.scheduler.runCurrent()
+
+            assertEquals(1, repository.installRequests)
+        }
+
+    @Test
+    fun `permission callback은 exact review owner만 설치하고 stale owner는 무시한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE, SECOND_TOKEN),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            val effect = assertIs<ManagerEffect.RequestInstallNotificationPermission>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            viewModel.accept(
+                ManagerAction.ContinueInstallAfterNotificationPermission(
+                    reviewToken = effect.reviewToken,
+                    generatedToken = effect.generatedToken,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, repository.installRequests)
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
+        }
+
+    @Test
+    fun `permission callback은 recreation 후 exact review identity를 설치한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val savedState = SavedStateHandle(
+                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
+            )
+            val source = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            source.accept(ManagerAction.PrepareReviewedInstall)
+            val effect = assertIs<ManagerEffect.RequestInstallNotificationPermission>(
+                source.effects.first(),
+            )
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            recreated.accept(
+                ManagerAction.ContinueInstallAfterNotificationPermission(
+                    reviewToken = effect.reviewToken,
+                    generatedToken = effect.generatedToken,
+                ),
+            )
+            advanceUntilIdle()
 
             assertEquals(1, repository.installRequests)
         }
@@ -4024,6 +4489,166 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `startup blocked 동안 restored quarantine은 어떤 cleanup mutation도 시작하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY to "REVIEW",
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_INSTALL_SESSION_ID_KEY to 41,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY to false,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+            assertEquals(
+                TOKEN,
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(
+                "REVIEW",
+                savedState.get<String>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY,
+                ),
+            )
+        }
+
+    @Test
+    fun `quarantine reconcile은 initialize가 복원한 durable handoff owner를 침범하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val initializeResult = CompletableDeferred<ManagerRestoreResult>()
+            val handoff = NormalInstallHandoff(
+                importToken = TOKEN,
+                sessionId = 41,
+                packageName = PACKAGE,
+                state = InstallState.Cancelled,
+                stage = NormalHandoffStage.OUTCOME_READY,
+            )
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY to SECOND_TOKEN,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY to "REVIEW",
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY to false,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                initializeDeferred = initializeResult
+                normalHandoff = handoff
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                StartupRecoveryUiState.INITIALIZING,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            initializeResult.complete(ManagerRestoreResult(normalHandoff = handoff))
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertEquals(listOf(SECOND_TOKEN), repository.discardedConversions)
+        }
+
+    @Test
+    fun `wrong type quarantine marker는 원본을 보존하고 fail closed한다`() =
+        runTest(dispatcher.scheduler) {
+            val wrongToken: Any = 7
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY to wrongToken,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY to "CONVERSION",
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY to false,
+                ),
+            )
+            val repository = FakeManagerRepository()
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                wrongToken,
+                savedState.get<Any>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
+    fun `wrong type quarantine marker와 cleanup journal 공존 시 원본을 덮지 않고 fail closed한다`() =
+        runTest(dispatcher.scheduler) {
+            val wrongToken: Any = 7
+            val cleanupJournal = """
+                {
+                  "version": 1,
+                  "token": "$SECOND_TOKEN",
+                  "reviewToken": null,
+                  "phase": "CONVERSION",
+                  "destination": {
+                    "kind": "HOME",
+                    "packageName": null
+                  },
+                  "installSessionId": null,
+                  "autoReplayPending": false
+                }
+            """.trimIndent()
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY to wrongToken,
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_PHASE_KEY to "CONVERSION",
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_CONVERSION_CLEANED_KEY to false,
+                    CLEANUP_JOURNAL_KEY to cleanupJournal,
+                ),
+            )
+            val repository = FakeManagerRepository()
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(
+                wrongToken,
+                savedState.get<Any>(
+                    ManagerViewModel.QUARANTINED_GENERATED_CLEANUP_TOKEN_KEY,
+                ),
+            )
+            assertEquals(cleanupJournal, savedState.get<String>(CLEANUP_JOURNAL_KEY))
+            assertTrue(repository.discardAttempts.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
     fun `quarantine failure survives recreation 뒤 safe conversion만 다시 시도한다`() =
         runTest(dispatcher.scheduler) {
             val savedState = SavedStateHandle()
@@ -4404,7 +5029,15 @@ class ManagerViewModelTest {
             )
             assertEquals(41, deathState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
 
-            val recreated = ManagerViewModel(currentGeneratedInstallRepository(), deathState)
+            val recreatedRepository = currentGeneratedInstallRepository().apply {
+                installFlow.value = InstallState.Installed(PACKAGE)
+                terminalOwnerImportToken = TOKEN
+                terminalOwnerSessionId = 41
+                terminalOwnerState = InstallState.Installed(PACKAGE)
+                terminalOwnerProofConfigured = true
+                terminalReceiptActive = true
+            }
+            val recreated = ManagerViewModel(recreatedRepository, deathState)
             advanceUntilIdle()
             recreated.accept(ManagerAction.RetryGeneratedCleanup)
             advanceUntilIdle()
@@ -4795,13 +5428,14 @@ class ManagerViewModelTest {
             val recreatedRepository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE),
-                    installSessionId = 41,
+                    installSessionId = null,
                 )
                 restoredConversion = RestoredConversion.BundleReady(
                     review(ContractCompatibilityStatus.COMPATIBLE),
                     generatedBundle(),
                 )
-                installFlow.value = InstallState.AwaitingUserApproval(41)
+                installFlow.value = InstallState.Idle
+                terminalReceiptActive = false
             }
             val recreated = ManagerViewModel(recreatedRepository, savedState)
             advanceUntilIdle()
@@ -5011,7 +5645,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `pending REVIEW initialize exception은 Home Retry로 exact Report를 완료한다`() =
+    fun `pending REVIEW initialize persistent exception은 journal을 보존하고 fail closed한다`() =
         runTest(dispatcher.scheduler) {
             val savedState = pendingReviewReportSavedState()
             val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
@@ -5024,24 +5658,27 @@ class ManagerViewModelTest {
 
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
             assertEquals(
-                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                UserMessageKind.RECOVERY_BLOCKED,
                 viewModel.state.value.message?.kind,
             )
             assertEquals(
-                RecoveryAction.RETRY,
+                RecoveryAction.NONE,
                 viewModel.state.value.message?.recoveryAction,
             )
             assertGeneratedOwnersAndSessionPreserved(savedState)
             assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
             assertEquals(0, repository.cleanupRequestCount())
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
 
             viewModel.accept(ManagerAction.RetryGeneratedCleanup)
             advanceUntilIdle()
 
-            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
-            assertEquals(TOKEN, viewModel.state.value.destinationCommitToken)
-            assertEquals(listOf(TOKEN), repository.discardedTokens)
-            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(repository.discardedTokens.isEmpty())
+            assertTrue(repository.discardedConversions.isEmpty())
         }
 
     @Test
@@ -5052,6 +5689,9 @@ class ManagerViewModelTest {
                 val journalBefore = savedState.get<String>(CLEANUP_JOURNAL_KEY)
                 val repository = currentGeneratedInstallRepository().apply {
                     restoredConversion = null
+                    installFlow.value = InstallState.Idle
+                    restoreResult = restoreResult.copy(installSessionId = null)
+                    terminalReceiptActive = false
                     restoreConversionFailure = if (caseName == "exception") {
                         IOException("transient")
                     } else {
@@ -5073,7 +5713,7 @@ class ManagerViewModelTest {
                     viewModel.state.value.message?.recoveryAction,
                     caseName,
                 )
-                assertGeneratedOwnersAndSessionPreserved(savedState)
+                assertGeneratedInstallOwnerCleared(savedState)
                 assertEquals(
                     journalBefore,
                     savedState.get<String>(CLEANUP_JOURNAL_KEY),
@@ -5100,7 +5740,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `pending REVIEW initialize 전 import는 무시하고 exception Retry를 표시한다`() =
+    fun `pending REVIEW initialize 전 import는 무시하고 exception 뒤 fail closed한다`() =
         runTest(dispatcher.scheduler) {
             val initializeResult = CompletableDeferred<ManagerRestoreResult>()
             val savedState = pendingReviewReportSavedState()
@@ -5127,17 +5767,17 @@ class ManagerViewModelTest {
 
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
             assertEquals(
-                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                UserMessageKind.RECOVERY_BLOCKED,
                 viewModel.state.value.message?.kind,
             )
-            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
             assertGeneratedOwnersAndSessionPreserved(savedState)
             assertEquals(journalBefore, savedState.get<String>(CLEANUP_JOURNAL_KEY))
             assertEquals(0, repository.cancelInstallRequests)
             assertTrue(repository.discardedTokens.isEmpty())
             assertTrue(repository.discardedConversions.isEmpty())
             assertEquals(
-                StartupRecoveryUiState.READY,
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
                 viewModel.state.value.startupRecoveryState,
             )
         }
@@ -5815,7 +6455,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `normal rebase commit fault 뒤 새 import는 current receipt를 다시 증명해야 진행한다`() =
+    fun `normal rebase commit fault는 fail closed하고 recreation에서 재증명해야 진행한다`() =
         runTest(dispatcher.scheduler) {
             listOf(
                 InstallState.Installed(PACKAGE),
@@ -5856,11 +6496,17 @@ class ManagerViewModelTest {
                         ),
                     )
                 }
-                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
                 advanceUntilIdle()
 
                 assertEquals(old, repository.normalHandoff, "state=$currentState")
                 assertTrue(repository.terminalReceiptActive, "state=$currentState")
+                assertEquals(
+                    StartupRecoveryUiState.RECOVERY_BLOCKED,
+                    viewModel.state.value.startupRecoveryState,
+                    "state=$currentState",
+                )
 
                 viewModel.startImport(repository::nextImport)
                 advanceUntilIdle()
@@ -5882,7 +6528,14 @@ class ManagerViewModelTest {
                 )
 
                 repository.normalHandoffRebaseResult = true
-                viewModel.startImport(repository::nextImport)
+                val recreated = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                assertEquals(
+                    StartupRecoveryUiState.READY,
+                    recreated.state.value.startupRecoveryState,
+                    "state=$currentState",
+                )
+                recreated.startImport(repository::nextImport)
                 advanceUntilIdle()
 
                 assertNull(repository.normalHandoff, "state=$currentState")
@@ -5891,7 +6544,7 @@ class ManagerViewModelTest {
                 assertEquals(
                     SECOND_TOKEN,
                     assertIs<ImportUiState.ReviewReady>(
-                        viewModel.state.value.importState,
+                        recreated.state.value.importState,
                     ).review.token,
                     "state=$currentState",
                 )
@@ -7734,6 +8387,14 @@ class ManagerViewModelTest {
         suggestedFileName = "확장.six",
     )
 
+    private fun restoredCancelledTerminal() = RestoredInstallTerminal(
+        importToken = TOKEN,
+        sessionId = 41,
+        packageName = PACKAGE,
+        state = InstallState.Cancelled,
+        stage = FinalReceiptStage.READY,
+    )
+
     private fun generatedInstallSavedState(
         cleanupValues: Map<String, Any?>,
     ) = SavedStateHandle(
@@ -8105,10 +8766,13 @@ private class FakeManagerRepository : ManagerRepository {
         ManagerImportResult.Failure(ImportFailure(ImportFailureCode.SOURCE_UNREADABLE))
     var initialized = false
     var initializeException: RuntimeException? = null
+    var initializeFailuresRemaining = 0
+    var initializeRequests = 0
     var initializeDeferred: CompletableDeferred<ManagerRestoreResult>? = null
     var suspendInitialize = false
     var ignoreInitializeCancellation = false
     var restoreArguments: Pair<String?, Int?>? = null
+    var uriImportRequests = 0
     var installRequests = 0
     var completedInstallRequests = 0
     var installResult: InstallState = InstallState.Idle
@@ -8218,7 +8882,12 @@ private class FakeManagerRepository : ManagerRepository {
 
     override suspend fun initialize(reviewToken: String?, installSessionId: Int?): ManagerRestoreResult {
         initialized = true
+        initializeRequests += 1
         restoreArguments = reviewToken to installSessionId
+        if (initializeFailuresRemaining > 0) {
+            initializeFailuresRemaining -= 1
+            throw IllegalStateException("transient initialize failure")
+        }
         initializeException?.let { throw it }
         initializeDeferred?.let { return it.await() }
         if (suspendInitialize) {
@@ -8235,8 +8904,10 @@ private class FakeManagerRepository : ManagerRepository {
         initializeGate.emit(Unit)
     }
 
-    override suspend fun import(uri: Uri): ManagerImportResult =
-        nextImport()
+    override suspend fun import(uri: Uri): ManagerImportResult {
+        uriImportRequests += 1
+        return nextImport()
+    }
 
     override suspend fun beginConversion(request: OnDeviceInputRequest): ConversionBeginResult {
         val index = conversionRequests.size

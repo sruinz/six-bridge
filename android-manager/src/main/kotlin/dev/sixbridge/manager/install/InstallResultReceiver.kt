@@ -133,6 +133,15 @@ internal class PendingConfirmationHandoff {
 
 private val processPendingConfirmationHandoff = PendingConfirmationHandoff()
 
+internal inline fun withValidRecoveryStoreSnapshot(
+    snapshot: RecoveryStoreSnapshot,
+    block: (RecoveryStoreSnapshot.Valid) -> Unit,
+): Boolean {
+    val valid = snapshot as? RecoveryStoreSnapshot.Valid ?: return false
+    block(valid)
+    return true
+}
+
 class InstallResultReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_INSTALL_RESULT) return
@@ -141,56 +150,63 @@ class InstallResultReceiver : BroadcastReceiver() {
             intent.getIntExtra(EXTRA_CALLBACK_SESSION_ID, -1),
         )
         if (sessionId < 0) return
-        when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)) {
-            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val store = SharedPreferencesPendingInstallStore(context)
-                val pending = runCatching { store.load() }.getOrNull()
-                if (!matchesPendingInstallSession(pending, sessionId)) return
-                val confirmation = confirmationIntent(intent)
-                    ?.let { makeExplicitSystemIntent(context, it) }
-                if (confirmation == null) {
-                    persistAndNotify(
-                        context,
-                        PackageInstallResult.Failure(
+        val store = SharedPreferencesPendingInstallStore(context)
+        val snapshot = runCatching { store.recoveryStoreSnapshot() }
+            .getOrDefault(RecoveryStoreSnapshot.Invalid)
+        withValidRecoveryStoreSnapshot(snapshot) { recovery ->
+            when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)) {
+                PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                    val pending = recovery.pending
+                    if (!matchesPendingInstallSession(pending, sessionId)) return
+                    val confirmation = confirmationIntent(intent)
+                        ?.let { makeExplicitSystemIntent(context, it) }
+                    if (confirmation == null) {
+                        persistAndNotify(
+                            context = context,
+                            store = store,
+                            result = PackageInstallResult.Failure(
+                                sessionId = sessionId,
+                                code = "MISSING_USER_ACTION_INTENT",
+                                message = "설치 승인 화면을 확인할 수 없습니다.",
+                            ),
+                        )
+                    } else {
+                        val delivery = PendingConfirmationDelivery(
+                            isAppVisible = ManagerAppVisibility::isVisible,
+                            launchForeground = { target ->
+                                context.startActivity(
+                                    Intent(target).addFlags(
+                                        pendingConfirmationFlags(target.flags),
+                                    ),
+                                )
+                            },
+                            postBackgroundNotification = { ownedSessionId, target ->
+                                postPendingConfirmationNotification(
+                                    context = context,
+                                    sessionId = ownedSessionId,
+                                    confirmationIntent = target,
+                                )
+                            },
+                        )
+                        handoffPendingConfirmation(
+                            pending = pending,
                             sessionId = sessionId,
-                            code = "MISSING_USER_ACTION_INTENT",
-                            message = "설치 승인 화면을 확인할 수 없습니다.",
-                        ),
-                    )
-                } else {
-                    val delivery = PendingConfirmationDelivery(
-                        isAppVisible = ManagerAppVisibility::isVisible,
-                        launchForeground = { target ->
-                            context.startActivity(
-                                Intent(target).addFlags(
-                                    pendingConfirmationFlags(target.flags),
-                                ),
-                            )
-                        },
-                        postBackgroundNotification = { ownedSessionId, target ->
-                            postPendingConfirmationNotification(
-                                context = context,
-                                sessionId = ownedSessionId,
-                                confirmationIntent = target,
-                            )
-                        },
-                    )
-                    handoffPendingConfirmation(
-                        pending = pending,
-                        sessionId = sessionId,
-                        confirmationIntent = confirmation,
-                        isDelivered = store::isConfirmationDelivered,
-                        markDelivered = store::markConfirmationDelivered,
-                        launch = { target -> delivery.deliver(sessionId, target) },
-                    )
+                            confirmationIntent = confirmation,
+                            isDelivered = store::isConfirmationDelivered,
+                            markDelivered = store::markConfirmationDelivered,
+                            launch = { target -> delivery.deliver(sessionId, target) },
+                        )
+                    }
+                }
+
+                else -> packageInstallResultFromStatus(
+                    sessionId = sessionId,
+                    status = status,
+                    statusMessage = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE),
+                )?.let { result ->
+                    persistAndNotify(context = context, store = store, result = result)
                 }
             }
-
-            else -> packageInstallResultFromStatus(
-                sessionId = sessionId,
-                status = status,
-                statusMessage = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE),
-            )?.let { persistAndNotify(context, it) }
         }
     }
 
@@ -210,11 +226,15 @@ class InstallResultReceiver : BroadcastReceiver() {
         launch = launch,
     )
 
-    private fun persistAndNotify(context: Context, result: PackageInstallResult) {
+    private fun persistAndNotify(
+        context: Context,
+        store: PendingInstallStore,
+        result: PackageInstallResult,
+    ) {
         context.getSystemService(NotificationManager::class.java)
             ?.cancel(INSTALL_CONFIRMATION_NOTIFICATION_BASE + result.sessionId)
         val recorded = runCatching {
-            SharedPreferencesPendingInstallStore(context).recordTerminalResult(
+            store.recordTerminalResult(
                 result = result,
                 terminalAtEpochMillis = System.currentTimeMillis(),
             )

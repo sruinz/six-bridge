@@ -681,19 +681,39 @@ class SharedPreferencesPendingInstallStore internal constructor(
         val terminalAt = recoveryPreferences.getLong(KEY_TERMINAL_AT, -1)
         val packageName = recoveryPreferences.getString(KEY_RESULT_PACKAGE_NAME, null).orEmpty()
         if (sessionId < 0 || terminalAt <= 0 || !PACKAGE_NAME.matches(packageName)) return null
-        val importToken = recoveryPreferences.getString(KEY_RESULT_IMPORT_TOKEN, null)
-            ?.takeIf(::isCanonicalToken)
-        val result = when (recoveryPreferences.getString(KEY_RESULT_KIND, null)) {
+        val importToken = if (recoveryPreferences.contains(KEY_RESULT_IMPORT_TOKEN)) {
+            recoveryPreferences.getString(KEY_RESULT_IMPORT_TOKEN, null)
+                ?.takeIf(::isCanonicalToken)
+                ?: return null
+        } else {
+            null
+        }
+        val resultKind = recoveryPreferences.getString(KEY_RESULT_KIND, null)
+        if (resultKind != RESULT_FAILURE &&
+            (recoveryPreferences.contains(KEY_RESULT_CODE) ||
+                recoveryPreferences.contains(KEY_RESULT_MESSAGE))
+        ) {
+            return null
+        }
+        val result = when (resultKind) {
             RESULT_SUCCESS -> PackageInstallResult.Success(sessionId)
             RESULT_CANCELLED -> PackageInstallResult.Cancelled(sessionId)
             RESULT_FAILURE -> PackageInstallResult.Failure(
                 sessionId = sessionId,
-                code = recoveryPreferences.getString(KEY_RESULT_CODE, null)
-                    ?.takeIf(String::isNotBlank)
-                    ?: DEFAULT_FAILURE_CODE,
-                message = recoveryPreferences.getString(KEY_RESULT_MESSAGE, null)
-                    ?.takeIf(String::isNotBlank)
-                    ?: DEFAULT_FAILURE_MESSAGE,
+                code = if (recoveryPreferences.contains(KEY_RESULT_CODE)) {
+                    recoveryPreferences.getString(KEY_RESULT_CODE, null)
+                        ?.takeIf(::isValidFailureCode)
+                        ?: return null
+                } else {
+                    DEFAULT_FAILURE_CODE
+                },
+                message = if (recoveryPreferences.contains(KEY_RESULT_MESSAGE)) {
+                    recoveryPreferences.getString(KEY_RESULT_MESSAGE, null)
+                        ?.takeIf(::isValidFailureMessage)
+                        ?: return null
+                } else {
+                    DEFAULT_FAILURE_MESSAGE
+                },
             )
             else -> return null
         }
@@ -1023,6 +1043,16 @@ class SharedPreferencesPendingInstallStore internal constructor(
 
     private fun isCanonicalToken(token: String): Boolean =
         runCatching { UUID.fromString(token).toString() == token }.getOrDefault(false)
+
+    private fun isValidFailureCode(code: String): Boolean =
+        code.isNotBlank() &&
+            code.length <= MAX_CODE_LENGTH &&
+            code.all { it.isUpperCase() || it.isDigit() || it == '_' }
+
+    private fun isValidFailureMessage(message: String): Boolean =
+        message.isNotBlank() &&
+            message.length <= MAX_MESSAGE_LENGTH &&
+            message.all { it >= ' ' && it != '\u007f' }
 
     private fun canonicalImportRoot(): File? = runCatching {
         if (!importDirectory.exists() || !importDirectory.isDirectory) return null

@@ -42,13 +42,20 @@ import java.util.concurrent.CancellationException
 class MainActivity : ComponentActivity() {
     private lateinit var managerViewModel: ManagerViewModel
     private lateinit var notificationInstallGate: NotificationPermissionInstallGate
+    private var sixPickerLaunchGate = ActivityDocumentLaunchGate()
     private var pendingConversionPicker: PendingActivityDocumentLaunch? = null
     private var pendingConversionSave: PendingActivityDocumentLaunch? = null
 
     private val openDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        uri?.let { managerViewModel.accept(ManagerAction.ImportSelected(it)) }
+        val completion = sixPickerLaunchGate.complete()
+        completion?.completed?.let {
+            managerViewModel.accept(it.sixImportAction(uri))
+        }
+        completion?.launchNext?.let {
+            launchSixDocumentPicker()
+        }
     }
 
     private val openConversionDocument = registerForActivityResult(
@@ -80,6 +87,18 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repository = ManagerDependencies.create(application).repository
+        sixPickerLaunchGate = ActivityDocumentLaunchGate(
+            active = savedInstanceState?.restorePendingDocumentLaunch(
+                tokenKey = null,
+                ownerKey = PENDING_SIX_PICKER_OWNER,
+                launchKey = PENDING_SIX_PICKER_LAUNCH_ID,
+            ),
+            queued = savedInstanceState?.restorePendingDocumentLaunch(
+                tokenKey = null,
+                ownerKey = QUEUED_SIX_PICKER_OWNER,
+                launchKey = QUEUED_SIX_PICKER_LAUNCH_ID,
+            ),
+        )
         pendingConversionPicker = savedInstanceState?.restorePendingDocumentLaunch(
             tokenKey = null,
             ownerKey = PENDING_CONVERSION_PICKER_OWNER,
@@ -110,8 +129,15 @@ class MainActivity : ComponentActivity() {
             },
         )[ManagerViewModel::class.java]
         notificationInstallGate = NotificationPermissionInstallGate(
-            awaitingPermissionResult =
-                savedInstanceState?.getBoolean(AWAITING_NOTIFICATION_PERMISSION) == true,
+            pendingInstall = savedInstanceState
+                ?.getString(PENDING_NOTIFICATION_REVIEW_TOKEN)
+                ?.let { reviewToken ->
+                    ManagerEffect.RequestInstallNotificationPermission(
+                        reviewToken = reviewToken,
+                        generatedToken =
+                            savedInstanceState.getString(PENDING_NOTIFICATION_GENERATED_TOKEN),
+                    )
+                },
             needsPermission = {
                 Build.VERSION.SDK_INT >= 33 &&
                     checkSelfPermission(POST_NOTIFICATIONS_PERMISSION) !=
@@ -120,8 +146,13 @@ class MainActivity : ComponentActivity() {
             requestPermission = {
                 requestNotificationPermission()
             },
-            continueInstall = {
-                managerViewModel.accept(ManagerAction.InstallReviewedBundle)
+            continueInstall = { effect ->
+                managerViewModel.accept(
+                    ManagerAction.ContinueInstallAfterNotificationPermission(
+                        reviewToken = effect.reviewToken,
+                        generatedToken = effect.generatedToken,
+                    ),
+                )
             },
         )
         setContent {
@@ -139,10 +170,18 @@ class MainActivity : ComponentActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 managerViewModel.effects.collect { effect ->
                     when (effect) {
-                        ManagerEffect.PickSixDocument ->
-                            openDocument.launch(SIX_MIME_TYPES)
+                        is ManagerEffect.PickSixDocument -> {
+                            val launch = PendingActivityDocumentLaunch(
+                                token = null,
+                                ownerGeneration = effect.ownerGeneration,
+                                launchId = effect.launchId,
+                            )
+                            if (sixPickerLaunchGate.enqueue(launch) != null) {
+                                launchSixDocumentPicker()
+                            }
+                        }
                         is ManagerEffect.RequestInstallNotificationPermission ->
-                            notificationInstallGate.requestInstall()
+                            notificationInstallGate.requestInstall(effect)
                         is ManagerEffect.LaunchIntent -> executeLaunch(
                             effect = effect,
                             resolveIntent = { it.intentFactory() },
@@ -198,11 +237,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         if (::notificationInstallGate.isInitialized) {
-            outState.putBoolean(
-                AWAITING_NOTIFICATION_PERMISSION,
-                notificationInstallGate.awaitingPermissionResult,
-            )
+            notificationInstallGate.pendingInstall?.let { pending ->
+                outState.putString(PENDING_NOTIFICATION_REVIEW_TOKEN, pending.reviewToken)
+                pending.generatedToken?.let {
+                    outState.putString(PENDING_NOTIFICATION_GENERATED_TOKEN, it)
+                }
+            }
         }
+        sixPickerLaunchGate.active?.save(
+            outState = outState,
+            tokenKey = null,
+            ownerKey = PENDING_SIX_PICKER_OWNER,
+            launchKey = PENDING_SIX_PICKER_LAUNCH_ID,
+        )
+        sixPickerLaunchGate.queued?.save(
+            outState = outState,
+            tokenKey = null,
+            ownerKey = QUEUED_SIX_PICKER_OWNER,
+            launchKey = QUEUED_SIX_PICKER_LAUNCH_ID,
+        )
         pendingConversionPicker?.save(
             outState = outState,
             tokenKey = null,
@@ -227,13 +280,23 @@ class MainActivity : ComponentActivity() {
         requestNotifications.launch(POST_NOTIFICATIONS_PERMISSION)
     }
 
+    private fun launchSixDocumentPicker() {
+        openDocument.launch(SIX_MIME_TYPES)
+    }
+
     override fun onStop() {
         ManagerAppVisibility.onActivityStopped()
         super.onStop()
     }
 
     private companion object {
-        const val AWAITING_NOTIFICATION_PERMISSION = "awaiting_notification_permission"
+        const val PENDING_NOTIFICATION_REVIEW_TOKEN = "pending_notification_review_token"
+        const val PENDING_NOTIFICATION_GENERATED_TOKEN =
+            "pending_notification_generated_token"
+        const val PENDING_SIX_PICKER_OWNER = "pending_six_picker_owner"
+        const val PENDING_SIX_PICKER_LAUNCH_ID = "pending_six_picker_launch_id"
+        const val QUEUED_SIX_PICKER_OWNER = "queued_six_picker_owner"
+        const val QUEUED_SIX_PICKER_LAUNCH_ID = "queued_six_picker_launch_id"
         const val PENDING_CONVERSION_SAVE_TOKEN = "pending_conversion_save_token"
         const val PENDING_CONVERSION_SAVE_OWNER = "pending_conversion_save_owner"
         const val PENDING_CONVERSION_SAVE_LAUNCH_ID = "pending_conversion_save_launch_id"
@@ -270,9 +333,55 @@ internal data class PendingActivityDocumentLaunch(
     }
 }
 
+internal data class ActivityDocumentLaunchCompletion(
+    val completed: PendingActivityDocumentLaunch,
+    val launchNext: PendingActivityDocumentLaunch?,
+)
+
+internal class ActivityDocumentLaunchGate(
+    active: PendingActivityDocumentLaunch? = null,
+    queued: PendingActivityDocumentLaunch? = null,
+) {
+    var active: PendingActivityDocumentLaunch? = active
+        private set
+    var queued: PendingActivityDocumentLaunch? = queued
+        private set
+
+    init {
+        require(active != null || queued == null) {
+            "queued document launch에는 active launch가 필요합니다."
+        }
+    }
+
+    fun enqueue(launch: PendingActivityDocumentLaunch): PendingActivityDocumentLaunch? {
+        if (active == null) {
+            active = launch
+            return launch
+        }
+        queued = launch
+        return null
+    }
+
+    fun complete(): ActivityDocumentLaunchCompletion? {
+        val completed = active ?: return null
+        val launchNext = queued
+        active = launchNext
+        queued = null
+        return ActivityDocumentLaunchCompletion(completed, launchNext)
+    }
+}
+
 internal fun PendingActivityDocumentLaunch.conversionFileAction(
     uri: Uri?,
 ): ManagerAction.ConversionFileSelected = ManagerAction.ConversionFileSelected(
+    uri = uri,
+    ownerGeneration = ownerGeneration,
+    launchId = launchId,
+)
+
+internal fun PendingActivityDocumentLaunch.sixImportAction(
+    uri: Uri?,
+): ManagerAction.ImportSelected = ManagerAction.ImportSelected(
     uri = uri,
     ownerGeneration = ownerGeneration,
     launchId = launchId,
@@ -474,27 +583,29 @@ internal fun <T> executeLaunch(
 }
 
 internal class NotificationPermissionInstallGate(
-    awaitingPermissionResult: Boolean,
+    pendingInstall: ManagerEffect.RequestInstallNotificationPermission?,
     private val needsPermission: () -> Boolean,
     private val requestPermission: () -> Unit,
-    private val continueInstall: () -> Unit,
+    private val continueInstall: (
+        ManagerEffect.RequestInstallNotificationPermission,
+    ) -> Unit,
 ) {
-    var awaitingPermissionResult: Boolean = awaitingPermissionResult
+    var pendingInstall: ManagerEffect.RequestInstallNotificationPermission? = pendingInstall
         private set
 
-    fun requestInstall() {
-        if (awaitingPermissionResult) return
+    fun requestInstall(effect: ManagerEffect.RequestInstallNotificationPermission) {
+        if (pendingInstall != null) return
         if (!needsPermission()) {
-            continueInstall()
+            continueInstall(effect)
             return
         }
-        awaitingPermissionResult = true
+        pendingInstall = effect
         requestPermission()
     }
 
     fun onPermissionResult() {
-        if (!awaitingPermissionResult) return
-        awaitingPermissionResult = false
-        continueInstall()
+        val effect = pendingInstall ?: return
+        pendingInstall = null
+        continueInstall(effect)
     }
 }

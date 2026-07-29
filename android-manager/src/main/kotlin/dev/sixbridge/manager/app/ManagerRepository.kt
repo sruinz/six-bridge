@@ -67,6 +67,7 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -576,10 +577,16 @@ internal class RepositoryStartup(
     private val catalogPublisher: CatalogPublisher,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val retryDelayMillis: Long = 250,
+    private val maxAttempts: Int = 3,
 ) {
     private val mutex = Mutex()
     private val ready = CompletableDeferred<StartupSnapshot>()
     private val started = AtomicBoolean()
+    private val failedAttempts = AtomicInteger()
+
+    init {
+        require(maxAttempts > 0) { "maxAttempts는 1 이상이어야 합니다." }
+    }
 
     fun start(
         applicationScope: CoroutineScope,
@@ -603,7 +610,11 @@ internal class RepositoryStartup(
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
-                delay(retryDelayMillis)
+                if (failedAttempts.incrementAndGet() >= maxAttempts) {
+                    ready.complete(StartupSnapshot.RecoveryBlocked)
+                } else {
+                    delay(retryDelayMillis)
+                }
             }
         }
         return ready.await()

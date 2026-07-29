@@ -55,6 +55,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -64,6 +65,40 @@ class CoreConversionRuntimeInstrumentedTest {
     private val testContext = InstrumentationRegistry.getInstrumentation().context
     private val targetContext =
         InstrumentationRegistry.getInstrumentation().targetContext
+
+    @Test
+    fun memorySharedPreferencesPresentWrongTypesThrowForEveryTypedGetter() {
+        val preferences = memorySharedPreferences()
+        assertTrue(
+            preferences.edit()
+                .putInt("string", 1)
+                .putInt("string_set", 1)
+                .putString("int", "wrong")
+                .putString("long", "wrong")
+                .putString("float", "wrong")
+                .putString("boolean", "wrong")
+                .commit(),
+        )
+
+        assertThrows(ClassCastException::class.java) {
+            preferences.getString("string", "fallback")
+        }
+        assertThrows(ClassCastException::class.java) {
+            preferences.getStringSet("string_set", setOf("fallback"))
+        }
+        assertThrows(ClassCastException::class.java) {
+            preferences.getInt("int", 1)
+        }
+        assertThrows(ClassCastException::class.java) {
+            preferences.getLong("long", 1L)
+        }
+        assertThrows(ClassCastException::class.java) {
+            preferences.getFloat("float", 1F)
+        }
+        assertThrows(ClassCastException::class.java) {
+            preferences.getBoolean("boolean", true)
+        }
+    }
 
     @Test
     fun terminalImportTokenSchemaRoundTripsLegacyAndClear() {
@@ -1329,6 +1364,17 @@ internal fun memorySharedPreferences(
 ): SharedPreferences {
     val values = linkedMapOf<String, Any?>()
 
+    fun typedValueOrDefault(
+        key: String,
+        defaultValue: Any?,
+        isExpectedType: (Any?) -> Boolean,
+    ): Any? {
+        if (!values.containsKey(key)) return defaultValue
+        return values[key]
+            ?.takeIf(isExpectedType)
+            ?: throw ClassCastException("SharedPreferences value has the wrong type: $key")
+    }
+
     fun editor(): SharedPreferences.Editor {
         val updates = linkedMapOf<String, Any?>()
         val removals = linkedSetOf<String>()
@@ -1398,12 +1444,38 @@ internal fun memorySharedPreferences(
         val args = arguments.orEmpty()
         when (method.name) {
             "getAll" -> values.toMap()
-            "getString" -> values[args[0] as String] as? String ?: args[1]
-            "getStringSet" -> values[args[0] as String] as? Set<*> ?: args[1]
-            "getInt" -> values[args[0] as String] as? Int ?: args[1]
-            "getLong" -> values[args[0] as String] as? Long ?: args[1]
-            "getFloat" -> values[args[0] as String] as? Float ?: args[1]
-            "getBoolean" -> values[args[0] as String] as? Boolean ?: args[1]
+            "getString" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { it is String },
+            )
+            "getStringSet" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { value ->
+                    value is Set<*> && value.all { member -> member is String }
+                },
+            )
+            "getInt" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { it is Int },
+            )
+            "getLong" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { it is Long },
+            )
+            "getFloat" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { it is Float },
+            )
+            "getBoolean" -> typedValueOrDefault(
+                key = args[0] as String,
+                defaultValue = args[1],
+                isExpectedType = { it is Boolean },
+            )
             "contains" -> values.containsKey(args[0] as String)
             "edit" -> editor()
             "registerOnSharedPreferenceChangeListener",

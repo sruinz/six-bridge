@@ -56,6 +56,7 @@ import dev.sixbridge.manager.ui.ImportUiState
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerViewModel
 import dev.sixbridge.manager.ui.ManagerRoute
+import dev.sixbridge.manager.ui.StartupRecoveryUiState
 import dev.sixbridge.manager.ui.UserMessageKind
 import dev.sixbridge.manager.uninstall.UninstallCoordinator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
@@ -178,6 +179,28 @@ class ManagerRepositoryTest {
                 assertEquals(0, fixture.store.discardAttempts, invalidRecord)
                 assertEquals(InstallState.Idle, fixture.coordinator.state.value, invalidRecord)
             }
+        }
+
+    @Test
+    fun `영구 startup 예외는 기본 최대 시도 뒤 RecoveryBlocked로 완료한다`() =
+        runTest {
+            val fixture = startupFixture(
+                invalidRecord = "pending",
+                retryDelayMillis = 1,
+            )
+            fixture.store.apply {
+                pendingSnapshotOverride = RecoveryRecordSnapshot.Absent
+                recoverySnapshotFailures = Int.MAX_VALUE
+            }
+
+            val result = withTimeout(500) { fixture.startup.awaitReady() }
+
+            assertEquals(StartupSnapshot.RecoveryBlocked, result)
+            assertEquals(3, fixture.store.recoverySnapshotReads)
+            assertEquals(Int.MAX_VALUE - 3, fixture.store.recoverySnapshotFailures)
+            assertEquals(0, fixture.store.nullableLoadReads)
+            assertEquals(0, fixture.store.discardAttempts)
+            assertEquals(InstallState.Idle, fixture.coordinator.state.value)
         }
 
     @Test
@@ -2118,6 +2141,10 @@ class ManagerRepositoryTest {
                 val recreated = ManagerViewModel(repository, savedState)
                 advanceUntilIdle()
                 assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
+                assertEquals(
+                    StartupRecoveryUiState.RECOVERY_BLOCKED,
+                    recreated.state.value.startupRecoveryState,
+                )
                 recreated.startImport {
                     blockedImportCalls += 1
                     ManagerImportResult.Success(
@@ -2139,24 +2166,14 @@ class ManagerRepositoryTest {
 
                 pendingStore.discardFailure = false
                 recreated.startImport {
-                    ManagerImportResult.Success(
-                        ReviewBundle(
-                            token = SECOND_TOKEN,
-                            packageName = bundle.verifiedApk.packageName,
-                            extensionId = bundle.descriptor.extensionId,
-                            name = bundle.descriptor.name,
-                            version = bundle.descriptor.version,
-                            status = bundle.report.status,
-                            issues = bundle.report.issues,
-                        ),
-                    )
+                    error("recovery blocked import must not start")
                 }
                 advanceUntilIdle()
 
-                assertEquals(4, pendingStore.discardAttempts)
-                assertTrue(!File(root, TOKEN).exists())
+                assertEquals(2, pendingStore.discardAttempts)
+                assertTrue(File(root, TOKEN).exists())
                 assertEquals(
-                    SECOND_TOKEN,
+                    TOKEN,
                     assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
                         .review.token,
                 )
@@ -2296,12 +2313,20 @@ class ManagerRepositoryTest {
                 assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
                 assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState)
                 assertEquals(TOKEN, savedState.get<String>("review_token"))
+                assertEquals(
+                    StartupRecoveryUiState.RECOVERY_BLOCKED,
+                    recreated.state.value.startupRecoveryState,
+                )
 
                 pendingStore.discardFailure = false
-                recreated.accept(ManagerAction.CancelReview)
+                val retried = ManagerViewModel(repository, savedState)
                 advanceUntilIdle()
 
-                assertEquals(ManagerRoute.Home, recreated.state.value.route)
+                assertEquals(
+                    StartupRecoveryUiState.READY,
+                    retried.state.value.startupRecoveryState,
+                )
+                assertEquals(ManagerRoute.Home, retried.state.value.route)
                 assertNull(savedState.get<String>("review_token"))
                 assertNull(pendingStore.record)
                 assertFalse(File(root, TOKEN).exists())
@@ -3586,6 +3611,7 @@ private class StartupPendingStore(
     var discardFailure = false
     var discardAttempts = 0
     var loadFailures = 0
+    var recoverySnapshotFailures = 0
     var recoverySnapshotReads = 0
     var nullableLoadReads = 0
     var recoverySnapshotSequence: List<RecoveryStoreSnapshot>? = null
@@ -3609,6 +3635,10 @@ private class StartupPendingStore(
     override fun recoveryStoreSnapshot(): RecoveryStoreSnapshot {
         recoverySnapshotReads += 1
         nullableReadsAtRecoverySnapshots += nullableLoadReads
+        if (recoverySnapshotFailures > 0) {
+            recoverySnapshotFailures -= 1
+            error("persistent recovery snapshot failure")
+        }
         recoverySnapshotSequence?.let { snapshots ->
             check(recoverySnapshotIndex < snapshots.size) {
                 "recovery snapshot sequence exhausted at read $recoverySnapshotReads"
