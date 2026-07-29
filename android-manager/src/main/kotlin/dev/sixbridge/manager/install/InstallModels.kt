@@ -2,6 +2,8 @@ package dev.sixbridge.manager.install
 
 sealed interface InstallState {
     data object Idle : InstallState
+    data object PreparingSystemInstaller : InstallState
+    data class AwaitingSystemInstaller(val importToken: String) : InstallState
     data object UnknownSourcesPermissionRequired : InstallState
     data class WritingSession(val sessionId: Int) : InstallState
     data class AwaitingUserApproval(val sessionId: Int) : InstallState
@@ -28,6 +30,28 @@ data class PendingInstall(
     val packageName: String,
     val importToken: String,
     val startedAtEpochMillis: Long,
+)
+
+enum class SystemInstallStage {
+    PREPARED,
+    LAUNCHED,
+}
+
+data class ExpectedInstalledWrapper(
+    val packageName: String,
+    val extensionId: String,
+    val versionCode: Long,
+    val signerSha256: String,
+)
+
+data class PendingSystemInstall(
+    val importToken: String,
+    val expected: ExpectedInstalledWrapper,
+    val wrapperSha256: String,
+    val previous: ExpectedInstalledWrapper?,
+    val startedAtEpochMillis: Long,
+    val stage: SystemInstallStage,
+    val version: Int = 1,
 )
 
 data class PendingInstallResult(

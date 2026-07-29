@@ -1523,6 +1523,8 @@ class ManagerViewModel(
                 val suppressedTerminal = installState == suppressedInstallTerminal
                 if (suppressedTerminal) suppressedInstallTerminal = null
                 when (installState) {
+                    InstallState.PreparingSystemInstaller,
+                    is InstallState.AwaitingSystemInstaller -> Unit
                     is InstallState.WritingSession -> {
                         saveSessionIfInitialized(installState.sessionId)
                         clearLaunchRecovery(LaunchDestination.UNKNOWN_SOURCES_SETTINGS)
