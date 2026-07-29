@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.app
 
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
@@ -51,6 +52,12 @@ import dev.sixbridge.manager.install.PendingInstallResult
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.RecoveryStoreSnapshot
+import dev.sixbridge.manager.install.SystemInstallCoordinator
+import dev.sixbridge.manager.install.SystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallerGateway
+import dev.sixbridge.manager.install.SystemInstallerLaunch
+import dev.sixbridge.manager.install.SystemInstallerLaunchResult
+import dev.sixbridge.manager.install.PendingSystemInstall
 import dev.sixbridge.manager.ui.LaunchDestination
 import dev.sixbridge.manager.ui.ImportUiState
 import dev.sixbridge.manager.ui.ManagerAction
@@ -102,6 +109,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.emptyFlow
@@ -111,6 +119,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -123,10 +132,140 @@ import kotlinx.coroutines.test.setMain
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class ManagerRepositoryTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `검증된 install 요청은 session 대신 system installer launch를 발행한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("system-install-launch")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+
+            val requestState = fixture.repository.install(review, partialConfirmed = true)
+            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), requestState)
+            val launch = fixture.repository.launches.first()
+
+            assertEquals(LaunchDestination.SYSTEM_INSTALL_CONFIRMATION, launch.destination)
+            assertEquals(TOKEN, launch.installImportToken)
+            assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
+        }
+
+    @Test
+    fun `system installer launch 결과와 복귀 reconcile은 import token 소유권으로 전달한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("system-install-return")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+
+            assertFalse(fixture.repository.markSystemInstallLaunchSucceeded(SECOND_TOKEN))
+            assertTrue(fixture.repository.markSystemInstallLaunchSucceeded(TOKEN))
+            assertEquals(
+                dev.sixbridge.manager.install.SystemInstallStage.LAUNCHED,
+                assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                    fixture.handoffStore.snapshot(),
+                ).value.stage,
+            )
+
+            fixture.installed.values = listOf(
+                installed(version = 2, signer = "a".repeat(64)),
+            )
+            assertEquals(
+                InstallState.Installed(PACKAGE),
+                fixture.repository.reconcileSystemInstallAfterReturn(),
+            )
+            assertEquals(
+                FinalReceiptOrigin.SYSTEM_INSTALLER,
+                fixture.pendingStore.finalReceipt?.origin,
+            )
+        }
+
+    @Test
+    fun `system installer launch 실패는 정확한 import token만 정리한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("system-install-launch-failed")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+
+            assertFalse(fixture.repository.markSystemInstallLaunchFailed(SECOND_TOKEN))
+            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                fixture.handoffStore.snapshot(),
+            )
+            assertTrue(fixture.repository.markSystemInstallLaunchFailed(TOKEN))
+
+            assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+            assertEquals(
+                listOf(File(fixture.root, TOKEN).resolve("wrapper.apk")),
+                fixture.systemGateway.revoked,
+            )
+        }
+
+    @Test
+    fun `LAUNCHED handoff는 프로세스 재생성 뒤 startup에서 보존되고 reconcile 대상으로 복원된다`() =
+        runTest {
+            val fixture = systemRepositoryFixture("system-install-recreated")
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+            fixture.repository.install(review, partialConfirmed = true)
+            assertTrue(fixture.repository.markSystemInstallLaunchSucceeded(TOKEN))
+            val recreatedSystemCoordinator = systemInstallCoordinator(
+                root = fixture.root,
+                pendingStore = fixture.pendingStore,
+                installed = fixture.installed,
+                gateway = fixture.systemGateway,
+                handoffStore = fixture.handoffStore,
+            )
+            val recreated = managerRepository(
+                root = fixture.root,
+                retainedImports = fixture.retainedImports,
+                gateway = fixture.legacyGateway,
+                pendingStore = fixture.pendingStore,
+                installed = fixture.installed,
+                catalog = fixture.catalog,
+                coordinator = fixture.legacyCoordinator,
+                systemCoordinator = recreatedSystemCoordinator,
+                systemInstallStore = fixture.handoffStore,
+            )
+
+            assertNotNull(recreated.initialize(TOKEN, null).review)
+
+            assertEquals(
+                InstallState.AwaitingSystemInstaller(TOKEN),
+                recreated.installState.value,
+            )
+            assertTrue(File(fixture.root, TOKEN).exists())
+            assertIs<RecoveryRecordSnapshot.Present<PendingSystemInstall>>(
+                fixture.handoffStore.snapshot(),
+            )
+            fixture.installed.values = listOf(
+                installed(version = 2, signer = "a".repeat(64)),
+            )
+            assertEquals(
+                InstallState.Installed(PACKAGE),
+                recreated.reconcileSystemInstallAfterReturn(),
+            )
+        }
+
+    @Test
+    fun `system installer fallback은 launch나 legacy session 없이 Idle을 반환한다`() =
+        runTest {
+            val fixture = systemRepositoryFixture(
+                name = "system-install-fallback",
+                systemGateway = FakeSystemInstallerGateway(
+                    launchResult = SystemInstallerLaunchResult.MyFilesFallbackRequired,
+                ),
+            )
+            val review = assertNotNull(fixture.repository.initialize(TOKEN, null).review)
+
+            val result = fixture.repository.install(review, partialConfirmed = true)
+
+            assertEquals(InstallState.Idle, result)
+            assertNull(withTimeoutOrNull(100) { fixture.repository.launches.first() })
+            assertTrue(fixture.legacyGateway.ownedSessions().isEmpty())
+        }
 
     @Test
     fun `recovery store snapshot은 하나의 Invalid도 전체 Invalid로 보존한다`() {
@@ -772,6 +911,11 @@ class ManagerRepositoryTest {
                         coordinator = sourceCoordinator,
                         conversionCoordinator = conversion,
                     )
+                    val legacySourceRepository = legacyInstallRepository(
+                        delegate = sourceRepository,
+                        coordinator = sourceCoordinator,
+                        retainedImports = retainedImports,
+                    )
                     val savedState = SavedStateHandle(
                         mapOf(
                             ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
@@ -782,7 +926,7 @@ class ManagerRepositoryTest {
                         ),
                     )
                     val source = ManagerViewModel(
-                        sourceRepository,
+                        legacySourceRepository,
                         savedState,
                         afterTerminalReceiptFinalized = {
                             throw CancellationException("simulated process death")
@@ -831,7 +975,12 @@ class ManagerRepositoryTest {
                         coordinator = retryCoordinator,
                         conversionCoordinator = conversion,
                     )
-                    val recreated = ManagerViewModel(retryRepository, savedState)
+                    val legacyRetryRepository = legacyInstallRepository(
+                        delegate = retryRepository,
+                        coordinator = retryCoordinator,
+                        retainedImports = retainedImports,
+                    )
+                    val recreated = ManagerViewModel(legacyRetryRepository, savedState)
                     advanceUntilIdle()
 
                     assertNull(
@@ -1870,8 +2019,13 @@ class ManagerRepositoryTest {
                     catalog,
                     coordinator,
                 )
+                val legacyRepository = legacyInstallRepository(
+                    delegate = repository,
+                    coordinator = coordinator,
+                    retainedImports = retainedImports,
+                )
                 val savedState = SavedStateHandle(mapOf("review_token" to SECOND_TOKEN))
-                val viewModel = ManagerViewModel(repository, savedState)
+                val viewModel = ManagerViewModel(legacyRepository, savedState)
                 advanceUntilIdle()
                 assertEquals(ManagerRoute.Review(SECOND_TOKEN), viewModel.state.value.route)
                 val messages = mutableListOf<UserMessageKind?>()
@@ -1896,7 +2050,7 @@ class ManagerRepositoryTest {
     }
 
     @Test
-    fun `repository install은 mutex 뒤 callback보다 request 내부 결과를 반환한다`() =
+    fun `repository install은 legacy callback과 무관하게 system request 내부 결과를 반환한다`() =
         runBlocking {
             val root = temporaryFolder.newFolder("atomic-attempt-result")
             val bundle = importedBundle(root)
@@ -1941,12 +2095,11 @@ class ManagerRepositoryTest {
 
             val attemptResult = repository.install(review, partialConfirmed = false)
 
-            assertEquals(InstallState.AwaitingUserApproval(41), stateBeforeCallback)
-            assertEquals(InstallState.AwaitingUserApproval(41), attemptResult)
-            assertEquals(
-                "CALLBACK_FAILURE",
-                assertIs<InstallState.Failed>(coordinator.state.value).code,
-            )
+            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), stateBeforeCallback)
+            assertEquals(InstallState.AwaitingSystemInstaller(TOKEN), attemptResult)
+            assertEquals(InstallState.Idle, coordinator.state.value)
+            assertNull(pendingStore.record)
+            assertTrue(gateway.ownedSessions().isEmpty())
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -2100,6 +2253,12 @@ class ManagerRepositoryTest {
                         Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
                     ),
                     installCoordinator = coordinator,
+                    systemInstallCoordinator = systemInstallCoordinator(
+                        root = root,
+                        pendingStore = pendingStore,
+                        installed = installed,
+                        gateway = FakeSystemInstallerGateway(canInstallPackages = false),
+                    ),
                     pendingStore = pendingStore,
                     uninstallCoordinator = object : UninstallCoordinator {
                         override fun intent(packageName: String) =
@@ -2116,8 +2275,13 @@ class ManagerRepositoryTest {
                     installEvents = emptyFlow(),
                     ioDispatcher = dispatcher,
                 )
+                val legacyRepository = legacyInstallRepository(
+                    delegate = repository,
+                    coordinator = coordinator,
+                    retainedImports = retainedImports,
+                )
                 val savedState = SavedStateHandle(mapOf("review_token" to TOKEN))
-                val viewModel = ManagerViewModel(repository, savedState)
+                val viewModel = ManagerViewModel(legacyRepository, savedState)
                 advanceUntilIdle()
                 assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
 
@@ -2138,7 +2302,7 @@ class ManagerRepositoryTest {
                 assertTrue(File(root, TOKEN).exists())
 
                 var blockedImportCalls = 0
-                val recreated = ManagerViewModel(repository, savedState)
+                val recreated = ManagerViewModel(legacyRepository, savedState)
                 advanceUntilIdle()
                 assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
                 assertEquals(
@@ -2273,6 +2437,11 @@ class ManagerRepositoryTest {
                         Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
                     ),
                     installCoordinator = restoredCoordinator,
+                    systemInstallCoordinator = systemInstallCoordinator(
+                        root = root,
+                        pendingStore = pendingStore,
+                        installed = installed,
+                    ),
                     pendingStore = pendingStore,
                     uninstallCoordinator = object : UninstallCoordinator {
                         override fun intent(packageName: String) =
@@ -3226,6 +3395,8 @@ class ManagerRepositoryTest {
         installed: InstalledWrapperRepository,
         catalog: FakeCatalog,
         coordinator: InstallCoordinator,
+        systemCoordinator: SystemInstallCoordinator? = null,
+        systemInstallStore: SystemInstallHandoffStore = InMemorySystemInstallHandoffStore(),
         afterInstallRequest: suspend (InstallState) -> Unit = {},
         uninstallCoordinator: UninstallCoordinator = object : UninstallCoordinator {
             override fun intent(packageName: String) = error("uninstall하지 않습니다.")
@@ -3250,8 +3421,14 @@ class ManagerRepositoryTest {
             gateway,
             pendingStore,
             Clock.fixed(Instant.ofEpochMilli(2), ZoneOffset.UTC),
+            systemInstallHandoffStore = systemInstallStore,
         ),
         installCoordinator = coordinator,
+        systemInstallCoordinator = systemCoordinator ?: systemInstallCoordinator(
+            root = root,
+            pendingStore = pendingStore,
+            installed = installed,
+        ),
         pendingStore = pendingStore,
         uninstallCoordinator = uninstallCoordinator,
         samsungBrowserNavigator = object : SamsungBrowserNavigator {
@@ -3264,6 +3441,92 @@ class ManagerRepositoryTest {
         afterInstallRequest = afterInstallRequest,
         conversionCoordinator = conversionCoordinator,
         generatedImporter = generatedImporter,
+    )
+
+    private fun legacyInstallRepository(
+        delegate: ManagerRepository,
+        coordinator: InstallCoordinator,
+        retainedImports: RetainedImportStore,
+    ): ManagerRepository = object : ManagerRepository by delegate {
+        override val installState: StateFlow<InstallState> = coordinator.state
+
+        override suspend fun install(
+            review: ReviewBundle,
+            partialConfirmed: Boolean,
+        ): InstallState {
+            val bundle = retainedImports.load(review.token) ?: return InstallState.Idle
+            return coordinator.request(bundle, partialConfirmed)
+        }
+    }
+
+    private fun systemRepositoryFixture(
+        name: String,
+        systemGateway: FakeSystemInstallerGateway = FakeSystemInstallerGateway(),
+    ): SystemRepositoryFixture {
+        val root = temporaryFolder.newFolder(name)
+        val bundle = importedBundle(root)
+        val retainedImports = RetainedImportStore(root) { _, _, _ ->
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        assertTrue(retainedImports.save(bundle))
+        val pendingStore = StartupPendingStore(null, root)
+        val legacyGateway = StartupGateway(emptyList())
+        val installed = FakeInstalledWrappers(emptyList())
+        val catalog = FakeCatalog(emptyList())
+        val legacyCoordinator = InstallCoordinator(
+            InstallPolicy(),
+            legacyGateway,
+            pendingStore,
+            installed,
+            catalog,
+        )
+        val handoffStore = InMemorySystemInstallHandoffStore()
+        val systemCoordinator = systemInstallCoordinator(
+            root = root,
+            pendingStore = pendingStore,
+            installed = installed,
+            gateway = systemGateway,
+            handoffStore = handoffStore,
+        )
+        val repository = managerRepository(
+            root = root,
+            retainedImports = retainedImports,
+            gateway = legacyGateway,
+            pendingStore = pendingStore,
+            installed = installed,
+            catalog = catalog,
+            coordinator = legacyCoordinator,
+            systemCoordinator = systemCoordinator,
+            systemInstallStore = handoffStore,
+        )
+        return SystemRepositoryFixture(
+            root = root,
+            repository = repository,
+            retainedImports = retainedImports,
+            legacyGateway = legacyGateway,
+            legacyCoordinator = legacyCoordinator,
+            systemGateway = systemGateway,
+            handoffStore = handoffStore,
+            pendingStore = pendingStore,
+            installed = installed,
+            catalog = catalog,
+        )
+    }
+
+    private fun systemInstallCoordinator(
+        root: File,
+        pendingStore: PendingInstallStore,
+        installed: InstalledWrapperRepository,
+        gateway: SystemInstallerGateway = FakeSystemInstallerGateway(),
+        handoffStore: SystemInstallHandoffStore = InMemorySystemInstallHandoffStore(),
+    ) = SystemInstallCoordinator(
+        policy = InstallPolicy(),
+        gateway = gateway,
+        handoffStore = handoffStore,
+        installedWrappers = installed,
+        pendingStore = pendingStore,
+        retainedWrapperFile = { token -> File(root, token).resolve("wrapper.apk") },
+        retainedWrapperSha256 = { sha256(it) },
     )
 
     private data class StartupTestFixture(
@@ -3466,6 +3729,69 @@ class ManagerRepositoryTest {
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
         val SECOND_PACKAGE = "dev.sixbridge.ext.$SECOND_EXTENSION_ID"
         val PUBLISHER_PNG = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47)
+    }
+}
+
+private data class SystemRepositoryFixture(
+    val root: File,
+    val repository: DefaultManagerRepository,
+    val retainedImports: RetainedImportStore,
+    val legacyGateway: StartupGateway,
+    val legacyCoordinator: InstallCoordinator,
+    val systemGateway: FakeSystemInstallerGateway,
+    val handoffStore: InMemorySystemInstallHandoffStore,
+    val pendingStore: StartupPendingStore,
+    val installed: FakeInstalledWrappers,
+    val catalog: FakeCatalog,
+)
+
+private class FakeSystemInstallerGateway(
+    private val canInstallPackages: Boolean = true,
+    private val launchResult: SystemInstallerLaunchResult? = null,
+) : SystemInstallerGateway {
+    val revoked = mutableListOf<File>()
+    private val readyLaunchResult = SystemInstallerLaunchResult.Ready(
+        SystemInstallerLaunch(
+            uri = Uri.parse("content://dev.sixbridge.manager.install/import/wrapper.apk"),
+            intent = Intent(Intent.ACTION_VIEW),
+        ),
+    )
+
+    override fun canRequestPackageInstalls(): Boolean = canInstallPackages
+
+    override fun unknownSourcesSettingsIntent(): Intent = Intent()
+
+    override fun createLaunch(apk: File): SystemInstallerLaunchResult =
+        launchResult ?: readyLaunchResult
+
+    override fun revoke(apk: File) {
+        revoked += apk
+    }
+}
+
+private class InMemorySystemInstallHandoffStore : SystemInstallHandoffStore {
+    private var record: PendingSystemInstall? = null
+
+    override fun snapshot(): RecoveryRecordSnapshot<PendingSystemInstall> =
+        record?.let { RecoveryRecordSnapshot.Present(it) } ?: RecoveryRecordSnapshot.Absent
+
+    override fun tryPrepare(record: PendingSystemInstall): Boolean {
+        if (this.record != null) return false
+        this.record = record
+        return true
+    }
+
+    override fun markLaunched(expected: PendingSystemInstall): PendingSystemInstall? {
+        if (record != expected) return null
+        return expected.copy(
+            stage = dev.sixbridge.manager.install.SystemInstallStage.LAUNCHED,
+        ).also { record = it }
+    }
+
+    override fun clear(expected: PendingSystemInstall): Boolean {
+        if (record != expected) return false
+        record = null
+        return true
     }
 }
 

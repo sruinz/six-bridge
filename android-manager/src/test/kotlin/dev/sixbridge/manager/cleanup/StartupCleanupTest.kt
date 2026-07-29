@@ -5,6 +5,7 @@ import dev.sixbridge.manager.install.PackageInstallGateway
 import dev.sixbridge.manager.install.FinalInstallReceipt
 import dev.sixbridge.manager.install.FinalReceiptOrigin
 import dev.sixbridge.manager.install.FinalReceiptStage
+import dev.sixbridge.manager.install.ExpectedInstalledWrapper
 import dev.sixbridge.manager.install.InstallSessionSnapshot
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.NormalHandoffStage
@@ -15,6 +16,9 @@ import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallResult
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
+import dev.sixbridge.manager.install.PendingSystemInstall
+import dev.sixbridge.manager.install.SystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallStage
 import java.io.File
 import java.nio.file.Files
 import java.time.Clock
@@ -216,6 +220,58 @@ class StartupCleanupTest {
         }
 
     @Test
+    fun `startup cleanup은 신규 handoff를 보존하면서 legacy pending과 session만 정리한다`() =
+        runBlocking {
+            listOf(SystemInstallStage.PREPARED, SystemInstallStage.LAUNCHED).forEach { stage ->
+                val handoff = PendingSystemInstall(
+                    importToken = HANDOFF_TOKEN,
+                    expected = ExpectedInstalledWrapper(
+                        packageName = PACKAGE_NAME,
+                        extensionId = EXTENSION_ID,
+                        versionCode = 2,
+                        signerSha256 = "a".repeat(64),
+                    ),
+                    wrapperSha256 = "b".repeat(64),
+                    previous = null,
+                    startedAtEpochMillis = now,
+                    stage = stage,
+                )
+                val handoffStore = FakeSystemInstallHandoffStore(handoff)
+                val handoffImport = tokenDirectory(HANDOFF_TOKEN, now - DAY_MILLIS - 1)
+                val legacyPending = pending(
+                    sessionId = 41,
+                    startedAt = now - DAY_MILLIS - 1,
+                )
+                val legacyImport = tokenDirectory(
+                    legacyPending.importToken,
+                    now - DAY_MILLIS - 1,
+                )
+                val pendingStore = FakePendingStore(
+                    record = legacyPending,
+                    missingObservedAt = now - DAY_MILLIS - 1,
+                )
+                val gateway = FakeGateway(owned = mutableListOf(77))
+
+                cleanup(
+                    gateway = gateway,
+                    store = pendingStore,
+                    systemInstallStore = handoffStore,
+                ).run()
+
+                assertTrue(handoffImport.exists())
+                assertEquals(
+                    RecoveryRecordSnapshot.Present(handoff),
+                    handoffStore.snapshot(),
+                )
+                assertEquals(0, handoffStore.mutationCalls)
+                assertNull(pendingStore.record)
+                assertFalse(legacyImport.exists())
+                assertEquals(listOf(77), gateway.abandoned)
+                handoffImport.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `손상된 final 또는 normal handoff marker가 있으면 startup cleanup은 아무 소유권도 정리하지 않는다`() =
         runBlocking {
             listOf(
@@ -364,12 +420,14 @@ class StartupCleanupTest {
     private fun cleanup(
         gateway: FakeGateway = FakeGateway(),
         store: FakePendingStore = FakePendingStore(),
+        systemInstallStore: SystemInstallHandoffStore = FakeSystemInstallHandoffStore(),
         importRoot: File = imports,
     ) = StartupCleanup(
         importRoot = importRoot,
         installGateway = gateway,
         pendingStore = store,
         clock = Clock.fixed(Instant.ofEpochMilli(now), ZoneOffset.UTC),
+        systemInstallHandoffStore = systemInstallStore,
     )
 
     private fun tokenDirectory(token: String, timestamp: Long): File =
@@ -478,6 +536,30 @@ class StartupCleanupTest {
         }
     }
 
+    private class FakeSystemInstallHandoffStore(
+        private val record: PendingSystemInstall? = null,
+    ) : SystemInstallHandoffStore {
+        var mutationCalls = 0
+
+        override fun snapshot(): RecoveryRecordSnapshot<PendingSystemInstall> =
+            record?.let { RecoveryRecordSnapshot.Present(it) } ?: RecoveryRecordSnapshot.Absent
+
+        override fun tryPrepare(record: PendingSystemInstall): Boolean {
+            mutationCalls += 1
+            return false
+        }
+
+        override fun markLaunched(expected: PendingSystemInstall): PendingSystemInstall? {
+            mutationCalls += 1
+            return null
+        }
+
+        override fun clear(expected: PendingSystemInstall): Boolean {
+            mutationCalls += 1
+            return false
+        }
+    }
+
     private class CancellingTimestampFile(
         path: String,
         private val cancel: () -> Unit,
@@ -504,6 +586,7 @@ class StartupCleanupTest {
         const val FINAL_TOKEN = "123e4567-e89b-12d3-a456-426614174003"
         const val HANDOFF_TOKEN = "123e4567-e89b-12d3-a456-426614174004"
         const val UNPROTECTED_TOKEN = "123e4567-e89b-12d3-a456-426614174005"
+        const val EXTENSION_ID = "aabbccddeeffgghhiijjkkllmmnnoopp"
         const val PACKAGE_NAME = "dev.sixbridge.ext.aabbccddeeffgghhiijjkkllmmnnoopp"
     }
 }

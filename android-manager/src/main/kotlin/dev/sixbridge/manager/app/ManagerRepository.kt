@@ -41,6 +41,8 @@ import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.install.RecoveryStoreSnapshot
+import dev.sixbridge.manager.install.SystemInstallCoordinator
+import dev.sixbridge.manager.install.SystemInstallRequestResult
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
 import dev.sixbridge.manager.ui.LaunchDestination
@@ -149,6 +151,7 @@ class RepositoryLaunch(
     val destination: LaunchDestination,
     val intentFactory: () -> Intent,
     val installSessionId: Int? = null,
+    val installImportToken: String? = null,
 )
 
 sealed interface RepositoryNavigationResult {
@@ -183,6 +186,9 @@ interface ManagerRepository {
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun createGeneratedShareSnapshot(token: String): File? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
+    fun markSystemInstallLaunchSucceeded(importToken: String): Boolean = false
+    fun markSystemInstallLaunchFailed(importToken: String): Boolean = false
+    suspend fun reconcileSystemInstallAfterReturn(): InstallState? = null
     suspend fun cancelInstall(
         expectedReviewToken: String,
         expectedSessionId: Int?,
@@ -233,6 +239,7 @@ internal class DefaultManagerRepository(
     private val retainedImports: RetainedImportStore,
     private val startupCleanup: StartupCleanup,
     private val installCoordinator: InstallCoordinator,
+    private val systemInstallCoordinator: SystemInstallCoordinator,
     private val pendingStore: PendingInstallStore,
     private val uninstallCoordinator: UninstallCoordinator,
     private val samsungBrowserNavigator: SamsungBrowserNavigator,
@@ -260,7 +267,7 @@ internal class DefaultManagerRepository(
     )
 
     override val catalog: Flow<List<CatalogRecord>> = catalogPublisher.state
-    override val installState: StateFlow<InstallState> = installCoordinator.state
+    override val installState: StateFlow<InstallState> = systemInstallCoordinator.state
     override val launches: Flow<RepositoryLaunch> = launchChannel.receiveAsFlow()
 
     fun start(applicationScope: CoroutineScope, catalogStore: ManagerCatalog) {
@@ -423,10 +430,36 @@ internal class DefaultManagerRepository(
     ): InstallState {
         val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) }
             ?: return InstallState.Idle
-        val requestState = installCoordinator.request(bundle, partialConfirmed)
+        val requestState = when (
+            val result = systemInstallCoordinator.request(bundle, partialConfirmed)
+        ) {
+            is SystemInstallRequestResult.Launch -> {
+                launchChannel.send(
+                    RepositoryLaunch(
+                        destination = LaunchDestination.SYSTEM_INSTALL_CONFIRMATION,
+                        intentFactory = { result.launch.intent },
+                        installImportToken = result.state.importToken,
+                    ),
+                )
+                result.state
+            }
+            SystemInstallRequestResult.UnknownSourcesPermissionRequired ->
+                InstallState.UnknownSourcesPermissionRequired
+            SystemInstallRequestResult.MyFilesFallbackRequired -> InstallState.Idle
+            is SystemInstallRequestResult.Failed -> result.state
+        }
         afterInstallRequest(requestState)
         return requestState
     }
+
+    override fun markSystemInstallLaunchSucceeded(importToken: String): Boolean =
+        systemInstallCoordinator.markLaunchSucceeded(importToken)
+
+    override fun markSystemInstallLaunchFailed(importToken: String): Boolean =
+        systemInstallCoordinator.markLaunchFailed(importToken)
+
+    override suspend fun reconcileSystemInstallAfterReturn(): InstallState? =
+        systemInstallCoordinator.reconcileAfterReturn()
 
     override suspend fun cancelInstall(
         expectedReviewToken: String,

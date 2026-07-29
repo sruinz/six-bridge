@@ -42,6 +42,10 @@ import dev.sixbridge.manager.install.PackageInstallResult
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
 import dev.sixbridge.manager.install.RecoveryStoreSnapshot
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
+import dev.sixbridge.manager.install.SharedPreferencesSystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallCoordinator
+import dev.sixbridge.manager.install.SystemInstallerGateway
+import dev.sixbridge.manager.install.SystemInstallerLaunchResult
 import dev.sixbridge.manager.navigation.SamsungBrowserAvailability
 import dev.sixbridge.manager.navigation.SamsungBrowserNavigator
 import dev.sixbridge.manager.ui.ConversionUiState
@@ -920,6 +924,7 @@ class TerminalHandoffRaceInstrumentedTest {
         val pendingPreferences = memorySharedPreferences()
         val recoveryControl = MemoryPreferenceControl()
         val recoveryPreferences = memorySharedPreferences(recoveryControl)
+        val systemHandoffPreferences = memorySharedPreferences()
         val gateway = TestPackageInstallGateway()
         val installed = MutableInstalledWrappers()
         val catalog = TestCatalog()
@@ -963,6 +968,25 @@ class TerminalHandoffRaceInstrumentedTest {
             catalog = durable.catalog,
             clock = { 10 },
         )
+        private val systemInstallStore = SharedPreferencesSystemInstallHandoffStore(
+            durable.systemHandoffPreferences,
+        )
+        private val systemInstallCoordinator = SystemInstallCoordinator(
+            policy = InstallPolicy(),
+            gateway = object : SystemInstallerGateway {
+                override fun canRequestPackageInstalls(): Boolean = true
+                override fun unknownSourcesSettingsIntent(): Intent = Intent()
+                override fun createLaunch(apk: File) =
+                    SystemInstallerLaunchResult.MyFilesFallbackRequired
+                override fun revoke(apk: File) = Unit
+            },
+            handoffStore = systemInstallStore,
+            installedWrappers = durable.installed,
+            pendingStore = store,
+            retainedWrapperFile = { token ->
+                File(durable.root, token).resolve("wrapper.apk")
+            },
+        )
         val conversion = TestConversionCoordinator().apply {
             configure(durable.bundle.toReview(), durable.generated)
         }
@@ -979,7 +1003,7 @@ class TerminalHandoffRaceInstrumentedTest {
             ),
             scope = scope,
         )
-        val repository = DefaultManagerRepository(
+        private val defaultRepository = DefaultManagerRepository(
             importer = BundleImportService(
                 BundleSource { error("직접 import하지 않습니다.") },
                 AndroidWrapperVerifier(
@@ -994,8 +1018,10 @@ class TerminalHandoffRaceInstrumentedTest {
                 durable.gateway,
                 store,
                 Clock.fixed(Instant.ofEpochMilli(11), ZoneOffset.UTC),
+                systemInstallHandoffStore = systemInstallStore,
             ),
             installCoordinator = coordinator,
+            systemInstallCoordinator = systemInstallCoordinator,
             pendingStore = store,
             uninstallCoordinator = noOpUninstallCoordinator(),
             samsungBrowserNavigator = missingSamsungBrowserNavigator(),
@@ -1004,9 +1030,20 @@ class TerminalHandoffRaceInstrumentedTest {
             ioDispatcher = Dispatchers.Unconfined,
             conversionCoordinator = conversion,
         )
+        val repository: ManagerRepository = object : ManagerRepository by defaultRepository {
+            override val installState = coordinator.state
+
+            override suspend fun install(
+                review: ReviewBundle,
+                partialConfirmed: Boolean,
+            ): InstallState {
+                val bundle = retained.load(review.token) ?: return InstallState.Idle
+                return coordinator.request(bundle, partialConfirmed)
+            }
+        }
 
         init {
-            repository.start(scope, durable.catalog)
+            defaultRepository.start(scope, durable.catalog)
         }
 
         suspend fun awaitReview(

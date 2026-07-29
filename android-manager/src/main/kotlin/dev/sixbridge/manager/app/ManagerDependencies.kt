@@ -30,9 +30,12 @@ import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
 import dev.sixbridge.manager.importer.ImportResult
 import dev.sixbridge.manager.importer.RoutingBundleSource
 import dev.sixbridge.manager.install.AndroidPackageInstallGateway
+import dev.sixbridge.manager.install.AndroidSystemInstallerGateway
 import dev.sixbridge.manager.install.InstallCoordinator
 import dev.sixbridge.manager.install.InstallPolicy
 import dev.sixbridge.manager.install.SharedPreferencesPendingInstallStore
+import dev.sixbridge.manager.install.SharedPreferencesSystemInstallHandoffStore
+import dev.sixbridge.manager.install.SystemInstallCoordinator
 import dev.sixbridge.manager.navigation.AndroidSamsungBrowserNavigator
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.profile.AndroidSamsungBrowserProfileProvider
@@ -76,7 +79,9 @@ class ManagerDependencies private constructor(
             val catalog = RoomManagerCatalog(database.catalogEntryDao())
             val installedWrappers = PackageManagerInstalledWrapperRepository(application.packageManager)
             val pendingStore = SharedPreferencesPendingInstallStore(application)
+            val systemInstallStore = SharedPreferencesSystemInstallHandoffStore(application)
             val installGateway = AndroidPackageInstallGateway(application)
+            val systemInstallGateway = AndroidSystemInstallerGateway(application)
             val verifier = AndroidWrapperVerifier(
                 AndroidArchiveInspector(application.packageManager),
                 File(application.cacheDir, "wrapper-verifier"),
@@ -97,9 +102,17 @@ class ManagerDependencies private constructor(
                 verifier = verifier,
                 cacheDirectory = application.cacheDir,
             )
-            val retainedImports = RetainedImportStore(
-                File(application.cacheDir, "imports"),
-                verifier,
+            val importRoot = File(application.cacheDir, "imports")
+            val retainedImports = RetainedImportStore(importRoot, verifier)
+            val systemInstallCoordinator = SystemInstallCoordinator(
+                policy = InstallPolicy(),
+                gateway = systemInstallGateway,
+                handoffStore = systemInstallStore,
+                installedWrappers = installedWrappers,
+                pendingStore = pendingStore,
+                retainedWrapperFile = { token ->
+                    File(importRoot, token).resolve("wrapper.apk")
+                },
             )
             val identityLedger = ConversionIdentityLedger(database.conversionIdentityDao())
             val packager = OnDeviceWrapperPackager(application)
@@ -169,12 +182,14 @@ class ManagerDependencies private constructor(
                 importer = importer,
                 retainedImports = retainedImports,
                 startupCleanup = StartupCleanup(
-                    importRoot = File(application.cacheDir, "imports"),
+                    importRoot = importRoot,
                     installGateway = installGateway,
                     pendingStore = pendingStore,
                     clock = Clock.systemUTC(),
+                    systemInstallHandoffStore = systemInstallStore,
                 ),
                 installCoordinator = installCoordinator,
+                systemInstallCoordinator = systemInstallCoordinator,
                 pendingStore = pendingStore,
                 uninstallCoordinator = uninstall,
                 samsungBrowserNavigator =

@@ -5,6 +5,7 @@ import dev.sixbridge.manager.install.PendingCleanupResult
 import dev.sixbridge.manager.install.PendingInstall
 import dev.sixbridge.manager.install.PendingInstallStore
 import dev.sixbridge.manager.install.RecoveryRecordSnapshot
+import dev.sixbridge.manager.install.SystemInstallHandoffStore
 import java.io.File
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
@@ -23,6 +24,7 @@ class StartupCleanup(
     private val installGateway: PackageInstallGateway,
     private val pendingStore: PendingInstallStore,
     private val clock: Clock,
+    private val systemInstallHandoffStore: SystemInstallHandoffStore? = null,
 ) {
     suspend fun run() {
         val context = currentCoroutineContext()
@@ -50,10 +52,20 @@ class StartupCleanup(
             RecoveryRecordSnapshot.Absent -> null
             RecoveryRecordSnapshot.Invalid -> return
         }
+        context.ensureActive()
+        val systemInstallHandoff = when (
+            val snapshot = systemInstallHandoffStore?.snapshot()
+                ?: RecoveryRecordSnapshot.Absent
+        ) {
+            is RecoveryRecordSnapshot.Present -> snapshot.value
+            RecoveryRecordSnapshot.Absent -> null
+            RecoveryRecordSnapshot.Invalid -> return
+        }
         val durableProtectedTokens = setOfNotNull(
             terminal?.importToken,
             finalReceipt?.importToken,
             normalHandoff?.importToken,
+            systemInstallHandoff?.importToken,
         )
         val terminalAvailable = terminal?.importToken != null || finalReceipt != null
         context.ensureActive()
