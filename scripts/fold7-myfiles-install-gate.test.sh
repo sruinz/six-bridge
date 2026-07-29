@@ -505,6 +505,30 @@ test_saved_marker_evidence_is_fail_closed() {
     expect_exit_3 \
         '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
         marker-epoch-mismatch run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s\ntrailing-record-without-newline' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-extra-record run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s\r\n' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-crlf run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s\0\n' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-nul run_post ADB_LOG_MARKER=missing
+
+    printf '%s 1 1 I SixBridgeMyFilesGate: %s' \
+        "$epoch" "$nonce" >"$marker"
+    expect_exit_3 \
+        '저장된 pre log marker evidence가 baseline과 일치하지 않습니다.' \
+        marker-missing-final-lf run_post ADB_LOG_MARKER=missing
 }
 
 test_fresh_target_with_target_bound_logs_succeeds() {

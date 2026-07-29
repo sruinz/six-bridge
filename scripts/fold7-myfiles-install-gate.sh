@@ -730,7 +730,7 @@ EOF
 
 capture_samsung_logs() {
     local marker_epoch nonce package_name extension_id marker_file
-    local expected_nonce marker_lines
+    local expected_nonce marker_lines marker_last_byte
     marker_epoch=$(baseline_value preLogEpoch)
     nonce=$(baseline_value preLogNonce)
     package_name=$(baseline_value package)
@@ -744,9 +744,14 @@ capture_samsung_logs() {
     [ -f "$marker_file" ] && [ ! -L "$marker_file" ] ||
         fail "저장된 pre log marker evidence를 찾지 못했습니다."
     marker_lines=$(wc -l <"$marker_file" | tr -d '[:space:]')
+    marker_last_byte=$(tail -c 1 "$marker_file" | od -An -t x1 |
+        tr -d '[:space:]')
     [ "$marker_lines" = 1 ] &&
+        [ "$marker_last_byte" = 0a ] &&
+        ! rg -a -q '\r|\x00' "$marker_file" &&
         awk -v epoch="$marker_epoch" -v nonce="$nonce" '
-          NF == 6 &&
+          NR == 1 &&
+          $0 == epoch " " $2 " " $3 " I SixBridgeMyFilesGate: " nonce &&
           $1 == epoch &&
           $2 ~ /^[0-9]+$/ &&
           $3 ~ /^[0-9]+$/ &&
@@ -756,7 +761,7 @@ capture_samsung_logs() {
             valid=1
           }
           END {
-            exit(valid ? 0 : 1)
+            exit(NR == 1 && valid ? 0 : 1)
           }
         ' "$marker_file" ||
         fail "저장된 pre log marker evidence가 baseline과 일치하지 않습니다."
