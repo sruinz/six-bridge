@@ -3,6 +3,7 @@ package dev.sixbridge.core.conversion
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.file.DirectoryNotEmptyException
+import java.nio.file.FileSystem
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.NoSuchFileException
@@ -22,6 +23,7 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.DosFileAttributeView
 import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.EnumSet
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -85,7 +87,7 @@ internal object PendingTempCleanup {
         retryPending()
         val parentOwner = requireRegistered(parent)
         return createNested(parentOwner) {
-            Files.createTempDirectory(parentOwner.root, prefix)
+            createTempDirectory(parentOwner.root, prefix)
                 .toAbsolutePath()
                 .normalize()
         }
@@ -109,7 +111,7 @@ internal object PendingTempCleanup {
             requireCapacity(parent = null)
             val normalized = path.toAbsolutePath().normalize()
             val created = try {
-                Files.createDirectory(normalized)
+                createDirectory(normalized)
             } catch (_: Exception) {
                 throw OwnedTempCleanupException()
             }
@@ -206,8 +208,8 @@ internal object PendingTempCleanup {
         retryPending()
         val childName = singleName(name)
         return createNested(parentOwner) {
-            val created = parentOwner.root.resolve(childName.toString())
-            Files.createDirectory(created)
+            val created = parentOwner.root.resolve(childName)
+            createDirectory(created)
                 .toAbsolutePath()
                 .normalize()
         }
@@ -228,11 +230,11 @@ internal object PendingTempCleanup {
                     verifyLocation(parentOwner)
                     requireCapacity(parentOwner)
                     parentHandle = parentOwner.rootHandle.newDirectoryStream(
-                        Path.of("."),
+                        parentOwner.root.fileSystem.getPath("."),
                         NOFOLLOW_LINKS,
                     )
                     created = create()
-                    val name = singleName(created.fileName.toString())
+                    val name = singleName(created.fileName)
                     rootHandle = parentHandle.newDirectoryStream(
                         name,
                         NOFOLLOW_LINKS,
@@ -256,7 +258,7 @@ internal object PendingTempCleanup {
                         } else {
                             cleanupRegistrationFailure(
                                 root = created,
-                                name = singleName(created.fileName.toString()),
+                                name = singleName(created.fileName),
                                 capturedFileKey = cleanupFileKey,
                                 parentHandle = parentHandle,
                                 rootHandle = rootHandle,
@@ -286,7 +288,7 @@ internal object PendingTempCleanup {
         var rootHandle: SecureDirectoryStream<Path>? = null
         return try {
             rootHandle = stream.newDirectoryStream(
-                singleName(normalized.fileName.toString()),
+                singleName(normalized.fileName),
                 NOFOLLOW_LINKS,
             )
             sealCreated(
@@ -301,7 +303,7 @@ internal object PendingTempCleanup {
         } catch (_: Throwable) {
             cleanupRegistrationFailure(
                 root = normalized,
-                name = singleName(normalized.fileName.toString()),
+                name = singleName(normalized.fileName),
                 capturedFileKey = capturedFileKey,
                 parentHandle = stream,
                 rootHandle = rootHandle,
@@ -321,7 +323,7 @@ internal object PendingTempCleanup {
     ): OwnedTempDirectory {
         val normalizedRoot = created.toAbsolutePath().normalize()
         val normalizedParent = parentPath.toAbsolutePath().normalize()
-        val name = singleName(normalizedRoot.fileName.toString())
+        val name = singleName(normalizedRoot.fileName)
         check(normalizedRoot.parent == normalizedParent)
         val pathParent = Files.readAttributes(
             normalizedParent,
@@ -391,13 +393,43 @@ internal object PendingTempCleanup {
         return attributes.fileKey() ?: throw OwnedTempCleanupException()
     }
 
+    private fun createTempDirectory(parent: Path, prefix: String): Path =
+        if (supportsPosixPermissions(parent)) {
+            Files.createTempDirectory(
+                parent,
+                prefix,
+                PosixFilePermissions.asFileAttribute(OWNER_ONLY),
+            )
+        } else {
+            Files.createTempDirectory(parent, prefix)
+        }
+
+    private fun createDirectory(path: Path): Path =
+        if (supportsPosixPermissions(requireNotNull(path.parent))) {
+            Files.createDirectory(
+                path,
+                PosixFilePermissions.asFileAttribute(OWNER_ONLY),
+            )
+        } else {
+            Files.createDirectory(path)
+        }
+
+    private fun supportsPosixPermissions(path: Path): Boolean =
+        Files.getFileAttributeView(
+            path,
+            PosixFileAttributeView::class.java,
+            NOFOLLOW_LINKS,
+        ) != null
+
     private fun verifyMarkerToken(
         root: Path,
         rootHandle: SecureDirectoryStream<Path>,
         token: UUID,
         expectedFileKey: Any,
     ) {
-        val marker = singleName(".sixbridge-owner-probe-$token")
+        val marker = singleName(
+            root.fileSystem.getPath(".sixbridge-owner-probe-$token"),
+        )
         val bytes = token.toString().toByteArray(Charsets.UTF_8)
         rootHandle.newByteChannel(
             marker,
@@ -446,7 +478,7 @@ internal object PendingTempCleanup {
                     NOFOLLOW_LINKS,
                 ).use { reopened ->
                     val reopenedKey = readAttributes(reopened).fileKey()
-                    deleteContents(reopened)
+                    deleteContents(reopened, root.fileSystem)
                     val attributes = readAttributesOrNull(parentHandle, name)
                     if (
                         reopenedKey != null &&
@@ -469,7 +501,7 @@ internal object PendingTempCleanup {
         runCatching {
             val retainedFileKey =
                 readAttributes(rootHandle).fileKey() ?: capturedFileKey
-            deleteContents(rootHandle)
+            deleteContents(rootHandle, root.fileSystem)
             val attributes = readAttributesOrNull(parentHandle, name)
             if (
                 retainedFileKey != null &&
@@ -582,7 +614,7 @@ internal object PendingTempCleanup {
     private fun deleteRoot(owner: Owner) {
         repeat(MAX_DELETE_PASSES) {
             normalizeOwnerAccess(owner.rootHandle)
-            deleteContents(owner.rootHandle)
+            deleteContents(owner.rootHandle, owner.root.fileSystem)
             verifyParent(owner)
             check(ownersByToken[owner.token] === owner)
             check(owners[owner.root] === owner)
@@ -744,7 +776,7 @@ internal object PendingTempCleanup {
     }
 
     private fun locateOwnerName(owner: Owner): Path? =
-        listNames(owner.parentHandle)
+        listNames(owner.parentHandle, owner.parentPath.fileSystem)
             .firstOrNull { name ->
                 readAttributesOrNull(owner.parentHandle, name)
                     ?.fileKey() == owner.rootFileKey
@@ -759,25 +791,32 @@ internal object PendingTempCleanup {
         owners[next] = owner
     }
 
-    private fun deleteContents(directory: SecureDirectoryStream<Path>) {
+    private fun deleteContents(
+        directory: SecureDirectoryStream<Path>,
+        fileSystem: FileSystem,
+    ) {
         repeat(MAX_DELETE_PASSES) {
-            val names = listNames(directory)
+            val names = listNames(directory, fileSystem)
             if (names.isEmpty()) return
-            names.forEach { name -> deleteEntry(directory, name) }
+            names.forEach { name -> deleteEntry(directory, name, fileSystem) }
         }
         throw IOException("bounded anchored cleanup failed")
     }
 
     private fun listNames(
         directory: SecureDirectoryStream<Path>,
-    ): List<Path> =
-        directory.newDirectoryStream(Path.of("."), NOFOLLOW_LINKS).use { scan ->
-            scan.toList().map { singleName(it.fileName.toString()) }
-        }
+        fileSystem: FileSystem,
+    ): List<Path> = directory.newDirectoryStream(
+        fileSystem.getPath("."),
+        NOFOLLOW_LINKS,
+    ).use { scan ->
+        scan.toList().map { singleName(it.fileName) }
+    }
 
     private fun deleteEntry(
         parent: SecureDirectoryStream<Path>,
         name: Path,
+        fileSystem: FileSystem,
     ) {
         repeat(MAX_DELETE_PASSES) {
             val attributes = readAttributesOrNull(parent, name) ?: return
@@ -785,7 +824,7 @@ internal object PendingTempCleanup {
                 normalizeOwnerAccess(parent, name, directory = true)
                 try {
                     parent.newDirectoryStream(name, NOFOLLOW_LINKS).use { child ->
-                        deleteContents(child)
+                        deleteContents(child, fileSystem)
                     }
                 } catch (_: NoSuchFileException) {
                     return
@@ -925,8 +964,19 @@ internal object PendingTempCleanup {
         }
     }
 
-    private fun singleName(value: String): Path =
-        Path.of(value).also { name ->
+    private fun singleName(value: String): String =
+        value.also { name ->
+            val path = Path.of(name)
+            require(
+                path.nameCount == 1 &&
+                    name != "." &&
+                    name != ".." &&
+                    !path.isAbsolute,
+            )
+        }
+
+    private fun singleName(path: Path): Path =
+        path.also { name ->
             require(
                 name.nameCount == 1 &&
                     name.toString() != "." &&
@@ -939,6 +989,11 @@ internal object PendingTempCleanup {
         CREATE_NEW,
         WRITE,
         NOFOLLOW_LINKS,
+    )
+    private val OWNER_ONLY = setOf(
+        PosixFilePermission.OWNER_READ,
+        PosixFilePermission.OWNER_WRITE,
+        PosixFilePermission.OWNER_EXECUTE,
     )
     private const val MAX_DELETE_PASSES = 8
     private const val MAX_CLOSE_PASSES = 3

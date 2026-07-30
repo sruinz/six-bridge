@@ -3,6 +3,7 @@ package dev.sixbridge.core.compat
 import dev.sixbridge.core.conversion.OwnedTempDirectory
 import dev.sixbridge.core.conversion.OwnedTempCleanupException
 import dev.sixbridge.core.conversion.OwnedTempTree
+import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.input.ExtensionZip
 import java.nio.file.Path
 import java.security.MessageDigest
@@ -43,10 +44,11 @@ internal class StableExtensionAnalysis private constructor(
         fun captureLive(
             source: Path,
             control: AnalysisControl = AnalysisControl(),
+            tempTreeFactory: ConversionTempTreeFactory = ConversionTempTreeFactory(),
         ): StableExtensionAnalysis {
             control.checkCancelled()
             val sourceRoot = source.toAbsolutePath().normalize()
-            val temporary = OwnedTempTree.create(
+            val temporary = tempTreeFactory.create(
                 "sixbridge-analysis-",
             )
             return try {
@@ -86,9 +88,10 @@ internal class StableExtensionAnalysis private constructor(
         fun fromArchive(
             bytes: ByteArray,
             control: AnalysisControl = AnalysisControl(),
+            tempTreeFactory: ConversionTempTreeFactory = ConversionTempTreeFactory(),
         ): StableExtensionAnalysis {
             control.checkCancelled()
-            val temporary = OwnedTempTree.create(
+            val temporary = tempTreeFactory.create(
                 "sixbridge-analysis-",
             )
             return try {

@@ -57,8 +57,15 @@ private class WorkspaceVerifiedAdapterApplication(
         decisions.map { it.copy() }
 }
 
-class ConversionWorkspace : AutoCloseable {
-    private val rootOwner = OwnedTempTree.create("sixbridge-conversion-")
+class ConversionWorkspace private constructor(
+    private val tempTreeFactory: ConversionTempTreeFactory,
+    @Suppress("UNUSED_PARAMETER") private val internalConstructorMarker: Unit,
+) : AutoCloseable {
+    constructor() : this(ConversionTempTreeFactory(), Unit)
+
+    internal constructor(tempTreeFactory: ConversionTempTreeFactory) : this(tempTreeFactory, Unit)
+
+    private val rootOwner = tempTreeFactory.create("sixbridge-conversion-")
     private val root = rootOwner.rootPath
     private val ownedWorkingRoots = mutableListOf<Path>()
     private val ownedSnapshots = IdentityHashMap<ExtensionSnapshot, Unit>()
@@ -69,7 +76,7 @@ class ConversionWorkspace : AutoCloseable {
     @Synchronized
     @JvmSynthetic
     internal fun snapshot(sourceZip: ByteArray): ExtensionSnapshot {
-        val portableOwner = OwnedTempTree.create("sixbridge-portable-input-")
+        val portableOwner = tempTreeFactory.create("sixbridge-portable-input-")
         return try {
             val source = ExtensionZip.extractInto(
                 sourceZip,

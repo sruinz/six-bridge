@@ -24,6 +24,7 @@ data class ResolvedExtensionInput(
     val crxBytes: ByteArray? = null,
     val expectedExtensionId: String? = null,
     val projectIdentity: String? = null,
+    val archivePath: Path? = null,
 )
 
 class UnsupportedInputException(message: String) : IllegalArgumentException(message)
@@ -71,6 +72,7 @@ class ExtensionInputResolver private constructor(
                     kind = ExtensionInputKind.ZIP,
                     originalInput = input,
                     sourceRoot = root,
+                    archivePath = path,
                 )
             }
             path.isRegularFile() && path.extension.equals("crx", ignoreCase = true) -> {
@@ -85,6 +87,7 @@ class ExtensionInputResolver private constructor(
                     ),
                     crxBytes = bytes,
                     expectedExtensionId = parsed.extensionId,
+                    archivePath = path,
                 )
             }
             else -> throw UnsupportedInputException("지원하지 않는 입력입니다: $input")

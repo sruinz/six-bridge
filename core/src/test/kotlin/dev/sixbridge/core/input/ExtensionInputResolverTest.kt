@@ -1,5 +1,7 @@
 package dev.sixbridge.core.input
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import dev.sixbridge.core.crx.Crx3
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.nio.file.Files
@@ -17,6 +19,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class ExtensionInputResolverTest {
@@ -204,17 +207,51 @@ class ExtensionInputResolverTest {
         val crxBytes = Crx3.pack(source, keyPair).bytes
         val crx = source.parent.resolve("input.crx")
         crx.writeBytes(crxBytes)
-        val resolver = ExtensionInputResolver()
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val resolver = ExtensionInputResolver(
+                extractionRootFactory = secureExtractionRootFactory(fileSystem),
+            )
 
-        val directoryInput = resolver.resolve(source.toString())
-        val zipInput = resolver.resolve(zip.toString())
-        val crxInput = resolver.resolve(crx.toString())
+            val directoryInput = resolver.resolve(source.toString())
+            val zipInput = resolver.resolve(zip.toString())
+            val crxInput = resolver.resolve(crx.toString())
 
-        assertEquals(ExtensionInputKind.SOURCE_DIRECTORY, directoryInput.kind)
-        assertEquals(ExtensionInputKind.ZIP, zipInput.kind)
-        assertTrue(zipInput.sourceRoot?.resolve("manifest.json")?.toFile()?.isFile == true)
-        assertEquals(ExtensionInputKind.CRX3, crxInput.kind)
-        assertContentEquals(crxBytes, crxInput.crxBytes)
+            assertEquals(ExtensionInputKind.SOURCE_DIRECTORY, directoryInput.kind)
+            assertEquals(ExtensionInputKind.ZIP, zipInput.kind)
+            assertTrue(Files.isRegularFile(requireNotNull(zipInput.sourceRoot).resolve("manifest.json")))
+            assertEquals(ExtensionInputKind.CRX3, crxInput.kind)
+            assertContentEquals(crxBytes, crxInput.crxBytes)
+        }
+    }
+
+    @Test
+    fun `ZIP과 CRX 입력은 원본 archive path provider를 보존한다`() {
+        val source = Files.createTempDirectory("six-input-archive-provider-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Archive provider","version":"1"}""",
+        )
+        val zip = source.parent.resolve("archive-provider.zip")
+        ExtensionZip.create(source, zip)
+        val crx = source.parent.resolve("archive-provider.crx")
+        crx.writeBytes(
+            Crx3.pack(
+                source,
+                KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair(),
+            ).bytes,
+        )
+
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val resolver = ExtensionInputResolver(
+                extractionRootFactory = secureExtractionRootFactory(fileSystem),
+            )
+            val zipInput = resolver.resolve(zip.toString())
+            val crxInput = resolver.resolve(crx.toString())
+
+            assertEquals(zip.toAbsolutePath().normalize(), zipInput.archivePath)
+            assertEquals(crx.toAbsolutePath().normalize(), crxInput.archivePath)
+            assertSame(zip.fileSystem.provider(), zipInput.archivePath?.fileSystem?.provider())
+            assertSame(crx.fileSystem.provider(), crxInput.archivePath?.fileSystem?.provider())
+        }
     }
 
     @Test
@@ -229,45 +266,50 @@ class ExtensionInputResolverTest {
                 .apply { initialize(2048) }
                 .generateKeyPair(),
         )
-        val resolver = ExtensionInputResolver(
-            ChromeCrxDownloader { address ->
-                packed.bytes.also {
-                    assertEquals(packed.extensionId, address.extensionId)
-                }
-            },
-        )
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val extractionRootFactory = secureExtractionRootFactory(fileSystem)
+            val resolver = ExtensionInputResolver(
+                ChromeCrxDownloader { address ->
+                    packed.bytes.also {
+                        assertEquals(packed.extensionId, address.extensionId)
+                    }
+                },
+                extractionRootFactory,
+            )
 
-        val chrome = resolver.resolve(
-            "https://chromewebstore.google.com/detail/video-download-to-nas/" +
-                "${packed.extensionId}?hl=ko",
-        )
-
-        assertEquals(ExtensionInputKind.CHROME_WEB_STORE, chrome.kind)
-        assertEquals(packed.extensionId, chrome.expectedExtensionId)
-        assertContentEquals(packed.bytes, chrome.crxBytes)
-
-        val mismatch = ExtensionInputResolver(
-            ChromeCrxDownloader {
-                val otherSource = Files.createTempDirectory("six-input-other-store")
-                otherSource.resolve("manifest.json").writeText(
-                    """{"manifest_version":3,"name":"Other","version":"1"}""",
-                )
-                Crx3.pack(
-                    otherSource,
-                    KeyPairGenerator.getInstance("RSA")
-                        .apply { initialize(2048) }
-                        .generateKeyPair(),
-                ).bytes
-            },
-        )
-        assertFailsWith<UnsupportedInputException> {
-            mismatch.resolve(
+            val chrome = resolver.resolve(
                 "https://chromewebstore.google.com/detail/video-download-to-nas/" +
                     "${packed.extensionId}?hl=ko",
             )
-        }
-        assertFailsWith<UnsupportedInputException> {
-            resolver.resolve("https://microsoftedge.microsoft.com/addons/detail/example/abcdefghijkl")
+
+            assertEquals(ExtensionInputKind.CHROME_WEB_STORE, chrome.kind)
+            assertEquals(packed.extensionId, chrome.expectedExtensionId)
+            assertContentEquals(packed.bytes, chrome.crxBytes)
+
+            val mismatch = ExtensionInputResolver(
+                ChromeCrxDownloader {
+                    val otherSource = Files.createTempDirectory("six-input-other-store")
+                    otherSource.resolve("manifest.json").writeText(
+                        """{"manifest_version":3,"name":"Other","version":"1"}""",
+                    )
+                    Crx3.pack(
+                        otherSource,
+                        KeyPairGenerator.getInstance("RSA")
+                            .apply { initialize(2048) }
+                            .generateKeyPair(),
+                    ).bytes
+                },
+                extractionRootFactory,
+            )
+            assertFailsWith<UnsupportedInputException> {
+                mismatch.resolve(
+                    "https://chromewebstore.google.com/detail/video-download-to-nas/" +
+                        "${packed.extensionId}?hl=ko",
+                )
+            }
+            assertFailsWith<UnsupportedInputException> {
+                resolver.resolve("https://microsoftedge.microsoft.com/addons/detail/example/abcdefghijkl")
+            }
         }
     }
 
@@ -287,14 +329,18 @@ class ExtensionInputResolverTest {
         )
         val crx = source.parent.resolve("local-only.crx")
         crx.writeBytes(packed.bytes)
-        val resolver = ExtensionInputResolver()
-
-        assertEquals(ExtensionInputKind.ZIP, resolver.resolve(zip.toString()).kind)
-        assertEquals(ExtensionInputKind.CRX3, resolver.resolve(crx.toString()).kind)
-        assertFailsWith<UnsupportedInputException> {
-            resolver.resolve(
-                "https://chromewebstore.google.com/detail/name/${packed.extensionId}",
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val resolver = ExtensionInputResolver(
+                extractionRootFactory = secureExtractionRootFactory(fileSystem),
             )
+
+            assertEquals(ExtensionInputKind.ZIP, resolver.resolve(zip.toString()).kind)
+            assertEquals(ExtensionInputKind.CRX3, resolver.resolve(crx.toString()).kind)
+            assertFailsWith<UnsupportedInputException> {
+                resolver.resolve(
+                    "https://chromewebstore.google.com/detail/name/${packed.extensionId}",
+                )
+            }
         }
     }
 
@@ -335,5 +381,14 @@ class ExtensionInputResolverTest {
     private fun fileKey(path: java.nio.file.Path): Any = requireNotNull(
         Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS).fileKey(),
     )
+
+    private fun secureExtractionRootFactory(
+        fileSystem: java.nio.file.FileSystem,
+    ): () -> java.nio.file.Path {
+        var index = 0
+        return {
+            Files.createDirectory(fileSystem.getPath("/extract-${index++}"))
+        }
+    }
 
 }

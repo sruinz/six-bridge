@@ -29,16 +29,43 @@ internal data class MobileArchiveAnalysis(
     val sourceProjectIdentity: String?,
 )
 
-class MobilePatternAnalyzer(
-    private val control: AnalysisControl = AnalysisControl(),
-    private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(control),
-    private val json: Json = Json { ignoreUnknownKeys = true },
+class MobilePatternAnalyzer private constructor(
+    private val control: AnalysisControl,
+    private val compatibilityAnalyzer: CompatibilityAnalyzer,
+    private val json: Json,
+    private val tempTreeFactory: ConversionTempTreeFactory,
+    @Suppress("UNUSED_PARAMETER") private val internalConstructorMarker: Unit,
 ) {
+    constructor(
+        control: AnalysisControl = AnalysisControl(),
+        compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(control),
+        json: Json = Json { ignoreUnknownKeys = true },
+    ) : this(
+        control,
+        compatibilityAnalyzer,
+        json,
+        ConversionTempTreeFactory(),
+        Unit,
+    )
+
+    internal constructor(
+        control: AnalysisControl,
+        compatibilityAnalyzer: CompatibilityAnalyzer,
+        json: Json = Json { ignoreUnknownKeys = true },
+        tempTreeFactory: ConversionTempTreeFactory,
+    ) : this(
+        control,
+        compatibilityAnalyzer,
+        json,
+        tempTreeFactory,
+        Unit,
+    )
+
     fun analyze(
         extensionRoot: Path,
         profile: BrowserProfile,
     ): CompatibilityReport {
-        return StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
+        return StableExtensionAnalysis.captureLive(extensionRoot, control, tempTreeFactory).use { stable ->
             val report = analyzeStable(
                 stable.root,
                 profile,
@@ -60,7 +87,7 @@ class MobilePatternAnalyzer(
         sourceArchive: ByteArray,
         profile: BrowserProfile,
     ): MobileArchiveAnalysis {
-        return StableExtensionAnalysis.fromArchive(sourceArchive, control).use { stable ->
+        return StableExtensionAnalysis.fromArchive(sourceArchive, control, tempTreeFactory).use { stable ->
             val report = analyzeStable(stable.root, profile, stable.sourceSha256)
             control.checkCancelled()
             MobileArchiveAnalysis(

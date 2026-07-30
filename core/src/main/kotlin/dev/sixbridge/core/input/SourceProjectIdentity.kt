@@ -174,7 +174,11 @@ class SourceProjectIdentityStore(
     }
 
     private fun canonicalInputPath(resolved: ResolvedExtensionInput): String =
-        Path.of(resolved.originalInput).toAbsolutePath().normalize().toRealPath().toString()
+        (resolved.archivePath ?: Path.of(resolved.originalInput))
+            .toAbsolutePath()
+            .normalize()
+            .toRealPath()
+            .toString()
 
     private fun contentFingerprint(source: Path): String =
         sha256(ExtensionZip.createBytes(source))

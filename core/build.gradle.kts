@@ -16,6 +16,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
     testImplementation(kotlin("test"))
+    testImplementation("com.google.jimfs:jimfs:1.3.1")
 }
 
 tasks.test {

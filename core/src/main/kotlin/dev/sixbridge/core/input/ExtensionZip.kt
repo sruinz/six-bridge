@@ -904,8 +904,8 @@ object ExtensionZip {
             val name = entry.fileName.toString()
             val relative = if (prefix.isEmpty()) name else "$prefix/$name"
             val attributes = requireNotNull(
-                directory.getFileAttributeView(
-                    Path.of(name),
+                    directory.getFileAttributeView(
+                    entry.fileName,
                     BasicFileAttributeView::class.java,
                     LinkOption.NOFOLLOW_LINKS,
                 ),
@@ -916,7 +916,7 @@ object ExtensionZip {
             entries[relative] = attributes.isDirectory
             if (attributes.isDirectory) {
                 directory.newDirectoryStream(
-                    Path.of(name),
+                    entry.fileName,
                     LinkOption.NOFOLLOW_LINKS,
                 ).use { child ->
                     entries.putAll(secureInventory(child, control, relative))
@@ -958,12 +958,12 @@ object ExtensionZip {
         control: AnalysisControl,
     ): Long = if (components.size == 1) {
         directory.newByteChannel(
-            Path.of(components.single()),
+            output.fileSystem.getPath(components.single()),
             FILE_CREATE_OPTIONS,
         ).use { channel -> copyLimited(input, channel, output, control) }
     } else {
         directory.newDirectoryStream(
-            Path.of(components.first()),
+            output.fileSystem.getPath(components.first()),
             LinkOption.NOFOLLOW_LINKS,
         ).use { child ->
             copyLimited(input, child, components.drop(1), output, control)

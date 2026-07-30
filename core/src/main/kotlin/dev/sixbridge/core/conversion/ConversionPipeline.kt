@@ -50,8 +50,12 @@ internal interface ConversionPipelineMaterialization : AutoCloseable {
 
 private class DefaultConversionPipelineEngine(
     compatibilityAnalyzer: CompatibilityAnalyzer,
+    tempTreeFactory: ConversionTempTreeFactory,
 ) : ConversionPipelineEngine {
-    private val delegate = ConversionPreparationEngine.create(compatibilityAnalyzer)
+    private val delegate = ConversionPreparationEngine.create(
+        compatibilityAnalyzer,
+        tempTreeFactory,
+    )
 
     override fun analyzeWithIdentity(
         input: PortableExtensionInput,
@@ -80,9 +84,11 @@ private class DefaultConversionPipelineEngine(
     override fun close() = delegate.close()
 }
 
-private class DefaultConversionPipelineMaterialization :
+private class DefaultConversionPipelineMaterialization(
+    tempTreeFactory: ConversionTempTreeFactory,
+) :
     ConversionPipelineMaterialization {
-    private val delegate = ConversionWorkspace()
+    private val delegate = ConversionWorkspace(tempTreeFactory)
 
     override fun snapshot(sourceZip: ByteArray): ExtensionSnapshot =
         delegate.snapshot(sourceZip)
@@ -94,18 +100,21 @@ class ConversionPipeline private constructor(
     localRoot: Path,
     private val engineHolder: Lazy<ConversionPipelineEngine>,
     private val materializationHolder: Lazy<ConversionPipelineMaterialization>,
+    private val tempTreeFactory: ConversionTempTreeFactory,
 ) : AutoCloseable {
     private constructor(
         localRoot: Path,
         compatibilityAnalyzer: CompatibilityAnalyzer,
+        tempTreeFactory: ConversionTempTreeFactory,
     ) : this(
         localRoot,
         lazy(LazyThreadSafetyMode.NONE) {
-            DefaultConversionPipelineEngine(compatibilityAnalyzer)
+            DefaultConversionPipelineEngine(compatibilityAnalyzer, tempTreeFactory)
         },
         lazy(LazyThreadSafetyMode.NONE) {
-            DefaultConversionPipelineMaterialization()
+            DefaultConversionPipelineMaterialization(tempTreeFactory)
         },
+        tempTreeFactory,
     )
 
     private val engine: ConversionPipelineEngine
@@ -114,7 +123,11 @@ class ConversionPipeline private constructor(
         get() = materializationHolder.value
     private val packaging = CrxIdentityPolicy.create(localRoot)
 
-    constructor(localRoot: Path) : this(localRoot, CompatibilityAnalyzer())
+    constructor(localRoot: Path) : this(
+        localRoot,
+        CompatibilityAnalyzer(),
+        ConversionTempTreeFactory(),
+    )
 
     fun analyze(
         resolved: ResolvedExtensionInput,
@@ -292,7 +305,10 @@ class ConversionPipeline private constructor(
         }
         val publicKey = parsed.publicKey
         val canonical = try {
-            StableExtensionAnalysis.fromArchive(parsed.zipBytes).use { stable ->
+            StableExtensionAnalysis.fromArchive(
+                parsed.zipBytes,
+                tempTreeFactory = tempTreeFactory,
+            ).use { stable ->
                 ExtensionZip.createCanonicalManifestBytes(
                     stable.root,
                     publicKey,
@@ -329,9 +345,11 @@ class ConversionPipeline private constructor(
         internal fun create(
             localRoot: Path,
             compatibilityAnalyzer: CompatibilityAnalyzer,
+            tempTreeFactory: ConversionTempTreeFactory = ConversionTempTreeFactory(),
         ): ConversionPipeline = ConversionPipeline(
             localRoot,
             compatibilityAnalyzer,
+            tempTreeFactory,
         )
 
         @JvmSynthetic
@@ -340,10 +358,11 @@ class ConversionPipeline private constructor(
             engine: ConversionPipelineEngine,
             materialization: ConversionPipelineMaterialization? = null,
         ): ConversionPipeline {
+            val tempTreeFactory = ConversionTempTreeFactory()
             val materializationHolder: Lazy<ConversionPipelineMaterialization> =
                 if (materialization == null) {
                     lazy(LazyThreadSafetyMode.NONE) {
-                        DefaultConversionPipelineMaterialization()
+                        DefaultConversionPipelineMaterialization(tempTreeFactory)
                     }
                 } else {
                     lazyOf(materialization)
@@ -352,6 +371,7 @@ class ConversionPipeline private constructor(
                 localRoot,
                 lazyOf(engine),
                 materializationHolder,
+                tempTreeFactory,
             )
         }
     }
@@ -630,7 +650,10 @@ internal class CrxIdentityPolicy private constructor(
                 ExtensionInputKind.SOURCE_DIRECTORY ->
                     source.toAbsolutePath().normalize().toString()
                 ExtensionInputKind.ZIP ->
-                    Path.of(resolved.originalInput).toAbsolutePath().normalize().toString()
+                    (resolved.archivePath ?: Path.of(resolved.originalInput))
+                        .toAbsolutePath()
+                        .normalize()
+                        .toString()
                 else -> resolved.originalInput
             }
             val legacyIdentity = "source-${sha256(legacyInput.toByteArray()).take(24)}"

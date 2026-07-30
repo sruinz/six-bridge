@@ -57,12 +57,17 @@ data class AnalyzedConversion(
 
 class ConversionPreparationEngine private constructor(
     private val compatibilityAnalyzer: CompatibilityAnalyzer,
+    private val tempTreeFactory: ConversionTempTreeFactory,
 ) : AutoCloseable {
-    private val workspace = ConversionWorkspace()
-    private val analyzer = MobilePatternAnalyzer(compatibilityAnalyzer = compatibilityAnalyzer)
+    private val workspace = ConversionWorkspace(tempTreeFactory)
+    private val analyzer = MobilePatternAnalyzer(
+        control = AnalysisControl(),
+        compatibilityAnalyzer = compatibilityAnalyzer,
+        tempTreeFactory = tempTreeFactory,
+    )
     private val planner = ConversionPlanner()
 
-    constructor() : this(CompatibilityAnalyzer())
+    constructor() : this(CompatibilityAnalyzer(), ConversionTempTreeFactory())
 
     fun analyze(
         input: PortableExtensionInput,
@@ -77,6 +82,7 @@ class ConversionPreparationEngine private constructor(
         val analyzed = MobilePatternAnalyzer(
             control = control,
             compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
+            tempTreeFactory = tempTreeFactory,
         )
             .analyzeArchiveWithIdentity(input.canonicalOriginalZip, profile)
         requireCrxManifestBinding(input, analyzed.report)
@@ -100,6 +106,7 @@ class ConversionPreparationEngine private constructor(
         val controlledAnalyzer = MobilePatternAnalyzer(
             control = control,
             compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
+            tempTreeFactory = tempTreeFactory,
         )
         val approvals = approvedAdapterIds.toSet()
         val snapshot = workspace.snapshot(input.canonicalOriginalZip)
@@ -461,7 +468,8 @@ class ConversionPreparationEngine private constructor(
         @JvmSynthetic
         internal fun create(
             compatibilityAnalyzer: CompatibilityAnalyzer,
+            tempTreeFactory: ConversionTempTreeFactory = ConversionTempTreeFactory(),
         ): ConversionPreparationEngine =
-            ConversionPreparationEngine(compatibilityAnalyzer)
+            ConversionPreparationEngine(compatibilityAnalyzer, tempTreeFactory)
     }
 }
