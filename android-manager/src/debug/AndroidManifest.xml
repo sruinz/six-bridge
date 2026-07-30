@@ -8,8 +8,9 @@
             android:name="androidx.activity.ComponentActivity"
             android:exported="false"
             android:showWhenLocked="true"
+            android:theme="@style/Theme.SixBridgeAdbTestDark"
             android:turnScreenOn="true"
-            tools:replace="android:exported" />
+            tools:replace="android:exported,android:theme" />
     </application>
 
 </manifest>
