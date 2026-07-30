@@ -14,6 +14,7 @@ dependencies {
     implementation(project(":bundle-contract"))
     implementation(compose.desktop.currentOs)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     testImplementation(kotlin("test"))
     testImplementation(compose.desktop.uiTestJUnit4)
 }
@@ -24,4 +25,10 @@ application {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.processResources {
+    from(rootProject.layout.projectDirectory.dir("profiles")) {
+        into("profiles/builtin")
+    }
 }
