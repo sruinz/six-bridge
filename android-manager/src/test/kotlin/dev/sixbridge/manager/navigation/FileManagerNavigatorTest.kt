@@ -49,7 +49,7 @@ class FileManagerNavigatorTest {
                         enabled = false,
                         managesDocuments = true,
                     ),
-                    handler("third.party", "Files", managesDocuments = false),
+                    handler("a.third.party", "Files", managesDocuments = false),
                     handler("system.documents", "Files", managesDocuments = true),
                 )
             },
