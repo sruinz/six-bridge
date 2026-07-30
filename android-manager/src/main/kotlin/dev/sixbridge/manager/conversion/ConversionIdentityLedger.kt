@@ -700,8 +700,10 @@ class ConversionIdentityLedger(
             "설치본 versionCode가 올바르지 않습니다."
         }
         when (request.identityKey.mode) {
-            InstallationIdentityMode.PASSTHROUGH -> require(binding.crxKeyAlias == null) {
-                "passthrough 신원에는 CRX key alias를 저장할 수 없습니다."
+            InstallationIdentityMode.PASSTHROUGH,
+            InstallationIdentityMode.PREPARED,
+            -> require(binding.crxKeyAlias == null) {
+                "외부 서명 CRX 신원에는 CRX key alias를 저장할 수 없습니다."
             }
             InstallationIdentityMode.CONVERTED -> require(
                 !binding.crxKeyAlias.isNullOrBlank() &&
@@ -710,9 +712,9 @@ class ConversionIdentityLedger(
                 "converted 신원에는 CRX key alias와 공개 키 proof가 필요합니다."
             }
         }
-        if (request.identityKey.mode == InstallationIdentityMode.PASSTHROUGH) {
+        if (request.identityKey.mode != InstallationIdentityMode.CONVERTED) {
             require(binding.crxPublicKeySha256 == null) {
-                "passthrough 신원에는 CRX 공개 키 proof를 저장할 수 없습니다."
+                "외부 서명 CRX 신원에는 CRX 공개 키 proof를 저장할 수 없습니다."
             }
         }
     }

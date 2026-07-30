@@ -35,6 +35,17 @@ class DraftMetadata private constructor(
             sourceIdentity = sourceIdentity,
         )
 
+        fun createV3(
+            coreVersion: String,
+            adapterVersions: Map<String, Int>,
+            sourceIdentity: String,
+        ): DraftMetadata = create(
+            schemaVersion = 3,
+            coreVersion = coreVersion,
+            adapterVersions = adapterVersions,
+            sourceIdentity = sourceIdentity,
+        )
+
         @JvmSynthetic
         internal fun decoded(
             schemaVersion: Int,
@@ -54,7 +65,7 @@ class DraftMetadata private constructor(
             adapterVersions: Map<String, Int>,
             sourceIdentity: String,
         ): DraftMetadata {
-            require(schemaVersion == 1 || schemaVersion == 2) {
+            require(schemaVersion in 1..3) {
                 "지원하지 않는 draft schemaVersion입니다."
             }
             require(coreVersion.isNotBlank()) { "coreVersion은 비어 있을 수 없습니다." }

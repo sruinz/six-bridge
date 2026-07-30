@@ -290,6 +290,17 @@ class OnDeviceInputServiceTest {
     }
 
     @Test
+    fun `SAF schema v3 prepared SixDraft를 strict reader로 판별한다`() = runTest {
+        val draft = validDraftV3()
+
+        val artifact = service(ByteArrayInputStream(draft))
+            .acquire(safRequest())
+
+        assertEquals(OnDeviceInputKind.SIX_DRAFT, artifact.kind)
+        assertNull(artifact.expectedExtensionId)
+    }
+
+    @Test
     fun `각 draft marker 하나만 가진 정상 extension은 ZIP으로 판별한다`() = runTest {
         val markers = listOf(
             "draft.json",
@@ -714,6 +725,53 @@ class OnDeviceInputServiceTest {
             plan = DraftConversionPlan.create(report, emptyList()),
             compatibilityBefore = report,
             compatibilityAfter = report,
+        )
+        val signingKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        return SixDraft.createBytes(payload, signingKey)
+    }
+
+    private fun validDraftV3(): ByteArray {
+        val crx = validCrx()
+        val proof = dev.sixbridge.contract.crx.Crx3Verifier.verify(crx.bytes)
+        val originalHash = "8".repeat(64)
+        val profileHash = "2".repeat(64)
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "Draft",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.PASSTHROUGH,
+            sourceSha256 = originalHash,
+            browserProfileSha256 = profileHash,
+        )
+        val after = before.copy(
+            convertedExtensionId = proof.extensionId,
+            sourceSha256 = proof.zipSha256,
+        )
+        val identity = "on-device-input-test-v3"
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV3(
+                coreVersion = "test",
+                adapterVersions = emptyMap(),
+                sourceIdentity = identity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = originalHash,
+                browserProfileSha256 = profileHash,
+                originalExtensionId = null,
+                originalExtensionVersion = "1",
+                sourceIdentity = identity,
+            ),
+            sourceKind = DraftSourceKind.PREPARED_CRX,
+            source = crx.bytes,
+            plan = DraftConversionPlan.create(before, emptyList()),
+            compatibilityBefore = before,
+            compatibilityAfter = after,
         )
         val signingKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         return SixDraft.createBytes(payload, signingKey)

@@ -2,6 +2,9 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisBudgetExceededException
+import dev.sixbridge.core.compat.AnalysisBudgetLedger
+import dev.sixbridge.core.compat.analysisBudgetExceededReport
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -76,10 +79,12 @@ class MobilePatternAnalyzer(
         sourceSha256: String?,
     ): CompatibilityReport {
         control.checkCancelled()
+        val ledger = AnalysisBudgetLedger(control.policy)
         val compatibility = compatibilityAnalyzer.analyzeStable(
             extensionRoot,
             profile,
             sourceSha256,
+            ledger,
         )
         control.checkCancelled()
         val manifestPath = extensionRoot.resolve("manifest.json")
@@ -102,7 +107,20 @@ class MobilePatternAnalyzer(
         }
         manifest ?: return compatibility
         control.checkCancelled()
-        val index = RuntimeResourceIndex.create(extensionRoot, manifest, control)
+        val index = try {
+            RuntimeResourceIndex.create(extensionRoot, manifest, control, ledger)
+        } catch (error: AnalysisBudgetExceededException) {
+            return analysisBudgetExceededReport(
+                error.exceeded,
+                compatibility.manifestVersion,
+                compatibility.extensionName,
+                compatibility.extensionVersion,
+                compatibility.declaredPermissions,
+            ).copy(
+                sourceSha256 = sourceSha256,
+                browserProfileSha256 = profile.canonicalSha256(),
+            ).also(CompatibilityReport::validate)
+        }
         control.checkCancelled()
         if (index.unresolvedDependency) {
             return compatibility

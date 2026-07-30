@@ -7,6 +7,7 @@ import java.util.UUID
 
 enum class InstallationIdentityMode {
     PASSTHROUGH,
+    PREPARED,
     CONVERTED,
 }
 

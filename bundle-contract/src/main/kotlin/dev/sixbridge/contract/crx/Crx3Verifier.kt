@@ -20,6 +20,7 @@ import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECParameterSpec
 import java.security.spec.X509EncodedKeySpec
+import java.util.concurrent.CancellationException
 
 data class VerifiedCrx3(
     val extensionId: String,
@@ -60,6 +61,23 @@ object Crx3Verifier {
     ): VerifiedCrx3 =
         verifyStablePath(path) { channel ->
             verifyPathRange(channel, offset, length, maximumBytes)
+        }
+
+    fun verify(
+        path: Path,
+        offset: Long,
+        length: Long,
+        maximumBytes: Long,
+        checkpoint: () -> Unit,
+    ): VerifiedCrx3 =
+        verifyStablePath(path) { channel ->
+            verifyPathRange(
+                channel,
+                offset,
+                length,
+                maximumBytes,
+                checkpoint = checkpoint,
+            )
         }
 
     fun verify(bytes: ByteArray, offset: Int, length: Int): VerifiedCrx3 {
@@ -121,7 +139,9 @@ object Crx3Verifier {
         length: Long,
         maximumBytes: Long,
         afterInitialVerification: () -> Unit = {},
+        checkpoint: () -> Unit = {},
     ): VerifiedCrx3 {
+        checkpoint()
         val channelSize = channel.size()
         if (maximumBytes < 0L ||
             offset < 0L ||
@@ -174,6 +194,7 @@ object Crx3Verifier {
             fields[2].orEmpty().forEach { add(readProof(ProofKind.RSA, it)) }
             fields[3].orEmpty().forEach { add(readProof(ProofKind.ECDSA, it)) }
         }.firstNotNullOfOrNull { (kind, proof) ->
+            checkpoint()
             verifyProof(
                 kind,
                 proof.publicKey,
@@ -183,6 +204,7 @@ object Crx3Verifier {
                 channel,
                 headerEnd,
                 zipLength,
+                checkpoint,
             )?.let { SelectedProof(kind, proof, it) }
         } ?: invalid("CRX3 서명을 검증할 수 없습니다.")
         afterInitialVerification()
@@ -200,7 +222,9 @@ object Crx3Verifier {
             channel = channel,
             zipOffset = headerEnd,
             zipLength = zipLength,
+            checkpoint = checkpoint,
         ) ?: invalid("CRX3 파일이 검증 중 변경되었습니다.")
+        checkpoint()
         if (channel.size() != channelSize) {
             invalid("CRX3 파일이 검증 중 변경되었습니다.")
         }
@@ -223,37 +247,45 @@ object Crx3Verifier {
         channel: FileChannel,
         zipOffset: Long,
         zipLength: Long,
-    ): BoundPathProof? = runCatching {
-        val actualCrxId = MessageDigest.getInstance("SHA-256")
-            .digest(selected.proof.publicKey)
-            .copyOfRange(0, 16)
-        if (!actualCrxId.contentEquals(expectedCrxId)) return null
-        val publicKey = readPublicKey(selected.kind, selected.proof.publicKey)
-        val signature = Signature.getInstance(selected.kind.signatureAlgorithm).apply {
-            initVerify(publicKey)
-            update(signedDataContext)
-            update(uint32(signedHeaderData.size))
-            update(signedHeaderData)
+        checkpoint: () -> Unit,
+    ): BoundPathProof? {
+        return try {
+            val actualCrxId = MessageDigest.getInstance("SHA-256")
+                .digest(selected.proof.publicKey)
+                .copyOfRange(0, 16)
+            if (!actualCrxId.contentEquals(expectedCrxId)) return null
+            val publicKey = readPublicKey(selected.kind, selected.proof.publicKey)
+            val signature = Signature.getInstance(selected.kind.signatureAlgorithm).apply {
+                initVerify(publicKey)
+                update(signedDataContext)
+                update(uint32(signedHeaderData.size))
+                update(signedHeaderData)
+            }
+            val crxDigest = MessageDigest.getInstance("SHA-256").apply {
+                update(prefix)
+                update(header)
+            }
+            val zipDigest = MessageDigest.getInstance("SHA-256")
+            updateRange(channel, zipOffset, zipLength) { buffer ->
+                checkpoint()
+                val bytes = buffer.array()
+                val count = buffer.remaining()
+                signature.update(bytes, 0, count)
+                crxDigest.update(bytes, 0, count)
+                zipDigest.update(bytes, 0, count)
+            }
+            if (!signature.verify(selected.proof.signature)) return null
+            BoundPathProof(
+                publicKey = selected.publicKey,
+                crxSha256 = crxDigest.digest().toHex(),
+                zipSha256 = zipDigest.digest().toHex(),
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
         }
-        val crxDigest = MessageDigest.getInstance("SHA-256").apply {
-            update(prefix)
-            update(header)
-        }
-        val zipDigest = MessageDigest.getInstance("SHA-256")
-        updateRange(channel, zipOffset, zipLength) { buffer ->
-            val bytes = buffer.array()
-            val count = buffer.remaining()
-            signature.update(bytes, 0, count)
-            crxDigest.update(bytes, 0, count)
-            zipDigest.update(bytes, 0, count)
-        }
-        if (!signature.verify(selected.proof.signature)) return null
-        BoundPathProof(
-            publicKey = selected.publicKey,
-            crxSha256 = crxDigest.digest().toHex(),
-            zipSha256 = zipDigest.digest().toHex(),
-        )
-    }.getOrNull()
+    }
 
     private inline fun verifyStablePath(
         path: Path,
@@ -318,22 +350,32 @@ object Crx3Verifier {
         channel: FileChannel,
         zipOffset: Long,
         zipLength: Long,
-    ): ByteArray? = runCatching {
-        val actualCrxId = MessageDigest.getInstance("SHA-256")
-            .digest(publicKeyBytes)
-            .copyOfRange(0, 16)
-        if (!actualCrxId.contentEquals(expectedCrxId)) return null
-        val publicKey = readPublicKey(kind, publicKeyBytes)
-        val verified = Signature.getInstance(kind.signatureAlgorithm).run {
-            initVerify(publicKey)
-            update(signedDataContext)
-            update(uint32(signedHeaderData.size))
-            update(signedHeaderData)
-            updateRange(channel, zipOffset, zipLength) { update(it) }
-            verify(signatureBytes)
+        checkpoint: () -> Unit = {},
+    ): ByteArray? {
+        return try {
+            val actualCrxId = MessageDigest.getInstance("SHA-256")
+                .digest(publicKeyBytes)
+                .copyOfRange(0, 16)
+            if (!actualCrxId.contentEquals(expectedCrxId)) return null
+            val publicKey = readPublicKey(kind, publicKeyBytes)
+            val verified = Signature.getInstance(kind.signatureAlgorithm).run {
+                initVerify(publicKey)
+                update(signedDataContext)
+                update(uint32(signedHeaderData.size))
+                update(signedHeaderData)
+                updateRange(channel, zipOffset, zipLength) {
+                    checkpoint()
+                    update(it)
+                }
+                verify(signatureBytes)
+            }
+            publicKeyBytes.takeIf { verified }?.copyOf()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
         }
-        publicKeyBytes.takeIf { verified }?.copyOf()
-    }.getOrNull()
+    }
 
     private fun readProof(kind: ProofKind, encodedProof: ByteArray): Pair<ProofKind, Proof> {
         val fields = Proto.parse(encodedProof)

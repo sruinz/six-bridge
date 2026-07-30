@@ -3,6 +3,7 @@ package dev.sixbridge.core.draft
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
@@ -36,8 +37,15 @@ class SixDraftReplay {
         draft: VerifiedSixDraft,
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): DraftReplayResult {
+        control.checkCancelled()
         val payload = draft.payload
+        if (payload.draft.schemaVersion == 3) {
+            throw LegacyDraftNotReplayableException(
+                "schema v3 prepared CRX draft는 replay 대상이 아닙니다.",
+            )
+        }
         if (payload.draft.schemaVersion == 1 &&
             (
                 payload.plan.selectedAdapters.isNotEmpty() ||
@@ -57,14 +65,15 @@ class SixDraftReplay {
                     signedProfileSha256 = signedProfile,
                     currentProfileSha256 = currentProfile,
                     currentAnalysis = replayBoundary("현재 profile 분석에 실패했습니다.") {
-                        engine.analyze(input, profile)
+                        engine.analyzeWithIdentity(input, profile, control).report
                     },
                 )
             }
 
             val replayed = replayBoundary("signed draft 재실행에 실패했습니다.") {
-                engine.prepare(input, profile, approvedAdapterIds)
+                engine.prepare(input, profile, approvedAdapterIds, control)
             }
+            control.checkCancelled()
             val prepared = normalizePrepared(payload, replayed)
             requireExpectedProof(payload, prepared)
             DraftReplayResult.Ready(prepared)
@@ -86,6 +95,10 @@ class SixDraftReplay {
                 expectedExtensionId = payload.input.originalExtensionId,
                 signedDraftSourceIdentity = signedIdentity,
             )
+            DraftSourceKind.PREPARED_CRX ->
+                throw LegacyDraftNotReplayableException(
+                    "prepared CRX draft는 portable source로 재실행할 수 없습니다.",
+                )
         }
     }
 

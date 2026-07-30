@@ -220,7 +220,13 @@ internal class OnDeviceConversionCoordinator(
         }
         val prepared = try {
             work.withVerifiedInputFile(token) {
-                runtime.prepare(it, job.inputKind, profile, approvedAdapterIds)
+                runtime.prepare(
+                    it,
+                    job.inputKind,
+                    profile,
+                    approvedAdapterIds,
+                    control,
+                )
             }
         } catch (error: CancellationException) {
             throw error

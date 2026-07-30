@@ -6,6 +6,7 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.draft.VerifiedPreparedCrxArtifact
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -120,6 +121,8 @@ internal data class PreparedConversionSnapshot(
     val descriptorVersion: String,
     val sourceKind: String,
     val opaque: Any,
+    val preparedCrx: VerifiedPreparedCrxArtifact? = null,
+    val control: AnalysisControl? = null,
 )
 
 internal fun installationIdentityMode(
@@ -144,6 +147,8 @@ internal data class BoundConversionSnapshot(
     val compatibility: ContractCompatibilityReport,
     val extensionId: String,
     val sourceKind: String,
+    val preparedCrx: VerifiedPreparedCrxArtifact? = null,
+    val control: AnalysisControl? = null,
 )
 
 internal data class ResolvedPackageIdentity(
@@ -246,6 +251,19 @@ internal interface ConversionRuntimePort {
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
     ): PreparedConversionSnapshot
+
+    fun prepare(
+        input: File,
+        kind: OnDeviceInputKind,
+        profile: BrowserProfile,
+        approvedAdapterIds: Set<String>,
+        control: AnalysisControl,
+    ): PreparedConversionSnapshot = prepare(
+        input,
+        kind,
+        profile,
+        approvedAdapterIds,
+    )
 
     fun bind(
         prepared: PreparedConversionSnapshot,

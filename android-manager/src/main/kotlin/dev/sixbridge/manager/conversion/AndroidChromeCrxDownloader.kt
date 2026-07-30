@@ -41,6 +41,7 @@ class ChromeDownloadResponse(
     val contentType: String?,
     val location: String?,
     val body: InputStream,
+    val contentLength: Long? = null,
     private val closeAction: () -> Unit = {},
 ) : Closeable {
     override fun close() {
@@ -234,6 +235,14 @@ class AndroidChromeCrxDownloader(
                         ChromeDownloadErrorCode.HTML_RESPONSE,
                         "Chrome CRX 대신 HTML 응답을 받았습니다.",
                     )
+                }
+                response.contentLength?.let { declared ->
+                    if (declared < 0L || declared > MAX_DOWNLOAD_BYTES) {
+                        fail(
+                            ChromeDownloadErrorCode.RESPONSE_TOO_LARGE,
+                            "Chrome CRX 응답 크기가 제한을 초과했습니다.",
+                        )
+                    }
                 }
                 val downloaded = writeBounded(response.body, destination, created)
                 if (looksLikeHtml(downloaded.prefix)) {
@@ -483,6 +492,8 @@ internal class HttpsChromeDownloadTransport(
                     contentType = opened.contentType,
                     location = opened.getHeaderField("Location"),
                     body = body,
+                    contentLength = opened.contentLengthLong
+                        .takeIf { it >= 0L },
                     closeAction = opened::disconnect,
                 )
                 continuation.resume(response) { _, cancelledResponse, _ ->

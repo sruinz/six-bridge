@@ -50,10 +50,15 @@ internal class StableExtensionAnalysis private constructor(
                 "sixbridge-analysis-",
             )
             return try {
-                val archive = ExtensionZip.createBytes(
+                val archive = AnalysisInputMaterializer.snapshotDirectory(
                     sourceRoot,
-                    includeProjectMarker = true,
-                )
+                    control,
+                ) {
+                    ExtensionZip.createBytes(
+                        it,
+                        includeProjectMarker = true,
+                    )
+                }
                 val canonical = OwnedTempTree.createNamed(
                     temporary,
                     "canonical",

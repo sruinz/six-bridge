@@ -113,7 +113,7 @@ class SixBridgeService(
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
-            val prepared = pipeline.preflightPreparation(
+            val prepared = pipeline.prepare(
                 resolved,
                 profile,
                 approvedAdapterIds,
@@ -127,24 +127,13 @@ class SixBridgeService(
                 .filter { it.applied }
                 .sortedWith(compareBy({ it.id }, { it.version }))
             val before = prepared.compatibilityBefore.copy(
-                originalExtensionId = prepared.originalExtensionId,
+                originalExtensionId = prepared.compatibilityBefore.originalExtensionId,
             )
             val after = prepared.compatibilityAfter
-            val sourceKind = if (resolved.crxBytes != null) {
-                DraftSourceKind.CRX
-            } else {
-                DraftSourceKind.ZIP
-            }
-            val source = if (sourceKind == DraftSourceKind.CRX) {
-                requireNotNull(resolved.crxBytes).copyOf()
-            } else {
-                ExtensionZip.createBytes(
-                    requireNotNull(resolved.sourceRoot),
-                    includeProjectMarker = true,
-                )
-            }
+            val sourceKind = DraftSourceKind.PREPARED_CRX
+            val source = prepared.crxBytes
             val payload = SixDraftPayload.create(
-                draft = DraftMetadata.createV2(
+                draft = DraftMetadata.createV3(
                     coreVersion = CORE_VERSION,
                     adapterVersions = applied.associate { it.id to it.version },
                     sourceIdentity = sourceIdentity,
@@ -157,7 +146,7 @@ class SixBridgeService(
                     browserProfileSha256 = requireNotNull(
                         before.browserProfileSha256,
                     ),
-                    originalExtensionId = prepared.originalExtensionId,
+                    originalExtensionId = before.originalExtensionId,
                     originalExtensionVersion = requireNotNull(
                         before.extensionVersion,
                     ),

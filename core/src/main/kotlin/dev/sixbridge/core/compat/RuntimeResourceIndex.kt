@@ -45,20 +45,46 @@ class RuntimeResourceIndex private constructor(
             root: Path,
             manifest: JsonObject,
             control: AnalysisControl,
-        ): RuntimeResourceIndex = create(root, manifest, control, Files::readString)
+        ): RuntimeResourceIndex = create(
+            root,
+            manifest,
+            control,
+            Files::readString,
+            AnalysisBudgetLedger(control.policy),
+        )
 
         internal fun createForTesting(
             root: Path,
             manifest: JsonObject,
             readSource: (Path) -> String,
             control: AnalysisControl = AnalysisControl(),
-        ): RuntimeResourceIndex = create(root, manifest, control, readSource)
+        ): RuntimeResourceIndex = create(
+            root,
+            manifest,
+            control,
+            readSource,
+            AnalysisBudgetLedger(control.policy),
+        )
+
+        internal fun create(
+            root: Path,
+            manifest: JsonObject,
+            control: AnalysisControl,
+            ledger: AnalysisBudgetLedger,
+        ): RuntimeResourceIndex = create(
+            root,
+            manifest,
+            control,
+            Files::readString,
+            ledger,
+        )
 
         private fun create(
             root: Path,
             manifest: JsonObject,
             control: AnalysisControl,
             readSource: (Path) -> String,
+            ledger: AnalysisBudgetLedger,
         ): RuntimeResourceIndex {
             val normalizedRoot = root.toAbsolutePath().normalize()
             val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
@@ -158,12 +184,29 @@ class RuntimeResourceIndex private constructor(
                 control.checkCancelled()
                 val resource = pending[pendingIndex++]
                 val roles = rolesByResource.getValue(resource).toSet()
+                val executableText = resource.extension.lowercase() in TEXT_EXTENSIONS
+                ledger.reserveRuntimeDependency(
+                    resource,
+                    Files.size(resource),
+                    executableText,
+                )
+                if (!executableText) {
+                    unresolvedDependency = true
+                    sourceByResource[resource] = ""
+                    control.checkCancelled()
+                    continue
+                }
                 control.checkCancelled()
-                val source = runCatching { readSource(resource) }
-                    .getOrElse {
+                val source = try {
+                    readSource(resource)
+                } catch (error: java.util.concurrent.CancellationException) {
+                    throw error
+                } catch (error: AnalysisBudgetExceededException) {
+                    throw error
+                } catch (_: Exception) {
                         unresolvedDependency = true
                         ""
-                    }
+                }
                 sourceByResource[resource] = source
                 val dependencyScan = when (resource.extension.lowercase()) {
                     "html" -> {
@@ -270,6 +313,8 @@ class RuntimeResourceIndex private constructor(
                 ),
             )
         }
+
+        private val TEXT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
 
         private fun resolveLocalRuntimeResource(
             root: Path,

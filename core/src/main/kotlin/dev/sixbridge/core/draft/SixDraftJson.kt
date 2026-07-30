@@ -235,6 +235,17 @@ internal object SixDraftJson {
                     value.transformedSourceSha256,
                 ),
             )
+            3 -> objectOf(
+                "originalSourceSha256" to JsonPrimitive(
+                    value.originalSourceSha256,
+                ),
+                "planSha256" to JsonPrimitive(value.planSha256),
+                "reportSha256" to JsonPrimitive(value.reportSha256),
+                "schemaVersion" to JsonPrimitive(3),
+                "transformedSourceSha256" to JsonPrimitive(
+                    value.transformedSourceSha256,
+                ),
+            )
             else -> throw IllegalArgumentException(
                 "지원하지 않는 expected.json schemaVersion입니다.",
             )
@@ -261,6 +272,20 @@ internal object SixDraftJson {
             2 -> {
                 value.requireKeys(EXPECTED_V2_KEYS, "expected.json")
                 value.requireSchema("expected.json", 2)
+                DraftExpected(
+                    originalSourceSha256 = value.strictSha256(
+                        "originalSourceSha256",
+                    ),
+                    transformedSourceSha256 = value.strictSha256(
+                        "transformedSourceSha256",
+                    ),
+                    reportSha256 = value.strictSha256("reportSha256"),
+                    planSha256 = value.strictSha256("planSha256"),
+                )
+            }
+            3 -> {
+                value.requireKeys(EXPECTED_V2_KEYS, "expected.json")
+                value.requireSchema("expected.json", 3)
                 DraftExpected(
                     originalSourceSha256 = value.strictSha256(
                         "originalSourceSha256",
@@ -537,7 +562,7 @@ internal object SixDraftJson {
 
     private fun JsonObject.supportedDraftSchema(): Int =
         getValue("schemaVersion").strictInt("schemaVersion").also {
-            require(it == 1 || it == 2) {
+            require(it in 1..3) {
                 "지원하지 않는 draft.json schemaVersion입니다."
             }
         }

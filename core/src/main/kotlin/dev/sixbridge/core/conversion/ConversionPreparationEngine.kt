@@ -94,10 +94,17 @@ class ConversionPreparationEngine private constructor(
         input: PortableExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): PreparedConversion {
+        control.checkCancelled()
+        val controlledAnalyzer = MobilePatternAnalyzer(
+            control = control,
+            compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
+        )
         val approvals = approvedAdapterIds.toSet()
         val snapshot = workspace.snapshot(input.canonicalOriginalZip)
-        val beforeRaw = analyzer.analyzeArchive(snapshot.sourceZip, profile)
+        control.checkCancelled()
+        val beforeRaw = controlledAnalyzer.analyzeArchive(snapshot.sourceZip, profile)
         requireCrxManifestBinding(input, beforeRaw)
         val originalSourceSha256 =
             input.verifiedCrxPayloadSha256 ?: snapshot.sourceSha256
@@ -120,6 +127,7 @@ class ConversionPreparationEngine private constructor(
             }
         }
         val transformed = plan.selectedAdapters.isNotEmpty()
+        control.checkCancelled()
         val applied = if (transformed) {
             workspace.transform(snapshot, profile, plan)
         } else {
@@ -131,6 +139,7 @@ class ConversionPreparationEngine private constructor(
             snapshot.workingRoot,
             includeProjectMarker = true,
         )
+        control.checkCancelled()
         val applicationProof = if (transformed) {
             workspace.verifyApplied(
                 snapshot = snapshot,
@@ -142,7 +151,8 @@ class ConversionPreparationEngine private constructor(
         } else {
             null
         }
-        val rawAfter = analyzer.analyzeArchive(transformedArchive, profile)
+        val rawAfter = controlledAnalyzer.analyzeArchive(transformedArchive, profile)
+        control.checkCancelled()
         validateCompatibility(before, rawAfter)
         val after = conversionReport(
             rawAfter = rawAfter,

@@ -97,6 +97,58 @@ class RuntimeResourceIndexTest {
     }
 
     @Test
+    fun `100MiB JSON dependency는 source reader 전에 공유 예산으로 거부한다`() {
+        val root = workerExtension(
+            """import data from "./large.json" with { type: "json" };""",
+        )
+        val large = root.resolve("large.json")
+        java.nio.channels.FileChannel.open(
+            large,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.WRITE,
+        ).use {
+            it.position(100L * 1024 * 1024 - 1)
+            it.write(java.nio.ByteBuffer.wrap(byteArrayOf(0)))
+        }
+        val reads = mutableListOf<String>()
+
+        val error = assertFailsWith<AnalysisBudgetExceededException> {
+            RuntimeResourceIndex.createForTesting(
+                root = root,
+                manifest = manifest("""{"service_worker":"background.js"}"""),
+                readSource = { path ->
+                    reads += path.fileName.toString()
+                    Files.readString(path)
+                },
+                control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+            )
+        }
+
+        assertEquals("analysis_budget_exceeded", error.code)
+        assertEquals(listOf("background.js"), reads)
+    }
+
+    @Test
+    fun `작은 비실행 dependency는 String으로 읽지 않고 unresolved 처리한다`() {
+        val root = workerExtension("""import "./payload.txt";""")
+        root.resolve("payload.txt").writeText("opaque payload")
+        val reads = mutableListOf<String>()
+
+        val index = RuntimeResourceIndex.createForTesting(
+            root = root,
+            manifest = manifest("""{"service_worker":"background.js"}"""),
+            readSource = { path ->
+                reads += path.fileName.toString()
+                Files.readString(path)
+            },
+            control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
+
+        assertEquals(listOf("background.js"), reads)
+        assertTrue(index.unresolvedDependency)
+    }
+
+    @Test
     fun `runtime dependency 순회는 파일 사이 취소를 전달한다`() {
         val root = workerExtension("""importScripts("./b.js");""")
         root.resolve("b.js").writeText("console.log('b');")

@@ -3,6 +3,7 @@ package dev.sixbridge.core.draft
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.conversion.WorkspaceAccessState
@@ -38,6 +39,7 @@ enum class DraftSourceKind(
 ) {
     ZIP("source.zip"),
     CRX("source.crx"),
+    PREPARED_CRX("prepared.crx"),
 }
 
 internal data class DraftSourceEvidence(
@@ -267,7 +269,7 @@ class SixDraftPayload private constructor(
                 1 -> DraftSignature.sha256(
                     SixDraftJson.encodeCompatibility(after),
                 )
-                2 -> DraftSignature.sha256(
+                2, 3 -> DraftSignature.sha256(
                     BundleJson.encodeCompatibility(
                         after.toContractV4(
                             originalSourceSha256 = input.originalSourceSha256,
@@ -304,6 +306,15 @@ class SixDraftPayload private constructor(
                 after,
             )
             2 -> validateV2Semantics(
+                draft,
+                input,
+                sourceKind,
+                sourceEvidence,
+                plan,
+                before,
+                after,
+            )
+            3 -> validateV3Semantics(
                 draft,
                 input,
                 sourceKind,
@@ -577,10 +588,99 @@ class SixDraftPayload private constructor(
             }
         }
 
+        private fun validateV3Semantics(
+            draft: DraftMetadata,
+            input: DraftInputMetadata,
+            sourceKind: DraftSourceKind,
+            sourceEvidence: DraftSourceEvidence,
+            plan: DraftConversionPlan,
+            before: dev.sixbridge.core.compat.CompatibilityReport,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ) {
+            before.validate()
+            after.validate()
+            require(sourceKind == DraftSourceKind.PREPARED_CRX) {
+                "schema v3에는 prepared.crx가 필요합니다."
+            }
+            require(draft.sourceIdentity == input.sourceIdentity) {
+                "draft와 input sourceIdentity가 일치하지 않습니다."
+            }
+            require(before.sourceSha256 == input.originalSourceSha256) {
+                "schema v3 원본 provenance가 변환 전 보고서와 다릅니다."
+            }
+            require(
+                before.browserProfileSha256 == input.browserProfileSha256 &&
+                    after.browserProfileSha256 == input.browserProfileSha256,
+            ) {
+                "schema v3 browser profile provenance가 일치하지 않습니다."
+            }
+            require(
+                before.extensionVersion == input.originalExtensionVersion &&
+                    before.originalExtensionId == input.originalExtensionId &&
+                    after.originalExtensionId == input.originalExtensionId,
+            ) {
+                "schema v3 원본 extension provenance가 일치하지 않습니다."
+            }
+            require(
+                after.sourceSha256 == sourceEvidence.actualSha256 &&
+                    after.convertedExtensionId == sourceEvidence.crxExtensionId,
+            ) {
+                "prepared CRX proof가 변환 후 source 또는 extension ID와 다릅니다."
+            }
+            require(
+                plan.reportSourceSha256 == before.sourceSha256 &&
+                    plan.browserProfileSha256 == before.browserProfileSha256 &&
+                    plan.reportSha256 == SixDraftJson.compatibilitySha256(before),
+            ) {
+                "schema v3 변환 계획 provenance가 변환 전 보고서와 다릅니다."
+            }
+            val decisions = before.adapterDecisions.associateBy { it.id to it.version }
+            val selectedDecisions = plan.selectedAdapters.map { selected ->
+                requireNotNull(decisions[selected.id to selected.version]) {
+                    "schema v3 변환 계획 어댑터가 변환 전 보고서에 없습니다."
+                }
+            }
+            require(
+                plan.planSha256 ==
+                    dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
+                        before,
+                        selectedDecisions,
+                    ),
+            ) {
+                "schema v3 변환 계획 proof가 일치하지 않습니다."
+            }
+            require(
+                draft.adapterVersions ==
+                    plan.selectedAdapters.associate { it.id to it.version },
+            ) {
+                "schema v3 adapter version 집합이 계획과 다릅니다."
+            }
+            val applied = after.adapterDecisions.filter { it.applied }
+                .map { it.id to it.version }
+            val selected = plan.selectedAdapters.map { it.id to it.version }
+            require(
+                applied.sortedWith(ADAPTER_KEY_ORDER) ==
+                    selected.sortedWith(ADAPTER_KEY_ORDER),
+            ) {
+                "schema v3 적용 어댑터가 계획과 다릅니다."
+            }
+            val expectedState = if (selected.isEmpty()) {
+                dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH
+            } else {
+                dev.sixbridge.core.conversion.ConversionState.CONVERTED
+            }
+            require(after.conversionState == expectedState) {
+                "schema v3 conversionState가 계획과 다릅니다."
+            }
+        }
+
         private fun sourceEvidence(
             sourceKind: DraftSourceKind,
             source: ByteArray,
-        ): DraftSourceEvidence = if (sourceKind == DraftSourceKind.CRX) {
+        ): DraftSourceEvidence = if (
+            sourceKind == DraftSourceKind.CRX ||
+            sourceKind == DraftSourceKind.PREPARED_CRX
+        ) {
             val verified = Crx3Verifier.verify(source)
             DraftSourceEvidence(
                 actualSha256 = verified.zipSha256,
@@ -772,6 +872,15 @@ object SixDraft {
             readVerified(bytes)
         }
 
+    fun readControlled(
+        input: Path,
+        control: AnalysisControl,
+    ): ControlledSixDraft = StrictDraftPathProbe.readControlled(
+        input.toAbsolutePath().normalize(),
+        MAX_ARCHIVE_SIZE,
+        control,
+    )
+
     fun probe(input: Path, maximumBytes: Long): SixDraftProbe =
         StrictDraftPathProbe.probe(input, maximumBytes)
 
@@ -785,6 +894,7 @@ object SixDraft {
         val sourceKind = when {
             "source.zip" in entries -> DraftSourceKind.ZIP
             "source.crx" in entries -> DraftSourceKind.CRX
+            "prepared.crx" in entries -> DraftSourceKind.PREPARED_CRX
             else -> throw IllegalArgumentException("SixDraft source entry가 없습니다.")
         }
         val signature = SixDraftJson.decodeSignature(
@@ -977,7 +1087,11 @@ object SixDraft {
         throw InvalidSixDraftException("$message ${error.message}", error)
     }
 
-    internal val SOURCE_ENTRIES = setOf("source.zip", "source.crx")
+    internal val SOURCE_ENTRIES = setOf(
+        "source.zip",
+        "source.crx",
+        "prepared.crx",
+    )
     internal val METADATA_ENTRIES = setOf(
         "compatibility-after.json",
         "compatibility-before.json",
@@ -1092,7 +1206,7 @@ private object StrictDraftArchive {
         var total = 0L
         val result = linkedMapOf<String, ByteArray>()
         verified.forEach { entry ->
-            val isSource = entry.name == "source.zip" || entry.name == "source.crx"
+            val isSource = entry.name in SixDraft.SOURCE_ENTRIES
             if (isSource) {
                 require(entry.method == ZipEntry.STORED) {
                     "SixDraft source entry는 STORED method여야 합니다: ${entry.name}"

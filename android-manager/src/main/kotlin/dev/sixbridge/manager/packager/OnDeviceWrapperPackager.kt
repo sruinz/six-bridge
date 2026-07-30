@@ -168,6 +168,39 @@ class OnDeviceWrapperPackager(context: Context) {
         }
     }
 
+    internal fun stageSource(
+        ownerToken: String,
+        expectedBytes: Long,
+        copy: (Path) -> Unit,
+    ): File {
+        require(UUID.fromString(ownerToken).toString() == ownerToken) {
+            "source owner token은 canonical UUID여야 합니다."
+        }
+        require(expectedBytes in 4..ON_DEVICE_MAX_SOURCE_BYTES) {
+            "온디바이스 source 크기가 올바르지 않습니다."
+        }
+        val staged = createTemporaryFile(".source.", ".bin")
+        return try {
+            copy(staged)
+            val attributes = Files.readAttributes(
+                staged,
+                BasicFileAttributes::class.java,
+                NOFOLLOW_LINKS,
+            )
+            require(
+                attributes.isRegularFile &&
+                    !attributes.isSymbolicLink &&
+                    attributes.size() == expectedBytes,
+            ) {
+                "온디바이스 source copy 크기가 일치하지 않습니다."
+            }
+            staged.toFile()
+        } catch (error: Throwable) {
+            Files.deleteIfExists(staged)
+            throw error
+        }
+    }
+
     @Synchronized
     fun resolveIdentity(
         identityKey: InstallationIdentityKey,
@@ -184,6 +217,12 @@ class OnDeviceWrapperPackager(context: Context) {
             Crx3Verifier.verify(it.toPath(), ON_DEVICE_MAX_SOURCE_BYTES)
         },
     )
+
+    @Synchronized
+    internal fun resolveIdentityFromProof(
+        identityKey: InstallationIdentityKey,
+        proof: dev.sixbridge.contract.crx.VerifiedCrx3,
+    ): OnDevicePackageIdentity = resolveIdentityProof(identityKey, proof)
 
     internal fun plannedCrxAlias(identityKey: InstallationIdentityKey): String {
         require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
@@ -212,7 +251,9 @@ class OnDeviceWrapperPackager(context: Context) {
         val wrapperIdentity = identityStore.wrapperIdentity()
         val wrapperSignerSha256 = sha256(wrapperIdentity.certificate.encoded)
         return when (identityKey.mode) {
-            InstallationIdentityMode.PASSTHROUGH -> {
+            InstallationIdentityMode.PASSTHROUGH,
+            InstallationIdentityMode.PREPARED,
+            -> {
                 val proof = passthroughProof
                     ?: throw IllegalArgumentException("passthrough 신원에는 원본 CRX3가 필요합니다.")
                 OnDevicePackageIdentity(
@@ -248,7 +289,9 @@ class OnDeviceWrapperPackager(context: Context) {
         val wrapperIdentity = identityStore.existingWrapperIdentity()
         val wrapperSignerSha256 = sha256(wrapperIdentity.certificate.encoded)
         val current = when (reservation.identityKey.mode) {
-            InstallationIdentityMode.PASSTHROUGH -> {
+            InstallationIdentityMode.PASSTHROUGH,
+            InstallationIdentityMode.PREPARED,
+            -> {
                 val proof = passthroughProof
                     ?: throw IllegalArgumentException("passthrough 예약에는 원본 CRX3가 필요합니다.")
                 OnDevicePackageIdentity(
@@ -413,7 +456,9 @@ class OnDeviceWrapperPackager(context: Context) {
         val generatedCrx = createTemporaryFile(".extension.", ".crx")
         try {
             val crxPath = when (request.reservation.identityKey.mode) {
-                InstallationIdentityMode.PASSTHROUGH -> requireNotNull(request.passthroughCrx)
+                InstallationIdentityMode.PASSTHROUGH,
+                InstallationIdentityMode.PREPARED,
+                -> requireNotNull(request.passthroughCrx)
                 InstallationIdentityMode.CONVERTED -> {
                     Crx3Writer.create(
                         requireNotNull(request.canonicalSourceZip),
@@ -547,6 +592,9 @@ class OnDeviceWrapperPackager(context: Context) {
             InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
                 "passthrough 신원에는 원본 CRX3가 필요합니다."
             }
+            InstallationIdentityMode.PREPARED -> require(hasPassthroughCrx) {
+                "prepared 신원에는 검증된 CRX3가 필요합니다."
+            }
             InstallationIdentityMode.CONVERTED -> require(hasCanonicalZip) {
                 "converted 신원에는 canonical source ZIP이 필요합니다."
             }
@@ -611,6 +659,11 @@ class OnDeviceWrapperPackager(context: Context) {
                         report.originalExtensionId == identity.extensionId,
                 ) {
                     "passthrough compatibility identity가 원본 CRX3와 일치하지 않습니다."
+                }
+            }
+            InstallationIdentityMode.PREPARED -> {
+                require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
+                    "prepared package identity에 CRX Keystore key가 포함되었습니다."
                 }
             }
             InstallationIdentityMode.CONVERTED -> {
@@ -1136,6 +1189,9 @@ private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
         InstallationIdentityMode.PASSTHROUGH -> require(hasPassthroughCrx) {
             "passthrough 신원에는 원본 CRX3가 필요합니다."
         }
+        InstallationIdentityMode.PREPARED -> require(hasPassthroughCrx) {
+            "prepared 신원에는 검증된 CRX3가 필요합니다."
+        }
         InstallationIdentityMode.CONVERTED -> require(hasCanonicalZip) {
             "converted 신원에는 canonical source ZIP이 필요합니다."
         }
@@ -1216,6 +1272,14 @@ private fun requireBoundRequest(
                     report.originalExtensionId == identity.extensionId,
             ) {
                 "passthrough compatibility identity가 원본 CRX3와 일치하지 않습니다."
+            }
+        }
+        InstallationIdentityMode.PREPARED -> {
+            require(request.passthroughCrx!!.contentEquals(crxBytes)) {
+                "prepared CRX3 bytes가 signed artifact와 일치하지 않습니다."
+            }
+            require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
+                "prepared package identity에 CRX Keystore key가 포함되었습니다."
             }
         }
         InstallationIdentityMode.CONVERTED -> {

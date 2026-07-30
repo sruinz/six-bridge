@@ -1,6 +1,12 @@
 package dev.sixbridge.core.draft
 
 import dev.sixbridge.contract.crx.Crx3Verifier
+import dev.sixbridge.contract.crx.VerifiedCrx3
+import dev.sixbridge.core.compat.AnalysisArchiveKind
+import dev.sixbridge.core.compat.AnalysisBudgetExceededException
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisInputMaterializer
+import dev.sixbridge.core.compat.CompatibilityReport
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -59,7 +65,7 @@ internal object StrictDraftPathProbe {
         if (!candidate) return SixDraftProbe.NotDraft
         return try {
             val initialHash = sha256(path, before.size)
-            val result = inspect(path, maximumBytes)
+            val result = inspect(path, maximumBytes, AnalysisControl()).valid
             afterValidation()
             require(readPathState(path) == before) {
                 "SixDraft archive가 검증 중 변경되었습니다."
@@ -73,7 +79,64 @@ internal object StrictDraftPathProbe {
         }
     }
 
-    private fun inspect(path: Path, maximumBytes: Long): SixDraftProbe.Valid {
+    internal fun readControlled(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): ControlledSixDraft {
+        control.checkCancelled()
+        val descriptor = sourceDescriptor(path, maximumBytes, control)
+        if (descriptor.schemaVersion <= 2) {
+            try {
+                AnalysisInputMaterializer.preflightArchiveRange(
+                    path = path,
+                    offset = descriptor.sourceOffset,
+                    length = descriptor.sourceLength,
+                    kind = descriptor.archiveKind,
+                    control = control,
+                )
+            } catch (error: AnalysisBudgetExceededException) {
+                return ControlledSixDraft.BudgetExceeded(error.exceeded)
+            }
+        }
+        val inspected = inspect(path, maximumBytes, control)
+        control.checkCancelled()
+        if (inspected.decoded.draft.schemaVersion == 3) {
+            val proof = requireNotNull(inspected.sourceProof) {
+                "schema v3 prepared CRX proof가 없습니다."
+            }
+            return ControlledSixDraft.Prepared(
+                VerifiedPreparedSixDraft(
+                    draft = inspected.decoded.draft,
+                    input = inspected.decoded.input,
+                    plan = inspected.plan,
+                    compatibilityBefore = inspected.before,
+                    compatibilityAfter = inspected.after,
+                    expected = inspected.decoded.signerIndependentExpected,
+                    signerFingerprint = DraftSignature.fingerprint(
+                        inspected.signature.publicKey,
+                    ),
+                    signerPublicKey = inspected.signature.publicKey,
+                    entryNames = inspected.names,
+                    preparedCrx = VerifiedPreparedCrxArtifact(
+                        path = path,
+                        offset = inspected.sourceOffset,
+                        length = inspected.sourceLength,
+                        proof = proof,
+                    ),
+                ),
+            )
+        }
+        val bytes = readWholeBounded(path, maximumBytes, control)
+        control.checkCancelled()
+        return ControlledSixDraft.Legacy(SixDraft.read(bytes))
+    }
+
+    private fun inspect(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): PathInspection {
         require(maximumBytes >= 0L && maximumBytes <= SixDraft.MAX_ARCHIVE_SIZE) {
             "SixDraft caller archive 제한이 올바르지 않습니다."
         }
@@ -99,6 +162,7 @@ internal object StrictDraftPathProbe {
             val metadata = linkedMapOf<String, ByteArray>()
             val digests = linkedMapOf<String, DraftEntryDigest>()
             entries.forEach { entry ->
+                control.checkCancelled()
                 val isSource = entry.name in SixDraft.SOURCE_ENTRIES
                 val maximum = if (isSource) {
                     SixDraft.MAX_SOURCE_SIZE
@@ -129,10 +193,10 @@ internal object StrictDraftPathProbe {
                     require(entry.method == ZipEntry.STORED) {
                         "SixDraft source entry는 STORED method여야 합니다."
                     }
-                    val digest = digestStored(channel, entry)
+                    val digest = digestStored(channel, entry, control)
                     digests[entry.name] = digest
                 } else {
-                    val decoded = decodeMetadata(channel, entry)
+                    val decoded = decodeMetadata(channel, entry, control)
                     metadata[entry.name] = decoded
                     digests[entry.name] = DraftEntryDigest(
                         size = decoded.size.toLong(),
@@ -144,22 +208,31 @@ internal object StrictDraftPathProbe {
             val sourceEntry = entries.single { it.name == sourceName }
             val sourceKind = if (sourceName == DraftSourceKind.ZIP.entryName) {
                 DraftSourceKind.ZIP
+            } else if (sourceName == DraftSourceKind.PREPARED_CRX.entryName) {
+                DraftSourceKind.PREPARED_CRX
             } else {
                 DraftSourceKind.CRX
             }
             val sourceDigest = digests.getValue(sourceName)
-            val sourceEvidence = if (sourceKind == DraftSourceKind.CRX) {
+            val sourceProof: VerifiedCrx3?
+            val sourceEvidence = if (
+                sourceKind == DraftSourceKind.CRX ||
+                sourceKind == DraftSourceKind.PREPARED_CRX
+            ) {
                 val verified = Crx3Verifier.verify(
                     path = path,
                     offset = sourceEntry.dataOffset,
                     length = sourceEntry.uncompressedSize,
                     maximumBytes = sourceEntry.uncompressedSize,
+                    checkpoint = control::checkCancelled,
                 )
+                sourceProof = verified
                 DraftSourceEvidence(
                     actualSha256 = verified.zipSha256,
                     crxExtensionId = verified.extensionId,
                 )
             } else {
+                sourceProof = null
                 DraftSourceEvidence(
                     actualSha256 = sourceDigest.sha256,
                     crxExtensionId = null,
@@ -184,9 +257,29 @@ internal object StrictDraftPathProbe {
             require(channel.size() == size) {
                 "SixDraft archive가 검증 중 변경되었습니다."
             }
-            SixDraftProbe.Valid(
-                schemaVersion = decoded.draft.schemaVersion,
-                originalExtensionId = decoded.input.originalExtensionId,
+            control.checkCancelled()
+            PathInspection(
+                valid = SixDraftProbe.Valid(
+                    schemaVersion = decoded.draft.schemaVersion,
+                    originalExtensionId = decoded.input.originalExtensionId,
+                ),
+                decoded = decoded,
+                plan = SixDraftJson.decodePlan(
+                    metadata.getValue("conversion-plan.json"),
+                ),
+                before = SixDraftJson.decodeCompatibility(
+                    "compatibility-before.json",
+                    metadata.getValue("compatibility-before.json"),
+                ),
+                after = SixDraftJson.decodeCompatibility(
+                    "compatibility-after.json",
+                    metadata.getValue("compatibility-after.json"),
+                ),
+                signature = signature,
+                names = names,
+                sourceOffset = sourceEntry.dataOffset,
+                sourceLength = sourceEntry.uncompressedSize,
+                sourceProof = sourceProof,
             )
         }
     }
@@ -194,10 +287,16 @@ internal object StrictDraftPathProbe {
     private fun digestStored(
         channel: FileChannel,
         entry: PathEntry,
+        control: AnalysisControl,
     ): DraftEntryDigest {
         val digest = MessageDigest.getInstance("SHA-256")
         val crc = CRC32()
-        readRange(channel, entry.dataOffset, entry.compressedSize) { buffer, count ->
+        readRange(
+            channel,
+            entry.dataOffset,
+            entry.compressedSize,
+            control,
+        ) { buffer, count ->
             digest.update(buffer.array(), 0, count)
             crc.update(buffer.array(), 0, count)
         }
@@ -213,6 +312,7 @@ internal object StrictDraftPathProbe {
     private fun decodeMetadata(
         channel: FileChannel,
         entry: PathEntry,
+        control: AnalysisControl,
     ): ByteArray {
         require(entry.uncompressedSize <= SixDraft.MAX_METADATA_SIZE) {
             "SixDraft metadata entry가 너무 큽니다."
@@ -220,7 +320,7 @@ internal object StrictDraftPathProbe {
         val decoded = if (entry.method == ZipEntry.STORED) {
             readBytes(channel, entry.dataOffset, entry.compressedSize.toInt())
         } else {
-            inflate(channel, entry)
+            inflate(channel, entry, control)
         }
         require(decoded.size.toLong() == entry.uncompressedSize) {
             "SixDraft entry 압축 해제 크기가 일치하지 않습니다: ${entry.name}"
@@ -231,7 +331,11 @@ internal object StrictDraftPathProbe {
         return decoded
     }
 
-    private fun inflate(channel: FileChannel, entry: PathEntry): ByteArray {
+    private fun inflate(
+        channel: FileChannel,
+        entry: PathEntry,
+        control: AnalysisControl,
+    ): ByteArray {
         val inflater = Inflater(true)
         val output = ByteArrayOutputStream(
             minOf(entry.uncompressedSize, 8192L).toInt(),
@@ -241,12 +345,14 @@ internal object StrictDraftPathProbe {
         var remaining = entry.compressedSize
         try {
             while (remaining > 0L && !inflater.finished()) {
+                control.checkCancelled()
                 val count = minOf(STREAM_BUFFER_SIZE.toLong(), remaining).toInt()
                 val chunk = readBytes(channel, position, count)
                 inflater.setInput(chunk)
                 position += count
                 remaining -= count
                 while (!inflater.needsInput() && !inflater.finished()) {
+                    control.checkCancelled()
                     val written = try {
                         inflater.inflate(decoded)
                     } catch (error: DataFormatException) {
@@ -286,7 +392,12 @@ internal object StrictDraftPathProbe {
                 "SixDraft archive가 검증 중 변경되었습니다."
             }
             val digest = MessageDigest.getInstance("SHA-256")
-            readRange(channel, 0L, expectedSize) { buffer, count ->
+            readRange(
+                channel,
+                0L,
+                expectedSize,
+                AnalysisControl(),
+            ) { buffer, count ->
                 digest.update(buffer.array(), 0, count)
             }
             require(channel.size() == expectedSize) {
@@ -318,12 +429,14 @@ internal object StrictDraftPathProbe {
         channel: FileChannel,
         offset: Long,
         length: Long,
+        control: AnalysisControl,
         consume: (ByteBuffer, Int) -> Unit,
     ) {
         val buffer = ByteBuffer.allocate(STREAM_BUFFER_SIZE)
         var position = offset
         var remaining = length
         while (remaining > 0L) {
+            control.checkCancelled()
             buffer.clear()
             buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
             val count = channel.read(buffer, position)
@@ -338,6 +451,75 @@ internal object StrictDraftPathProbe {
         val fileKey: Any?,
         val size: Long,
         val modifiedTime: FileTime,
+    )
+
+    private fun sourceDescriptor(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): SourceDescriptor = FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+        require(channel.size() <= maximumBytes) {
+            "SixDraft archive 크기가 제한을 초과합니다."
+        }
+        val entries = StrictPathArchive.index(channel, channel.size())
+        val source = entries.single { it.name in SixDraft.SOURCE_ENTRIES }
+        require(source.method == ZipEntry.STORED) {
+            "SixDraft source entry는 STORED method여야 합니다."
+        }
+        val draftEntry = entries.single { it.name == "draft.json" }
+        val draft = SixDraftJson.decodeDraft(
+            decodeMetadata(channel, draftEntry, control),
+        )
+        val kind = if (source.name == DraftSourceKind.ZIP.entryName) {
+            AnalysisArchiveKind.ZIP
+        } else {
+            AnalysisArchiveKind.CRX3
+        }
+        SourceDescriptor(
+            schemaVersion = draft.schemaVersion,
+            archiveKind = kind,
+            sourceOffset = source.dataOffset,
+            sourceLength = source.uncompressedSize,
+        )
+    }
+
+    private fun readWholeBounded(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): ByteArray = FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+        val size = channel.size()
+        require(size <= maximumBytes && size <= Int.MAX_VALUE) {
+            "legacy SixDraft archive 크기가 제한을 초과합니다."
+        }
+        val bytes = ByteArray(size.toInt())
+        val buffer = ByteBuffer.wrap(bytes)
+        while (buffer.hasRemaining()) {
+            control.checkCancelled()
+            val count = channel.read(buffer)
+            require(count > 0) { "legacy SixDraft archive를 완전히 읽지 못했습니다." }
+        }
+        bytes
+    }
+
+    private data class SourceDescriptor(
+        val schemaVersion: Int,
+        val archiveKind: AnalysisArchiveKind,
+        val sourceOffset: Long,
+        val sourceLength: Long,
+    )
+
+    private data class PathInspection(
+        val valid: SixDraftProbe.Valid,
+        val decoded: DecodedSixDraftMetadata,
+        val plan: DraftConversionPlan,
+        val before: CompatibilityReport,
+        val after: CompatibilityReport,
+        val signature: DraftSignatureRecord,
+        val names: Set<String>,
+        val sourceOffset: Long,
+        val sourceLength: Long,
+        val sourceProof: VerifiedCrx3?,
     )
 }
 
@@ -457,6 +639,7 @@ private object DraftCandidatePreflight {
     private val SOURCE_NAMES = listOf(
         DraftSourceKind.ZIP.entryName,
         DraftSourceKind.CRX.entryName,
+        DraftSourceKind.PREPARED_CRX.entryName,
     ).map(String::encodeToByteArray)
     private const val SIGNATURE_INDEX = 6
     private const val SIGNATURE_MASK = 1 shl SIGNATURE_INDEX

@@ -174,6 +174,41 @@ class AndroidChromeCrxDownloaderTest {
     }
 
     @Test
+    fun `선언된 128 MiB 초과 응답은 body를 읽기 전에 거부한다`() = runTest {
+        var bodyReads = 0
+        val body = object : InputStream() {
+            override fun read(): Int {
+                bodyReads += 1
+                return -1
+            }
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                bodyReads += 1
+                return -1
+            }
+        }
+        val transport = FakeTransport(
+            ChromeDownloadResponse(
+                statusCode = 200,
+                contentType = "application/x-chrome-extension",
+                location = null,
+                body = body,
+                contentLength = 134_217_729L,
+            ),
+        )
+
+        val error = assertFailsWith<ChromeDownloadException> {
+            AndroidChromeCrxDownloader(transport).download(
+                address("a".repeat(32)),
+                destination(),
+            )
+        }
+
+        assertEquals(ChromeDownloadErrorCode.RESPONSE_TOO_LARGE, error.code)
+        assertEquals(0, bodyReads)
+    }
+
+    @Test
     fun `정확히 128 MiB 응답은 크기 제한을 통과한다`() = runTest {
         val transport = FakeTransport(
             ChromeDownloadResponse(

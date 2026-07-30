@@ -43,9 +43,10 @@ class CompatibilityAnalyzer(
         extensionRoot: Path,
         profile: BrowserProfile,
         sourceSha256: String?,
+        ledger: AnalysisBudgetLedger = AnalysisBudgetLedger(control.policy),
     ): CompatibilityReport {
         profile.validate()
-        val report = analyzeUnsealed(extensionRoot, profile)
+        val report = analyzeUnsealed(extensionRoot, profile, ledger)
         return report.copy(
             sourceSha256 = sourceSha256,
             browserProfileSha256 = profile.canonicalSha256(),
@@ -55,6 +56,7 @@ class CompatibilityAnalyzer(
     private fun analyzeUnsealed(
         extensionRoot: Path,
         profile: BrowserProfile,
+        ledger: AnalysisBudgetLedger,
     ): CompatibilityReport {
         val manifestPath = extensionRoot.resolve("manifest.json")
         if (!manifestPath.isRegularFile()) {
@@ -62,7 +64,7 @@ class CompatibilityAnalyzer(
         }
         val manifestBytes = Files.size(manifestPath)
         if (manifestBytes > control.policy.maxManifestBytes) {
-            return budgetExceededReport(
+            return analysisBudgetExceededReport(
                 manifestVersion = null,
                 name = null,
                 version = null,
@@ -96,19 +98,29 @@ class CompatibilityAnalyzer(
             ).toSet()
         when (val inventory = AnalysisInventory.inspect(
             extensionRoot,
-            control.policy,
+            ledger,
             control::checkCancelled,
         )) {
             AnalysisInventoryResult.Allowed -> Unit
-            is AnalysisInventoryResult.Exceeded -> return budgetExceededReport(
+            is AnalysisInventoryResult.Exceeded -> return analysisBudgetExceededReport(
+                exceeded = inventory,
+                manifestVersion = manifestVersion,
+                name = name,
+                version = version,
+                permissions = permissions,
+            )
+        }
+        val apiScan = try {
+            scanApiCalls(extensionRoot, manifest, ledger)
+        } catch (error: AnalysisBudgetExceededException) {
+            return analysisBudgetExceededReport(
+                error.exceeded,
                 manifestVersion,
                 name,
                 version,
                 permissions,
-                inventory,
             )
         }
-        val apiScan = scanApiCalls(extensionRoot, manifest)
         val usedApis = (
             apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
             ).toSortedSet()
@@ -242,9 +254,18 @@ class CompatibilityAnalyzer(
         )
     }
 
-    private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
+    private fun scanApiCalls(
+        root: Path,
+        manifest: JsonObject,
+        ledger: AnalysisBudgetLedger,
+    ): ApiScan {
         val found = mutableSetOf<String>()
-        val runtimeClosure = RuntimeResourceIndex.create(root, manifest, control)
+        val runtimeClosure = RuntimeResourceIndex.create(
+            root,
+            manifest,
+            control,
+            ledger,
+        )
         var dynamicUsage = runtimeClosure.unresolvedDependency
         Files.walk(root).use { paths ->
             paths.filter { path ->
@@ -256,7 +277,16 @@ class CompatibilityAnalyzer(
                     )
             }.forEach { path ->
                 control.checkCancelled()
-                val source = runCatching { path.readText() }.getOrDefault("")
+                ledger.reserveText(path, Files.size(path))
+                val source = try {
+                    path.readText()
+                } catch (error: java.util.concurrent.CancellationException) {
+                    throw error
+                } catch (error: AnalysisBudgetExceededException) {
+                    throw error
+                } catch (_: Exception) {
+                    ""
+                }
                 control.checkCancelled()
                 val apiSource = if (path.extension.lowercase() == "html") {
                     RuntimeSourceScanner.scanHtmlScripts(source).inlineSource
@@ -497,29 +527,6 @@ class CompatibilityAnalyzer(
         usedApis = emptySet(),
         unsupportedApis = emptySet(),
         issues = listOf(CompatibilityIssue(code, message, blocking = true)),
-    )
-
-    private fun budgetExceededReport(
-        manifestVersion: Int?,
-        name: String?,
-        version: String?,
-        permissions: Set<String>,
-        exceeded: AnalysisInventoryResult.Exceeded,
-    ): CompatibilityReport = CompatibilityReport(
-        status = CompatibilityStatus.UNKNOWN,
-        manifestVersion = manifestVersion,
-        extensionName = name,
-        extensionVersion = version,
-        declaredPermissions = permissions.toSortedSet(),
-        usedApis = emptySet(),
-        unsupportedApis = emptySet(),
-        issues = listOf(
-            CompatibilityIssue(
-                code = "analysis_budget_exceeded",
-                message = "${exceeded.metric}: ${exceeded.actual} > ${exceeded.limit}",
-                blocking = true,
-            ),
-        ),
     )
 
     private fun report(

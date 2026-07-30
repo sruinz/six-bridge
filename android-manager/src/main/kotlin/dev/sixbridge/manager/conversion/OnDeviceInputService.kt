@@ -522,7 +522,7 @@ class OnDeviceInputService(
             }
             SixDraftProbe.NotDraft -> Unit
             is SixDraftProbe.Valid -> {
-                if (probe.schemaVersion != 2) {
+                if (probe.schemaVersion !in 2..3) {
                     inputFailure(
                         OnDeviceInputErrorCode.INVALID_DRAFT,
                         "지원하지 않는 SixDraft schema입니다.",
