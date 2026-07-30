@@ -138,7 +138,9 @@ class ConversionWorkStore internal constructor(
                 claimed.toRestored(tokenDirectory, inputAlreadyVerified = true)
                     ?: throw IllegalStateException("새 작업을 복구할 수 없습니다.")
             } catch (error: CancellationException) {
-                throw error
+                val token = claimedToken
+                if (token == null) throw error
+                throw ConversionWorkClaimedCancellationException(token, error)
             } catch (error: Throwable) {
                 throw ConversionWorkCreateException(claimedToken, error)
             }

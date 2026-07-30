@@ -228,6 +228,15 @@ internal class ConversionWorkCreateException(
     cause,
 )
 
+internal class ConversionWorkClaimedCancellationException(
+    val claimedToken: String,
+    val originalCancellation: CancellationException,
+) : CancellationException(originalCancellation.message) {
+    init {
+        initCause(originalCancellation)
+    }
+}
+
 internal class ConversionCleanupCancellationException(
     val token: String,
     cause: CancellationException,

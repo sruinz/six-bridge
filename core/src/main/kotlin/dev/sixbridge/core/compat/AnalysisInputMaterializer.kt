@@ -16,6 +16,7 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.text.Normalizer
 import java.util.Locale
+import java.util.concurrent.CancellationException
 
 enum class AnalysisArchiveKind {
     ZIP,
@@ -27,11 +28,24 @@ object AnalysisInputMaterializer {
         root: Path,
         control: AnalysisControl,
         snapshotter: (Path) -> T,
+    ): T = snapshotDirectory(
+        root = root,
+        control = control,
+        cleanupSnapshot = ::deleteTree,
+        snapshotter = snapshotter,
+    )
+
+    internal fun <T> snapshotDirectory(
+        root: Path,
+        control: AnalysisControl,
+        cleanupSnapshot: (Path) -> Unit,
+        snapshotter: (Path) -> T,
     ): T {
         val ledger = AnalysisBudgetLedger(control.policy)
         val normalizedRoot = root.toAbsolutePath().normalize()
         val rootIdentity = fileIdentity(normalizedRoot, directory = true)
         val snapshot = Files.createTempDirectory("sixbridge-analysis-input-")
+        var primaryFailure: Throwable? = null
         return try {
             Files.walkFileTree(
                 normalizedRoot,
@@ -83,8 +97,11 @@ object AnalysisInputMaterializer {
             }
             control.checkCancelled()
             snapshotter(snapshot)
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
         } finally {
-            deleteTree(snapshot)
+            completeSnapshotCleanup(snapshot, cleanupSnapshot, primaryFailure)
         }
     }
 
@@ -93,6 +110,22 @@ object AnalysisInputMaterializer {
         kind: AnalysisArchiveKind,
         control: AnalysisControl,
         payloadReader: (Path) -> ByteArray = Files::readAllBytes,
+    ): ByteArray = readArchive(
+        path = path,
+        kind = kind,
+        control = control,
+        cleanupSnapshot = {
+            Files.deleteIfExists(it)
+        },
+        payloadReader = payloadReader,
+    )
+
+    internal fun readArchive(
+        path: Path,
+        kind: AnalysisArchiveKind,
+        control: AnalysisControl,
+        cleanupSnapshot: (Path) -> Unit,
+        payloadReader: (Path) -> ByteArray,
     ): ByteArray {
         val attributes = Files.readAttributes(
             path,
@@ -103,6 +136,7 @@ object AnalysisInputMaterializer {
             "분석 archive는 일반 파일이어야 합니다."
         }
         val snapshot = Files.createTempFile("sixbridge-analysis-archive-", ".bin")
+        var primaryFailure: Throwable? = null
         return try {
             FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
                 val size = channel.size()
@@ -115,8 +149,11 @@ object AnalysisInputMaterializer {
             preflightArchive(snapshot, kind, control)
             control.checkCancelled()
             payloadReader(snapshot)
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
         } finally {
-            Files.deleteIfExists(snapshot)
+            completeSnapshotCleanup(snapshot, cleanupSnapshot, primaryFailure)
         }
     }
 
@@ -311,6 +348,28 @@ object AnalysisInputMaterializer {
                 }
             },
         )
+    }
+
+    private fun completeSnapshotCleanup(
+        snapshot: Path,
+        cleanupSnapshot: (Path) -> Unit,
+        primaryFailure: Throwable?,
+    ) {
+        val cleanupFailure = try {
+            cleanupSnapshot(snapshot)
+            null
+        } catch (error: Throwable) {
+            error
+        }
+        if (cleanupFailure != null) {
+            if (primaryFailure is CancellationException) {
+                if (cleanupFailure !== primaryFailure) {
+                    primaryFailure.addSuppressed(cleanupFailure)
+                }
+            } else {
+                throw cleanupFailure
+            }
+        }
     }
 
     private data class FileIdentity(

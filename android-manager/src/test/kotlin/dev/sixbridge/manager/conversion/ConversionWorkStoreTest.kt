@@ -488,21 +488,112 @@ class ConversionWorkStoreTest {
     }
 
     @Test
-    fun `DAO create commit 직후 cancellation은 active owner row를 잃지 않는다`() = runTest {
+    fun `DAO create commit 직후 cancellation은 claimed token과 원인을 보존한다`() = runTest {
+        val cancellation = CancellationException("simulated death")
         val store = store(
             hooks = ConversionWorkStoreHooks(
-                afterCreateClaim = { throw CancellationException("simulated death") },
+                afterCreateClaim = { throw cancellation },
             ),
         )
 
-        assertFailsWith<CancellationException> {
+        val thrown = assertFailsWith<ConversionWorkClaimedCancellationException> {
             store.create(artifact("input".encodeToByteArray()))
         }
 
         val row = requireNotNull(dao.get())
+        assertEquals(row.token, thrown.claimedToken)
+        assertTrue(thrown.originalCancellation === cancellation)
         assertTrue(isUuid(row.token))
         assertEquals(1L, row.generation)
     }
+
+    @Test
+    fun `DAO claim 전 cancellation은 token 없는 원 cancellation을 보존한다`() = runTest {
+        val cancellation = CancellationException("cancel before claim")
+        val store = store(
+            hooks = ConversionWorkStoreHooks(
+                listFiles = { throw cancellation },
+            ),
+        )
+
+        val thrown = assertFailsWith<CancellationException> {
+            store.create(artifact("input".encodeToByteArray()))
+        }
+
+        assertEquals(cancellation.message, thrown.message)
+        assertFalse(thrown is ConversionWorkClaimedCancellationException)
+        assertNull(dao.get())
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `coordinator는 input copy 뒤 claimed cancellation을 exact token으로 정리한다`() =
+        runTest {
+            val cancellation = CancellationException("cancel after input copy")
+            val input = artifact("input".encodeToByteArray())
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterInputCopied = { throw cancellation },
+                ),
+            )
+            val generatedRoot = File(sourceRoot, "claimed-cancel-generated").apply {
+                check(mkdir())
+            }
+            val coordinator = conversionCoordinator(
+                workStore = workStore,
+                bundleStore = GeneratedBundleStore(
+                    filesDir = generatedRoot,
+                    wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+                ),
+                inputArtifact = input,
+            )
+
+            val thrown = assertFailsWith<CancellationException> {
+                coordinator.begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                )
+            }
+
+            assertEquals(cancellation.message, thrown.message)
+            assertFalse(thrown is ConversionWorkClaimedCancellationException)
+            assertNull(dao.get())
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        }
+
+    @Test
+    fun `coordinator claimed cancellation cleanup 실패는 exact token retry를 보존한다`() =
+        runTest {
+            val cancellation = CancellationException("cancel after input copy")
+            val input = artifact("input".encodeToByteArray())
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { false },
+                    afterInputCopied = { throw cancellation },
+                ),
+            )
+            val generatedRoot = File(sourceRoot, "claimed-cancel-pending-generated").apply {
+                check(mkdir())
+            }
+            val coordinator = conversionCoordinator(
+                workStore = workStore,
+                bundleStore = GeneratedBundleStore(
+                    filesDir = generatedRoot,
+                    wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+                ),
+                inputArtifact = input,
+            )
+
+            val thrown = assertFailsWith<ConversionCleanupCancellationException> {
+                coordinator.begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                )
+            }
+
+            assertEquals(requireNotNull(dao.get()).token, thrown.token)
+            assertTrue(thrown.cause === cancellation)
+            assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
+            assertTrue(File(root, thrown.token).isDirectory)
+        }
 
     @Test
     fun `BUILDING crash artifact cleanup 실패는 stage를 내리지 않고 재시도 가능하게 둔다`() =
@@ -1003,7 +1094,7 @@ class ConversionWorkStoreTest {
             ).apply {
                 writeText("generated")
             }
-            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+            val coordinator = conversionCoordinator(workStore, bundleStore)
 
             assertFalse(coordinator.discard(current.token))
             assertFalse(bundleFile.exists())
@@ -1051,7 +1142,7 @@ class ConversionWorkStoreTest {
                 },
                 wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
             )
-            val coordinator = discardOnlyCoordinator(
+            val coordinator = conversionCoordinator(
                 workStore = workStore,
                 bundleStore = bundleStore,
                 onAnalyze = { analyzeCalls += 1 },
@@ -1096,7 +1187,7 @@ class ConversionWorkStoreTest {
                 },
                 wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
             )
-            val coordinator = discardOnlyCoordinator(
+            val coordinator = conversionCoordinator(
                 workStore = workStore,
                 bundleStore = bundleStore,
                 onAnalyze = { analyzeCalls += 1 },
@@ -1134,7 +1225,7 @@ class ConversionWorkStoreTest {
                 },
                 wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
             )
-            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+            val coordinator = conversionCoordinator(workStore, bundleStore)
 
             assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
 
@@ -1166,7 +1257,7 @@ class ConversionWorkStoreTest {
                 },
                 wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
             )
-            val coordinator = discardOnlyCoordinator(
+            val coordinator = conversionCoordinator(
                 workStore = workStore,
                 bundleStore = bundleStore,
                 profileSnapshot = SamsungProfileSnapshot.Supported(profile()),
@@ -1244,23 +1335,32 @@ class ConversionWorkStoreTest {
         hooks = hooks,
     )
 
-    private fun discardOnlyCoordinator(
+    private fun conversionCoordinator(
         workStore: ConversionWorkStore,
         bundleStore: GeneratedBundleStore,
         profileSnapshot: SamsungProfileSnapshot? = null,
         onAnalyze: () -> Unit = {},
+        inputArtifact: OnDeviceInputArtifact? = null,
     ) = OnDeviceConversionCoordinator(
         input = object : ConversionInputPort {
             override suspend fun acquire(
                 request: OnDeviceInputRequest,
             ): OnDeviceInputArtifact =
-                error("discard test에서 input은 사용하지 않습니다.")
+                inputArtifact ?: error("discard test에서 input은 사용하지 않습니다.")
 
             override suspend fun release(artifact: OnDeviceInputArtifact): Boolean =
-                error("discard test에서 input은 사용하지 않습니다.")
+                if (inputArtifact != null) {
+                    true
+                } else {
+                    error("discard test에서 input은 사용하지 않습니다.")
+                }
 
             override suspend fun reclaimOrphans(): Boolean =
-                error("discard test에서 input은 사용하지 않습니다.")
+                if (inputArtifact != null) {
+                    true
+                } else {
+                    error("discard test에서 input은 사용하지 않습니다.")
+                }
         },
         work = DefaultConversionWorkPort(workStore),
         profiles = ConversionProfilePort {

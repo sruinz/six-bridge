@@ -88,11 +88,19 @@ internal class OnDeviceConversionCoordinator(
             }
             analyzeJob(requireNotNull(createdJob), markAwaiting = true)
         } catch (error: CancellationException) {
-            if (createdJob == null) throw error
-            when (val cleanup = discardInterrupted(createdJob.token)) {
-                RestoredConversion.InterruptedDiscarded -> throw error
+            val claimedCancellation =
+                error as? ConversionWorkClaimedCancellationException
+            val cleanupToken =
+                createdJob?.token ?: claimedCancellation?.claimedToken ?: throw error
+            val originalCancellation =
+                claimedCancellation?.originalCancellation ?: error
+            when (val cleanup = discardInterrupted(cleanupToken)) {
+                RestoredConversion.InterruptedDiscarded -> throw originalCancellation
                 is RestoredConversion.InterruptedCleanupPending ->
-                    throw ConversionCleanupCancellationException(cleanup.token, error)
+                    throw ConversionCleanupCancellationException(
+                        cleanup.token,
+                        originalCancellation,
+                    )
                 else -> error("취소 cleanup은 완료 또는 pending이어야 합니다.")
             }
         }

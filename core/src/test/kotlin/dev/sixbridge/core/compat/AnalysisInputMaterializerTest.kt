@@ -1,11 +1,13 @@
 package dev.sixbridge.core.compat
 
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption.READ
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -203,6 +205,64 @@ class AnalysisInputMaterializerTest {
         }
 
         assertContentEquals(expected, captured)
+    }
+
+    @Test
+    fun `directory cleanup 실패는 primary cancellation에 suppressed로 남는다`() {
+        val root = Files.createTempDirectory("six-input-cleanup-directory-")
+        Files.writeString(root.resolve("manifest.json"), validManifest)
+        val cancellation = CancellationException("cancel directory snapshot")
+        val cleanup = IOException("directory cleanup failed")
+
+        val thrown = assertFailsWith<CancellationException> {
+            AnalysisInputMaterializer.snapshotDirectory(
+                root = root,
+                control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+                cleanupSnapshot = { throw cleanup },
+                snapshotter = { throw cancellation },
+            )
+        }
+
+        assertTrue(thrown === cancellation)
+        assertEquals(listOf(cleanup), thrown.suppressed.toList())
+    }
+
+    @Test
+    fun `archive cleanup 실패는 primary cancellation에 suppressed로 남는다`() {
+        val input = zipWithScript("worker.js", "console.log('worker')")
+        val cancellation = CancellationException("cancel archive reader")
+        val cleanup = IOException("archive cleanup failed")
+
+        val thrown = assertFailsWith<CancellationException> {
+            AnalysisInputMaterializer.readArchive(
+                path = input,
+                kind = AnalysisArchiveKind.ZIP,
+                control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+                cleanupSnapshot = { throw cleanup },
+                payloadReader = { throw cancellation },
+            )
+        }
+
+        assertTrue(thrown === cancellation)
+        assertEquals(listOf(cleanup), thrown.suppressed.toList())
+    }
+
+    @Test
+    fun `primary가 없으면 snapshot cleanup 실패를 직접 전파한다`() {
+        val input = zipWithScript("worker.js", "console.log('worker')")
+        val cleanup = IOException("archive cleanup failed")
+
+        val thrown = assertFailsWith<IOException> {
+            AnalysisInputMaterializer.readArchive(
+                path = input,
+                kind = AnalysisArchiveKind.ZIP,
+                control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+                cleanupSnapshot = { throw cleanup },
+                payloadReader = Files::readAllBytes,
+            )
+        }
+
+        assertTrue(thrown === cleanup)
     }
 
     @Test
