@@ -17,6 +17,12 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.Locale
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 data class DesktopDownloadResponse(
     val statusCode: Int,
@@ -25,8 +31,12 @@ data class DesktopDownloadResponse(
     val location: String?,
     val body: InputStream,
 ) : Closeable {
+    private val closed = AtomicBoolean(false)
+
     override fun close() {
-        body.close()
+        if (closed.compareAndSet(false, true)) {
+            body.close()
+        }
     }
 }
 
@@ -34,9 +44,19 @@ fun interface DesktopDownloadTransport {
     fun execute(uri: URI): DesktopDownloadResponse
 }
 
-class DesktopChromeCrxDownloader(
-    private val transport: DesktopDownloadTransport = JavaHttpDownloadTransport(),
+class DesktopChromeCrxDownloader private constructor(
+    private val transport: DesktopDownloadTransport,
+    private val bodyReadTimeout: Duration,
+    private val deadlineScheduler: ScheduledExecutorService,
 ) : ChromeCrxDownloader {
+    constructor() : this(JavaHttpDownloadTransport())
+
+    constructor(transport: DesktopDownloadTransport) : this(
+        transport = transport,
+        bodyReadTimeout = DEFAULT_BODY_READ_TIMEOUT,
+        deadlineScheduler = DEFAULT_DEADLINE_SCHEDULER,
+    )
+
     override fun download(address: ChromeWebStoreAddress): ByteArray {
         return try {
             downloadVerified(address)
@@ -106,6 +126,19 @@ class DesktopChromeCrxDownloader(
     }
 
     private fun readBounded(response: DesktopDownloadResponse): ByteArray {
+        val deadline = BodyReadDeadline(response)
+        val deadlineTask = scheduleDeadline(deadline)
+        try {
+            return readBounded(response, deadline)
+        } finally {
+            deadlineTask.cancel(false)
+        }
+    }
+
+    private fun readBounded(
+        response: DesktopDownloadResponse,
+        deadline: BodyReadDeadline,
+    ): ByteArray {
         val declaredLength = response.contentLength
         if (declaredLength != null && declaredLength !in 0..MAX_DOWNLOAD_BYTES) {
             throw UnsupportedInputException(
@@ -123,7 +156,8 @@ class DesktopChromeCrxDownloader(
             throwIfInterrupted()
             val remainingThroughBoundary = MAX_DOWNLOAD_BYTES - total + 1
             val readLimit = minOf(buffer.size.toLong(), remainingThroughBoundary).toInt()
-            val count = response.body.read(buffer, 0, readLimit)
+            val count = readResponseBody(response, buffer, readLimit, deadline)
+            throwIfDeadlineExpired(deadline)
             if (count < 0) break
             if (count == 0) {
                 throw UnsupportedInputException(
@@ -149,7 +183,62 @@ class DesktopChromeCrxDownloader(
                 "Chrome CRX3 다운로드 Content-Length가 실제 body와 다릅니다.",
             )
         }
+        if (!deadline.complete()) {
+            throw downloadTimedOut()
+        }
         return output.toByteArray()
+    }
+
+    private fun readResponseBody(
+        response: DesktopDownloadResponse,
+        buffer: ByteArray,
+        readLimit: Int,
+        deadline: BodyReadDeadline,
+    ): Int {
+        return try {
+            response.body.read(buffer, 0, readLimit)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw downloadCancelled()
+        } catch (_: InterruptedIOException) {
+            Thread.currentThread().interrupt()
+            throw downloadCancelled()
+        } catch (_: CancellationException) {
+            throw downloadCancelled()
+        } catch (_: Exception) {
+            if (Thread.currentThread().isInterrupted) {
+                throw downloadCancelled()
+            }
+            throwIfDeadlineExpired(deadline)
+            throw UnsupportedInputException(
+                "Chrome CRX3 다운로드 body를 읽지 못했습니다.",
+            )
+        }
+    }
+
+    private fun scheduleDeadline(deadline: BodyReadDeadline): ScheduledFuture<*> {
+        return try {
+            deadlineScheduler.schedule(
+                deadline,
+                bodyReadTimeout.toNanos(),
+                TimeUnit.NANOSECONDS,
+            )
+        } catch (_: CancellationException) {
+            throw downloadCancelled()
+        } catch (_: Exception) {
+            if (Thread.currentThread().isInterrupted) {
+                throw downloadCancelled()
+            }
+            throw UnsupportedInputException(
+                "Chrome CRX3 다운로드 제한 시간을 설정하지 못했습니다.",
+            )
+        }
+    }
+
+    private fun throwIfDeadlineExpired(deadline: BodyReadDeadline) {
+        if (deadline.isExpired()) {
+            throw downloadTimedOut()
+        }
     }
 
     private fun executeTransport(uri: URI): DesktopDownloadResponse {
@@ -270,7 +359,12 @@ class DesktopChromeCrxDownloader(
         } catch (_: InterruptedIOException) {
             Thread.currentThread().interrupt()
             throw downloadCancelled()
+        } catch (_: CancellationException) {
+            throw downloadCancelled()
         } catch (_: Exception) {
+            if (Thread.currentThread().isInterrupted) {
+                throw downloadCancelled()
+            }
             throw UnsupportedInputException(
                 "Chrome CRX3 다운로드 응답을 안전하게 닫지 못했습니다.",
             )
@@ -286,6 +380,9 @@ class DesktopChromeCrxDownloader(
     private fun downloadCancelled(): CancellationException =
         CancellationException("Chrome CRX3 다운로드가 취소되었습니다.")
 
+    private fun downloadTimedOut(): UnsupportedInputException =
+        UnsupportedInputException("Chrome CRX3 다운로드 body 시간이 제한을 초과했습니다.")
+
     private fun updateUri(address: ChromeWebStoreAddress): URI = URI(
         "https://clients2.google.com/service/update2/crx" +
             "?response=redirect&prodversion=130.0&acceptformat=crx3" +
@@ -293,6 +390,19 @@ class DesktopChromeCrxDownloader(
     )
 
     companion object {
+        internal fun testing(
+            transport: DesktopDownloadTransport,
+            bodyReadTimeout: Duration,
+            deadlineScheduler: ScheduledExecutorService,
+        ): DesktopChromeCrxDownloader {
+            require(!bodyReadTimeout.isZero && !bodyReadTimeout.isNegative)
+            return DesktopChromeCrxDownloader(
+                transport = transport,
+                bodyReadTimeout = bodyReadTimeout,
+                deadlineScheduler = deadlineScheduler,
+            )
+        }
+
         private const val MAX_REDIRECTS = 5
         private const val MAX_DOWNLOAD_BYTES = 134_217_728L
         private const val READ_BUFFER_SIZE = 64 * 1024
@@ -310,6 +420,42 @@ class DesktopChromeCrxDownloader(
         )
         private const val GVT1_SUFFIX = ".gvt1.com"
         private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
+        private val DEFAULT_BODY_READ_TIMEOUT = Duration.ofSeconds(60)
+        private val DEFAULT_DEADLINE_SCHEDULER: ScheduledExecutorService =
+            ScheduledThreadPoolExecutor(1) { runnable ->
+                Thread(runnable, "sixbridge-crx-download-deadline").apply {
+                    isDaemon = true
+                }
+            }.apply {
+                removeOnCancelPolicy = true
+            }
+    }
+
+    private class BodyReadDeadline(
+        private val response: DesktopDownloadResponse,
+    ) : Runnable {
+        private val state = AtomicReference(BodyReadState.ACTIVE)
+
+        override fun run() {
+            if (state.compareAndSet(BodyReadState.ACTIVE, BodyReadState.EXPIRED)) {
+                try {
+                    response.close()
+                } catch (_: Exception) {
+                    // read 경계가 고정 timeout 오류로 변환하며 close 오류는 노출하지 않는다.
+                }
+            }
+        }
+
+        fun isExpired(): Boolean = state.get() == BodyReadState.EXPIRED
+
+        fun complete(): Boolean =
+            state.compareAndSet(BodyReadState.ACTIVE, BodyReadState.COMPLETED)
+    }
+
+    private enum class BodyReadState {
+        ACTIVE,
+        EXPIRED,
+        COMPLETED,
     }
 }
 

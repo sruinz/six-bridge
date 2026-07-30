@@ -10,11 +10,14 @@ import java.io.InterruptedIOException
 import java.net.URI
 import java.nio.file.Files
 import java.security.KeyPairGenerator
+import java.time.Duration
 import java.util.ArrayDeque
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -27,6 +30,16 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class DesktopChromeCrxDownloaderTest {
+    @Test
+    fun `public downloader constructor는 기본 transport와 주입 transport 표면을 유지한다`() {
+        assertNotNull(DesktopChromeCrxDownloader::class.java.getConstructor())
+        assertNotNull(
+            DesktopChromeCrxDownloader::class.java.getConstructor(
+                DesktopDownloadTransport::class.java,
+            ),
+        )
+    }
+
     @Test
     fun `고정 Chrome update endpoint에서 서명과 요청 ID가 일치하는 CRX3만 반환한다`() {
         val fixture = response(VALID_CRX.bytes, "application/x-chrome-extension")
@@ -42,7 +55,7 @@ class DesktopChromeCrxDownloaderTest {
                 "&x=id%3D${VALID_CRX.extensionId}%26uc",
             transport.requested.single().toASCIIString(),
         )
-        assertTrue(fixture.closed.get())
+        assertEquals(1, fixture.closeCount.get())
     }
 
     @Test
@@ -58,7 +71,7 @@ class DesktopChromeCrxDownloaderTest {
         assertContentEquals(VALID_CRX.bytes, downloaded)
         assertEquals("clients2.google.com", transport.requested[1].host)
         assertEquals("R3---SN.GVT1.COM", transport.requested[2].host)
-        assertTrue(listOf(first, second, final).all { it.closed.get() })
+        assertTrue(listOf(first, second, final).all { it.closeCount.get() == 1 })
     }
 
     @Test
@@ -85,7 +98,7 @@ class DesktopChromeCrxDownloaderTest {
                     .download(address(VALID_CRX.extensionId))
             }
 
-            assertTrue(fixture.closed.get(), location)
+            assertEquals(1, fixture.closeCount.get(), location)
             assertFalse(error.message.orEmpty().contains(VALID_CRX.extensionId), location)
             assertFalse(error.message.orEmpty().contains(location), location)
         }
@@ -103,7 +116,7 @@ class DesktopChromeCrxDownloaderTest {
                 .download(address(VALID_CRX.extensionId)),
         )
         assertEquals(6, allowedTransport.requested.size)
-        assertTrue((allowedRedirects + final).all { it.closed.get() })
+        assertTrue((allowedRedirects + final).all { it.closeCount.get() == 1 })
 
         val excessiveRedirects = (1..6).map { redirect("/excessive-$it") }
         val excessiveTransport = FakeTransport(*excessiveRedirects.toTypedArray())
@@ -113,7 +126,7 @@ class DesktopChromeCrxDownloaderTest {
                 .download(address(VALID_CRX.extensionId))
         }
         assertEquals(6, excessiveTransport.requested.size)
-        assertTrue(excessiveRedirects.all { it.closed.get() })
+        assertTrue(excessiveRedirects.all { it.closeCount.get() == 1 })
     }
 
     @Test
@@ -128,7 +141,7 @@ class DesktopChromeCrxDownloaderTest {
                 DesktopChromeCrxDownloader(FakeTransport(fixture))
                     .download(address(VALID_CRX.extensionId))
             }
-            assertTrue(fixture.closed.get())
+            assertEquals(1, fixture.closeCount.get())
         }
     }
 
@@ -143,7 +156,7 @@ class DesktopChromeCrxDownloaderTest {
         }
 
         assertEquals(MAX_DOWNLOAD_BYTES + 1, body.bytesRead)
-        assertTrue(fixture.closed.get())
+        assertEquals(1, fixture.closeCount.get())
     }
 
     @Test
@@ -162,7 +175,7 @@ class DesktopChromeCrxDownloaderTest {
                 DesktopChromeCrxDownloader(FakeTransport(fixture))
                     .download(address(VALID_CRX.extensionId))
             }
-            assertTrue(fixture.closed.get())
+            assertEquals(1, fixture.closeCount.get())
         }
     }
 
@@ -176,7 +189,7 @@ class DesktopChromeCrxDownloaderTest {
             DesktopChromeCrxDownloader(FakeTransport(magicOnly))
                 .download(address(VALID_CRX.extensionId))
         }
-        assertTrue(magicOnly.closed.get())
+        assertEquals(1, magicOnly.closeCount.get())
 
         val requestedId = if (VALID_CRX.extensionId == "a".repeat(32)) {
             "b".repeat(32)
@@ -188,7 +201,7 @@ class DesktopChromeCrxDownloaderTest {
             DesktopChromeCrxDownloader(FakeTransport(mismatch))
                 .download(address(requestedId))
         }
-        assertTrue(mismatch.closed.get())
+        assertEquals(1, mismatch.closeCount.get())
         assertFalse(error.message.orEmpty().contains(requestedId))
         assertFalse(error.message.orEmpty().contains(VALID_CRX.extensionId))
     }
@@ -224,6 +237,180 @@ class DesktopChromeCrxDownloaderTest {
     }
 
     @Test
+    fun `body read 외부 오류는 메시지와 cause를 숨기고 response를 정확히 한 번 닫는다`() {
+        val requestedId = VALID_CRX.extensionId
+        val secret = "secret ?response=redirect&x=id%3D$requestedId%26uc"
+
+        listOf(
+            UnsupportedInputException(secret),
+            IOException(secret),
+        ).forEach { readFailure ->
+            val fixture = response(
+                body = FailingInputStream(readFailure = readFailure),
+                contentType = null,
+                contentLength = null,
+            )
+            var downloaded: ByteArray? = null
+
+            val error = assertFailsWith<UnsupportedInputException> {
+                downloaded = DesktopChromeCrxDownloader(FakeTransport(fixture))
+                    .download(address(requestedId))
+            }
+
+            assertNull(downloaded)
+            assertNull(error.cause)
+            assertFalse(error.message.orEmpty().contains(requestedId))
+            assertFalse(error.message.orEmpty().contains("response=redirect"))
+            assertFalse(error.message.orEmpty().contains("x=id"))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `body close 외부 오류도 메시지와 cause를 숨기고 bytes를 반환하지 않는다`() {
+        val requestedId = VALID_CRX.extensionId
+        val secret = "secret ?response=redirect&x=id%3D$requestedId%26uc"
+
+        listOf(
+            UnsupportedInputException(secret),
+            IOException(secret),
+        ).forEach { closeFailure ->
+            val fixture = response(
+                body = FailingInputStream(
+                    bytes = VALID_CRX.bytes,
+                    closeFailure = closeFailure,
+                ),
+                contentType = "application/x-chrome-extension",
+                contentLength = VALID_CRX.bytes.size.toLong(),
+            )
+            var downloaded: ByteArray? = null
+
+            val error = assertFailsWith<UnsupportedInputException> {
+                downloaded = DesktopChromeCrxDownloader(FakeTransport(fixture))
+                    .download(address(requestedId))
+            }
+
+            assertNull(downloaded)
+            assertNull(error.cause)
+            assertFalse(error.message.orEmpty().contains(requestedId))
+            assertFalse(error.message.orEmpty().contains("response=redirect"))
+            assertFalse(error.message.orEmpty().contains("x=id"))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `외부 interrupt가 없어도 streaming deadline이 stalled body를 닫고 종료한다`() {
+        val scheduler = testDeadlineScheduler()
+        val body = BlockingInputStream()
+        val fixture = response(body = body, contentType = null, contentLength = null)
+        val result = AtomicReference<ByteArray?>()
+        val failure = AtomicReference<Throwable?>()
+        val interruptedAtExit = AtomicBoolean(false)
+        val thread = Thread {
+            try {
+                result.set(
+                    DesktopChromeCrxDownloader.testing(
+                        transport = FakeTransport(fixture),
+                        bodyReadTimeout = Duration.ofMillis(50),
+                        deadlineScheduler = scheduler,
+                    ).download(address(VALID_CRX.extensionId)),
+                )
+            } catch (error: Throwable) {
+                failure.set(error)
+            } finally {
+                interruptedAtExit.set(Thread.currentThread().isInterrupted)
+            }
+        }
+
+        try {
+            thread.start()
+            assertTrue(body.started.await(3, TimeUnit.SECONDS))
+            thread.join(3_000)
+
+            assertFalse(thread.isAlive)
+            assertNull(result.get())
+            val error = assertNotNull(failure.get())
+            assertTrue(error is UnsupportedInputException)
+            assertNull(error.cause)
+            assertEquals(1, fixture.closeCount.get())
+            assertTrue(body.closed.get())
+            assertFalse(interruptedAtExit.get())
+            assertTrue(scheduler.queue.isEmpty())
+        } finally {
+            scheduler.shutdownNow()
+            thread.interrupt()
+            thread.join(3_000)
+        }
+    }
+
+    @Test
+    fun `정상 body 완료는 deadline task를 취소하고 scheduler queue를 비운다`() {
+        val scheduler = testDeadlineScheduler()
+        val fixture = response(VALID_CRX.bytes, "application/x-chrome-extension")
+
+        try {
+            val downloaded = DesktopChromeCrxDownloader.testing(
+                transport = FakeTransport(fixture),
+                bodyReadTimeout = Duration.ofSeconds(5),
+                deadlineScheduler = scheduler,
+            ).download(address(VALID_CRX.extensionId))
+
+            assertContentEquals(VALID_CRX.bytes, downloaded)
+            assertEquals(1, fixture.closeCount.get())
+            assertTrue(scheduler.queue.isEmpty())
+        } finally {
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `deadline close와 외부 interrupt가 경쟁해도 한 번만 닫고 interrupt를 보존한다`() {
+        val scheduler = testDeadlineScheduler()
+        val body = DeadlineInterruptRaceInputStream()
+        val fixture = response(body = body, contentType = null, contentLength = null)
+        val result = AtomicReference<ByteArray?>()
+        val failure = AtomicReference<Throwable?>()
+        val interruptedAtExit = AtomicBoolean(false)
+        val thread = Thread {
+            try {
+                result.set(
+                    DesktopChromeCrxDownloader.testing(
+                        transport = FakeTransport(fixture),
+                        bodyReadTimeout = Duration.ofMillis(50),
+                        deadlineScheduler = scheduler,
+                    ).download(address(VALID_CRX.extensionId)),
+                )
+            } catch (error: Throwable) {
+                failure.set(error)
+            } finally {
+                interruptedAtExit.set(Thread.currentThread().isInterrupted)
+            }
+        }
+
+        try {
+            thread.start()
+            assertTrue(body.started.await(3, TimeUnit.SECONDS))
+            assertTrue(body.closeStarted.await(3, TimeUnit.SECONDS))
+            thread.interrupt()
+            body.allowClose.countDown()
+            thread.join(3_000)
+
+            assertFalse(thread.isAlive)
+            assertNull(result.get())
+            assertTrue(assertNotNull(failure.get()) is CancellationException)
+            assertEquals(1, fixture.closeCount.get())
+            assertTrue(interruptedAtExit.get())
+            assertTrue(scheduler.queue.isEmpty())
+        } finally {
+            body.allowClose.countDown()
+            thread.interrupt()
+            thread.join(3_000)
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
     fun `body read interrupt는 response를 닫고 interrupt를 보존하며 bytes를 반환하지 않는다`() {
         val body = BlockingInputStream()
         val fixture = response(body = body, contentType = null, contentLength = null)
@@ -251,7 +438,7 @@ class DesktopChromeCrxDownloaderTest {
         assertFalse(thread.isAlive)
         assertNull(result.get())
         assertTrue(assertNotNull(failure.get()) is CancellationException)
-        assertTrue(fixture.closed.get())
+        assertEquals(1, fixture.closeCount.get())
         assertTrue(body.closed.get())
         assertTrue(interruptedAtExit.get())
     }
@@ -290,7 +477,7 @@ class DesktopChromeCrxDownloaderTest {
         statusCode: Int = 200,
         location: String? = null,
     ): ResponseFixture {
-        val closed = AtomicBoolean(false)
+        val closeCount = AtomicInteger()
         val tracked = object : InputStream() {
             override fun read(): Int = body.read()
 
@@ -298,7 +485,7 @@ class DesktopChromeCrxDownloaderTest {
                 body.read(target, offset, length)
 
             override fun close() {
-                closed.set(true)
+                closeCount.incrementAndGet()
                 body.close()
             }
         }
@@ -310,13 +497,13 @@ class DesktopChromeCrxDownloaderTest {
                 location = location,
                 body = tracked,
             ),
-            closed = closed,
+            closeCount = closeCount,
         )
     }
 
     private data class ResponseFixture(
         val response: DesktopDownloadResponse,
-        val closed: AtomicBoolean,
+        val closeCount: AtomicInteger,
     )
 
     private class FakeTransport(
@@ -357,6 +544,29 @@ class DesktopChromeCrxDownloaderTest {
         }
     }
 
+    private class FailingInputStream(
+        bytes: ByteArray = byteArrayOf(),
+        private val readFailure: Exception? = null,
+        private val closeFailure: Exception? = null,
+    ) : InputStream() {
+        private val delegate = ByteArrayInputStream(bytes)
+
+        override fun read(): Int {
+            readFailure?.let { throw it }
+            return delegate.read()
+        }
+
+        override fun read(target: ByteArray, offset: Int, length: Int): Int {
+            readFailure?.let { throw it }
+            return delegate.read(target, offset, length)
+        }
+
+        override fun close() {
+            closeFailure?.let { throw it }
+            delegate.close()
+        }
+    }
+
     private class BlockingInputStream : InputStream() {
         val started = CountDownLatch(1)
         val closed = AtomicBoolean(false)
@@ -377,6 +587,38 @@ class DesktopChromeCrxDownloaderTest {
             release.countDown()
         }
     }
+
+    private class DeadlineInterruptRaceInputStream : InputStream() {
+        val started = CountDownLatch(1)
+        val closeStarted = CountDownLatch(1)
+        val allowClose = CountDownLatch(1)
+        private val releaseRead = CountDownLatch(1)
+
+        override fun read(): Int {
+            started.countDown()
+            try {
+                releaseRead.await()
+            } catch (_: InterruptedException) {
+                throw InterruptedIOException("external interrupt raced with deadline")
+            }
+            return -1
+        }
+
+        override fun close() {
+            closeStarted.countDown()
+            allowClose.await()
+            releaseRead.countDown()
+        }
+    }
+
+    private fun testDeadlineScheduler(): ScheduledThreadPoolExecutor =
+        ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "desktop-crx-deadline-test").apply {
+                isDaemon = true
+            }
+        }.apply {
+            removeOnCancelPolicy = true
+        }
 
     companion object {
         private const val MAX_DOWNLOAD_BYTES = 134_217_728L
