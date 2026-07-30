@@ -122,6 +122,37 @@ class SystemInstallCoordinatorTest {
         }
 
     @Test
+    fun `시스템 문서 앱 출처와 정확 신원은 trusted installed로 조정한다`() =
+        runTest {
+            val fixture = fixture(
+                actual = expectedInstalled().copy(
+                    apkSha256 = WRAPPER_SHA,
+                    installSourceEvidence = InstallSourceEvidence.Known(
+                        GOOGLE_PACKAGE_INSTALLER,
+                        null,
+                    ),
+                ),
+            )
+            assertIs<SystemInstallRequestResult.ExportRequired>(
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+            )
+            assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+
+            val installed = assertIs<InstallState.Installed>(
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            )
+
+            assertEquals(
+                SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+                installed.samsungInternetSupport,
+            )
+            assertEquals(
+                FinalReceiptOrigin.MY_FILES,
+                fixture.pendingStore.loadFinalReceipt()?.origin,
+            )
+        }
+
+    @Test
     fun `ADB 출처도 정확 신원 확인 뒤 installed로 조정한다`() = runTest {
         val fixture = fixture(
             actual = expectedInstalled().copy(

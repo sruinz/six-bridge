@@ -248,6 +248,7 @@ class SystemInstallCoordinator(
                 } else {
                     when (classifySamsungInstallSource(actual.installSourceEvidence)) {
                         SamsungInstallSourceVerdict.ALLOWED_ADB,
+                        SamsungInstallSourceVerdict.ALLOWED_SYSTEM_DOCUMENTS,
                         SamsungInstallSourceVerdict.ALLOWED_MY_FILES,
                         -> InstallState.Installed(record.expected.packageName)
                         SamsungInstallSourceVerdict.UNVERIFIED_FILE_APP ->
@@ -258,7 +259,7 @@ class SystemInstallCoordinator(
                         SamsungInstallSourceVerdict.UNSUPPORTED ->
                             InstallState.Failed(
                                 "UNSUPPORTED_INSTALL_SOURCE",
-                                "내 파일에서 APK를 다시 설치해 주세요.",
+                                "지원되는 파일 앱에서 APK를 다시 설치해 주세요.",
                             )
                         SamsungInstallSourceVerdict.UNKNOWN ->
                             InstallState.Failed(

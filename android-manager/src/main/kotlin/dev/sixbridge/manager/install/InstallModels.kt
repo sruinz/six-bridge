@@ -82,6 +82,7 @@ enum class FinalReceiptOrigin {
     PROGRAM_CANCEL,
     RAW_TERMINAL,
     SYSTEM_INSTALLER,
+    // schema 1 legacy tag: 시스템 문서 앱과 Samsung My Files 수동 설치를 포함한다.
     MY_FILES,
 }
 

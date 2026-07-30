@@ -4,6 +4,7 @@ import dev.sixbridge.manager.wrapper.InstallSourceEvidence
 
 enum class SamsungInstallSourceVerdict {
     ALLOWED_ADB,
+    ALLOWED_SYSTEM_DOCUMENTS,
     ALLOWED_MY_FILES,
     UNVERIFIED_FILE_APP,
     UNSUPPORTED,
@@ -19,7 +20,10 @@ fun classifySamsungInstallSource(
             evidence.originatingPackageName == null ->
             SamsungInstallSourceVerdict.ALLOWED_ADB
         evidence.installingPackageName == GOOGLE_PACKAGE_INSTALLER &&
-            evidence.originatingPackageName in setOf(null, SAMSUNG_MY_FILES) ->
+            evidence.originatingPackageName == null ->
+            SamsungInstallSourceVerdict.ALLOWED_SYSTEM_DOCUMENTS
+        evidence.installingPackageName == GOOGLE_PACKAGE_INSTALLER &&
+            evidence.originatingPackageName == SAMSUNG_MY_FILES ->
             SamsungInstallSourceVerdict.ALLOWED_MY_FILES
         evidence.installingPackageName == GOOGLE_PACKAGE_INSTALLER &&
             evidence.originatingPackageName != MANAGER_PACKAGE ->
