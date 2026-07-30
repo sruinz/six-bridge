@@ -213,6 +213,7 @@ class RuntimeResourceIndex private constructor(
                         )
                     }
                 }
+                control.checkCancelled()
             }
 
             val scripts = rolesByResource.entries

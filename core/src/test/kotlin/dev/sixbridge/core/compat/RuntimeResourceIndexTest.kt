@@ -115,6 +115,25 @@ class RuntimeResourceIndexTest {
         }
     }
 
+    @Test
+    fun `runtime dependency 순회는 마지막 resource 처리 뒤 취소를 전달한다`() {
+        val root = workerExtension("""importScripts("./b.js");""")
+        root.resolve("b.js").writeText("console.log('b');")
+        var checkpoints = 0
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            checkpoints += 1
+            if (checkpoints == 8) throw CancellationException("cancel")
+        }
+
+        assertFailsWith<CancellationException> {
+            RuntimeResourceIndex.create(
+                root,
+                manifest("""{"service_worker":"background.js"}"""),
+                control,
+            )
+        }
+    }
+
     private fun workerExtension(source: String): Path =
         Files.createTempDirectory("sixbridge-index-").also { root ->
             root.resolve("background.js").writeText(source)
