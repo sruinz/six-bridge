@@ -1,5 +1,7 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityStatus
 import java.io.File
 import java.io.OutputStream
@@ -7,6 +9,7 @@ import java.util.concurrent.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -147,9 +150,13 @@ internal class OnDeviceConversionCoordinator(
                     ConversionFailureCode.PROFILE_UNKNOWN,
                 )
         }
+        val callerJob = currentCoroutineContext().job
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            callerJob.ensureActive()
+        }
         val analysis = try {
             work.withVerifiedInputFile(token) {
-                runtime.analyze(it, job.inputKind, profile)
+                runtime.analyze(it, job.inputKind, profile, control)
             }
         } catch (error: CancellationException) {
             throw error
@@ -364,9 +371,13 @@ internal class OnDeviceConversionCoordinator(
                     job.token,
                 )
         }
+        val callerJob = currentCoroutineContext().job
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            callerJob.ensureActive()
+        }
         val analysis = try {
             work.withVerifiedInputFile(job.token) {
-                runtime.analyze(it, job.inputKind, profile)
+                runtime.analyze(it, job.inputKind, profile, control)
             }
         } catch (error: CancellationException) {
             throw error
@@ -376,8 +387,8 @@ internal class OnDeviceConversionCoordinator(
                 job.token,
             )
         }
-        analysis.report.toBlockingFailure()?.let {
-            return ConversionBeginResult.Failure(it, job.token)
+        if (analysis.report.status == CompatibilityStatus.BLOCKED) {
+            return ConversionBeginResult.Failure(ConversionFailureCode.BLOCKED, job.token)
         }
         val profileSha256 = profile.canonicalSha256()
         if (markAwaiting) {

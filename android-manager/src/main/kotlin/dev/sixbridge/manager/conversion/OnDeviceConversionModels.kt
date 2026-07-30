@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.input.ExtensionInputKind
@@ -207,6 +208,7 @@ internal interface ConversionRuntimePort {
         input: File,
         kind: OnDeviceInputKind,
         profile: BrowserProfile,
+        control: AnalysisControl,
     ): ConversionAnalysisSnapshot
 
     fun prepare(

@@ -2,6 +2,8 @@ package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.ConversionState
@@ -503,24 +505,17 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
-    fun `blocked unknown partial은 reserve 전에 차단한다`() = runTest {
-        for (
-            (status, expected) in listOf(
-                CompatibilityStatus.BLOCKED to ConversionFailureCode.BLOCKED,
-                CompatibilityStatus.UNKNOWN to ConversionFailureCode.UNKNOWN,
-            )
-        ) {
-            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
-                compatibilityStatus = status
-            }
-            val failure = assertIs<ConversionBeginResult.Failure>(
-                fixture.coordinator().begin(
-                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
-                ),
-            )
-            assertEquals(expected, failure.code)
-            assertTrue("reserve" !in fixture.events)
+    fun `blocked와 미확인 partial은 reserve 전에 차단한다`() = runTest {
+        val blocked = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.BLOCKED
         }
+        val blockedFailure = assertIs<ConversionBeginResult.Failure>(
+            blocked.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+        assertEquals(ConversionFailureCode.BLOCKED, blockedFailure.code)
+        assertTrue("reserve" !in blocked.events)
 
         val partial = Fixture(temporaryFolder, mutableListOf())
         val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
@@ -538,6 +533,44 @@ class OnDeviceConversionCoordinatorTest {
         )
         assertEquals(ConversionFailureCode.PARTIAL_CONFIRMATION_REQUIRED, failure.code)
         assertTrue("reserve" !in partial.events)
+    }
+
+    @Test
+    fun `UNKNOWN 분석은 일반 실패로 축약하지 않고 빌드 불가 결과를 반환한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+        }
+
+        val result = assertIs<ConversionBeginResult.AnalysisReady>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        assertEquals(CompatibilityStatus.UNKNOWN, result.report.status)
+    }
+
+    @Test
+    fun `분석 중 caller 취소는 모바일 control checkpoint에 전달된다`() = runBlocking {
+        val analysisEntered = CountDownLatch(1)
+        val allowAnalysis = CountDownLatch(1)
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            analysisBlockingEntered = analysisEntered
+            analysisBlockingGate = allowAnalysis
+        }
+        val deferred = async(Dispatchers.Default) {
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            )
+        }
+        assertTrue(analysisEntered.await(5, TimeUnit.SECONDS))
+
+        deferred.cancel(CancellationException("caller cancelled"))
+        allowAnalysis.countDown()
+        deferred.join()
+
+        assertEquals(AnalysisSafetyPolicy.mobile, fixture.analysisPolicy)
+        assertTrue(fixture.analysisCancellationObserved)
     }
 
     @Test
@@ -1011,6 +1044,10 @@ class OnDeviceConversionCoordinatorTest {
         val releasedTokens = mutableListOf<String>()
         var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
+        var analysisBlockingEntered: CountDownLatch? = null
+        var analysisBlockingGate: CountDownLatch? = null
+        var analysisPolicy: AnalysisSafetyPolicy? = null
+        var analysisCancellationObserved = false
         var logicalIdentity: LogicalSourceIdentity? =
             LogicalSourceIdentity.storeExtensionId(EXTENSION_ID)
         var analysisIdentityMode = InstallationIdentityMode.PASSTHROUGH
@@ -1171,8 +1208,18 @@ class OnDeviceConversionCoordinatorTest {
                     input: File,
                     kind: OnDeviceInputKind,
                     profile: BrowserProfile,
+                    control: AnalysisControl,
                 ): ConversionAnalysisSnapshot {
                     events += "analyze"
+                    analysisPolicy = control.policy
+                    analysisBlockingEntered?.countDown()
+                    analysisBlockingGate?.await(5, TimeUnit.SECONDS)
+                    try {
+                        control.checkCancelled()
+                    } catch (error: CancellationException) {
+                        analysisCancellationObserved = true
+                        throw error
+                    }
                     return analysis(profile)
                 }
 

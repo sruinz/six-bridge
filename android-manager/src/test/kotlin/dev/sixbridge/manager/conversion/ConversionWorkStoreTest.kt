@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.core.compat.AnalysisControl
 import java.io.File
 import java.io.InputStream
 import java.nio.ByteBuffer
@@ -1101,6 +1102,7 @@ class ConversionWorkStoreTest {
                 input: File,
                 kind: OnDeviceInputKind,
                 profile: dev.sixbridge.core.profile.BrowserProfile,
+                control: AnalysisControl,
             ): ConversionAnalysisSnapshot =
                 error("discard test에서 analyze는 사용하지 않습니다.")
 

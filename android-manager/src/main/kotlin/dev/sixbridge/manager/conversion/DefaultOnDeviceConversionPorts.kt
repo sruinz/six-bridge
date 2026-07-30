@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
@@ -63,6 +64,7 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
         input: File,
         kind: OnDeviceInputKind,
         profile: BrowserProfile,
+        control: AnalysisControl,
     ): ConversionAnalysisSnapshot {
         if (kind == OnDeviceInputKind.SIX_DRAFT) {
             val draft = SixDraft.read(input.toPath())
@@ -89,23 +91,14 @@ internal class DefaultConversionRuntime : ConversionRuntimePort {
             }
         }
         val portable = portable(input, kind)
-        return ConversionPreparationEngine().use { engine ->
-            val report = engine.analyze(portable, profile)
-            val prepared = runCatching {
-                engine.prepare(
-                    portable,
-                    profile,
-                    report.adapterDecisions
-                        .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
-                        .map { it.id },
-                )
-            }.getOrNull()
-            snapshot(
-                report,
-                prepared?.logicalSourceIdentity.toManagerIdentity(),
-                portable.kind,
-            )
+        val analyzed = ConversionPreparationEngine().use {
+            it.analyzeWithIdentity(portable, profile, control)
         }
+        return snapshot(
+            report = analyzed.report,
+            logicalIdentity = analyzed.logicalSourceIdentity.toManagerIdentity(),
+            inputKind = portable.kind,
+        )
     }
 
     override fun prepare(

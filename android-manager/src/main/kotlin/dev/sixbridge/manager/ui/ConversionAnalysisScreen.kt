@@ -83,7 +83,13 @@ private fun AnalysisReadyContent(
         Text(compatibilityLabel(ready.report.status))
         Text(ready.report.extensionName ?: stringResource(R.string.review_none))
         ready.report.issues.forEach { issue ->
-            Text("${issue.code}: ${issue.message}")
+            Text(
+                if (issue.code == "analysis_budget_exceeded") {
+                    stringResource(R.string.conversion_mobile_budget_exceeded)
+                } else {
+                    "${issue.code}: ${issue.message}"
+                },
+            )
         }
     }
     SectionCard(stringResource(R.string.review_permissions)) {

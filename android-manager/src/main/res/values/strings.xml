@@ -15,6 +15,7 @@
     <string name="conversion_pick_file">ZIP · CRX3 · SixDraft 선택</string>
     <string name="conversion_acquiring">입력을 앱 전용 저장소로 가져와 검증하는 중입니다.</string>
     <string name="conversion_analysis_title">변환 전 분석</string>
+    <string name="conversion_mobile_budget_exceeded">이 확장은 모바일 안전 분석 범위를 초과했습니다. 데스크탑 SIX Bridge에서 분석·변환한 .six 파일을 가져와 주세요.</string>
     <string name="conversion_compatibility">호환성</string>
     <string name="conversion_apis">사용 API</string>
     <string name="conversion_adapter_requires_approval">동작 변경 · 직접 승인 필요</string>
