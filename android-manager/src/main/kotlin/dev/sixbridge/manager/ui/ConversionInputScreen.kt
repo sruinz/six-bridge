@@ -22,6 +22,7 @@ fun ConversionInputScreen(
     modifier: Modifier = Modifier,
 ) {
     val acquiring = state.conversionState == ConversionUiState.Acquiring
+    val conversionInputEnabled = !acquiring && !state.conversionCleanupPending
     CenteredScrollableColumn(
         modifier = modifier,
         testTagModifier = Modifier.testTag("conversion:input-screen"),
@@ -34,21 +35,21 @@ fun ConversionInputScreen(
         OutlinedTextField(
             value = state.conversionUrl,
             onValueChange = { onAction(ManagerAction.ConversionUrlChanged(it)) },
-            enabled = !acquiring,
+            enabled = conversionInputEnabled,
             singleLine = true,
             label = { Text(stringResource(R.string.conversion_url_label)) },
             modifier = Modifier.fillMaxWidth().testTag("conversion:url"),
         )
         Button(
             onClick = { onAction(ManagerAction.AnalyzeConversionUrl) },
-            enabled = !acquiring && state.conversionUrl.isNotBlank(),
+            enabled = conversionInputEnabled && state.conversionUrl.isNotBlank(),
             modifier = Modifier.fillMaxWidth().testTag("conversion:analyze"),
         ) {
             Text(stringResource(R.string.conversion_analyze))
         }
         OutlinedButton(
             onClick = { onAction(ManagerAction.OpenConversionFilePicker) },
-            enabled = !acquiring,
+            enabled = conversionInputEnabled,
             modifier = Modifier.fillMaxWidth().testTag("conversion:pick-file"),
         ) {
             Text(stringResource(R.string.conversion_pick_file))

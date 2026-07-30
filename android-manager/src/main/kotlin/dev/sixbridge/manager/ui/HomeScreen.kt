@@ -44,6 +44,8 @@ fun HomeScreen(
 ) {
     val mutationsEnabled =
         state.startupRecoveryState == StartupRecoveryUiState.READY
+    val newConversionEnabled =
+        mutationsEnabled && !state.conversionCleanupPending
     CenteredScrollableColumn(
         modifier = modifier,
         testTagModifier = Modifier.testTag("home:scroll"),
@@ -54,7 +56,7 @@ fun HomeScreen(
         )
         Button(
             onClick = { onAction(ManagerAction.OpenConversionInput) },
-            enabled = mutationsEnabled,
+            enabled = newConversionEnabled,
             modifier = Modifier.fillMaxWidth().testTag("home:convert-on-device"),
         ) {
             Text(text = stringResource(R.string.home_convert_on_device))

@@ -176,6 +176,11 @@ class ManagerViewModel(
             return
         }
         if (!gateStartupAction(action)) return
+        if (mutableState.value.conversionCleanupPending &&
+            action.startsConversionWork()
+        ) {
+            return
+        }
         if (intermediateGeneratedCleanupRestorePending &&
             pendingGeneratedCleanup?.phase in setOf(
                 GeneratedCleanupPhase.REVIEW,
@@ -805,6 +810,12 @@ class ManagerViewModel(
             }
             return
         }
+        val cancelling =
+            mutableState.value.conversionState as? ConversionUiState.Cancelling
+        if (mutableState.value.conversionCleanupPending && cancelling?.token != null) {
+            retryRouteConversionCleanup(cancelling.token)
+            return
+        }
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady ?: return
         val failure = repository.installState.value as? InstallState.Failed ?: return
         if (failure.code !in CLEANUP_RETRYABLE_FAILURES ||
@@ -851,6 +862,7 @@ class ManagerViewModel(
     }
 
     private fun cleanupConversion(destination: ManagerRoute) {
+        if (mutableState.value.conversionCleanupPending) return
         val stateBeforeCancel = mutableState.value.conversionState
         if (stateBeforeCancel is ConversionUiState.ResultReady &&
             (stateBeforeCancel.cleanupPending ||
@@ -864,6 +876,7 @@ class ManagerViewModel(
             is ConversionUiState.Building -> stateBeforeCancel.token
             is ConversionUiState.ResultReady -> stateBeforeCancel.token
             is ConversionUiState.Failed -> stateBeforeCancel.token
+            is ConversionUiState.Cancelling -> stateBeforeCancel.token
             ConversionUiState.Acquiring,
             ConversionUiState.Idle,
             -> savedStateHandle.get<String>(CONVERSION_TOKEN_KEY)
@@ -898,6 +911,16 @@ class ManagerViewModel(
         }
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
+        if (generatedCleanup == null) {
+            mutableState.update {
+                it.copy(
+                    route = destination,
+                    conversionState = ConversionUiState.Cancelling(token),
+                    conversionCleanupPending = true,
+                    message = null,
+                )
+            }
+        }
         val supersededInstall = if (generatedInstallOwned) detachInstallJob() else null
         supersededInstall?.cancel()
         routeOperation = null
@@ -953,7 +976,7 @@ class ManagerViewModel(
             }
             if (token != null &&
                 token !in scheduledConversionCleanupTokens &&
-                !repository.discardConversion(token)
+                !discardConversionExactly(token)
             ) {
                 showGeneratedCleanupFailure()
                 return@cleanup false
@@ -968,13 +991,16 @@ class ManagerViewModel(
                 showGeneratedCleanupFailure()
                 return@cleanup false
             }
+            if (scheduledConversionCleanupTokens.isNotEmpty()) {
+                return@cleanup true
+            }
             clearGeneratedInstallOwner()
             clearGeneratedResultOwner()
             clearSavedConversion()
             mutableState.update {
                 it.copy(
-                    route = destination,
                     conversionState = ConversionUiState.Idle,
+                    conversionCleanupPending = false,
                     conversionUrl = "",
                     importState = if (ownedReviewToken == null) {
                         ImportUiState.Idle
@@ -989,8 +1015,34 @@ class ManagerViewModel(
         if (generatedCleanup != null) {
             enqueueGeneratedCleanup(cleanupWork)
         } else {
-            enqueueRouteCleanup(cleanupWork)
+            enqueueRouteCleanup(
+                nonCancellable = false,
+                cleanup = cleanupWork,
+            )
         }
+    }
+
+    private fun retryRouteConversionCleanup(token: String) {
+        routeCleanupFailed = false
+        enqueueRouteCleanup(
+            nonCancellable = false,
+            cleanup = {
+                if (!discardConversionExactly(token)) {
+                    showGeneratedCleanupFailure()
+                    return@enqueueRouteCleanup false
+                }
+                clearSavedConversion()
+                mutableState.update {
+                    it.copy(
+                        conversionState = ConversionUiState.Idle,
+                        conversionCleanupPending = false,
+                        conversionUrl = "",
+                        message = null,
+                    )
+                }
+                true
+            },
+        )
     }
 
     private fun finishConversion() {
@@ -2013,6 +2065,15 @@ class ManagerViewModel(
         else -> false
     }
 
+    private fun ManagerAction.startsConversionWork(): Boolean = when (this) {
+        ManagerAction.OpenConversionInput,
+        ManagerAction.OpenConversionFilePicker,
+        is ManagerAction.ConversionFileSelected,
+        ManagerAction.AnalyzeConversionUrl,
+        -> true
+        else -> false
+    }
+
     private fun invalidateUninstallAttempt() {
         uninstallGeneration += 1
         pendingUninstallLaunch = null
@@ -2087,12 +2148,17 @@ class ManagerViewModel(
     }
 
     private fun enqueueRouteCleanup(
+        nonCancellable: Boolean = true,
         cleanup: suspend () -> Boolean,
     ): Job {
         val previous = routeCleanup
         val job = viewModelScope.launch {
             previous?.join()
-            val succeeded = withContext(NonCancellable) {
+            val succeeded = if (nonCancellable) {
+                withContext(NonCancellable) {
+                    runCatching { cleanup() }.getOrDefault(false)
+                }
+            } else {
                 runCatching { cleanup() }.getOrDefault(false)
             }
             routeCleanupFailed = !succeeded
@@ -2110,16 +2176,50 @@ class ManagerViewModel(
         reviewToken: String?,
     ) {
         if (!scheduledConversionCleanupTokens.add(token)) return
-        enqueueRouteCleanup {
-            try {
-                val reviewCleaned = reviewToken?.let(repository::discardReview) ?: true
-                val conversionCleaned = repository.discardConversion(token)
-                reviewCleaned && conversionCleaned
-            } finally {
-                scheduledConversionCleanupTokens.remove(token)
+        if (mutableState.value.conversionCleanupPending) {
+            mutableState.update {
+                val cancelling = it.conversionState as? ConversionUiState.Cancelling
+                if (cancelling?.token == null) {
+                    it.copy(conversionState = ConversionUiState.Cancelling(token))
+                } else {
+                    it
+                }
             }
         }
+        enqueueRouteCleanup(
+            cleanup = {
+                try {
+                    val reviewCleaned = reviewToken?.let(repository::discardReview) ?: true
+                    val conversionCleaned = discardConversionExactly(token)
+                    val cleaned = reviewCleaned && conversionCleaned
+                    if (mutableState.value.conversionCleanupPending) {
+                        if (cleaned) {
+                            clearSavedConversion()
+                            mutableState.update {
+                                it.copy(
+                                    conversionState = ConversionUiState.Idle,
+                                    conversionCleanupPending = false,
+                                    conversionUrl = "",
+                                    message = null,
+                                )
+                            }
+                        } else {
+                            showGeneratedCleanupFailure()
+                        }
+                    }
+                    cleaned
+                } finally {
+                    scheduledConversionCleanupTokens.remove(token)
+                }
+            },
+            nonCancellable = false,
+        )
     }
+
+    private suspend fun discardConversionExactly(token: String): Boolean =
+        withContext(NonCancellable) {
+            repository.discardConversion(token)
+        }
 
     private fun enqueueStaleBuildCleanup(result: ConversionBuildResult) {
         when (result) {
@@ -3696,6 +3796,7 @@ class ManagerViewModel(
             it.copy(
                 route = cleanup.destination.toRoute(),
                 conversionState = ConversionUiState.Idle,
+                conversionCleanupPending = false,
                 conversionUrl = "",
                 importState = ImportUiState.Idle,
                 message = null,

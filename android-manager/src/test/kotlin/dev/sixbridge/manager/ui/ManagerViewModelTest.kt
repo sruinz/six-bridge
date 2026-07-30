@@ -8175,6 +8175,152 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `분석 취소는 join 전에 홈을 열고 제거를 허용한다`() =
+        runTest(dispatcher.scheduler) {
+            val pending = CompletableDeferred<ConversionBeginResult>()
+            val repository = FakeManagerRepository().apply {
+                beginConversionDeferred = pending
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Cancelling>(viewModel.state.value.conversionState)
+            assertEquals(listOf(PACKAGE), repository.uninstallPackages)
+        }
+
+    @Test
+    fun `분석 cleanup 중 보고서와 Add-ons 이동도 허용한다`() =
+        runTest(dispatcher.scheduler) {
+            val pending = CompletableDeferred<ConversionBeginResult>()
+            val repository = FakeManagerRepository().apply {
+                beginConversionDeferred = pending
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+            assertEquals(
+                LaunchDestination.SAMSUNG_ADD_ONS,
+                assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first()).destination,
+            )
+
+            pending.complete(conversionAnalysis(TOKEN))
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertFalse(
+                viewModel.state.value.conversionCleanupPending,
+                viewModel.state.value.toString(),
+            )
+        }
+
+    @Test
+    fun `분석 cleanup 중 새 변환은 차단되고 완료 뒤 허용된다`() =
+        runTest(dispatcher.scheduler) {
+            val pending = CompletableDeferred<ConversionBeginResult>()
+            val repository = FakeManagerRepository().apply {
+                beginConversionDeferred = pending
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+
+            pending.complete(conversionAnalysis(TOKEN))
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+
+            viewModel.accept(ManagerAction.OpenConversionInput)
+
+            assertEquals(ManagerRoute.ConversionInput, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `분석 cleanup 실패는 홈과 exact token을 유지하고 Retry로 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis(TOKEN)
+                discardConversionResult = false
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.Cancelling>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+
+            repository.discardConversionResult = true
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN, TOKEN), repository.discardedConversions)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
     fun `새 begin은 cancellation 무시 old begin과 compensation cleanup 완료를 기다린다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -8199,6 +8345,12 @@ class ManagerViewModelTest {
             assertEquals(1, repository.conversionRequests.size)
 
             repository.completeFirstConversionBegin()
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/new"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
             advanceUntilIdle()
 
             assertEquals(2, repository.conversionRequests.size)
@@ -8246,6 +8398,12 @@ class ManagerViewModelTest {
             assertEquals(1, repository.conversionRequests.size)
 
             repository.completeFirstConversionBuild()
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test/new"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
             advanceUntilIdle()
 
             assertEquals(2, repository.conversionRequests.size)
@@ -8923,6 +9081,7 @@ private class FakeManagerRepository : ManagerRepository {
     )
     var conversionBeginResult: ConversionBeginResult =
         ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+    var beginConversionDeferred: CompletableDeferred<ConversionBeginResult>? = null
     var conversionBuildResult: ConversionBuildResult =
         ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
     val conversionBeginResults = mutableListOf<ConversionBeginResult>()
@@ -9039,6 +9198,9 @@ private class FakeManagerRepository : ManagerRepository {
     override suspend fun beginConversion(request: OnDeviceInputRequest): ConversionBeginResult {
         val index = conversionRequests.size
         conversionRequests += request
+        beginConversionDeferred?.let { pending ->
+            return withContext(NonCancellable) { pending.await() }
+        }
         if (index == 0 && suspendFirstConversionBegin) {
             if (ignoreFirstConversionBeginCancellation) {
                 withContext(NonCancellable) { firstConversionBeginGate.first() }

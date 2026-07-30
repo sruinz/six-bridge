@@ -63,6 +63,7 @@ sealed interface ImportUiState {
 sealed interface ConversionUiState {
     data object Idle : ConversionUiState
     data object Acquiring : ConversionUiState
+    data class Cancelling(val token: String?) : ConversionUiState
 
     data class AnalysisReady(
         val token: String,
@@ -195,6 +196,7 @@ data class ManagerUiState(
     val installed: List<ManagedExtensionItem> = emptyList(),
     val importState: ImportUiState = ImportUiState.Idle,
     val conversionState: ConversionUiState = ConversionUiState.Idle,
+    val conversionCleanupPending: Boolean = false,
     val conversionUrl: String = "",
     val installState: InstallState = InstallState.Idle,
     val message: UserMessage? = null,
