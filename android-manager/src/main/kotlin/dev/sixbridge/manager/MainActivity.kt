@@ -174,10 +174,7 @@ class MainActivity : ComponentActivity() {
                                 copy = copy,
                             )
                         },
-                        fileManagerNavigator = AndroidFileManagerNavigator(
-                            packageManager,
-                            getString(R.string.file_manager_chooser_title),
-                        ),
+                        fileManagerNavigator = AndroidFileManagerNavigator(packageManager),
                     )
                 }
             },

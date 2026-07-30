@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.navigation
 
+import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -13,34 +14,30 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class FileManagerNavigatorInstrumentedTest {
     @Test
-    fun production_navigator_finds_files_category_handler_without_apk_grants() {
+    fun production_navigator_finds_privileged_view_downloads_handler_without_apk_grants() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val chooser = requireNotNull(
-            AndroidFileManagerNavigator(
-                context.packageManager,
-                "파일 앱 선택",
-            ).launcherIntent(),
-        )
-        val target = requireNotNull(
-            chooser.getParcelableExtra<Intent>(Intent.EXTRA_INTENT),
+        val intent = requireNotNull(
+            AndroidFileManagerNavigator(context.packageManager).launcherIntent(),
         )
 
-        assertEquals(Intent.ACTION_MAIN, target.action)
-        assertEquals(Intent.CATEGORY_APP_FILES, target.selector?.categories?.single())
-        assertNull(target.data)
-        assertNull(target.type)
-        assertNull(target.clipData)
-        assertEquals(0, target.flags and URI_PERMISSION_FLAGS)
-        assertEquals(0, chooser.flags and URI_PERMISSION_FLAGS)
-        assertNotNull(
-            context.packageManager.resolveActivity(
-                target,
-                PackageManager.MATCH_DEFAULT_ONLY,
+        assertEquals(DownloadManager.ACTION_VIEW_DOWNLOADS, intent.action)
+        assertNotNull(intent.component)
+        assertEquals(
+            PackageManager.PERMISSION_GRANTED,
+            context.packageManager.checkPermission(
+                MANAGE_DOCUMENTS_PERMISSION,
+                requireNotNull(intent.component).packageName,
             ),
         )
+        assertNull(intent.data)
+        assertNull(intent.type)
+        assertNull(intent.clipData)
+        assertNull(intent.extras)
+        assertEquals(0, intent.flags and URI_PERMISSION_FLAGS)
     }
 
     private companion object {
+        const val MANAGE_DOCUMENTS_PERMISSION = "android.permission.MANAGE_DOCUMENTS"
         const val URI_PERMISSION_FLAGS =
             Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or

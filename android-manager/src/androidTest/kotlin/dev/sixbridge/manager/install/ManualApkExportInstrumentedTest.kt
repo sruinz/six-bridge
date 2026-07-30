@@ -40,6 +40,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -108,18 +109,13 @@ class ManualApkExportInstrumentedTest {
             )
 
             val fileManager = requireNotNull(
-                AndroidFileManagerNavigator(
-                    context.packageManager,
-                    "파일 앱 선택",
-                ).launcherIntent(),
+                AndroidFileManagerNavigator(context.packageManager).launcherIntent(),
             )
-            val target = requireNotNull(
-                fileManager.getParcelableExtra<Intent>(Intent.EXTRA_INTENT),
-            )
-            assertNull(target.data)
-            assertNull(target.type)
-            assertNull(target.clipData)
-            assertEquals(0, target.flags and URI_PERMISSION_FLAGS)
+            assertNotNull(fileManager.component)
+            assertNull(fileManager.data)
+            assertNull(fileManager.type)
+            assertNull(fileManager.clipData)
+            assertNull(fileManager.extras)
             assertEquals(0, fileManager.flags and URI_PERMISSION_FLAGS)
         } finally {
             context.contentResolver.delete(destination, null, null)

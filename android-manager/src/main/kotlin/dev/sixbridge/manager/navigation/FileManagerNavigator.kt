@@ -50,37 +50,34 @@ internal class DefaultFileManagerNavigator(
     }
 }
 
-private class LegacyFileManagerNavigator(
-    private val canResolve: (Intent) -> Boolean,
-    private val chooser: (Intent) -> Intent,
-) : FileManagerNavigator {
-    override fun launcherIntent(): Intent? {
-        val target = filesIntent()
-        if (!canResolve(target)) return null
-        return chooser(target).apply {
-            data = null
-            type = null
-            clipData = null
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-    }
-
-    private fun filesIntent(): Intent =
-        Intent.makeMainSelectorActivity(
-            Intent.ACTION_MAIN,
-            Intent.CATEGORY_APP_FILES,
-        ).apply {
-            data = null
-            type = null
-            clipData = null
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-}
-
 class AndroidFileManagerNavigator(
     packageManager: PackageManager,
-    chooserTitle: String = "파일 앱 선택",
-) : FileManagerNavigator by LegacyFileManagerNavigator(
-    canResolve = { packageManager.resolveActivity(it, PackageManager.MATCH_DEFAULT_ONLY) != null },
-    chooser = { Intent.createChooser(it, chooserTitle) },
+) : FileManagerNavigator by DefaultFileManagerNavigator(
+    viewDownloadsHandlers = {
+        packageManager.queryIntentActivities(
+            Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
+                .addCategory(Intent.CATEGORY_DEFAULT),
+            PackageManager.MATCH_DEFAULT_ONLY,
+        ).map { resolved ->
+            FileManagerHandler(
+                component = ComponentName(
+                    resolved.activityInfo.packageName,
+                    resolved.activityInfo.name,
+                ),
+                exported = resolved.activityInfo.exported,
+                enabled = resolved.activityInfo.enabled,
+                managesDocuments = packageManager.checkPermission(
+                    MANAGE_DOCUMENTS_PERMISSION,
+                    resolved.activityInfo.packageName,
+                ) == PackageManager.PERMISSION_GRANTED,
+            )
+        }
+    },
+    myFilesLauncherComponent = {
+        packageManager.getLaunchIntentForPackage(SAMSUNG_MY_FILES_PACKAGE)
+            ?.component
+    },
 )
+
+internal const val MANAGE_DOCUMENTS_PERMISSION = "android.permission.MANAGE_DOCUMENTS"
+internal const val SAMSUNG_MY_FILES_PACKAGE = "com.sec.android.app.myfiles"
