@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style
+        name="Theme.SixBridgeAndroidTestDark"
+        parent="@style/Theme.SixBridgeAndroidTestDarkBase">
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+    </style>
+
+    <style
+        name="Theme.SixBridgeAndroidTestDark.Dialog"
+        parent="@style/Theme.SixBridgeAndroidTestDark.DialogBase">
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+    </style>
+</resources>

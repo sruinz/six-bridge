@@ -1,9 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <application>
         <activity
             android:name="dev.sixbridge.manager.ShareGrantReceiverActivity"
             android:exported="true" />
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity"
+            android:theme="@style/Theme.SixBridgeAndroidTestDark"
+            tools:replace="android:theme" />
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity"
+            android:theme="@style/Theme.SixBridgeAndroidTestDark"
+            tools:replace="android:theme" />
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity"
+            android:theme="@style/Theme.SixBridgeAndroidTestDark.Dialog"
+            tools:replace="android:theme" />
         <provider
             android:name="dev.sixbridge.manager.icon.TestBlockingIconProvider"
             android:authorities="dev.sixbridge.manager.test.iconprovider"
