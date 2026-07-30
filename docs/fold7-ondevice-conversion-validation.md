@@ -53,17 +53,72 @@ APK v2·v3 서명과 `six://ex`/Provider 계약을 다시 확인한다.
 10. 4단계에서 저장한 `.six`를 관리자의 `.six 파일 추가` 흐름으로 다시
     가져와 식별 정보와 호환성 보고서가 동일하게 표시되는지 확인한다.
 
-이 문서 작성 시점에는 위 수동 UI 절차를 실행했다고 주장하지 않는다.
-자동 게이트만 완료했다.
+## 수동 UI 검증 결과
 
-2026-07-30에는 저장된 `SIXBridge-exact-ddcp.six`를 최신 관리자 빌드에서
-가져와 Google DocumentsUI로 설치하는 수동 회귀를 별도로 완료했다. 설치
-출처, `dev_ext`, 활성화·기능·브라우저 재시작 유지 결과는
-`docs/FOLD7_SYSTEM_DOCUMENTS_INSTALL_GATE_KO.md`에 기록했다. 이 결과는
-시스템 문서 앱 설치 경로를 검증하지만, 위 2단계의 실제 Chrome 웹 스토어 URL
-다운로드와 9단계의 동일 URL 재변환·업데이트를 실행한 결과로 대신하지
-않는다. 따라서 이 문서의 Chrome 웹 스토어 URL 수동 UI 게이트는 계속
-미완료로 유지한다.
+- 검증일: 2026-07-30
+- 결과: 위 1~10단계 완료
+- evidence:
+  `.local/evidence/20260730-224010-chrome-store-url-manual-gate`
+- 입력 원본 Chrome Extension ID:
+  `lneaoklobohnoncgckmbbjfiajgpbdde`
+- 변환 Extension ID:
+  `logkhkjljapjeiljhemdfpgendeodflm`
+- package:
+  `dev.sixbridge.ext.logkhkjljapjeiljhemdfpgendeodflm`
+- APK signer SHA-256:
+  `5c3a7b12ee77eead998cf1037f669b5f6e6a9253464641437e213ec8e8ff5d75`
+- versionCode: `1` → `2`
+- 최종 호환성: `compatible`
+
+`action-popup-entry v2`는 사용자가 직접 승인했고
+`desktop-selection-event-bridge v1`은 안전 어댑터로 자동 적용됐다.
+변환으로 CRX 내용이 바뀌므로 Chrome 웹 스토어 원본 서명을 재사용하지
+않는다. 따라서 원본 ID와 변환 ID가 다르며, 이후 같은 URL 변환에서는
+Keystore 신원을 재사용해 변환 ID·package·signer를 유지한다.
+
+최초 생성 `.six`와 사용자가 Android 파일 선택기로 저장한
+`logkhkjljapjeiljhemdfpgendeodflm-1.six`의 SHA-256은 모두
+`ea46218a7eae801608e5834c00fff80589941e73a66635a7f3a33c50a5ca3aa2`로
+일치했다. 최초 `.six` 내부 wrapper와 시스템 설치본의 SHA-256도
+`71f35eb62638321948e165160582cf4a129f68a654559db886d572a84855a866`으로
+일치했다.
+
+두 번째 변환에서 저장한 `.six`는 ZIP 무결성 검사를 통과했고 내부
+`extension.json`은 같은 변환 ID·package·signer와 `versionCode 2`를
+기록했다. 내부 wrapper와 시스템 업데이트 설치본의 SHA-256은 모두
+`828f1cd842da3a8d67b0f41f448578340aad543bff469901763c6bc8fd037ed2`로
+일치했다. 두 번째 앱 private 생성본은 작업 정리 뒤 직접 회수하지 못했으므로
+저장본과 생성본의 전체 ZIP byte identity는 주장하지 않는다.
+
+두 설치 모두 `com.google.android.packageinstaller`가
+`installerPackageName`과 `initiatingPackageName`으로 기록됐고
+`originatingPackageName=null`, `packageSource=3`이었다. 삼성 Add-ons에서
+변환 확장을 활성화한 뒤 텍스트 선택 기능이 동작했고, 삼성 인터넷 완전
+종료·재실행 뒤 활성 상태와 기능이 유지됐다. 같은 URL 업데이트 뒤에도
+기능과 재시작 유지가 확인됐다.
+
+최초 저장 `.six`를 `변환된 .six 설치` 흐름으로 다시 가져오자 설치 전 검토
+화면에서 다음 정보가 원본과 동일하게 복원됐다.
+
+- 이름·버전: `스마트 컨텍스트 메뉴 · 1.1.1`
+- 원본 ID: `lneaoklobohnoncgckmbbjfiajgpbdde`
+- 변환 ID와 package:
+  `logkhkjljapjeiljhemdfpgendeodflm`,
+  `dev.sixbridge.ext.logkhkjljapjeiljhemdfpgendeodflm`
+- wrapper versionCode: `1`
+- 권한: `activeTab`, `contextMenus`, `storage`
+- 비차단 이슈: `storage_area_unknown`
+- 두 적용 어댑터와 disposition
+- wrapper SHA-256과 signer SHA-256
+
+재가져오기 검토에서는 `설치 APK 내보내기`를 누르지 않고 취소했다.
+직후 설치 package는 `versionCode 2`를 유지해 downgrade나 재설치가
+발생하지 않았다.
+
+같은 날 저장된 `SIXBridge-exact-ddcp.six`를 최신 관리자 빌드에서 가져와
+Google DocumentsUI로 설치하는 별도 수동 회귀도 완료했다. 해당 설치 출처,
+`dev_ext`, 활성화·기능·브라우저 재시작 유지 결과는
+`docs/FOLD7_SYSTEM_DOCUMENTS_INSTALL_GATE_KO.md`에 기록했다.
 
 ## 알려진 기존 검증 이슈
 
