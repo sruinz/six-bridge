@@ -1,6 +1,8 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
@@ -14,6 +16,7 @@ import java.nio.file.Files
 import java.nio.file.attribute.FileTime
 import java.security.KeyPairGenerator
 import java.util.Base64
+import java.util.concurrent.CancellationException
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -26,6 +29,25 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class ConversionPipelineTest {
+    @Test
+    fun `분석 preflight 준비는 취소 신호를 각각 전파한다`() {
+        val source = plainSource("six-pipeline-cancel")
+        val resolved = resolvedSource(source)
+        val cancelled = AnalysisControl(AnalysisSafetyPolicy.desktop) {
+            throw CancellationException("cancel")
+        }
+
+        assertPipelineCancellation {
+            it.analyzeWithIdentity(resolved, profile(), cancelled)
+        }
+        assertPipelineCancellation {
+            it.preflight(resolved, profile(), emptyList(), cancelled)
+        }
+        assertPipelineCancellation {
+            it.prepare(resolved, profile(), emptyList(), cancelled)
+        }
+    }
+
     @Test
     fun `same snapshot profile and approvals produce deterministic source plan and report hashes`() {
         val localRoot = Files.createTempDirectory("six-pipeline-local")
@@ -770,6 +792,24 @@ class ConversionPipelineTest {
     private fun keyPair() = KeyPairGenerator.getInstance("RSA")
         .apply { initialize(2048) }
         .generateKeyPair()
+
+    private fun assertPipelineCancellation(operation: (ConversionPipeline) -> Unit) {
+        val pipeline = runCatching {
+            ConversionPipeline(Files.createTempDirectory("six-pipeline-cancel"))
+        }.getOrElse { error ->
+            assertIs<OwnedTempCleanupException>(error)
+            return
+        }
+        try {
+            assertFailsWith<CancellationException> { operation(pipeline) }
+        } finally {
+            val closeFailure = runCatching(pipeline::close).exceptionOrNull()
+            assertTrue(
+                closeFailure == null || closeFailure is OwnedTempCleanupException,
+                "예상하지 못한 pipeline 정리 실패: $closeFailure",
+            )
+        }
+    }
 
     private fun packSignedZip(
         zipBytes: ByteArray,

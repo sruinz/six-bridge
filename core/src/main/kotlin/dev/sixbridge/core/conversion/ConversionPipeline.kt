@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.crx.Crx3
@@ -35,14 +36,23 @@ class ConversionPipeline private constructor(
     fun analyze(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
-    ): CompatibilityReport = engine.analyze(portableInput(resolved), profile)
+        control: AnalysisControl = AnalysisControl(),
+    ): CompatibilityReport = analyzeWithIdentity(resolved, profile, control).report
+
+    fun analyzeWithIdentity(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        control: AnalysisControl = AnalysisControl(),
+    ): AnalyzedConversion =
+        engine.analyzeWithIdentity(portableInput(resolved), profile, control)
 
     fun preflight(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): CompatibilityReport =
-        preflightPreparation(resolved, profile, approvedAdapterIds)
+        preflightPreparation(resolved, profile, approvedAdapterIds, control)
             .compatibilityBefore
 
     @JvmSynthetic
@@ -50,17 +60,20 @@ class ConversionPipeline private constructor(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): PreparedConversion =
         engine.prepare(
             portableInput(resolved),
             profile,
             approvedAdapterIds,
+            control,
         )
 
     fun prepare(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): ConversionPipelineResult {
         val source = requireNotNull(resolved.sourceRoot) {
             "빌드할 확장 소스를 입력에서 추출하지 못했습니다."
@@ -69,6 +82,7 @@ class ConversionPipeline private constructor(
             portableInput(resolved),
             profile,
             approvedAdapterIds,
+            control,
         )
         val verifiedMarker = SourceProjectIdentityStore.readSourceMarker(
             source,

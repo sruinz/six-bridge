@@ -2,6 +2,7 @@ package dev.sixbridge.core.input
 
 import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.security.KeyPairGenerator
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -11,9 +12,82 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ExtensionInputResolverTest {
+    @Test
+    fun `주입된 추출 root factory를 ZIP CRX 스토어 입력마다 사용한다`() {
+        val source = Files.createTempDirectory("six-input-root-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Root","version":"1"}""",
+        )
+        val zip = source.parent.resolve("root.zip")
+        ExtensionZip.create(source, zip)
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair(),
+        )
+        val crx = source.parent.resolve("root.crx")
+        crx.writeBytes(packed.bytes)
+        val roots = mutableListOf<java.nio.file.Path>()
+        val factory = {
+            Files.createTempDirectory("six-input-root-factory").also(roots::add)
+        }
+        val resolver = ExtensionInputResolver(
+            chromeDownloader = ChromeCrxDownloader { packed.bytes },
+            extractionRootFactory = factory,
+        )
+
+        val inputs = listOf(
+            zip.toString(),
+            crx.toString(),
+            "https://chromewebstore.google.com/detail/name/${packed.extensionId}",
+        )
+        val resolved = inputs.map { input ->
+            runCatching { resolver.resolve(input) }
+        }
+
+        assertEquals(3, roots.size)
+        resolved.zip(roots).forEach { (result, root) ->
+            assertTrue(Files.isDirectory(root, NOFOLLOW_LINKS))
+            assertFalse(Files.isSymbolicLink(root))
+            result.getOrNull()?.let { input ->
+                assertTrue(requireNotNull(input.sourceRoot).startsWith(root))
+            } ?: assertTrue(
+                requireNotNull(result.exceptionOrNull()).message.orEmpty().contains(
+                    "파일시스템이 안전한 ZIP 압축 해제를 지원하지 않습니다",
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `추출 root factory는 실제 비어 있는 일반 디렉터리만 허용한다`() {
+        val source = Files.createTempDirectory("six-input-invalid-root-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Invalid root","version":"1"}""",
+        )
+        val zip = source.parent.resolve("invalid-root.zip")
+        ExtensionZip.create(source, zip)
+
+        val regularFile = Files.createTempFile("six-input-root-file", ".tmp")
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionInputResolver(extractionRootFactory = { regularFile }).resolve(zip.toString())
+        }
+        val nonEmpty = Files.createTempDirectory("six-input-root-nonempty")
+        nonEmpty.resolve("existing").writeText("not empty")
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionInputResolver(extractionRootFactory = { nonEmpty }).resolve(zip.toString())
+        }
+        val target = Files.createTempDirectory("six-input-root-symlink-target")
+        val symlink = target.parent.resolve("six-input-root-symlink-${System.nanoTime()}")
+        Files.createSymbolicLink(symlink, target)
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionInputResolver(extractionRootFactory = { symlink }).resolve(zip.toString())
+        }
+    }
+
     @Test
     fun `accepts directories zip files and CRX3 files`() {
         val source = Files.createTempDirectory("six-input")
@@ -51,11 +125,13 @@ class ExtensionInputResolverTest {
                 .apply { initialize(2048) }
                 .generateKeyPair(),
         )
-        val resolver = ExtensionInputResolver { address ->
-            packed.bytes.also {
-                assertEquals(packed.extensionId, address.extensionId)
-            }
-        }
+        val resolver = ExtensionInputResolver(
+            ChromeCrxDownloader { address ->
+                packed.bytes.also {
+                    assertEquals(packed.extensionId, address.extensionId)
+                }
+            },
+        )
 
         val chrome = resolver.resolve(
             "https://chromewebstore.google.com/detail/video-download-to-nas/" +
@@ -66,18 +142,20 @@ class ExtensionInputResolverTest {
         assertEquals(packed.extensionId, chrome.expectedExtensionId)
         assertContentEquals(packed.bytes, chrome.crxBytes)
 
-        val mismatch = ExtensionInputResolver {
-            val otherSource = Files.createTempDirectory("six-input-other-store")
-            otherSource.resolve("manifest.json").writeText(
-                """{"manifest_version":3,"name":"Other","version":"1"}""",
-            )
-            Crx3.pack(
-                otherSource,
-                KeyPairGenerator.getInstance("RSA")
-                    .apply { initialize(2048) }
-                    .generateKeyPair(),
-            ).bytes
-        }
+        val mismatch = ExtensionInputResolver(
+            ChromeCrxDownloader {
+                val otherSource = Files.createTempDirectory("six-input-other-store")
+                otherSource.resolve("manifest.json").writeText(
+                    """{"manifest_version":3,"name":"Other","version":"1"}""",
+                )
+                Crx3.pack(
+                    otherSource,
+                    KeyPairGenerator.getInstance("RSA")
+                        .apply { initialize(2048) }
+                        .generateKeyPair(),
+                ).bytes
+            },
+        )
         assertFailsWith<UnsupportedInputException> {
             mismatch.resolve(
                 "https://chromewebstore.google.com/detail/video-download-to-nas/" +
@@ -146,4 +224,5 @@ class ExtensionInputResolverTest {
             )
         }
     }
+
 }

@@ -4,6 +4,7 @@ import dev.sixbridge.core.bundle.ExtensionDescriptor
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.ConversionPipeline
 import dev.sixbridge.core.conversion.ConversionState
@@ -19,6 +20,7 @@ import dev.sixbridge.core.draft.DraftInputMetadata
 import dev.sixbridge.core.draft.DraftMetadata
 import dev.sixbridge.core.draft.DraftSelectedAdapter
 import dev.sixbridge.core.draft.DraftSigningKeyStore
+import dev.sixbridge.core.draft.DraftSigningIdentityProvider
 import dev.sixbridge.core.draft.DraftSourceKind
 import dev.sixbridge.core.draft.DraftSourceStreams
 import dev.sixbridge.core.draft.SixDraft
@@ -61,6 +63,11 @@ data class SixDraftResult(
     val transformedSha256: String,
 )
 
+data class SixDraftAnalysisResult(
+    val report: CompatibilityReport,
+    val logicalSourceIdentity: LogicalSourceIdentityResult,
+)
+
 class SixBridgeService(
     private val workspaceRoot: Path,
     private val inputResolver: ExtensionInputResolver = ExtensionInputResolver(),
@@ -68,9 +75,17 @@ class SixBridgeService(
     private val draftReader: (Path) -> VerifiedSixDraft = SixDraft::read,
     private val draftSourceStreamObserver: (InputStream) -> InputStream = { it },
     private val outputGuardHook: () -> Unit = {},
+    draftSigningIdentityProvider: DraftSigningIdentityProvider? = null,
     private val toolchainProvider: () -> AndroidToolchain = { AndroidToolchain.locate() },
 ) {
     private val localRoot = workspaceRoot.resolve(".local")
+    private val signingIdentityProvider =
+        draftSigningIdentityProvider ?: DraftSigningIdentityProvider {
+            DraftSigningKeyStore(
+                trustedRoot = workspaceRoot,
+                keyRoot = localRoot.resolve("keystore/draft-transfer"),
+            ).getOrCreate()
+        }
 
     fun analyze(input: String, profile: BrowserProfile): CompatibilityReport {
         val resolved = inputResolver.resolve(input)
@@ -81,6 +96,32 @@ class SixBridgeService(
         }
     }
 
+    fun analyzeDraft(
+        input: String,
+        profile: BrowserProfile,
+        control: AnalysisControl = AnalysisControl(),
+    ): SixDraftAnalysisResult {
+        control.checkCancelled()
+        val resolved = inputResolver.resolve(input)
+        control.checkCancelled()
+        return analyzeResolvedDraft(resolved, profile, control)
+    }
+
+    fun analyzeResolvedDraft(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        control: AnalysisControl = AnalysisControl(),
+    ): SixDraftAnalysisResult {
+        control.checkCancelled()
+        return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
+            val analysis = userInputBoundary("확장 입력을 분석할 수 없습니다.") {
+                pipeline.analyzeWithIdentity(resolved, profile, control)
+            }
+            control.checkCancelled()
+            SixDraftAnalysisResult(analysis.report, analysis.logicalSourceIdentity)
+        }
+    }
+
     fun draft(
         input: String,
         profile: BrowserProfile,
@@ -88,36 +129,68 @@ class SixBridgeService(
         projectIdentity: String? = null,
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
+        control: AnalysisControl = AnalysisControl(),
     ): SixDraftResult {
+        control.checkCancelled()
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
-        validateProjectIdentity(projectIdentity)
+        control.checkCancelled()
+        return draftResolved(
+            resolved = resolved,
+            profile = profile,
+            outputDraft = outputDraft,
+            projectIdentity = projectIdentity,
+            approvedAdapterIds = approvedAdapterIds,
+            protectedInputs = protectedInputs,
+            control = control,
+        )
+    }
+
+    fun draftResolved(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        outputDraft: Path,
+        projectIdentity: String? = null,
+        approvedAdapterIds: Iterable<String> = emptyList(),
+        protectedInputs: Iterable<Path> = emptyList(),
+        control: AnalysisControl = AnalysisControl(),
+    ): SixDraftResult {
+        control.checkCancelled()
+        val requestedProjectIdentity = projectIdentity ?: resolved.projectIdentity
+        val draftInput = resolved.copy(projectIdentity = requestedProjectIdentity)
+        validateProjectIdentity(requestedProjectIdentity)
         val target = outputDraft.toAbsolutePath().normalize()
         val outputGuard = ProtectedOutputPolicy.capture(
             workspaceRoot = workspaceRoot,
             localRoot = localRoot,
-            resolved = resolved,
+            resolved = draftInput,
             outputs = listOf(target),
             protectedInputs = protectedInputs,
         )
         outputGuardHook()
         outputGuard.requireCurrent()
+        control.checkCancelled()
         val preflightIdentity = preflightAnalyze(
-            resolved,
+            draftInput,
             profile,
             approvedAdapterIds,
+            control,
         )
+        control.checkCancelled()
         val sourceIdentity = resolveDraftSourceIdentity(
             preflightIdentity,
-            projectIdentity,
+            requestedProjectIdentity,
         )
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
+            control.checkCancelled()
             val prepared = pipeline.prepare(
-                resolved,
+                draftInput,
                 profile,
                 approvedAdapterIds,
+                control,
             )
+            control.checkCancelled()
             check(prepared.logicalSourceIdentity == preflightIdentity) {
                 "draft 준비 사이에 논리 원본 신원이 달라졌습니다."
             }
@@ -139,7 +212,7 @@ class SixBridgeService(
                     sourceIdentity = sourceIdentity,
                 ),
                 input = DraftInputMetadata(
-                    inputKind = resolved.kind,
+                    inputKind = draftInput.kind,
                     originalSourceSha256 = requireNotNull(
                         before.sourceSha256,
                     ),
@@ -162,17 +235,17 @@ class SixBridgeService(
                 compatibilityAfter = after,
             )
             targetGuard.requireCurrent()
-            val key = DraftSigningKeyStore(
-                trustedRoot = workspaceRoot,
-                keyRoot = localRoot.resolve("keystore/draft-transfer"),
-            ).getOrCreate()
+            control.checkCancelled()
+            val key = signingIdentityProvider.getOrCreate()
             targetGuard.requireCurrent()
+            control.checkCancelled()
             SixDraft.writeGuarded(
                 target,
                 payload,
                 key,
                 targetGuard.publicationGuard,
             )
+            control.checkCancelled()
             verifyWrittenDraft(payload, key, draftReader(target))
             SixDraftResult(
                 draft = target,
@@ -394,6 +467,7 @@ class SixBridgeService(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl = AnalysisControl(),
     ): LogicalSourceIdentityResult =
         ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             userInputBoundary("확장 입력을 분석할 수 없습니다.") {
@@ -401,6 +475,7 @@ class SixBridgeService(
                     resolved,
                     profile,
                     approvedAdapterIds,
+                    control,
                 ).logicalSourceIdentity
             }
         }

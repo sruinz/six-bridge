@@ -2,6 +2,10 @@ package dev.sixbridge.core
 
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.ExtensionKeyManager
+import dev.sixbridge.core.draft.DraftSigningIdentityProvider
+import dev.sixbridge.core.draft.SixDraft
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionInputResolver
 import dev.sixbridge.core.input.ExtensionZip
@@ -21,6 +25,7 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import java.util.concurrent.CancellationException
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -28,9 +33,92 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
+    @Test
+    fun `draft는 주입된 signer를 사용하고 별도 key store를 만들지 않는다`() {
+        val workspace = Files.createTempDirectory("six-draft-signer-workspace")
+        val source = source("six-draft-signer-source", "Injected signer")
+        val output = Files.createDirectory(workspace.resolve("drafts"))
+            .resolve("injected.sixdraft")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val service = SixBridgeService(
+            workspaceRoot = workspace,
+            draftSigningIdentityProvider = DraftSigningIdentityProvider { pair },
+        )
+
+        val result = service.draft(
+            input = source.toString(),
+            profile = supportedProfile(),
+            outputDraft = output,
+            projectIdentity = "a".repeat(32),
+        )
+
+        assertContentEquals(pair.public.encoded, SixDraft.read(result.draft).signerPublicKey)
+        assertFalse(Files.exists(workspace.resolve(".local/keystore/draft-transfer")))
+    }
+
+    @Test
+    fun `draft 분석은 logical identity 요구를 보고한다`() {
+        val workspace = Files.createTempDirectory("six-draft-analysis-workspace")
+        val source = source("six-draft-analysis-source", "Markerless draft")
+        val markerless = workspace.resolve("markerless.zip")
+        markerlessZip(source, markerless)
+
+        val analysis = SixBridgeService(workspace).analyzeDraft(
+            markerless.toString(),
+            supportedProfile(),
+        )
+
+        assertIs<dev.sixbridge.core.conversion.LogicalSourceIdentityResult.NeedsUserSelection>(
+            analysis.logicalSourceIdentity,
+        )
+    }
+
+    @Test
+    fun `draft 분석과 생성은 취소 신호를 전파한다`() {
+        val workspace = Files.createTempDirectory("six-draft-cancel-workspace")
+        val source = source("six-draft-cancel-source", "Cancelled draft")
+        val output = Files.createDirectory(workspace.resolve("drafts"))
+            .resolve("cancelled.sixdraft")
+        val service = SixBridgeService(workspace)
+        val resolved = ResolvedExtensionInput(
+            kind = ExtensionInputKind.SOURCE_DIRECTORY,
+            originalInput = source.toString(),
+            sourceRoot = source,
+        )
+        val cancelled = AnalysisControl(AnalysisSafetyPolicy.desktop) {
+            throw CancellationException("cancel")
+        }
+
+        assertFailsWith<CancellationException> {
+            service.analyzeDraft(source.toString(), supportedProfile(), cancelled)
+        }
+        assertFailsWith<CancellationException> {
+            service.draft(
+                source.toString(),
+                supportedProfile(),
+                output,
+                projectIdentity = "b".repeat(32),
+                control = cancelled,
+            )
+        }
+        assertFailsWith<CancellationException> {
+            service.analyzeResolvedDraft(resolved, supportedProfile(), cancelled)
+        }
+        assertFailsWith<CancellationException> {
+            service.draftResolved(
+                resolved,
+                supportedProfile(),
+                output,
+                projectIdentity = "b".repeat(32),
+                control = cancelled,
+            )
+        }
+    }
+
     @Test
     fun `build preserves output directories for every reserved internal bundle name`() {
         val toolchain = requireNotNull(AndroidToolchain.locateOrNull()) {

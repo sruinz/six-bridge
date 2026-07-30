@@ -2,6 +2,7 @@ package dev.sixbridge.core.input
 
 import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import kotlin.io.path.extension
 import kotlin.io.path.isDirectory
@@ -32,6 +33,9 @@ fun interface ChromeCrxDownloader {
 
 class ExtensionInputResolver(
     private val chromeDownloader: ChromeCrxDownloader? = null,
+    private val extractionRootFactory: () -> Path = {
+        Files.createTempDirectory("sixbridge-extension-")
+    },
 ) {
     fun resolve(input: String): ResolvedExtensionInput {
         if (input.startsWith("http://") || input.startsWith("https://")) {
@@ -46,7 +50,7 @@ class ExtensionInputResolver(
                 sourceRoot = path,
             )
             path.isRegularFile() && path.extension.equals("zip", ignoreCase = true) -> {
-                val extracted = Files.createTempDirectory("sixbridge-extension-")
+                val extracted = extractionRoot()
                 val root = ExtensionZip.extract(path, extracted)
                 ResolvedExtensionInput(
                     kind = ExtensionInputKind.ZIP,
@@ -62,7 +66,7 @@ class ExtensionInputResolver(
                     originalInput = input,
                     sourceRoot = ExtensionZip.extract(
                         parsed.zipBytes,
-                        Files.createTempDirectory("sixbridge-extension-"),
+                        extractionRoot(),
                     ),
                     crxBytes = bytes,
                     expectedExtensionId = parsed.extensionId,
@@ -89,10 +93,21 @@ class ExtensionInputResolver(
             originalInput = input,
             sourceRoot = ExtensionZip.extract(
                 parsed.zipBytes,
-                Files.createTempDirectory("sixbridge-extension-"),
+                extractionRoot(),
             ),
             crxBytes = bytes,
             expectedExtensionId = address.extensionId,
         )
+    }
+
+    private fun extractionRoot(): Path {
+        val root = extractionRootFactory().toAbsolutePath().normalize()
+        require(Files.isDirectory(root, NOFOLLOW_LINKS) && !Files.isSymbolicLink(root)) {
+            "확장 추출 root는 이미 생성된 실제 디렉터리여야 합니다: $root"
+        }
+        require(Files.list(root).use { it.findAny().isEmpty }) {
+            "확장 추출 root는 비어 있어야 합니다: $root"
+        }
+        return root.toRealPath()
     }
 }
