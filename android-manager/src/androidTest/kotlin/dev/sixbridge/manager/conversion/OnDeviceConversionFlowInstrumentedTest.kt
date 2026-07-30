@@ -136,6 +136,8 @@ class OnDeviceConversionFlowInstrumentedTest {
                     is RestoredConversion.Analysis -> restored.value.token
                     is RestoredConversion.BundleReady -> restored.generated.token
                     is RestoredConversion.GeneratedPending -> restored.generated.token
+                    RestoredConversion.InterruptedDiscarded -> return@let
+                    is RestoredConversion.InterruptedCleanupPending -> restored.token
                 }
                 check(coordinator.discard(staleToken)) {
                     "이전 Task 11 conversion work를 정리하지 못했습니다."

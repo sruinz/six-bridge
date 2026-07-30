@@ -3,6 +3,8 @@ package dev.sixbridge.manager.conversion
 import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.draft.DraftConversionPlan
 import dev.sixbridge.core.draft.DraftInputMetadata
@@ -65,7 +67,12 @@ class DraftIdentityPreviewInstrumentedTest {
             val file = File(context.cacheDir, "direct-mode-${kind.name}.bin")
             try {
                 file.writeBytes(bytes)
-                val analysis = runtime.analyze(file, kind, profile)
+                val analysis = runtime.analyze(
+                    file,
+                    kind,
+                    profile,
+                    AnalysisControl(AnalysisSafetyPolicy.mobile),
+                )
                 val prepared = runtime.prepare(
                     file,
                     kind,
@@ -120,7 +127,12 @@ class DraftIdentityPreviewInstrumentedTest {
             writeBytes(bytes)
         }
         val runtime = DefaultConversionRuntime()
-        val analysis = runtime.analyze(source, baseKind, profile)
+        val analysis = runtime.analyze(
+            source,
+            baseKind,
+            profile,
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
         val validPrepared = runtime.prepare(
             source,
             baseKind,

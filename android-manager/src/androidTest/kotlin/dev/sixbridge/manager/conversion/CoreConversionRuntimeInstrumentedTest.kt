@@ -6,6 +6,8 @@ import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.manager.app.RetainedImportStore
 import dev.sixbridge.manager.app.toReview
 import dev.sixbridge.manager.catalog.ManagerDatabase
@@ -906,6 +908,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 draftFile,
                 OnDeviceInputKind.SIX_DRAFT,
                 profile,
+                AnalysisControl(AnalysisSafetyPolicy.mobile),
             )
             assertFalse(same.profileChanged)
             assertEquals(InstallationIdentityMode.CONVERTED, same.identityMode)
@@ -926,6 +929,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 draftFile,
                 OnDeviceInputKind.SIX_DRAFT,
                 changedProfile,
+                AnalysisControl(AnalysisSafetyPolicy.mobile),
             )
             assertTrue(changed.profileChanged)
             assertEquals(InstallationIdentityMode.CONVERTED, changed.identityMode)
