@@ -1,10 +1,13 @@
 package dev.sixbridge.core.input
 
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import java.net.URI
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -263,6 +266,27 @@ class ExtensionZipTest {
 
         assertEquals(destination, extracted)
         assertEquals("inside", Files.readString(extracted.resolve("assets/payload.js")))
+    }
+
+    @Test
+    fun `extract entry scan은 caller AnalysisControl 취소 전에 output을 만들지 않는다`() {
+        val zip = zipWith(
+            "manifest.json" to """{"name":"cancel"}""",
+            "first.js" to "first",
+            "second.js" to "second",
+        )
+        val destination = Files.createTempDirectory("six-cancel-output")
+        var checkpoints = 0
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            checkpoints += 1
+            if (checkpoints == 3) throw CancellationException("cancel extraction")
+        }
+
+        assertFailsWith<CancellationException> {
+            ExtensionZip.extract(zip, destination, control)
+        }
+
+        assertTrue(Files.list(destination).use { it.findAny().isEmpty })
     }
 
     @Test

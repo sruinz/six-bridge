@@ -565,6 +565,51 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
+    fun schemaV3PreparedModeEmbedsExactSignedCrxAndDoesNotCreateCrxKey() {
+        val preparedCrx = externalSignedCrx(canonicalSourceZip())
+        val proof = Crx3Verifier.verify(preparedCrx)
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.storeExtensionId(proof.extensionId),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.PREPARED,
+        )
+        val forbiddenAlias = "sixbridge.crx.rsa.v1.${identityKey.identitySha256}"
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        assertFalse(keyStore.containsAlias(forbiddenAlias))
+        val packager = OnDeviceWrapperPackager(context)
+        val identity = packager.resolveIdentity(identityKey, preparedCrx)
+        val report = compatibility(
+            extensionId = proof.extensionId,
+            sourceSha256 = proof.zipSha256,
+            conversionState = "passthrough",
+            originalExtensionId = proof.extensionId,
+        )
+        val output = File(root, "schema-v3-prepared.apk")
+
+        val result = packageClaim(
+            packager,
+            passthroughRequest(
+                identityKey = identityKey,
+                identity = identity,
+                originalCrx = preparedCrx,
+                report = report,
+                output = output,
+                mode = InstallationIdentityMode.PREPARED,
+                sourceKind = "ZIP",
+            ),
+        )
+        val embedded = AndroidArchiveInspector(context.packageManager)
+            .inspect(result.outputApk)
+            .crxBytes
+
+        assertArrayEquals(preparedCrx, embedded)
+        assertEquals(proof.extensionId, result.extensionId)
+        assertNull(identity.crxKeyAlias)
+        assertNull(identity.crxPublicKeyDer)
+        assertFalse(keyStore.containsAlias(forbiddenAlias))
+    }
+
+    @Test
     fun unreservedCreateNewLeaseRecoversAcrossRestartAndReservationConsumesOwner() {
         val identityKey = InstallationIdentityKey.create(
             LogicalSourceIdentity.projectMarker(
@@ -1131,6 +1176,8 @@ class OnDevicePackagerGateInstrumentedTest {
         originalCrx: ByteArray,
         report: ContractCompatibilityReport,
         output: File,
+        mode: InstallationIdentityMode = InstallationIdentityMode.PASSTHROUGH,
+        sourceKind: String = "CRX3",
     ): ClaimedRequest {
         val database = Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
             .allowMainThreadQueries()
@@ -1148,7 +1195,7 @@ class OnDevicePackagerGateInstrumentedTest {
                 val selected = ledger.resolveSelection(
                     logicalSourceIdentity = identityKey.logicalSourceIdentity,
                     profileMajorVersion = identityKey.profileMajorVersion,
-                    mode = InstallationIdentityMode.PASSTHROUGH,
+                    mode = mode,
                     selection = null,
                 )
                 val reserved = ledger.reserve(
@@ -1167,7 +1214,7 @@ class OnDevicePackagerGateInstrumentedTest {
                         passthroughCrx = originalCrx,
                         descriptorName = "SIX Bridge On-Device Gate",
                         descriptorVersion = "1.0",
-                        sourceKind = "CRX3",
+                        sourceKind = sourceKind,
                         compatibility = report,
                         outputApk = output,
                     ),

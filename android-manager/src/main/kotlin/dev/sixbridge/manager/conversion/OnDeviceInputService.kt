@@ -2,6 +2,11 @@ package dev.sixbridge.manager.conversion
 
 import android.content.ContentResolver
 import dev.sixbridge.contract.crx.Crx3Verifier
+import dev.sixbridge.core.compat.AnalysisArchiveKind
+import dev.sixbridge.core.compat.AnalysisBudgetExceededException
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisInputMaterializer
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.draft.SixDraftProbe
 import dev.sixbridge.core.input.ChromeWebStoreAddress
@@ -60,8 +65,14 @@ class OnDeviceInputService(
     )
 
     override suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact =
+        acquire(request, AnalysisControl(AnalysisSafetyPolicy.mobile))
+
+    override suspend fun acquire(
+        request: OnDeviceInputRequest,
+        control: AnalysisControl,
+    ): OnDeviceInputArtifact =
         leaseMutex.withLock {
-            acquireLocked(request)
+            acquireLocked(request, control)
         }
 
     override suspend fun release(artifact: OnDeviceInputArtifact): Boolean =
@@ -88,15 +99,18 @@ class OnDeviceInputService(
 
     private suspend fun acquireLocked(
         request: OnDeviceInputRequest,
+        control: AnalysisControl,
     ): OnDeviceInputArtifact {
+        control.checkCancelled()
         val ownedWorkspace = AtomicReference<Path?>()
         var primaryFailure: Throwable? = null
         return try {
             val artifact = withContext(ioDispatcher) {
                 currentCoroutineContext().ensureActive()
+                control.checkCancelled()
                 val workspace = createWorkspace()
                 ownedWorkspace.set(workspace)
-                acquireOnIo(request, workspace)
+                acquireOnIo(request, workspace, control)
             }
             activeLeases[artifact.token] = ActiveInputLease.from(artifact)
             ownedWorkspace.set(null)
@@ -188,14 +202,21 @@ class OnDeviceInputService(
     private suspend fun acquireOnIo(
         request: OnDeviceInputRequest,
         workspace: Path,
+        control: AnalysisControl,
     ): OnDeviceInputArtifact {
         return try {
+            control.checkCancelled()
             val privateFile = workspace.resolve(INPUT_FILE_NAME).toFile()
             val acquisition = when (request) {
-                is OnDeviceInputRequest.Saf -> copySaf(request, privateFile)
+                is OnDeviceInputRequest.Saf -> copySaf(request, privateFile, control)
                 is OnDeviceInputRequest.ChromeStore -> downloadChrome(request, privateFile)
             }
-            val classified = classify(privateFile, acquisition.expectedExtensionId)
+            control.checkCancelled()
+            val classified = classify(
+                privateFile,
+                acquisition.expectedExtensionId,
+                control,
+            )
             if (!privateFile.setReadOnly()) {
                 inputFailure(
                     OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
@@ -302,7 +323,9 @@ class OnDeviceInputService(
     private suspend fun copySaf(
         request: OnDeviceInputRequest.Saf,
         destination: File,
+        control: AnalysisControl,
     ): AcquiredBytes {
+        control.checkCancelled()
         val input = try {
             safInputOpener.open(request)
         } catch (error: CancellationException) {
@@ -319,7 +342,7 @@ class OnDeviceInputService(
         var primaryFailure: Throwable? = null
         val acquired = try {
             writeNew(destination) { channel ->
-                copyBounded(input, channel)
+                copyBounded(input, channel, control)
             }
         } catch (error: Throwable) {
             primaryFailure = error
@@ -393,12 +416,14 @@ class OnDeviceInputService(
     private suspend fun copyBounded(
         input: InputStream,
         channel: FileChannel,
+        control: AnalysisControl,
     ): AcquiredBytes {
         val digest = MessageDigest.getInstance("SHA-256")
         val output = Channels.newOutputStream(channel)
         val buffer = ByteArray(BUFFER_SIZE)
         var total = 0L
         while (true) {
+            control.checkCancelled()
             currentCoroutineContext().ensureActive()
             val count = try {
                 readCancellable(input, buffer)
@@ -411,6 +436,7 @@ class OnDeviceInputService(
                 )
             }
             currentCoroutineContext().ensureActive()
+            control.checkCancelled()
             if (count < 0) break
             if (count == 0) {
                 inputFailure(
@@ -475,7 +501,9 @@ class OnDeviceInputService(
     private fun classify(
         file: File,
         expectedExtensionId: String?,
+        control: AnalysisControl,
     ): ClassifiedInput {
+        control.checkCancelled()
         val magic = try {
             readMagic(file.toPath())
         } catch (_: Exception) {
@@ -485,8 +513,23 @@ class OnDeviceInputService(
             )
         }
         if (magic.contentEquals(CRX3_MAGIC)) {
+            if (!withinMobileBudget(
+                    file.toPath(),
+                    AnalysisArchiveKind.CRX3,
+                    OnDeviceInputErrorCode.INVALID_CRX3,
+                    control,
+                )
+            ) {
+                return ClassifiedInput(OnDeviceInputKind.CRX3, expectedExtensionId)
+            }
             val verified = try {
-                Crx3Verifier.verify(file.toPath(), MAX_INPUT_BYTES)
+                Crx3Verifier.verify(
+                    file.toPath(),
+                    0L,
+                    file.length(),
+                    MAX_INPUT_BYTES,
+                    control::checkCancelled,
+                )
             } catch (_: IllegalArgumentException) {
                 inputFailure(
                     OnDeviceInputErrorCode.INVALID_CRX3,
@@ -504,6 +547,7 @@ class OnDeviceInputService(
                 verified.zipOffset.toLong(),
                 verified.zipLength.toLong(),
                 requireNotNull(file.parentFile).toPath(),
+                control,
             )
             return ClassifiedInput(OnDeviceInputKind.CRX3, verified.extensionId)
         }
@@ -513,7 +557,13 @@ class OnDeviceInputService(
                 "지원하지 않는 입력 형식입니다.",
             )
         }
-        when (val probe = SixDraft.probe(file.toPath(), MAX_INPUT_BYTES)) {
+        when (
+            val probe = SixDraft.probe(
+                file.toPath(),
+                MAX_INPUT_BYTES,
+                control,
+            )
+        ) {
             SixDraftProbe.MalformedDraft -> {
                 inputFailure(
                     OnDeviceInputErrorCode.INVALID_DRAFT,
@@ -534,22 +584,53 @@ class OnDeviceInputService(
                 )
             }
         }
+        if (!withinMobileBudget(
+                file.toPath(),
+                AnalysisArchiveKind.ZIP,
+                OnDeviceInputErrorCode.INVALID_ZIP,
+                control,
+            )
+        ) {
+            return ClassifiedInput(OnDeviceInputKind.ZIP, null)
+        }
         validateExtensionZip(
             file.toPath(),
             requireNotNull(file.parentFile).toPath(),
             OnDeviceInputErrorCode.INVALID_ZIP,
+            control,
         )
         return ClassifiedInput(OnDeviceInputKind.ZIP, null)
+    }
+
+    private fun withinMobileBudget(
+        path: Path,
+        kind: AnalysisArchiveKind,
+        invalidCode: OnDeviceInputErrorCode,
+        control: AnalysisControl,
+    ): Boolean = try {
+        AnalysisInputMaterializer.preflightArchive(
+            path,
+            kind,
+            control,
+        )
+        true
+    } catch (_: AnalysisBudgetExceededException) {
+        false
+    } catch (_: IllegalArgumentException) {
+        inputFailure(invalidCode, "입력 archive 구조가 올바르지 않습니다.")
     }
 
     private fun validateExtensionZip(
         zipPath: Path,
         workspace: Path,
         errorCode: OnDeviceInputErrorCode,
+        control: AnalysisControl,
     ) {
         val validationRoot = workspace.resolve(VALIDATION_DIRECTORY)
         try {
-            ExtensionZip.extract(zipPath, validationRoot)
+            ExtensionZip.extract(zipPath, validationRoot, control)
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Exception) {
             inputFailure(errorCode, "확장 ZIP 구조가 올바르지 않습니다.")
         } finally {
@@ -567,6 +648,7 @@ class OnDeviceInputService(
         payloadOffset: Long,
         payloadLength: Long,
         workspace: Path,
+        control: AnalysisControl,
     ) {
         val payloadPath = workspace.resolve(CRX_PAYLOAD_FILE)
         try {
@@ -576,12 +658,14 @@ class OnDeviceInputService(
                     var position = payloadOffset
                     var remaining = payloadLength
                     while (remaining > 0) {
+                        control.checkCancelled()
                         buffer.clear()
                         buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
                         val count = source.read(buffer, position)
                         require(count > 0) { "CRX3 ZIP payload를 완전히 읽지 못했습니다." }
                         buffer.flip()
                         while (buffer.hasRemaining()) output.write(buffer)
+                        control.checkCancelled()
                         position += count
                         remaining -= count
                     }
@@ -592,7 +676,10 @@ class OnDeviceInputService(
                 payloadPath,
                 workspace,
                 OnDeviceInputErrorCode.INVALID_CRX3,
+                control,
             )
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: OnDeviceInputException) {
             throw error
         } catch (_: Exception) {

@@ -174,6 +174,10 @@ internal data class PackagedConversion(
 
 internal interface ConversionInputPort {
     suspend fun acquire(request: OnDeviceInputRequest): OnDeviceInputArtifact
+    suspend fun acquire(
+        request: OnDeviceInputRequest,
+        control: AnalysisControl,
+    ): OnDeviceInputArtifact = acquire(request)
     suspend fun release(artifact: OnDeviceInputArtifact): Boolean
     suspend fun reclaimOrphans(): Boolean
 }

@@ -36,15 +36,36 @@ sealed interface SixDraftProbe {
 
 internal object StrictDraftPathProbe {
     fun probe(path: Path, maximumBytes: Long): SixDraftProbe =
-        probe(path, maximumBytes) {}
+        probe(path, maximumBytes, AnalysisControl()) {}
+
+    fun probe(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): SixDraftProbe = probe(path, maximumBytes, control) {}
 
     internal fun probe(
         path: Path,
         maximumBytes: Long,
         afterValidation: () -> Unit,
+    ): SixDraftProbe = probe(
+        path,
+        maximumBytes,
+        AnalysisControl(),
+        afterValidation,
+    )
+
+    private fun probe(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+        afterValidation: () -> Unit,
     ): SixDraftProbe {
+        control.checkCancelled()
         val before = try {
             readPathState(path)
+        } catch (error: java.util.concurrent.CancellationException) {
+            throw error
         } catch (_: Exception) {
             return SixDraftProbe.NotDraft
         }
@@ -57,29 +78,58 @@ internal object StrictDraftPathProbe {
         }
         val candidate = try {
             FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
-                DraftCandidatePreflight.isCandidate(channel, before.size)
+                DraftCandidatePreflight.isCandidate(
+                    channel,
+                    before.size,
+                    control,
+                )
             }
+        } catch (error: java.util.concurrent.CancellationException) {
+            throw error
         } catch (_: Exception) {
             false
         }
         if (!candidate) return SixDraftProbe.NotDraft
         return try {
-            val initialHash = sha256(path, before.size)
-            val result = inspect(path, maximumBytes, AnalysisControl()).valid
+            val initialHash = sha256(path, before.size, control)
+            val result = inspect(path, maximumBytes, control).valid
             afterValidation()
+            control.checkCancelled()
             require(readPathState(path) == before) {
                 "SixDraft archive가 검증 중 변경되었습니다."
             }
-            require(sha256(path, before.size) == initialHash) {
+            require(sha256(path, before.size, control) == initialHash) {
                 "SixDraft archive가 검증 중 변경되었습니다."
             }
             result
+        } catch (error: java.util.concurrent.CancellationException) {
+            throw error
         } catch (_: Exception) {
             SixDraftProbe.MalformedDraft
         }
     }
 
     internal fun readControlled(
+        path: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): ControlledSixDraft {
+        control.checkCancelled()
+        val before = readPathState(path)
+        val initialHash = sha256(path, before.size, control)
+        return try {
+            val result = readControlledVerified(path, maximumBytes, control)
+            requireStablePath(path, before, initialHash, control)
+            result
+        } catch (error: java.util.concurrent.CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            requireStablePath(path, before, initialHash, control)
+            throw error
+        }
+    }
+
+    private fun readControlledVerified(
         path: Path,
         maximumBytes: Long,
         control: AnalysisControl,
@@ -130,6 +180,20 @@ internal object StrictDraftPathProbe {
         val bytes = readWholeBounded(path, maximumBytes, control)
         control.checkCancelled()
         return ControlledSixDraft.Legacy(SixDraft.read(bytes))
+    }
+
+    private fun requireStablePath(
+        path: Path,
+        before: PathState,
+        initialHash: String,
+        control: AnalysisControl,
+    ) {
+        require(readPathState(path) == before) {
+            "SixDraft archive가 검증 중 변경되었습니다."
+        }
+        require(sha256(path, before.size, control) == initialHash) {
+            "SixDraft archive가 검증 중 변경되었습니다."
+        }
     }
 
     private fun inspect(
@@ -386,7 +450,11 @@ internal object StrictDraftPathProbe {
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).toHex()
 
-    private fun sha256(path: Path, expectedSize: Long): String =
+    private fun sha256(
+        path: Path,
+        expectedSize: Long,
+        control: AnalysisControl,
+    ): String =
         FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
             require(channel.size() == expectedSize) {
                 "SixDraft archive가 검증 중 변경되었습니다."
@@ -396,7 +464,7 @@ internal object StrictDraftPathProbe {
                 channel,
                 0L,
                 expectedSize,
-                AnalysisControl(),
+                control,
             ) { buffer, count ->
                 digest.update(buffer.array(), 0, count)
             }
@@ -524,7 +592,12 @@ internal object StrictDraftPathProbe {
 }
 
 private object DraftCandidatePreflight {
-    fun isCandidate(channel: FileChannel, size: Long): Boolean {
+    fun isCandidate(
+        channel: FileChannel,
+        size: Long,
+        control: AnalysisControl,
+    ): Boolean {
+        control.checkCancelled()
         val eocd = findEocd(channel, size) ?: return false
         if (eocd.diskNumber != 0 ||
             eocd.centralDisk != 0 ||
@@ -545,6 +618,7 @@ private object DraftCandidatePreflight {
         var sourceOccurrences = 0
         var matchedOccurrences = 0
         repeat(eocd.entryCount) {
+            control.checkCancelled()
             if (cursor > centralEnd - CENTRAL_HEADER_SIZE) return false
             val header = readBytes(channel, cursor, CENTRAL_HEADER_SIZE)
             if (le32(header, 0) != CENTRAL_SIGNATURE) return false

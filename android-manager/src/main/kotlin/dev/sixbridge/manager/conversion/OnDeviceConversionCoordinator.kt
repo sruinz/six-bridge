@@ -44,8 +44,12 @@ internal class OnDeviceConversionCoordinator(
         if (!reclaimed) {
             return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_CLEANUP)
         }
+        val callerJob = currentCoroutineContext().job
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            callerJob.ensureActive()
+        }
         val artifact = try {
-            input.acquire(request)
+            input.acquire(request, control)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {

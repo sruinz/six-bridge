@@ -81,6 +81,41 @@ class ConversionIdentityLedgerTest {
         }
 
     @Test
+    fun `PREPARED 예약은 signed CRX ID를 bind하고 Android CRX key를 만들지 않는다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(dao)
+            val signedCrxId = "d".repeat(32)
+            val key = InstallationIdentityKey.create(
+                LogicalSourceIdentity.storeExtensionId(signedCrxId),
+                30,
+                InstallationIdentityMode.PREPARED,
+            )
+            val binding = ConversionPackageBinding(
+                extensionId = signedCrxId,
+                packageName = "dev.sixbridge.ext.$signedCrxId",
+                wrapperSignerSha256 = SIGNER,
+                crxKeyAlias = null,
+                crxPublicKeySha256 = null,
+            )
+
+            ledger.reserve(
+                reservation(key, binding),
+                ownerToken = JOB_ONE,
+            )
+
+            val stored = requireNotNull(dao.get(key.identitySha256))
+            val lease = requireNotNull(dao.getLease(key.identitySha256))
+            assertEquals(InstallationIdentityMode.PREPARED.name, stored.mode)
+            assertEquals(signedCrxId, stored.extensionId)
+            assertNull(stored.crxKeyAlias)
+            assertEquals(signedCrxId, lease.extensionId)
+            assertNull(lease.crxKeyAlias)
+            assertNull(lease.crxPublicKeySha256)
+            assertTrue(ledger.abortReservationByOwnerToken(JOB_ONE))
+        }
+
+    @Test
     fun `미예약 abort는 packager 없이 lease를 버리지 않는다`() = runTest {
         val dao = FakeConversionIdentityDao()
         val ledger = ConversionIdentityLedger(dao)

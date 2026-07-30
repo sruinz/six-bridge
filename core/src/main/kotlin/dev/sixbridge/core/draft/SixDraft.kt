@@ -616,6 +616,8 @@ class SixDraftPayload private constructor(
             }
             require(
                 before.extensionVersion == input.originalExtensionVersion &&
+                    after.extensionVersion == input.originalExtensionVersion &&
+                    after.extensionName == before.extensionName &&
                     before.originalExtensionId == input.originalExtensionId &&
                     after.originalExtensionId == input.originalExtensionId,
             ) {
@@ -883,6 +885,12 @@ object SixDraft {
 
     fun probe(input: Path, maximumBytes: Long): SixDraftProbe =
         StrictDraftPathProbe.probe(input, maximumBytes)
+
+    fun probe(
+        input: Path,
+        maximumBytes: Long,
+        control: AnalysisControl,
+    ): SixDraftProbe = StrictDraftPathProbe.probe(input, maximumBytes, control)
 
     private fun readVerified(bytes: ByteArray): VerifiedSixDraft {
         require(bytes.size.toLong() <= MAX_ARCHIVE_SIZE) {

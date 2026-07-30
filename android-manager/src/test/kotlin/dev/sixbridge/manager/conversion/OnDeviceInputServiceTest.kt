@@ -1,5 +1,7 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.ConversionState
@@ -443,6 +445,25 @@ class OnDeviceInputServiceTest {
     }
 
     @Test
+    fun `caller AnalysisControl 취소는 SAF copy와 probe 사이에서 bounded 전파된다`() =
+        runTest {
+            val input = CountingGeneratedInputStream(4L * 1024 * 1024)
+            val service = service(input)
+            var checkpoints = 0
+            val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+                checkpoints += 1
+                if (checkpoints == 4) throw CancellationException("cancel acquisition")
+            }
+
+            assertFailsWith<CancellationException> {
+                service.acquire(safRequest(), control)
+            }
+
+            assertTrue(input.readCalls <= 2, "readCalls=${input.readCalls}")
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        }
+
+    @Test
     fun `IO 성공 뒤 caller resume 전 취소하면 전달되지 않은 token을 정리한다`() = runBlocking {
         val callerExecutor = Executors.newSingleThreadExecutor()
         val ioExecutor = Executors.newSingleThreadExecutor()
@@ -513,6 +534,36 @@ class OnDeviceInputServiceTest {
         assertEquals(OnDeviceInputErrorCode.UNSUPPORTED_FORMAT, error.code)
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
+
+    @Test
+    fun `모바일 예산 초과 ZIP은 private copy 뒤 extraction 없이 분석 artifact로 유지한다`() =
+        runTest {
+            val source = extensionZipWithLargeScript(
+                AnalysisSafetyPolicy.mobile.maxSingleScriptBytes.toInt() + 1,
+            )
+            val service = service(ByteArrayInputStream(source))
+
+            val artifact = service.acquire(safRequest())
+
+            assertEquals(OnDeviceInputKind.ZIP, artifact.kind)
+            assertTrue(artifact.privateFile.isFile)
+            assertTrue(service.release(artifact))
+        }
+
+    @Test
+    fun `모바일 예산 초과 CRX는 private copy 뒤 payload extraction 없이 artifact로 유지한다`() =
+        runTest {
+            val crx = crxWithLargeScript(
+                AnalysisSafetyPolicy.mobile.maxSingleScriptBytes.toInt() + 1,
+            )
+            val service = service(ByteArrayInputStream(crx.bytes))
+
+            val artifact = service.acquire(safRequest())
+
+            assertEquals(OnDeviceInputKind.CRX3, artifact.kind)
+            assertTrue(artifact.privateFile.isFile)
+            assertTrue(service.release(artifact))
+        }
 
     @Test
     fun `SAF request 문자열도 URI를 노출하지 않는다`() {
@@ -688,6 +739,47 @@ class OnDeviceInputServiceTest {
         }
     }
 
+    private fun crxWithLargeScript(size: Int) =
+        Files.createTempDirectory("on-device-large-crx-extension").let { source ->
+            try {
+                source.resolve("manifest.json").writeText(
+                    """{"manifest_version":3,"name":"Large CRX","version":"1"}""",
+                )
+                Files.write(source.resolve("large.js"), ByteArray(size))
+                Crx3.pack(
+                    source,
+                    KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                        .generateKeyPair(),
+                )
+            } finally {
+                source.toFile().deleteRecursively()
+            }
+        }
+
+    private fun extensionZipWithLargeScript(size: Int): ByteArray =
+        ByteArrayOutputStream().also { bytes ->
+            ZipOutputStream(bytes).use { zip ->
+                listOf(
+                    "manifest.json" to
+                        """{"manifest_version":3,"name":"Large","version":"1"}"""
+                            .encodeToByteArray(),
+                    "large.js" to ByteArray(size),
+                ).forEach { (name, value) ->
+                    val crc = java.util.zip.CRC32().apply { update(value) }.value
+                    zip.putNextEntry(
+                        ZipEntry(name).apply {
+                            method = ZipEntry.STORED
+                            this.size = value.size.toLong()
+                            compressedSize = this.size
+                            this.crc = crc
+                        },
+                    )
+                    zip.write(value)
+                    zip.closeEntry()
+                }
+            }
+        }.toByteArray()
+
     private fun validDraftV2(): ByteArray {
         val source = extensionZip()
         val sourceHash = sha256(source)
@@ -815,6 +907,28 @@ class OnDeviceInputServiceTest {
             if (position++ < size) 0 else -1
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (position >= size) return -1
+            val count = minOf(length.toLong(), size - position).toInt()
+            buffer.fill(0, offset, offset + count)
+            position += count
+            return count
+        }
+    }
+
+    private class CountingGeneratedInputStream(
+        private val size: Long,
+    ) : InputStream() {
+        private var position = 0L
+        var readCalls: Int = 0
+            private set
+
+        override fun read(): Int {
+            readCalls += 1
+            return if (position++ < size) 0 else -1
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            readCalls += 1
             if (position >= size) return -1
             val count = minOf(length.toLong(), size - position).toInt()
             buffer.fill(0, offset, offset + count)
