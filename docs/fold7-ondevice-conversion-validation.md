@@ -56,6 +56,15 @@ APK v2·v3 서명과 `six://ex`/Provider 계약을 다시 확인한다.
 이 문서 작성 시점에는 위 수동 UI 절차를 실행했다고 주장하지 않는다.
 자동 게이트만 완료했다.
 
+2026-07-30에는 저장된 `SIXBridge-exact-ddcp.six`를 최신 관리자 빌드에서
+가져와 Google DocumentsUI로 설치하는 수동 회귀를 별도로 완료했다. 설치
+출처, `dev_ext`, 활성화·기능·브라우저 재시작 유지 결과는
+`docs/FOLD7_SYSTEM_DOCUMENTS_INSTALL_GATE_KO.md`에 기록했다. 이 결과는
+시스템 문서 앱 설치 경로를 검증하지만, 위 2단계의 실제 Chrome 웹 스토어 URL
+다운로드와 9단계의 동일 URL 재변환·업데이트를 실행한 결과로 대신하지
+않는다. 따라서 이 문서의 Chrome 웹 스토어 URL 수동 UI 게이트는 계속
+미완료로 유지한다.
+
 ## 알려진 기존 검증 이슈
 
 `scripts/verify.sh`의 Android lint는

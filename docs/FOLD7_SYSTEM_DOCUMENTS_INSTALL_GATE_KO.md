@@ -461,3 +461,58 @@ DocumentsUI 실행, 사용자 승인, Add-ons 활성화·기능·재시작 유�
 
 실패 시 wrapper, manager app data, `.local/` 키와 증거를 삭제하지 않는다.
 현재 화면과 명령 출력을 보존한 뒤 원인을 기록한다.
+
+## 2026-07-30 최신 관리자 빌드 실행 결과
+
+다음 최신 관리자 빌드로 이 문서의 수동 게이트를 다시 실행했다.
+
+- Git commit: `0c9a4cb`
+- manager debug APK SHA-256:
+  `d0388aa6f945be01f3430ad4005e72f993b7267cd5a6ce2bb3b23dc8bd39e7e8`
+- evidence:
+  `.local/evidence/20260730-221316-system-documents-latest-gate`
+- 가져온 `.six`: `SIXBridge-exact-ddcp.six`
+- 내보낸 APK:
+  `스마트 컨텍스트 메뉴-1.1.1-ddcpml (3).apk`
+- wrapper package:
+  `dev.sixbridge.ext.ddcpmlcaanjillmjmnlmngimhbbojgam`
+- wrapper APK SHA-256:
+  `8a0b44558e22d16deaf7a92e8e8119629cadbfcc88dbbd8dae160fb41b30a6c2`
+- wrapper signer SHA-256:
+  `55f73d78f4597a14039162a63985a831766e402e3910bbb44b3c71d8740c0c0f`
+
+`파일 앱 열기` 뒤 최상위 task는 다음 계약을 모두 만족했다.
+
+- component package: `com.google.android.documentsui`
+- action: `android.intent.action.VIEW_DOWNLOADS`
+- category: `android.intent.category.DEFAULT`
+- `launchedFromPackage=dev.sixbridge.manager`
+- Activity state: `RESUMED`
+
+사용자가 Google DocumentsUI 다운로드 화면에서 APK를 직접 선택하고 설치를
+승인했다. 설치 결과는 다음과 같다.
+
+```text
+installerPackageName=com.google.android.packageinstaller
+initiatingPackageName=com.google.android.packageinstaller
+originatingPackageName=null
+packageSource=3
+```
+
+설치된 `base.apk`는 내보낸 APK와 byte 단위로 같았고 SHA-256과 signer도
+일치했다. Samsung Internet은 해당 package를 `dev_ext`와
+`Allowed to be supported`로 판정했다. 사용자는 같은 이름의 기존 테스트
+확장을 비활성화하고 새 `ddcp…` 확장만 활성화한 뒤 일반 웹 페이지의 텍스트
+선택 기능이 동작하는 것을 확인했다.
+
+Samsung Internet을 완전히 종료하고 Add-ons 화면으로 다시 시작한 뒤에도
+다음 상태가 유지됐다.
+
+```text
+stored:ddcpm,dev.sixbridge.ext.ddcpmlcaanjillmjmnlmngimhbbojgam,스마트 컨텍스트 메뉴,1.1.1,dev_ext,Instd,0,ON
+```
+
+사용자는 재시작된 브라우저에서 페이지를 새로고침한 뒤 텍스트 선택 기능이
+다시 정상 동작하는 것도 확인했다. 따라서 최신 관리자 빌드의 Google
+DocumentsUI 실행, 설치 출처, wrapper 신원, `dev_ext`, 활성화·기능·재시작
+유지 수동 게이트는 합격이다.
