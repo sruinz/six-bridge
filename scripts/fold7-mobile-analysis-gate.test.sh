@@ -131,6 +131,18 @@ fi
 [ ! -e "${FIXTURE_ROOT}/adb.log" ] ||
     fail "serial 검증 전에 adb가 실행됐습니다."
 
+wrong_serial_output="${FIXTURE_ROOT}/wrong-serial.log"
+if run_gate "$wrong_serial_output" 192.168.0.99:5555; then
+    fail "다른 serial을 gate가 허용했습니다."
+fi
+assert_contains "$wrong_serial_output" \
+    'Fold7 serial만 허용합니다: 192.0.2.10:39359' \
+    "다른 serial의 명확한 한글 거부 이유가 없습니다."
+[ ! -d "${FIXTURE_ROOT}/.local/evidence" ] ||
+    fail "다른 serial 거부 전에 evidence 디렉터리가 생성됐습니다."
+[ ! -e "${FIXTURE_ROOT}/adb.log" ] ||
+    fail "다른 serial 거부 전에 adb가 실행됐습니다."
+
 success_output="${FIXTURE_ROOT}/success.log"
 run_gate "$success_output" 192.0.2.10:39359
 readonly EVIDENCE="${FIXTURE_ROOT}/.local/evidence/20260730-123456-mobile-analysis-gate.log"

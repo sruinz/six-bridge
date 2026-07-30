@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly expected_serial='192.0.2.10:39359'
 readonly serial="${1:?adb serial이 필요합니다}"
+if [ "$serial" != "$expected_serial" ]; then
+    printf '오류: Fold7 serial만 허용합니다: %s\n' "$expected_serial" >&2
+    exit 2
+fi
 readonly apk="android-manager/build/outputs/apk/debug/android-manager-debug.apk"
 readonly package="dev.sixbridge.manager"
 readonly evidence_dir=".local/evidence"
