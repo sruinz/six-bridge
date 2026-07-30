@@ -32,6 +32,44 @@ class CompatibilityAnalyzerTest {
     )
 
     @Test
+    fun `모바일 분석 예산 초과는 이름과 권한을 보존한 UNKNOWN이다`() {
+        val source = Files.createTempDirectory("six-budget")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Large","version":"1","permissions":["storage"]}""",
+        )
+        Files.write(source.resolve("bundle.js"), ByteArray(2 * 1024 * 1024 + 1))
+
+        val report = CompatibilityAnalyzer(
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        ).analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertEquals("Large", report.extensionName)
+        assertEquals(setOf("storage"), report.declaredPermissions)
+        assertTrue(report.usedApis.isEmpty())
+        assertEquals("analysis_budget_exceeded", report.issues.single().code)
+    }
+
+    @Test
+    fun `stable 분석에서 모바일 예산 초과 preflight는 UNKNOWN 계약을 보존한다`() {
+        val source = Files.createTempDirectory("six-budget-stable")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Large","version":"1","permissions":["storage"]}""",
+        )
+        Files.write(source.resolve("bundle.js"), ByteArray(2 * 1024 * 1024 + 1))
+
+        val report = CompatibilityAnalyzer(
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        ).analyzeStable(source, profile, sourceSha256 = null)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertEquals("Large", report.extensionName)
+        assertEquals(setOf("storage"), report.declaredPermissions)
+        assertTrue(report.usedApis.isEmpty())
+        assertEquals("analysis_budget_exceeded", report.issues.single().code)
+    }
+
+    @Test
     fun `classifies a supported MV3 extension as compatible`() {
         val source = Files.createTempDirectory("six-compatible")
         source.resolve("manifest.json").writeText(

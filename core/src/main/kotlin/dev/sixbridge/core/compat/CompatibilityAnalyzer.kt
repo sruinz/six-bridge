@@ -19,6 +19,7 @@ import kotlin.io.path.readText
 import kotlin.jvm.JvmSynthetic
 
 class CompatibilityAnalyzer(
+    private val control: AnalysisControl = AnalysisControl(),
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
@@ -55,6 +56,20 @@ class CompatibilityAnalyzer(
         if (!manifestPath.isRegularFile()) {
             return blocked("manifest_missing", "manifest.json 파일을 찾을 수 없습니다.")
         }
+        val manifestBytes = Files.size(manifestPath)
+        if (manifestBytes > control.policy.maxManifestBytes) {
+            return budgetExceededReport(
+                manifestVersion = null,
+                name = null,
+                version = null,
+                permissions = emptySet(),
+                exceeded = AnalysisInventoryResult.Exceeded(
+                    metric = AnalysisBudgetMetric.MANIFEST_BYTES,
+                    actual = manifestBytes,
+                    limit = control.policy.maxManifestBytes,
+                ),
+            )
+        }
 
         val manifest = try {
             json.parseToJsonElement(manifestPath.readText()) as? JsonObject
@@ -75,6 +90,20 @@ class CompatibilityAnalyzer(
             readStringSet(manifest["permissions"]) +
                 readStringSet(manifest["optional_permissions"])
             ).toSet()
+        when (val inventory = AnalysisInventory.inspect(
+            extensionRoot,
+            control.policy,
+            control::checkCancelled,
+        )) {
+            AnalysisInventoryResult.Allowed -> Unit
+            is AnalysisInventoryResult.Exceeded -> return budgetExceededReport(
+                manifestVersion,
+                name,
+                version,
+                permissions,
+                inventory,
+            )
+        }
         val apiScan = scanApiCalls(extensionRoot, manifest)
         val usedApis = (
             apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
@@ -449,6 +478,29 @@ class CompatibilityAnalyzer(
         usedApis = emptySet(),
         unsupportedApis = emptySet(),
         issues = listOf(CompatibilityIssue(code, message, blocking = true)),
+    )
+
+    private fun budgetExceededReport(
+        manifestVersion: Int?,
+        name: String?,
+        version: String?,
+        permissions: Set<String>,
+        exceeded: AnalysisInventoryResult.Exceeded,
+    ): CompatibilityReport = CompatibilityReport(
+        status = CompatibilityStatus.UNKNOWN,
+        manifestVersion = manifestVersion,
+        extensionName = name,
+        extensionVersion = version,
+        declaredPermissions = permissions.toSortedSet(),
+        usedApis = emptySet(),
+        unsupportedApis = emptySet(),
+        issues = listOf(
+            CompatibilityIssue(
+                code = "analysis_budget_exceeded",
+                message = "${exceeded.metric}: ${exceeded.actual} > ${exceeded.limit}",
+                blocking = true,
+            ),
+        ),
     )
 
     private fun report(
