@@ -21,27 +21,51 @@ import kotlin.test.assertTrue
 
 class ExtensionZipTest {
     @Test
-    fun `secure root hook 뒤 재검증 실패는 ZIP 쓰기 전에 중단한다`() {
-        val events = mutableListOf<String>()
-        var rootIsEmpty = true
+    fun `secure inventory 순회와 추출은 각각 새 handle을 사용한다`() {
+        class SingleIteratorHandle(val id: Int) : AutoCloseable {
+            var traversed = false
+            var closed = false
 
-        val failure = assertFailsWith<IllegalArgumentException> {
-            runAfterSecureExtractionHook(
-                hook = {
-                    events += "hook"
-                    rootIsEmpty = false
-                },
-                revalidate = {
-                    events += "revalidate"
-                    require(rootIsEmpty) { "secure root is not empty" }
-                },
-            ) {
-                events += "write"
+            fun traverse() {
+                check(!traversed) { "handle $id iterator reused" }
+                traversed = true
+            }
+
+            override fun close() {
+                check(!closed) { "handle $id closed twice" }
+                closed = true
             }
         }
+        val opened = mutableListOf<SingleIteratorHandle>()
+        val inventoryHandles = mutableListOf<Int>()
+        var extractionHandle: Int? = null
+        var hookRan = false
 
-        assertTrue(failure.message.orEmpty().contains("not empty"))
-        assertEquals(listOf("hook", "revalidate"), events)
+        val result = runSecureExtractionWithFreshHandles(
+            openRoot = {
+                SingleIteratorHandle(opened.size + 1).also(opened::add)
+            },
+            requireEmpty = { handle ->
+                handle.traverse()
+                inventoryHandles += handle.id
+            },
+            hook = { hookRan = true },
+            extract = { handle ->
+                check(hookRan)
+                extractionHandle = handle.id
+                "extracted"
+            },
+            requireFinalInventory = { handle ->
+                handle.traverse()
+                inventoryHandles += handle.id
+            },
+        )
+
+        assertEquals("extracted", result)
+        assertEquals(listOf(1, 2, 3, 4), opened.map { it.id })
+        assertEquals(listOf(1, 2, 4), inventoryHandles)
+        assertEquals(3, extractionHandle)
+        assertTrue(opened.all { it.closed })
     }
 
     @Test

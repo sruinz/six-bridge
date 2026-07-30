@@ -21,6 +21,16 @@ import kotlin.test.assertTrue
 
 class ExtensionInputResolverTest {
     @Test
+    fun `public 생성자는 downloader와 root factory만 노출한다`() {
+        val parameterCounts = ExtensionInputResolver::class.java.constructors
+            .filterNot { it.isSynthetic }
+            .map { it.parameterCount }
+            .sorted()
+
+        assertEquals(listOf(2), parameterCounts)
+    }
+
+    @Test
     fun `같은 추출 root는 첫 추출 실패 뒤에도 재사용하지 않는다`() {
         val source = Files.createTempDirectory("six-input-reused-root-source")
         source.resolve("manifest.json").writeText(
@@ -63,8 +73,7 @@ class ExtensionInputResolverTest {
         ExtensionZip.create(source, zip)
         val root = Files.createTempDirectory("six-input-replaced-root")
         val moved = root.resolveSibling("${root.fileName}-moved")
-        @Suppress("DEPRECATION")
-        val resolver = ExtensionInputResolver(
+        val resolver = ExtensionInputResolver.withExtractionRootValidatedHook(
             extractionRootFactory = { root },
             extractionRootValidatedHook = { validated ->
                 Files.move(validated, moved, ATOMIC_MOVE)

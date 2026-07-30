@@ -828,37 +828,68 @@ object ExtensionZip {
             require(parentStream is SecureDirectoryStream<Path>) {
                 "파일시스템이 안전한 ZIP 압축 해제를 지원하지 않습니다: $root"
             }
-            requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
-            parentStream.newDirectoryStream(
-                root.fileName,
-                LinkOption.NOFOLLOW_LINKS,
-            ).use { directory ->
-                requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
-                require(!directory.iterator().hasNext()) {
-                    "ZIP 압축 해제 대상은 secure handle 확인 시점에도 비어 있어야 합니다."
-                }
-                val result = runAfterSecureExtractionHook(
-                    hook = { afterSecureValidation(root) },
-                    revalidate = {
-                        requireSecureRootIdentity(
-                            parentStream,
-                            root.fileName,
-                            expectedFileKey,
-                        )
-                        require(!directory.iterator().hasNext()) {
-                            "ZIP 압축 해제 대상은 secure hook 뒤에도 비어 있어야 합니다."
-                        }
-                    },
-                ) {
-                    block(directory)
-                }
-                require(secureInventory(directory, control) == expectedEntries) {
-                    "ZIP 압축 해제 중 예상하지 않은 root 항목이 생겼습니다."
-                }
-                requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
-                control.checkCancelled()
-                return result
+            val verifyRoot = {
+                requireSecureRootIdentity(
+                    parentStream,
+                    root.fileName,
+                    expectedFileKey,
+                )
             }
+            return runSecureExtractionWithFreshHandles(
+                openRoot = {
+                    openSecureExtractionRoot(
+                        parentStream,
+                        root.fileName,
+                        expectedFileKey,
+                    )
+                },
+                requireEmpty = { directory ->
+                    control.checkCancelled()
+                    verifyRoot()
+                    require(!directory.iterator().hasNext()) {
+                        "ZIP 압축 해제 대상은 secure handle 확인 시점에도 비어 있어야 합니다."
+                    }
+                    verifyRoot()
+                },
+                hook = { afterSecureValidation(root) },
+                extract = { directory ->
+                    verifyRoot()
+                    val result = block(directory)
+                    verifyRoot()
+                    result
+                },
+                requireFinalInventory = { directory ->
+                    verifyRoot()
+                    require(secureInventory(directory, control) == expectedEntries) {
+                        "ZIP 압축 해제 중 예상하지 않은 root 항목이 생겼습니다."
+                    }
+                    verifyRoot()
+                    control.checkCancelled()
+                },
+            )
+        }
+    }
+
+    private fun openSecureExtractionRoot(
+        parent: SecureDirectoryStream<Path>,
+        name: Path,
+        expectedFileKey: Any,
+    ): SecureDirectoryStream<Path> {
+        requireSecureRootIdentity(parent, name, expectedFileKey)
+        val directory = parent.newDirectoryStream(
+            name,
+            LinkOption.NOFOLLOW_LINKS,
+        )
+        return try {
+            requireSecureRootIdentity(parent, name, expectedFileKey)
+            directory
+        } catch (error: Throwable) {
+            try {
+                directory.close()
+            } catch (closeError: Throwable) {
+                error.addSuppressed(closeError)
+            }
+            throw error
         }
     }
 
@@ -1018,12 +1049,17 @@ object ExtensionZip {
     )
 }
 
-internal inline fun <T> runAfterSecureExtractionHook(
+internal inline fun <H : AutoCloseable, T> runSecureExtractionWithFreshHandles(
+    openRoot: () -> H,
+    requireEmpty: (H) -> Unit,
     hook: () -> Unit,
-    revalidate: () -> Unit,
-    extract: () -> T,
+    extract: (H) -> T,
+    requireFinalInventory: (H) -> Unit,
 ): T {
+    openRoot().use(requireEmpty)
     hook()
-    revalidate()
-    return extract()
+    openRoot().use(requireEmpty)
+    val result = openRoot().use(extract)
+    openRoot().use(requireFinalInventory)
+    return result
 }
