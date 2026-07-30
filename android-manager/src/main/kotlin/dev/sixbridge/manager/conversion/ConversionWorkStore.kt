@@ -75,75 +75,83 @@ class ConversionWorkStore internal constructor(
     suspend fun create(
         artifact: OnDeviceInputArtifact,
     ): RestoredConversionJob = mutex.withLock {
-        withContext(Dispatchers.IO) {
-            var claimedToken: String? = null
-            try {
-                validateArtifactBoundary(artifact)
-                val root = requirePrivateRoot()
-                val token = requireCanonicalUuid(tokenFactory(), "작업 token")
-                val inputFileName =
-                    "${requireCanonicalUuid(fileNameFactory(), "입력 파일명")}.input"
-                val discoveredCleanup = (
-                    listFiles(root)
-                        ?: throw IllegalStateException("private 작업 저장소를 열거할 수 없습니다.")
-                    )
-                    .map(File::getName)
-                    .filter(::isCanonicalUuid)
-                    .toSet()
-                var claimed = dao.claimCreate(
-                    ConversionJobEntity(
-                        token = token,
-                        generation = 0,
-                        inputKind = artifact.kind.name,
-                        inputSha256 = artifact.sha256,
-                        inputFileName = inputFileName,
-                        stage = ConversionJobStage.INPUT_READY.name,
-                        approvedAdapterIdsJson = null,
-                        profileSha256 = null,
-                        bundleFileName = null,
-                        bundleSha256 = null,
-                        cleanupTokensJson = encodeCleanupTokens(discoveredCleanup),
-                        updatedAtEpochMillis = now(),
-                    ),
-                )
-                claimedToken = token
-                hooks.afterCreateClaim()
-                val tokenDirectory = directChild(root, token)
+        var claimedToken: String? = null
+        try {
+            withContext(Dispatchers.IO) {
                 try {
-                    Files.createDirectory(tokenDirectory.toPath())
-                } catch (_: Exception) {
-                    throw IllegalStateException("private 작업 directory를 만들 수 없습니다.")
-                }
-                val inputFile = directChild(tokenDirectory, inputFileName)
-                copyStableNew(
-                    source = artifact.privateFile,
-                    destination = inputFile,
-                    expectedSha256 = artifact.sha256,
-                    label = "Task 6 입력",
-                )
-                hooks.afterInputCopied()
-                val verifiedInputState = verifyFileHash(inputFile, artifact.sha256)
-                require(inputFile.setReadOnly()) {
-                    "private 입력을 불변 상태로 고정할 수 없습니다."
-                }
-                requireStableFile(inputFile, verifiedInputState, "입력 고정")
-                val current = dao.get()
-                check(current?.token == token && current.generation == claimed.generation) {
-                    "활성 작업이 바뀌었습니다."
-                }
-                claimed = drainCleanupTokens(root, claimed)
-                    ?: throw IllegalStateException(
-                        "이전 private 작업 cleanup을 완료하지 못했습니다.",
+                    validateArtifactBoundary(artifact)
+                    val root = requirePrivateRoot()
+                    val token = requireCanonicalUuid(tokenFactory(), "작업 token")
+                    val inputFileName =
+                        "${requireCanonicalUuid(fileNameFactory(), "입력 파일명")}.input"
+                    val discoveredCleanup = (
+                        listFiles(root)
+                            ?: throw IllegalStateException("private 작업 저장소를 열거할 수 없습니다.")
+                        )
+                        .map(File::getName)
+                        .filter(::isCanonicalUuid)
+                        .toSet()
+                    var claimed = dao.claimCreate(
+                        ConversionJobEntity(
+                            token = token,
+                            generation = 0,
+                            inputKind = artifact.kind.name,
+                            inputSha256 = artifact.sha256,
+                            inputFileName = inputFileName,
+                            stage = ConversionJobStage.INPUT_READY.name,
+                            approvedAdapterIdsJson = null,
+                            profileSha256 = null,
+                            bundleFileName = null,
+                            bundleSha256 = null,
+                            cleanupTokensJson = encodeCleanupTokens(discoveredCleanup),
+                            updatedAtEpochMillis = now(),
+                        ),
                     )
-                claimed.toRestored(tokenDirectory, inputAlreadyVerified = true)
-                    ?: throw IllegalStateException("새 작업을 복구할 수 없습니다.")
-            } catch (error: CancellationException) {
-                val token = claimedToken
-                if (token == null) throw error
-                throw ConversionWorkClaimedCancellationException(token, error)
-            } catch (error: Throwable) {
-                throw ConversionWorkCreateException(claimedToken, error)
+                    claimedToken = token
+                    hooks.afterCreateClaim()
+                    val tokenDirectory = directChild(root, token)
+                    try {
+                        Files.createDirectory(tokenDirectory.toPath())
+                    } catch (_: Exception) {
+                        throw IllegalStateException("private 작업 directory를 만들 수 없습니다.")
+                    }
+                    val inputFile = directChild(tokenDirectory, inputFileName)
+                    copyStableNew(
+                        source = artifact.privateFile,
+                        destination = inputFile,
+                        expectedSha256 = artifact.sha256,
+                        label = "Task 6 입력",
+                    )
+                    hooks.afterInputCopied()
+                    val verifiedInputState = verifyFileHash(inputFile, artifact.sha256)
+                    require(inputFile.setReadOnly()) {
+                        "private 입력을 불변 상태로 고정할 수 없습니다."
+                    }
+                    requireStableFile(inputFile, verifiedInputState, "입력 고정")
+                    val current = dao.get()
+                    check(current?.token == token && current.generation == claimed.generation) {
+                        "활성 작업이 바뀌었습니다."
+                    }
+                    claimed = drainCleanupTokens(root, claimed)
+                        ?: throw IllegalStateException(
+                            "이전 private 작업 cleanup을 완료하지 못했습니다.",
+                        )
+                    claimed.toRestored(tokenDirectory, inputAlreadyVerified = true)
+                        ?: throw IllegalStateException("새 작업을 복구할 수 없습니다.")
+                } catch (error: CancellationException) {
+                    if (error is ConversionWorkClaimedCancellationException) throw error
+                    val token = claimedToken
+                    if (token == null) throw error
+                    throw ConversionWorkClaimedCancellationException(token, error)
+                } catch (error: Throwable) {
+                    throw ConversionWorkCreateException(claimedToken, error)
+                }
             }
+        } catch (error: CancellationException) {
+            if (error is ConversionWorkClaimedCancellationException) throw error
+            val token = claimedToken
+            if (token == null) throw error
+            throw ConversionWorkClaimedCancellationException(token, error)
         }
     }
 

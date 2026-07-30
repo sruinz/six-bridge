@@ -67,7 +67,12 @@ internal class OnDeviceConversionCoordinator(
             runCatching { input.release(artifact) }.getOrDefault(false)
         }
         val createdJob = job
+        val claimedCreateCancellation =
+            createFailure as? ConversionWorkClaimedCancellationException
         return try {
+            if (claimedCreateCancellation != null) {
+                throw claimedCreateCancellation
+            }
             currentCoroutineContext().ensureActive()
             if (createFailure is CancellationException) {
                 throw createFailure
@@ -89,7 +94,8 @@ internal class OnDeviceConversionCoordinator(
             analyzeJob(requireNotNull(createdJob), markAwaiting = true)
         } catch (error: CancellationException) {
             val claimedCancellation =
-                error as? ConversionWorkClaimedCancellationException
+                claimedCreateCancellation
+                    ?: error as? ConversionWorkClaimedCancellationException
             val cleanupToken =
                 createdJob?.token ?: claimedCancellation?.claimedToken ?: throw error
             val originalCancellation =

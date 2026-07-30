@@ -14,9 +14,14 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -508,18 +513,71 @@ class ConversionWorkStoreTest {
     }
 
     @Test
-    fun `DAO claim 전 cancellation은 token 없는 원 cancellation을 보존한다`() = runTest {
-        val cancellation = CancellationException("cancel before claim")
+    fun `이미 token-bearing cancellation이면 중복 wrapping하지 않는다`() = runTest {
+        val cancellation = CancellationException("already claimed cancellation")
+        val claimed = ConversionWorkClaimedCancellationException(
+            UUID(0, 1).toString(),
+            cancellation,
+        )
         val store = store(
             hooks = ConversionWorkStoreHooks(
-                listFiles = { throw cancellation },
+                afterCreateClaim = { throw claimed },
             ),
         )
 
-        val thrown = assertFailsWith<CancellationException> {
+        val thrown = assertFailsWith<ConversionWorkClaimedCancellationException> {
             store.create(artifact("input".encodeToByteArray()))
         }
 
+        assertTrue(thrown === claimed)
+        assertTrue(thrown.originalCancellation === cancellation)
+    }
+
+    @Test
+    fun `withContext 복귀 prompt cancellation은 claimed token과 원인을 보존한다`() =
+        runTest {
+            val cancellation = CancellationException("prompt cancellation after claim")
+            lateinit var callerJob: Job
+            val store = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterInputCopied = { callerJob.cancel(cancellation) },
+                ),
+            )
+            val observed = AtomicReference<Throwable?>()
+
+            val caller = launch {
+                callerJob = currentCoroutineContext().job
+                try {
+                    store.create(artifact("input".encodeToByteArray()))
+                } catch (error: Throwable) {
+                    observed.set(error)
+                }
+            }
+            caller.join()
+
+            val thrown = assertIs<ConversionWorkClaimedCancellationException>(
+                requireNotNull(observed.get()),
+            )
+            assertEquals(requireNotNull(dao.get()).token, thrown.claimedToken)
+            assertEquals(cancellation.message, thrown.originalCancellation.message)
+        }
+
+    @Test
+    fun `DAO claim 전 실제 Job cancellation은 token 없는 원 cancellation을 보존한다`() = runTest {
+        val cancellation = CancellationException("cancel before claim")
+        val observed = AtomicReference<Throwable?>()
+
+        val caller = launch {
+            currentCoroutineContext().job.cancel(cancellation)
+            try {
+                store().create(artifact("input".encodeToByteArray()))
+            } catch (error: Throwable) {
+                observed.set(error)
+            }
+        }
+        caller.join()
+
+        val thrown = assertIs<CancellationException>(requireNotNull(observed.get()))
         assertEquals(cancellation.message, thrown.message)
         assertFalse(thrown is ConversionWorkClaimedCancellationException)
         assertNull(dao.get())
@@ -527,13 +585,14 @@ class ConversionWorkStoreTest {
     }
 
     @Test
-    fun `coordinator는 input copy 뒤 claimed cancellation을 exact token으로 정리한다`() =
+    fun `coordinator는 input copy 뒤 실제 Job cancellation을 exact token으로 정리한다`() =
         runTest {
             val cancellation = CancellationException("cancel after input copy")
             val input = artifact("input".encodeToByteArray())
+            lateinit var callerJob: Job
             val workStore = store(
                 hooks = ConversionWorkStoreHooks(
-                    afterInputCopied = { throw cancellation },
+                    afterInputCopied = { callerJob.cancel(cancellation) },
                 ),
             )
             val generatedRoot = File(sourceRoot, "claimed-cancel-generated").apply {
@@ -547,28 +606,38 @@ class ConversionWorkStoreTest {
                 ),
                 inputArtifact = input,
             )
+            val observed = AtomicReference<Throwable?>()
 
-            val thrown = assertFailsWith<CancellationException> {
-                coordinator.begin(
-                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
-                )
+            val caller = launch {
+                callerJob = currentCoroutineContext().job
+                try {
+                    coordinator.begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    )
+                } catch (error: Throwable) {
+                    observed.set(error)
+                }
             }
+            caller.join()
 
+            val thrown = assertIs<CancellationException>(requireNotNull(observed.get()))
             assertEquals(cancellation.message, thrown.message)
             assertFalse(thrown is ConversionWorkClaimedCancellationException)
+            assertFalse(thrown is ConversionCleanupCancellationException)
             assertNull(dao.get())
             assertTrue(root.listFiles().orEmpty().isEmpty())
         }
 
     @Test
-    fun `coordinator claimed cancellation cleanup 실패는 exact token retry를 보존한다`() =
+    fun `coordinator 실제 Job cancellation cleanup 실패는 exact token retry를 보존한다`() =
         runTest {
             val cancellation = CancellationException("cancel after input copy")
             val input = artifact("input".encodeToByteArray())
+            lateinit var callerJob: Job
             val workStore = store(
                 hooks = ConversionWorkStoreHooks(
                     deleteTree = { false },
-                    afterInputCopied = { throw cancellation },
+                    afterInputCopied = { callerJob.cancel(cancellation) },
                 ),
             )
             val generatedRoot = File(sourceRoot, "claimed-cancel-pending-generated").apply {
@@ -582,15 +651,25 @@ class ConversionWorkStoreTest {
                 ),
                 inputArtifact = input,
             )
+            val observed = AtomicReference<Throwable?>()
 
-            val thrown = assertFailsWith<ConversionCleanupCancellationException> {
-                coordinator.begin(
-                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
-                )
+            val caller = launch {
+                callerJob = currentCoroutineContext().job
+                try {
+                    coordinator.begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    )
+                } catch (error: Throwable) {
+                    observed.set(error)
+                }
             }
+            caller.join()
 
+            val thrown = assertIs<ConversionCleanupCancellationException>(
+                requireNotNull(observed.get()),
+            )
             assertEquals(requireNotNull(dao.get()).token, thrown.token)
-            assertTrue(thrown.cause === cancellation)
+            assertEquals(cancellation.message, thrown.cause?.message)
             assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
             assertTrue(File(root, thrown.token).isDirectory)
         }
