@@ -36,6 +36,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
+import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import dev.sixbridge.manager.navigation.FileManagerNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
@@ -1566,10 +1567,10 @@ class ManagerViewModelTest {
 
                 if (terminal is InstallState.Installed) {
                     assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+                    assertNull(viewModel.state.value.message)
                     assertEquals(
-                        "설치됨 · 삼성 인터넷 지원 미확인\n" +
-                            "삼성 인터넷 Add-ons에서 확장이 표시되고 활성화되는지 확인해 주세요.",
-                        viewModel.state.value.message?.text,
+                        SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+                        viewModel.state.value.reportInstallSupportStatus,
                     )
                 } else {
                     assertEquals(expectedMessage, viewModel.state.value.message?.kind)
@@ -1581,6 +1582,35 @@ class ManagerViewModelTest {
                     )
                 }
             }
+        }
+
+    @Test
+    fun `다른 파일 앱 normal handoff만 report 지원 미확인 status를 전달한다`() =
+        runTest(dispatcher.scheduler) {
+            val installed = InstallState.Installed(
+                PACKAGE,
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+
+            repository.installFlow.value = installed
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+            assertEquals(
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                viewModel.state.value.reportInstallSupportStatus,
+            )
         }
 
     @Test
@@ -2927,9 +2957,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
             assertEquals(
-                UserMessageKind.INSTALL_SUPPORT_UNVERIFIED,
-                viewModel.state.value.message?.kind,
+                SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+                viewModel.state.value.reportInstallSupportStatus,
             )
         }
 
@@ -4383,7 +4414,10 @@ class ManagerViewModelTest {
             repository.installFlow.value = InstallState.AwaitingUserApproval(41)
             dispatcher.scheduler.runCurrent()
 
-            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            repository.installFlow.value = InstallState.Installed(
+                PACKAGE,
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -4422,6 +4456,11 @@ class ManagerViewModelTest {
                 assertEquals(
                     TOKEN,
                     recreated.state.value.destinationCommitToken,
+                    "step=$step",
+                )
+                assertEquals(
+                    SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                    recreated.state.value.reportInstallSupportStatus,
                     "step=$step",
                 )
                 assertEquals(0, recreatedRepository.cleanupRequestCount(), "step=$step")
@@ -6098,7 +6137,10 @@ class ManagerViewModelTest {
             repository.installFlow.value = InstallState.AwaitingUserApproval(41)
             dispatcher.scheduler.runCurrent()
 
-            repository.installFlow.value = InstallState.Installed(PACKAGE)
+            repository.installFlow.value = InstallState.Installed(
+                PACKAGE,
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+            )
             advanceUntilIdle()
 
             val reviewSnapshot = requireNotNull(reviewDeathState)
@@ -6145,6 +6187,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Report(PACKAGE), reviewRecreated.state.value.route)
+            assertEquals(
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                reviewRecreated.state.value.reportInstallSupportStatus,
+            )
             assertEquals(TOKEN, reviewRecreated.state.value.destinationCommitToken)
             assertEquals(0, reviewRecreatedRepository.cancelInstallRequests)
             assertEquals(listOf(TOKEN), reviewRecreatedRepository.discardedTokens)
@@ -6163,7 +6209,10 @@ class ManagerViewModelTest {
             }
 
             val conversionRecreatedRepository = FakeManagerRepository().apply {
-                installFlow.value = InstallState.Installed(PACKAGE)
+                installFlow.value = InstallState.Installed(
+                    PACKAGE,
+                    SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+                )
                 restoredConversion = null
             }
             val conversionRecreated = ManagerViewModel(
@@ -6173,6 +6222,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Report(PACKAGE), conversionRecreated.state.value.route)
+            assertEquals(
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                conversionRecreated.state.value.reportInstallSupportStatus,
+            )
             assertEquals(TOKEN, conversionRecreated.state.value.destinationCommitToken)
             assertEquals(0, conversionRecreatedRepository.cancelInstallRequests)
             assertTrue(conversionRecreatedRepository.discardedTokens.isEmpty())

@@ -13,6 +13,7 @@ import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.manager.install.InstallState
+import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import java.io.File
 
 sealed interface ManagerRoute {
@@ -168,7 +169,6 @@ enum class UserMessageKind {
     SAMSUNG_BROWSER_MISSING,
     SAMSUNG_ADD_ONS_UNAVAILABLE,
     FILE_MANAGER_MISSING,
-    INSTALL_SUPPORT_UNVERIFIED,
     UNINSTALL_CANCELLED,
     UNINSTALLED,
     LAUNCH_FAILED,
@@ -200,6 +200,7 @@ data class ManagerUiState(
     val conversionCleanupPending: Boolean = false,
     val conversionUrl: String = "",
     val installState: InstallState = InstallState.Idle,
+    val reportInstallSupportStatus: SamsungInternetSupportStatus? = null,
     val message: UserMessage? = null,
     val destinationCommitToken: String? = null,
     val startupRecoveryState: StartupRecoveryUiState =

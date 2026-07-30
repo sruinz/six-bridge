@@ -7,9 +7,18 @@ sealed interface InstallState {
     data object UnknownSourcesPermissionRequired : InstallState
     data class WritingSession(val sessionId: Int) : InstallState
     data class AwaitingUserApproval(val sessionId: Int) : InstallState
-    data class Installed(val packageName: String) : InstallState
+    data class Installed(
+        val packageName: String,
+        val samsungInternetSupport: SamsungInternetSupportStatus =
+            SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+    ) : InstallState
     data object Cancelled : InstallState
     data class Failed(val code: String, val message: String) : InstallState
+}
+
+enum class SamsungInternetSupportStatus {
+    TRUSTED_INSTALL_SOURCE,
+    UNVERIFIED_FILE_APP,
 }
 
 sealed interface PackageInstallResult {

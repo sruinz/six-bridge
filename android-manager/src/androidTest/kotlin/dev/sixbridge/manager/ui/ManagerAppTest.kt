@@ -63,6 +63,7 @@ import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.install.InstallCleanupResult
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
+import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -938,6 +939,28 @@ class ManagerAppTest {
         composeRule.onNodeWithText("tabs v1 · requires-approval", substring = true).assertExists()
         composeRule.onNodeWithText(
             "이 보고서는 호환성·식별자 검증 결과이며 악성 코드 검사나 보안 보증을 의미하지 않습니다.",
+        ).assertExists()
+        composeRule.onNodeWithText("설치됨 · 삼성 인터넷 지원 미확인").assertDoesNotExist()
+    }
+
+    @Test
+    fun report_route_displays_unverified_file_app_support_warning() {
+        composeRule.setContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    route = ManagerRoute.Report(PACKAGE),
+                    installed = listOf(installedItem()),
+                    reportInstallSupportStatus =
+                        SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("설치됨 · 삼성 인터넷 지원 미확인").assertExists()
+        composeRule.onNodeWithText(
+            "삼성 인터넷 Add-ons에서 확장이 표시되고 활성화되는지 확인해 주세요.",
         ).assertExists()
     }
 

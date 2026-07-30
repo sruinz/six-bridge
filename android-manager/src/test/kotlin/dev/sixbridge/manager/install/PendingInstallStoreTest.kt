@@ -56,6 +56,51 @@ class PendingInstallStoreTest {
     }
 
     @Test
+    fun `지원 미확인 status는 receipt와 normal handoff 재생성 뒤에도 보존된다`() {
+        val context = RuntimeEnvironment.getApplication()
+        val pending = context.getSharedPreferences(
+            "pending_install_store_support_status_test",
+            Context.MODE_PRIVATE,
+        )
+        val recovery = context.getSharedPreferences(
+            "install_recovery_support_status_test",
+            Context.MODE_PRIVATE,
+        )
+        pending.edit().clear().commit()
+        recovery.edit().clear().commit()
+        val installed = InstallState.Installed(
+            PACKAGE,
+            SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+        )
+        val receipt = myFilesReceipt().copy(state = installed)
+        val preparedHandoff = NormalInstallHandoff(
+            importToken = TOKEN,
+            sessionId = null,
+            packageName = PACKAGE,
+            state = installed,
+            stage = NormalHandoffStage.PREPARED,
+        )
+        val handoff = preparedHandoff.copy(stage = NormalHandoffStage.OUTCOME_READY)
+        val store = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pending,
+            recoveryPreferences = recovery,
+            importDirectory = File(temporaryFolder.root, "imports"),
+        )
+
+        assertTrue(store.compareAndSetNormalHandoff(null, preparedHandoff))
+        assertTrue(store.createFinalReceipt(null, null, receipt))
+        assertTrue(store.compareAndSetNormalHandoff(preparedHandoff, handoff))
+
+        val recreated = SharedPreferencesPendingInstallStore(
+            pendingPreferences = pending,
+            recoveryPreferences = recovery,
+            importDirectory = File(temporaryFolder.root, "imports"),
+        )
+        assertEquals(receipt, recreated.loadFinalReceipt())
+        assertEquals(handoff, recreated.loadNormalHandoff())
+    }
+
+    @Test
     fun `MY_FILES ACKNOWLEDGED receipt는 최초 record로 직접 생성할 수 없다`() {
         val store = mutableStore()
         val acknowledged = myFilesReceipt().copy(

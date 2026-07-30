@@ -137,6 +137,7 @@ fun ManagerAppContent(
         }
         is ManagerRoute.Report -> ReportScreen(
             item = state.installed.firstOrNull { it.packageName == route.packageName },
+            installSupportStatus = state.reportInstallSupportStatus,
             onBack = { onAction(ManagerAction.ReturnHome) },
             modifier = modifier,
         )

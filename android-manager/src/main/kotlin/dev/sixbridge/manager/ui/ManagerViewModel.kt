@@ -29,6 +29,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
+import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import dev.sixbridge.manager.navigation.FileManagerNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
@@ -278,7 +279,12 @@ class ManagerViewModel(
             ManagerAction.CancelReview -> cancelReview()
             is ManagerAction.Remove -> remove(action.packageName)
             is ManagerAction.OpenReport -> openReport(action.packageName)
-            ManagerAction.ReturnHome -> mutableState.update { it.copy(route = ManagerRoute.Home) }
+            ManagerAction.ReturnHome -> mutableState.update {
+                it.copy(
+                    route = ManagerRoute.Home,
+                    reportInstallSupportStatus = null,
+                )
+            }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
             ManagerAction.OpenFileManager -> openFileManager()
             ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
@@ -1979,6 +1985,7 @@ class ManagerViewModel(
         mutableState.update {
             it.copy(
                 route = ManagerRoute.Report(packageName),
+                reportInstallSupportStatus = null,
                 message = if (
                     it.startupRecoveryState == StartupRecoveryUiState.RECOVERY_BLOCKED
                 ) {
@@ -2924,7 +2931,8 @@ class ManagerViewModel(
                 is InstallState.Installed -> it.copy(
                     route = ManagerRoute.Report(terminal.packageName),
                     importState = ImportUiState.Idle,
-                    message = installSupportUnverifiedMessage(),
+                    reportInstallSupportStatus = terminal.samsungInternetSupport,
+                    message = null,
                 )
                 InstallState.Cancelled -> it.copy(
                     route = ManagerRoute.Home,
@@ -3047,6 +3055,7 @@ class ManagerViewModel(
                         ManagerRoute.Report(installState.packageName),
                     ),
                     autoReplayPending = true,
+                    reportInstallSupportStatus = installState.samsungInternetSupport,
                 )
                 afterGeneratedInstallCleanupTransitionPersisted()
                 if (!completeTerminalReceipt(
@@ -3168,6 +3177,10 @@ class ManagerViewModel(
             destination = destination,
             installSessionId = null,
             autoReplayPending = terminalReceipt?.state is InstallState.Installed,
+            reportInstallSupportStatus =
+                (terminalReceipt?.state as? InstallState.Installed)
+                    ?.samsungInternetSupport
+                    ?: cleanup.reportInstallSupportStatus,
         )
         advanceGeneratedCleanup(next)
         afterGeneratedInstallCleanupTransitionPersisted()
@@ -3282,6 +3295,7 @@ class ManagerViewModel(
                 },
                 destination = destination,
                 autoReplayPending = true,
+                reportInstallSupportStatus = installed.samsungInternetSupport,
             )
         }
         afterGeneratedInstallCleanupTransitionPersisted()
@@ -3563,6 +3577,7 @@ class ManagerViewModel(
         destination: GeneratedCleanupDestination,
         installSessionId: Int? = null,
         autoReplayPending: Boolean = false,
+        reportInstallSupportStatus: SamsungInternetSupportStatus? = null,
     ): PendingGeneratedCleanup {
         pendingGeneratedCleanup?.let { existing ->
             if (existing.token == token &&
@@ -3581,6 +3596,7 @@ class ManagerViewModel(
             destination = destination,
             installSessionId = installSessionId,
             autoReplayPending = autoReplayPending,
+            reportInstallSupportStatus = reportInstallSupportStatus,
         ).also {
             advanceGeneratedCleanup(it)
             updateGeneratedCleanupState(
@@ -3847,6 +3863,7 @@ class ManagerViewModel(
                 conversionUrl = "",
                 importState = ImportUiState.Idle,
                 message = null,
+                reportInstallSupportStatus = cleanup.reportInstallSupportStatus,
                 destinationCommitToken = cleanup.token,
             )
         }
@@ -4166,6 +4183,7 @@ class ManagerViewModel(
             is InstallState.Installed -> {
                 put("state", "INSTALLED")
                 put("packageName", state.packageName)
+                put("samsungInternetSupport", state.samsungInternetSupport.name)
             }
             else -> error("generated result handoff는 terminal state만 허용합니다.")
         }
@@ -4184,7 +4202,13 @@ class ManagerViewModel(
                 root.requiredString("message"),
             )
             "INSTALLED" -> InstallState.Installed(
-                root.requiredString("packageName"),
+                packageName = root.requiredString("packageName"),
+                samsungInternetSupport =
+                    root["samsungInternetSupport"]?.let {
+                        SamsungInternetSupportStatus.valueOf(
+                            root.requiredString("samsungInternetSupport"),
+                        )
+                    } ?: SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
             )
             else -> error("generated terminal handoff state")
         }
@@ -4225,6 +4249,9 @@ class ManagerViewModel(
                 cleanup.installSessionId?.let(::JsonPrimitive) ?: JsonNull,
             )
             put("autoReplayPending", cleanup.autoReplayPending)
+            cleanup.reportInstallSupportStatus?.let {
+                put(GENERATED_CLEANUP_REPORT_SUPPORT_FIELD, it.name)
+            }
         }.toString()
     }
 
@@ -4233,9 +4260,8 @@ class ManagerViewModel(
             val root = Json.parseToJsonElement(encoded) as? JsonObject
                 ?: error("cleanup journal root")
             require(
-                root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS ||
-                    root.keys == GENERATED_CLEANUP_JOURNAL_FIELDS +
-                    GENERATED_CLEANUP_AUTO_REPLAY_FIELD,
+                root.keys - GENERATED_CLEANUP_OPTIONAL_FIELDS ==
+                    GENERATED_CLEANUP_JOURNAL_FIELDS,
             )
             require(
                 root.requiredInt("version") == GENERATED_CLEANUP_JOURNAL_VERSION,
@@ -4256,6 +4282,14 @@ class ManagerViewModel(
                 installSessionId = root.nullableInt("installSessionId"),
                 autoReplayPending =
                     root.optionalBoolean(GENERATED_CLEANUP_AUTO_REPLAY_FIELD),
+                reportInstallSupportStatus =
+                    root[GENERATED_CLEANUP_REPORT_SUPPORT_FIELD]?.let {
+                        SamsungInternetSupportStatus.valueOf(
+                            root.requiredString(
+                                GENERATED_CLEANUP_REPORT_SUPPORT_FIELD,
+                            ),
+                        )
+                    },
             ).also { require(it.isValid()) }
         }.getOrNull()
 
@@ -4457,6 +4491,12 @@ class ManagerViewModel(
         private const val STARTUP_INITIALIZE_RETRY_DELAY_MILLIS = 250L
         private const val GENERATED_CLEANUP_AUTO_REPLAY_FIELD =
             "autoReplayPending"
+        private const val GENERATED_CLEANUP_REPORT_SUPPORT_FIELD =
+            "reportInstallSupportStatus"
+        private val GENERATED_CLEANUP_OPTIONAL_FIELDS = setOf(
+            GENERATED_CLEANUP_AUTO_REPLAY_FIELD,
+            GENERATED_CLEANUP_REPORT_SUPPORT_FIELD,
+        )
         private val GENERATED_CLEANUP_JOURNAL_FIELDS = setOf(
             "version",
             "token",
@@ -4510,6 +4550,7 @@ private data class PendingGeneratedCleanup(
     val destination: GeneratedCleanupDestination,
     val installSessionId: Int? = null,
     val autoReplayPending: Boolean = false,
+    val reportInstallSupportStatus: SamsungInternetSupportStatus? = null,
 )
 
 private data class GeneratedTerminalReceipt(
@@ -4766,13 +4807,6 @@ private fun importFailureMessage(code: ImportFailureCode): UserMessage = when (c
         RecoveryAction.SELECT_ANOTHER_FILE,
     )
 }
-
-private fun installSupportUnverifiedMessage() = UserMessage(
-    UserMessageKind.INSTALL_SUPPORT_UNVERIFIED,
-    "설치됨 · 삼성 인터넷 지원 미확인\n" +
-        "삼성 인터넷 Add-ons에서 확장이 표시되고 활성화되는지 확인해 주세요.",
-    RecoveryAction.NONE,
-)
 
 private fun installFailureMessage(code: String): UserMessage = when (code) {
     "SIGNER_MISMATCH", "VERSION_NOT_NEWER", "PACKAGE_MISMATCH" -> UserMessage(

@@ -9,10 +9,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import dev.sixbridge.manager.R
+import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 
 @Composable
 fun ReportScreen(
     item: ManagedExtensionItem?,
+    installSupportStatus: SamsungInternetSupportStatus?,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -37,6 +39,19 @@ fun ReportScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (installSupportStatus ==
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP
+            ) {
+                SectionCard(
+                    title = stringResource(R.string.report_install_support_unverified_title),
+                ) {
+                    Text(
+                        text = stringResource(
+                            R.string.report_install_support_unverified_guidance,
+                        ),
+                    )
+                }
+            }
             if (!reportAvailable) {
                 Text(
                     text = stringResource(

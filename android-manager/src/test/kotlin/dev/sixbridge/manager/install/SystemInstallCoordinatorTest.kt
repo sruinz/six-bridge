@@ -107,8 +107,12 @@ class SystemInstallCoordinatorTest {
             )
             assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
 
-            assertIs<InstallState.Installed>(
+            val installed = assertIs<InstallState.Installed>(
                 fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            )
+            assertEquals(
+                SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+                installed.samsungInternetSupport,
             )
             assertEquals(
                 FinalReceiptOrigin.MY_FILES,
@@ -130,8 +134,12 @@ class SystemInstallCoordinatorTest {
         )
         assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
 
-        assertIs<InstallState.Installed>(
+        val installed = assertIs<InstallState.Installed>(
             fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+        )
+        assertEquals(
+            SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+            installed.samsungInternetSupport,
         )
     }
 
@@ -177,8 +185,17 @@ class SystemInstallCoordinatorTest {
             assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
 
             assertEquals(
-                InstallState.Installed(PACKAGE),
+                InstallState.Installed(
+                    PACKAGE,
+                    SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                ),
                 fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            )
+            assertEquals(
+                SamsungInternetSupportStatus.UNVERIFIED_FILE_APP,
+                assertIs<InstallState.Installed>(
+                    fixture.pendingStore.loadFinalReceipt()?.state,
+                ).samsungInternetSupport,
             )
         }
 

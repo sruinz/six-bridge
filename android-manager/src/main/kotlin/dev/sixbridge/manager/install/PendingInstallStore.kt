@@ -764,6 +764,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             kindKey = KEY_FINAL_STATE_KIND,
             codeKey = KEY_FINAL_STATE_CODE,
             messageKey = KEY_FINAL_STATE_MESSAGE,
+            supportKey = KEY_FINAL_STATE_SUPPORT,
             packageName = packageName,
         ) ?: return null
         return runCatching {
@@ -791,6 +792,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             KEY_FINAL_STATE_KIND,
             KEY_FINAL_STATE_CODE,
             KEY_FINAL_STATE_MESSAGE,
+            KEY_FINAL_STATE_SUPPORT,
             KEY_FINAL_STAGE,
             KEY_FINAL_ORIGIN,
             KEY_FINAL_RAW_TERMINAL_AT,
@@ -822,6 +824,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             kindKey = KEY_FINAL_STATE_KIND,
             codeKey = KEY_FINAL_STATE_CODE,
             messageKey = KEY_FINAL_STATE_MESSAGE,
+            supportKey = KEY_FINAL_STATE_SUPPORT,
         )
         return editor.commit()
     }
@@ -841,6 +844,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             kindKey = KEY_HANDOFF_STATE_KIND,
             codeKey = KEY_HANDOFF_STATE_CODE,
             messageKey = KEY_HANDOFF_STATE_MESSAGE,
+            supportKey = KEY_HANDOFF_STATE_SUPPORT,
             packageName = packageName,
         ) ?: return null
         return runCatching {
@@ -865,6 +869,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             KEY_HANDOFF_STATE_KIND,
             KEY_HANDOFF_STATE_CODE,
             KEY_HANDOFF_STATE_MESSAGE,
+            KEY_HANDOFF_STATE_SUPPORT,
             KEY_HANDOFF_STAGE,
         ).any(recoveryPreferences::contains)
         if (!markerPresent) return RecoveryRecordSnapshot.Absent
@@ -888,6 +893,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             kindKey = KEY_HANDOFF_STATE_KIND,
             codeKey = KEY_HANDOFF_STATE_CODE,
             messageKey = KEY_HANDOFF_STATE_MESSAGE,
+            supportKey = KEY_HANDOFF_STATE_SUPPORT,
         )
         return editor.commit()
     }
@@ -896,9 +902,17 @@ class SharedPreferencesPendingInstallStore internal constructor(
         kindKey: String,
         codeKey: String,
         messageKey: String,
+        supportKey: String,
         packageName: String,
     ): InstallState? = when (recoveryPreferences.getString(kindKey, null)) {
-        STATE_INSTALLED -> InstallState.Installed(packageName)
+        STATE_INSTALLED -> InstallState.Installed(
+            packageName = packageName,
+            samsungInternetSupport =
+                recoveryPreferences.getString(supportKey, null)?.let {
+                    enumValueOrNull<SamsungInternetSupportStatus>(it)
+                        ?: return null
+                } ?: SamsungInternetSupportStatus.TRUSTED_INSTALL_SOURCE,
+        )
         STATE_CANCELLED -> InstallState.Cancelled
         STATE_FAILED -> InstallState.Failed(
             code = recoveryPreferences.getString(codeKey, null)
@@ -917,18 +931,22 @@ class SharedPreferencesPendingInstallStore internal constructor(
         kindKey: String,
         codeKey: String,
         messageKey: String,
+        supportKey: String,
     ) {
         when (state) {
             is InstallState.Installed -> editor
                 .putString(kindKey, STATE_INSTALLED)
+                .putString(supportKey, state.samsungInternetSupport.name)
                 .remove(codeKey)
                 .remove(messageKey)
             is InstallState.Cancelled -> editor
                 .putString(kindKey, STATE_CANCELLED)
+                .remove(supportKey)
                 .remove(codeKey)
                 .remove(messageKey)
             is InstallState.Failed -> editor
                 .putString(kindKey, STATE_FAILED)
+                .remove(supportKey)
                 .putString(codeKey, state.code)
                 .putString(messageKey, state.message)
             else -> error("terminal install state만 저장할 수 있습니다.")
@@ -961,6 +979,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             .remove(KEY_FINAL_STATE_KIND)
             .remove(KEY_FINAL_STATE_CODE)
             .remove(KEY_FINAL_STATE_MESSAGE)
+            .remove(KEY_FINAL_STATE_SUPPORT)
             .remove(KEY_FINAL_STAGE)
             .remove(KEY_FINAL_ORIGIN)
             .remove(KEY_FINAL_RAW_TERMINAL_AT)
@@ -976,6 +995,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
             .remove(KEY_HANDOFF_STATE_KIND)
             .remove(KEY_HANDOFF_STATE_CODE)
             .remove(KEY_HANDOFF_STATE_MESSAGE)
+            .remove(KEY_HANDOFF_STATE_SUPPORT)
             .remove(KEY_HANDOFF_STAGE)
 
     private fun FinalInstallReceipt.matchesRaw(raw: PendingInstallResult?): Boolean =
@@ -1132,6 +1152,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
         const val KEY_FINAL_STATE_KIND = "final_state_kind"
         const val KEY_FINAL_STATE_CODE = "final_state_code"
         const val KEY_FINAL_STATE_MESSAGE = "final_state_message"
+        const val KEY_FINAL_STATE_SUPPORT = "final_state_support"
         const val KEY_FINAL_STAGE = "final_stage"
         const val KEY_FINAL_ORIGIN = "final_origin"
         const val KEY_FINAL_RAW_TERMINAL_AT = "final_raw_terminal_at"
@@ -1144,6 +1165,7 @@ class SharedPreferencesPendingInstallStore internal constructor(
         const val KEY_HANDOFF_STATE_KIND = "handoff_state_kind"
         const val KEY_HANDOFF_STATE_CODE = "handoff_state_code"
         const val KEY_HANDOFF_STATE_MESSAGE = "handoff_state_message"
+        const val KEY_HANDOFF_STATE_SUPPORT = "handoff_state_support"
         const val KEY_HANDOFF_STAGE = "handoff_stage"
         const val RESULT_SUCCESS = "success"
         const val RESULT_CANCELLED = "cancelled"
