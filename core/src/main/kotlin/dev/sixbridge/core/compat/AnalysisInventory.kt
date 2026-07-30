@@ -15,6 +15,7 @@ enum class AnalysisBudgetMetric {
     SINGLE_SOURCE_BYTES,
     TOTAL_SOURCE_BYTES,
     SOURCE_FILE_COUNT,
+    SOURCE_ENTRY_COUNT,
     RUNTIME_DEPENDENCY_COUNT,
     TOTAL_SOURCE_CHARS,
 }
@@ -111,6 +112,7 @@ fun analysisBudgetExceededReport(
 internal class AnalysisBudgetLedger(
     val policy: AnalysisSafetyPolicy,
 ) {
+    private val sourceEntries = linkedSetOf<Path>()
     private val sourceFiles = linkedSetOf<Path>()
     private val scriptFiles = linkedSetOf<Path>()
     private val runtimeDependencies = linkedSetOf<Path>()
@@ -118,6 +120,17 @@ internal class AnalysisBudgetLedger(
     private var sourceBytes = 0L
     private var scriptBytes = 0L
     private var sourceChars = 0L
+
+    fun reserveSourceEntry(path: Path) {
+        val key = path.toAbsolutePath().normalize()
+        if (key in sourceEntries) return
+        exceed(
+            AnalysisBudgetMetric.SOURCE_ENTRY_COUNT,
+            sourceEntries.size.toLong() + 1,
+            policy.maxScriptFiles.toLong() * 2,
+        )
+        sourceEntries.add(key)
+    }
 
     fun reserveSource(path: Path, size: Long) {
         require(size >= 0L) { "분석 source 크기가 올바르지 않습니다." }

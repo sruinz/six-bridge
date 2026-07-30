@@ -1,8 +1,14 @@
 package dev.sixbridge.core.compat
 
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption.READ
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.outputStream
@@ -10,9 +16,85 @@ import kotlin.test.assertContentEquals
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 class AnalysisInputMaterializerTest {
+    @Test
+    fun `archive FIFO는 channel open 전에 거부한다`() {
+        val directory = Files.createTempDirectory("six-input-fifo-")
+        val fifo = directory.resolve("input.zip")
+        assertEquals(
+            0,
+            ProcessBuilder("mkfifo", fifo.toString()).start().waitFor(),
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        val writerStarted = CountDownLatch(1)
+        val writerFinished = CountDownLatch(1)
+        val writer = executor.submit {
+            writerStarted.countDown()
+            try {
+                Files.newOutputStream(fifo).use { it.write(1) }
+            } finally {
+                writerFinished.countDown()
+            }
+        }
+        assertTrue(writerStarted.await(5, TimeUnit.SECONDS))
+        var payloadReads = 0
+
+        try {
+            assertFailsWith<IllegalArgumentException> {
+                AnalysisInputMaterializer.readArchive(
+                    fifo,
+                    AnalysisArchiveKind.ZIP,
+                    AnalysisControl(AnalysisSafetyPolicy.mobile),
+                ) {
+                    payloadReads += 1
+                    Files.readAllBytes(it)
+                }
+            }
+            assertFalse(
+                writerFinished.await(1, TimeUnit.SECONDS),
+                "FIFO writer 완료는 archive channel이 열렸음을 뜻합니다.",
+            )
+        } finally {
+            if (!writer.isDone) {
+                FileChannel.open(fifo, READ).use { channel ->
+                    channel.read(ByteBuffer.allocate(1))
+                }
+            }
+            writer.get(5, TimeUnit.SECONDS)
+            executor.shutdownNow()
+        }
+
+        assertEquals(0, payloadReads)
+    }
+
+    @Test
+    fun `빈 디렉터리 breadth도 traversal entry 예산을 넘으면 snapshotter 전에 거부한다`() {
+        val root = Files.createTempDirectory("six-input-empty-directories-")
+        repeat(5) { index ->
+            Files.createDirectory(root.resolve("empty-$index"))
+        }
+        val policy = AnalysisSafetyPolicy.mobile.copy(maxScriptFiles = 2)
+        var snapshots = 0
+
+        val error = assertFailsWith<AnalysisBudgetExceededException> {
+            AnalysisInputMaterializer.snapshotDirectory(
+                root,
+                AnalysisControl(policy),
+            ) {
+                snapshots += 1
+                Unit
+            }
+        }
+
+        assertEquals(5, error.exceeded.actual)
+        assertEquals(4, error.exceeded.limit)
+        assertEquals(0, snapshots)
+    }
+
     @Test
     fun `source directory 예산 초과는 snapshot 전에 거부한다`() {
         val root = Files.createTempDirectory("six-input-directory-")

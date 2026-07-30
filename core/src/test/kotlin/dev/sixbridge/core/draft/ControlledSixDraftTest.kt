@@ -21,6 +21,7 @@ import java.util.zip.ZipOutputStream
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 
@@ -131,6 +132,56 @@ class ControlledSixDraftTest {
             "SixDraft archive가 검증 중 변경되었습니다.",
             error.message,
         )
+    }
+
+    @Test
+    fun `probe 중 draft path 교체는 valid 결과를 반환하지 않는다`() {
+        val original = preparedDraft(sourceEntryBytes = 3 * 1024 * 1024)
+        val replacement = preparedDraft(sourceEntryBytes = 3 * 1024 * 1024 + 1)
+        var checkpoints = 0
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            checkpoints += 1
+            if (checkpoints == 2) {
+                Files.move(
+                    replacement.path,
+                    original.path,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        }
+
+        val result = SixDraft.probe(
+            original.path,
+            SixDraft.MAX_ARCHIVE_SIZE,
+            control,
+        )
+
+        assertIs<SixDraftProbe.MalformedDraft>(result)
+    }
+
+    @Test
+    fun `prepared CRX 검증 후 stage 전 draft path 교체는 output을 남기지 않는다`() {
+        val original = preparedDraft(sourceEntryBytes = 3 * 1024 * 1024)
+        val replacement = preparedDraft(sourceEntryBytes = 3 * 1024 * 1024 + 1)
+        val controlled = SixDraft.readControlled(
+            original.path,
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
+        val prepared = assertIs<ControlledSixDraft.Prepared>(controlled).verified
+        Files.move(
+            replacement.path,
+            original.path,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+        val output = Files.createTempFile("six-prepared-replaced-", ".crx")
+
+        assertFailsWith<IllegalArgumentException> {
+            prepared.preparedCrx.copyTo(
+                output,
+                AnalysisControl(AnalysisSafetyPolicy.mobile),
+            )
+        }
+        assertFalse(Files.exists(output))
     }
 
     @Test

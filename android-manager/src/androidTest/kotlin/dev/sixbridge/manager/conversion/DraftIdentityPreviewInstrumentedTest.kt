@@ -3,6 +3,7 @@ package dev.sixbridge.manager.conversion
 import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
@@ -19,19 +20,24 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
+import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.KeyPairGenerator
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.Signature
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -48,6 +54,114 @@ class DraftIdentityPreviewInstrumentedTest {
     @Test
     fun chromeWebStorePassthroughDraftPreviewMatchesResolvedAndReservedIdentityKey() =
         assertPassthroughDraftPreview(ExtensionInputKind.CHROME_WEB_STORE)
+
+    @Test
+    fun schemaV3DraftRunsThroughRuntimeIdentityStageAndActualWrapper() {
+        val profile = profile()
+        val fixture = schemaV3PreparedDraft(profile)
+        val identityKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.signedDraft(fixture.sourceIdentity),
+            profile.majorVersion,
+            InstallationIdentityMode.PREPARED,
+        )
+        val forbiddenAlias = "sixbridge.crx.rsa.v1.${identityKey.identitySha256}"
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        assertFalse(keyStore.containsAlias(forbiddenAlias))
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ManagerDatabase::class.java,
+        ).allowMainThreadQueries().build()
+        val inputRoot = File(
+            context.filesDir,
+            "schema3-full-path-input/${UUID.randomUUID()}",
+        )
+        val workRoot = File(
+            context.filesDir,
+            "schema3-full-path-work/${UUID.randomUUID()}",
+        )
+        val packager = OnDeviceWrapperPackager(context)
+        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        val generatedStore = GeneratedBundleStore(context)
+        val workStore = ConversionWorkStore(
+            privateRoot = workRoot,
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { true },
+            identityOwnerLifecycle = ledger.ownerLifecycle(packager),
+        )
+        val inputService = OnDeviceInputService(
+            privateRoot = inputRoot,
+            safInputOpener = SafInputOpener {
+                ByteArrayInputStream(fixture.draft)
+            },
+        )
+        val coordinator = OnDeviceConversionCoordinator(
+            input = inputService,
+            work = DefaultConversionWorkPort(workStore),
+            profiles = ConversionProfilePort {
+                SamsungProfileSnapshot.Supported(profile)
+            },
+            runtime = DefaultConversionRuntime(),
+            identities = DefaultConversionIdentityPort(ledger, packager),
+            installed = ConversionInstalledPort { null },
+            packages = DefaultConversionPackagePort(ledger, packager),
+            bundles = DefaultConversionBundlePort(generatedStore),
+            imports = ConversionGeneratedImportPort { null },
+        )
+        var token: String? = null
+        val wrapper = File(
+            context.cacheDir,
+            "schema3-full-path-wrapper-${UUID.randomUUID()}.apk",
+        )
+        try {
+            runBlocking {
+                val analysis = coordinator.begin(
+                    OnDeviceInputRequest.Saf(android.net.Uri.EMPTY),
+                )
+                check(analysis is ConversionBeginResult.AnalysisReady) {
+                    "schema3 전체 경로 분석 실패: $analysis"
+                }
+                token = analysis.token
+                assertEquals(
+                    identityKey.identitySha256.take(12),
+                    (analysis.identityRequirement as IdentityRequirement.Stable)
+                        .identityKeyPreview,
+                )
+
+                val built = coordinator.build(
+                    token = analysis.token,
+                    approvedAdapterIds = analysis.requiredApprovals,
+                    partialConfirmed = true,
+                    identitySelection = null,
+                )
+                val generated = when (built) {
+                    is ConversionBuildResult.BundleReady -> built.generated
+                    is ConversionBuildResult.Failure -> {
+                        assertEquals(ConversionFailureCode.BUNDLE_IO, built.code)
+                        requireNotNull(built.generated) {
+                            "actual wrapper bundle이 import terminal 전에 생성되지 않았습니다."
+                        }
+                    }
+                }
+                val bundle = generated.file.inputStream().use(SixBundleContract::read)
+                wrapper.writeBytes(bundle.wrapperApk)
+                val wrapperFacts =
+                    AndroidArchiveInspector(context.packageManager).inspect(wrapper)
+
+                assertArrayEquals(fixture.preparedCrx, wrapperFacts.crxBytes)
+                assertEquals(fixture.extensionId, bundle.extension.extensionId)
+                assertEquals(fixture.extensionId, wrapperFacts.metadata["extension-id"])
+                assertFalse(keyStore.containsAlias(forbiddenAlias))
+            }
+        } finally {
+            runBlocking {
+                token?.let { runCatching { coordinator.discard(it) } }
+            }
+            database.close()
+            wrapper.delete()
+            inputRoot.deleteRecursively()
+            workRoot.deleteRecursively()
+        }
+    }
 
     @Test
     fun directZipCrxAndChromeRetainInstallationIdentityModes() {
@@ -378,6 +492,63 @@ class DraftIdentityPreviewInstrumentedTest {
         ).bytes
     }
 
+    private fun schemaV3PreparedDraft(profile: BrowserProfile): PreparedDraftFixture {
+        val sourceIdentity = "project:${UUID.randomUUID().toString().replace("-", "")}"
+        val prepared = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    kind = ExtensionInputKind.ZIP,
+                    zipBytes = simpleExtensionZip(),
+                    signedDraftSourceIdentity = sourceIdentity,
+                ),
+                profile,
+                emptySet(),
+            )
+        }
+        val preparedCrx = externalSignedCrx(prepared.transformedSourceZip)
+        val proof = Crx3Verifier.verify(preparedCrx)
+        val selected = prepared.compatibilityAfter.adapterDecisions
+            .filter { it.applied }
+            .map { DraftSelectedAdapter(it.id, it.version) }
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV3(
+                coreVersion = "schema3-full-path",
+                adapterVersions = selected.associate { it.id to it.version },
+                sourceIdentity = sourceIdentity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = prepared.originalSourceSha256,
+                browserProfileSha256 = prepared.browserProfileSha256,
+                originalExtensionId = prepared.originalExtensionId,
+                originalExtensionVersion = requireNotNull(
+                    prepared.compatibilityBefore.extensionVersion,
+                ),
+                sourceIdentity = sourceIdentity,
+            ),
+            sourceKind = DraftSourceKind.PREPARED_CRX,
+            source = preparedCrx,
+            plan = DraftConversionPlan.create(
+                prepared.compatibilityBefore,
+                selected,
+            ),
+            compatibilityBefore = prepared.compatibilityBefore,
+            compatibilityAfter = prepared.compatibilityAfter.copy(
+                convertedExtensionId = proof.extensionId,
+                sourceSha256 = proof.zipSha256,
+            ),
+        )
+        return PreparedDraftFixture(
+            draft = SixDraft.createBytes(
+                payload,
+                KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
+            ),
+            preparedCrx = preparedCrx,
+            extensionId = proof.extensionId,
+            sourceIdentity = sourceIdentity,
+        )
+    }
+
     private fun simpleExtensionZip(): ByteArray = ByteArrayOutputStream().use { output ->
         ZipOutputStream(output).use { zip ->
             zip.putNextEntry(ZipEntry("manifest.json").apply { time = 0L })
@@ -407,4 +578,11 @@ class DraftIdentityPreviewInstrumentedTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private data class PreparedDraftFixture(
+        val draft: ByteArray,
+        val preparedCrx: ByteArray,
+        val extensionId: String,
+        val sourceIdentity: String,
+    )
 }

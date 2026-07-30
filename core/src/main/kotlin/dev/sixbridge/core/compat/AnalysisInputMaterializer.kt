@@ -47,6 +47,7 @@ object AnalysisInputMaterializer {
                             "분석 source에는 실제 디렉터리만 허용됩니다."
                         }
                         if (directory != normalizedRoot) {
+                            ledger.reserveSourceEntry(directory)
                             val target = snapshotTarget(
                                 normalizedRoot,
                                 snapshot,
@@ -65,6 +66,7 @@ object AnalysisInputMaterializer {
                         require(attributes.isRegularFile && !attributes.isSymbolicLink) {
                             "분석 source에는 일반 파일만 허용됩니다."
                         }
+                        ledger.reserveSourceEntry(file)
                         ledger.reserveSource(file, attributes.size())
                         copyStableFile(
                             source = file,
@@ -92,6 +94,14 @@ object AnalysisInputMaterializer {
         control: AnalysisControl,
         payloadReader: (Path) -> ByteArray = Files::readAllBytes,
     ): ByteArray {
+        val attributes = Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+            "분석 archive는 일반 파일이어야 합니다."
+        }
         val snapshot = Files.createTempFile("sixbridge-analysis-archive-", ".bin")
         return try {
             FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->

@@ -627,19 +627,24 @@ class OnDeviceInputService(
         control: AnalysisControl,
     ) {
         val validationRoot = workspace.resolve(VALIDATION_DIRECTORY)
+        var primaryFailure: Throwable? = null
         try {
-            ExtensionZip.extract(zipPath, validationRoot, control)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            inputFailure(errorCode, "확장 ZIP 구조가 올바르지 않습니다.")
-        } finally {
-            if (!workspaceDeleter(validationRoot)) {
-                inputFailure(
-                    OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
-                    "ZIP 검증 임시 파일을 정리할 수 없습니다.",
-                )
+            try {
+                ExtensionZip.extract(zipPath, validationRoot, control)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                inputFailure(errorCode, "확장 ZIP 구조가 올바르지 않습니다.")
             }
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            cleanupValidationPath(
+                validationRoot,
+                "ZIP 검증 임시 파일을 정리할 수 없습니다.",
+                primaryFailure,
+            )
         }
     }
 
@@ -651,50 +656,81 @@ class OnDeviceInputService(
         control: AnalysisControl,
     ) {
         val payloadPath = workspace.resolve(CRX_PAYLOAD_FILE)
+        var primaryFailure: Throwable? = null
         try {
-            FileChannel.open(crxPath, READ, NOFOLLOW_LINKS).use { source ->
-                FileChannel.open(payloadPath, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { output ->
-                    val buffer = java.nio.ByteBuffer.allocate(BUFFER_SIZE)
-                    var position = payloadOffset
-                    var remaining = payloadLength
-                    while (remaining > 0) {
-                        control.checkCancelled()
-                        buffer.clear()
-                        buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
-                        val count = source.read(buffer, position)
-                        require(count > 0) { "CRX3 ZIP payload를 완전히 읽지 못했습니다." }
-                        buffer.flip()
-                        while (buffer.hasRemaining()) output.write(buffer)
-                        control.checkCancelled()
-                        position += count
-                        remaining -= count
-                    }
-                    output.force(true)
-                }
-            }
-            validateExtensionZip(
-                payloadPath,
-                workspace,
-                OnDeviceInputErrorCode.INVALID_CRX3,
-                control,
-            )
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: OnDeviceInputException) {
-            throw error
-        } catch (_: Exception) {
-            inputFailure(
-                OnDeviceInputErrorCode.INVALID_CRX3,
-                "CRX3 ZIP payload 구조가 올바르지 않습니다.",
-            )
-        } finally {
             try {
-                Files.deleteIfExists(payloadPath)
+                FileChannel.open(crxPath, READ, NOFOLLOW_LINKS).use { source ->
+                    FileChannel.open(payloadPath, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { output ->
+                        val buffer = java.nio.ByteBuffer.allocate(BUFFER_SIZE)
+                        var position = payloadOffset
+                        var remaining = payloadLength
+                        while (remaining > 0) {
+                            control.checkCancelled()
+                            buffer.clear()
+                            buffer.limit(minOf(buffer.capacity().toLong(), remaining).toInt())
+                            val count = source.read(buffer, position)
+                            require(count > 0) {
+                                "CRX3 ZIP payload를 완전히 읽지 못했습니다."
+                            }
+                            buffer.flip()
+                            while (buffer.hasRemaining()) output.write(buffer)
+                            control.checkCancelled()
+                            position += count
+                            remaining -= count
+                        }
+                        output.force(true)
+                    }
+                }
+                validateExtensionZip(
+                    payloadPath,
+                    workspace,
+                    OnDeviceInputErrorCode.INVALID_CRX3,
+                    control,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: OnDeviceInputException) {
+                throw error
             } catch (_: Exception) {
                 inputFailure(
-                    OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
-                    "CRX3 검증 임시 파일을 정리할 수 없습니다.",
+                    OnDeviceInputErrorCode.INVALID_CRX3,
+                    "CRX3 ZIP payload 구조가 올바르지 않습니다.",
                 )
+            }
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            cleanupValidationPath(
+                payloadPath,
+                "CRX3 검증 임시 파일을 정리할 수 없습니다.",
+                primaryFailure,
+            )
+        }
+    }
+
+    private fun cleanupValidationPath(
+        path: Path,
+        failureMessage: String,
+        primaryFailure: Throwable?,
+    ) {
+        val cleanupFailure = try {
+            if (workspaceDeleter(path)) {
+                null
+            } else {
+                OnDeviceInputException(
+                    OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED,
+                    failureMessage,
+                )
+            }
+        } catch (error: Exception) {
+            error
+        }
+        if (cleanupFailure != null) {
+            if (primaryFailure is CancellationException) {
+                primaryFailure.addSuppressed(cleanupFailure)
+            } else {
+                throw cleanupFailure
             }
         }
     }

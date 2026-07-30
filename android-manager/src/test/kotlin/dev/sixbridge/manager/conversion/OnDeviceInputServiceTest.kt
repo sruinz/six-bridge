@@ -34,6 +34,7 @@ import kotlin.io.path.writeText
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
@@ -443,6 +444,87 @@ class OnDeviceInputServiceTest {
         }
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
+
+    @Test
+    fun `ZIP validation cleanup 실패는 caller cancellation에 suppressed로 남는다`() =
+        runTest {
+            val cancellation = CancellationException("cancel ZIP validation")
+            val service = OnDeviceInputService(
+                privateRoot = root,
+                safInputOpener = SafInputOpener {
+                    ByteArrayInputStream(extensionZip())
+                },
+                workspaceDeleter = { path ->
+                    if (path.fileName.toString() == ".validation") {
+                        false
+                    } else {
+                        path.toFile().deleteRecursively()
+                        !Files.exists(path)
+                    }
+                },
+            )
+            val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+                if (root.walkTopDown().any { it.name == ".validation" }) {
+                    throw cancellation
+                }
+            }
+
+            val thrown = assertFailsWith<CancellationException> {
+                service.acquire(safRequest(), control)
+            }
+
+            assertEquals(cancellation.message, thrown.message)
+            assertTrue(thrown === cancellation || thrown.cause === cancellation)
+            val cancellationWithCleanup =
+                sequenceOf(thrown, thrown.cause)
+                    .filterIsInstance<CancellationException>()
+                    .first { it.suppressed.isNotEmpty() }
+            val cleanup =
+                assertIs<OnDeviceInputException>(cancellationWithCleanup.suppressed.single())
+            assertEquals(OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED, cleanup.code)
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        }
+
+    @Test
+    fun `CRX payload cleanup 실패는 caller cancellation에 suppressed로 남는다`() =
+        runTest {
+            val crx = validCrx()
+            val cancellation = CancellationException("cancel CRX payload")
+            val service = OnDeviceInputService(
+                privateRoot = root,
+                safInputOpener = SafInputOpener {
+                    ByteArrayInputStream(crx.bytes)
+                },
+                workspaceDeleter = { path ->
+                    if (path.fileName.toString() == ".payload.zip") {
+                        false
+                    } else {
+                        path.toFile().deleteRecursively()
+                        !Files.exists(path)
+                    }
+                },
+            )
+            val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+                if (root.walkTopDown().any { it.name == ".payload.zip" }) {
+                    throw cancellation
+                }
+            }
+
+            val thrown = assertFailsWith<CancellationException> {
+                service.acquire(safRequest(), control)
+            }
+
+            assertEquals(cancellation.message, thrown.message)
+            assertTrue(thrown === cancellation || thrown.cause === cancellation)
+            val cancellationWithCleanup =
+                sequenceOf(thrown, thrown.cause)
+                    .filterIsInstance<CancellationException>()
+                    .first { it.suppressed.isNotEmpty() }
+            val cleanup =
+                assertIs<OnDeviceInputException>(cancellationWithCleanup.suppressed.single())
+            assertEquals(OnDeviceInputErrorCode.PRIVATE_STORAGE_FAILED, cleanup.code)
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        }
 
     @Test
     fun `caller AnalysisControl 취소는 SAF copy와 probe 사이에서 bounded 전파된다`() =
