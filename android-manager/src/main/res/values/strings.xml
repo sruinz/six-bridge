@@ -49,6 +49,7 @@
     <string name="review_identity">확장 정보</string>
     <string name="review_name_version">%1$s · %2$s</string>
     <string name="review_extension_id">Extension ID\n%1$s</string>
+    <string name="review_original_extension_id">원본 Chrome Extension ID\n%1$s</string>
     <string name="review_package">Package\n%1$s</string>
     <string name="review_wrapper_version">Wrapper versionCode\n%1$d</string>
     <string name="review_status">호환성 상태</string>
@@ -56,9 +57,12 @@
     <string name="review_issues">호환성 이슈</string>
     <string name="review_adapters">적용 Adapter</string>
     <string name="review_signer">APK signer SHA-256</string>
+    <string name="review_wrapper_sha256">APK SHA-256\n%1$s</string>
+    <string name="review_signer_sha256">APK signer SHA-256\n%1$s</string>
     <string name="review_none">없음</string>
     <string name="review_partial_notice">부분 호환 항목과 남은 제한을 이해했으며 설치를 계속합니다.</string>
     <string name="review_security_notice">이 보고서는 호환성·식별자 검증 결과이며 악성 코드 검사나 보안 보증을 의미하지 않습니다.</string>
+    <string name="review_play_protect_notice">이 APK는 기기에서 생성되어 Google Play에서 배포·검사된 앱이 아닙니다. Android 보안 경고가 표시될 수 있으며, 이 화면의 package·서명·hash를 확인한 뒤 설치 여부를 결정하세요.</string>
     <string name="review_notification_notice">Android 13 이상에서는 백그라운드 설치 승인 안내를 위해 설치 시 알림 권한을 요청할 수 있습니다. 거부해도 설치는 계속됩니다.</string>
     <string name="review_install">설치 APK 내보내기</string>
     <string name="review_cancel">취소</string>

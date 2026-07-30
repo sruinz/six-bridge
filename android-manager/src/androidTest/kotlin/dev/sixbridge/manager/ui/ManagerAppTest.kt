@@ -25,6 +25,7 @@ import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -1136,11 +1137,36 @@ class ManagerAppTest {
         composeRule.onNodeWithTag("review:install").assertIsDisplayed()
     }
 
+    @Test
+    fun review_shows_verified_apk_provenance_and_security_limits() {
+        composeRule.setContent {
+            ManagerAppContent(
+                state = reviewState(ContractCompatibilityStatus.COMPATIBLE),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        listOf(
+            ORIGINAL_EXTENSION_ID,
+            WRAPPER_SHA256,
+            SIGNER_SHA256,
+            "이 APK는 기기에서 생성되어 Google Play에서 배포·검사된 앱이 아닙니다.",
+            "악성 코드 검사나 보안 보증을 의미하지 않습니다",
+        ).forEach { expected ->
+            composeRule.onNodeWithTag("review:scroll")
+                .performScrollToNode(hasText(expected, substring = true))
+            composeRule.onNodeWithText(expected, substring = true).assertIsDisplayed()
+        }
+    }
+
     private fun reviewState(status: ContractCompatibilityStatus): ManagerUiState {
         val review = ReviewBundle(
             token = "11111111-1111-1111-1111-111111111111",
             packageName = PACKAGE,
             extensionId = EXTENSION_ID,
+            originalExtensionId = ORIGINAL_EXTENSION_ID,
+            wrapperSha256 = WRAPPER_SHA256,
             name = "테스트 확장",
             version = "1.2.3",
             status = status,
@@ -1158,7 +1184,7 @@ class ManagerAppTest {
                     remainingLimitations = listOf("백그라운드 동작 제한"),
                 ),
             ),
-            signerSha256 = "a".repeat(64),
+            signerSha256 = SIGNER_SHA256,
             wrapperVersionCode = 7,
         )
         return ManagerUiState(
@@ -1391,6 +1417,11 @@ class ManagerAppTest {
         const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
         const val PACKAGE = "dev.sixbridge.ext.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val EXTENSION_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val ORIGINAL_EXTENSION_ID = "bcdefghijklmnopabcdefghijklmnopa"
+        const val WRAPPER_SHA256 =
+            "97bd5a88552319b46e3d5ed350451b18a7558170aa11d7947452c62365c75403"
+        const val SIGNER_SHA256 =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
 }
 

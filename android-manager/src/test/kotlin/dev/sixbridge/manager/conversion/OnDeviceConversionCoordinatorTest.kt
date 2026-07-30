@@ -1454,6 +1454,9 @@ class OnDeviceConversionCoordinatorTest {
                         token = "22222222-2222-4222-8222-222222222222",
                         packageName = PACKAGE,
                         extensionId = EXTENSION_ID,
+                        originalExtensionId = null,
+                        wrapperSha256 =
+                            "2222222222222222222222222222222222222222222222222222222222222222",
                         name = "Example",
                         version = "1.0",
                         status = ContractCompatibilityStatus.PARTIAL,

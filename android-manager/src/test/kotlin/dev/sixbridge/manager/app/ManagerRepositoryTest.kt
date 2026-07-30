@@ -140,6 +140,21 @@ class ManagerRepositoryTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `설치 검토는 원본 ID와 wrapper hash를 보존한다`() {
+        val imported = importedBundle(
+            root = temporaryFolder.newFolder("review-provenance"),
+            originalExtensionId = ORIGINAL_EXTENSION_ID,
+            wrapperSha256 = WRAPPER_SHA256,
+        )
+
+        val review = imported.toReview()
+
+        assertEquals(ORIGINAL_EXTENSION_ID, review.originalExtensionId)
+        assertEquals(WRAPPER_SHA256, review.wrapperSha256)
+        assertEquals(imported.descriptor.signerSha256, review.signerSha256)
+    }
+
+    @Test
     fun `검증된 install 요청은 launch 없이 APK 내보내기 준비 상태를 반환한다`() =
         runTest {
             val fixture = systemRepositoryFixture("apk-export-required")
@@ -2346,6 +2361,8 @@ class ManagerRepositoryTest {
                             token = SECOND_TOKEN,
                             packageName = bundle.verifiedApk.packageName,
                             extensionId = bundle.descriptor.extensionId,
+                            originalExtensionId = bundle.report.originalExtensionId,
+                            wrapperSha256 = bundle.descriptor.wrapperSha256,
                             name = bundle.descriptor.name,
                             version = bundle.descriptor.version,
                             status = bundle.report.status,
@@ -3657,10 +3674,15 @@ class ManagerRepositoryTest {
         iconLoadTimeoutMillis = iconLoadTimeoutMillis,
     )
 
-    private fun importedBundle(root: File, token: String = TOKEN): ImportedBundle {
+    private fun importedBundle(
+        root: File,
+        token: String = TOKEN,
+        originalExtensionId: String = EXTENSION_ID,
+        wrapperSha256: String? = null,
+    ): ImportedBundle {
         val directory = File(root, token).apply { mkdir() }
         val wrapper = File(directory, "wrapper.apk").apply { writeText("verified apk") }
-        val hash = sha256(wrapper)
+        val hash = wrapperSha256 ?: sha256(wrapper)
         val descriptor = ContractExtensionDescriptor(
             schemaVersion = 1,
             extensionId = EXTENSION_ID,
@@ -3687,7 +3709,7 @@ class ManagerRepositoryTest {
             issues = emptyList(),
             conversionState = "converted",
             adapterDecisions = emptyList<ContractAdapterDecision>(),
-            originalExtensionId = EXTENSION_ID,
+            originalExtensionId = originalExtensionId,
             convertedExtensionId = EXTENSION_ID,
             sourceSha256 = "d".repeat(64),
             browserProfileSha256 = "e".repeat(64),
@@ -3742,6 +3764,9 @@ class ManagerRepositoryTest {
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
         const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
+        const val ORIGINAL_EXTENSION_ID = "bcdefghijklmnopabcdefghijklmnopa"
+        const val WRAPPER_SHA256 =
+            "97bd5a88552319b46e3d5ed350451b18a7558170aa11d7947452c62365c75403"
         val EXTENSION_ID = "a".repeat(32)
         val SECOND_EXTENSION_ID = "b".repeat(32)
         val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"

@@ -9226,6 +9226,9 @@ class ManagerViewModelTest {
         token = token,
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
+        originalExtensionId = null,
+        wrapperSha256 =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         name = "확장",
         version = "1.0",
         status = status,

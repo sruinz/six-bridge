@@ -50,6 +50,14 @@ fun ReviewScreen(
                 style = MaterialTheme.typography.titleLarge,
             )
             Text(text = stringResource(R.string.review_extension_id, review.extensionId))
+            review.originalExtensionId?.let { originalExtensionId ->
+                Text(
+                    text = stringResource(
+                        R.string.review_original_extension_id,
+                        originalExtensionId,
+                    ),
+                )
+            }
             Text(text = stringResource(R.string.review_package, review.packageName))
             Text(text = stringResource(R.string.review_wrapper_version, review.wrapperVersionCode))
         }
@@ -100,7 +108,13 @@ fun ReviewScreen(
             title = stringResource(R.string.review_signer),
             modifier = Modifier.testTag("review:signer"),
         ) {
-            Text(text = review.signerSha256)
+            Text(text = stringResource(R.string.review_wrapper_sha256, review.wrapperSha256))
+            Text(text = stringResource(R.string.review_signer_sha256, review.signerSha256))
+            Text(
+                text = stringResource(R.string.review_play_protect_notice),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Text(
                 text = stringResource(R.string.review_security_notice),
                 style = MaterialTheme.typography.bodySmall,
