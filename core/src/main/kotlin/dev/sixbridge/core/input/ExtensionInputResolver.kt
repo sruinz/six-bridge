@@ -4,6 +4,7 @@ import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
 import kotlin.io.path.extension
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
@@ -36,7 +37,11 @@ class ExtensionInputResolver(
     private val extractionRootFactory: () -> Path = {
         Files.createTempDirectory("sixbridge-extension-")
     },
+    private val extractionRootValidatedHook: (Path) -> Unit = {},
 ) {
+    private val consumedExtractionRootPaths = mutableSetOf<Path>()
+    private val consumedExtractionRootFileKeys = mutableSetOf<Any>()
+
     fun resolve(input: String): ResolvedExtensionInput {
         if (input.startsWith("http://") || input.startsWith("https://")) {
             return resolveUrl(input)
@@ -51,7 +56,7 @@ class ExtensionInputResolver(
             )
             path.isRegularFile() && path.extension.equals("zip", ignoreCase = true) -> {
                 val extracted = extractionRoot()
-                val root = ExtensionZip.extract(path, extracted)
+                val root = ExtensionZip.extractVerified(path, extracted)
                 ResolvedExtensionInput(
                     kind = ExtensionInputKind.ZIP,
                     originalInput = input,
@@ -64,7 +69,7 @@ class ExtensionInputResolver(
                 ResolvedExtensionInput(
                     kind = ExtensionInputKind.CRX3,
                     originalInput = input,
-                    sourceRoot = ExtensionZip.extract(
+                    sourceRoot = ExtensionZip.extractVerified(
                         parsed.zipBytes,
                         extractionRoot(),
                     ),
@@ -91,7 +96,7 @@ class ExtensionInputResolver(
         return ResolvedExtensionInput(
             kind = ExtensionInputKind.CHROME_WEB_STORE,
             originalInput = input,
-            sourceRoot = ExtensionZip.extract(
+            sourceRoot = ExtensionZip.extractVerified(
                 parsed.zipBytes,
                 extractionRoot(),
             ),
@@ -100,14 +105,44 @@ class ExtensionInputResolver(
         )
     }
 
-    private fun extractionRoot(): Path {
+    private fun extractionRoot(): ExtensionExtractionRoot {
         val root = extractionRootFactory().toAbsolutePath().normalize()
         require(Files.isDirectory(root, NOFOLLOW_LINKS) && !Files.isSymbolicLink(root)) {
             "확장 추출 root는 이미 생성된 실제 디렉터리여야 합니다: $root"
         }
+        val canonical = root.toRealPath()
+        val fileKey = requireNotNull(
+            Files.readAttributes(
+                canonical,
+                BasicFileAttributes::class.java,
+                NOFOLLOW_LINKS,
+            ).fileKey(),
+        ) {
+            "확장 추출 root identity를 확인할 수 없습니다: $canonical"
+        }
+        synchronized(this) {
+            require(
+                canonical !in consumedExtractionRootPaths &&
+                    fileKey !in consumedExtractionRootFileKeys,
+            ) {
+                "이미 사용한 확장 추출 root는 재사용할 수 없습니다: $canonical"
+            }
+            consumedExtractionRootPaths.add(canonical)
+            consumedExtractionRootFileKeys.add(fileKey)
+        }
         require(Files.list(root).use { it.findAny().isEmpty }) {
             "확장 추출 root는 비어 있어야 합니다: $root"
         }
-        return root.toRealPath()
+        return ExtensionExtractionRoot(
+            canonical,
+            fileKey,
+            extractionRootValidatedHook,
+        )
     }
 }
+
+internal data class ExtensionExtractionRoot(
+    val path: Path,
+    val fileKey: Any,
+    val afterSecureValidation: (Path) -> Unit = {},
+)

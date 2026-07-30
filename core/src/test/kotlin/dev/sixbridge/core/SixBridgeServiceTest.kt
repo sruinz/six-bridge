@@ -38,6 +38,76 @@ import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
     @Test
+    fun `draft 단계 경계는 작업 전후에 취소를 확인한다`() {
+        var checkpoints = 0
+        var operations = 0
+
+        val value = runControlledDraftStage(
+            AnalysisControl(AnalysisSafetyPolicy.desktop) { checkpoints++ },
+        ) {
+            operations++
+            "done"
+        }
+
+        assertEquals("done", value)
+        assertEquals(1, operations)
+        assertEquals(2, checkpoints)
+
+        operations = 0
+        checkpoints = 0
+        assertFailsWith<CancellationException> {
+            runControlledDraftStage(
+                AnalysisControl(AnalysisSafetyPolicy.desktop) {
+                    checkpoints++
+                    if (checkpoints == 2) throw CancellationException("after")
+                },
+            ) {
+                operations++
+            }
+        }
+        assertEquals(1, operations)
+        assertEquals(2, checkpoints)
+    }
+
+    @Test
+    fun `signer provider 경계는 전후 취소 확인과 주입 identity를 보존한다`() {
+        val workspace = Files.createTempDirectory("six-draft-signer-boundary")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        var providerCalls = 0
+        var checkpoints = 0
+        val service = SixBridgeService(
+            workspaceRoot = workspace,
+            draftSigningIdentityProvider = DraftSigningIdentityProvider {
+                providerCalls++
+                pair
+            },
+        )
+
+        val actual = service.signingIdentityForDraft(
+            AnalysisControl(AnalysisSafetyPolicy.desktop) { checkpoints++ },
+        )
+
+        assertEquals(1, providerCalls)
+        assertEquals(2, checkpoints)
+        assertContentEquals(pair.public.encoded, actual.public.encoded)
+        assertFalse(Files.exists(workspace.resolve(".local/keystore/draft-transfer")))
+
+        providerCalls = 0
+        checkpoints = 0
+        assertFailsWith<CancellationException> {
+            service.signingIdentityForDraft(
+                AnalysisControl(AnalysisSafetyPolicy.desktop) {
+                    checkpoints++
+                    if (checkpoints == 2) throw CancellationException("after signer")
+                },
+            )
+        }
+        assertEquals(1, providerCalls)
+        assertEquals(2, checkpoints)
+        assertFalse(Files.exists(workspace.resolve(".local/keystore/draft-transfer")))
+    }
+
+    @Test
     fun `draft는 주입된 signer를 사용하고 별도 key store를 만들지 않는다`() {
         val workspace = Files.createTempDirectory("six-draft-signer-workspace")
         val source = source("six-draft-signer-source", "Injected signer")

@@ -27,8 +27,16 @@ class ConversionPipeline private constructor(
     localRoot: Path,
     compatibilityAnalyzer: CompatibilityAnalyzer,
 ) : AutoCloseable {
-    private val engine = ConversionPreparationEngine.create(compatibilityAnalyzer)
-    private val materialization = ConversionWorkspace()
+    private val engineHolder = lazy(LazyThreadSafetyMode.NONE) {
+        ConversionPreparationEngine.create(compatibilityAnalyzer)
+    }
+    private val materializationHolder = lazy(LazyThreadSafetyMode.NONE) {
+        ConversionWorkspace()
+    }
+    private val engine: ConversionPreparationEngine
+        get() = engineHolder.value
+    private val materialization: ConversionWorkspace
+        get() = materializationHolder.value
     private val packaging = CrxIdentityPolicy.create(localRoot)
 
     constructor(localRoot: Path) : this(localRoot, CompatibilityAnalyzer())
@@ -43,8 +51,12 @@ class ConversionPipeline private constructor(
         resolved: ResolvedExtensionInput,
         profile: BrowserProfile,
         control: AnalysisControl = AnalysisControl(),
-    ): AnalyzedConversion =
-        engine.analyzeWithIdentity(portableInput(resolved), profile, control)
+    ): AnalyzedConversion {
+        control.checkCancelled()
+        val input = portableInput(resolved)
+        control.checkCancelled()
+        return engine.analyzeWithIdentity(input, profile, control)
+    }
 
     fun preflight(
         resolved: ResolvedExtensionInput,
@@ -61,13 +73,17 @@ class ConversionPipeline private constructor(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
-    ): PreparedConversion =
-        engine.prepare(
-            portableInput(resolved),
+    ): PreparedConversion {
+        control.checkCancelled()
+        val input = portableInput(resolved)
+        control.checkCancelled()
+        return engine.prepare(
+            input,
             profile,
             approvedAdapterIds,
             control,
         )
+    }
 
     fun prepare(
         resolved: ResolvedExtensionInput,
@@ -75,11 +91,14 @@ class ConversionPipeline private constructor(
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
     ): ConversionPipelineResult {
+        control.checkCancelled()
         val source = requireNotNull(resolved.sourceRoot) {
             "빌드할 확장 소스를 입력에서 추출하지 못했습니다."
         }
+        val input = portableInput(resolved)
+        control.checkCancelled()
         val prepared = engine.prepare(
-            portableInput(resolved),
+            input,
             profile,
             approvedAdapterIds,
             control,
@@ -135,11 +154,26 @@ class ConversionPipeline private constructor(
     }
 
     override fun close() {
-        try {
-            materialization.close()
-        } finally {
-            engine.close()
+        var failure: Throwable? = null
+        if (materializationHolder.isInitialized()) {
+            try {
+                materialization.close()
+            } catch (error: Throwable) {
+                failure = error
+            }
         }
+        if (engineHolder.isInitialized()) {
+            try {
+                engine.close()
+            } catch (error: Throwable) {
+                if (failure == null) {
+                    failure = error
+                } else {
+                    requireNotNull(failure).addSuppressed(error)
+                }
+            }
+        }
+        failure?.let { throw it }
     }
 
     private fun portableInput(

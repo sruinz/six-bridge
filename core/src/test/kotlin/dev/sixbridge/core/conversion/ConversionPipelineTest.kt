@@ -26,25 +26,37 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class ConversionPipelineTest {
     @Test
+    fun `pipeline use 정리 실패는 취소 예외에 suppressed로 보존된다`() {
+        val cleanup = IllegalStateException("cleanup")
+
+        val cancellation = assertFailsWith<CancellationException> {
+            AutoCloseable { throw cleanup }.use {
+                throw CancellationException("cancel")
+            }
+        }
+
+        assertEquals(1, cancellation.suppressed.size)
+        assertSame(cleanup, cancellation.suppressed.single())
+    }
+
+    @Test
     fun `분석 preflight 준비는 취소 신호를 각각 전파한다`() {
         val source = plainSource("six-pipeline-cancel")
         val resolved = resolvedSource(source)
-        val cancelled = AnalysisControl(AnalysisSafetyPolicy.desktop) {
-            throw CancellationException("cancel")
-        }
 
-        assertPipelineCancellation {
-            it.analyzeWithIdentity(resolved, profile(), cancelled)
+        assertPipelineCancellation { pipeline, control ->
+            pipeline.analyzeWithIdentity(resolved, profile(), control)
         }
-        assertPipelineCancellation {
-            it.preflight(resolved, profile(), emptyList(), cancelled)
+        assertPipelineCancellation { pipeline, control ->
+            pipeline.preflight(resolved, profile(), emptyList(), control)
         }
-        assertPipelineCancellation {
-            it.prepare(resolved, profile(), emptyList(), cancelled)
+        assertPipelineCancellation { pipeline, control ->
+            pipeline.prepare(resolved, profile(), emptyList(), control)
         }
     }
 
@@ -793,21 +805,24 @@ class ConversionPipelineTest {
         .apply { initialize(2048) }
         .generateKeyPair()
 
-    private fun assertPipelineCancellation(operation: (ConversionPipeline) -> Unit) {
-        val pipeline = runCatching {
-            ConversionPipeline(Files.createTempDirectory("six-pipeline-cancel"))
-        }.getOrElse { error ->
-            assertIs<OwnedTempCleanupException>(error)
-            return
-        }
-        try {
-            assertFailsWith<CancellationException> { operation(pipeline) }
-        } finally {
-            val closeFailure = runCatching(pipeline::close).exceptionOrNull()
-            assertTrue(
-                closeFailure == null || closeFailure is OwnedTempCleanupException,
-                "예상하지 못한 pipeline 정리 실패: $closeFailure",
-            )
+    private fun assertPipelineCancellation(
+        operation: (ConversionPipeline, AnalysisControl) -> Unit,
+    ) {
+        listOf(1, 2).forEach { cancellationCheckpoint ->
+            val pipeline = ConversionPipeline(Files.createTempDirectory("six-pipeline-cancel"))
+            var checkpoints = 0
+            val control = AnalysisControl(AnalysisSafetyPolicy.desktop) {
+                checkpoints++
+                if (checkpoints == cancellationCheckpoint) {
+                    throw CancellationException("cancel")
+                }
+            }
+            try {
+                assertFailsWith<CancellationException> { operation(pipeline, control) }
+                assertEquals(cancellationCheckpoint, checkpoints)
+            } finally {
+                pipeline.close()
+            }
         }
     }
 

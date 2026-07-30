@@ -23,6 +23,7 @@ import java.nio.file.SecureDirectoryStream
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.BasicFileAttributeView
 import java.text.Normalizer
 import java.util.Base64
 import java.util.Locale
@@ -132,10 +133,47 @@ object ExtensionZip {
     ): Path {
         control.checkCancelled()
         val normalizedDestination = prepareExtractionRoot(destination)
+        val identity = extractionRootIdentity(normalizedDestination)
         return extractArchive(
             zipPath,
             normalizedDestination,
             destination,
+            identity.fileKey,
+            identity.afterSecureValidation,
+            control,
+        )
+    }
+
+    @JvmSynthetic
+    internal fun extractVerified(
+        bytes: ByteArray,
+        root: ExtensionExtractionRoot,
+        control: AnalysisControl = AnalysisControl(),
+    ): Path {
+        control.checkCancelled()
+        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        return try {
+            Files.write(temporary, bytes)
+            control.checkCancelled()
+            extractVerified(temporary, root, control)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    @JvmSynthetic
+    internal fun extractVerified(
+        zipPath: Path,
+        root: ExtensionExtractionRoot,
+        control: AnalysisControl = AnalysisControl(),
+    ): Path {
+        control.checkCancelled()
+        return extractArchive(
+            zipPath,
+            root.path,
+            root.path,
+            root.fileKey,
+            root.afterSecureValidation,
             control,
         )
     }
@@ -179,10 +217,13 @@ object ExtensionZip {
         require(Files.list(normalizedDestination).use { it.findAny().isEmpty }) {
             "ZIP 압축 해제 대상은 등록 직후의 빈 디렉터리여야 합니다."
         }
+        val identity = extractionRootIdentity(normalizedDestination)
         return extractArchive(
             zipPath,
             normalizedDestination,
             normalizedDestination,
+            identity.fileKey,
+            identity.afterSecureValidation,
             control,
         )
     }
@@ -191,6 +232,8 @@ object ExtensionZip {
         zipPath: Path,
         normalizedDestination: Path,
         resultRoot: Path,
+        expectedRootFileKey: Any,
+        afterSecureValidation: (Path) -> Unit,
         control: AnalysisControl,
     ): Path {
         control.checkCancelled()
@@ -222,35 +265,54 @@ object ExtensionZip {
                 }
                 ValidatedEntry(entry, name)
             }.toList()
-            var totalSize = 0L
-            validated.forEach { validatedEntry ->
-                control.checkCancelled()
-                val entry = validatedEntry.entry
-                val components = validatedEntry.name.split('/')
-                val output = normalizedDestination.resolve(validatedEntry.name).normalize()
-                require(output.startsWith(normalizedDestination)) {
-                    "ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}"
-                }
-                if (entry.isDirectory) {
-                    ensureDirectoryComponents(normalizedDestination, components)
-                } else {
-                    ensureDirectoryComponents(normalizedDestination, components.dropLast(1))
-                    zip.getInputStream(entry).use { input ->
-                        totalSize += copyLimited(
-                            input,
-                            normalizedDestination,
-                            components,
-                            output,
-                            control,
-                        )
-                        require(totalSize <= MAX_TOTAL_SIZE) {
-                            "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+            withSecureExtractionRoot(
+                normalizedDestination,
+                expectedRootFileKey,
+                entryTypes,
+                afterSecureValidation,
+                control,
+            ) { secureRoot ->
+                var totalSize = 0L
+                validated.forEach { validatedEntry ->
+                    control.checkCancelled()
+                    val entry = validatedEntry.entry
+                    val components = validatedEntry.name.split('/')
+                    val output = normalizedDestination.resolve(validatedEntry.name).normalize()
+                    require(output.startsWith(normalizedDestination)) {
+                        "ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}"
+                    }
+                    requireCurrentExtractionRoot(
+                        normalizedDestination,
+                        expectedRootFileKey,
+                    )
+                    if (entry.isDirectory) {
+                        ensureDirectoryComponents(normalizedDestination, components)
+                    } else {
+                        ensureDirectoryComponents(normalizedDestination, components.dropLast(1))
+                        zip.getInputStream(entry).use { input ->
+                            totalSize += copyLimited(
+                                input,
+                                secureRoot,
+                                components,
+                                output,
+                                control,
+                            )
+                            require(totalSize <= MAX_TOTAL_SIZE) {
+                                "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+                            }
                         }
                     }
+                    requireCurrentExtractionRoot(
+                        normalizedDestination,
+                        expectedRootFileKey,
+                    )
                 }
             }
         }
-        return locateManifestRoot(resultRoot)
+        requireCurrentExtractionRoot(normalizedDestination, expectedRootFileKey)
+        return locateManifestRoot(resultRoot).also {
+            requireCurrentExtractionRoot(normalizedDestination, expectedRootFileKey)
+        }
     }
 
     private fun validateUnixEntryTypes(
@@ -725,13 +787,39 @@ object ExtensionZip {
         }
     }
 
-    private fun copyLimited(
-        input: InputStream,
+    private fun extractionRootIdentity(path: Path): ExtensionExtractionRoot {
+        val canonical = path.toRealPath()
+        val attributes = Files.readAttributes(
+            canonical,
+            BasicFileAttributes::class.java,
+            LinkOption.NOFOLLOW_LINKS,
+        )
+        require(attributes.isDirectory && !attributes.isSymbolicLink) {
+            "ZIP 압축 해제 root가 실제 디렉터리가 아닙니다: $canonical"
+        }
+        return ExtensionExtractionRoot(
+            canonical,
+            requireNotNull(attributes.fileKey()) {
+                "ZIP 압축 해제 root identity를 확인할 수 없습니다: $canonical"
+            },
+        )
+    }
+
+    private fun requireCurrentExtractionRoot(path: Path, expectedFileKey: Any) {
+        val current = extractionRootIdentity(path)
+        require(current.fileKey == expectedFileKey) {
+            "ZIP 압축 해제 root identity가 변경되었습니다: $path"
+        }
+    }
+
+    private inline fun <T> withSecureExtractionRoot(
         root: Path,
-        components: List<String>,
-        output: Path,
+        expectedFileKey: Any,
+        expectedEntries: Map<String, Boolean>,
+        afterSecureValidation: (Path) -> Unit,
         control: AnalysisControl,
-    ): Long {
+        block: (SecureDirectoryStream<Path>) -> T,
+    ): T {
         control.checkCancelled()
         val parent = requireNotNull(root.parent) {
             "ZIP 압축 해제 루트의 안전한 상위 디렉터리를 찾지 못했습니다: $root"
@@ -740,12 +828,81 @@ object ExtensionZip {
             require(parentStream is SecureDirectoryStream<Path>) {
                 "파일시스템이 안전한 ZIP 압축 해제를 지원하지 않습니다: $root"
             }
+            requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
             parentStream.newDirectoryStream(
                 root.fileName,
                 LinkOption.NOFOLLOW_LINKS,
             ).use { directory ->
-                return copyLimited(input, directory, components, output, control)
+                requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
+                require(!directory.iterator().hasNext()) {
+                    "ZIP 압축 해제 대상은 secure handle 확인 시점에도 비어 있어야 합니다."
+                }
+                afterSecureValidation(root)
+                val result = block(directory)
+                require(secureInventory(directory, control) == expectedEntries) {
+                    "ZIP 압축 해제 중 예상하지 않은 root 항목이 생겼습니다."
+                }
+                requireSecureRootIdentity(parentStream, root.fileName, expectedFileKey)
+                control.checkCancelled()
+                return result
             }
+        }
+    }
+
+    private fun secureInventory(
+        directory: SecureDirectoryStream<Path>,
+        control: AnalysisControl,
+        prefix: String = "",
+    ): Map<String, Boolean> {
+        val entries = linkedMapOf<String, Boolean>()
+        directory.forEach { entry ->
+            control.checkCancelled()
+            val name = entry.fileName.toString()
+            val relative = if (prefix.isEmpty()) name else "$prefix/$name"
+            val attributes = requireNotNull(
+                directory.getFileAttributeView(
+                    Path.of(name),
+                    BasicFileAttributeView::class.java,
+                    LinkOption.NOFOLLOW_LINKS,
+                ),
+            ).readAttributes()
+            require(!attributes.isSymbolicLink && (attributes.isDirectory || attributes.isRegularFile)) {
+                "ZIP 압축 해제 root에 안전하지 않은 항목이 있습니다: $relative"
+            }
+            entries[relative] = attributes.isDirectory
+            if (attributes.isDirectory) {
+                directory.newDirectoryStream(
+                    Path.of(name),
+                    LinkOption.NOFOLLOW_LINKS,
+                ).use { child ->
+                    entries.putAll(secureInventory(child, control, relative))
+                }
+            }
+        }
+        return entries
+    }
+
+    private fun requireSecureRootIdentity(
+        parent: SecureDirectoryStream<Path>,
+        name: Path,
+        expectedFileKey: Any,
+    ) {
+        val view = requireNotNull(
+            parent.getFileAttributeView(
+                name,
+                BasicFileAttributeView::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            ),
+        ) {
+            "ZIP 압축 해제 root attribute view를 열 수 없습니다: $name"
+        }
+        val attributes = view.readAttributes()
+        require(
+            attributes.isDirectory &&
+                !attributes.isSymbolicLink &&
+                attributes.fileKey() == expectedFileKey,
+        ) {
+            "ZIP 압축 해제 root identity가 변경되었습니다: $name"
         }
     }
 

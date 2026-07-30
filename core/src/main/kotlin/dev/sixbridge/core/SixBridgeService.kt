@@ -101,9 +101,9 @@ class SixBridgeService(
         profile: BrowserProfile,
         control: AnalysisControl = AnalysisControl(),
     ): SixDraftAnalysisResult {
-        control.checkCancelled()
-        val resolved = inputResolver.resolve(input)
-        control.checkCancelled()
+        val resolved = runControlledDraftStage(control) {
+            inputResolver.resolve(input)
+        }
         return analyzeResolvedDraft(resolved, profile, control)
     }
 
@@ -114,10 +114,11 @@ class SixBridgeService(
     ): SixDraftAnalysisResult {
         control.checkCancelled()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
-            val analysis = userInputBoundary("확장 입력을 분석할 수 없습니다.") {
-                pipeline.analyzeWithIdentity(resolved, profile, control)
+            val analysis = runControlledDraftStage(control) {
+                userInputBoundary("확장 입력을 분석할 수 없습니다.") {
+                    pipeline.analyzeWithIdentity(resolved, profile, control)
+                }
             }
-            control.checkCancelled()
             SixDraftAnalysisResult(analysis.report, analysis.logicalSourceIdentity)
         }
     }
@@ -131,9 +132,9 @@ class SixBridgeService(
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
     ): SixDraftResult {
-        control.checkCancelled()
-        val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
-        control.checkCancelled()
+        val resolved = runControlledDraftStage(control) {
+            inputResolver.resolve(input)
+        }.copy(projectIdentity = projectIdentity)
         return draftResolved(
             resolved = resolved,
             profile = profile,
@@ -168,14 +169,14 @@ class SixBridgeService(
         )
         outputGuardHook()
         outputGuard.requireCurrent()
-        control.checkCancelled()
-        val preflightIdentity = preflightAnalyze(
-            draftInput,
-            profile,
-            approvedAdapterIds,
-            control,
-        )
-        control.checkCancelled()
+        val preflightIdentity = runControlledDraftStage(control) {
+            preflightAnalyze(
+                draftInput,
+                profile,
+                approvedAdapterIds,
+                control,
+            )
+        }
         val sourceIdentity = resolveDraftSourceIdentity(
             preflightIdentity,
             requestedProjectIdentity,
@@ -183,14 +184,14 @@ class SixBridgeService(
         outputGuard.requireCurrent()
         return ConversionPipeline.create(localRoot, compatibilityAnalyzer).use { pipeline ->
             outputGuard.requireCurrent()
-            control.checkCancelled()
-            val prepared = pipeline.prepare(
-                draftInput,
-                profile,
-                approvedAdapterIds,
-                control,
-            )
-            control.checkCancelled()
+            val prepared = runControlledDraftStage(control) {
+                pipeline.prepare(
+                    draftInput,
+                    profile,
+                    approvedAdapterIds,
+                    control,
+                )
+            }
             check(prepared.logicalSourceIdentity == preflightIdentity) {
                 "draft 준비 사이에 논리 원본 신원이 달라졌습니다."
             }
@@ -235,18 +236,17 @@ class SixBridgeService(
                 compatibilityAfter = after,
             )
             targetGuard.requireCurrent()
-            control.checkCancelled()
-            val key = signingIdentityProvider.getOrCreate()
+            val key = signingIdentityForDraft(control)
             targetGuard.requireCurrent()
-            control.checkCancelled()
-            SixDraft.writeGuarded(
-                target,
-                payload,
-                key,
-                targetGuard.publicationGuard,
-            )
-            control.checkCancelled()
-            verifyWrittenDraft(payload, key, draftReader(target))
+            runControlledDraftStage(control) {
+                SixDraft.writeGuarded(
+                    target,
+                    payload,
+                    key,
+                    targetGuard.publicationGuard,
+                )
+                verifyWrittenDraft(payload, key, draftReader(target))
+            }
             SixDraftResult(
                 draft = target,
                 conversionState = after.conversionState,
@@ -259,6 +259,13 @@ class SixBridgeService(
                 ),
             )
         }
+    }
+
+    @JvmSynthetic
+    internal fun signingIdentityForDraft(
+        control: AnalysisControl = AnalysisControl(),
+    ): KeyPair = runControlledDraftStage(control) {
+        signingIdentityProvider.getOrCreate()
     }
 
     fun build(
@@ -532,6 +539,16 @@ class SixBridgeService(
         private const val CORE_VERSION = "0.1.0-SNAPSHOT"
     }
 
+}
+
+internal inline fun <T> runControlledDraftStage(
+    control: AnalysisControl,
+    operation: () -> T,
+): T {
+    control.checkCancelled()
+    val result = operation()
+    control.checkCancelled()
+    return result
 }
 
 open class SixBridgeUserInputException(

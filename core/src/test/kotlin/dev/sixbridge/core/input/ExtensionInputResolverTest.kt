@@ -1,8 +1,12 @@
 package dev.sixbridge.core.input
 
 import dev.sixbridge.core.crx.Crx3
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.SecureDirectoryStream
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyPairGenerator
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -17,8 +21,90 @@ import kotlin.test.assertTrue
 
 class ExtensionInputResolverTest {
     @Test
+    fun `같은 추출 root는 첫 추출 실패 뒤에도 재사용하지 않는다`() {
+        val source = Files.createTempDirectory("six-input-reused-root-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Reused root","version":"1"}""",
+        )
+        val zip = source.parent.resolve("reused-root.zip")
+        ExtensionZip.create(source, zip)
+        val root = Files.createTempDirectory("six-input-reused-root")
+        val resolver = ExtensionInputResolver(extractionRootFactory = { root })
+
+        runCatching { resolver.resolve(zip.toString()) }
+        val second = assertFailsWith<IllegalArgumentException> {
+            resolver.resolve(zip.toString())
+        }
+
+        assertTrue(second.message.orEmpty().contains("이미 사용한"))
+    }
+
+    @Test
+    fun `검증 직후 교체된 추출 root와 원래 root를 수정하지 않는다`() {
+        val source = Files.createTempDirectory("six-input-replaced-root-source")
+        assumeTrue(
+            supportsSecureDirectoryStream(requireNotNull(source.parent)),
+            "SecureDirectoryStream을 제공하는 파일시스템에서 실행하는 보안 게이트",
+        )
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Replaced root","version":"1"}""",
+        )
+        val zip = source.parent.resolve("replaced-root.zip")
+        ExtensionZip.create(source, zip)
+        val root = Files.createTempDirectory("six-input-replaced-root")
+        val moved = root.resolveSibling("${root.fileName}-moved")
+        val resolver = ExtensionInputResolver(
+            extractionRootFactory = { root },
+            extractionRootValidatedHook = { validated ->
+                Files.move(validated, moved, ATOMIC_MOVE)
+                Files.createDirectory(validated)
+            },
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            resolver.resolve(zip.toString())
+        }
+
+        assertTrue(Files.list(root).use { it.findAny().isEmpty })
+        assertTrue(Files.list(moved).use { it.findAny().isEmpty })
+    }
+
+    @Test
+    fun `검증 직후 삽입된 sentinel을 수정하지 않고 추출을 거부한다`() {
+        val source = Files.createTempDirectory("six-input-sentinel-source")
+        assumeTrue(
+            supportsSecureDirectoryStream(requireNotNull(source.parent)),
+            "SecureDirectoryStream을 제공하는 파일시스템에서 실행하는 보안 게이트",
+        )
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Sentinel","version":"1"}""",
+        )
+        val zip = source.parent.resolve("sentinel.zip")
+        ExtensionZip.create(source, zip)
+        val root = Files.createTempDirectory("six-input-sentinel-root")
+        val sentinel = root.resolve("sentinel.txt")
+        val resolver = ExtensionInputResolver(
+            extractionRootFactory = { root },
+            extractionRootValidatedHook = {
+                sentinel.writeText("keep")
+            },
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            resolver.resolve(zip.toString())
+        }
+
+        assertEquals("keep", Files.readString(sentinel))
+        assertFalse(Files.exists(root.resolve("manifest.json"), NOFOLLOW_LINKS))
+    }
+
+    @Test
     fun `주입된 추출 root factory를 ZIP CRX 스토어 입력마다 사용한다`() {
         val source = Files.createTempDirectory("six-input-root-source")
+        assumeTrue(
+            supportsSecureDirectoryStream(requireNotNull(source.parent)),
+            "SecureDirectoryStream을 제공하는 파일시스템에서 실행하는 통합 게이트",
+        )
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Root","version":"1"}""",
         )
@@ -44,22 +130,15 @@ class ExtensionInputResolverTest {
             crx.toString(),
             "https://chromewebstore.google.com/detail/name/${packed.extensionId}",
         )
-        val resolved = inputs.map { input ->
-            runCatching { resolver.resolve(input) }
-        }
+        val resolved = inputs.map(resolver::resolve)
 
         assertEquals(3, roots.size)
         resolved.zip(roots).forEach { (result, root) ->
             assertTrue(Files.isDirectory(root, NOFOLLOW_LINKS))
             assertFalse(Files.isSymbolicLink(root))
-            result.getOrNull()?.let { input ->
-                assertTrue(requireNotNull(input.sourceRoot).startsWith(root))
-            } ?: assertTrue(
-                requireNotNull(result.exceptionOrNull()).message.orEmpty().contains(
-                    "파일시스템이 안전한 ZIP 압축 해제를 지원하지 않습니다",
-                ),
-            )
+            assertTrue(requireNotNull(result.sourceRoot).startsWith(root))
         }
+        assertEquals(3, roots.map(::fileKey).toSet().size)
     }
 
     @Test
@@ -224,5 +303,12 @@ class ExtensionInputResolverTest {
             )
         }
     }
+
+    private fun supportsSecureDirectoryStream(directory: java.nio.file.Path): Boolean =
+        Files.newDirectoryStream(directory).use { it is SecureDirectoryStream<*> }
+
+    private fun fileKey(path: java.nio.file.Path): Any = requireNotNull(
+        Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS).fileKey(),
+    )
 
 }
