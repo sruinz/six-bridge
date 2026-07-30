@@ -38,6 +38,19 @@ class SamsungInstallSourcePolicyTest {
     }
 
     @Test
+    fun `알 수 없는 installer의 null origin은 지원하지 않는다`() {
+        assertEquals(
+            SamsungInstallSourceVerdict.UNSUPPORTED,
+            classifySamsungInstallSource(
+                InstallSourceEvidence.Known(
+                    installingPackageName = "com.example.installer",
+                    originatingPackageName = null,
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun `Google installer의 null origin은 시스템 문서 앱 설치로 허용한다`() {
         assertEquals(
             SamsungInstallSourceVerdict.ALLOWED_SYSTEM_DOCUMENTS,

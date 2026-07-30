@@ -1823,6 +1823,71 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `파일 앱 launch 실패 RETRY는 navigator를 다시 조회해 My Files로 대체한다`() =
+        runTest(dispatcher.scheduler) {
+            val documentsUi = Intent()
+            val myFiles = Intent()
+            var launcherIntentCalls = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository(),
+                SavedStateHandle(),
+                fileManagerNavigator = object : FileManagerNavigator {
+                    override fun launcherIntent(): Intent {
+                        launcherIntentCalls += 1
+                        return if (launcherIntentCalls == 1) documentsUi else myFiles
+                    }
+                },
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenFileManager)
+            val failed = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            assertTrue(documentsUi === failed.intentFactory())
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+            val retried = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+
+            assertEquals(2, launcherIntentCalls)
+            assertEquals(LaunchDestination.FILE_MANAGER, retried.destination)
+            assertTrue(myFiles === retried.intentFactory())
+            assertTrue(failed.ownerGeneration != retried.ownerGeneration)
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `파일 앱 launch 실패 RETRY 재조회가 null이면 지원 앱 부재를 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val documentsUi = Intent()
+            var launcherIntentCalls = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository(),
+                SavedStateHandle(),
+                fileManagerNavigator = object : FileManagerNavigator {
+                    override fun launcherIntent(): Intent? {
+                        launcherIntentCalls += 1
+                        return documentsUi.takeIf { launcherIntentCalls == 1 }
+                    }
+                },
+            )
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenFileManager)
+            val failed = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.LaunchFailed(failed))
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+
+            assertEquals(2, launcherIntentCalls)
+            assertEquals(
+                UserMessageKind.FILE_MANAGER_MISSING,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
     fun `process recreation은 EXPORTED manual install 확인 버튼을 복원하고 자동 조정하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

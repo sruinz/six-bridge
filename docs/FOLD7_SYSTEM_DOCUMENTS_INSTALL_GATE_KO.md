@@ -55,41 +55,133 @@ Shizuku, 무인 설치, 설치 출처 extra 또는 APK URI 전달을 사용하�
 
 ## 1. 관리자 검증 빌드 준비
 
-저장소 루트에서 다음 명령을 실행한다.
+저장소 루트에서 다음 블록을 한 shell에서 순서대로 실행한다. 블록은
+`set -euo pipefail`을 사용하며, 기기 상태와 model을 exact 값으로 먼저
+검증한다. build, connected test, fresh XML 또는 exit code 검증 중 하나라도
+실패하면 `adb install -r`에 도달하지 않는다.
 
 ```bash
-export SERIAL='192.0.2.10:39359'
-export PACKAGE='dev.sixbridge.ext.ddcpmlcaanjillmjmnlmngimhbbojgam'
+set -euo pipefail
+
+SERIAL='192.0.2.10:39359'
+PACKAGE='dev.sixbridge.ext.ddcpmlcaanjillmjmnlmngimhbbojgam'
+EXPECTED_MODEL='SM-F966N'
+MANAGER_APK="$PWD/android-manager/build/outputs/apk/debug/android-manager-debug.apk"
+TEST_RESULTS_DIR="$PWD/android-manager/build/outputs/androidTest-results/connected/debug"
+
+DEVICE_STATE="$(adb -s "$SERIAL" get-state | tr -d '\r')"
+if [[ "$DEVICE_STATE" != 'device' ]]; then
+  printf '불합격: adb state=%q (expected device)\n' "$DEVICE_STATE" >&2
+  exit 1
+fi
+
+DEVICE_MODEL="$(
+  adb -s "$SERIAL" shell getprop ro.product.model |
+    tr -d '\r'
+)"
+if [[ "$DEVICE_MODEL" != "$EXPECTED_MODEL" ]]; then
+  printf '불합격: model=%q (expected %s)\n' \
+    "$DEVICE_MODEL" "$EXPECTED_MODEL" >&2
+  exit 1
+fi
+
+EVIDENCE_ROOT="$PWD/.local/evidence"
+RUN_ID="$(date '+%Y%m%d-%H%M%S')"
+mkdir -p "$EVIDENCE_ROOT"
+EVIDENCE_DIR="$(
+  mktemp -d \
+    "$EVIDENCE_ROOT/${RUN_ID}-system-documents-install-gate.XXXXXX"
+)"
+printf 'SERIAL=%s\nMODEL=%s\n' "$SERIAL" "$DEVICE_MODEL" |
+  tee "$EVIDENCE_DIR/device.txt"
+printf 'EVIDENCE_DIR=%s\n' "$EVIDENCE_DIR"
 
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
 GRADLE_USER_HOME="$PWD/.local/gradle-home" \
-gradle --no-daemon :android-manager:assembleDebug
+gradle --no-daemon :android-manager:assembleDebug 2>&1 |
+  tee "$EVIDENCE_DIR/manager-build.log"
 
-shasum -a 256 \
-  android-manager/build/outputs/apk/debug/android-manager-debug.apk
+shasum -a 256 "$MANAGER_APK" |
+  tee "$EVIDENCE_DIR/manager-debug.sha256"
 
+TEST_STARTED_MARKER="$EVIDENCE_DIR/connected-test.started"
+: > "$TEST_STARTED_MARKER"
 ANDROID_SERIAL="$SERIAL" \
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
 GRADLE_USER_HOME="$PWD/.local/gradle-home" \
 gradle --no-daemon :android-manager:connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=dev.sixbridge.manager.navigation.FileManagerNavigatorInstrumentedTest,dev.sixbridge.manager.install.ManualApkExportInstrumentedTest,dev.sixbridge.manager.ui.ManagerAppTest
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.sixbridge.manager.navigation.FileManagerNavigatorInstrumentedTest,dev.sixbridge.manager.install.ManualApkExportInstrumentedTest,dev.sixbridge.manager.ui.ManagerAppTest \
+  2>&1 |
+  tee "$EVIDENCE_DIR/connected-test.log"
 
-adb -s "$SERIAL" get-state
-adb -s "$SERIAL" shell getprop ro.product.model
-adb -s "$SERIAL" install -r \
-  android-manager/build/outputs/apk/debug/android-manager-debug.apk
+TEST_XML=''
+TEST_XML_COUNT=0
+while IFS= read -r candidate; do
+  TEST_XML="$candidate"
+  TEST_XML_COUNT=$((TEST_XML_COUNT + 1))
+done < <(
+  find "$TEST_RESULTS_DIR" -maxdepth 1 -type f \
+    -name 'TEST-SM-F966N -*_android-manager-.xml' \
+    -newer "$TEST_STARTED_MARKER" -print
+)
+if [[ "$TEST_XML_COUNT" -ne 1 ]]; then
+  printf '불합격: fresh Fold7 XML count=%s (expected 1)\n' \
+    "$TEST_XML_COUNT" >&2
+  exit 1
+fi
+
+TEST_EXIT_FILE="$TEST_RESULTS_DIR/test-result-exit-code.txt"
+if [[ ! -f "$TEST_EXIT_FILE" || ! "$TEST_EXIT_FILE" -nt "$TEST_STARTED_MARKER" ]]; then
+  printf '불합격: fresh test-result-exit-code.txt가 없습니다.\n' >&2
+  exit 1
+fi
+TEST_EXIT_CODE="$(tr -d '[:space:]' < "$TEST_EXIT_FILE")"
+if [[ "$TEST_EXIT_CODE" != '0' ]]; then
+  printf '불합격: connected test exit code=%q (expected 0)\n' \
+    "$TEST_EXIT_CODE" >&2
+  exit 1
+fi
+
+TEST_SUMMARY="$(sed -n '2p' "$TEST_XML")"
+if [[ "$TEST_SUMMARY" != *'tests="42"'* ||
+      "$TEST_SUMMARY" != *'failures="0"'* ||
+      "$TEST_SUMMARY" != *'errors="0"'* ||
+      "$TEST_SUMMARY" != *'skipped="0"'* ]]; then
+  printf '불합격: connected test XML summary=%s\n' "$TEST_SUMMARY" >&2
+  exit 1
+fi
+cp "$TEST_XML" "$EVIDENCE_DIR/connected-test.xml"
+cp "$TEST_EXIT_FILE" "$EVIDENCE_DIR/connected-test-exit-code.txt"
+
+INSTALL_OUTPUT="$(
+  adb -s "$SERIAL" install -r "$MANAGER_APK" 2>&1 |
+    tee "$EVIDENCE_DIR/manager-install.log"
+)"
+INSTALL_RESULT="$(
+  printf '%s\n' "$INSTALL_OUTPUT" |
+    tail -n 1 |
+    tr -d '\r'
+)"
+if [[ "$INSTALL_RESULT" != 'Success' ]]; then
+  printf '불합격: adb install result=%q (expected Success)\n' \
+    "$INSTALL_RESULT" >&2
+  exit 1
+fi
 ```
 
-instrumentation 결과 XML
-`android-manager/build/outputs/androidTest-results/connected/debug/TEST-SM-F966N - 16-_android-manager-.xml`이
-42 tests, 0 failures, 0 errors, 0 skipped이고 같은 디렉터리의
-`test-result-exit-code.txt`가 `0`이어야 한다.
+블록이 고르는 fresh instrumentation XML은 42 tests, 0 failures, 0 errors,
+0 skipped이고 같은 실행에서 생성된 `test-result-exit-code.txt`가 `0`이어야
+한다. XML, exit code, build/test/install 로그와 manager APK hash는 새
+`$EVIDENCE_DIR`에 복사하거나 기록한다.
 `androidx.test.services` package UID가 없다는 `appops` 보조 명령 경고만으로
 실패 처리하지 않고 XML과 exit code를 함께 판정한다.
 
-`get-state`가 `device`, model이 `SM-F966N`, 설치 결과가 `Success`이고 debug APK
-SHA-256이 실행 기록에 남아야 합격이다. instrumentation XML·exit code, 연결
-기기, model 또는 설치 결과가 다르면 사용자 설치 단계로 진행하지 않는다.
+`get-state`가 exact `device`, model이 exact `SM-F966N`, 설치 결과 마지막
+행이 exact `Success`이고 debug APK SHA-256이 실행 기록에 남아야 합격이다.
+기기·model 검증은 connected test보다 먼저 끝나며, instrumentation Gradle
+명령·fresh XML·fresh exit code 검증은 `adb install -r`보다 먼저 끝난다.
+잘못된 기기, model 불일치, build/test/XML/exit code 실패에서는 manager APK를
+설치하거나 사용자 설치 단계로 진행하지 않는다.
 
 ## 2. 래퍼 APK 내보내기와 DocumentsUI 실행
 
@@ -109,6 +201,8 @@ SHA-256이 실행 기록에 남아야 합격이다. instrumentation XML·exit co
 순서로 출력하므로 `awk`는 첫 번째 top task block만 남긴다.
 
 ```bash
+: "${EVIDENCE_DIR:?1단계에서 새 evidence dir를 먼저 생성하세요.}"
+
 adb -s "$SERIAL" shell dumpsys activity activities |
   awk '
     /Display #0 \(activities from top to bottom\):/ {
@@ -123,7 +217,8 @@ adb -s "$SERIAL" shell dumpsys activity activities |
       print
     }
   ' |
-  rg 'Task\{|launchedFromPackage=|Intent \{|state='
+  rg 'Task\{|launchedFromPackage=|Intent \{|state=' |
+  tee "$EVIDENCE_DIR/documentsui-top-task.txt"
 ```
 
 Fold7 Android 16에서는 다음 필드 형식으로 출력된다. class 이름은 OS
@@ -172,8 +267,11 @@ ADB `install`, manager의 APK URI 전달 또는 다른 파일 앱을 이용해 �
 사용자 승인 직후 다음 명령을 실행한다.
 
 ```bash
+: "${EVIDENCE_DIR:?1단계에서 새 evidence dir를 먼저 생성하세요.}"
+
 adb -s "$SERIAL" shell dumpsys package "$PACKAGE" |
-  rg 'installerPackageName|initiatingPackageName|originatingPackageName|packageSource|lastUpdateTime'
+  rg 'installerPackageName|initiatingPackageName|originatingPackageName|packageSource|lastUpdateTime' |
+  tee "$EVIDENCE_DIR/install-source.txt"
 ```
 
 합격값은 다음과 같다.
@@ -195,35 +293,52 @@ originating package가 null이 아니어도 불합격이다.
 설치된 `base.apk`를 읽기 전용으로 회수해 기준값과 비교한다.
 
 ```bash
-mkdir -p .local/evidence/system-documents-install-gate
+: "${EVIDENCE_DIR:?1단계에서 새 evidence dir를 먼저 생성하세요.}"
+if [[ ! -d "$EVIDENCE_DIR" ]]; then
+  printf '불합격: evidence dir가 없습니다: %s\n' "$EVIDENCE_DIR" >&2
+  exit 1
+fi
+INSTALLED_APK="$EVIDENCE_DIR/installed-base.apk"
+if [[ -e "$INSTALLED_APK" ]]; then
+  printf '불합격: 현재 실행 evidence에 APK가 이미 있습니다: %s\n' \
+    "$INSTALLED_APK" >&2
+  exit 1
+fi
 
 DEVICE_APK="$(
   adb -s "$SERIAL" shell pm path "$PACKAGE" |
     sed -n 's/^package://p' |
     tr -d '\r'
 )"
+if [[ -z "$DEVICE_APK" ]]; then
+  printf '불합격: 설치된 package APK 경로를 찾지 못했습니다.\n' >&2
+  exit 1
+fi
 
-adb -s "$SERIAL" pull "$DEVICE_APK" \
-  .local/evidence/system-documents-install-gate/installed-base.apk
+adb -s "$SERIAL" pull "$DEVICE_APK" "$INSTALLED_APK" 2>&1 |
+  tee "$EVIDENCE_DIR/installed-base-pull.log"
 
-shasum -a 256 \
-  .local/evidence/system-documents-install-gate/installed-base.apk
+shasum -a 256 "$INSTALLED_APK" |
+  tee "$EVIDENCE_DIR/installed-base.sha256"
 
 /opt/homebrew/share/android-commandlinetools/build-tools/36.0.0/apksigner \
-  verify --print-certs \
-  .local/evidence/system-documents-install-gate/installed-base.apk |
+  verify --print-certs "$INSTALLED_APK" |
+  tee "$EVIDENCE_DIR/installed-base-apksigner.txt" |
   rg 'Signer #1 certificate SHA-256 digest'
 
 /opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin/apkanalyzer \
-  manifest application-id \
-  .local/evidence/system-documents-install-gate/installed-base.apk
+  manifest application-id "$INSTALLED_APK" |
+  tee "$EVIDENCE_DIR/installed-base-application-id.txt"
 ```
 
 출력 package가 `$PACKAGE`, APK SHA-256과 signer SHA-256이 기준값과 정확히
 같아야 합격이다. 내보내기 전 review 값, 기존 기준 APK 또는 설치된 APK 중
 어느 하나라도 SHA-256이나 signer가 다르면 불합격이다.
 
-`.local/evidence/`는 실행 증거 보관 경로이며 Git에 추가하지 않는다.
+`.local/evidence/`는 실행 증거 보관 경로이며 Git에 추가하지 않는다. 고정
+파일이나 과거 디렉터리를 재사용하지 않는다. 1단계의 timestamp `RUN_ID`와
+`mktemp -d` suffix로 만든 새 `$EVIDENCE_DIR`에만 이번 실행의 pull, hash,
+signer, XML과 로그를 기록해 기존 증거를 보존한다.
 
 ## 6. Samsung Internet `dev_ext` 판정
 
@@ -231,22 +346,31 @@ shasum -a 256 \
 않고 기기 시각을 경계로 기록한 뒤 그 시각 이후의 로그만 읽는다.
 
 ```bash
+: "${EVIDENCE_DIR:?1단계에서 새 evidence dir를 먼저 생성하세요.}"
+
 LOG_START="$(
   adb -s "$SERIAL" shell "date '+%m-%d %H:%M:%S.%3N'" |
     tr -d '\r'
 )"
-printf 'LOG_START=%s\n' "$LOG_START"
+if [[ -z "$LOG_START" ]]; then
+  printf '불합격: logcat 시작 시각을 얻지 못했습니다.\n' >&2
+  exit 1
+fi
+printf 'LOG_START=%s\n' "$LOG_START" |
+  tee "$EVIDENCE_DIR/log-start.txt"
 
 adb -s "$SERIAL" shell am force-stop com.sec.android.app.sbrowser
 adb -s "$SERIAL" shell am start -W \
   -a android.intent.action.VIEW \
   -d 'internet://extension/' \
   -p com.sec.android.app.sbrowser
-adb -s "$SERIAL" logcat -d -T "$LOG_START" -v threadtime |
-  rg "SixAppDataUpdater|SixPkgUpdater|$PACKAGE|dev_ext"
+LOGCAT_FILE="$EVIDENCE_DIR/samsung-internet-logcat.txt"
+adb -s "$SERIAL" logcat -d -T "$LOG_START" -v threadtime > "$LOGCAT_FILE"
+rg "SixAppDataUpdater|SixPkgUpdater|$PACKAGE|dev_ext" "$LOGCAT_FILE" |
+  tee "$EVIDENCE_DIR/samsung-internet-relevant-log.txt"
 
-adb -s "$SERIAL" logcat -d -T "$LOG_START" -v threadtime |
-  rg "$PACKAGE.*dev_ext"
+rg "$PACKAGE.*dev_ext" "$LOGCAT_FILE" |
+  tee "$EVIDENCE_DIR/dev-ext-match.txt"
 ```
 
 `LOG_START`가 비어 있지 않고 마지막 명령이 대상 `$PACKAGE`와 `dev_ext`를
@@ -279,12 +403,16 @@ Fold7의 시스템 문서 앱을 비활성화하거나 제거해 대체 경로�
 다음 단위 테스트와 기존 게이트 증거로만 회귀를 확인한다.
 
 ```bash
+: "${EVIDENCE_DIR:?1단계에서 새 evidence dir를 먼저 생성하세요.}"
+
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
 GRADLE_USER_HOME="$PWD/.local/gradle-home" \
 gradle --no-daemon :android-manager:testDebugUnitTest \
   --tests 'dev.sixbridge.manager.navigation.FileManagerNavigatorTest' \
   --tests 'dev.sixbridge.manager.install.SamsungInstallSourcePolicyTest' \
-  --tests 'dev.sixbridge.manager.install.SystemInstallCoordinatorTest'
+  --tests 'dev.sixbridge.manager.install.SystemInstallCoordinatorTest' \
+  2>&1 |
+  tee "$EVIDENCE_DIR/fallback-unit-tests.log"
 ```
 
 테스트가 모두 통과하고 다음 계약이 유지되어야 합격이다.

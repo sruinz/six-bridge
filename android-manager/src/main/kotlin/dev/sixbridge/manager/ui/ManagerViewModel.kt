@@ -2026,7 +2026,11 @@ class ManagerViewModel(
             uninstallPackage != null -> "시스템 제거 화면을 열 수 없습니다."
             else -> "시스템 화면을 열 수 없습니다."
         }
-        pendingRecovery = PendingRecovery.Launch(effect, uninstallPackage)
+        pendingRecovery = if (effect.destination == LaunchDestination.FILE_MANAGER) {
+            PendingRecovery.FileManager
+        } else {
+            PendingRecovery.Launch(effect, uninstallPackage)
+        }
         mutableState.update {
             it.copy(
                 message = UserMessage(
@@ -2062,6 +2066,7 @@ class ManagerViewModel(
         mutableState.update { it.copy(message = null) }
         when (recovery) {
             PendingRecovery.SamsungAddOns -> openSamsungAddOns()
+            PendingRecovery.FileManager -> openFileManager()
             is PendingRecovery.Uninstall -> remove(recovery.packageName)
             is PendingRecovery.Launch -> {
                 val retriedEffect = ManagerEffect.LaunchIntent(
@@ -4849,6 +4854,7 @@ private fun installFailureMessage(code: String): UserMessage = when (code) {
 
 private sealed interface PendingRecovery {
     data object SamsungAddOns : PendingRecovery
+    data object FileManager : PendingRecovery
     data class Uninstall(val packageName: String) : PendingRecovery
     data class Launch(
         val effect: ManagerEffect.LaunchIntent,
