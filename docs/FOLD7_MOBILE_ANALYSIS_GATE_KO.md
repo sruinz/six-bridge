@@ -53,11 +53,15 @@ ADB 연결, 설치 또는 PID 확인이 실패하면 즉시 중단한다. logcat
    분석·변환하고, 생성된 래퍼 APK를 설치한 뒤 삼성 인터넷의 실제 context
    menu가 동작하는지 확인한다. 과거 `.six`의 extension ID가 현재 설치본과
    다르면 중복 설치가 되므로 사용하지 않는다.
-8. `파일 앱 열기`를 눌러 chooser가 표시되는지 확인하고, 설치 완료 뒤
-   설치 출처 결과가 예상한 파일 앱 경로와 일치하는지 확인한다.
-9. review 화면의 원본 extension ID, wrapper package, APK SHA-256,
+8. `파일 앱 열기`를 눌러 시스템 문서 앱이 열리는지 확인하고
+   `docs/FOLD7_SYSTEM_DOCUMENTS_INSTALL_GATE_KO.md`의 설치 출처·`dev_ext`
+   게이트를 통과한다.
+9. 시스템 문서 앱이 없는 환경의 Samsung My Files 대체는 시스템 문서 앱을
+   제거하거나 비활성화하지 않고 `docs/FOLD7_MYFILES_INSTALL_GATE_KO.md`와
+   해당 단위 테스트로 회귀 확인한다.
+10. review 화면의 원본 extension ID, wrapper package, APK SHA-256,
    signer SHA-256이 변환 산출물과 모두 일치하는지 확인한다.
-10. Play Protect 경고가 표시되면 플랫폼 제한으로 증거에 기록하고 우회하거나
+11. Play Protect 경고가 표시되면 플랫폼 제한으로 증거에 기록하고 우회하거나
     보호 기능을 끄지 않는다.
 
 각 단계의 결과, 시각, 화면 메시지와 관련 evidence 파일명을 기록한다. 수동
