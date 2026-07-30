@@ -4,14 +4,22 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
@@ -26,6 +34,7 @@ import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.ComposeContentTestRule
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -83,6 +92,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
@@ -91,10 +101,25 @@ class ManagerAppTest {
     val composeRule = createComposeRule()
 
     @Test
+    fun adb_test_content_uses_dark_material_colors() {
+        lateinit var colors: ColorScheme
+
+        composeRule.setDarkContent {
+            colors = MaterialTheme.colorScheme
+        }
+
+        composeRule.runOnIdle {
+            assertEquals(ComposeColor.Black, colors.background)
+            assertTrue(colors.surface.luminance() < 0.2f)
+            assertTrue(colors.surfaceVariant.luminance() < 0.2f)
+        }
+    }
+
+    @Test
     fun home_exposes_add_ons_file_report_and_remove_actions() {
         val actions = mutableListOf<ManagerAction>()
         var addFileRequests = 0
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     installed = listOf(installedItem()),
@@ -132,7 +157,7 @@ class ManagerAppTest {
     @Test
     fun startup_gate_disables_mutations_but_keeps_report_readable() {
         var startupState by mutableStateOf(StartupRecoveryUiState.INITIALIZING)
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     installed = listOf(installedItem()),
@@ -164,7 +189,7 @@ class ManagerAppTest {
     @Test
     fun conversion_input_exposes_url_file_and_analyze_actions() {
         val actions = mutableListOf<ManagerAction>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(route = ManagerRoute.ConversionInput),
                 onAction = actions::add,
@@ -195,7 +220,7 @@ class ManagerAppTest {
     @Test
     fun conversion_analysis_requires_adapter_and_partial_confirmation() {
         var state by mutableStateOf(conversionAnalysisState())
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = { action ->
@@ -236,7 +261,7 @@ class ManagerAppTest {
         val initial = conversionAnalysisState()
         val ready = initial.conversionState as ConversionUiState.AnalysisReady
         val actions = mutableListOf<ManagerAction>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             val density = LocalDensity.current
             CompositionLocalProvider(
                 LocalDensity provides Density(density.density, fontScale = 2f),
@@ -283,7 +308,7 @@ class ManagerAppTest {
 
     @Test
     fun conversion_result_exposes_install_save_share_done_and_cancel() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = conversionResultState(),
                 onAction = {},
@@ -305,7 +330,7 @@ class ManagerAppTest {
     @Test
     fun generated_cleanup_pending_disables_all_result_actions() {
         var state by mutableStateOf(conversionResultState())
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = {},
@@ -341,7 +366,7 @@ class ManagerAppTest {
                 RecoveryAction.RETRY,
             ),
         )
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = initial.copy(
                     conversionState = ready.copy(cleanupPending = true),
@@ -384,7 +409,7 @@ class ManagerAppTest {
         )
         val savedState = cleanupRestoreSavedState()
         val viewModel = ManagerViewModel(repository, savedState)
-        composeRule.setContent {
+        composeRule.setDarkContent {
             SixBridgeManagerApp(
                 viewModel = viewModel,
                 onAddSix = {},
@@ -462,7 +487,7 @@ class ManagerAppTest {
             repository,
             cleanupNullSessionInstallSavedState(),
         )
-        composeRule.setContent {
+        composeRule.setDarkContent {
             SixBridgeManagerApp(
                 viewModel = viewModel,
                 onAddSix = {},
@@ -506,7 +531,7 @@ class ManagerAppTest {
         )
         val savedState = cleanupRestoreSavedState()
         val viewModel = ManagerViewModel(repository, savedState)
-        composeRule.setContent {
+        composeRule.setDarkContent {
             SixBridgeManagerApp(
                 viewModel = viewModel,
                 onAddSix = {},
@@ -556,7 +581,7 @@ class ManagerAppTest {
             restoredConversion = null,
         )
         val viewModel = ManagerViewModel(repository, cleanupRestoreSavedState())
-        composeRule.setContent {
+        composeRule.setDarkContent {
             SixBridgeManagerApp(
                 viewModel = viewModel,
                 onAddSix = {},
@@ -590,7 +615,7 @@ class ManagerAppTest {
     fun generated_review_null_failure_has_no_retry_button_and_keeps_save_share() {
         val initial = conversionResultState()
         val ready = initial.conversionState as ConversionUiState.ResultReady
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = initial.copy(
                     conversionState = ready.copy(
@@ -615,7 +640,7 @@ class ManagerAppTest {
     fun conversion_build_back_dispatches_cancel() {
         val actions = mutableListOf<ManagerAction>()
         val ready = conversionAnalysisState().conversionState as ConversionUiState.AnalysisReady
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     route = ManagerRoute.ConversionAnalysis(TOKEN),
@@ -658,7 +683,7 @@ class ManagerAppTest {
         var installState by mutableStateOf<dev.sixbridge.manager.install.InstallState>(
             dev.sixbridge.manager.install.InstallState.Idle,
         )
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = conversionResultState().copy(installState = installState),
                 onAction = {},
@@ -781,7 +806,7 @@ class ManagerAppTest {
 
     @Test
     fun review_exposes_required_report_sections() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = reviewState(ContractCompatibilityStatus.COMPATIBLE),
                 onAction = {},
@@ -805,7 +830,7 @@ class ManagerAppTest {
     @Test
     fun awaiting_manual_install_review_shows_file_manager_handoff_actions_only() {
         val actionNames = mutableListOf<String>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = reviewState(ContractCompatibilityStatus.COMPATIBLE).copy(
                     installState = InstallState.AwaitingManualInstall(TOKEN),
@@ -842,7 +867,7 @@ class ManagerAppTest {
     @Test
     fun awaiting_manual_install_conversion_result_shows_file_manager_handoff_actions_only() {
         val actionNames = mutableListOf<String>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = conversionResultState().copy(
                     installState = InstallState.AwaitingManualInstall(TOKEN),
@@ -865,6 +890,8 @@ class ManagerAppTest {
         composeRule.onNodeWithText("파일 앱 열기").assertExists()
         composeRule.onNodeWithText("삼성 내 파일", substring = true).assertDoesNotExist()
         composeRule.onNodeWithTag("manual-install:open-file-manager").performClick()
+        composeRule.onNodeWithTag("conversion:result-screen")
+            .performScrollToNode(hasTestTag("manual-install:check-status"))
         composeRule.onNodeWithTag("manual-install:check-status").performClick()
 
         assertEquals(
@@ -877,7 +904,7 @@ class ManagerAppTest {
     @Test
     fun blocked_and_unknown_reviews_cannot_be_installed() {
         var state by mutableStateOf(reviewState(ContractCompatibilityStatus.BLOCKED))
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = {},
@@ -898,7 +925,7 @@ class ManagerAppTest {
     @Test
     fun partial_review_requires_explicit_confirmation_before_install() {
         var state by mutableStateOf(reviewState(ContractCompatibilityStatus.PARTIAL))
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = { action ->
@@ -923,7 +950,7 @@ class ManagerAppTest {
 
     @Test
     fun report_route_displays_the_installed_extension_report() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     route = ManagerRoute.Report(PACKAGE),
@@ -953,7 +980,7 @@ class ManagerAppTest {
 
     @Test
     fun report_route_displays_unverified_file_app_support_warning() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     route = ManagerRoute.Report(PACKAGE),
@@ -976,7 +1003,7 @@ class ManagerAppTest {
     fun `destination presented ACK는 report 한 frame 뒤 exact token을 한 번 전달한다`() {
         val actions = mutableListOf<ManagerAction>()
         composeRule.mainClock.autoAdvance = false
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     route = ManagerRoute.Report(PACKAGE),
@@ -1009,7 +1036,7 @@ class ManagerAppTest {
             ),
         )
         composeRule.mainClock.autoAdvance = false
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = actions::add,
@@ -1054,7 +1081,7 @@ class ManagerAppTest {
                 reportAvailability = ReportAvailability.MISSING,
             ),
         )
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     route = ManagerRoute.Report(item.packageName),
@@ -1082,7 +1109,7 @@ class ManagerAppTest {
     @Test
     fun retry_card_dispatches_only_view_model_owned_retry_action() {
         val actions = mutableListOf<ManagerAction>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     message = UserMessage(
@@ -1105,7 +1132,7 @@ class ManagerAppTest {
     fun review_and_report_back_dispatch_route_owned_actions() {
         var state by mutableStateOf(reviewState(ContractCompatibilityStatus.COMPATIBLE))
         val actions = mutableListOf<ManagerAction>()
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = state,
                 onAction = actions::add,
@@ -1130,7 +1157,7 @@ class ManagerAppTest {
 
     @Test
     fun narrow_review_can_scroll_to_install_action() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = reviewState(ContractCompatibilityStatus.COMPATIBLE),
                 onAction = {},
@@ -1146,7 +1173,7 @@ class ManagerAppTest {
 
     @Test
     fun review_shows_verified_apk_provenance_and_security_limits() {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = reviewState(ContractCompatibilityStatus.COMPATIBLE),
                 onAction = {},
@@ -1239,7 +1266,7 @@ class ManagerAppTest {
         val actions = mutableListOf<ManagerAction>()
         val initial = conversionResultState()
         val ready = initial.conversionState as ConversionUiState.ResultReady
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = initial.copy(
                     conversionState = ready.copy(installOwnerActive = true),
@@ -1337,7 +1364,7 @@ class ManagerAppTest {
         iconPng: ByteArray?,
         name: String = "테스트 확장",
     ) {
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     installed = listOf(installedItem(iconPng = iconPng, name = name)),
@@ -1350,7 +1377,7 @@ class ManagerAppTest {
 
     private fun setRecomposingHome(iconPng: ByteArray): MutableState<Int> {
         val revision = mutableStateOf(0)
-        composeRule.setContent {
+        composeRule.setDarkContent {
             ManagerAppContent(
                 state = ManagerUiState(
                     installed = listOf(installedItem(iconPng = iconPng)),
@@ -1429,6 +1456,27 @@ class ManagerAppTest {
             "97bd5a88552319b46e3d5ed350451b18a7558170aa11d7947452c62365c75403"
         const val SIGNER_SHA256 =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+}
+
+private val AdbTestDarkColors = darkColorScheme(
+    background = ComposeColor.Black,
+    surface = ComposeColor(0xFF121212),
+    surfaceVariant = ComposeColor(0xFF1E1E1E),
+)
+
+private fun ComposeContentTestRule.setDarkContent(
+    content: @Composable () -> Unit,
+) {
+    setContent {
+        MaterialTheme(colorScheme = AdbTestDarkColors) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = MaterialTheme.colorScheme.background,
+            ) {
+                content()
+            }
+        }
     }
 }
 
