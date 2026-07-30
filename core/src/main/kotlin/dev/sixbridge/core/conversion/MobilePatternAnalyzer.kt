@@ -1,12 +1,14 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import dev.sixbridge.core.compat.RuntimeResourceIndex
 import dev.sixbridge.core.compat.StableExtensionAnalysis
+import dev.sixbridge.core.input.SourceProjectIdentityStore
 import dev.sixbridge.core.profile.BrowserProfile
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -19,15 +21,21 @@ import java.nio.file.Path
 import kotlin.io.path.readText
 import kotlin.jvm.JvmSynthetic
 
+internal data class MobileArchiveAnalysis(
+    val report: CompatibilityReport,
+    val sourceProjectIdentity: String?,
+)
+
 class MobilePatternAnalyzer(
-    private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(),
+    private val control: AnalysisControl = AnalysisControl(),
+    private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(control),
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
     fun analyze(
         extensionRoot: Path,
         profile: BrowserProfile,
     ): CompatibilityReport {
-        return StableExtensionAnalysis.captureLive(extensionRoot).use { stable ->
+        return StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
             val report = analyzeStable(
                 stable.root,
                 profile,
@@ -42,12 +50,22 @@ class MobilePatternAnalyzer(
     internal fun analyzeArchive(
         sourceArchive: ByteArray,
         profile: BrowserProfile,
-    ): CompatibilityReport {
-        return StableExtensionAnalysis.fromArchive(sourceArchive).use { stable ->
-            analyzeStable(
-                stable.root,
-                profile,
-                stable.sourceSha256,
+    ): CompatibilityReport = analyzeArchiveWithIdentity(sourceArchive, profile).report
+
+    @JvmSynthetic
+    internal fun analyzeArchiveWithIdentity(
+        sourceArchive: ByteArray,
+        profile: BrowserProfile,
+    ): MobileArchiveAnalysis {
+        return StableExtensionAnalysis.fromArchive(sourceArchive, control).use { stable ->
+            val report = analyzeStable(stable.root, profile, stable.sourceSha256)
+            control.checkCancelled()
+            MobileArchiveAnalysis(
+                report = report,
+                sourceProjectIdentity = SourceProjectIdentityStore.readSourceMarker(
+                    stable.root,
+                    requireOwnerOnly = false,
+                ),
             )
         }
     }
@@ -57,11 +75,13 @@ class MobilePatternAnalyzer(
         profile: BrowserProfile,
         sourceSha256: String?,
     ): CompatibilityReport {
+        control.checkCancelled()
         val compatibility = compatibilityAnalyzer.analyzeStable(
             extensionRoot,
             profile,
             sourceSha256,
         )
+        control.checkCancelled()
         val manifestPath = extensionRoot.resolve("manifest.json")
         val manifest = runCatching {
             json.parseToJsonElement(manifestPath.readText()) as? JsonObject
@@ -81,7 +101,9 @@ class MobilePatternAnalyzer(
             return compatibility
         }
         manifest ?: return compatibility
-        val index = RuntimeResourceIndex.create(extensionRoot, manifest)
+        control.checkCancelled()
+        val index = RuntimeResourceIndex.create(extensionRoot, manifest, control)
+        control.checkCancelled()
         if (index.unresolvedDependency) {
             return compatibility
         }
@@ -89,8 +111,11 @@ class MobilePatternAnalyzer(
         val decisions = mutableListOf<AdapterDecision>()
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
+        control.checkCancelled()
         popupDecision(manifestPath, manifest, profile)?.let(decisions::add)
+        control.checkCancelled()
         val storage = storageDecision(extensionRoot, manifest, index, profile)
+        control.checkCancelled()
         storage.decision?.let(decisions::add)
         if (storage.unknown) {
             issues += CompatibilityIssue(

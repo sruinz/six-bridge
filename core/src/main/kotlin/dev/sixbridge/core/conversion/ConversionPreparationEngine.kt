@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -49,11 +50,16 @@ class PreparedConversion internal constructor(
         get() = stablePassthroughCrx?.copyOf()
 }
 
+data class AnalyzedConversion(
+    val report: CompatibilityReport,
+    val logicalSourceIdentity: LogicalSourceIdentityResult,
+)
+
 class ConversionPreparationEngine private constructor(
-    compatibilityAnalyzer: CompatibilityAnalyzer,
+    private val compatibilityAnalyzer: CompatibilityAnalyzer,
 ) : AutoCloseable {
     private val workspace = ConversionWorkspace()
-    private val analyzer = MobilePatternAnalyzer(compatibilityAnalyzer)
+    private val analyzer = MobilePatternAnalyzer(compatibilityAnalyzer = compatibilityAnalyzer)
     private val planner = ConversionPlanner()
 
     constructor() : this(CompatibilityAnalyzer())
@@ -61,10 +67,27 @@ class ConversionPreparationEngine private constructor(
     fun analyze(
         input: PortableExtensionInput,
         profile: BrowserProfile,
-    ): CompatibilityReport {
-        val report = analyzer.analyzeArchive(input.canonicalOriginalZip, profile)
-        requireCrxManifestBinding(input, report)
-        return report
+    ): CompatibilityReport = analyzeWithIdentity(input, profile).report
+
+    fun analyzeWithIdentity(
+        input: PortableExtensionInput,
+        profile: BrowserProfile,
+        control: AnalysisControl = AnalysisControl(),
+    ): AnalyzedConversion {
+        val analyzed = MobilePatternAnalyzer(
+            control = control,
+            compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
+        )
+            .analyzeArchiveWithIdentity(input.canonicalOriginalZip, profile)
+        requireCrxManifestBinding(input, analyzed.report)
+        return AnalyzedConversion(
+            report = analyzed.report,
+            logicalSourceIdentity = logicalSourceIdentity(
+                input,
+                analyzed.sourceProjectIdentity,
+                analyzed.report,
+            ),
+        )
     }
 
     fun prepare(

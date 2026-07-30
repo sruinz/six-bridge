@@ -1,6 +1,8 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
@@ -13,10 +15,12 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
 import java.util.Base64
+import java.util.concurrent.CancellationException
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -33,6 +37,20 @@ class MobilePatternAnalyzerTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
+
+    @Test
+    fun `모바일 패턴 분석은 취소를 전달한다`() {
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            throw CancellationException("cancel")
+        }
+
+        assertFailsWith<CancellationException> {
+            MobilePatternAnalyzer(control = control).analyze(
+                extension(contentFile = "content.js", contentSource = "console.log('x');"),
+                profile,
+            )
+        }
+    }
 
     @Test
     fun `AI recipe pattern은 storage 세부 증거가 없으면 passthrough다`() {

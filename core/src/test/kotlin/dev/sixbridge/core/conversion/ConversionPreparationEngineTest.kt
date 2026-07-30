@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
@@ -168,6 +169,45 @@ class ConversionPreparationEngineTest {
                 manifest.logicalSourceIdentity,
             ).value,
         )
+    }
+
+    @Test
+    fun `분석 전용 결과는 prepare 없이 동일한 논리 원본 신원을 반환한다`() {
+        val packed = packedCrx()
+        val storeInput = PortableExtensionInput.fromCrx(
+            ExtensionInputKind.CHROME_WEB_STORE,
+            packed.bytes,
+            packed.extensionId,
+        )
+        val marker = "0123456789abcdef0123456789abcdef"
+        val projectInput = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            plainFixtureZip(projectMarker = marker, manifestKey = keyPair().public.encoded),
+        )
+        val publicKey = keyPair().public.encoded
+        val manifestInput = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            plainFixtureZip(manifestKey = publicKey),
+        )
+
+        ConversionPreparationEngine().use { engine ->
+            val store = engine.analyzeWithIdentity(storeInput, profile(), AnalysisControl())
+            val project = engine.analyzeWithIdentity(projectInput, profile(), AnalysisControl())
+            val manifest = engine.analyzeWithIdentity(manifestInput, profile(), AnalysisControl())
+
+            assertEquals(
+                "store:${packed.extensionId}",
+                assertIs<LogicalSourceIdentityResult.Stable>(store.logicalSourceIdentity).value,
+            )
+            assertEquals(
+                "project:$marker",
+                assertIs<LogicalSourceIdentityResult.Stable>(project.logicalSourceIdentity).value,
+            )
+            assertEquals(
+                "manifest:${Crx3.extensionId(publicKey)}",
+                assertIs<LogicalSourceIdentityResult.Stable>(manifest.logicalSourceIdentity).value,
+            )
+        }
     }
 
     @Test

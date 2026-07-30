@@ -22,8 +22,12 @@ class CompatibilityAnalyzer(
     private val control: AnalysisControl = AnalysisControl(),
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
+    @JvmSynthetic
+    internal fun withControl(control: AnalysisControl): CompatibilityAnalyzer =
+        CompatibilityAnalyzer(control, json)
+
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
-        return StableExtensionAnalysis.captureLive(extensionRoot).use { stable ->
+        return StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
             val report = analyzeStable(
                 stable.root,
                 profile,
@@ -240,7 +244,7 @@ class CompatibilityAnalyzer(
 
     private fun scanApiCalls(root: Path, manifest: JsonObject): ApiScan {
         val found = mutableSetOf<String>()
-        val runtimeClosure = RuntimeResourceIndex.create(root, manifest)
+        val runtimeClosure = RuntimeResourceIndex.create(root, manifest, control)
         var dynamicUsage = runtimeClosure.unresolvedDependency
         Files.walk(root).use { paths ->
             paths.filter { path ->
@@ -249,9 +253,11 @@ class CompatibilityAnalyzer(
                     (
                         ".test." !in path.fileName.toString().lowercase() ||
                             path.toAbsolutePath().normalize() in runtimeClosure.resources
-                        )
+                    )
             }.forEach { path ->
+                control.checkCancelled()
                 val source = runCatching { path.readText() }.getOrDefault("")
+                control.checkCancelled()
                 val apiSource = if (path.extension.lowercase() == "html") {
                     RuntimeSourceScanner.scanHtmlScripts(source).inlineSource
                 } else {
@@ -261,10 +267,12 @@ class CompatibilityAnalyzer(
                     apiSource,
                     maskLiterals = false,
                 )
+                control.checkCancelled()
                 val codeOnly = JavaScriptLexicalMask.mask(
                     apiSource,
                     maskLiterals = true,
                 )
+                control.checkCancelled()
                 val aliases = mutableSetOf<String>()
                 val consumedRoots = mutableSetOf<Int>()
                 ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments)
@@ -301,6 +309,7 @@ class CompatibilityAnalyzer(
                         dynamicUsage = true
                     }
                 }
+                control.checkCancelled()
                 API_CALL_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
                     .forEach { match ->
@@ -308,6 +317,7 @@ class CompatibilityAnalyzer(
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
+                control.checkCancelled()
                 BRACKET_API_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
                     .forEach { match ->
@@ -315,6 +325,7 @@ class CompatibilityAnalyzer(
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
+                control.checkCancelled()
                 DESTRUCTURING_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
                     .forEach { match ->
@@ -328,38 +339,46 @@ class CompatibilityAnalyzer(
                         if (API_NAME.matches(namespace)) found += namespace
                     }
                 }
+                control.checkCancelled()
                 aliases.forEach { alias ->
+                    control.checkCancelled()
                     aliasMemberRegex(alias).findAll(sourceWithoutComments)
                         .filter { it.startsInCode(codeOnly) }
                         .forEach { match ->
                         found += match.groupValues[1]
                     }
+                    control.checkCancelled()
                     aliasBracketRegex(alias).findAll(sourceWithoutComments)
                         .filter { it.startsInCode(codeOnly) }
                         .forEach { match ->
                         found += match.groupValues[1]
                     }
+                    control.checkCancelled()
                     if (aliasDynamicBracketRegex(alias).findAll(sourceWithoutComments)
                             .any { it.startsInCode(codeOnly) }
                     ) {
                         dynamicUsage = true
                     }
                 }
+                control.checkCancelled()
                 if (DYNAMIC_BRACKET_REGEX.findAll(sourceWithoutComments)
                         .any { it.startsInCode(codeOnly) }
                 ) {
                     dynamicUsage = true
                 }
+                control.checkCancelled()
                 ROOT_SCHEME_LITERAL_REGEX.findAll(codeOnly).forEach { match ->
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
+                control.checkCancelled()
                 if (ROOT_TOKEN.findAll(codeOnly).any {
                         it.range.first !in consumedRoots
                     }
                 ) {
                     dynamicUsage = true
                 }
+                control.checkCancelled()
                 if (NATIVE_MESSAGING_REGEX.findAll(sourceWithoutComments)
                         .any { it.startsInCode(codeOnly) }
                 ) {

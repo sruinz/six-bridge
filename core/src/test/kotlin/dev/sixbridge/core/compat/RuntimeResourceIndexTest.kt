@@ -4,9 +4,11 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CancellationException
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -92,6 +94,25 @@ class RuntimeResourceIndexTest {
         )
 
         assertTrue(index.unresolvedDependency)
+    }
+
+    @Test
+    fun `runtime dependency 순회는 파일 사이 취소를 전달한다`() {
+        val root = workerExtension("""importScripts("./b.js");""")
+        root.resolve("b.js").writeText("console.log('b');")
+        var checkpoints = 0
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
+            checkpoints += 1
+            if (checkpoints == 3) throw CancellationException("cancel")
+        }
+
+        assertFailsWith<CancellationException> {
+            RuntimeResourceIndex.create(
+                root,
+                manifest("""{"service_worker":"background.js"}"""),
+                control,
+            )
+        }
     }
 
     private fun workerExtension(source: String): Path =

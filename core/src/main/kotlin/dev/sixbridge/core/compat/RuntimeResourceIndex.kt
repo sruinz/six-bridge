@@ -39,17 +39,25 @@ class RuntimeResourceIndex private constructor(
 
     companion object {
         fun create(root: Path, manifest: JsonObject): RuntimeResourceIndex =
-            create(root, manifest, Files::readString)
+            create(root, manifest, AnalysisControl())
+
+        fun create(
+            root: Path,
+            manifest: JsonObject,
+            control: AnalysisControl,
+        ): RuntimeResourceIndex = create(root, manifest, control, Files::readString)
 
         internal fun createForTesting(
             root: Path,
             manifest: JsonObject,
             readSource: (Path) -> String,
-        ): RuntimeResourceIndex = create(root, manifest, readSource)
+            control: AnalysisControl = AnalysisControl(),
+        ): RuntimeResourceIndex = create(root, manifest, control, readSource)
 
         private fun create(
             root: Path,
             manifest: JsonObject,
+            control: AnalysisControl,
             readSource: (Path) -> String,
         ): RuntimeResourceIndex {
             val normalizedRoot = root.toAbsolutePath().normalize()
@@ -147,8 +155,10 @@ class RuntimeResourceIndex private constructor(
                 }
 
             while (pendingIndex < pending.size) {
+                control.checkCancelled()
                 val resource = pending[pendingIndex++]
                 val roles = rolesByResource.getValue(resource).toSet()
+                control.checkCancelled()
                 val source = runCatching { readSource(resource) }
                     .getOrElse {
                         unresolvedDependency = true
@@ -187,6 +197,7 @@ class RuntimeResourceIndex private constructor(
                         false,
                     )
                 }
+                control.checkCancelled()
                 if (dependencyScan.unresolvedDependency) unresolvedDependency = true
                 dependencyScan.dependencies.forEach {
                     val dependency = enqueue(

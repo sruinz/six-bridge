@@ -14,6 +14,7 @@ internal class StableExtensionAnalysis private constructor(
     @get:JvmSynthetic val sourceSha256: String,
     private val temporaryRoot: OwnedTempDirectory,
     private val liveSource: Path?,
+    private val control: AnalysisControl,
 ) : AutoCloseable {
     @JvmSynthetic
     fun verifyLiveSource() {
@@ -28,12 +29,22 @@ internal class StableExtensionAnalysis private constructor(
     }
 
     override fun close() {
-        cleanupStableOwner(temporaryRoot)?.let { throw it }
+        val cancellation = runCatching(control::checkCancelled).exceptionOrNull()
+        val cleanupFailure = cleanupStableOwner(temporaryRoot)
+        if (cancellation != null) {
+            cleanupFailure?.let(cancellation::addSuppressed)
+            throw cancellation
+        }
+        cleanupFailure?.let { throw it }
     }
 
     companion object {
         @JvmSynthetic
-        fun captureLive(source: Path): StableExtensionAnalysis {
+        fun captureLive(
+            source: Path,
+            control: AnalysisControl = AnalysisControl(),
+        ): StableExtensionAnalysis {
+            control.checkCancelled()
             val sourceRoot = source.toAbsolutePath().normalize()
             val temporary = OwnedTempTree.create(
                 "sixbridge-analysis-",
@@ -51,12 +62,14 @@ internal class StableExtensionAnalysis private constructor(
                     archive,
                     canonical.rootPath,
                 )
+                control.checkCancelled()
                 StableExtensionAnalysis(
                     root = stableRoot,
                     sourceArchive = archive,
                     sourceSha256 = sha256(archive),
                     temporaryRoot = temporary,
                     liveSource = sourceRoot,
+                    control = control,
                 )
             } catch (error: Throwable) {
                 cleanupFailure(temporary, error)
@@ -65,7 +78,11 @@ internal class StableExtensionAnalysis private constructor(
         }
 
         @JvmSynthetic
-        fun fromArchive(bytes: ByteArray): StableExtensionAnalysis {
+        fun fromArchive(
+            bytes: ByteArray,
+            control: AnalysisControl = AnalysisControl(),
+        ): StableExtensionAnalysis {
+            control.checkCancelled()
             val temporary = OwnedTempTree.create(
                 "sixbridge-analysis-",
             )
@@ -79,12 +96,14 @@ internal class StableExtensionAnalysis private constructor(
                     archive,
                     canonical.rootPath,
                 )
+                control.checkCancelled()
                 StableExtensionAnalysis(
                     root = stableRoot,
                     sourceArchive = archive,
                     sourceSha256 = sha256(archive),
                     temporaryRoot = temporary,
                     liveSource = null,
+                    control = control,
                 )
             } catch (error: Throwable) {
                 cleanupFailure(temporary, error)
