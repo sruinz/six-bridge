@@ -34,6 +34,10 @@ Shizuku, 무인 설치, 설치 출처 extra 또는 APK URI 전달을 사용하�
 
 - `파일 앱 열기`가 chooser나 서드파티 파일 앱이 아니라 Google
   DocumentsUI의 다운로드 화면을 연다.
+- top task의 launch origin이 manager이고 Intent action·category가 각각
+  `android.intent.action.VIEW_DOWNLOADS`,
+  `android.intent.category.DEFAULT`이며 component package가 Google
+  DocumentsUI다.
 - 설치본의 installer와 initiating package가 모두
   `com.google.android.packageinstaller`다.
 - originating package가 `null`이고 `packageSource=3`이다.
@@ -100,17 +104,55 @@ SHA-256이 실행 기록에 남아야 합격이다. instrumentation XML·exit co
 5. 열린 화면이 방금 저장한 APK가 보이는 Google DocumentsUI 다운로드
    화면인지 확인한다.
 
-화면 package는 host에서 다음 명령으로 교차 확인한다.
+`파일 앱 열기`를 누른 직후 화면을 켠 상태에서 다음 읽기 전용 명령을
+실행한다. `dumpsys activity activities`의 display 0은 task를 위에서 아래
+순서로 출력하므로 `awk`는 첫 번째 top task block만 남긴다.
 
 ```bash
 adb -s "$SERIAL" shell dumpsys activity activities |
-  rg 'topResumedActivity|mResumedActivity|com.google.android.documentsui'
+  awk '
+    /Display #0 \(activities from top to bottom\):/ {
+      inDisplay = 1
+      next
+    }
+    inDisplay && /^  \* Task/ {
+      if (seenTask) exit
+      seenTask = 1
+    }
+    inDisplay && seenTask {
+      print
+    }
+  ' |
+  rg 'Task\{|launchedFromPackage=|Intent \{|state='
 ```
 
-현재 resumed Activity package에 `com.google.android.documentsui`가 포함되고,
-화면에도 다운로드 목록이 보이면 합격이다. chooser, Solid Explorer 등
-서드파티 파일 앱, `dev.sixbridge.manager` 또는 Samsung Internet이 열리면
-불합격이다.
+Fold7 Android 16에서는 다음 필드 형식으로 출력된다. class 이름은 OS
+업데이트에 따라 달라질 수 있으므로 package를 판정한다.
+
+```text
+* Task{... I=com.google.android.documentsui/... visible=true ...}
+launchedFromUid=... launchedFromPackage=dev.sixbridge.manager ...
+Intent { act=android.intent.action.VIEW_DOWNLOADS cat=[android.intent.category.DEFAULT] ... cmp=com.google.android.documentsui/... }
+state=RESUMED ...
+```
+
+top task 하나에서 다음 조건을 모두 만족하고 화면에도 다운로드 목록이 보이면
+합격이다.
+
+- `visible=true`이고 Activity `state=RESUMED`다.
+- `launchedFromPackage=dev.sixbridge.manager`다.
+- `Intent`에 `act=android.intent.action.VIEW_DOWNLOADS`가 있다.
+- 같은 `Intent`에
+  `cat=[android.intent.category.DEFAULT]`가 있다.
+- 같은 `Intent`의 `cmp=` package가
+  `com.google.android.documentsui`다.
+
+`adb shell am start -n`으로 DocumentsUI component를 직접 지정해 같은 화면을
+만드는 것은 이 게이트를 대체하지 않는다. 이 경우 Fold7 출력의
+`launchedFromPackage`는 `com.android.shell`이므로 불합격이다. 과거에 남은
+STOPPED task나 top task가 아닌 DocumentsUI task, action·category가 없는
+launch, chooser, Solid Explorer 등 서드파티 파일 앱,
+`dev.sixbridge.manager` 화면 또는 Samsung Internet 화면도 불합격이다.
 
 ## 3. 사용자 승인 설치와 manager 판정
 
@@ -185,23 +227,33 @@ shasum -a 256 \
 
 ## 6. Samsung Internet `dev_ext` 판정
 
-설치 출처와 바이트 신원 확인 뒤 다음 명령을 실행한다.
+설치 출처와 바이트 신원 확인 뒤 다음 명령을 실행한다. 기존 logcat을 지우지
+않고 기기 시각을 경계로 기록한 뒤 그 시각 이후의 로그만 읽는다.
 
 ```bash
-adb -s "$SERIAL" logcat -c
+LOG_START="$(
+  adb -s "$SERIAL" shell "date '+%m-%d %H:%M:%S.%3N'" |
+    tr -d '\r'
+)"
+printf 'LOG_START=%s\n' "$LOG_START"
+
 adb -s "$SERIAL" shell am force-stop com.sec.android.app.sbrowser
-adb -s "$SERIAL" shell am start \
+adb -s "$SERIAL" shell am start -W \
   -a android.intent.action.VIEW \
   -d 'internet://extension/' \
   -p com.sec.android.app.sbrowser
-adb -s "$SERIAL" logcat -d -v threadtime |
-  rg 'SixAppDataUpdater|SixPkgUpdater|dev_ext'
+adb -s "$SERIAL" logcat -d -T "$LOG_START" -v threadtime |
+  rg "SixAppDataUpdater|SixPkgUpdater|$PACKAGE|dev_ext"
+
+adb -s "$SERIAL" logcat -d -T "$LOG_START" -v threadtime |
+  rg "$PACKAGE.*dev_ext"
 ```
 
-대상 `$PACKAGE`가 포함된 행에 `dev_ext`와 설치 상태가 기록되어야 합격이다.
-다른 확장의 `dev_ext` 로그로 대신 판정하지 않는다. 대상 행의 type이
-`3rd_party`이거나 `Allowed to be supported`에 해당하는 로그를 확인할 수
-없으면 불합격이다.
+`LOG_START`가 비어 있지 않고 마지막 명령이 대상 `$PACKAGE`와 `dev_ext`를
+같은 행에서 찾아야 합격이다. 다른 확장의 `dev_ext` 로그로 대신 판정하지
+않는다. 대상 행의 type이 `3rd_party`이거나 시각 경계 뒤 대상 행이 없으면
+불합격이다. `logcat -c`는 기존 진단 증거를 삭제하므로 이 게이트에서 실행하지
+않는다.
 
 ## 7. Add-ons와 실제 기능 수동 확인
 
@@ -271,6 +323,10 @@ DocumentsUI 실행, 사용자 승인, Add-ons 활성화·기능·재시작 유�
 - Add-ons의 `작동 안 함`, `지원 안 함` 또는 지원 불가 표시
 - 기준 APK와 다른 SHA-256 또는 signer SHA-256
 - chooser나 임의 파일 앱을 기본 설치 경로로 노출
+- top task의 `VIEW_DOWNLOADS`·`DEFAULT`·DocumentsUI component 또는
+  `launchedFromPackage=dev.sixbridge.manager` 증거 부재
+- `adb shell am start -n`으로 DocumentsUI 화면을 직접 만든 결과를 manager
+  launch 증거로 사용
 - APK URI, `ClipData`, URI grant 또는 originating package extra를 manager
   handoff에 포함
 - 사용자 승인 없이 ADB, root, Shizuku 또는 무인 설치로 wrapper를 설치
