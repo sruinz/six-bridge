@@ -183,10 +183,10 @@ internal fun ManualInstallHandoff(
         )
     }
     Button(
-        onClick = { onAction(ManagerAction.OpenSamsungMyFiles) },
-        modifier = Modifier.fillMaxWidth().testTag("manual-install:open-my-files"),
+        onClick = { onAction(ManagerAction.OpenFileManager) },
+        modifier = Modifier.fillMaxWidth().testTag("manual-install:open-file-manager"),
     ) {
-        Text(text = stringResource(R.string.manual_install_open_my_files))
+        Text(text = stringResource(R.string.manual_install_open_file_manager))
     }
     OutlinedButton(
         onClick = { onAction(ManagerAction.ConfirmManualInstallStatus) },

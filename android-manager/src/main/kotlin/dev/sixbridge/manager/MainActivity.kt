@@ -19,7 +19,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.core.content.FileProvider
 import dev.sixbridge.manager.app.ManagerDependencies
 import dev.sixbridge.manager.install.ManagerAppVisibility
-import dev.sixbridge.manager.navigation.AndroidSamsungMyFilesNavigator
+import dev.sixbridge.manager.navigation.AndroidFileManagerNavigator
 import dev.sixbridge.manager.ui.ManagerAction
 import dev.sixbridge.manager.ui.ManagerEffect
 import dev.sixbridge.manager.ui.ManagerViewModel
@@ -174,8 +174,10 @@ class MainActivity : ComponentActivity() {
                                 copy = copy,
                             )
                         },
-                        samsungMyFilesNavigator =
-                            AndroidSamsungMyFilesNavigator(packageManager),
+                        fileManagerNavigator = AndroidFileManagerNavigator(
+                            packageManager,
+                            getString(R.string.file_manager_chooser_title),
+                        ),
                     )
                 }
             },

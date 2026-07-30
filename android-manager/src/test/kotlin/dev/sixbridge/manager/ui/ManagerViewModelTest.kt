@@ -36,7 +36,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
-import dev.sixbridge.manager.navigation.SamsungMyFilesNavigator
+import dev.sixbridge.manager.navigation.FileManagerNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -1566,6 +1566,11 @@ class ManagerViewModelTest {
 
                 if (terminal is InstallState.Installed) {
                     assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+                    assertEquals(
+                        "설치됨 · 삼성 인터넷 지원 미확인\n" +
+                            "삼성 인터넷 Add-ons에서 확장이 표시되고 활성화되는지 확인해 주세요.",
+                        viewModel.state.value.message?.text,
+                    )
                 } else {
                     assertEquals(expectedMessage, viewModel.state.value.message?.kind)
                 }
@@ -1584,7 +1589,7 @@ class ManagerViewModelTest {
             val scenarios = listOf(
                 "UNSUPPORTED_INSTALL_SOURCE" to
                     "확장 APK는 설치됐지만 삼성 인터넷이 허용하는 설치 출처가 아닙니다.\n" +
-                    "저장한 APK를 삼성 내 파일에서 직접 열어 다시 설치해 주세요.",
+                    "저장한 APK를 파일 앱에서 직접 열어 다시 설치해 주세요.",
                 "INSTALL_SOURCE_UNKNOWN" to "설치 출처를 확인하지 못했습니다.",
             )
             scenarios.forEach { (code, expectedText) ->
@@ -1737,46 +1742,46 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `삼성 내 파일 열기는 전용 launcher만 현재 세대 effect로 발행한다`() =
+    fun `파일 앱 열기는 표준 chooser를 현재 세대 effect로 발행한다`() =
         runTest(dispatcher.scheduler) {
             val launcher = Intent()
             val viewModel = ManagerViewModel(
                 FakeManagerRepository(),
                 SavedStateHandle(),
-                samsungMyFilesNavigator = object : SamsungMyFilesNavigator {
+                fileManagerNavigator = object : FileManagerNavigator {
                     override fun launcherIntent(): Intent = launcher
                 },
             )
             advanceUntilIdle()
 
-            viewModel.accept(ManagerAction.OpenSamsungMyFiles)
+            viewModel.accept(ManagerAction.OpenFileManager)
             val effect = assertIs<ManagerEffect.LaunchIntent>(viewModel.effects.first())
 
-            assertEquals(LaunchDestination.SAMSUNG_MY_FILES, effect.destination)
+            assertEquals(LaunchDestination.FILE_MANAGER, effect.destination)
             assertTrue(launcher === effect.intentFactory())
             assertNull(viewModel.state.value.message)
         }
 
     @Test
-    fun `삼성 내 파일이 없으면 다른 관리자를 열지 않고 지정 메시지만 표시한다`() =
+    fun `파일 앱 resolver가 없으면 chooser를 열지 않고 지정 메시지만 표시한다`() =
         runTest(dispatcher.scheduler) {
             val viewModel = ManagerViewModel(
                 FakeManagerRepository(),
                 SavedStateHandle(),
-                samsungMyFilesNavigator = object : SamsungMyFilesNavigator {
+                fileManagerNavigator = object : FileManagerNavigator {
                     override fun launcherIntent(): Intent? = null
                 },
             )
             advanceUntilIdle()
 
-            viewModel.accept(ManagerAction.OpenSamsungMyFiles)
+            viewModel.accept(ManagerAction.OpenFileManager)
 
             assertEquals(
-                UserMessageKind.SAMSUNG_MY_FILES_MISSING,
+                UserMessageKind.FILE_MANAGER_MISSING,
                 viewModel.state.value.message?.kind,
             )
             assertEquals(
-                "삼성 내 파일 앱을 찾을 수 없습니다.",
+                "파일 앱을 찾을 수 없습니다.",
                 viewModel.state.value.message?.text,
             )
             assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
@@ -2922,7 +2927,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
-            assertNull(viewModel.state.value.message)
+            assertEquals(
+                UserMessageKind.INSTALL_SUPPORT_UNVERIFIED,
+                viewModel.state.value.message?.kind,
+            )
         }
 
     @Test

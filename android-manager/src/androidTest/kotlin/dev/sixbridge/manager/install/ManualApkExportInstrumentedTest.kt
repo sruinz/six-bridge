@@ -20,7 +20,7 @@ import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.BundleOpenRequest
 import dev.sixbridge.manager.importer.BundleSource
 import dev.sixbridge.manager.importer.ImportResult
-import dev.sixbridge.manager.navigation.AndroidSamsungMyFilesNavigator
+import dev.sixbridge.manager.navigation.AndroidFileManagerNavigator
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.manager.wrapper.ArchiveActivity
 import dev.sixbridge.manager.wrapper.ArchiveFacts
@@ -70,7 +70,7 @@ class ManualApkExportInstrumentedTest {
     }
 
     @Test
-    fun bundleImportCopiesExactApkBytesAndMyFilesIntentCarriesNoApkGrant() = runBlocking {
+    fun bundleImportCopiesExactApkBytesAndFileManagerIntentCarriesNoApkGrant() = runBlocking {
         val fixture = createSixFixture()
         val cache = File(context.cacheDir, "manual-apk-import-${UUID.randomUUID()}").apply {
             assertTrue(mkdir())
@@ -107,13 +107,20 @@ class ManualApkExportInstrumentedTest {
                 context.contentResolver.openInputStream(destination)!!.use { it.readBytes() },
             )
 
-            val myFiles = requireNotNull(
-                AndroidSamsungMyFilesNavigator(context.packageManager).launcherIntent(),
+            val fileManager = requireNotNull(
+                AndroidFileManagerNavigator(
+                    context.packageManager,
+                    "파일 앱 선택",
+                ).launcherIntent(),
             )
-            assertNull(myFiles.data)
-            assertNull(myFiles.type)
-            assertNull(myFiles.clipData)
-            assertEquals(0, myFiles.flags and URI_PERMISSION_FLAGS)
+            val target = requireNotNull(
+                fileManager.getParcelableExtra<Intent>(Intent.EXTRA_INTENT),
+            )
+            assertNull(target.data)
+            assertNull(target.type)
+            assertNull(target.clipData)
+            assertEquals(0, target.flags and URI_PERMISSION_FLAGS)
+            assertEquals(0, fileManager.flags and URI_PERMISSION_FLAGS)
         } finally {
             context.contentResolver.delete(destination, null, null)
             cache.deleteRecursively()

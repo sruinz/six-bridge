@@ -249,6 +249,7 @@ class SystemInstallCoordinator(
                     when (classifySamsungInstallSource(actual.installSourceEvidence)) {
                         SamsungInstallSourceVerdict.ALLOWED_ADB,
                         SamsungInstallSourceVerdict.ALLOWED_MY_FILES,
+                        SamsungInstallSourceVerdict.UNVERIFIED_FILE_APP,
                         -> InstallState.Installed(record.expected.packageName)
                         SamsungInstallSourceVerdict.UNSUPPORTED ->
                             InstallState.Failed(

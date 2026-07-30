@@ -167,7 +167,8 @@ enum class UserMessageKind {
     INSTALL_FAILED,
     SAMSUNG_BROWSER_MISSING,
     SAMSUNG_ADD_ONS_UNAVAILABLE,
-    SAMSUNG_MY_FILES_MISSING,
+    FILE_MANAGER_MISSING,
+    INSTALL_SUPPORT_UNVERIFIED,
     UNINSTALL_CANCELLED,
     UNINSTALLED,
     LAUNCH_FAILED,
@@ -272,7 +273,7 @@ sealed interface ManagerAction {
     data class OpenReport(val packageName: String) : ManagerAction
     data object ReturnHome : ManagerAction
     data object OpenSamsungAddOns : ManagerAction
-    data object OpenSamsungMyFiles : ManagerAction
+    data object OpenFileManager : ManagerAction
     data object OpenUnknownSourcesSettings : ManagerAction
     data object ReturnedToForeground : ManagerAction
     data object DismissMessage : ManagerAction
@@ -285,7 +286,7 @@ enum class LaunchDestination {
     UNKNOWN_SOURCES_SETTINGS,
     UNINSTALL,
     SAMSUNG_ADD_ONS,
-    SAMSUNG_MY_FILES,
+    FILE_MANAGER,
 }
 
 sealed interface ManagerEffect {

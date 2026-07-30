@@ -29,7 +29,7 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.InstallTerminalOwnerResult
 import dev.sixbridge.manager.install.NormalHandoffStage
 import dev.sixbridge.manager.install.NormalInstallHandoff
-import dev.sixbridge.manager.navigation.SamsungMyFilesNavigator
+import dev.sixbridge.manager.navigation.FileManagerNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import java.io.File
@@ -80,8 +80,8 @@ class ManagerViewModel(
     private val afterTerminalReceiptFinalized: () -> Unit = {},
     private val afterNormalHandoffPersisted: () -> Unit = {},
     private val afterGeneratedTerminalHandoffCleared: () -> Unit = {},
-    private val samsungMyFilesNavigator: SamsungMyFilesNavigator =
-        object : SamsungMyFilesNavigator {
+    private val fileManagerNavigator: FileManagerNavigator =
+        object : FileManagerNavigator {
             override fun launcherIntent() = null
         },
 ) : ViewModel() {
@@ -280,7 +280,7 @@ class ManagerViewModel(
             is ManagerAction.OpenReport -> openReport(action.packageName)
             ManagerAction.ReturnHome -> mutableState.update { it.copy(route = ManagerRoute.Home) }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
-            ManagerAction.OpenSamsungMyFiles -> openSamsungMyFiles()
+            ManagerAction.OpenFileManager -> openFileManager()
             ManagerAction.OpenUnknownSourcesSettings -> openUnknownSourcesSettings()
             ManagerAction.ReturnedToForeground -> returnedToForeground()
             ManagerAction.DismissMessage -> mutableState.update { it.copy(message = null) }
@@ -1950,14 +1950,14 @@ class ManagerViewModel(
         }
     }
 
-    private fun openSamsungMyFiles() {
-        val intent = samsungMyFilesNavigator.launcherIntent()
+    private fun openFileManager() {
+        val intent = fileManagerNavigator.launcherIntent()
         if (intent == null) {
             mutableState.update {
                 it.copy(
                     message = UserMessage(
-                        UserMessageKind.SAMSUNG_MY_FILES_MISSING,
-                        "삼성 내 파일 앱을 찾을 수 없습니다.",
+                        UserMessageKind.FILE_MANAGER_MISSING,
+                        "파일 앱을 찾을 수 없습니다.",
                         RecoveryAction.NONE,
                     ),
                 )
@@ -1967,7 +1967,7 @@ class ManagerViewModel(
         enqueueEffect(
             currentLaunchEffect(
                 RepositoryLaunch(
-                    destination = LaunchDestination.SAMSUNG_MY_FILES,
+                    destination = LaunchDestination.FILE_MANAGER,
                     intentFactory = { intent },
                 ),
             ),
@@ -2924,7 +2924,7 @@ class ManagerViewModel(
                 is InstallState.Installed -> it.copy(
                     route = ManagerRoute.Report(terminal.packageName),
                     importState = ImportUiState.Idle,
-                    message = null,
+                    message = installSupportUnverifiedMessage(),
                 )
                 InstallState.Cancelled -> it.copy(
                     route = ManagerRoute.Home,
@@ -4767,6 +4767,13 @@ private fun importFailureMessage(code: ImportFailureCode): UserMessage = when (c
     )
 }
 
+private fun installSupportUnverifiedMessage() = UserMessage(
+    UserMessageKind.INSTALL_SUPPORT_UNVERIFIED,
+    "설치됨 · 삼성 인터넷 지원 미확인\n" +
+        "삼성 인터넷 Add-ons에서 확장이 표시되고 활성화되는지 확인해 주세요.",
+    RecoveryAction.NONE,
+)
+
 private fun installFailureMessage(code: String): UserMessage = when (code) {
     "SIGNER_MISMATCH", "VERSION_NOT_NEWER", "PACKAGE_MISMATCH" -> UserMessage(
         UserMessageKind.UPDATE_IDENTITY,
@@ -4786,7 +4793,7 @@ private fun installFailureMessage(code: String): UserMessage = when (code) {
     "UNSUPPORTED_INSTALL_SOURCE" -> UserMessage(
         UserMessageKind.INSTALL_FAILED,
         "확장 APK는 설치됐지만 삼성 인터넷이 허용하는 설치 출처가 아닙니다.\n" +
-            "저장한 APK를 삼성 내 파일에서 직접 열어 다시 설치해 주세요.",
+            "저장한 APK를 파일 앱에서 직접 열어 다시 설치해 주세요.",
         RecoveryAction.SELECT_ANOTHER_FILE,
     )
     "INSTALL_SOURCE_UNKNOWN" -> UserMessage(

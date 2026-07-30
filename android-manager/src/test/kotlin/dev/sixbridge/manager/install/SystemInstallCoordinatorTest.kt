@@ -160,6 +160,29 @@ class SystemInstallCoordinatorTest {
     }
 
     @Test
+    fun `다른 파일 앱 origin은 설치를 유지하고 삼성 인터넷 지원만 미확인으로 둔다`() =
+        runTest {
+            val fixture = fixture(
+                actual = expectedInstalled().copy(
+                    apkSha256 = WRAPPER_SHA,
+                    installSourceEvidence = InstallSourceEvidence.Known(
+                        GOOGLE_PACKAGE_INSTALLER,
+                        "com.example.files",
+                    ),
+                ),
+            )
+            assertIs<SystemInstallRequestResult.ExportRequired>(
+                fixture.coordinator.request(fixture.bundle, partialConfirmed = false),
+            )
+            assertTrue(fixture.coordinator.markManualExportSucceeded(TOKEN))
+
+            assertEquals(
+                InstallState.Installed(PACKAGE),
+                fixture.coordinator.reconcileManualAfterUserCheck(TOKEN),
+            )
+        }
+
+    @Test
     fun `설치 출처를 확인하지 못하면 source unknown으로 실패한다`() = runTest {
         val fixture = fixture(
             actual = expectedInstalled().copy(

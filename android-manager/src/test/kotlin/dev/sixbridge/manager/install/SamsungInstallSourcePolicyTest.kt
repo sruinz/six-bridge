@@ -51,4 +51,17 @@ class SamsungInstallSourcePolicyTest {
             )
         }
     }
+
+    @Test
+    fun `Google installer의 다른 파일 앱 origin은 설치됨 지원 미확인이다`() {
+        assertEquals(
+            SamsungInstallSourceVerdict.UNVERIFIED_FILE_APP,
+            classifySamsungInstallSource(
+                InstallSourceEvidence.Known(
+                    installingPackageName = GOOGLE_PACKAGE_INSTALLER,
+                    originatingPackageName = "com.example.files",
+                ),
+            ),
+        )
+    }
 }

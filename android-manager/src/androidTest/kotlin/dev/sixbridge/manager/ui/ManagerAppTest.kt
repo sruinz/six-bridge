@@ -801,7 +801,7 @@ class ManagerAppTest {
     }
 
     @Test
-    fun awaiting_manual_install_review_shows_my_files_handoff_actions_only() {
+    fun awaiting_manual_install_review_shows_file_manager_handoff_actions_only() {
         val actionNames = mutableListOf<String>()
         composeRule.setContent {
             ManagerAppContent(
@@ -815,28 +815,30 @@ class ManagerAppTest {
         }
 
         composeRule.onNodeWithTag("review:scroll")
-            .performScrollToNode(hasTestTag("manual-install:open-my-files"))
+            .performScrollToNode(hasTestTag("manual-install:open-file-manager"))
         composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
         composeRule.onNodeWithText(
-            "삼성 내 파일에서 저장한 APK를 직접 눌러 설치해 주세요.",
+            "파일 앱에서 저장한 APK를 직접 눌러 설치해 주세요.",
         ).assertExists()
         composeRule.onNodeWithText(
-            "다른 앱에서 열면 삼성 인터넷이 지원하지 않는 확장으로 분류할 수 있습니다.",
+            "설치 출처에 따라 삼성 인터넷의 지원 여부가 달라질 수 있습니다. " +
+                "설치 뒤 상태를 확인해 주세요.",
         ).assertExists()
-        composeRule.onNodeWithTag("manual-install:open-my-files").performClick()
+        composeRule.onNodeWithText("삼성 내 파일", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithTag("manual-install:open-file-manager").performClick()
         composeRule.onNodeWithTag("review:scroll")
             .performScrollToNode(hasTestTag("manual-install:check-status"))
         composeRule.onNodeWithTag("manual-install:check-status").performClick()
 
         assertEquals(
-            listOf("OpenSamsungMyFiles", "ConfirmManualInstallStatus"),
+            listOf("OpenFileManager", "ConfirmManualInstallStatus"),
             actionNames,
         )
         composeRule.onNodeWithTag("review:install").assertDoesNotExist()
     }
 
     @Test
-    fun awaiting_manual_install_conversion_result_shows_my_files_handoff_actions_only() {
+    fun awaiting_manual_install_conversion_result_shows_file_manager_handoff_actions_only() {
         val actionNames = mutableListOf<String>()
         composeRule.setContent {
             ManagerAppContent(
@@ -850,13 +852,14 @@ class ManagerAppTest {
         }
 
         composeRule.onNodeWithTag("conversion:result-screen")
-            .performScrollToNode(hasTestTag("manual-install:open-my-files"))
+            .performScrollToNode(hasTestTag("manual-install:open-file-manager"))
         composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
-        composeRule.onNodeWithTag("manual-install:open-my-files").performClick()
+        composeRule.onNodeWithText("삼성 내 파일", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithTag("manual-install:open-file-manager").performClick()
         composeRule.onNodeWithTag("manual-install:check-status").performClick()
 
         assertEquals(
-            listOf("OpenSamsungMyFiles", "ConfirmManualInstallStatus"),
+            listOf("OpenFileManager", "ConfirmManualInstallStatus"),
             actionNames,
         )
         composeRule.onNodeWithTag("conversion:install").assertDoesNotExist()

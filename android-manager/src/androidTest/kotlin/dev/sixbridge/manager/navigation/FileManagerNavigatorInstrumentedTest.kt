@@ -11,30 +11,36 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class SamsungMyFilesNavigatorInstrumentedTest {
+class FileManagerNavigatorInstrumentedTest {
     @Test
-    fun production_navigator_finds_real_samsung_my_files_launcher_without_apk_grants() {
+    fun production_navigator_finds_files_category_handler_without_apk_grants() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val intent = requireNotNull(
-            AndroidSamsungMyFilesNavigator(context.packageManager).launcherIntent(),
+        val chooser = requireNotNull(
+            AndroidFileManagerNavigator(
+                context.packageManager,
+                "파일 앱 선택",
+            ).launcherIntent(),
+        )
+        val target = requireNotNull(
+            chooser.getParcelableExtra<Intent>(Intent.EXTRA_INTENT),
         )
 
-        assertEquals(SAMSUNG_MY_FILES_PACKAGE, intent.`package`)
-        assertEquals(Intent.ACTION_MAIN, intent.action)
-        assertNull(intent.data)
-        assertNull(intent.type)
-        assertNull(intent.clipData)
-        assertEquals(0, intent.flags and URI_PERMISSION_FLAGS)
+        assertEquals(Intent.ACTION_MAIN, target.action)
+        assertEquals(Intent.CATEGORY_APP_FILES, target.selector?.categories?.single())
+        assertNull(target.data)
+        assertNull(target.type)
+        assertNull(target.clipData)
+        assertEquals(0, target.flags and URI_PERMISSION_FLAGS)
+        assertEquals(0, chooser.flags and URI_PERMISSION_FLAGS)
         assertNotNull(
             context.packageManager.resolveActivity(
-                intent,
+                target,
                 PackageManager.MATCH_DEFAULT_ONLY,
             ),
         )
     }
 
     private companion object {
-        const val SAMSUNG_MY_FILES_PACKAGE = "com.sec.android.app.myfiles"
         const val URI_PERMISSION_FLAGS =
             Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
