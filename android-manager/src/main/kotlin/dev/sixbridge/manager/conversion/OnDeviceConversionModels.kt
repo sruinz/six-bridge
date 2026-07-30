@@ -172,10 +172,23 @@ internal interface ConversionInputPort {
     suspend fun reclaimOrphans(): Boolean
 }
 
+internal sealed interface ConversionWorkStartupRestore {
+    data class Active(
+        val job: RestoredConversionJob,
+    ) : ConversionWorkStartupRestore
+
+    data class Interrupted(
+        val token: String,
+        val stage: ConversionJobStage,
+    ) : ConversionWorkStartupRestore
+}
+
 internal interface ConversionWorkPort {
     suspend fun create(artifact: OnDeviceInputArtifact): RestoredConversionJob
     suspend fun restore(): RestoredConversionJob?
     suspend fun restoreBuildAware(): RestoredConversionJob? = restore()
+    suspend fun restoreForStartup(): ConversionWorkStartupRestore? =
+        restoreBuildAware()?.let(ConversionWorkStartupRestore::Active)
     suspend fun markAwaitingApproval(token: String, profileSha256: String)
     suspend fun refreshAwaitingApproval(
         token: String,

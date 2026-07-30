@@ -253,15 +253,21 @@ class ConversionWorkStore internal constructor(
         }
     }
 
-    suspend fun restore(): RestoredConversionJob? = restoreInternal(
-        preserveBuilding = false,
-    )
+    suspend fun restore(): RestoredConversionJob? =
+        (
+            restoreInternal(
+                preserveBuilding = false,
+            ) as? ConversionWorkStartupRestore.Active
+        )?.job
 
-    suspend fun restorePreservingBuilding(): RestoredConversionJob? = restoreInternal(
-        preserveBuilding = true,
-    )
+    suspend fun restorePreservingBuilding(): RestoredConversionJob? =
+        (
+            restoreInternal(
+                preserveBuilding = true,
+            ) as? ConversionWorkStartupRestore.Active
+        )?.job
 
-    internal suspend fun restoreForCoordinator(): RestoredConversionJob? = restoreInternal(
+    internal suspend fun restoreForStartup(): ConversionWorkStartupRestore? = restoreInternal(
         preserveBuilding = true,
         deferInterruptedCleanup = true,
     )
@@ -269,45 +275,48 @@ class ConversionWorkStore internal constructor(
     private suspend fun restoreInternal(
         preserveBuilding: Boolean,
         deferInterruptedCleanup: Boolean = false,
-    ): RestoredConversionJob? = mutex.withLock {
+    ): ConversionWorkStartupRestore? = mutex.withLock {
         withContext(Dispatchers.IO) {
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext null
             var row = dao.get() ?: return@withContext null
             row = reconcileCleanupTokens(root, row) ?: return@withContext null
             if (isInvalidTimestamp(row.updatedAtEpochMillis)) {
-                discardInvalid(root, row)
-                return@withContext null
+                return@withContext restoreInterruptedOrDiscard(
+                    root = root,
+                    row = row,
+                    deferInterruptedCleanup = deferInterruptedCleanup,
+                )
             }
             val stage = enumValueOrNull<ConversionJobStage>(row.stage)
             if (stage == null || !isCanonicalUuid(row.token)) {
-                discardInvalid(root, row)
-                return@withContext null
+                return@withContext restoreInterruptedOrDiscard(
+                    root = root,
+                    row = row,
+                    deferInterruptedCleanup = deferInterruptedCleanup,
+                )
             }
             if (stage == ConversionJobStage.DISCARDING) {
-                if (deferInterruptedCleanup) {
-                    row.toInterruptedRestored()?.let { return@withContext it }
-                }
-                discardClaimed(root, row)
-                return@withContext null
+                return@withContext restoreInterruptedOrDiscard(
+                    root = root,
+                    row = row,
+                    deferInterruptedCleanup = deferInterruptedCleanup,
+                )
             }
             if (stage != ConversionJobStage.BUNDLE_READY && isExpired(row.updatedAtEpochMillis)) {
-                if (deferInterruptedCleanup) {
-                    val claimed = claimDiscarding(row)
-                    if (claimed != null) {
-                        hooks.afterDiscardClaim()
-                        claimed.toInterruptedRestored()?.let { return@withContext it }
-                        discardClaimed(root, claimed)
-                        return@withContext null
-                    }
-                }
-                discardInvalid(root, row)
-                return@withContext null
+                return@withContext restoreInterruptedOrDiscard(
+                    root = root,
+                    row = row,
+                    deferInterruptedCleanup = deferInterruptedCleanup,
+                )
             }
             row = drainCleanupTokens(root, row) ?: return@withContext null
             val tokenDirectory = runCatching { requireTokenDirectory(root, row.token) }.getOrNull()
             if (tokenDirectory == null || row.toRestored(tokenDirectory) == null) {
-                discardInvalid(root, row)
-                return@withContext null
+                return@withContext restoreInterruptedOrDiscard(
+                    root = root,
+                    row = row,
+                    deferInterruptedCleanup = deferInterruptedCleanup,
+                )
             }
             if (stage == ConversionJobStage.BUILDING && !preserveBuilding) {
                 if (!deleteUnreferencedChildren(tokenDirectory, row.inputFileName)) {
@@ -340,28 +349,36 @@ class ConversionWorkStore internal constructor(
                     requireNotNull(restored.bundleSha256),
                 )
             }
-            restored
+            ConversionWorkStartupRestore.Active(restored)
         }
     }
 
-    private fun ConversionJobEntity.toInterruptedRestored(): RestoredConversionJob? {
+    private suspend fun restoreInterruptedOrDiscard(
+        root: File,
+        row: ConversionJobEntity,
+        deferInterruptedCleanup: Boolean,
+    ): ConversionWorkStartupRestore.Interrupted? {
+        val alreadyClaimed = row.stage == ConversionJobStage.DISCARDING.name
+        val claimed = if (alreadyClaimed) row else claimDiscarding(row) ?: return null
+        if (!alreadyClaimed) hooks.afterDiscardClaim()
+        val interrupted = claimed.toInterruptedRestore()
+        if (deferInterruptedCleanup && interrupted != null) return interrupted
+        discardClaimed(root, claimed)
+        return null
+    }
+
+    private fun ConversionJobEntity.toInterruptedRestore():
+        ConversionWorkStartupRestore.Interrupted? {
         if (singletonId != ConversionJobEntity.SINGLETON_ID ||
             generation <= 0 ||
-            !isCanonicalUuid(token)
+            !isCanonicalUuid(token) ||
+            stage != ConversionJobStage.DISCARDING.name
         ) {
             return null
         }
-        val restoredInputKind = enumValueOrNull<OnDeviceInputKind>(inputKind) ?: return null
-        if (!isLowerHexSha256(inputSha256)) return null
-        val adapterIds = decodeAdapterIds(approvedAdapterIdsJson) ?: return null
-        return RestoredConversionJob(
+        return ConversionWorkStartupRestore.Interrupted(
             token = token,
-            inputKind = restoredInputKind,
-            inputSha256 = inputSha256,
             stage = ConversionJobStage.DISCARDING,
-            approvedAdapterIds = adapterIds,
-            profileSha256 = profileSha256,
-            bundleSha256 = bundleSha256,
         )
     }
 

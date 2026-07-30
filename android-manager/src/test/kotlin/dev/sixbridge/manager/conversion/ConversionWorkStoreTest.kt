@@ -1,6 +1,8 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import java.io.File
 import java.io.InputStream
 import java.nio.ByteBuffer
@@ -1016,9 +1018,10 @@ class ConversionWorkStoreTest {
         }
 
     @Test
-    fun `production restore는 durable DISCARDING 실패를 exact token pending으로 전달한다`() =
+    fun `production restore는 malformed durable DISCARDING 실패를 exact token pending으로 전달한다`() =
         runTest {
             var failWorkDelete = true
+            var analyzeCalls = 0
             val created = store().create(artifact("interrupted".encodeToByteArray()))
             val interrupted = store(
                 hooks = ConversionWorkStoreHooks(
@@ -1028,6 +1031,13 @@ class ConversionWorkStoreTest {
             assertFailsWith<IllegalStateException> {
                 interrupted.discard(created.token)
             }
+            dao.force(
+                requireNotNull(dao.get()).copy(
+                    inputKind = "malformed-kind",
+                    inputSha256 = "malformed-sha",
+                    approvedAdapterIdsJson = "{malformed",
+                ),
+            )
             val workStore = store(
                 hooks = ConversionWorkStoreHooks(
                     deleteTree = { path ->
@@ -1041,7 +1051,11 @@ class ConversionWorkStoreTest {
                 },
                 wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
             )
-            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+            val coordinator = discardOnlyCoordinator(
+                workStore = workStore,
+                bundleStore = bundleStore,
+                onAnalyze = { analyzeCalls += 1 },
+            )
 
             val pending = assertIs<RestoredConversion.InterruptedCleanupPending>(
                 coordinator.restore(),
@@ -1049,11 +1063,58 @@ class ConversionWorkStoreTest {
 
             assertEquals(created.token, pending.token)
             assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
+            assertEquals(0, analyzeCalls)
 
             failWorkDelete = false
             assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
             assertNull(dao.get())
             assertFalse(File(root, created.token).exists())
+            assertEquals(0, analyzeCalls)
+        }
+
+    @Test
+    fun `production restore는 invalid timestamp cleanup 실패를 exact token pending으로 전달한다`() =
+        runTest {
+            var failWorkDelete = true
+            var analyzeCalls = 0
+            val created = store().create(artifact("invalid-time".encodeToByteArray()))
+            dao.force(
+                requireNotNull(dao.get()).copy(
+                    updatedAtEpochMillis = -1,
+                ),
+            )
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path ->
+                        !failWorkDelete && path.toFile().deleteRecursively()
+                    },
+                ),
+            )
+            val bundleStore = GeneratedBundleStore(
+                filesDir = File(sourceRoot, "invalid-time-generated").apply {
+                    check(mkdir())
+                },
+                wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            )
+            val coordinator = discardOnlyCoordinator(
+                workStore = workStore,
+                bundleStore = bundleStore,
+                onAnalyze = { analyzeCalls += 1 },
+            )
+
+            val pending = assertIs<RestoredConversion.InterruptedCleanupPending>(
+                coordinator.restore(),
+            )
+
+            assertEquals(created.token, pending.token)
+            assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
+            assertEquals(0, analyzeCalls)
+
+            failWorkDelete = false
+            assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
+            assertNull(dao.get())
+            assertFalse(File(root, created.token).exists())
+            assertEquals(0, analyzeCalls)
         }
 
     @Test
@@ -1079,6 +1140,46 @@ class ConversionWorkStoreTest {
 
             assertNull(dao.get())
             assertFalse(File(root, created.token).exists())
+        }
+
+    @Test
+    fun `production analyze는 durable DISCARDING을 analyzer로 넘기지 않는다`() =
+        runTest {
+            var analyzeCalls = 0
+            val created = store().create(artifact("do-not-analyze".encodeToByteArray()))
+            val interrupted = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterDiscardClaim = { error("simulated process death") },
+                ),
+            )
+            assertFailsWith<IllegalStateException> {
+                interrupted.discard(created.token)
+            }
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { false },
+                ),
+            )
+            val bundleStore = GeneratedBundleStore(
+                filesDir = File(sourceRoot, "analyze-discarding-generated").apply {
+                    check(mkdir())
+                },
+                wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            )
+            val coordinator = discardOnlyCoordinator(
+                workStore = workStore,
+                bundleStore = bundleStore,
+                profileSnapshot = SamsungProfileSnapshot.Supported(profile()),
+                onAnalyze = { analyzeCalls += 1 },
+            )
+
+            val result = assertIs<ConversionBeginResult.Failure>(
+                coordinator.analyze(created.token),
+            )
+
+            assertEquals(ConversionFailureCode.INPUT_INVALID, result.code)
+            assertEquals(0, analyzeCalls)
+            assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
         }
 
     @Test
@@ -1146,6 +1247,8 @@ class ConversionWorkStoreTest {
     private fun discardOnlyCoordinator(
         workStore: ConversionWorkStore,
         bundleStore: GeneratedBundleStore,
+        profileSnapshot: SamsungProfileSnapshot? = null,
+        onAnalyze: () -> Unit = {},
     ) = OnDeviceConversionCoordinator(
         input = object : ConversionInputPort {
             override suspend fun acquire(
@@ -1161,7 +1264,8 @@ class ConversionWorkStoreTest {
         },
         work = DefaultConversionWorkPort(workStore),
         profiles = ConversionProfilePort {
-            error("discard test에서 profile은 사용하지 않습니다.")
+            profileSnapshot
+                ?: error("discard test에서 profile은 사용하지 않습니다.")
         },
         runtime = object : ConversionRuntimePort {
             override fun analyze(
@@ -1169,8 +1273,10 @@ class ConversionWorkStoreTest {
                 kind: OnDeviceInputKind,
                 profile: dev.sixbridge.core.profile.BrowserProfile,
                 control: AnalysisControl,
-            ): ConversionAnalysisSnapshot =
+            ): ConversionAnalysisSnapshot {
+                onAnalyze()
                 error("discard test에서 analyze는 사용하지 않습니다.")
+            }
 
             override fun prepare(
                 input: File,
@@ -1226,6 +1332,18 @@ class ConversionWorkStoreTest {
         imports = ConversionGeneratedImportPort {
             error("discard test에서 import는 사용하지 않습니다.")
         },
+    )
+
+    private fun profile() = BrowserProfile(
+        browserPackage = "com.sec.android.app.sbrowser",
+        versionName = "30.0.2.61",
+        versionCode = 1,
+        majorVersion = 30,
+        supportedApis = emptySet(),
+        wrapperContract = WrapperContract.complete(),
+        sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+        installationApkSetSha256 = "f".repeat(64),
+        sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
 
     private fun artifact(bytes: ByteArray): OnDeviceInputArtifact {

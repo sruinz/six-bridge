@@ -316,7 +316,12 @@ internal class OnDeviceConversionCoordinator(
 
     override suspend fun restore(importReview: Boolean): RestoredConversion? {
         cleanAnalysisCacheOnce()
-        val job = work.restoreBuildAware() ?: return null
+        val job = when (val restored = work.restoreForStartup()) {
+            is ConversionWorkStartupRestore.Active -> restored.job
+            is ConversionWorkStartupRestore.Interrupted ->
+                return discardInterrupted(restored.token)
+            null -> return null
+        }
         return when (job.stage) {
             ConversionJobStage.BUNDLE_READY -> restoreBundle(job, importReview)
             ConversionJobStage.BUILDING ->

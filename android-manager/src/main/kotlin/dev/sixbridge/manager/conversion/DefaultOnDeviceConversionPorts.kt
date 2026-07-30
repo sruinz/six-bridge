@@ -25,7 +25,8 @@ internal class DefaultConversionWorkPort(
 ) : ConversionWorkPort {
     override suspend fun create(artifact: OnDeviceInputArtifact) = store.create(artifact)
     override suspend fun restore() = store.restore()
-    override suspend fun restoreBuildAware() = store.restoreForCoordinator()
+    override suspend fun restoreBuildAware() = store.restorePreservingBuilding()
+    override suspend fun restoreForStartup() = store.restoreForStartup()
     override suspend fun markAwaitingApproval(token: String, profileSha256: String) {
         store.markAwaitingApproval(token, profileSha256)
     }
