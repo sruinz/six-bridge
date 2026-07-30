@@ -2354,21 +2354,24 @@ class ManagerRepositoryTest {
                     StartupRecoveryUiState.RECOVERY_BLOCKED,
                     recreated.state.value.startupRecoveryState,
                 )
+                val blockedReview = ReviewBundle(
+                    token = SECOND_TOKEN,
+                    packageName = bundle.verifiedApk.packageName,
+                    extensionId = bundle.descriptor.extensionId,
+                    originalExtensionId = bundle.report.originalExtensionId,
+                    wrapperSha256 = bundle.descriptor.wrapperSha256,
+                    signerSha256 =
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    name = bundle.descriptor.name,
+                    version = bundle.descriptor.version,
+                    status = bundle.report.status,
+                    issues = bundle.report.issues,
+                )
+                assertTrue(Regex("^[0-9a-f]{64}$").matches(blockedReview.wrapperSha256))
+                assertTrue(Regex("^[0-9a-f]{64}$").matches(blockedReview.signerSha256))
                 recreated.startImport {
                     blockedImportCalls += 1
-                    ManagerImportResult.Success(
-                        ReviewBundle(
-                            token = SECOND_TOKEN,
-                            packageName = bundle.verifiedApk.packageName,
-                            extensionId = bundle.descriptor.extensionId,
-                            originalExtensionId = bundle.report.originalExtensionId,
-                            wrapperSha256 = bundle.descriptor.wrapperSha256,
-                            name = bundle.descriptor.name,
-                            version = bundle.descriptor.version,
-                            status = bundle.report.status,
-                            issues = bundle.report.issues,
-                        ),
-                    )
+                    ManagerImportResult.Success(blockedReview)
                 }
                 advanceUntilIdle()
                 assertEquals(0, blockedImportCalls)

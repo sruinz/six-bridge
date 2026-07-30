@@ -204,9 +204,12 @@ class ManagerViewModelTest {
                     ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
                 ),
             )
+            val restoredReview = review(ContractCompatibilityStatus.COMPATIBLE)
+            assertTrue(Regex("^[0-9a-f]{64}$").matches(restoredReview.wrapperSha256))
+            assertTrue(Regex("^[0-9a-f]{64}$").matches(restoredReview.signerSha256))
             val repository = FakeManagerRepository().apply {
                 restoredConversion = RestoredConversion.BundleReady(
-                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    restoredReview,
                     generatedBundle(),
                 )
             }
@@ -9229,6 +9232,8 @@ class ManagerViewModelTest {
         originalExtensionId = null,
         wrapperSha256 =
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        signerSha256 =
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         name = "확장",
         version = "1.0",
         status = status,

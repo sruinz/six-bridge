@@ -291,6 +291,8 @@ class OnDeviceConversionCoordinatorTest {
         )
         assertEquals(fixture.token, ready.generated.token)
         assertEquals("Example", ready.review.name)
+        assertTrue(Regex("^[0-9a-f]{64}$").matches(ready.review.wrapperSha256))
+        assertTrue(Regex("^[0-9a-f]{64}$").matches(ready.review.signerSha256))
         assertNull(fixture.activeOwner)
     }
 
@@ -1457,6 +1459,8 @@ class OnDeviceConversionCoordinatorTest {
                         originalExtensionId = null,
                         wrapperSha256 =
                             "2222222222222222222222222222222222222222222222222222222222222222",
+                        signerSha256 =
+                            "3333333333333333333333333333333333333333333333333333333333333333",
                         name = "Example",
                         version = "1.0",
                         status = ContractCompatibilityStatus.PARTIAL,
