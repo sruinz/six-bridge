@@ -3,6 +3,7 @@ package dev.sixbridge.desktop.security
 import dev.sixbridge.core.draft.DraftSignature
 import dev.sixbridge.desktop.DesktopApplicationPaths
 import dev.sixbridge.desktop.DesktopHostOs
+import java.io.IOException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -14,6 +15,7 @@ import kotlin.io.path.listDirectoryEntries
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -249,42 +251,130 @@ class DesktopDraftSigningIdentityStoreTest {
     }
 
     @Test
-    fun `Windows atomic move 실패는 외부 파일을 지우지 않고 orphan만 남겨 다음 실행을 거부한다`() {
-        val paths = newPaths("desktop-draft-windows-atomic")
-        val outside = paths.dataRoot.parent.resolve("outside.txt")
-        Files.writeString(outside, "outside")
+    fun `Windows 첫 번째 move 실패는 commit marker 없이 orphan 셋만 남긴다`() {
+        assertWindowsMoveFailure(
+            failingMove = 1,
+            expectedFinals = emptySet(),
+            expectedOrphanKinds = setOf("private", "public", "identity"),
+        )
+    }
+
+    @Test
+    fun `Windows 두 번째 move 실패는 private final을 uncommitted로 남긴다`() {
+        assertWindowsMoveFailure(
+            failingMove = 2,
+            expectedFinals = setOf("draft-transfer.pk8"),
+            expectedOrphanKinds = setOf("public", "identity"),
+        )
+    }
+
+    @Test
+    fun `Windows 세 번째 move 실패는 pair final을 identity 없이 uncommitted로 남긴다`() {
+        assertWindowsMoveFailure(
+            failingMove = 3,
+            expectedFinals = setOf(
+                "draft-transfer.pk8",
+                "draft-transfer.pub",
+            ),
+            expectedOrphanKinds = setOf("identity"),
+        )
+    }
+
+    @Test
+    fun `identity commit 뒤 pair 검증에 실패하면 key를 반환하지 않는다`() {
+        val paths = newPaths("desktop-draft-windows-commit-verify")
         val acl = FakeWindowsAclAccess()
+        var moves = 0
         val store = DesktopDraftSigningIdentityStore.testingWindows(
             paths = paths,
             aclAccess = acl,
             atomicMove = WindowsAtomicMove { source, target ->
-                throw AtomicMoveNotSupportedException(
-                    source.toString(),
-                    target.toString(),
-                    "unsupported",
-                )
+                Files.move(source, target, ATOMIC_MOVE)
+                moves += 1
+                if (moves == 3) {
+                    Files.write(
+                        target.parent.resolve("draft-transfer.pub"),
+                        byteArrayOf(1),
+                    )
+                }
             },
         )
+        var returned = false
 
-        assertFailsWith<IllegalStateException> { store.getOrCreate() }
+        assertFails {
+            store.getOrCreate()
+            returned = true
+        }
+
+        assertFalse(returned)
+        assertEquals(3, moves)
+        assertTrue(Files.exists(paths.draftKeyRoot.resolve("draft-transfer.identity")))
+        assertFails {
+            windowsStore(paths, acl).getOrCreate()
+        }
+        assertContentEquals(
+            byteArrayOf(1),
+            Files.readAllBytes(paths.draftKeyRoot.resolve("draft-transfer.pub")),
+        )
+    }
+
+    private fun assertWindowsMoveFailure(
+        failingMove: Int,
+        expectedFinals: Set<String>,
+        expectedOrphanKinds: Set<String>,
+    ) {
+        val paths = newPaths("desktop-draft-windows-move-$failingMove")
+        val outside = paths.dataRoot.parent.resolve("outside.txt")
+        Files.writeString(outside, "outside")
+        val acl = FakeWindowsAclAccess()
+        var moves = 0
+        val store = DesktopDraftSigningIdentityStore.testingWindows(
+            paths = paths,
+            aclAccess = acl,
+            atomicMove = WindowsAtomicMove { source, target ->
+                moves += 1
+                if (moves == failingMove) {
+                    throw IOException("injected move $failingMove failure")
+                }
+                Files.move(source, target, ATOMIC_MOVE)
+            },
+        )
+        var returned = false
+
+        assertFails {
+            store.getOrCreate()
+            returned = true
+        }
 
         val names = paths.draftKeyRoot.listDirectoryEntries()
             .map { it.fileName.toString() }
             .toSet()
+        assertFalse(returned)
+        assertEquals(failingMove, moves)
         assertEquals(4, names.size)
         assertTrue(".sixbridge-draft-key.lock" in names)
-        assertEquals(3, names.count { it.startsWith(".sixbridge-draft-key.orphan-") })
-        assertTrue(names.none { it in FINAL_KEY_FILES })
+        assertEquals(expectedFinals, names.intersect(FINAL_KEY_FILES))
+        assertEquals(
+            expectedOrphanKinds,
+            names.filter { it.startsWith(".sixbridge-draft-key.orphan-") }
+                .map { it.substringAfterLast('-') }
+                .toSet(),
+        )
+        assertFalse("draft-transfer.identity" in names)
         assertEquals("outside", Files.readString(outside))
 
         val orphaned = snapshot(paths.draftKeyRoot)
-        assertFailsWith<IllegalStateException> {
+        var retryReturned = false
+        assertFails {
             windowsStore(paths, acl).getOrCreate()
+            retryReturned = true
         }
+        assertFalse(retryReturned)
         assertEquals(orphaned.keys, snapshot(paths.draftKeyRoot).keys)
         orphaned.forEach { (name, bytes) ->
             assertContentEquals(bytes, Files.readAllBytes(paths.draftKeyRoot.resolve(name)))
         }
+        assertFalse(Files.exists(paths.draftKeyRoot.resolve("draft-transfer.identity")))
         assertEquals("outside", Files.readString(outside))
     }
 

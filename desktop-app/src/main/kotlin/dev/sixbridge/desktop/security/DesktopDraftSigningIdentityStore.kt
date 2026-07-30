@@ -52,21 +52,23 @@ class DesktopDraftSigningIdentityStore private constructor(
             val roots = prepareRoots()
             withFileLock(roots) {
                 validateContents(roots.guard)
-                val state = listOf(
-                    existsNoFollow(identityPath),
-                    existsNoFollow(privatePath),
-                    existsNoFollow(publicPath),
-                )
+                val hasIdentityCommit = existsNoFollow(identityPath)
+                val hasPrivate = existsNoFollow(privatePath)
+                val hasPublic = existsNoFollow(publicPath)
                 when {
-                    state.all { it } -> readPair(roots.guard)
-                    state.any { it } -> throw IllegalStateException(
-                        "데스크톱 전달 signer가 부분 게시 또는 손상 상태입니다.",
+                    hasIdentityCommit && hasPrivate && hasPublic ->
+                        readPair(roots.guard)
+                    hasIdentityCommit -> throw IllegalStateException(
+                        "commit된 데스크톱 전달 signer가 불완전하거나 손상되었습니다.",
+                    )
+                    hasPrivate || hasPublic -> throw IllegalStateException(
+                        "identity commit marker가 없는 signer pair는 신뢰할 수 없습니다.",
                     )
                     roots.freshKeyRoot -> {
                         val pair = KeyPairGenerator.getInstance(ALGORITHM)
                             .generateKeyPair()
                         publish(pair, roots.guard)
-                        pair
+                        readPair(roots.guard)
                     }
                     else -> throw IllegalStateException(
                         "기존 데스크톱 전달 signer 저장소에 완전한 key pair가 없습니다.",
@@ -259,6 +261,11 @@ class DesktopDraftSigningIdentityStore private constructor(
         writeNewFile(privateTemp, pair.private.encoded, guard)
         writeNewFile(publicTemp, pair.public.encoded, guard)
         writeNewFile(identityTemp, IDENTITY_CONTENT, guard)
+
+        // Filesystem은 세 파일의 다중 원자 transaction을 제공하지 않는다.
+        // 안전한 probe cleanup도 path delete race를 만들므로 ATOMIC_MOVE preflight는
+        // 하지 않는다. 후반 I/O fault는 private/public final을 남길 수 있지만,
+        // identity가 마지막 유일한 commit point이므로 그 전 상태는 신뢰하지 않는다.
         atomicPublish(privateTemp, privatePath, guard)
         atomicPublish(publicTemp, publicPath, guard)
         forceKeyDirectory(guard)
