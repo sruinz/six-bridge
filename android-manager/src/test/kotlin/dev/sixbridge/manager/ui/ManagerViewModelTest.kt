@@ -8321,6 +8321,85 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `분석 cleanup discard 예외는 retry 상태와 exact token을 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis(TOKEN)
+                discardConversionException = IOException("discard failed")
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.Cancelling>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+
+            repository.discardConversionException = null
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN, TOKEN), repository.discardedConversions)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+        }
+
+    @Test
+    fun `분석 cleanup 완료는 Add-ons 오류 메시지를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val pending = CompletableDeferred<ConversionBeginResult>()
+            val repository = FakeManagerRepository().apply {
+                beginConversionDeferred = pending
+                navigationResult = RepositoryNavigationResult.AddOnsIntentUnavailable
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.OpenSamsungAddOns)
+
+            assertEquals(
+                UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE,
+                viewModel.state.value.message?.kind,
+            )
+            pending.complete(conversionAnalysis(TOKEN))
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertEquals(
+                UserMessageKind.SAMSUNG_ADD_ONS_UNAVAILABLE,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
     fun `새 begin은 cancellation 무시 old begin과 compensation cleanup 완료를 기다린다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -9098,6 +9177,7 @@ private class FakeManagerRepository : ManagerRepository {
     val conversionBuildRequests = mutableListOf<ConversionBuildRequest>()
     val discardedConversions = mutableListOf<String>()
     var discardConversionResult = true
+    var discardConversionException: IOException? = null
     val discardConversionResults = mutableMapOf<String, Boolean>()
     var beforeDiscardConversion: ((String) -> Unit)? = null
     var suspendDiscardConversion = false
@@ -9254,6 +9334,7 @@ private class FakeManagerRepository : ManagerRepository {
         lifecycleEvents += "discardConversion:$token"
         discardedConversions += token
         beforeDiscardConversion?.invoke(token)
+        discardConversionException?.let { throw it }
         if (suspendDiscardConversion) discardConversionGate.first()
         val result = discardConversionResults[token] ?: discardConversionResult
         if (result) generatedExists = false

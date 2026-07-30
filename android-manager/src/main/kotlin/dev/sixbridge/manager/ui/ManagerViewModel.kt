@@ -884,7 +884,8 @@ class ManagerViewModel(
         val reviewToken = (stateBeforeCancel as? ConversionUiState.ResultReady)
             ?.review
             ?.token
-        val generatedInstallOwned = generatedInstallOwnerToken == token
+        val generatedInstallOwned =
+            token != null && generatedInstallOwnerToken == token
         val generatedCleanup = if (
             stateBeforeCancel is ConversionUiState.ResultReady &&
             token != null
@@ -976,7 +977,7 @@ class ManagerViewModel(
             }
             if (token != null &&
                 token !in scheduledConversionCleanupTokens &&
-                !discardConversionExactly(token)
+                !discardRouteConversion(token)
             ) {
                 showGeneratedCleanupFailure()
                 return@cleanup false
@@ -1007,7 +1008,9 @@ class ManagerViewModel(
                     } else {
                         it.importState
                     },
-                    message = null,
+                    message = it.message?.takeUnless { message ->
+                        message.kind == UserMessageKind.CONVERSION_CLEANUP_FAILED
+                    },
                 )
             }
             true
@@ -1027,7 +1030,7 @@ class ManagerViewModel(
         enqueueRouteCleanup(
             nonCancellable = false,
             cleanup = {
-                if (!discardConversionExactly(token)) {
+                if (!discardRouteConversion(token)) {
                     showGeneratedCleanupFailure()
                     return@enqueueRouteCleanup false
                 }
@@ -1037,7 +1040,9 @@ class ManagerViewModel(
                         conversionState = ConversionUiState.Idle,
                         conversionCleanupPending = false,
                         conversionUrl = "",
-                        message = null,
+                        message = it.message?.takeUnless { message ->
+                            message.kind == UserMessageKind.CONVERSION_CLEANUP_FAILED
+                        },
                     )
                 }
                 true
@@ -2190,7 +2195,7 @@ class ManagerViewModel(
             cleanup = {
                 try {
                     val reviewCleaned = reviewToken?.let(repository::discardReview) ?: true
-                    val conversionCleaned = discardConversionExactly(token)
+                    val conversionCleaned = discardRouteConversion(token)
                     val cleaned = reviewCleaned && conversionCleaned
                     if (mutableState.value.conversionCleanupPending) {
                         if (cleaned) {
@@ -2200,7 +2205,10 @@ class ManagerViewModel(
                                     conversionState = ConversionUiState.Idle,
                                     conversionCleanupPending = false,
                                     conversionUrl = "",
-                                    message = null,
+                                    message = it.message?.takeUnless { message ->
+                                        message.kind ==
+                                            UserMessageKind.CONVERSION_CLEANUP_FAILED
+                                    },
                                 )
                             }
                         } else {
@@ -2220,6 +2228,14 @@ class ManagerViewModel(
         withContext(NonCancellable) {
             repository.discardConversion(token)
         }
+
+    private suspend fun discardRouteConversion(token: String): Boolean = try {
+        discardConversionExactly(token)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        false
+    }
 
     private fun enqueueStaleBuildCleanup(result: ConversionBuildResult) {
         when (result) {
