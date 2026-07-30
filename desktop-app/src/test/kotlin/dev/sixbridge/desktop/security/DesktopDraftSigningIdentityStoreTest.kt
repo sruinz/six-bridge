@@ -144,6 +144,41 @@ class DesktopDraftSigningIdentityStoreTest {
     }
 
     @Test
+    fun `macOS atomic move 실패도 외부 파일을 지우지 않고 orphan을 보존한다`() {
+        val paths = newPaths("desktop-draft-mac-atomic")
+        val outside = paths.dataRoot.parent.resolve("outside.txt")
+        Files.writeString(outside, "outside")
+        val store = DesktopDraftSigningIdentityStore.testingMac(
+            paths = paths,
+            atomicMove = WindowsAtomicMove { source, target ->
+                throw AtomicMoveNotSupportedException(
+                    source.toString(),
+                    target.toString(),
+                    "unsupported",
+                )
+            },
+        )
+
+        assertFailsWith<IllegalStateException> { store.getOrCreate() }
+
+        val names = paths.draftKeyRoot.listDirectoryEntries()
+            .map { it.fileName.toString() }
+            .toSet()
+        assertEquals(4, names.size)
+        assertTrue(".sixbridge-draft-key.lock" in names)
+        assertEquals(3, names.count { it.startsWith(".sixbridge-draft-key.orphan-") })
+        assertTrue(names.none { it in FINAL_KEY_FILES })
+        assertEquals("outside", Files.readString(outside))
+        assertFailsWith<IllegalStateException> {
+            DesktopDraftSigningIdentityStore(paths, DesktopHostOs.MAC).getOrCreate()
+        }
+        assertEquals(names, paths.draftKeyRoot.listDirectoryEntries().map {
+            it.fileName.toString()
+        }.toSet())
+        assertEquals("outside", Files.readString(outside))
+    }
+
+    @Test
     fun `Windows store는 fake ACL 경계에서도 stable pair와 기존 손상 fail-closed를 유지한다`() {
         val acl = FakeWindowsAclAccess()
         val paths = newPaths("desktop-draft-windows-stable")
@@ -214,11 +249,14 @@ class DesktopDraftSigningIdentityStoreTest {
     }
 
     @Test
-    fun `Windows atomic move 미지원은 final key를 남기지 않는다`() {
+    fun `Windows atomic move 실패는 외부 파일을 지우지 않고 orphan만 남겨 다음 실행을 거부한다`() {
         val paths = newPaths("desktop-draft-windows-atomic")
+        val outside = paths.dataRoot.parent.resolve("outside.txt")
+        Files.writeString(outside, "outside")
+        val acl = FakeWindowsAclAccess()
         val store = DesktopDraftSigningIdentityStore.testingWindows(
             paths = paths,
-            aclAccess = FakeWindowsAclAccess(),
+            aclAccess = acl,
             atomicMove = WindowsAtomicMove { source, target ->
                 throw AtomicMoveNotSupportedException(
                     source.toString(),
@@ -230,10 +268,24 @@ class DesktopDraftSigningIdentityStoreTest {
 
         assertFailsWith<IllegalStateException> { store.getOrCreate() }
 
-        assertEquals(
-            setOf(".sixbridge-draft-key.lock"),
-            paths.draftKeyRoot.listDirectoryEntries().map { it.fileName.toString() }.toSet(),
-        )
+        val names = paths.draftKeyRoot.listDirectoryEntries()
+            .map { it.fileName.toString() }
+            .toSet()
+        assertEquals(4, names.size)
+        assertTrue(".sixbridge-draft-key.lock" in names)
+        assertEquals(3, names.count { it.startsWith(".sixbridge-draft-key.orphan-") })
+        assertTrue(names.none { it in FINAL_KEY_FILES })
+        assertEquals("outside", Files.readString(outside))
+
+        val orphaned = snapshot(paths.draftKeyRoot)
+        assertFailsWith<IllegalStateException> {
+            windowsStore(paths, acl).getOrCreate()
+        }
+        assertEquals(orphaned.keys, snapshot(paths.draftKeyRoot).keys)
+        orphaned.forEach { (name, bytes) ->
+            assertContentEquals(bytes, Files.readAllBytes(paths.draftKeyRoot.resolve(name)))
+        }
+        assertEquals("outside", Files.readString(outside))
     }
 
     private fun windowsStore(
@@ -301,6 +353,11 @@ class DesktopDraftSigningIdentityStoreTest {
         private val FILE_PERMISSIONS = setOf(
             PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE,
+        )
+        private val FINAL_KEY_FILES = setOf(
+            "draft-transfer.identity",
+            "draft-transfer.pk8",
+            "draft-transfer.pub",
         )
     }
 }

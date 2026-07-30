@@ -252,41 +252,25 @@ class DesktopDraftSigningIdentityStore private constructor(
                 "기존 데스크톱 전달 signer 상태를 덮어쓸 수 없습니다.",
             )
         }
-        val suffix = ".tmp-${UUID.randomUUID()}"
-        val privateTemp = keyRoot.resolve("$PRIVATE_FILE$suffix")
-        val publicTemp = keyRoot.resolve("$PUBLIC_FILE$suffix")
-        val identityTemp = keyRoot.resolve("$IDENTITY_FILE$suffix")
-        val temps = linkedMapOf<Path, Any>()
-        val published = mutableListOf<PublishedFile>()
-        var complete = false
-        try {
-            temps[privateTemp] = writeNewFile(privateTemp, pair.private.encoded, guard)
-            temps[publicTemp] = writeNewFile(publicTemp, pair.public.encoded, guard)
-            temps[identityTemp] = writeNewFile(identityTemp, IDENTITY_CONTENT, guard)
-            atomicPublish(privateTemp, privatePath, published, guard)
-            atomicPublish(publicTemp, publicPath, published, guard)
-            forceKeyDirectory(guard)
-            atomicPublish(identityTemp, identityPath, published, guard)
-            forceKeyDirectory(guard)
-            complete = true
-        } finally {
-            temps.forEach { (path, fileKey) ->
-                deleteIfIdentity(path, fileKey, guard)
-            }
-            if (!complete) {
-                published.asReversed().forEach { file ->
-                    deleteIfIdentity(file.path, file.fileKey, guard)
-                }
-                forceKeyDirectory(guard)
-            }
-        }
+        val orphanPrefix = ".sixbridge-draft-key.orphan-${UUID.randomUUID()}"
+        val privateTemp = keyRoot.resolve("$orphanPrefix-private")
+        val publicTemp = keyRoot.resolve("$orphanPrefix-public")
+        val identityTemp = keyRoot.resolve("$orphanPrefix-identity")
+        writeNewFile(privateTemp, pair.private.encoded, guard)
+        writeNewFile(publicTemp, pair.public.encoded, guard)
+        writeNewFile(identityTemp, IDENTITY_CONTENT, guard)
+        atomicPublish(privateTemp, privatePath, guard)
+        atomicPublish(publicTemp, publicPath, guard)
+        forceKeyDirectory(guard)
+        atomicPublish(identityTemp, identityPath, guard)
+        forceKeyDirectory(guard)
     }
 
     private fun writeNewFile(
         path: Path,
         bytes: ByteArray,
         guard: RootsGuard,
-    ): Any {
+    ) {
         validateRoots(guard)
         val channel = when (hostOs) {
             DesktopHostOs.MAC -> FileChannel.open(
@@ -331,13 +315,12 @@ class DesktopDraftSigningIdentityStore private constructor(
                 "데스크톱 전달 signer 파일 크기가 기록 결과와 다릅니다."
             }
         }
-        return stableFileState(path, guard).fileKey
+        stableFileState(path, guard)
     }
 
     private fun atomicPublish(
         source: Path,
         target: Path,
-        published: MutableList<PublishedFile>,
         guard: RootsGuard,
     ) {
         validateRoots(guard)
@@ -354,10 +337,6 @@ class DesktopDraftSigningIdentityStore private constructor(
                 "데스크톱 전달 signer 저장소가 atomic move를 지원하지 않습니다.",
                 error,
             )
-        } finally {
-            if (basicFileKeyOrNull(target) == sourceState.fileKey) {
-                published += PublishedFile(target, sourceState.fileKey)
-            }
         }
         if (existsNoFollow(source)) {
             throw IllegalStateException(
@@ -556,26 +535,6 @@ class DesktopDraftSigningIdentityStore private constructor(
         validateRoots(guard)
     }
 
-    private fun deleteIfIdentity(path: Path, fileKey: Any, guard: RootsGuard) {
-        if (!existsNoFollow(path)) return
-        if (basicFileKeyOrNull(path) != fileKey) {
-            throw IllegalStateException(
-                "데스크톱 전달 signer 정리 대상 identity가 변경되었습니다.",
-            )
-        }
-        requireSafeFile(path, guard)
-        Files.delete(path)
-        validateRoots(guard)
-    }
-
-    private fun basicFileKeyOrNull(path: Path): Any? = runCatching {
-        Files.readAttributes(
-            path,
-            BasicFileAttributes::class.java,
-            NOFOLLOW_LINKS,
-        ).fileKey()
-    }.getOrNull()
-
     private fun ownerToken(path: Path): String = runCatching {
         "uid:${(Files.getAttribute(path, "unix:uid", NOFOLLOW_LINKS) as Number).toLong()}"
     }.getOrElse {
@@ -616,11 +575,6 @@ class DesktopDraftSigningIdentityStore private constructor(
         val owner: String,
     )
 
-    private data class PublishedFile(
-        val path: Path,
-        val fileKey: Any,
-    )
-
     companion object {
         private val PROCESS_LOCKS = ConcurrentHashMap<Path, ReentrantLock>()
         private val FILE_PERMISSIONS = setOf(
@@ -646,6 +600,16 @@ class DesktopDraftSigningIdentityStore private constructor(
             paths = paths,
             hostOs = DesktopHostOs.WINDOWS,
             windowsAclAccess = aclAccess,
+            windowsAtomicMove = atomicMove,
+        )
+
+        internal fun testingMac(
+            paths: DesktopApplicationPaths,
+            atomicMove: WindowsAtomicMove,
+        ): DesktopDraftSigningIdentityStore = DesktopDraftSigningIdentityStore(
+            paths = paths,
+            hostOs = DesktopHostOs.MAC,
+            windowsAclAccess = NioWindowsAclAccess,
             windowsAtomicMove = atomicMove,
         )
     }

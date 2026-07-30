@@ -29,6 +29,17 @@ internal object WindowsOwnerAcl {
             .setPermissions(EnumSet.allOf(AclEntryPermission::class.java))
             .build(),
     )
+
+    fun requireOwnerOnly(
+        owner: UserPrincipal,
+        entries: List<AclEntry>,
+    ) {
+        if (entries != ownerOnly(owner)) {
+            throw IllegalStateException(
+                "Windows 전달 signer 경로 ACL이 현재 owner 전용이 아닙니다.",
+            )
+        }
+    }
 }
 
 internal object NioWindowsAclAccess : WindowsAclAccess {
@@ -40,10 +51,7 @@ internal object NioWindowsAclAccess : WindowsAclAccess {
 
     override fun requireOwnerOnly(path: Path) {
         val view = view(path)
-        val expected = WindowsOwnerAcl.ownerOnly(view.owner)
-        require(view.acl == expected) {
-            "Windows 전달 signer 경로 ACL이 현재 owner 전용이 아닙니다: $path"
-        }
+        WindowsOwnerAcl.requireOwnerOnly(view.owner, view.acl)
     }
 
     private fun view(path: Path): AclFileAttributeView = requireNotNull(
