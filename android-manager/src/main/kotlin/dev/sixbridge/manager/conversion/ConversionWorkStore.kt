@@ -261,8 +261,14 @@ class ConversionWorkStore internal constructor(
         preserveBuilding = true,
     )
 
+    internal suspend fun restoreForCoordinator(): RestoredConversionJob? = restoreInternal(
+        preserveBuilding = true,
+        deferInterruptedCleanup = true,
+    )
+
     private suspend fun restoreInternal(
         preserveBuilding: Boolean,
+        deferInterruptedCleanup: Boolean = false,
     ): RestoredConversionJob? = mutex.withLock {
         withContext(Dispatchers.IO) {
             val root = runCatching(::requirePrivateRoot).getOrNull() ?: return@withContext null
@@ -278,10 +284,22 @@ class ConversionWorkStore internal constructor(
                 return@withContext null
             }
             if (stage == ConversionJobStage.DISCARDING) {
+                if (deferInterruptedCleanup) {
+                    row.toInterruptedRestored()?.let { return@withContext it }
+                }
                 discardClaimed(root, row)
                 return@withContext null
             }
             if (stage != ConversionJobStage.BUNDLE_READY && isExpired(row.updatedAtEpochMillis)) {
+                if (deferInterruptedCleanup) {
+                    val claimed = claimDiscarding(row)
+                    if (claimed != null) {
+                        hooks.afterDiscardClaim()
+                        claimed.toInterruptedRestored()?.let { return@withContext it }
+                        discardClaimed(root, claimed)
+                        return@withContext null
+                    }
+                }
                 discardInvalid(root, row)
                 return@withContext null
             }
@@ -324,6 +342,27 @@ class ConversionWorkStore internal constructor(
             }
             restored
         }
+    }
+
+    private fun ConversionJobEntity.toInterruptedRestored(): RestoredConversionJob? {
+        if (singletonId != ConversionJobEntity.SINGLETON_ID ||
+            generation <= 0 ||
+            !isCanonicalUuid(token)
+        ) {
+            return null
+        }
+        val restoredInputKind = enumValueOrNull<OnDeviceInputKind>(inputKind) ?: return null
+        if (!isLowerHexSha256(inputSha256)) return null
+        val adapterIds = decodeAdapterIds(approvedAdapterIdsJson) ?: return null
+        return RestoredConversionJob(
+            token = token,
+            inputKind = restoredInputKind,
+            inputSha256 = inputSha256,
+            stage = ConversionJobStage.DISCARDING,
+            approvedAdapterIds = adapterIds,
+            profileSha256 = profileSha256,
+            bundleSha256 = bundleSha256,
+        )
     }
 
     suspend fun resetAwaitingApproval(

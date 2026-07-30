@@ -1016,6 +1016,72 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `production restore는 durable DISCARDING 실패를 exact token pending으로 전달한다`() =
+        runTest {
+            var failWorkDelete = true
+            val created = store().create(artifact("interrupted".encodeToByteArray()))
+            val interrupted = store(
+                hooks = ConversionWorkStoreHooks(
+                    afterDiscardClaim = { error("simulated process death") },
+                ),
+            )
+            assertFailsWith<IllegalStateException> {
+                interrupted.discard(created.token)
+            }
+            val workStore = store(
+                hooks = ConversionWorkStoreHooks(
+                    deleteTree = { path ->
+                        !failWorkDelete && path.toFile().deleteRecursively()
+                    },
+                ),
+            )
+            val bundleStore = GeneratedBundleStore(
+                filesDir = File(sourceRoot, "durable-discarding-generated").apply {
+                    check(mkdir())
+                },
+                wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            )
+            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+
+            val pending = assertIs<RestoredConversion.InterruptedCleanupPending>(
+                coordinator.restore(),
+            )
+
+            assertEquals(created.token, pending.token)
+            assertEquals(ConversionJobStage.DISCARDING.name, dao.get()?.stage)
+
+            failWorkDelete = false
+            assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
+            assertNull(dao.get())
+            assertFalse(File(root, created.token).exists())
+        }
+
+    @Test
+    fun `production restore는 만료된 미완료 stage를 exact token으로 정리했다고 전달한다`() =
+        runTest {
+            val workStore = store()
+            val created = workStore.create(artifact("expired".encodeToByteArray()))
+            dao.force(
+                requireNotNull(dao.get()).copy(
+                    updatedAtEpochMillis =
+                        now - ConversionWorkStore.INCOMPLETE_RETENTION_MILLIS,
+                ),
+            )
+            val bundleStore = GeneratedBundleStore(
+                filesDir = File(sourceRoot, "expired-generated").apply {
+                    check(mkdir())
+                },
+                wrapperVerifier = GeneratedWrapperVerifier { _, _, _ -> true },
+            )
+            val coordinator = discardOnlyCoordinator(workStore, bundleStore)
+
+            assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
+
+            assertNull(dao.get())
+            assertFalse(File(root, created.token).exists())
+        }
+
+    @Test
     fun `미래 음수 retention 경계와 작은 clock rollback을 구분한다`() = runTest {
         val base = store()
         val created = base.create(artifact("input".encodeToByteArray()))
