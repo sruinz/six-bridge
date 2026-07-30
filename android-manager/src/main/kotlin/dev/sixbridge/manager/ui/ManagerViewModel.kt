@@ -1967,7 +1967,8 @@ class ManagerViewModel(
                 it.copy(
                     message = UserMessage(
                         UserMessageKind.FILE_MANAGER_MISSING,
-                        "파일 앱을 찾을 수 없습니다.",
+                        "지원되는 파일 앱을 찾을 수 없습니다.\n" +
+                            "APK를 파일로 저장한 뒤 다른 기기에서 설치 호환성을 확인해 주세요.",
                         RecoveryAction.NONE,
                     ),
                 )

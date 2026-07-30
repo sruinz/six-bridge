@@ -1776,7 +1776,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `파일 앱 열기는 표준 chooser를 현재 세대 effect로 발행한다`() =
+    fun `파일 앱 열기는 지원되는 파일 앱 Intent를 현재 세대 effect로 발행한다`() =
         runTest(dispatcher.scheduler) {
             val launcher = Intent()
             val viewModel = ManagerViewModel(
@@ -1797,7 +1797,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `파일 앱 resolver가 없으면 chooser를 열지 않고 지정 메시지만 표시한다`() =
+    fun `지원되는 파일 앱이 없으면 launch 없이 지정 메시지만 표시한다`() =
         runTest(dispatcher.scheduler) {
             val viewModel = ManagerViewModel(
                 FakeManagerRepository(),
@@ -1811,12 +1811,13 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.OpenFileManager)
 
             assertEquals(
-                UserMessageKind.FILE_MANAGER_MISSING,
-                viewModel.state.value.message?.kind,
+                "지원되는 파일 앱을 찾을 수 없습니다.\n" +
+                    "APK를 파일로 저장한 뒤 다른 기기에서 설치 호환성을 확인해 주세요.",
+                viewModel.state.value.message?.text,
             )
             assertEquals(
-                "파일 앱을 찾을 수 없습니다.",
-                viewModel.state.value.message?.text,
+                UserMessageKind.FILE_MANAGER_MISSING,
+                viewModel.state.value.message?.kind,
             )
             assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
         }

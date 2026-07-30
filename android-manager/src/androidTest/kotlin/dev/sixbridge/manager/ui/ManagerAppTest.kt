@@ -820,12 +820,12 @@ class ManagerAppTest {
             .performScrollToNode(hasTestTag("manual-install:open-file-manager"))
         composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
         composeRule.onNodeWithText(
-            "파일 앱에서 저장한 APK를 직접 눌러 설치해 주세요.",
+            "시스템 파일 앱의 다운로드 폴더에서 저장한 APK를 직접 눌러 설치해 주세요.",
         ).assertExists()
         composeRule.onNodeWithText(
-            "설치 출처에 따라 삼성 인터넷의 지원 여부가 달라질 수 있습니다. " +
-                "설치 뒤 상태를 확인해 주세요.",
+            "일부 서드파티 파일 앱에서 설치하면 삼성 인터넷에서 지원되지 않을 수 있습니다.",
         ).assertExists()
+        composeRule.onNodeWithText("파일 앱 열기").assertExists()
         composeRule.onNodeWithText("삼성 내 파일", substring = true).assertDoesNotExist()
         composeRule.onNodeWithTag("manual-install:open-file-manager").performClick()
         composeRule.onNodeWithTag("review:scroll")
@@ -856,6 +856,13 @@ class ManagerAppTest {
         composeRule.onNodeWithTag("conversion:result-screen")
             .performScrollToNode(hasTestTag("manual-install:open-file-manager"))
         composeRule.onNodeWithText("APK를 저장했습니다.").assertExists()
+        composeRule.onNodeWithText(
+            "시스템 파일 앱의 다운로드 폴더에서 저장한 APK를 직접 눌러 설치해 주세요.",
+        ).assertExists()
+        composeRule.onNodeWithText(
+            "일부 서드파티 파일 앱에서 설치하면 삼성 인터넷에서 지원되지 않을 수 있습니다.",
+        ).assertExists()
+        composeRule.onNodeWithText("파일 앱 열기").assertExists()
         composeRule.onNodeWithText("삼성 내 파일", substring = true).assertDoesNotExist()
         composeRule.onNodeWithTag("manual-install:open-file-manager").performClick()
         composeRule.onNodeWithTag("manual-install:check-status").performClick()
