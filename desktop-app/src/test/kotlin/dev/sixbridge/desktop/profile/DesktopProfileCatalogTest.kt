@@ -11,11 +11,15 @@ import java.nio.channels.Channels
 import java.nio.channels.WritableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption.CREATE_NEW
+import java.nio.file.StandardOpenOption.WRITE
+import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -124,6 +128,195 @@ class DesktopProfileCatalogTest {
         Files.writeString(profiles.resolve("not-a-sha.json"), "{}")
 
         assertTrue(catalog(dataRoot = dataRoot).loadPersisted().isEmpty())
+    }
+
+    @Test
+    fun `정적 profiles symlink에는 저장하지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val outsideDirectory = Files.createTempDirectory("six-bridge-outside")
+        Files.createSymbolicLink(dataRoot.resolve("profiles"), outsideDirectory)
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+        )
+
+        val imported = catalog.importJson(signedEnvelope(pair).encodeToByteArray())
+
+        assertEquals(DesktopProfileTrust.SIGNED, imported.trust)
+        Files.list(outsideDirectory).use { entries ->
+            assertEquals(0, entries.count())
+        }
+        assertTrue(catalog.loadPersisted().isEmpty())
+    }
+
+    @Test
+    fun `temp open 전 parent symlink replacement는 외부에 파일을 만들지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val outsideDirectory = Files.createTempDirectory("six-bridge-outside")
+        val displacedDirectory = dataRoot.resolve("profiles-displaced")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        var replaced = false
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+            persistenceCheckpoint = { checkpoint, directory ->
+                if (
+                    checkpoint == DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_TEMP_OPEN &&
+                    !replaced
+                ) {
+                    Files.move(directory, displacedDirectory)
+                    Files.createSymbolicLink(directory, outsideDirectory)
+                    replaced = true
+                }
+            },
+        )
+
+        assertFails {
+            catalog.importJson(signedEnvelope(pair).encodeToByteArray())
+        }
+
+        Files.list(outsideDirectory).use { entries ->
+            assertEquals(0, entries.count())
+        }
+        Files.list(displacedDirectory).use { entries ->
+            assertEquals(0, entries.count())
+        }
+    }
+
+    @Test
+    fun `force 후 실제 directory replacement는 실패 temp를 남긴다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val displacedDirectory = dataRoot.resolve("profiles-displaced")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        var replaced = false
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+            persistenceCheckpoint = { checkpoint, directory ->
+                if (
+                    checkpoint == DesktopProfilePersistenceCheckpoint.PERSIST_AFTER_FORCE &&
+                    !replaced
+                ) {
+                    Files.move(directory, displacedDirectory)
+                    Files.createDirectory(directory)
+                    replaced = true
+                }
+            },
+        )
+
+        assertFails {
+            catalog.importJson(signedEnvelope(pair).encodeToByteArray())
+        }
+
+        Files.list(dataRoot.resolve("profiles")).use { entries ->
+            assertEquals(0, entries.count())
+        }
+        Files.list(displacedDirectory).use { entries ->
+            val names = entries.map { it.fileName.toString() }.toList()
+            assertEquals(1, names.size)
+            assertTrue(names.single().endsWith(".tmp"))
+        }
+        assertTrue(catalog(dataRoot = dataRoot).loadPersisted().isEmpty())
+    }
+
+    @Test
+    fun `load 중 실제 directory replacement는 persisted profile을 신뢰하지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val displacedDirectory = dataRoot.resolve("profiles-displaced")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val trustedKeys = mapOf("test-key" to pair.public)
+        catalog(
+            dataRoot = dataRoot,
+            trustedKeys = trustedKeys,
+        ).importJson(signedEnvelope(pair).encodeToByteArray())
+        var replaced = false
+        val replacingCatalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = trustedKeys,
+            persistenceCheckpoint = { checkpoint, directory ->
+                if (
+                    checkpoint == DesktopProfilePersistenceCheckpoint.LOAD_DIRECTORY_OPENED &&
+                    !replaced
+                ) {
+                    Files.move(directory, displacedDirectory)
+                    Files.createDirectory(directory)
+                    replaced = true
+                }
+            },
+        )
+
+        assertTrue(replacingCatalog.loadPersisted().isEmpty())
+
+        Files.list(dataRoot.resolve("profiles")).use { entries ->
+            assertEquals(0, entries.count())
+        }
+        Files.list(displacedDirectory).use { entries ->
+            assertEquals(1, entries.count())
+        }
+    }
+
+    @Test
+    fun `existing signed destination 변조는 재검증하고 덮어쓰지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val envelope = signedEnvelope(pair)
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+        )
+        val imported = catalog.importJson(envelope.encodeToByteArray())
+        val destination = dataRoot.resolve("profiles").resolve("${imported.id}.json")
+        val original = Files.readAllBytes(destination)
+
+        catalog.importJson(envelope.encodeToByteArray())
+        assertContentEquals(original, Files.readAllBytes(destination))
+
+        val tampered = replaceRecordField(
+            original,
+            "profileSha256",
+            JsonPrimitive("0".repeat(64)),
+        )
+        Files.write(destination, tampered)
+
+        assertFails {
+            catalog.importJson(envelope.encodeToByteArray())
+        }
+        assertContentEquals(tampered, Files.readAllBytes(destination))
+        assertTrue(catalog.loadPersisted().isEmpty())
+    }
+
+    @Test
+    fun `move 직전 나타난 final은 덮어쓰지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val destinationName = "${profile.canonicalSha256()}.json"
+        val occupied = "occupied".encodeToByteArray()
+        var occupiedDestination = false
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+            persistenceCheckpoint = { checkpoint, directory ->
+                if (
+                    checkpoint == DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_MOVE &&
+                    !occupiedDestination
+                ) {
+                    Files.write(directory.resolve(destinationName), occupied, CREATE_NEW, WRITE)
+                    occupiedDestination = true
+                }
+            },
+        )
+
+        assertFails {
+            catalog.importJson(signedEnvelope(pair).encodeToByteArray())
+        }
+
+        val profilesDirectory = dataRoot.resolve("profiles")
+        assertContentEquals(occupied, Files.readAllBytes(profilesDirectory.resolve(destinationName)))
+        Files.list(profilesDirectory).use { entries ->
+            assertEquals(1, entries.filter { it.fileName.toString().endsWith(".tmp") }.count())
+        }
+        assertTrue(catalog.loadPersisted().isEmpty())
     }
 
     @Test
@@ -237,7 +430,19 @@ class DesktopProfileCatalogTest {
         dataRoot: Path = Files.createTempDirectory("six-bridge-catalog"),
         trustedKeys: Map<String, java.security.PublicKey> = emptyMap(),
         extract: (Path) -> BrowserProfile = { profile.copy(versionName = "31.0.0.1") },
-    ) = DesktopProfileCatalog.testing(dataRoot, trustedKeys, extract)
+        persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
+    ) = DesktopProfileCatalog.testing(
+        dataRoot,
+        trustedKeys,
+        extract,
+        persistenceCheckpoint = persistenceCheckpoint,
+    )
+
+    private fun signedEnvelope(pair: KeyPair): String = SignedBrowserProfile.sign(
+        BrowserProfileJson.encode(profile).encodeToByteArray(),
+        "test-key",
+        pair.private,
+    )
 
     private fun onlyPersistedPath(dataRoot: Path): Path =
         Files.list(dataRoot.resolve("profiles")).use { entries -> entries.toList().single() }

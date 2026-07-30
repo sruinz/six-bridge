@@ -45,17 +45,30 @@ data class DesktopProfileOption(
     val explanation: String,
 )
 
+internal enum class DesktopProfilePersistenceCheckpoint {
+    LOAD_DIRECTORY_READY,
+    LOAD_DIRECTORY_OPENED,
+    PERSIST_DIRECTORY_READY,
+    PERSIST_BEFORE_TEMP_OPEN,
+    PERSIST_TEMP_OPENED,
+    PERSIST_AFTER_FORCE,
+    PERSIST_BEFORE_MOVE,
+    PERSIST_AFTER_MOVE,
+}
+
 class DesktopProfileCatalog private constructor(
     private val dataRoot: Path,
     private val trustedKeys: Map<String, PublicKey>,
     private val extractProfile: (Path) -> BrowserProfile,
     private val resources: ClassLoader,
+    private val persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit,
 ) {
     constructor(dataRoot: Path) : this(
         dataRoot = dataRoot,
         trustedKeys = loadBundledTrustedProfileKeys(DesktopProfileCatalog::class.java.classLoader),
         extractProfile = BrowserProfileExtractor()::extract,
         resources = DesktopProfileCatalog::class.java.classLoader,
+        persistenceCheckpoint = { _, _ -> },
     )
 
     fun builtIns(): List<DesktopProfileOption> = builtInProfiles().map(::builtInOption)
@@ -88,10 +101,21 @@ class DesktopProfileCatalog private constructor(
     }
 
     fun loadPersisted(): List<DesktopProfileOption> {
-        val directory = profilesDirectory(create = false) ?: return emptyList()
-        return Files.newDirectoryStream(directory).use { entries ->
-            entries.mapNotNull { path -> loadPersisted(path) }.toList()
-        }
+        return runCatching {
+            val directory = profilesDirectory(create = false) ?: return@runCatching emptyList()
+            checkpoint(directory, DesktopProfilePersistenceCheckpoint.LOAD_DIRECTORY_READY)
+            Files.newDirectoryStream(directory.path).use { entries ->
+                checkpoint(directory, DesktopProfilePersistenceCheckpoint.LOAD_DIRECTORY_OPENED)
+                entries.mapNotNull { path ->
+                    requireSameRealDirectory(directory)
+                    loadPersisted(path).also {
+                        requireSameRealDirectory(directory)
+                    }
+                }.toList().also {
+                    requireSameRealDirectory(directory)
+                }
+            }
+        }.getOrElse { emptyList() }
     }
 
     private fun loadPersisted(path: Path): DesktopProfileOption? = runCatching {
@@ -159,11 +183,12 @@ class DesktopProfileCatalog private constructor(
     private fun persist(profile: BrowserProfile, record: PersistedProfile) {
         val profileSha256 = profile.canonicalSha256()
         require(record.profileSha256 == profileSha256)
+        val encoded = encodeRecord(record)
         val directory = profilesDirectory(create = true) ?: return
-        val directoryFileKey = fileKey(directory)
-        val destination = directory.resolve("$profileSha256.json")
+        checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_DIRECTORY_READY)
+        val destination = directory.path.resolve("$profileSha256.json")
         require(
-            destination.parent == directory &&
+            destination.parent == directory.path &&
                 (
                     !Files.exists(destination, NOFOLLOW_LINKS) ||
                         Files.isRegularFile(destination, NOFOLLOW_LINKS)
@@ -171,65 +196,153 @@ class DesktopProfileCatalog private constructor(
         ) {
             "profile 저장 경로가 올바르지 않습니다."
         }
-        if (Files.exists(destination, NOFOLLOW_LINKS)) return
-        val temporary = directory.resolve(".$profileSha256.${UUID.randomUUID()}.tmp")
-        var temporaryFileKey: Any? = null
+        if (Files.exists(destination, NOFOLLOW_LINKS)) {
+            validateExistingDestination(directory, destination, encoded, record)
+            return
+        }
+        val temporary = directory.path.resolve(".$profileSha256.${UUID.randomUUID()}.tmp")
+        checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_TEMP_OPEN)
+        // Path 기반 delete는 stat 이후 다른 파일로 교체될 수 있으므로 실패한 temp는 지우지 않는다.
+        // temp 파일명은 persisted profile hash 규칙과 일치하지 않아 load 대상이 되지 않는다.
+        val temporaryFileKey = FileChannel.open(
+            temporary,
+            CREATE_NEW,
+            WRITE,
+            NOFOLLOW_LINKS,
+        ).use { channel ->
+            checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_TEMP_OPENED)
+            val openedFileKey = regularFileKey(temporary)
+            DesktopProfileFileIo.writeFully(channel, encoded)
+            require(channel.size() == encoded.size.toLong()) {
+                "profile 임시 파일이 완전히 기록되지 않았습니다."
+            }
+            channel.force(true)
+            checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_AFTER_FORCE)
+            openedFileKey
+        }
+        val temporaryAttributes = fileAttributes(temporary)
+        require(
+            temporaryAttributes.isRegularFile &&
+                !temporaryAttributes.isSymbolicLink &&
+                temporaryAttributes.fileKey() == temporaryFileKey &&
+                temporaryAttributes.size() == encoded.size.toLong(),
+        ) {
+            "profile 임시 파일이 게시 전에 변경되었습니다."
+        }
+        checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_MOVE)
+        if (Files.exists(destination, NOFOLLOW_LINKS)) {
+            validateExistingDestination(directory, destination, encoded, record)
+            return
+        }
+        // macOS의 ATOMIC_MOVE는 이 확인 뒤 나타난 target을 덮어쓸 수 있다. Java 17 Path API만으로
+        // parent-bound openat를 만들 수 없어 직전·직후 directory/file identity 확인으로 범위를 줄인다.
         try {
-            val encoded = encodeRecord(record)
-            FileChannel.open(temporary, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { channel ->
-                temporaryFileKey = fileKey(temporary)
-                DesktopProfileFileIo.writeFully(channel, encoded)
-                require(channel.size() == encoded.size.toLong()) {
-                    "profile 임시 파일이 완전히 기록되지 않았습니다."
-                }
-                channel.force(true)
-            }
-            val temporaryAttributes = fileAttributes(temporary)
-            require(
-                temporaryAttributes.isRegularFile &&
-                    temporaryAttributes.fileKey() == temporaryFileKey &&
-                    temporaryAttributes.size() == encoded.size.toLong(),
-            ) {
-                "profile 임시 파일이 게시 전에 변경되었습니다."
-            }
-            require(fileKey(directory) == directoryFileKey) {
-                "profile 저장 디렉터리가 기록 중 변경되었습니다."
-            }
-            try {
-                Files.move(temporary, destination, ATOMIC_MOVE)
-            } catch (error: AtomicMoveNotSupportedException) {
-                throw IllegalStateException("profile 저장소는 atomic move를 지원해야 합니다.", error)
-            }
-            require(fileKey(directory) == directoryFileKey) {
-                "profile 저장 디렉터리가 게시 중 변경되었습니다."
-            }
-            val destinationAttributes = fileAttributes(destination)
-            require(
-                destinationAttributes.isRegularFile &&
-                    destinationAttributes.fileKey() == temporaryFileKey &&
-                    destinationAttributes.size() == encoded.size.toLong(),
-            ) {
-                "profile 최종 파일이 게시 중 변경되었습니다."
-            }
-        } finally {
-            deleteOwnedTemporary(
-                temporary,
-                directory,
-                directoryFileKey,
-                temporaryFileKey,
-            )
+            Files.move(temporary, destination, ATOMIC_MOVE)
+        } catch (error: AtomicMoveNotSupportedException) {
+            throw IllegalStateException("profile 저장소는 atomic move를 지원해야 합니다.", error)
+        }
+        checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_AFTER_MOVE)
+        val destinationAttributes = fileAttributes(destination)
+        require(
+            destinationAttributes.isRegularFile &&
+                !destinationAttributes.isSymbolicLink &&
+                destinationAttributes.fileKey() == temporaryFileKey &&
+                destinationAttributes.size() == encoded.size.toLong(),
+        ) {
+            "profile 최종 파일이 게시 중 변경되었습니다."
+        }
+        validateStoredDestination(destination, encoded, record)
+        requireSameRealDirectory(directory)
+        val verifiedDestinationAttributes = fileAttributes(destination)
+        require(
+            verifiedDestinationAttributes.isRegularFile &&
+                !verifiedDestinationAttributes.isSymbolicLink &&
+                verifiedDestinationAttributes.fileKey() == temporaryFileKey &&
+                verifiedDestinationAttributes.size() == encoded.size.toLong(),
+        ) {
+            "profile 최종 파일이 검증 중 변경되었습니다."
         }
     }
 
-    private fun profilesDirectory(create: Boolean): Path? {
+    private fun validateExistingDestination(
+        directory: RealDirectoryIdentity,
+        destination: Path,
+        expected: ByteArray,
+        record: PersistedProfile,
+    ) {
+        requireSameRealDirectory(directory)
+        validateStoredDestination(destination, expected, record)
+        requireSameRealDirectory(directory)
+    }
+
+    private fun validateStoredDestination(
+        destination: Path,
+        expected: ByteArray,
+        record: PersistedProfile,
+    ) {
+        require(
+            Files.isRegularFile(destination, NOFOLLOW_LINKS) &&
+                !Files.isSymbolicLink(destination),
+        ) {
+            "기존 profile 저장 파일은 일반 파일이어야 합니다."
+        }
+        require(DesktopProfileFileIo.readBounded(destination, MAX_PERSISTED_BYTES).contentEquals(expected)) {
+            "기존 profile 저장 파일 내용이 새 record와 일치하지 않습니다."
+        }
+        val loaded = requireNotNull(loadPersisted(destination)) {
+            "기존 profile 저장 record를 다시 검증할 수 없습니다."
+        }
+        require(loaded.id == record.profileSha256 && loaded.trust == record.trust) {
+            "기존 profile 저장 record identity가 일치하지 않습니다."
+        }
+    }
+
+    private fun checkpoint(
+        directory: RealDirectoryIdentity,
+        value: DesktopProfilePersistenceCheckpoint,
+    ) {
+        persistenceCheckpoint(value, directory.path)
+        requireSameRealDirectory(directory)
+    }
+
+    private fun profilesDirectory(create: Boolean): RealDirectoryIdentity? {
         val root = dataRoot.toAbsolutePath().normalize()
         if (create) Files.createDirectories(root)
-        if (!Files.isDirectory(root, NOFOLLOW_LINKS) || Files.isSymbolicLink(root)) return null
+        val rootIdentity = realDirectoryIdentityOrNull(root) ?: return null
         val directory = root.resolve("profiles")
         if (create) createDirectoryIfMissing(directory)
-        if (!Files.isDirectory(directory, NOFOLLOW_LINKS) || Files.isSymbolicLink(directory)) return null
-        return directory
+        val directoryIdentity = realDirectoryIdentityOrNull(directory) ?: return null
+        requireSameRealDirectory(rootIdentity)
+        return directoryIdentity
     }
+
+    private fun requireSameRealDirectory(expected: RealDirectoryIdentity) {
+        val actual = realDirectoryIdentity(expected.path)
+        require(actual.fileKey == expected.fileKey) {
+            "profile 저장 디렉터리가 작업 중 변경되었습니다."
+        }
+    }
+
+    private fun realDirectoryIdentityOrNull(path: Path): RealDirectoryIdentity? =
+        runCatching { realDirectoryIdentity(path) }.getOrNull()
+
+    private fun realDirectoryIdentity(path: Path): RealDirectoryIdentity {
+        val attributes = fileAttributes(path)
+        require(attributes.isDirectory && !attributes.isSymbolicLink) {
+            "profile 저장 경로는 실제 디렉터리여야 합니다."
+        }
+        return RealDirectoryIdentity(
+            path = path,
+            fileKey = requireNotNull(attributes.fileKey()) {
+                "profile 저장 디렉터리 identity를 확인할 수 없습니다."
+            },
+        )
+    }
+
+    private data class RealDirectoryIdentity(
+        val path: Path,
+        val fileKey: Any,
+    )
 
     private fun createDirectoryIfMissing(path: Path) {
         if (!Files.exists(path, NOFOLLOW_LINKS)) Files.createDirectory(path)
@@ -365,11 +478,13 @@ class DesktopProfileCatalog private constructor(
             trustedKeys: Map<String, PublicKey> = emptyMap(),
             extractProfile: (Path) -> BrowserProfile = BrowserProfileExtractor()::extract,
             resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
+            persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
         ): DesktopProfileCatalog = DesktopProfileCatalog(
             dataRoot,
             trustedKeys,
             extractProfile,
             resources,
+            persistenceCheckpoint,
         )
     }
 }
@@ -443,31 +558,15 @@ internal object DesktopProfileFileIo {
     }
 }
 
-private fun fileKey(path: Path): Any =
-    requireNotNull(
-        fileAttributes(path).fileKey(),
-    ) {
+private fun regularFileKey(path: Path): Any {
+    val attributes = fileAttributes(path)
+    require(attributes.isRegularFile && !attributes.isSymbolicLink) {
+        "profile 저장 파일은 실제 일반 파일이어야 합니다."
+    }
+    return requireNotNull(attributes.fileKey()) {
         "profile 저장 경로 identity를 확인할 수 없습니다."
     }
+}
 
 private fun fileAttributes(path: Path): BasicFileAttributes =
     Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
-
-private fun deleteOwnedTemporary(
-    temporary: Path,
-    directory: Path,
-    expectedDirectoryFileKey: Any,
-    expectedTemporaryFileKey: Any?,
-) {
-    if (expectedTemporaryFileKey == null || !Files.exists(temporary, NOFOLLOW_LINKS)) return
-    val directoryAttributes = runCatching { fileAttributes(directory) }.getOrNull() ?: return
-    val temporaryAttributes = runCatching { fileAttributes(temporary) }.getOrNull() ?: return
-    if (
-        directoryAttributes.isDirectory &&
-        directoryAttributes.fileKey() == expectedDirectoryFileKey &&
-        temporaryAttributes.isRegularFile &&
-        temporaryAttributes.fileKey() == expectedTemporaryFileKey
-    ) {
-        Files.deleteIfExists(temporary)
-    }
-}
