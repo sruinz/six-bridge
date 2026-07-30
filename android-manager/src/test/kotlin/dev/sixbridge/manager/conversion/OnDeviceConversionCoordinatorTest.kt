@@ -197,6 +197,9 @@ class OnDeviceConversionCoordinatorTest {
             assertEquals(1, fixture.events.count { it == "release" })
             assertTrue(fixture.inputOrphaned)
             assertTrue("profile" !in fixture.events)
+            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedTokens)
         }
 
     @Test
@@ -573,7 +576,44 @@ class OnDeviceConversionCoordinatorTest {
 
         assertEquals(AnalysisSafetyPolicy.mobile, fixture.analysisPolicy)
         assertTrue(fixture.analysisCancellationObserved)
+        assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+        assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
+        assertEquals(listOf(fixture.token), fixture.discardedTokens)
     }
+
+    @Test
+    fun `분석 취소 cleanup 일부 실패는 exact token cancellation으로 보존한다`() =
+        runBlocking {
+            val analysisEntered = CountDownLatch(1)
+            val allowAnalysis = CountDownLatch(1)
+            val observed = AtomicReference<CancellationException>()
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                analysisBlockingEntered = analysisEntered
+                analysisBlockingGate = allowAnalysis
+                identityAbortFailure = IllegalStateException("abort failed")
+            }
+            val deferred = async(Dispatchers.Default) {
+                try {
+                    fixture.coordinator().begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    )
+                } catch (error: CancellationException) {
+                    observed.set(error)
+                }
+            }
+            assertTrue(analysisEntered.await(5, TimeUnit.SECONDS))
+
+            deferred.cancel(CancellationException("caller cancelled"))
+            allowAnalysis.countDown()
+            deferred.join()
+
+            val cancellation =
+                assertIs<ConversionCleanupCancellationException>(observed.get())
+            assertEquals(fixture.token, cancellation.token)
+            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedTokens)
+        }
 
     @Test
     fun `markerless는 선택이 필요하고 stable 입력은 override를 거부한다`() = runTest {
@@ -1143,6 +1183,7 @@ class OnDeviceConversionCoordinatorTest {
         var installedWrapper: InstalledWrapper? = null
         var reserveFailure: Throwable? = null
         var identityFailure: Throwable? = null
+        var identityAbortFailure: Throwable? = null
         var importFailuresRemaining = 0
         var packageFailuresRemaining = 0
         var packageFailure: Throwable? = null
@@ -1385,6 +1426,7 @@ class OnDeviceConversionCoordinatorTest {
                 override suspend fun abort(ownerToken: String) {
                     events += "abort"
                     abortedOwnerTokens += ownerToken
+                    identityAbortFailure?.let { throw it }
                     ownerAborted = true
                     activeOwner = null
                 }

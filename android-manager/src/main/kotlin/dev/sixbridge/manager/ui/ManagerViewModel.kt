@@ -17,6 +17,7 @@ import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
@@ -509,6 +510,9 @@ class ManagerViewModel(
             if (!awaitRouteMutation(ticket)) return@launch
             val result = try {
                 repository.beginConversion(request)
+            } catch (error: ConversionCleanupCancellationException) {
+                enqueueStaleConversionCleanup(error.token)
+                throw error
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {

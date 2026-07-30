@@ -62,24 +62,36 @@ internal class OnDeviceConversionCoordinator(
         val released = withContext(NonCancellable) {
             runCatching { input.release(artifact) }.getOrDefault(false)
         }
-        currentCoroutineContext().ensureActive()
-        if (createFailure is CancellationException) {
-            throw createFailure
+        val createdJob = job
+        return try {
+            currentCoroutineContext().ensureActive()
+            if (createFailure is CancellationException) {
+                throw createFailure
+            }
+            val claimedToken =
+                (createFailure as? ConversionWorkCreateException)?.claimedToken
+            if (!released) {
+                return ConversionBeginResult.Failure(
+                    ConversionFailureCode.INPUT_CLEANUP,
+                    createdJob?.token ?: claimedToken,
+                )
+            }
+            if (createFailure != null) {
+                return ConversionBeginResult.Failure(
+                    ConversionFailureCode.INPUT_INVALID,
+                    claimedToken,
+                )
+            }
+            analyzeJob(requireNotNull(createdJob), markAwaiting = true)
+        } catch (error: CancellationException) {
+            if (createdJob == null) throw error
+            when (val cleanup = discardInterrupted(createdJob.token)) {
+                RestoredConversion.InterruptedDiscarded -> throw error
+                is RestoredConversion.InterruptedCleanupPending ->
+                    throw ConversionCleanupCancellationException(cleanup.token, error)
+                else -> error("취소 cleanup은 완료 또는 pending이어야 합니다.")
+            }
         }
-        val claimedToken = (createFailure as? ConversionWorkCreateException)?.claimedToken
-        if (!released) {
-            return ConversionBeginResult.Failure(
-                ConversionFailureCode.INPUT_CLEANUP,
-                job?.token ?: claimedToken,
-            )
-        }
-        if (createFailure != null) {
-            return ConversionBeginResult.Failure(
-                ConversionFailureCode.INPUT_INVALID,
-                claimedToken,
-            )
-        }
-        return analyzeJob(requireNotNull(job), markAwaiting = true)
     }
 
     suspend fun analyze(token: String): ConversionBeginResult {

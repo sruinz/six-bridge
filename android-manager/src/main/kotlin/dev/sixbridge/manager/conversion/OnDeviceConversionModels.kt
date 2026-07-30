@@ -11,6 +11,7 @@ import dev.sixbridge.manager.packager.OnDevicePackageIdentity
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import java.io.File
 import java.io.OutputStream
+import java.util.concurrent.CancellationException
 
 sealed interface IdentityRequirement {
     data class Stable(
@@ -217,6 +218,15 @@ internal class ConversionWorkCreateException(
     },
     cause,
 )
+
+internal class ConversionCleanupCancellationException(
+    val token: String,
+    cause: CancellationException,
+) : CancellationException(cause.message) {
+    init {
+        initCause(cause)
+    }
+}
 
 internal fun interface ConversionProfilePort {
     suspend fun load(): SamsungProfileSnapshot

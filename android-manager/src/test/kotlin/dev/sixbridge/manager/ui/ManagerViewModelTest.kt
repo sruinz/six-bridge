@@ -21,6 +21,7 @@ import dev.sixbridge.manager.app.TerminalReceiptOwnerResult
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
+import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.GeneratedBundle
@@ -8379,6 +8380,54 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `협력적 분석 취소 cleanup 실패는 관리 action과 exact token retry를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                suspendFirstConversionBegin = true
+                conversionCleanupCancellationToken = TOKEN
+                discardConversionResult = false
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(
+                ManagerAction.ConversionUrlChanged("https://example.test/extension"),
+            )
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            dispatcher.scheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            viewModel.accept(ManagerAction.Remove(PACKAGE))
+            viewModel.accept(ManagerAction.OpenReport(PACKAGE))
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(listOf(PACKAGE), repository.uninstallPackages)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.Cancelling>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+
+            repository.discardConversionResult = true
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN, TOKEN), repository.discardedConversions)
+            assertFalse(repository.generatedExists)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+            assertEquals(ManagerRoute.Report(PACKAGE), viewModel.state.value.route)
+        }
+
+    @Test
     fun `분석 cleanup 중 보고서와 Add-ons 이동도 허용한다`() =
         runTest(dispatcher.scheduler) {
             val pending = CompletableDeferred<ConversionBeginResult>()
@@ -9347,6 +9396,7 @@ private class FakeManagerRepository : ManagerRepository {
     val conversionBeginResults = mutableListOf<ConversionBeginResult>()
     var suspendFirstConversionBegin = false
     var ignoreFirstConversionBeginCancellation = false
+    var conversionCleanupCancellationToken: String? = null
     var suspendFirstConversionBuild = false
     var ignoreFirstConversionBuildCancellation = false
     var restoredConversion: RestoredConversion? = null
@@ -9466,7 +9516,14 @@ private class FakeManagerRepository : ManagerRepository {
             if (ignoreFirstConversionBeginCancellation) {
                 withContext(NonCancellable) { firstConversionBeginGate.first() }
             } else {
-                firstConversionBeginGate.first()
+                try {
+                    firstConversionBeginGate.first()
+                } catch (error: CancellationException) {
+                    conversionCleanupCancellationToken?.let {
+                        throw ConversionCleanupCancellationException(it, error)
+                    }
+                    throw error
+                }
             }
         }
         return conversionBeginResults.getOrNull(index) ?: conversionBeginResult
