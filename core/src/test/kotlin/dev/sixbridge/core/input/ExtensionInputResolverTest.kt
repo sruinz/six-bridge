@@ -26,16 +26,26 @@ class ExtensionInputResolverTest {
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Reused root","version":"1"}""",
         )
-        val zip = source.parent.resolve("reused-root.zip")
-        ExtensionZip.create(source, zip)
+        val validZip = source.parent.resolve("reused-root-valid.zip")
+        ExtensionZip.create(source, validZip)
+        val invalidZip = source.parent.resolve("reused-root-invalid.zip")
+        ZipOutputStream(Files.newOutputStream(invalidZip)).use { output ->
+            output.putNextEntry(ZipEntry("../manifest.json"))
+            output.write("""{"name":"escape"}""".toByteArray())
+            output.closeEntry()
+        }
         val root = Files.createTempDirectory("six-input-reused-root")
         val resolver = ExtensionInputResolver(extractionRootFactory = { root })
 
-        runCatching { resolver.resolve(zip.toString()) }
+        val first = assertFailsWith<IllegalArgumentException> {
+            resolver.resolve(invalidZip.toString())
+        }
         val second = assertFailsWith<IllegalArgumentException> {
-            resolver.resolve(zip.toString())
+            resolver.resolve(validZip.toString())
         }
 
+        assertTrue(first.message.orEmpty().contains("ZIP 경로 탈출"))
+        assertTrue(Files.list(root).use { it.findAny().isEmpty })
         assertTrue(second.message.orEmpty().contains("이미 사용한"))
     }
 
@@ -53,6 +63,7 @@ class ExtensionInputResolverTest {
         ExtensionZip.create(source, zip)
         val root = Files.createTempDirectory("six-input-replaced-root")
         val moved = root.resolveSibling("${root.fileName}-moved")
+        @Suppress("DEPRECATION")
         val resolver = ExtensionInputResolver(
             extractionRootFactory = { root },
             extractionRootValidatedHook = { validated ->
@@ -83,7 +94,7 @@ class ExtensionInputResolverTest {
         ExtensionZip.create(source, zip)
         val root = Files.createTempDirectory("six-input-sentinel-root")
         val sentinel = root.resolve("sentinel.txt")
-        val resolver = ExtensionInputResolver(
+        val resolver = ExtensionInputResolver.withExtractionRootValidatedHook(
             extractionRootFactory = { root },
             extractionRootValidatedHook = {
                 sentinel.writeText("keep")
@@ -95,7 +106,12 @@ class ExtensionInputResolverTest {
         }
 
         assertEquals("keep", Files.readString(sentinel))
-        assertFalse(Files.exists(root.resolve("manifest.json"), NOFOLLOW_LINKS))
+        assertEquals(
+            listOf("sentinel.txt"),
+            Files.list(root).use { paths ->
+                paths.map { it.fileName.toString() }.sorted().toList()
+            },
+        )
     }
 
     @Test

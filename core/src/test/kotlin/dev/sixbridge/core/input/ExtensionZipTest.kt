@@ -21,6 +21,30 @@ import kotlin.test.assertTrue
 
 class ExtensionZipTest {
     @Test
+    fun `secure root hook 뒤 재검증 실패는 ZIP 쓰기 전에 중단한다`() {
+        val events = mutableListOf<String>()
+        var rootIsEmpty = true
+
+        val failure = assertFailsWith<IllegalArgumentException> {
+            runAfterSecureExtractionHook(
+                hook = {
+                    events += "hook"
+                    rootIsEmpty = false
+                },
+                revalidate = {
+                    events += "revalidate"
+                    require(rootIsEmpty) { "secure root is not empty" }
+                },
+            ) {
+                events += "write"
+            }
+        }
+
+        assertTrue(failure.message.orEmpty().contains("not empty"))
+        assertEquals(listOf("hook", "revalidate"), events)
+    }
+
+    @Test
     fun `creates byte-identical sorted stored archives`() {
         val source = Files.createTempDirectory("six-deterministic-zip")
         source.resolve("z.txt").writeText("z")

@@ -837,8 +837,21 @@ object ExtensionZip {
                 require(!directory.iterator().hasNext()) {
                     "ZIP 압축 해제 대상은 secure handle 확인 시점에도 비어 있어야 합니다."
                 }
-                afterSecureValidation(root)
-                val result = block(directory)
+                val result = runAfterSecureExtractionHook(
+                    hook = { afterSecureValidation(root) },
+                    revalidate = {
+                        requireSecureRootIdentity(
+                            parentStream,
+                            root.fileName,
+                            expectedFileKey,
+                        )
+                        require(!directory.iterator().hasNext()) {
+                            "ZIP 압축 해제 대상은 secure hook 뒤에도 비어 있어야 합니다."
+                        }
+                    },
+                ) {
+                    block(directory)
+                }
                 require(secureInventory(directory, control) == expectedEntries) {
                     "ZIP 압축 해제 중 예상하지 않은 root 항목이 생겼습니다."
                 }
@@ -1003,4 +1016,14 @@ object ExtensionZip {
         val entry: ZipEntry,
         val name: String,
     )
+}
+
+internal inline fun <T> runAfterSecureExtractionHook(
+    hook: () -> Unit,
+    revalidate: () -> Unit,
+    extract: () -> T,
+): T {
+    hook()
+    revalidate()
+    return extract()
 }

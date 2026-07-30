@@ -6,6 +6,7 @@ import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.input.ResolvedExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
@@ -31,17 +32,35 @@ import kotlin.test.assertTrue
 
 class ConversionPipelineTest {
     @Test
-    fun `pipeline use 정리 실패는 취소 예외에 suppressed로 보존된다`() {
-        val cleanup = IllegalStateException("cleanup")
+    fun `pipeline use는 취소를 primary로 두고 실제 다중 정리 실패를 중첩 보존한다`() {
+        val closeOrder = mutableListOf<String>()
+        val materializationFailure = IllegalStateException("materialization cleanup")
+        val engineFailure = IllegalStateException("engine cleanup")
+        val engine = RecordingPipelineEngine(
+            closeFailure = engineFailure,
+            onClose = { closeOrder += "engine" },
+        )
+        val materialization = RecordingPipelineMaterialization(
+            closeFailure = materializationFailure,
+            onClose = { closeOrder += "materialization" },
+        )
+        val pipeline = ConversionPipeline.create(
+            localRoot = Files.createTempDirectory("six-pipeline-cleanup"),
+            engine = engine,
+            materialization = materialization,
+        )
 
         val cancellation = assertFailsWith<CancellationException> {
-            AutoCloseable { throw cleanup }.use {
+            pipeline.use {
                 throw CancellationException("cancel")
             }
         }
 
         assertEquals(1, cancellation.suppressed.size)
-        assertSame(cleanup, cancellation.suppressed.single())
+        assertSame(materializationFailure, cancellation.suppressed.single())
+        assertEquals(1, materializationFailure.suppressed.size)
+        assertSame(engineFailure, materializationFailure.suppressed.single())
+        assertEquals(listOf("materialization", "engine"), closeOrder)
     }
 
     @Test
@@ -808,8 +827,12 @@ class ConversionPipelineTest {
     private fun assertPipelineCancellation(
         operation: (ConversionPipeline, AnalysisControl) -> Unit,
     ) {
-        listOf(1, 2).forEach { cancellationCheckpoint ->
-            val pipeline = ConversionPipeline(Files.createTempDirectory("six-pipeline-cancel"))
+        listOf(1, 2, 3).forEach { cancellationCheckpoint ->
+            val engine = RecordingPipelineEngine()
+            val pipeline = ConversionPipeline.create(
+                localRoot = Files.createTempDirectory("six-pipeline-cancel"),
+                engine = engine,
+            )
             var checkpoints = 0
             val control = AnalysisControl(AnalysisSafetyPolicy.desktop) {
                 checkpoints++
@@ -820,9 +843,73 @@ class ConversionPipelineTest {
             try {
                 assertFailsWith<CancellationException> { operation(pipeline, control) }
                 assertEquals(cancellationCheckpoint, checkpoints)
+                assertEquals(
+                    if (cancellationCheckpoint == 3) 1 else 0,
+                    engine.operationCalls,
+                )
+                if (cancellationCheckpoint == 3) {
+                    assertSame(control, engine.observedControl)
+                }
             } finally {
                 pipeline.close()
             }
+        }
+    }
+
+    private class RecordingPipelineEngine(
+        private val closeFailure: Throwable? = null,
+        private val onClose: () -> Unit = {},
+    ) : ConversionPipelineEngine {
+        var operationCalls = 0
+            private set
+        var observedControl: AnalysisControl? = null
+            private set
+
+        override fun analyzeWithIdentity(
+            input: PortableExtensionInput,
+            profile: BrowserProfile,
+            control: AnalysisControl,
+        ): AnalyzedConversion {
+            operationCalls++
+            observedControl = control
+            control.checkCancelled()
+            error("engine analyze가 취소 checkpoint 뒤 계속 실행됐습니다.")
+        }
+
+        override fun prepare(
+            input: PortableExtensionInput,
+            profile: BrowserProfile,
+            approvedAdapterIds: Iterable<String>,
+            control: AnalysisControl,
+        ): PreparedConversion {
+            operationCalls++
+            observedControl = control
+            control.checkCancelled()
+            error("engine prepare가 취소 checkpoint 뒤 계속 실행됐습니다.")
+        }
+
+        override fun bindIdentity(
+            prepared: PreparedConversion,
+            profile: BrowserProfile,
+            publicKeyDer: ByteArray?,
+        ): BoundConversion = error("취소 전달 테스트에서 bindIdentity를 호출하면 안 됩니다.")
+
+        override fun close() {
+            onClose()
+            closeFailure?.let { throw it }
+        }
+    }
+
+    private class RecordingPipelineMaterialization(
+        private val closeFailure: Throwable,
+        private val onClose: () -> Unit,
+    ) : ConversionPipelineMaterialization {
+        override fun snapshot(sourceZip: ByteArray): ExtensionSnapshot =
+            error("정리 테스트에서 snapshot을 호출하면 안 됩니다.")
+
+        override fun close() {
+            onClose()
+            throw closeFailure
         }
     }
 

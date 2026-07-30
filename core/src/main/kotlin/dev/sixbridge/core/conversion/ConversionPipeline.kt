@@ -23,19 +23,94 @@ import java.security.MessageDigest
 import java.util.Base64
 import kotlin.io.path.readText
 
+internal interface ConversionPipelineEngine : AutoCloseable {
+    fun analyzeWithIdentity(
+        input: PortableExtensionInput,
+        profile: BrowserProfile,
+        control: AnalysisControl,
+    ): AnalyzedConversion
+
+    fun prepare(
+        input: PortableExtensionInput,
+        profile: BrowserProfile,
+        approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl,
+    ): PreparedConversion
+
+    fun bindIdentity(
+        prepared: PreparedConversion,
+        profile: BrowserProfile,
+        publicKeyDer: ByteArray?,
+    ): BoundConversion
+}
+
+internal interface ConversionPipelineMaterialization : AutoCloseable {
+    fun snapshot(sourceZip: ByteArray): ExtensionSnapshot
+}
+
+private class DefaultConversionPipelineEngine(
+    compatibilityAnalyzer: CompatibilityAnalyzer,
+) : ConversionPipelineEngine {
+    private val delegate = ConversionPreparationEngine.create(compatibilityAnalyzer)
+
+    override fun analyzeWithIdentity(
+        input: PortableExtensionInput,
+        profile: BrowserProfile,
+        control: AnalysisControl,
+    ): AnalyzedConversion = delegate.analyzeWithIdentity(input, profile, control)
+
+    override fun prepare(
+        input: PortableExtensionInput,
+        profile: BrowserProfile,
+        approvedAdapterIds: Iterable<String>,
+        control: AnalysisControl,
+    ): PreparedConversion = delegate.prepare(
+        input,
+        profile,
+        approvedAdapterIds,
+        control,
+    )
+
+    override fun bindIdentity(
+        prepared: PreparedConversion,
+        profile: BrowserProfile,
+        publicKeyDer: ByteArray?,
+    ): BoundConversion = delegate.bindIdentity(prepared, profile, publicKeyDer)
+
+    override fun close() = delegate.close()
+}
+
+private class DefaultConversionPipelineMaterialization :
+    ConversionPipelineMaterialization {
+    private val delegate = ConversionWorkspace()
+
+    override fun snapshot(sourceZip: ByteArray): ExtensionSnapshot =
+        delegate.snapshot(sourceZip)
+
+    override fun close() = delegate.close()
+}
+
 class ConversionPipeline private constructor(
     localRoot: Path,
-    compatibilityAnalyzer: CompatibilityAnalyzer,
+    private val engineHolder: Lazy<ConversionPipelineEngine>,
+    private val materializationHolder: Lazy<ConversionPipelineMaterialization>,
 ) : AutoCloseable {
-    private val engineHolder = lazy(LazyThreadSafetyMode.NONE) {
-        ConversionPreparationEngine.create(compatibilityAnalyzer)
-    }
-    private val materializationHolder = lazy(LazyThreadSafetyMode.NONE) {
-        ConversionWorkspace()
-    }
-    private val engine: ConversionPreparationEngine
+    private constructor(
+        localRoot: Path,
+        compatibilityAnalyzer: CompatibilityAnalyzer,
+    ) : this(
+        localRoot,
+        lazy(LazyThreadSafetyMode.NONE) {
+            DefaultConversionPipelineEngine(compatibilityAnalyzer)
+        },
+        lazy(LazyThreadSafetyMode.NONE) {
+            DefaultConversionPipelineMaterialization()
+        },
+    )
+
+    private val engine: ConversionPipelineEngine
         get() = engineHolder.value
-    private val materialization: ConversionWorkspace
+    private val materialization: ConversionPipelineMaterialization
         get() = materializationHolder.value
     private val packaging = CrxIdentityPolicy.create(localRoot)
 
@@ -258,6 +333,27 @@ class ConversionPipeline private constructor(
             localRoot,
             compatibilityAnalyzer,
         )
+
+        @JvmSynthetic
+        internal fun create(
+            localRoot: Path,
+            engine: ConversionPipelineEngine,
+            materialization: ConversionPipelineMaterialization? = null,
+        ): ConversionPipeline {
+            val materializationHolder: Lazy<ConversionPipelineMaterialization> =
+                if (materialization == null) {
+                    lazy(LazyThreadSafetyMode.NONE) {
+                        DefaultConversionPipelineMaterialization()
+                    }
+                } else {
+                    lazyOf(materialization)
+                }
+            return ConversionPipeline(
+                localRoot,
+                lazyOf(engine),
+                materializationHolder,
+            )
+        }
     }
 }
 

@@ -32,15 +32,40 @@ fun interface ChromeCrxDownloader {
     fun download(address: ChromeWebStoreAddress): ByteArray
 }
 
-class ExtensionInputResolver(
+class ExtensionInputResolver private constructor(
     private val chromeDownloader: ChromeCrxDownloader? = null,
-    private val extractionRootFactory: () -> Path = {
-        Files.createTempDirectory("sixbridge-extension-")
-    },
+    private val extractionRootFactory: () -> Path,
     private val extractionRootValidatedHook: (Path) -> Unit = {},
+    @Suppress("UNUSED_PARAMETER")
+    compatibilityConstructorMarker: Unit,
 ) {
     private val consumedExtractionRootPaths = mutableSetOf<Path>()
     private val consumedExtractionRootFileKeys = mutableSetOf<Any>()
+
+    constructor(
+        chromeDownloader: ChromeCrxDownloader? = null,
+        extractionRootFactory: () -> Path = DEFAULT_EXTRACTION_ROOT_FACTORY,
+    ) : this(
+        chromeDownloader,
+        extractionRootFactory,
+        {},
+        Unit,
+    )
+
+    @Deprecated(
+        message = "검증 hook은 테스트 전용입니다. 일반 호출자는 2-arg 생성자를 사용하세요.",
+        level = DeprecationLevel.WARNING,
+    )
+    constructor(
+        chromeDownloader: ChromeCrxDownloader? = null,
+        extractionRootFactory: () -> Path = DEFAULT_EXTRACTION_ROOT_FACTORY,
+        extractionRootValidatedHook: (Path) -> Unit,
+    ) : this(
+        chromeDownloader,
+        extractionRootFactory,
+        extractionRootValidatedHook,
+        Unit,
+    )
 
     fun resolve(input: String): ResolvedExtensionInput {
         if (input.startsWith("http://") || input.startsWith("https://")) {
@@ -137,6 +162,24 @@ class ExtensionInputResolver(
             canonical,
             fileKey,
             extractionRootValidatedHook,
+        )
+    }
+
+    companion object {
+        private val DEFAULT_EXTRACTION_ROOT_FACTORY: () -> Path = {
+            Files.createTempDirectory("sixbridge-extension-")
+        }
+
+        @JvmSynthetic
+        internal fun withExtractionRootValidatedHook(
+            chromeDownloader: ChromeCrxDownloader? = null,
+            extractionRootFactory: () -> Path = DEFAULT_EXTRACTION_ROOT_FACTORY,
+            extractionRootValidatedHook: (Path) -> Unit,
+        ): ExtensionInputResolver = ExtensionInputResolver(
+            chromeDownloader,
+            extractionRootFactory,
+            extractionRootValidatedHook,
+            Unit,
         )
     }
 }
