@@ -4,15 +4,29 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.SignedBrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
+import java.nio.channels.WritableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
+import java.util.Base64
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class DesktopProfileCatalogTest {
+    private val json = Json
     private val profile = BrowserProfile(
         browserPackage = "com.sec.android.app.sbrowser",
         versionName = "30.0.2.61",
@@ -49,6 +63,25 @@ class DesktopProfileCatalogTest {
         assertEquals(DesktopProfileTrust.UNTRUSTED, raw.trust)
         assertFalse(apk.selectable)
         assertEquals(DesktopProfileTrust.UNTRUSTED, apk.trust)
+    }
+
+    @Test
+    fun `내장 profile 의미값에 unknown 또는 duplicate field가 있으면 신뢰하지 않는다`() {
+        val resource = checkNotNull(
+            javaClass.classLoader.getResourceAsStream(
+                "profiles/builtin/sbrowser-30.0.2.61.json",
+            ),
+        ).use { it.readBytes().decodeToString() }
+        val unknown = resource.dropLastWhile(Char::isWhitespace).dropLast(1) +
+            ",\n    \"unexpected\": true\n}"
+        val duplicate = resource.replaceFirst(
+            "{",
+            "{\n    \"versionName\": \"spoofed\",",
+        )
+        val catalog = catalog()
+
+        assertEquals(DesktopProfileTrust.UNTRUSTED, catalog.importJson(unknown.encodeToByteArray()).trust)
+        assertEquals(DesktopProfileTrust.UNTRUSTED, catalog.importJson(duplicate.encodeToByteArray()).trust)
     }
 
     @Test
@@ -93,9 +126,167 @@ class DesktopProfileCatalogTest {
         assertTrue(catalog(dataRoot = dataRoot).loadPersisted().isEmpty())
     }
 
+    @Test
+    fun `persisted signed metadata와 envelope 변조는 거부하고 파일을 수정하지 않는다`() {
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+        )
+        val envelope = SignedBrowserProfile.sign(
+            BrowserProfileJson.encode(profile).encodeToByteArray(),
+            "test-key",
+            pair.private,
+        )
+        catalog.importJson(envelope.encodeToByteArray())
+        val path = onlyPersistedPath(dataRoot)
+        val original = Files.readAllBytes(path)
+        val metadataTampered = replaceRecordField(
+            original,
+            "profileSha256",
+            JsonPrimitive("0".repeat(64)),
+        )
+
+        Files.write(path, metadataTampered)
+        assertTrue(catalog.loadPersisted().isEmpty())
+        assertContentEquals(metadataTampered, Files.readAllBytes(path))
+
+        val envelopeTampered = replaceRecordBase64(original, "envelopeBase64") { encoded ->
+            val decoded = Base64.getDecoder().decode(encoded).decodeToString()
+            val signature = decoded.substringAfter("\"signatureBase64\":\"").substringBefore('"')
+            val changed = "${if (signature.first() == 'A') 'B' else 'A'}${signature.drop(1)}"
+            Base64.getEncoder().encodeToString(
+                decoded.replace(signature, changed).encodeToByteArray(),
+            )
+        }
+        Files.write(path, envelopeTampered)
+        assertTrue(catalog.loadPersisted().isEmpty())
+        assertContentEquals(envelopeTampered, Files.readAllBytes(path))
+    }
+
+    @Test
+    fun `persisted APK profile과 partial record는 다시 불러오지 않는다`() {
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            extract = { profile.copy(supportedFeatures = setOf("storage.local")) },
+        )
+        catalog.importApk(Files.createTempFile("supported-sbrowser", ".apk"))
+        val path = onlyPersistedPath(dataRoot)
+        val original = Files.readAllBytes(path)
+        val profileTampered = replaceRecordBase64(original, "profileBase64") { encoded ->
+            val decoded = Base64.getDecoder().decode(encoded).decodeToString()
+            Base64.getEncoder().encodeToString(
+                decoded.replace(
+                    "\"versionName\": \"30.0.2.61\"",
+                    "\"versionName\": \"30.0.2.62\"",
+                ).encodeToByteArray(),
+            )
+        }
+
+        Files.write(path, profileTampered)
+        assertTrue(catalog.loadPersisted().isEmpty())
+        assertContentEquals(profileTampered, Files.readAllBytes(path))
+
+        val partial = dataRoot.resolve("profiles").resolve("${"0".repeat(64)}.json")
+        Files.writeString(partial, "{\"profileSha256\":")
+        assertTrue(catalog.loadPersisted().isEmpty())
+        assertEquals("{\"profileSha256\":", Files.readString(partial))
+    }
+
+    @Test
+    fun `persisted IO는 growth bound와 short write를 끝까지 검증한다`() {
+        assertFailsWith<IllegalArgumentException> {
+            DesktopProfileFileIo.readBounded(
+                Channels.newChannel(ByteArrayInputStream(ByteArray(33))),
+                32,
+            )
+        }
+
+        val payload = ByteArray(31) { it.toByte() }
+        val channel = ShortWritingChannel(maxWrite = 3)
+        DesktopProfileFileIo.writeFully(channel, payload)
+        assertContentEquals(payload, channel.bytes())
+    }
+
+    @Test
+    fun `public catalog constructor는 data root만 받는다`() {
+        val publicArities = DesktopProfileCatalog::class.java.constructors
+            .filterNot { it.isSynthetic }
+            .map { it.parameterCount }
+
+        assertEquals(listOf(1), publicArities)
+    }
+
+    @Test
+    fun `bundled DER 공개 키는 고정 key id에 매핑한다`() {
+        val keys = loadBundledTrustedProfileKeys(javaClass.classLoader)
+        val resource = checkNotNull(
+            javaClass.classLoader.getResourceAsStream(
+                "profiles/trusted/profile-signing-2026-01.der",
+            ),
+        ).use { it.readBytes() }
+
+        assertEquals(setOf("profile-signing-2026-01"), keys.keys)
+        assertTrue(keys.getValue("profile-signing-2026-01").algorithm in setOf("Ed25519", "EdDSA"))
+        assertContentEquals(resource, keys.getValue("profile-signing-2026-01").encoded)
+    }
+
     private fun catalog(
         dataRoot: Path = Files.createTempDirectory("six-bridge-catalog"),
         trustedKeys: Map<String, java.security.PublicKey> = emptyMap(),
         extract: (Path) -> BrowserProfile = { profile.copy(versionName = "31.0.0.1") },
-    ) = DesktopProfileCatalog(dataRoot, trustedKeys, extract)
+    ) = DesktopProfileCatalog.testing(dataRoot, trustedKeys, extract)
+
+    private fun onlyPersistedPath(dataRoot: Path): Path =
+        Files.list(dataRoot.resolve("profiles")).use { entries -> entries.toList().single() }
+
+    private fun replaceRecordField(
+        encoded: ByteArray,
+        name: String,
+        replacement: JsonPrimitive,
+    ): ByteArray {
+        val original = json.parseToJsonElement(encoded.decodeToString()).jsonObject
+        return json.encodeToString(
+            JsonObject.serializer(),
+            JsonObject((original + (name to replacement)).toSortedMap()),
+        ).encodeToByteArray()
+    }
+
+    private fun replaceRecordBase64(
+        encoded: ByteArray,
+        name: String,
+        transform: (String) -> String,
+    ): ByteArray {
+        val original = json.parseToJsonElement(encoded.decodeToString()).jsonObject
+        return replaceRecordField(
+            encoded,
+            name,
+            JsonPrimitive(transform(original.getValue(name).jsonPrimitive.content)),
+        )
+    }
+
+    private class ShortWritingChannel(
+        private val maxWrite: Int,
+    ) : WritableByteChannel {
+        private val output = ByteArrayOutputStream()
+        private var open = true
+
+        override fun write(source: ByteBuffer): Int {
+            val count = minOf(maxWrite, source.remaining())
+            val bytes = ByteArray(count)
+            source.get(bytes)
+            output.write(bytes)
+            return count
+        }
+
+        override fun isOpen(): Boolean = open
+
+        override fun close() {
+            open = false
+        }
+
+        fun bytes(): ByteArray = output.toByteArray()
+    }
 }

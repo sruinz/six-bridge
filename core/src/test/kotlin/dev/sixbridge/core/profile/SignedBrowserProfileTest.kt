@@ -2,6 +2,7 @@ package dev.sixbridge.core.profile
 
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -103,6 +104,58 @@ class SignedBrowserProfileTest {
 
         assertFailsWith<IllegalArgumentException> {
             SignedBrowserProfile.sign(ByteArray(524_289), "test-key", pair.private)
+        }
+    }
+
+    @Test
+    fun `서명 profile 내부 JSON도 exact schema를 통과해야 한다`() {
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val profileJson = BrowserProfileJson.encode(profile)
+        val withUnknown = profileJson.dropLast(1) + ",\n    \"unexpected\": true\n}"
+        val envelope = SignedBrowserProfile.sign(
+            withUnknown.encodeToByteArray(),
+            "test-key",
+            pair.private,
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            SignedBrowserProfile.verify(envelope, mapOf("test-key" to pair.public))
+        }
+    }
+
+    @Test
+    fun `envelope는 noncanonical JSON과 Base64를 거부한다`() {
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val envelope = SignedBrowserProfile.sign(
+            BrowserProfileJson.encode(profile).encodeToByteArray(),
+            "test-key",
+            pair.private,
+        )
+        val signature = envelope.substringAfter("\"signatureBase64\":\"").substringBefore('"')
+        val unpaddedSignature = signature.trimEnd('=')
+
+        assertFailsWith<IllegalArgumentException> {
+            SignedBrowserProfile.verify(envelope.replaceFirst("{", "{ "), mapOf("test-key" to pair.public))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            SignedBrowserProfile.verify(
+                envelope.replace(signature, unpaddedSignature),
+                mapOf("test-key" to pair.public),
+            )
+        }
+    }
+
+    @Test
+    fun `verify도 envelope와 decoded profile 크기를 제한한다`() {
+        val oversizedProfileBase64 = Base64.getEncoder().encodeToString(ByteArray(524_289))
+        val oversizedProfileEnvelope =
+            """{"algorithm":"Ed25519","keyId":"test-key","profileBase64":"$oversizedProfileBase64","profileSha256":"${"0".repeat(64)}","schemaVersion":1,"signatureBase64":"AA=="}"""
+
+        assertFailsWith<IllegalArgumentException> {
+            SignedBrowserProfile.verify(oversizedProfileEnvelope, emptyMap())
+        }
+        assertFailsWith<IllegalArgumentException> {
+            SignedBrowserProfile.verify(" ".repeat(1_048_577), emptyMap())
         }
     }
 }

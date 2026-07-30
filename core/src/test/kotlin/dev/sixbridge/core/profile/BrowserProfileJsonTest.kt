@@ -27,6 +27,75 @@ class BrowserProfileJsonTest {
     }
 
     @Test
+    fun `profile JSON은 unknown과 duplicate root field를 거부한다`() {
+        val encoded = BrowserProfileJson.encode(baseline())
+        val unknown = encoded.dropLast(1) + ",\n    \"unexpected\": true\n}"
+        val duplicate = encoded.replaceFirst(
+            "{",
+            "{\n    \"versionName\": \"spoofed\",",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(unknown)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(duplicate)
+        }
+    }
+
+    @Test
+    fun `profile JSON은 missing field와 wrong scalar type을 거부한다`() {
+        val encoded = BrowserProfileJson.encode(baseline())
+        val missing = encoded.lines()
+            .filterNot { "\"browserPackage\"" in it }
+            .joinToString("\n")
+        val wrongType = encoded.replace(
+            "\"versionCode\": 1300261502",
+            "\"versionCode\": \"1300261502\"",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(missing)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(wrongType)
+        }
+    }
+
+    @Test
+    fun `profile JSON은 wrapper contract exact schema와 boolean type을 검증한다`() {
+        val encoded = BrowserProfileJson.encode(baseline())
+        val unknown = encoded.replace(
+            "\"devExtensionPath\": true",
+            "\"devExtensionPath\": true,\n        \"unexpected\": true",
+        )
+        val wrongType = encoded.replace(
+            "\"discoveryUri\": true",
+            "\"discoveryUri\": \"true\"",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(unknown)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(wrongType)
+        }
+    }
+
+    @Test
+    fun `profile JSON support는 검증된 evidence 계산과 일치해야 한다`() {
+        val encoded = BrowserProfileJson.encode(baseline())
+        val forged = encoded.replace(
+            "\"support\": \"unknown\"",
+            "\"support\": \"supported\"",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(forged)
+        }
+    }
+
+    @Test
     fun `fails closed for a baseline profile with an untrusted apk or signer`() {
         val profile = BrowserProfileJson.decode(
             """
@@ -46,7 +115,8 @@ class BrowserProfileJsonTest {
               },
               "sourceApkSha256": "${"0".repeat(64)}",
               "sourceApkSignerSha256": "${"1".repeat(64)}",
-              "profileDifferences": []
+              "profileDifferences": [],
+              "support": "unknown"
             }
             """.trimIndent(),
         )
@@ -76,7 +146,8 @@ class BrowserProfileJsonTest {
                 "6fad5501a3f9823c7dd9fafdfe1204f7246e487c8dea9c192426c07c8c48c981",
               "sourceApkSignerSha256":
                 "34df0e7a9f1cf1892e45c056b4973cd81ccf148a4050d11aea4ac5a65f900a42",
-              "profileDifferences": []
+              "profileDifferences": [],
+              "support": "supported"
             }
             """.trimIndent(),
         )
@@ -113,7 +184,7 @@ class BrowserProfileJsonTest {
             .filterNot { "\"installationApkSetSha256\"" in it }
             .joinToString("\n")
 
-        assertFailsWith<NoSuchElementException> {
+        assertFailsWith<IllegalArgumentException> {
             BrowserProfileJson.decode(missing)
         }
     }
@@ -146,8 +217,17 @@ class BrowserProfileJsonTest {
         sourceApkSha256 = "abc123",
     )
 
-    private fun legacyProfileJson(schemaVersion: Int): String =
-        """
+    private fun legacyProfileJson(schemaVersion: Int): String {
+        val featureFields = if (schemaVersion == 1) {
+            ""
+        } else {
+            """
+            ,
+              "supportedFeatures": [],
+              "unavailableFeatures": []
+            """.trimIndent()
+        }
+        return """
         {
           "schemaVersion": $schemaVersion,
           "browserPackage": "com.sec.android.app.sbrowser",
@@ -164,9 +244,9 @@ class BrowserProfileJsonTest {
           },
           "sourceApkSha256": "${"0".repeat(64)}",
           "sourceApkSignerSha256": "${"1".repeat(64)}",
-          "profileDifferences": [],
-          "supportedFeatures": [],
-          "unavailableFeatures": []
+          "profileDifferences": []$featureFields,
+          "support": "unknown"
         }
         """.trimIndent()
+    }
 }

@@ -6,7 +6,10 @@ import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.ProfileSupport
 import dev.sixbridge.core.profile.SignedBrowserProfile
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.nio.channels.ReadableByteChannel
+import java.nio.channels.WritableByteChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -15,10 +18,12 @@ import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyFactory
 import java.security.PublicKey
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -40,12 +45,19 @@ data class DesktopProfileOption(
     val explanation: String,
 )
 
-class DesktopProfileCatalog(
+class DesktopProfileCatalog private constructor(
     private val dataRoot: Path,
-    private val trustedKeys: Map<String, PublicKey> = bundledTrustedKeys(),
-    private val extractProfile: (Path) -> BrowserProfile = BrowserProfileExtractor()::extract,
-    private val resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
+    private val trustedKeys: Map<String, PublicKey>,
+    private val extractProfile: (Path) -> BrowserProfile,
+    private val resources: ClassLoader,
 ) {
+    constructor(dataRoot: Path) : this(
+        dataRoot = dataRoot,
+        trustedKeys = loadBundledTrustedProfileKeys(DesktopProfileCatalog::class.java.classLoader),
+        extractProfile = BrowserProfileExtractor()::extract,
+        resources = DesktopProfileCatalog::class.java.classLoader,
+    )
+
     fun builtIns(): List<DesktopProfileOption> = builtInProfiles().map(::builtInOption)
 
     fun default(): DesktopProfileOption = builtIns().maxWith(
@@ -89,7 +101,9 @@ class DesktopProfileCatalog(
         require(fileName == "$profileSha256.json" && SHA256.matches(profileSha256)) {
             "profile 저장 파일명이 올바르지 않습니다."
         }
-        val record = decodeRecord(readBounded(path))
+        val record = decodeRecord(
+            DesktopProfileFileIo.readBounded(path, MAX_PERSISTED_BYTES),
+        )
         require(record.profileSha256 == profileSha256) { "profile 저장 파일명 hash가 일치하지 않습니다." }
         when (record.trust) {
             DesktopProfileTrust.SIGNED -> {
@@ -146,25 +160,64 @@ class DesktopProfileCatalog(
         val profileSha256 = profile.canonicalSha256()
         require(record.profileSha256 == profileSha256)
         val directory = profilesDirectory(create = true) ?: return
+        val directoryFileKey = fileKey(directory)
         val destination = directory.resolve("$profileSha256.json")
-        require(destination.parent == directory && !Files.exists(destination, NOFOLLOW_LINKS) ||
-            Files.isRegularFile(destination, NOFOLLOW_LINKS)) {
+        require(
+            destination.parent == directory &&
+                (
+                    !Files.exists(destination, NOFOLLOW_LINKS) ||
+                        Files.isRegularFile(destination, NOFOLLOW_LINKS)
+                    ),
+        ) {
             "profile 저장 경로가 올바르지 않습니다."
         }
         if (Files.exists(destination, NOFOLLOW_LINKS)) return
-        val temporary = Files.createTempFile(directory, "$profileSha256.", ".tmp")
+        val temporary = directory.resolve(".$profileSha256.${UUID.randomUUID()}.tmp")
+        var temporaryFileKey: Any? = null
         try {
-            FileChannel.open(temporary, WRITE).use { channel ->
-                channel.write(java.nio.ByteBuffer.wrap(encodeRecord(record)))
+            val encoded = encodeRecord(record)
+            FileChannel.open(temporary, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { channel ->
+                temporaryFileKey = fileKey(temporary)
+                DesktopProfileFileIo.writeFully(channel, encoded)
+                require(channel.size() == encoded.size.toLong()) {
+                    "profile 임시 파일이 완전히 기록되지 않았습니다."
+                }
                 channel.force(true)
+            }
+            val temporaryAttributes = fileAttributes(temporary)
+            require(
+                temporaryAttributes.isRegularFile &&
+                    temporaryAttributes.fileKey() == temporaryFileKey &&
+                    temporaryAttributes.size() == encoded.size.toLong(),
+            ) {
+                "profile 임시 파일이 게시 전에 변경되었습니다."
+            }
+            require(fileKey(directory) == directoryFileKey) {
+                "profile 저장 디렉터리가 기록 중 변경되었습니다."
             }
             try {
                 Files.move(temporary, destination, ATOMIC_MOVE)
             } catch (error: AtomicMoveNotSupportedException) {
                 throw IllegalStateException("profile 저장소는 atomic move를 지원해야 합니다.", error)
             }
+            require(fileKey(directory) == directoryFileKey) {
+                "profile 저장 디렉터리가 게시 중 변경되었습니다."
+            }
+            val destinationAttributes = fileAttributes(destination)
+            require(
+                destinationAttributes.isRegularFile &&
+                    destinationAttributes.fileKey() == temporaryFileKey &&
+                    destinationAttributes.size() == encoded.size.toLong(),
+            ) {
+                "profile 최종 파일이 게시 중 변경되었습니다."
+            }
         } finally {
-            Files.deleteIfExists(temporary)
+            deleteOwnedTemporary(
+                temporary,
+                directory,
+                directoryFileKey,
+                temporaryFileKey,
+            )
         }
     }
 
@@ -180,13 +233,6 @@ class DesktopProfileCatalog(
 
     private fun createDirectoryIfMissing(path: Path) {
         if (!Files.exists(path, NOFOLLOW_LINKS)) Files.createDirectory(path)
-    }
-
-    private fun readBounded(path: Path): ByteArray {
-        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
-            require(channel.size() in 1..MAX_PERSISTED_BYTES) { "profile 저장 파일 크기가 올바르지 않습니다." }
-        }
-        return Files.readAllBytes(path)
     }
 
     private fun builtInProfiles(): List<BrowserProfile> = BUILT_IN_RESOURCES.map { resource ->
@@ -314,14 +360,114 @@ class DesktopProfileCatalog(
 
         private val json = Json
 
-        private fun bundledTrustedKeys(): Map<String, PublicKey> {
-            val key = DesktopProfileCatalog::class.java.classLoader
-                .getResourceAsStream("profiles/trusted/profile-signing-2026-01.der")
-                ?.use { input ->
-                    KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(input.readBytes()))
-                }
-                ?: throw IllegalStateException("내장 profile signing 공개 키가 없습니다.")
-            return mapOf("profile-signing-2026-01" to key)
+        internal fun testing(
+            dataRoot: Path,
+            trustedKeys: Map<String, PublicKey> = emptyMap(),
+            extractProfile: (Path) -> BrowserProfile = BrowserProfileExtractor()::extract,
+            resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
+        ): DesktopProfileCatalog = DesktopProfileCatalog(
+            dataRoot,
+            trustedKeys,
+            extractProfile,
+            resources,
+        )
+    }
+}
+
+internal fun loadBundledTrustedProfileKeys(resources: ClassLoader): Map<String, PublicKey> {
+    val key = resources
+        .getResourceAsStream("profiles/trusted/profile-signing-2026-01.der")
+        ?.use { input ->
+            KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(input.readBytes()))
         }
+        ?: throw IllegalStateException("내장 profile signing 공개 키가 없습니다.")
+    return mapOf("profile-signing-2026-01" to key)
+}
+
+internal object DesktopProfileFileIo {
+    fun readBounded(path: Path, maxBytes: Int): ByteArray {
+        require(maxBytes > 0)
+        val before = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(before.isRegularFile && before.fileKey() != null) {
+            "profile 저장 파일은 identity가 있는 일반 파일이어야 합니다."
+        }
+        require(before.size() in 1..maxBytes.toLong()) {
+            "profile 저장 파일 크기가 올바르지 않습니다."
+        }
+        return FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+            require(channel.size() in 1..maxBytes.toLong()) {
+                "profile 저장 파일 크기가 올바르지 않습니다."
+            }
+            val bytes = readBounded(channel, maxBytes)
+            require(channel.size() == bytes.size.toLong()) {
+                "profile 저장 파일 크기가 읽는 중 변경되었습니다."
+            }
+            val after = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+            require(
+                after.isRegularFile &&
+                    after.fileKey() == before.fileKey() &&
+                    before.size() == bytes.size.toLong() &&
+                    after.size() == bytes.size.toLong(),
+            ) {
+                "profile 저장 파일이 읽는 중 변경되었습니다."
+            }
+            bytes
+        }
+    }
+
+    fun readBounded(channel: ReadableByteChannel, maxBytes: Int): ByteArray {
+        require(maxBytes > 0)
+        val output = ByteArrayOutputStream(minOf(maxBytes, DEFAULT_BUFFER_SIZE))
+        val buffer = ByteBuffer.allocate(minOf(maxBytes, DEFAULT_BUFFER_SIZE))
+        while (true) {
+            buffer.clear()
+            val read = channel.read(buffer)
+            if (read < 0) break
+            require(read > 0) { "profile 저장 파일을 끝까지 읽을 수 없습니다." }
+            require(output.size().toLong() + read <= maxBytes.toLong()) {
+                "profile 저장 파일 크기가 제한을 초과합니다."
+            }
+            output.write(buffer.array(), 0, read)
+        }
+        require(output.size() > 0) { "profile 저장 파일이 비어 있습니다." }
+        return output.toByteArray()
+    }
+
+    fun writeFully(channel: WritableByteChannel, bytes: ByteArray) {
+        val buffer = ByteBuffer.wrap(bytes)
+        while (buffer.hasRemaining()) {
+            require(channel.write(buffer) > 0) {
+                "profile 임시 파일을 끝까지 기록할 수 없습니다."
+            }
+        }
+    }
+}
+
+private fun fileKey(path: Path): Any =
+    requireNotNull(
+        fileAttributes(path).fileKey(),
+    ) {
+        "profile 저장 경로 identity를 확인할 수 없습니다."
+    }
+
+private fun fileAttributes(path: Path): BasicFileAttributes =
+    Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+
+private fun deleteOwnedTemporary(
+    temporary: Path,
+    directory: Path,
+    expectedDirectoryFileKey: Any,
+    expectedTemporaryFileKey: Any?,
+) {
+    if (expectedTemporaryFileKey == null || !Files.exists(temporary, NOFOLLOW_LINKS)) return
+    val directoryAttributes = runCatching { fileAttributes(directory) }.getOrNull() ?: return
+    val temporaryAttributes = runCatching { fileAttributes(temporary) }.getOrNull() ?: return
+    if (
+        directoryAttributes.isDirectory &&
+        directoryAttributes.fileKey() == expectedDirectoryFileKey &&
+        temporaryAttributes.isRegularFile &&
+        temporaryAttributes.fileKey() == expectedTemporaryFileKey
+    ) {
+        Files.deleteIfExists(temporary)
     }
 }
