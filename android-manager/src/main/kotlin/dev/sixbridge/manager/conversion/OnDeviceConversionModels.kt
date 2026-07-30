@@ -84,6 +84,12 @@ sealed interface RestoredConversion {
     data class GeneratedPending(
         val generated: GeneratedBundle,
     ) : RestoredConversion
+
+    data object InterruptedDiscarded : RestoredConversion
+
+    data class InterruptedCleanupPending(
+        val token: String,
+    ) : RestoredConversion
 }
 
 internal sealed interface SamsungProfileSnapshot {

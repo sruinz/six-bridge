@@ -1520,6 +1520,37 @@ class ManagerViewModel(
                     generated = restored.generated,
                     persistOwners = persistOwners,
                 )
+            RestoredConversion.InterruptedDiscarded -> {
+                clearSavedConversion()
+                mutableState.update {
+                    it.copy(
+                        conversionState = ConversionUiState.Idle,
+                        conversionCleanupPending = false,
+                        conversionUrl = "",
+                        message = UserMessage(
+                            kind = UserMessageKind.CONVERSION_FAILURE,
+                            text = "이전 변환이 완료되기 전에 앱이 종료되어 " +
+                                "임시 자료를 정리했습니다. 필요하면 변환을 다시 시작해 주세요.",
+                            recoveryAction = RecoveryAction.NONE,
+                        ),
+                    )
+                }
+            }
+            is RestoredConversion.InterruptedCleanupPending -> {
+                saveConversionRoute(restored.token, "cancelling")
+                mutableState.update {
+                    it.copy(
+                        conversionState = ConversionUiState.Cancelling(restored.token),
+                        conversionCleanupPending = true,
+                        conversionUrl = "",
+                        message = UserMessage(
+                            kind = UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                            text = "변환 임시 자료를 정리하지 못했습니다. 다시 정리해 주세요.",
+                            recoveryAction = RecoveryAction.RETRY,
+                        ),
+                    )
+                }
+            }
             null -> {
                 if (pendingGeneratedCleanup?.matchesSavedOwners() != true) {
                     clearSavedConversion()

@@ -24,8 +24,14 @@ internal class OnDeviceConversionCoordinator(
     private val packages: ConversionPackagePort,
     private val bundles: ConversionBundlePort,
     private val imports: ConversionGeneratedImportPort,
+    private val analysisCacheCleaner: suspend () -> AnalysisCacheCleanupResult = {
+        AnalysisCacheCleanupResult(deleted = 0, failed = 0)
+    },
+    private val onAnalysisCacheCleanupWarning: (AnalysisCacheCleanupResult) -> Unit = {},
 ) : ConversionCoordinatorPort {
     private val buildMutex = Mutex()
+    private val startupCacheCleanupMutex = Mutex()
+    private var startupCacheCleanupAttempted = false
 
     override suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
         val reclaimed = try {
@@ -89,6 +95,10 @@ internal class OnDeviceConversionCoordinator(
                     ConversionBeginResult.Failure(ConversionFailureCode.BUNDLE_IO, job.token)
                 is RestoredConversion.BundleReady ->
                     ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, job.token)
+                RestoredConversion.InterruptedDiscarded,
+                is RestoredConversion.InterruptedCleanupPending,
+                ->
+                    ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, job.token)
                 null ->
                     ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, job.token)
             }
@@ -130,6 +140,12 @@ internal class OnDeviceConversionCoordinator(
                             ConversionFailureCode.INPUT_INVALID,
                         )
                 }
+                RestoredConversion.InterruptedDiscarded,
+                is RestoredConversion.InterruptedCleanupPending,
+                ->
+                    return@withLock ConversionBuildResult.Failure(
+                        ConversionFailureCode.INPUT_INVALID,
+                    )
                 null ->
                     return@withLock ConversionBuildResult.Failure(
                         ConversionFailureCode.INPUT_INVALID,
@@ -299,22 +315,17 @@ internal class OnDeviceConversionCoordinator(
     }
 
     override suspend fun restore(importReview: Boolean): RestoredConversion? {
+        cleanAnalysisCacheOnce()
         val job = work.restoreBuildAware() ?: return null
-        if (job.stage == ConversionJobStage.BUILDING) {
-            return reconcileBuilding(job, importReview)
+        return when (job.stage) {
+            ConversionJobStage.BUNDLE_READY -> restoreBundle(job, importReview)
+            ConversionJobStage.BUILDING ->
+                restoreCompletedBuildOrDiscard(job, importReview)
+            ConversionJobStage.INPUT_READY,
+            ConversionJobStage.AWAITING_APPROVAL,
+            ConversionJobStage.DISCARDING,
+            -> discardInterrupted(job.token)
         }
-        if (job.stage == ConversionJobStage.BUNDLE_READY) {
-            val generated = bundles.recover(job.token) ?: return null
-            if (!importReview) return RestoredConversion.GeneratedPending(generated)
-            val review = imports.importGenerated(generated) ?: return null
-            return RestoredConversion.BundleReady(review, generated)
-        }
-        val analyzed = analyzeJob(
-            job,
-            markAwaiting = job.stage == ConversionJobStage.INPUT_READY,
-        )
-        return (analyzed as? ConversionBeginResult.AnalysisReady)
-            ?.let(RestoredConversion::Analysis)
     }
 
     override suspend fun discard(token: String): Boolean {
@@ -329,6 +340,72 @@ internal class OnDeviceConversionCoordinator(
 
     override suspend fun createGeneratedShareSnapshot(token: String): File? =
         bundles.recover(token)?.let { bundles.createShareSnapshot(token) }
+
+    private suspend fun cleanAnalysisCacheOnce() {
+        startupCacheCleanupMutex.withLock {
+            if (startupCacheCleanupAttempted) return
+            startupCacheCleanupAttempted = true
+            val result = try {
+                analysisCacheCleaner()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                AnalysisCacheCleanupResult(deleted = 0, failed = 1)
+            }
+            if (result.failed > 0) {
+                runCatching { onAnalysisCacheCleanupWarning(result) }
+            }
+        }
+    }
+
+    private suspend fun restoreBundle(
+        job: RestoredConversionJob,
+        importReview: Boolean,
+    ): RestoredConversion? {
+        val generated = bundles.recover(job.token) ?: return null
+        if (!importReview) return RestoredConversion.GeneratedPending(generated)
+        val review = imports.importGenerated(generated) ?: return null
+        return RestoredConversion.BundleReady(review, generated)
+    }
+
+    private suspend fun restoreCompletedBuildOrDiscard(
+        job: RestoredConversionJob,
+        importReview: Boolean,
+    ): RestoredConversion {
+        val generated = bundles.recover(job.token)
+            ?: return discardInterrupted(job.token)
+        if (!importReview) return RestoredConversion.GeneratedPending(generated)
+        val review = imports.importGenerated(generated)
+            ?: return RestoredConversion.GeneratedPending(generated)
+        abortOwner(job.token)
+        work.markBundleReady(job.token, generated.file, generated.sha256)
+        return RestoredConversion.BundleReady(review, generated)
+    }
+
+    private suspend fun discardInterrupted(token: String): RestoredConversion =
+        withContext(NonCancellable) {
+            val ownerDiscarded = try {
+                identities.abort(token)
+                true
+            } catch (_: Exception) {
+                false
+            }
+            val bundleDiscarded = try {
+                bundles.discard(token)
+            } catch (_: Exception) {
+                false
+            }
+            val workDiscarded = try {
+                work.discard(token)
+            } catch (_: Exception) {
+                false
+            }
+            if (ownerDiscarded && bundleDiscarded && workDiscarded) {
+                RestoredConversion.InterruptedDiscarded
+            } else {
+                RestoredConversion.InterruptedCleanupPending(token)
+            }
+        }
 
     private suspend fun reconcileBuilding(
         job: RestoredConversionJob,

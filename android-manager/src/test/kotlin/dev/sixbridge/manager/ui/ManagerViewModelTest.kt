@@ -117,6 +117,118 @@ class ManagerViewModelTest {
     }
 
     @Test
+    fun `시작에서 폐기한 미완료 변환은 saved owner를 지우고 일회성 안내를 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "analysis",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.InterruptedDiscarded
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+            assertNull(savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertNull(savedState.get<String>(ManagerViewModel.CONVERSION_ROUTE_KEY))
+            assertEquals(UserMessageKind.CONVERSION_FAILURE, viewModel.state.value.message?.kind)
+            assertEquals(RecoveryAction.NONE, viewModel.state.value.message?.recoveryAction)
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            val recreated = ManagerViewModel(FakeManagerRepository(), savedState)
+            advanceUntilIdle()
+
+            assertNull(recreated.state.value.message)
+        }
+
+    @Test
+    fun `시작 미완료 변환 cleanup 실패는 exact token retry 상태를 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "analysis",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.InterruptedCleanupPending(TOKEN)
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertTrue(viewModel.state.value.conversionCleanupPending)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.Cancelling>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+            assertEquals(
+                UserMessageKind.CONVERSION_CLEANUP_FAILED,
+                viewModel.state.value.message?.kind,
+            )
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertTrue(repository.discardedConversions.isEmpty())
+
+            viewModel.accept(ManagerAction.RetryGeneratedCleanup)
+            advanceUntilIdle()
+
+            assertEquals(listOf(TOKEN), repository.discardedConversions)
+            assertFalse(viewModel.state.value.conversionCleanupPending)
+            assertIs<ConversionUiState.Idle>(viewModel.state.value.conversionState)
+            assertNull(savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+        }
+
+    @Test
+    fun `시작 BUNDLE_READY는 generated result를 폐기하지 않고 복구한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.READY,
+                viewModel.state.value.startupRecoveryState,
+            )
+            assertEquals(ManagerRoute.ConversionResult(TOKEN), viewModel.state.value.route)
+            assertEquals(
+                TOKEN,
+                assertIs<ConversionUiState.ResultReady>(
+                    viewModel.state.value.conversionState,
+                ).token,
+            )
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+            assertTrue(repository.discardedConversions.isEmpty())
+        }
+
+    @Test
     fun `initialize 전 import와 conversion은 PREPARED normal handoff보다 먼저 시작하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val initializeResult = CompletableDeferred<ManagerRestoreResult>()
@@ -9359,6 +9471,8 @@ private class FakeManagerRepository : ManagerRepository {
             is RestoredConversion.BundleReady -> restored.generated.file
             is RestoredConversion.GeneratedPending -> restored.generated.file
             is RestoredConversion.Analysis,
+            RestoredConversion.InterruptedDiscarded,
+            is RestoredConversion.InterruptedCleanupPending,
             null,
             -> null
         }

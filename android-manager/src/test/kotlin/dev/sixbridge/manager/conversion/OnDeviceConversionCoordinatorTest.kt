@@ -885,19 +885,76 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
-    fun `process restore는 승인 분석과 bundle ready 결과만 복구한다`() = runTest {
-        val analysisFixture = Fixture(temporaryFolder, mutableListOf())
-        val analysisCoordinator = analysisFixture.coordinator()
-        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
-            analysisCoordinator.begin(
-                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
-            ),
-        )
+    fun `미완료 stage는 restore에서 분석하지 않고 exact token을 폐기한다`() = runTest {
+        listOf(
+            ConversionJobStage.INPUT_READY,
+            ConversionJobStage.AWAITING_APPROVAL,
+            ConversionJobStage.BUILDING,
+            ConversionJobStage.DISCARDING,
+        ).forEach { restoredStage ->
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                this.restoredStage = restoredStage
+                recoveredGenerated = null
+            }
 
-        val restoredAnalysis =
-            assertIs<RestoredConversion.Analysis>(analysisCoordinator.restore())
-        assertEquals(analysis.token, restoredAnalysis.value.token)
+            assertIs<RestoredConversion.InterruptedDiscarded>(
+                fixture.coordinator().restore(),
+            )
+            assertEquals(0, fixture.analyzeCalls)
+            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
+            assertEquals(listOf(fixture.token), fixture.discardedTokens)
+        }
+    }
 
+    @Test
+    fun `미완료 exact token cleanup 실패는 pending으로 남기고 restore에서 재시도한다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                restoredStage = ConversionJobStage.AWAITING_APPROVAL
+                recoveredGenerated = null
+                bundleDiscardResult = true
+                workDiscardResult = false
+            }
+            val coordinator = fixture.coordinator()
+
+            val pending = assertIs<RestoredConversion.InterruptedCleanupPending>(
+                coordinator.restore(),
+            )
+
+            assertEquals(fixture.token, pending.token)
+            assertEquals(0, fixture.analyzeCalls)
+            assertEquals(listOf(fixture.token), fixture.discardedTokens)
+
+            fixture.workDiscardResult = true
+            assertIs<RestoredConversion.InterruptedDiscarded>(coordinator.restore())
+            assertEquals(listOf(fixture.token, fixture.token), fixture.discardedTokens)
+        }
+
+    @Test
+    fun `BUILDING generated proof는 import 정책에 따라 기존 완료 결과를 복구한다`() =
+        runTest {
+            listOf(true, false).forEach { importReview ->
+                val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                    restoredStage = ConversionJobStage.BUILDING
+                }
+
+                val restored = fixture.coordinator().restore(importReview)
+
+                if (importReview) {
+                    assertIs<RestoredConversion.BundleReady>(restored)
+                    assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
+                } else {
+                    assertIs<RestoredConversion.GeneratedPending>(restored)
+                    assertEquals(ConversionJobStage.INPUT_READY, fixture.stage)
+                }
+                assertEquals(0, fixture.analyzeCalls)
+                assertTrue(fixture.discardedTokens.isEmpty())
+            }
+        }
+
+    @Test
+    fun `BUNDLE_READY는 기존 generated와 review를 보존한다`() = runTest {
         val readyFixture = Fixture(temporaryFolder, mutableListOf())
         val readyCoordinator = readyFixture.coordinator()
         val readyAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
@@ -917,6 +974,33 @@ class OnDeviceConversionCoordinatorTest {
         val restoredReady =
             assertIs<RestoredConversion.BundleReady>(readyCoordinator.restore())
         assertEquals(ready.generated, restoredReady.generated)
+        assertEquals(0, readyFixture.discardedTokens.size)
+    }
+
+    @Test
+    fun `startup cache cleanup은 첫 restore의 work 조회 전에 한 번만 실행한다`() = runTest {
+        val events = mutableListOf<String>()
+        val warnings = mutableListOf<AnalysisCacheCleanupResult>()
+        val fixture = Fixture(temporaryFolder, events).apply {
+            restoredStage = ConversionJobStage.BUNDLE_READY
+        }
+        val coordinator = fixture.coordinator(
+            analysisCacheCleaner = {
+                events += "clean-cache"
+                AnalysisCacheCleanupResult(deleted = 2, failed = 1)
+            },
+            onAnalysisCacheCleanupWarning = warnings::add,
+        )
+
+        assertIs<RestoredConversion.BundleReady>(coordinator.restore())
+        assertIs<RestoredConversion.BundleReady>(coordinator.restore())
+
+        assertEquals(1, events.count { it == "clean-cache" })
+        assertTrue(events.indexOf("clean-cache") < events.indexOf("restore-build-aware"))
+        assertEquals(
+            listOf(AnalysisCacheCleanupResult(deleted = 2, failed = 1)),
+            warnings,
+        )
     }
 
     @Test
@@ -1032,6 +1116,7 @@ class OnDeviceConversionCoordinatorTest {
             .apply { writeText("bundle") }
         var currentProfile = profile()
         var profileResult: SamsungProfileSnapshot = SamsungProfileSnapshot.Supported(currentProfile)
+        var restoredStage: ConversionJobStage? = null
         var stage = ConversionJobStage.INPUT_READY
             private set
         private var storedProfile: String? = null
@@ -1074,13 +1159,24 @@ class OnDeviceConversionCoordinatorTest {
         var normalRestoreDestroysBuilding = false
         var normalRestoreDestroyedBuilding = false
         var bundleRecoverReturnsNull = false
+        var recoveredGenerated: GeneratedBundle? =
+            GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
         var bundleDiscardResult: Boolean? = null
         var activeOwner: String? = null
         var ownerAborted = false
+        val abortedOwnerTokens = mutableListOf<String>()
+        val discardedBundleTokens = mutableListOf<String>()
+        val discardedTokens = mutableListOf<String>()
+        var analyzeCalls = 0
         var workDiscarded = false
         var workDiscardResult = true
 
-        fun coordinator() = OnDeviceConversionCoordinator(
+        fun coordinator(
+            analysisCacheCleaner: suspend () -> AnalysisCacheCleanupResult = {
+                AnalysisCacheCleanupResult(deleted = 0, failed = 0)
+            },
+            onAnalysisCacheCleanupWarning: (AnalysisCacheCleanupResult) -> Unit = {},
+        ) = OnDeviceConversionCoordinator(
             input = object : ConversionInputPort {
                 override suspend fun acquire(
                     request: OnDeviceInputRequest,
@@ -1173,6 +1269,7 @@ class OnDeviceConversionCoordinatorTest {
 
                 override suspend fun discard(token: String): Boolean {
                     workDiscarded = true
+                    discardedTokens += token
                     return workDiscardResult
                 }
 
@@ -1211,6 +1308,7 @@ class OnDeviceConversionCoordinatorTest {
                     control: AnalysisControl,
                 ): ConversionAnalysisSnapshot {
                     events += "analyze"
+                    analyzeCalls += 1
                     analysisPolicy = control.policy
                     analysisBlockingEntered?.countDown()
                     analysisBlockingGate?.await(5, TimeUnit.SECONDS)
@@ -1284,6 +1382,7 @@ class OnDeviceConversionCoordinatorTest {
 
                 override suspend fun abort(ownerToken: String) {
                     events += "abort"
+                    abortedOwnerTokens += ownerToken
                     ownerAborted = true
                     activeOwner = null
                 }
@@ -1332,10 +1431,11 @@ class OnDeviceConversionCoordinatorTest {
                     if (bundleRecoverReturnsNull) {
                         null
                     } else {
-                        GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
+                        recoveredGenerated
                     }
 
                 override fun discard(token: String): Boolean {
+                    discardedBundleTokens += token
                     val deleted = generatedFile.delete()
                     return bundleDiscardResult ?: deleted
                 }
@@ -1361,13 +1461,15 @@ class OnDeviceConversionCoordinatorTest {
                     )
                 }
             },
+            analysisCacheCleaner = analysisCacheCleaner,
+            onAnalysisCacheCleanupWarning = onAnalysisCacheCleanupWarning,
         )
 
         private fun job() = RestoredConversionJob(
             token = token,
             inputKind = OnDeviceInputKind.CRX3,
             inputSha256 = "1".repeat(64),
-            stage = if (exposeAwaitingWhilePackaging && concurrentPackages > 0) {
+            stage = restoredStage ?: if (exposeAwaitingWhilePackaging && concurrentPackages > 0) {
                 ConversionJobStage.AWAITING_APPROVAL
             } else {
                 stage

@@ -1,12 +1,14 @@
 package dev.sixbridge.manager.app
 
 import android.app.Application
+import android.util.Log
 import androidx.room.Room
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.catalog.RoomManagerCatalog
 import dev.sixbridge.manager.cleanup.StartupCleanup
+import dev.sixbridge.manager.conversion.AnalysisCacheCleaner
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionGeneratedImportPort
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
@@ -55,6 +57,8 @@ class ManagerDependencies private constructor(
     private val applicationScope: CoroutineScope,
 ) {
     companion object {
+        private const val LOG_TAG = "SixBridgeManager"
+
         @Volatile
         private var instance: ManagerDependencies? = null
 
@@ -123,6 +127,7 @@ class ManagerDependencies private constructor(
                 File(application.filesDir, "conversion-input"),
                 application.contentResolver,
             )
+            val analysisCacheCleaner = AnalysisCacheCleaner(application.cacheDir.toPath())
             applicationScope.launch {
                 inputService.reclaimOrphans()
             }
@@ -157,6 +162,14 @@ class ManagerDependencies private constructor(
                             }
                         }
                     }
+                },
+                analysisCacheCleaner = analysisCacheCleaner::clean,
+                onAnalysisCacheCleanupWarning = { result ->
+                    Log.w(
+                        LOG_TAG,
+                        "analysis cache cleanup incomplete: " +
+                            "deleted=${result.deleted}, failed=${result.failed}",
+                    )
                 },
             )
             val uninstall = DefaultUninstallCoordinator(installedWrappers)
