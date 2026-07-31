@@ -2,9 +2,11 @@ package dev.sixbridge.core.draft
 
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.conversion.PreparedConversion
@@ -38,6 +40,21 @@ class SixDraftReplay {
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
         control: AnalysisControl = AnalysisControl(),
+    ): DraftReplayResult = replay(
+        draft,
+        profile,
+        approvedAdapterIds,
+        control,
+        ConversionTempTreeFactory(),
+    )
+
+    @JvmSynthetic
+    internal fun replay(
+        draft: VerifiedSixDraft,
+        profile: BrowserProfile,
+        approvedAdapterIds: Set<String>,
+        control: AnalysisControl,
+        tempTreeFactory: ConversionTempTreeFactory,
     ): DraftReplayResult {
         control.checkCancelled()
         val payload = draft.payload
@@ -57,7 +74,10 @@ class SixDraftReplay {
             )
         }
         val input = portableInput(payload)
-        return ConversionPreparationEngine().use { engine ->
+        return ConversionPreparationEngine.create(
+            CompatibilityAnalyzer(),
+            tempTreeFactory,
+        ).use { engine ->
             val signedProfile = payload.input.browserProfileSha256
             val currentProfile = profile.canonicalSha256()
             if (signedProfile != currentProfile) {

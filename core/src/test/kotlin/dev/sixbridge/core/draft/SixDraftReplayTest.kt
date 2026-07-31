@@ -1,8 +1,13 @@
 package dev.sixbridge.core.draft
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
+import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.conversion.SecureConversionRoot
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.PortableExtensionInput
@@ -148,11 +153,77 @@ class SixDraftReplayTest {
 
     @Test
     fun `schema v2 source is rejected when it differs from signed original hash`() {
-        val fixture = convertedV2Fixture()
+        val fixture = portablePassthroughV2Fixture()
         val entries = readEntries(fixture.bytes).toMutableMap()
         entries["source.zip"] = entries.getValue("source.zip").copyOf().also {
             it[it.lastIndex] = (it.last().toInt() xor 1).toByte()
         }
+        resign(entries, fixture.signingKey)
+
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(storedArchive(entries))
+        }
+    }
+
+    @Test
+    fun `schema v2 adapter ID와 version 변경은 재서명해도 거부한다`() {
+        val fixture = portablePassthroughV2Fixture()
+        val entries = readEntries(fixture.bytes).toMutableMap()
+        entries["draft.json"] = replaceRequired(
+            entries.getValue("draft.json"),
+            "\"adapterVersions\":{}",
+            "\"adapterVersions\":{\"storage-fallback\":1}",
+        )
+        resign(entries, fixture.signingKey)
+
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(storedArchive(entries))
+        }
+    }
+
+    @Test
+    fun `schema v2 plan SHA 변경은 재서명해도 거부한다`() {
+        val fixture = portablePassthroughV2Fixture()
+        val verified = SixDraft.read(fixture.bytes)
+        val entries = readEntries(fixture.bytes).toMutableMap()
+        entries["conversion-plan.json"] = replaceRequired(
+            entries.getValue("conversion-plan.json"),
+            "\"planSha256\":\"${verified.payload.plan.planSha256}\"",
+            "\"planSha256\":\"${"0".repeat(64)}\"",
+        )
+        resign(entries, fixture.signingKey)
+
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(storedArchive(entries))
+        }
+    }
+
+    @Test
+    fun `schema v2 compatibility after report 변경은 재서명해도 거부한다`() {
+        val fixture = portablePassthroughV2Fixture()
+        val entries = readEntries(fixture.bytes).toMutableMap()
+        entries["compatibility-after.json"] = replaceRequired(
+            entries.getValue("compatibility-after.json"),
+            "\"extensionName\":\"Portable Replay\"",
+            "\"extensionName\":\"Mutated Replay\"",
+        )
+        resign(entries, fixture.signingKey)
+
+        assertFailsWith<InvalidSixDraftException> {
+            SixDraft.read(storedArchive(entries))
+        }
+    }
+
+    @Test
+    fun `schema v2 browser profile SHA 변경은 재서명해도 거부한다`() {
+        val fixture = portablePassthroughV2Fixture()
+        val profileSha256 = fixture.profile.canonicalSha256()
+        val entries = readEntries(fixture.bytes).toMutableMap()
+        entries["input.json"] = replaceRequired(
+            entries.getValue("input.json"),
+            "\"browserProfileSha256\":\"$profileSha256\"",
+            "\"browserProfileSha256\":\"${"0".repeat(64)}\"",
+        )
         resign(entries, fixture.signingKey)
 
         assertFailsWith<InvalidSixDraftException> {
@@ -350,6 +421,63 @@ class SixDraftReplayTest {
         )
     }
 
+    private fun portablePassthroughV2Fixture(): Fixture {
+        val profile = profile()
+        val sourceIdentity = "project:portable-passthrough"
+        val sourceRoot = Files.createTempDirectory("six-draft-portable-source").also {
+            it.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Portable Replay","version":"1"}""",
+            )
+        }
+        val source = ExtensionZip.createBytes(
+            sourceRoot,
+            includeProjectMarker = true,
+        )
+        val prepared = withSecureEngine {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    ExtensionInputKind.ZIP,
+                    source,
+                    signedDraftSourceIdentity = sourceIdentity,
+                ),
+                profile,
+                emptySet(),
+            )
+        }
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                coreVersion = "test-portable-v2",
+                adapterVersions = emptyMap(),
+                sourceIdentity = sourceIdentity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = prepared.originalSourceSha256,
+                browserProfileSha256 = prepared.browserProfileSha256,
+                originalExtensionId = prepared.originalExtensionId,
+                originalExtensionVersion = requireNotNull(
+                    prepared.compatibilityBefore.extensionVersion,
+                ),
+                sourceIdentity = sourceIdentity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(
+                prepared.compatibilityBefore,
+                emptyList(),
+            ),
+            compatibilityBefore = prepared.compatibilityBefore,
+            compatibilityAfter = prepared.compatibilityAfter,
+        )
+        val key = ed25519()
+        return Fixture(
+            bytes = SixDraft.createBytes(payload, key),
+            profile = profile,
+            signingKey = key,
+            embeddedMarker = "portable-passthrough",
+        )
+    }
+
     private fun legacyPassthroughCrxFixture(): LegacyCrxFixture {
         val profile = profile()
         val source = Files.createTempDirectory("six-draft-v1-crx").also {
@@ -528,6 +656,32 @@ class SixDraftReplayTest {
                 }
             }
         }.toByteArray()
+
+    private fun replaceRequired(
+        bytes: ByteArray,
+        oldValue: String,
+        newValue: String,
+    ): ByteArray {
+        val text = bytes.decodeToString()
+        require(oldValue in text) {
+            "test mutation 대상을 찾지 못했습니다: $oldValue"
+        }
+        return text.replace(oldValue, newValue).encodeToByteArray()
+    }
+
+    private fun <T> withSecureEngine(
+        block: (ConversionPreparationEngine) -> T,
+    ): T = Jimfs.newFileSystem(
+        Configuration.unix().toBuilder()
+            .setAttributeViews("basic", "owner", "posix", "unix")
+            .build(),
+    ).use { fileSystem ->
+        val root = Files.createDirectory(fileSystem.getPath("/secure-root"))
+        ConversionPreparationEngine.create(
+            CompatibilityAnalyzer(),
+            ConversionTempTreeFactory(SecureConversionRoot.verify(root)),
+        ).use(block)
+    }
 
     private fun ed25519(): KeyPair =
         KeyPairGenerator.getInstance("Ed25519").generateKeyPair()

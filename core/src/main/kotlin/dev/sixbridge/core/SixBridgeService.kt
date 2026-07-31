@@ -79,7 +79,7 @@ class SixBridgeService(
     private val outputGuardHook: () -> Unit = {},
     draftSigningIdentityProvider: DraftSigningIdentityProvider? = null,
     private val toolchainProvider: () -> AndroidToolchain = { AndroidToolchain.locate() },
-    secureConversionRoot: SecureConversionRoot? = null,
+    private val secureConversionRoot: SecureConversionRoot? = null,
 ) {
     constructor(
         workspaceRoot: Path,
@@ -301,6 +301,116 @@ class SixBridgeService(
         }
     }
 
+    fun draftPortableResolved(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        outputDraft: Path,
+        projectIdentity: String? = null,
+        approvedAdapterIds: Iterable<String> = emptyList(),
+        protectedInputs: Iterable<Path> = emptyList(),
+        control: AnalysisControl = AnalysisControl(),
+    ): SixDraftResult {
+        control.checkCancelled()
+        val requestedProjectIdentity = projectIdentity ?: resolved.projectIdentity
+        val draftInput = resolved.copy(projectIdentity = requestedProjectIdentity)
+        validateProjectIdentity(requestedProjectIdentity)
+        val target = outputDraft.toAbsolutePath().normalize()
+        val outputGuard = ProtectedOutputPolicy.capture(
+            workspaceRoot = workspaceRoot,
+            localRoot = localRoot,
+            resolved = draftInput,
+            outputs = listOf(target),
+            protectedInputs = protectedInputs,
+        )
+        outputGuardHook()
+        outputGuard.requireCurrent()
+        return ConversionPipeline.create(
+            localRoot,
+            compatibilityAnalyzer,
+            tempTreeFactory,
+        ).use { pipeline ->
+            val prepared = runControlledDraftStage(control) {
+                pipeline.preflightPreparation(
+                    draftInput,
+                    profile,
+                    approvedAdapterIds,
+                    control,
+                )
+            }
+            val sourceIdentity = resolveDraftSourceIdentity(
+                prepared.logicalSourceIdentity,
+                requestedProjectIdentity,
+            )
+            outputGuard.requireCurrent()
+            val targetGuard = outputGuard.captureTargets(listOf(target))
+            val applied = prepared.compatibilityAfter.adapterDecisions
+                .filter { it.applied }
+                .sortedWith(compareBy({ it.id }, { it.version }))
+            val before = prepared.compatibilityBefore.copy(
+                originalExtensionId = prepared.originalExtensionId,
+            )
+            val after = prepared.compatibilityAfter
+            val sourceKind = if (draftInput.crxBytes == null) {
+                DraftSourceKind.ZIP
+            } else {
+                DraftSourceKind.CRX
+            }
+            val source = runControlledDraftStage(control) {
+                draftInput.crxBytes?.copyOf()
+                    ?: ExtensionZip.createBytes(
+                        requireNotNull(draftInput.sourceRoot),
+                        includeProjectMarker = true,
+                    )
+            }
+            val payload = SixDraftPayload.create(
+                draft = DraftMetadata.createV2(
+                    coreVersion = CORE_VERSION,
+                    adapterVersions = applied.associate { it.id to it.version },
+                    sourceIdentity = sourceIdentity,
+                ),
+                input = DraftInputMetadata(
+                    inputKind = draftInput.kind,
+                    originalSourceSha256 = requireNotNull(before.sourceSha256),
+                    browserProfileSha256 = requireNotNull(
+                        before.browserProfileSha256,
+                    ),
+                    originalExtensionId = before.originalExtensionId,
+                    originalExtensionVersion = requireNotNull(
+                        before.extensionVersion,
+                    ),
+                    sourceIdentity = sourceIdentity,
+                ),
+                sourceKind = sourceKind,
+                source = source,
+                plan = DraftConversionPlan.create(
+                    before,
+                    applied.map { DraftSelectedAdapter(it.id, it.version) },
+                ),
+                compatibilityBefore = before,
+                compatibilityAfter = after,
+            )
+            targetGuard.requireCurrent()
+            val key = signingIdentityForDraft(control)
+            targetGuard.requireCurrent()
+            runControlledDraftStage(control) {
+                publishPortableDraft(
+                    target,
+                    payload,
+                    key,
+                    targetGuard.publicationGuard,
+                )
+                verifyWrittenDraft(payload, key, draftReader(target))
+            }
+            SixDraftResult(
+                draft = target,
+                conversionState = after.conversionState,
+                adapterIds = applied.map { it.id },
+                sourceSha256 = requireNotNull(before.sourceSha256),
+                transformedSha256 = requireNotNull(after.sourceSha256),
+            )
+        }
+    }
+
     @JvmSynthetic
     internal fun signingIdentityForDraft(
         control: AnalysisControl = AnalysisControl(),
@@ -511,6 +621,44 @@ class SixBridgeService(
             throw DraftSelfVerificationException(
                 "게시된 SixDraft가 생성 의도 또는 서명 key와 다릅니다.",
             )
+        }
+    }
+
+    private fun publishPortableDraft(
+        target: Path,
+        payload: SixDraftPayload,
+        signingKey: KeyPair,
+        publicationGuard: PublicationGuard,
+    ) {
+        val isolatedFileSystem = secureConversionRoot?.path?.fileSystem
+        if (isolatedFileSystem == null || target.fileSystem !== isolatedFileSystem) {
+            SixDraft.writeGuarded(
+                target,
+                payload,
+                signingKey,
+                publicationGuard,
+            )
+            return
+        }
+
+        SecureBuildPublisher.requirePublicationGuard(publicationGuard)
+        val parent = requireNotNull(target.parent)
+        val temporary = Files.createTempFile(
+            parent,
+            ".sixbridge-portable-draft-",
+            ".tmp",
+        )
+        try {
+            Files.write(temporary, SixDraft.createBytes(payload, signingKey))
+            SecureBuildPublisher.requirePublicationGuard(publicationGuard)
+            Files.move(
+                temporary,
+                target,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
+        } finally {
+            Files.deleteIfExists(temporary)
         }
     }
 
