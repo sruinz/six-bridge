@@ -61,10 +61,19 @@ class SixBridgeSecureRootTest {
             )
 
             assertEquals(CompatibilityStatus.COMPATIBLE, service.analyze(zip.toString(), profile).status)
+            val zipRoots = fixture.secureRootChildren()
+            assertEquals(1, zipRoots.size)
+            assertTrue(Files.isRegularFile(zipRoots.single().resolve("manifest.json")))
             assertEquals(CompatibilityStatus.COMPATIBLE, service.analyze(crx.toString(), profile).status)
-            assertTrue(Files.list(fixture.root).use { roots ->
-                roots.allMatch { it.fileSystem.provider() === fixture.root.fileSystem.provider() }
+            val allRoots = fixture.secureRootChildren()
+            assertEquals(2, allRoots.size)
+            assertTrue(allRoots.all { root ->
+                root.fileSystem.provider() === fixture.root.fileSystem.provider() &&
+                    Files.isRegularFile(root.resolve("manifest.json"))
             })
+
+            allRoots.forEach(fixture::deleteSecureTree)
+            assertTrue(fixture.secureRootChildren().isEmpty())
         }
     }
 
@@ -151,6 +160,16 @@ class SixBridgeSecureRootTest {
             )
             return resolver.resolve(crx("prepare.crx").toString())
         }
+
+        fun secureRootChildren(): List<java.nio.file.Path> =
+            Files.list(root).use { children -> children.sorted().toList() }
+
+        fun deleteSecureTree(path: java.nio.file.Path) {
+            Files.walk(path).use { entries ->
+                entries.sorted(Comparator.reverseOrder()).forEach(Files::delete)
+            }
+        }
+
         override fun close() {
             fileSystem.close()
         }

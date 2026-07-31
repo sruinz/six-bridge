@@ -339,6 +339,49 @@ class ExtensionZipTest {
     }
 
     @Test
+    fun `byte extraction supports a relative destination and creates missing parents`() {
+        val bytes = Files.readAllBytes(
+            zipWith(
+                "manifest.json" to """{"name":"relative"}""",
+                "payload.js" to "relative",
+            ),
+        )
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val destinations = listOf(
+                fileSystem.getPath("relative-output"),
+                fileSystem.getPath("/missing/parent/output"),
+            )
+
+            destinations.forEach { destination ->
+                val extracted = ExtensionZip.extract(bytes, destination)
+
+                assertEquals(destination, extracted)
+                assertEquals("relative", Files.readString(extracted.resolve("payload.js")))
+            }
+        }
+    }
+
+    @Test
+    fun `byte extractInto supports an existing relative destination`() {
+        val bytes = Files.readAllBytes(
+            zipWith(
+                "manifest.json" to """{"name":"relative-into"}""",
+            ),
+        )
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val destination = Files.createDirectory(
+                fileSystem.getPath("/work/existing-relative"),
+            )
+            val relativeDestination = fileSystem.getPath("existing-relative")
+
+            val extracted = ExtensionZip.extractInto(bytes, relativeDestination)
+
+            assertEquals(destination, extracted)
+            assertTrue(Files.isRegularFile(destination.resolve("manifest.json")))
+        }
+    }
+
+    @Test
     fun `extract entry scan은 caller AnalysisControl 취소 전에 output을 만들지 않는다`() {
         val zip = zipWith(
             "manifest.json" to """{"name":"cancel"}""",

@@ -113,8 +113,9 @@ object ExtensionZip {
         control: AnalysisControl,
     ): Path {
         control.checkCancelled()
+        val normalizedDestination = prepareExtractionRoot(destination)
         val temporary = Files.createTempFile(
-            requireNotNull(destination.parent),
+            requireNotNull(normalizedDestination.parent),
             "sixbridge-extension-bytes-",
             ".zip",
         )
@@ -199,8 +200,10 @@ object ExtensionZip {
         control: AnalysisControl,
     ): Path {
         control.checkCancelled()
+        val normalizedDestination = destination.toAbsolutePath().normalize()
+        requireExtractionDirectory(normalizedDestination)
         val temporary = Files.createTempFile(
-            requireNotNull(destination.parent),
+            requireNotNull(normalizedDestination.parent),
             "sixbridge-extension-bytes-",
             ".zip",
         )
