@@ -52,9 +52,15 @@ internal class StableExtensionAnalysis private constructor(
                 "sixbridge-analysis-",
             )
             return try {
+                val snapshot = OwnedTempTree.createNamed(
+                    temporary,
+                    "live-source",
+                )
                 val archive = AnalysisInputMaterializer.snapshotDirectory(
-                    sourceRoot,
-                    control,
+                    root = sourceRoot,
+                    control = control,
+                    snapshot = snapshot.rootPath,
+                    cleanupSnapshot = { OwnedTempTree.delete(snapshot) },
                 ) {
                     ExtensionZip.createBytes(
                         it,

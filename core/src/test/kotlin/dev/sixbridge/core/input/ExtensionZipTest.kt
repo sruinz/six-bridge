@@ -1,5 +1,7 @@
 package dev.sixbridge.core.input
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import java.net.URI
@@ -247,6 +249,24 @@ class ExtensionZipTest {
     }
 
     @Test
+    fun `rejects encrypted entries before creating output`() {
+        val zip = zipWith(
+            "manifest.json" to """{"name":"encrypted"}""",
+        )
+        markAsEncrypted(zip)
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val destination = Files.createDirectory(fileSystem.getPath("/encrypted-output"))
+
+            val error = assertFailsWith<IllegalArgumentException> {
+                ExtensionZip.extract(zip, destination)
+            }
+
+            assertTrue(error.message.orEmpty().contains("암호화"))
+            assertTrue(Files.list(destination).use { it.findAny().isEmpty })
+        }
+    }
+
+    @Test
     fun `does not accept a fake empty EOCD inside a zip comment`() {
         val zip = zipWith(
             "manifest.json" to """{"name":"symlink-comment"}""",
@@ -308,12 +328,14 @@ class ExtensionZipTest {
             "manifest.json" to """{"name":"nested"}""",
             "assets/payload.js" to "inside",
         )
-        val destination = Files.createTempDirectory("six-nested-output")
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val destination = Files.createDirectory(fileSystem.getPath("/six-nested-output"))
 
-        val extracted = ExtensionZip.extract(zip, destination)
+            val extracted = ExtensionZip.extract(zip, destination)
 
-        assertEquals(destination, extracted)
-        assertEquals("inside", Files.readString(extracted.resolve("assets/payload.js")))
+            assertEquals(destination, extracted)
+            assertEquals("inside", Files.readString(extracted.resolve("assets/payload.js")))
+        }
     }
 
     @Test
@@ -409,6 +431,26 @@ class ExtensionZipTest {
             offset += 46 + nameLength + extraLength + commentLength
         }
         error("central directory entry를 찾지 못했습니다: $entryName")
+    }
+
+    private fun markAsEncrypted(zip: Path) {
+        val bytes = Files.readAllBytes(zip)
+        var localFound = false
+        var centralFound = false
+        for (offset in 0..bytes.size - 4) {
+            when (littleEndianInt(bytes, offset)) {
+                0x04034b50 -> {
+                    bytes[offset + 6] = (bytes[offset + 6].toInt() or 1).toByte()
+                    localFound = true
+                }
+                0x02014b50 -> {
+                    bytes[offset + 8] = (bytes[offset + 8].toInt() or 1).toByte()
+                    centralFound = true
+                }
+            }
+        }
+        check(localFound && centralFound)
+        Files.write(zip, bytes)
     }
 
     private fun appendFakeEocdComment(zip: Path) {

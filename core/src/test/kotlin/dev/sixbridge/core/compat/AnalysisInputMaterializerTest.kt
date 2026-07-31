@@ -1,5 +1,7 @@
 package dev.sixbridge.core.compat
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -21,8 +23,27 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertSame
 
 class AnalysisInputMaterializerTest {
+    @Test
+    fun `주입된 snapshot root에서만 live source snapshot을 만든다`() {
+        val source = Files.createTempDirectory("six-input-provider-source")
+        Files.writeString(source.resolve("manifest.json"), validManifest)
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val snapshot = Files.createDirectory(fileSystem.getPath("/snapshot"))
+
+            AnalysisInputMaterializer.snapshotDirectory(
+                root = source,
+                control = AnalysisControl(AnalysisSafetyPolicy.mobile),
+                snapshot = snapshot,
+                cleanupSnapshot = {},
+            ) { captured ->
+                assertSame(fileSystem.provider(), captured.fileSystem.provider())
+            }
+        }
+    }
+
     @Test
     fun `archive FIFO는 channel open 전에 거부한다`() {
         val directory = Files.createTempDirectory("six-input-fifo-")

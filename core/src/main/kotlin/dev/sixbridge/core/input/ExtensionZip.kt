@@ -6,12 +6,14 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+import org.apache.commons.compress.archivers.zip.ZipFile as CommonsZipFile
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
+import java.nio.channels.SeekableByteChannel
 import java.nio.channels.WritableByteChannel
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileVisitResult
@@ -28,7 +30,6 @@ import java.text.Normalizer
 import java.util.Base64
 import java.util.Locale
 import java.util.zip.CRC32
-import java.util.zip.ZipFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.io.path.invariantSeparatorsPathString
@@ -112,7 +113,11 @@ object ExtensionZip {
         control: AnalysisControl,
     ): Path {
         control.checkCancelled()
-        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        val temporary = Files.createTempFile(
+            requireNotNull(destination.parent),
+            "sixbridge-extension-bytes-",
+            ".zip",
+        )
         return try {
             Files.write(temporary, bytes)
             control.checkCancelled()
@@ -151,7 +156,11 @@ object ExtensionZip {
         control: AnalysisControl = AnalysisControl(),
     ): Path {
         control.checkCancelled()
-        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        val temporary = Files.createTempFile(
+            requireNotNull(root.path.parent),
+            "sixbridge-extension-bytes-",
+            ".zip",
+        )
         return try {
             Files.write(temporary, bytes)
             control.checkCancelled()
@@ -190,7 +199,11 @@ object ExtensionZip {
         control: AnalysisControl,
     ): Path {
         control.checkCancelled()
-        val temporary = Files.createTempFile("sixbridge-extension-bytes-", ".zip")
+        val temporary = Files.createTempFile(
+            requireNotNull(destination.parent),
+            "sixbridge-extension-bytes-",
+            ".zip",
+        )
         return try {
             Files.write(temporary, bytes)
             control.checkCancelled()
@@ -238,76 +251,90 @@ object ExtensionZip {
     ): Path {
         control.checkCancelled()
         val validatedEntryCount = validateUnixEntryTypes(zipPath, control)
-        ZipFile(zipPath.toFile()).use { zip ->
-            require(zip.size() == validatedEntryCount) {
-                "ZIP 중앙 디렉터리 항목 수가 일치하지 않습니다."
-            }
-            require(zip.size() <= MAX_ENTRIES) { "ZIP 항목 수가 제한을 초과합니다." }
-            var declaredTotal = 0L
-            val rawNames = mutableSetOf<String>()
-            val normalizedPaths = mutableMapOf<String, String>()
-            val foldedPaths = mutableMapOf<String, String>()
-            val entryTypes = mutableMapOf<String, Boolean>()
-            val validated = zip.entries().asSequence().map { entry ->
-                control.checkCancelled()
-                require(rawNames.add(entry.name)) {
-                    "ZIP 중복 항목을 거부했습니다: ${entry.name}"
-                }
-                val name = validateRelativePath(entry.name, entry.isDirectory)
-                registerPath(name, entry.name, normalizedPaths, foldedPaths)
-                registerEntryType(name, entry.isDirectory, entryTypes)
-                validateEntry(entry)
-                if (!entry.isDirectory) {
-                    declaredTotal += entry.size
-                    require(declaredTotal <= MAX_TOTAL_SIZE) {
-                        "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+        Files.newByteChannel(zipPath, StandardOpenOption.READ).use { channel ->
+            CommonsZipFile.builder()
+                .setSeekableByteChannel(channel)
+                .get()
+                .use { zip ->
+                    val entries = zip.entries.asSequence().toList()
+                    require(entries.size == validatedEntryCount) {
+                        "ZIP 중앙 디렉터리 항목 수가 일치하지 않습니다."
                     }
-                }
-                ValidatedEntry(entry, name)
-            }.toList()
-            withSecureExtractionRoot(
-                normalizedDestination,
-                expectedRootFileKey,
-                entryTypes,
-                afterSecureValidation,
-                control,
-            ) { secureRoot ->
-                var totalSize = 0L
-                validated.forEach { validatedEntry ->
-                    control.checkCancelled()
-                    val entry = validatedEntry.entry
-                    val components = validatedEntry.name.split('/')
-                    val output = normalizedDestination.resolve(validatedEntry.name).normalize()
-                    require(output.startsWith(normalizedDestination)) {
-                        "ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}"
+                    require(entries.size <= MAX_ENTRIES) {
+                        "ZIP 항목 수가 제한을 초과합니다."
                     }
-                    requireCurrentExtractionRoot(
-                        normalizedDestination,
-                        expectedRootFileKey,
-                    )
-                    if (entry.isDirectory) {
-                        ensureDirectoryComponents(normalizedDestination, components)
-                    } else {
-                        ensureDirectoryComponents(normalizedDestination, components.dropLast(1))
-                        zip.getInputStream(entry).use { input ->
-                            totalSize += copyLimited(
-                                input,
-                                secureRoot,
-                                components,
-                                output,
-                                control,
-                            )
-                            require(totalSize <= MAX_TOTAL_SIZE) {
+                    var declaredTotal = 0L
+                    val rawNames = mutableSetOf<String>()
+                    val normalizedPaths = mutableMapOf<String, String>()
+                    val foldedPaths = mutableMapOf<String, String>()
+                    val entryTypes = mutableMapOf<String, Boolean>()
+                    val validated = entries.map { entry ->
+                        control.checkCancelled()
+                        require(zip.canReadEntryData(entry)) {
+                            "지원하지 않는 ZIP 압축 또는 암호화 항목을 거부했습니다: ${entry.name}"
+                        }
+                        require(rawNames.add(entry.name)) {
+                            "ZIP 중복 항목을 거부했습니다: ${entry.name}"
+                        }
+                        val name = validateRelativePath(entry.name, entry.isDirectory)
+                        registerPath(name, entry.name, normalizedPaths, foldedPaths)
+                        registerEntryType(name, entry.isDirectory, entryTypes)
+                        validateEntry(entry)
+                        if (!entry.isDirectory) {
+                            declaredTotal += entry.size
+                            require(declaredTotal <= MAX_TOTAL_SIZE) {
                                 "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
                             }
                         }
+                        ValidatedEntry(entry, name)
                     }
-                    requireCurrentExtractionRoot(
+                    withSecureExtractionRoot(
                         normalizedDestination,
                         expectedRootFileKey,
-                    )
+                        entryTypes,
+                        afterSecureValidation,
+                        control,
+                    ) { secureRoot ->
+                        var totalSize = 0L
+                        validated.forEach { validatedEntry ->
+                            control.checkCancelled()
+                            val entry = validatedEntry.entry
+                            val components = validatedEntry.name.split('/')
+                            val output = normalizedDestination.resolve(validatedEntry.name).normalize()
+                            require(output.startsWith(normalizedDestination)) {
+                                "ZIP 경로 탈출 항목을 거부했습니다: ${entry.name}"
+                            }
+                            requireCurrentExtractionRoot(
+                                normalizedDestination,
+                                expectedRootFileKey,
+                            )
+                            if (entry.isDirectory) {
+                                ensureDirectoryComponents(normalizedDestination, components)
+                            } else {
+                                ensureDirectoryComponents(
+                                    normalizedDestination,
+                                    components.dropLast(1),
+                                )
+                                zip.getInputStream(entry).use { input ->
+                                    totalSize += copyLimited(
+                                        input,
+                                        secureRoot,
+                                        components,
+                                        output,
+                                        control,
+                                    )
+                                    require(totalSize <= MAX_TOTAL_SIZE) {
+                                        "ZIP 전체 압축 해제 크기가 제한을 초과합니다."
+                                    }
+                                }
+                            }
+                            requireCurrentExtractionRoot(
+                                normalizedDestination,
+                                expectedRootFileKey,
+                            )
+                        }
+                    }
                 }
-            }
         }
         requireCurrentExtractionRoot(normalizedDestination, expectedRootFileKey)
         return locateManifestRoot(resultRoot).also {
@@ -319,9 +346,9 @@ object ExtensionZip {
         zipPath: Path,
         control: AnalysisControl,
     ): Int =
-        RandomAccessFile(zipPath.toFile(), "r").use { archive ->
+        Files.newByteChannel(zipPath, StandardOpenOption.READ).use { archive ->
             control.checkCancelled()
-            val archiveSize = archive.length()
+            val archiveSize = archive.size()
             require(archiveSize >= END_OF_CENTRAL_DIRECTORY_SIZE) {
                 "ZIP 중앙 디렉터리를 찾지 못했습니다."
             }
@@ -331,8 +358,7 @@ object ExtensionZip {
             ).toInt()
             val tail = ByteArray(tailSize)
             val tailOffset = archiveSize - tailSize
-            archive.seek(tailOffset)
-            archive.readFully(tail)
+            readFully(archive, tailOffset, tail)
             val endOffset = (tail.size - END_OF_CENTRAL_DIRECTORY_SIZE.toInt() downTo 0)
                 .firstOrNull { offset ->
                     if (littleEndianInt(tail, offset) != END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
@@ -365,11 +391,12 @@ object ExtensionZip {
                 "지원하지 않는 ZIP64 또는 손상된 중앙 디렉터리입니다."
             }
 
-            archive.seek(centralOffset)
+            var position = centralOffset
             repeat(entryCount) {
                 control.checkCancelled()
                 val header = ByteArray(CENTRAL_DIRECTORY_HEADER_SIZE)
-                archive.readFully(header)
+                readFully(archive, position, header)
+                position += CENTRAL_DIRECTORY_HEADER_SIZE
                 require(littleEndianInt(header, 0) == CENTRAL_DIRECTORY_SIGNATURE) {
                     "ZIP 중앙 디렉터리 항목이 손상되었습니다."
                 }
@@ -377,7 +404,8 @@ object ExtensionZip {
                 val extraLength = littleEndianShort(header, 30)
                 val commentLength = littleEndianShort(header, 32)
                 val nameBytes = ByteArray(nameLength)
-                archive.readFully(nameBytes)
+                readFully(archive, position, nameBytes)
+                position += nameLength
                 val hostSystem = header[5].toInt() and 0xff
                 if (hostSystem == UNIX_HOST_SYSTEM) {
                     val mode = (
@@ -388,17 +416,31 @@ object ExtensionZip {
                         "ZIP 특수 파일 항목을 거부했습니다: ${nameBytes.decodeToString()}"
                     }
                 }
-                val next = archive.filePointer + extraLength + commentLength
+                val next = position + extraLength + commentLength
                 require(next <= centralOffset + centralSize && next <= archiveSize) {
                     "ZIP 중앙 디렉터리 항목 길이가 손상되었습니다."
                 }
-                archive.seek(next)
+                position = next
             }
-            require(archive.filePointer == centralOffset + centralSize) {
+            require(position == centralOffset + centralSize) {
                 "ZIP 중앙 디렉터리 크기와 실제 항목이 일치하지 않습니다."
             }
             entryCount
         }
+
+    private fun readFully(
+        channel: SeekableByteChannel,
+        offset: Long,
+        target: ByteArray,
+    ) {
+        channel.position(offset)
+        val buffer = ByteBuffer.wrap(target)
+        while (buffer.hasRemaining()) {
+            require(channel.read(buffer) > 0) {
+                "ZIP 중앙 디렉터리가 예상보다 일찍 끝났습니다."
+            }
+        }
+    }
 
     private fun readSourceEntries(
         sourceRoot: Path,
@@ -652,8 +694,11 @@ object ExtensionZip {
         return candidates.single()
     }
 
-    private fun validateEntry(entry: ZipEntry) {
-        if (!entry.isDirectory && entry.size >= 0) {
+    private fun validateEntry(entry: ZipArchiveEntry) {
+        if (!entry.isDirectory) {
+            require(entry.size >= 0 && entry.compressedSize >= 0) {
+                "ZIP 항목 크기를 확인할 수 없습니다: ${entry.name}"
+            }
             require(entry.size <= MAX_ENTRY_SIZE) {
                 "ZIP 개별 항목 크기가 제한을 초과합니다: ${entry.name}"
             }
@@ -1044,7 +1089,7 @@ object ExtensionZip {
     }
 
     private data class ValidatedEntry(
-        val entry: ZipEntry,
+        val entry: ZipArchiveEntry,
         val name: String,
     )
 }

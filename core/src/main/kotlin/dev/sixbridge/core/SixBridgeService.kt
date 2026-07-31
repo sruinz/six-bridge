@@ -72,7 +72,7 @@ data class SixDraftAnalysisResult(
 
 class SixBridgeService(
     private val workspaceRoot: Path,
-    private val inputResolver: ExtensionInputResolver = ExtensionInputResolver(),
+    inputResolver: ExtensionInputResolver? = null,
     private val compatibilityAnalyzer: CompatibilityAnalyzer = CompatibilityAnalyzer(),
     private val draftReader: (Path) -> VerifiedSixDraft = SixDraft::read,
     private val draftSourceStreamObserver: (InputStream) -> InputStream = { it },
@@ -86,7 +86,7 @@ class SixBridgeService(
         toolchainProvider: () -> AndroidToolchain,
     ) : this(
         workspaceRoot,
-        ExtensionInputResolver(),
+        null,
         CompatibilityAnalyzer(),
         SixDraft::read,
         { it },
@@ -98,6 +98,15 @@ class SixBridgeService(
 
     private val localRoot = workspaceRoot.resolve(".local")
     private val tempTreeFactory = ConversionTempTreeFactory(secureConversionRoot)
+    private val inputResolver = inputResolver ?: secureConversionRoot?.let { root ->
+        ExtensionInputResolver(
+            extractionRootFactory = {
+                Files.createDirectory(
+                    root.path.resolve("sixbridge-extension-${java.util.UUID.randomUUID()}"),
+                )
+            },
+        )
+    } ?: ExtensionInputResolver()
     private val signingIdentityProvider =
         draftSigningIdentityProvider ?: DraftSigningIdentityProvider {
             DraftSigningKeyStore(

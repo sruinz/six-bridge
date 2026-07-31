@@ -31,6 +31,7 @@ object AnalysisInputMaterializer {
     ): T = snapshotDirectory(
         root = root,
         control = control,
+        snapshot = Files.createTempDirectory("sixbridge-analysis-input-"),
         cleanupSnapshot = ::deleteTree,
         snapshotter = snapshotter,
     )
@@ -40,11 +41,30 @@ object AnalysisInputMaterializer {
         control: AnalysisControl,
         cleanupSnapshot: (Path) -> Unit,
         snapshotter: (Path) -> T,
+    ): T = snapshotDirectory(
+        root = root,
+        control = control,
+        snapshot = Files.createTempDirectory("sixbridge-analysis-input-"),
+        cleanupSnapshot = cleanupSnapshot,
+        snapshotter = snapshotter,
+    )
+
+    internal fun <T> snapshotDirectory(
+        root: Path,
+        control: AnalysisControl,
+        snapshot: Path,
+        cleanupSnapshot: (Path) -> Unit,
+        snapshotter: (Path) -> T,
     ): T {
         val ledger = AnalysisBudgetLedger(control.policy)
         val normalizedRoot = root.toAbsolutePath().normalize()
         val rootIdentity = fileIdentity(normalizedRoot, directory = true)
-        val snapshot = Files.createTempDirectory("sixbridge-analysis-input-")
+        require(Files.isDirectory(snapshot, NOFOLLOW_LINKS)) {
+            "분석 snapshot root는 실제 디렉터리여야 합니다: $snapshot"
+        }
+        require(Files.list(snapshot).use { it.findAny().isEmpty }) {
+            "분석 snapshot root는 비어 있어야 합니다: $snapshot"
+        }
         var primaryFailure: Throwable? = null
         return try {
             Files.walkFileTree(
@@ -304,11 +324,16 @@ object AnalysisInputMaterializer {
     }
 
     private fun snapshotTarget(root: Path, snapshot: Path, source: Path): Path =
-        snapshot.resolve(root.relativize(source)).normalize().also {
-            require(it.startsWith(snapshot)) {
-                "분석 source 경로가 snapshot root를 벗어났습니다."
+        root.relativize(source)
+            .fold(snapshot) { target, component ->
+                target.resolve(component.toString())
             }
-        }
+            .normalize()
+            .also {
+                require(it.startsWith(snapshot)) {
+                    "분석 source 경로가 snapshot root를 벗어났습니다."
+                }
+            }
 
     private fun fileIdentity(path: Path, directory: Boolean): FileIdentity {
         val attributes = Files.readAttributes(
