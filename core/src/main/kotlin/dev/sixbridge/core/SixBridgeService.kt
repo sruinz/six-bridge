@@ -70,6 +70,13 @@ data class SixDraftAnalysisResult(
     val logicalSourceIdentity: LogicalSourceIdentityResult,
 )
 
+internal typealias GuardedDraftPublisher = (
+    Path,
+    SixDraftPayload,
+    KeyPair,
+    PublicationGuard,
+) -> Unit
+
 class SixBridgeService(
     private val workspaceRoot: Path,
     inputResolver: ExtensionInputResolver? = null,
@@ -79,7 +86,7 @@ class SixBridgeService(
     private val outputGuardHook: () -> Unit = {},
     draftSigningIdentityProvider: DraftSigningIdentityProvider? = null,
     private val toolchainProvider: () -> AndroidToolchain = { AndroidToolchain.locate() },
-    private val secureConversionRoot: SecureConversionRoot? = null,
+    secureConversionRoot: SecureConversionRoot? = null,
 ) {
     constructor(
         workspaceRoot: Path,
@@ -190,6 +197,28 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
+    ): SixDraftResult = draftResolved(
+        resolved,
+        profile,
+        outputDraft,
+        projectIdentity,
+        approvedAdapterIds,
+        protectedInputs,
+        control,
+    ) { target, payload, key, publicationGuard ->
+        SixDraft.writeGuarded(target, payload, key, publicationGuard)
+    }
+
+    @JvmSynthetic
+    internal fun draftResolved(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        outputDraft: Path,
+        projectIdentity: String?,
+        approvedAdapterIds: Iterable<String>,
+        protectedInputs: Iterable<Path>,
+        control: AnalysisControl,
+        draftPublisher: GuardedDraftPublisher,
     ): SixDraftResult {
         control.checkCancelled()
         val requestedProjectIdentity = projectIdentity ?: resolved.projectIdentity
@@ -241,7 +270,7 @@ class SixBridgeService(
                 .filter { it.applied }
                 .sortedWith(compareBy({ it.id }, { it.version }))
             val before = prepared.compatibilityBefore.copy(
-                originalExtensionId = prepared.compatibilityBefore.originalExtensionId,
+                originalExtensionId = prepared.compatibilityAfter.originalExtensionId,
             )
             val after = prepared.compatibilityAfter
             val sourceKind = DraftSourceKind.PREPARED_CRX
@@ -279,7 +308,7 @@ class SixBridgeService(
             val key = signingIdentityForDraft(control)
             targetGuard.requireCurrent()
             runControlledDraftStage(control) {
-                SixDraft.writeGuarded(
+                draftPublisher(
                     target,
                     payload,
                     key,
@@ -309,6 +338,28 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
+    ): SixDraftResult = draftPortableResolved(
+        resolved,
+        profile,
+        outputDraft,
+        projectIdentity,
+        approvedAdapterIds,
+        protectedInputs,
+        control,
+    ) { target, payload, key, publicationGuard ->
+        SixDraft.writeGuarded(target, payload, key, publicationGuard)
+    }
+
+    @JvmSynthetic
+    internal fun draftPortableResolved(
+        resolved: ResolvedExtensionInput,
+        profile: BrowserProfile,
+        outputDraft: Path,
+        projectIdentity: String?,
+        approvedAdapterIds: Iterable<String>,
+        protectedInputs: Iterable<Path>,
+        control: AnalysisControl,
+        draftPublisher: GuardedDraftPublisher,
     ): SixDraftResult {
         control.checkCancelled()
         val requestedProjectIdentity = projectIdentity ?: resolved.projectIdentity
@@ -393,7 +444,7 @@ class SixBridgeService(
             val key = signingIdentityForDraft(control)
             targetGuard.requireCurrent()
             runControlledDraftStage(control) {
-                publishPortableDraft(
+                draftPublisher(
                     target,
                     payload,
                     key,
@@ -621,44 +672,6 @@ class SixBridgeService(
             throw DraftSelfVerificationException(
                 "게시된 SixDraft가 생성 의도 또는 서명 key와 다릅니다.",
             )
-        }
-    }
-
-    private fun publishPortableDraft(
-        target: Path,
-        payload: SixDraftPayload,
-        signingKey: KeyPair,
-        publicationGuard: PublicationGuard,
-    ) {
-        val isolatedFileSystem = secureConversionRoot?.path?.fileSystem
-        if (isolatedFileSystem == null || target.fileSystem !== isolatedFileSystem) {
-            SixDraft.writeGuarded(
-                target,
-                payload,
-                signingKey,
-                publicationGuard,
-            )
-            return
-        }
-
-        SecureBuildPublisher.requirePublicationGuard(publicationGuard)
-        val parent = requireNotNull(target.parent)
-        val temporary = Files.createTempFile(
-            parent,
-            ".sixbridge-portable-draft-",
-            ".tmp",
-        )
-        try {
-            Files.write(temporary, SixDraft.createBytes(payload, signingKey))
-            SecureBuildPublisher.requirePublicationGuard(publicationGuard)
-            Files.move(
-                temporary,
-                target,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-            )
-        } finally {
-            Files.deleteIfExists(temporary)
         }
     }
 

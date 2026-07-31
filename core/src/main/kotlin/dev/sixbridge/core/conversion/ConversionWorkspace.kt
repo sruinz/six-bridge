@@ -2,6 +2,8 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.SourceProjectIdentityStore
+import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.file.Files
@@ -399,7 +401,12 @@ class ConversionWorkspace private constructor(
         check(snapshot.sourceZip.contentEquals(originalArchive)) {
             "immutable original source archive가 snapshot과 다릅니다."
         }
-        val current = MobilePatternAnalyzer().analyzeArchive(
+        val analysisControl = AnalysisControl()
+        val current = MobilePatternAnalyzer(
+            control = analysisControl,
+            compatibilityAnalyzer = CompatibilityAnalyzer(analysisControl),
+            tempTreeFactory = tempTreeFactory,
+        ).analyzeArchive(
             originalArchive,
             profile,
         )
