@@ -33,7 +33,15 @@ import dev.sixbridge.desktop.ui.finishProfileImport
 import dev.sixbridge.desktop.ui.invalidateProfileImports
 import dev.sixbridge.desktop.ui.reduceInputState
 
-fun main() = application {
+fun main(arguments: Array<String>) {
+    if (DesktopDistributionProbe.isRequested(arguments)) {
+        println(DesktopDistributionProbe.run())
+        return
+    }
+    launchDesktopApplication()
+}
+
+private fun launchDesktopApplication() = application {
     val controller = remember { DesktopConversionController() }
     val paths = remember { DesktopApplicationPaths.resolve() }
     val catalog = remember(paths) { DesktopProfileCatalog(paths.dataRoot) }

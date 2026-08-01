@@ -37,6 +37,19 @@ fail() {
   exit 1
 }
 
+distribution_contains_credential() {
+  local scan_root="$1"
+  local probe="$2"
+  local status=0
+
+  rg -a --hidden --no-ignore -q -F -- "$probe" "$scan_root" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) fail "credential content scan을 실행하지 못했습니다." ;;
+  esac
+}
+
 tasks_output="$(run_unsigned_gradle :desktop-app:tasks --all)"
 rg -q '^packageDmg([[:space:]]|$)' <<<"$tasks_output" || fail "packageDmg task가 없습니다."
 rg -q '^packageMsi([[:space:]]|$)' <<<"$tasks_output" || fail "packageMsi task가 없습니다."
@@ -90,6 +103,13 @@ if rg -q -F "$credential_probe" <<<"$complete_output"; then
   fail "credential 값이 Gradle output에 노출됐습니다."
 fi
 
+hidden_scan_fixture="$test_home/credential-scan-fixture"
+mkdir -p "$hidden_scan_fixture"
+printf '%s\n' "$credential_probe" > "$hidden_scan_fixture/.credentials"
+if ! distribution_contains_credential "$hidden_scan_fixture" "$credential_probe"; then
+  fail "hidden credential 누출 self-test가 누출을 탐지하지 못했습니다."
+fi
+
 run_unsigned_gradle \
   -Pcompose.desktop.packaging.checkJdkVendor=false \
   :desktop-app:processResources \
@@ -126,7 +146,7 @@ for scan_root in "${scan_roots[@]}"; do
         ;;
     esac
   done < <(find "$scan_root" -type f -print0)
-  if rg -a -q -F "$credential_probe" "$scan_root"; then
+  if distribution_contains_credential "$scan_root" "$credential_probe"; then
     fail "credential probe가 resource 또는 distribution input에 남았습니다."
   fi
 done
@@ -145,19 +165,35 @@ if rg -q '(^|/)\.local/|\.(pem|pk8|p12|jks|sixdraft|six|crx|zip)$' <<<"$applicat
   fail "packaged application jar에 정적 비밀·작업 파일이 포함됐습니다."
 fi
 
-launcher_java="$(command -v java)"
-[[ -x "$launcher_java" ]] || fail "Jimfs packaged classpath probe에 사용할 Java launcher가 없습니다."
-set +e
-jimfs_output="$(
-  LC_ALL=C LANG=C \
-    "$launcher_java" \
-    -cp "$app_bundle/Contents/app/*" \
-    com.google.common.jimfs.Jimfs 2>&1
-)"
-jimfs_status=$?
-set -e
-[[ $jimfs_status -ne 0 ]] || fail "Jimfs runtime probe가 예상과 다르게 종료됐습니다."
-rg -q 'com\.google\.common\.jimfs\.Jimfs' <<<"$jimfs_output" || fail "packaged classpath에 Jimfs class가 없습니다."
-rg -q 'public static void main\(String\[\] args\)' <<<"$jimfs_output" || fail "packaged classpath의 Jimfs class를 load하지 못했습니다."
+app_launcher="$app_bundle/Contents/MacOS/SIX Bridge"
+[[ -x "$app_launcher" ]] || fail "packaged native launcher가 없습니다."
+probe_home="$test_home/native-probe-home"
+mkdir -p "$probe_home/Library/Application Support"
+chmod 700 "$probe_home" "$probe_home/Library" "$probe_home/Library/Application Support"
+
+run_distribution_probe() {
+  local sequence="$1"
+  local stdout_file="$test_home/native-probe-$sequence.stdout"
+  local stderr_file="$test_home/native-probe-$sequence.stderr"
+  local output
+
+  if ! env \
+    LC_ALL=C \
+    LANG=C \
+    JAVA_TOOL_OPTIONS="-Duser.home=$probe_home" \
+    "$app_launcher" --distribution-probe >"$stdout_file" 2>"$stderr_file"; then
+    fail "packaged native launcher distribution probe가 실패했습니다."
+  fi
+  output="$(<"$stdout_file")"
+  if [[ ! "$output" =~ ^SIXBRIDGE_DISTRIBUTION_PROBE_V1\ jimfs=OK\ signer=([0-9a-f]{64})$ ]]; then
+    fail "packaged native launcher distribution probe 출력이 일치하지 않습니다."
+  fi
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+first_signer_fingerprint="$(run_distribution_probe first)"
+second_signer_fingerprint="$(run_distribution_probe second)"
+[[ "$first_signer_fingerprint" == "$second_signer_fingerprint" ]] || \
+  fail "packaged native launcher에서 signer fingerprint가 유지되지 않습니다."
 
 echo "desktop distribution 검증 통과"
