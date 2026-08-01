@@ -23,6 +23,25 @@ import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
     @Test
+    fun `승인 실패 뒤 adapter 선택을 고쳐 draft 생성을 재시도한다`() {
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.popupSource), profile)
+            val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            assertTrue(ready.session.requiredApprovals.isNotEmpty())
+            controller.continueToApproval()
+            controller.buildDraft()
+            assertEquals(DesktopFailureStage.APPROVAL, (awaitState(controller) { it is DesktopConversionState.Failed } as DesktopConversionState.Failed).stage)
+
+            controller.toggleAdapter(ready.session.requiredApprovals.single())
+            controller.buildDraft()
+            assertIs<DesktopConversionState.DraftReady>(awaitState(controller) { it is DesktopConversionState.DraftReady })
+            controller.close()
+        }
+    }
+
+    @Test
     fun `취소된 이전 분석 결과는 새 분석 상태를 덮어쓰지 않는다`() {
         val entered = CountDownLatch(1)
         val finishFirst = CountDownLatch(1)
@@ -118,6 +137,10 @@ class DesktopConversionControllerTest {
         private val root = Files.createTempDirectory("desktop-controller-")
         val firstSource = source("first")
         val secondSource = source("second")
+        val popupSource = Files.createDirectory(root.resolve("popup")).also {
+            it.resolve("popup.html").writeText("<p>popup</p>")
+            it.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
+        }
 
         private fun source(name: String) = Files.createDirectory(root.resolve(name)).also {
             it.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"$name","version":"1"}""")

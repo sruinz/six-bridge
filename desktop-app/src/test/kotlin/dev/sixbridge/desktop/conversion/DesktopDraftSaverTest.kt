@@ -4,6 +4,7 @@ import com.google.common.jimfs.Configuration
 import com.google.common.jimfs.Jimfs
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.util.concurrent.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -13,7 +14,7 @@ class DesktopDraftSaverTest {
     @Test
     fun `기존 목적 파일을 덮어쓰지 않고 임시 파일을 남기지 않는다`() {
         Jimfs.newFileSystem(Configuration.unix()).use { privateFileSystem ->
-            val source = privateFileSystem.getPath("/draft.sixdraft")
+            val source = source(privateFileSystem)
             Files.writeString(source, "signed-draft")
             val destinationDirectory = Files.createTempDirectory("sixbridge-saver-")
             val destination = destinationDirectory.resolve("draft.sixdraft")
@@ -34,7 +35,7 @@ class DesktopDraftSaverTest {
     @Test
     fun `Jimfs 초안을 host 목적지에 hash 검증 뒤 공개한다`() {
         Jimfs.newFileSystem(Configuration.unix()).use { privateFileSystem ->
-            val source = privateFileSystem.getPath("/draft.sixdraft")
+            val source = source(privateFileSystem)
             Files.writeString(source, "signed-draft")
             val destination = Files.createTempDirectory("sixbridge-saver-").resolve("draft.sixdraft")
 
@@ -47,7 +48,7 @@ class DesktopDraftSaverTest {
     @Test
     fun `hash 검증 실패는 자신이 만든 임시 파일을 삭제한다`() {
         Jimfs.newFileSystem(Configuration.unix()).use { privateFileSystem ->
-            val source = privateFileSystem.getPath("/draft.sixdraft")
+            val source = source(privateFileSystem)
             Files.writeString(source, "signed-draft")
             val directory = Files.createTempDirectory("sixbridge-saver-")
 
@@ -72,6 +73,53 @@ class DesktopDraftSaverTest {
         assertEquals("replacement", Files.readString(destination))
     }
 
+    @Test
+    fun `workspace 밖 또는 심볼릭 링크 초안은 공개하지 않는다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val link = source.parent.resolve("link.sixdraft")
+            Files.createSymbolicLink(link, source)
+
+            assertFailsWith<DesktopDraftSaveException> {
+                DesktopDraftSaver().save(artifact(link, "signed-draft"), Files.createTempDirectory("sixbridge-saver-").resolve("draft"))
+            }
+        }
+    }
+
+    @Test
+    fun `hard link 미지원 목적지는 복사 전에 명확히 거부한다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val destination = Files.createTempDirectory("sixbridge-saver-").resolve("draft")
+
+            assertFailsWith<DesktopDraftSaveException> {
+                DesktopDraftSaver(DesktopDraftSaverTestHooks(createLink = { _, _ ->
+                    throw UnsupportedOperationException("hard link 없음")
+                })).save(artifact(source, "signed-draft"), destination)
+            }
+
+            assertTrue(Files.list(destination.parent).use { it.noneMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+        }
+    }
+
+    @Test
+    fun `취소된 복사는 임시 파일을 남기지 않는다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val destination = Files.createTempDirectory("sixbridge-saver-").resolve("draft")
+
+            assertFailsWith<CancellationException> {
+                DesktopDraftSaver(DesktopDraftSaverTestHooks(beforeCopy = {
+                    throw CancellationException("cancel")
+                })).save(artifact(source, "signed-draft"), destination)
+            }
+            assertTrue(Files.list(destination.parent).use { it.noneMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+        }
+    }
+
     private fun artifact(source: java.nio.file.Path, contents: String) = DesktopDraftArtifact(
         token = "00000000-0000-0000-0000-000000000001",
         privateFile = source,
@@ -81,4 +129,8 @@ class DesktopDraftSaverTest {
             .joinToString("") { "%02x".format(it) },
         signerFingerprint = "test",
     )
+
+    private fun source(fileSystem: java.nio.file.FileSystem): java.nio.file.Path =
+        fileSystem.getPath("/sixbridge/00000000-0000-0000-0000-000000000001/artifacts/draft.sixdraft")
+            .also { Files.createDirectories(it.parent) }
 }

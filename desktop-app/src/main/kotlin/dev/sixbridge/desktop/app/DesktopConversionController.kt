@@ -142,7 +142,7 @@ class DesktopConversionController private constructor(
 
     fun continueToApproval() {
         synchronized(lock) {
-            val ready = _state.value as? DesktopConversionState.AnalysisReady ?: return
+            val ready = approvalReady(_state.value) ?: return
             if (ready.session.report.status !in setOf(CompatibilityStatus.COMPATIBLE, CompatibilityStatus.PARTIAL)) return
             _state.value = ready.copy(reviewStep = DesktopReviewStep.APPROVAL)
         }
@@ -150,7 +150,7 @@ class DesktopConversionController private constructor(
 
     fun toggleAdapter(id: String) {
         synchronized(lock) {
-            val ready = _state.value as? DesktopConversionState.AnalysisReady ?: return
+            val ready = approvalReady(_state.value) ?: return
             if (id !in ready.session.requiredApprovals) return
             _state.value = ready.copy(
                 selectedAdapters = ready.selectedAdapters.toMutableSet().also {
@@ -162,14 +162,14 @@ class DesktopConversionController private constructor(
 
     fun setPartialConfirmed(confirmed: Boolean) {
         synchronized(lock) {
-            val ready = _state.value as? DesktopConversionState.AnalysisReady ?: return
+            val ready = approvalReady(_state.value) ?: return
             _state.value = ready.copy(partialConfirmed = confirmed)
         }
     }
 
     fun selectProjectIdentity(value: String) {
         synchronized(lock) {
-            val ready = _state.value as? DesktopConversionState.AnalysisReady ?: return
+            val ready = approvalReady(_state.value) ?: return
             _state.value = ready.copy(projectIdentity = value)
         }
     }
@@ -179,7 +179,7 @@ class DesktopConversionController private constructor(
         val operation = Operation()
         val nextGeneration: Long
         synchronized(lock) {
-            ready = _state.value as? DesktopConversionState.AnalysisReady ?: return
+            ready = approvalReady(_state.value) ?: return
             if (ready.reviewStep != DesktopReviewStep.APPROVAL) return
             if (!ready.selectedAdapters.containsAll(ready.session.requiredApprovals)) {
                 _state.value = DesktopConversionState.Failed(DesktopFailureStage.APPROVAL, "필수 adapter 승인이 필요합니다.", ready)
@@ -241,7 +241,7 @@ class DesktopConversionController private constructor(
                     throw error
                 } catch (error: Exception) {
                     if (!isExpectedFailure(error)) throw error
-                    failIfCurrent(nextGeneration, DesktopFailureStage.SAVE, error, draft)
+                    failSaveIfCurrent(nextGeneration, operation, error, draft)
                 } finally {
                     clearCurrent(nextGeneration, operation)
                 }
@@ -305,6 +305,25 @@ class DesktopConversionController private constructor(
         }
     }
 
+    private fun failSaveIfCurrent(
+        expectedGeneration: Long,
+        operation: Operation,
+        error: Exception,
+        previous: DesktopConversionState.DraftReady,
+    ) {
+        synchronized(lock) {
+            if (generation.get() == expectedGeneration && !closed && currentOperation === operation) {
+                currentOperation = null
+                currentJob = null
+                _state.value = DesktopConversionState.Failed(
+                    DesktopFailureStage.SAVE,
+                    failureMessage(error),
+                    previous,
+                )
+            }
+        }
+    }
+
     private fun releaseAsync(token: String) {
         scope.launch {
             runInterruptible(Dispatchers.IO) { engine.release(token) }
@@ -314,6 +333,16 @@ class DesktopConversionController private constructor(
     private fun savedDraftForRetry(state: DesktopConversionState): DesktopConversionState.DraftReady? = when (state) {
         is DesktopConversionState.DraftReady -> state
         is DesktopConversionState.Failed -> state.previous as? DesktopConversionState.DraftReady
+        else -> null
+    }
+
+    private fun approvalReady(state: DesktopConversionState): DesktopConversionState.AnalysisReady? = when (state) {
+        is DesktopConversionState.AnalysisReady -> state
+        is DesktopConversionState.Failed -> if (state.stage == DesktopFailureStage.APPROVAL) {
+            state.previous as? DesktopConversionState.AnalysisReady
+        } else {
+            null
+        }
         else -> null
     }
 
