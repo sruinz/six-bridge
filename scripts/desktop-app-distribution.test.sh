@@ -23,6 +23,8 @@ credential_names=(
 
 run_unsigned_gradle() {
   env \
+    -u _JAVA_OPTIONS \
+    -u JDK_JAVA_OPTIONS \
     -u "${credential_names[0]}" \
     -u "${credential_names[1]}" \
     -u "${credential_names[2]}" \
@@ -170,14 +172,31 @@ app_launcher="$app_bundle/Contents/MacOS/SIX Bridge"
 probe_home="$test_home/native-probe-home"
 mkdir -p "$probe_home/Library/Application Support"
 chmod 700 "$probe_home" "$probe_home/Library" "$probe_home/Library/Application Support"
+override_home_a="$test_home/host-jvm-override-a"
+override_home_b="$test_home/host-jvm-override-b"
+override_value_a="sixbridge-host-jvm-override-a"
+override_value_b="sixbridge-host-jvm-override-b"
+mkdir -p \
+  "$override_home_a/Library/Application Support" \
+  "$override_home_b/Library/Application Support"
+chmod 700 \
+  "$override_home_a" \
+  "$override_home_a/Library" \
+  "$override_home_a/Library/Application Support" \
+  "$override_home_b" \
+  "$override_home_b/Library" \
+  "$override_home_b/Library/Application Support"
 
 run_distribution_probe() {
   local sequence="$1"
   local stdout_file="$test_home/native-probe-$sequence.stdout"
   local stderr_file="$test_home/native-probe-$sequence.stderr"
   local output
+  local stderr_output
 
   if ! env \
+    -u _JAVA_OPTIONS \
+    -u JDK_JAVA_OPTIONS \
     LC_ALL=C \
     LANG=C \
     JAVA_TOOL_OPTIONS="-Duser.home=$probe_home" \
@@ -185,15 +204,46 @@ run_distribution_probe() {
     fail "packaged native launcher distribution probe가 실패했습니다."
   fi
   output="$(<"$stdout_file")"
+  stderr_output="$(<"$stderr_file")"
   if [[ ! "$output" =~ ^SIXBRIDGE_DISTRIBUTION_PROBE_V1\ jimfs=OK\ signer=([0-9a-f]{64})$ ]]; then
     fail "packaged native launcher distribution probe 출력이 일치하지 않습니다."
   fi
+  if [[ "$stderr_output" != "Picked up JAVA_TOOL_OPTIONS: -Duser.home=$probe_home" ]]; then
+    fail "packaged native launcher distribution probe stderr에 허용하지 않은 출력이 있습니다."
+  fi
+  for forbidden_marker in \
+    "$override_home_a" \
+    "$override_home_b" \
+    "$override_value_a" \
+    "$override_value_b"; do
+    if [[ "$output" == *"$forbidden_marker"* || "$stderr_output" == *"$forbidden_marker"* ]]; then
+      fail "packaged native launcher distribution probe가 host JVM override를 노출했습니다."
+    fi
+  done
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
-first_signer_fingerprint="$(run_distribution_probe first)"
-second_signer_fingerprint="$(run_distribution_probe second)"
+run_distribution_probe_with_host_overrides() {
+  local sequence="$1"
+  (
+    export _JAVA_OPTIONS="-Duser.home=$override_home_a -Dsixbridge.probe.override=$override_value_a"
+    export JDK_JAVA_OPTIONS="-Duser.home=$override_home_b -Dsixbridge.probe.override=$override_value_b"
+    run_distribution_probe "$sequence"
+  )
+}
+
+first_signer_fingerprint="$(run_distribution_probe_with_host_overrides first)"
+second_signer_fingerprint="$(run_distribution_probe_with_host_overrides second)"
 [[ "$first_signer_fingerprint" == "$second_signer_fingerprint" ]] || \
   fail "packaged native launcher에서 signer fingerprint가 유지되지 않습니다."
+for override_home in "$override_home_a" "$override_home_b"; do
+  leaked_signer_file="$(
+    find "$override_home" -type f \
+      \( -name 'draft-transfer.identity' -o -name 'draft-transfer.pk8' -o -name 'draft-transfer.pub' \) \
+      -print -quit
+  )"
+  [[ -z "$leaked_signer_file" ]] || \
+    fail "packaged native launcher가 host JVM override home에 signer 파일을 생성했습니다."
+done
 
 echo "desktop distribution 검증 통과"
