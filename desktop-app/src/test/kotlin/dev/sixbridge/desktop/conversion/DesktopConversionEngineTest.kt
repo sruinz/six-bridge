@@ -86,7 +86,7 @@ class DesktopConversionEngineTest {
     @Test
     fun `suggested filename은 unicode control을 치환하고 surrogate pair를 보존한다`() {
         Fixture().use { fixture ->
-            val name = "a".repeat(110) + "😀" + '\u007f' + '\u0085'
+            val name = "a".repeat(111) + "😀" + '\u007f' + '\u0085'
             val source = fixture.sourceWithName(name)
             val session = fixture.engine.analyze(DesktopExtensionInput.Local(source), profile, AnalysisControl())
             val artifact = fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl())

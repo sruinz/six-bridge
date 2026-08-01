@@ -17,6 +17,9 @@ import dev.sixbridge.desktop.input.DesktopInputSealer
 import dev.sixbridge.desktop.security.DesktopDraftSigningIdentityStore
 import java.nio.file.Files
 import java.util.UUID
+import java.util.Collections
+import java.util.LinkedHashSet
+import java.util.ArrayList
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -72,10 +75,10 @@ class DesktopConversionEngine private constructor(
                 logicalSourceIdentity = analysis.logicalSourceIdentity,
                 selectedAutomaticAdapters = analysis.report.adapterDecisions
                     .filter { it.disposition == AdapterDisposition.AUTOMATIC }
-                    .mapTo(sortedSetOf()) { it.id }.toSet(),
+                    .mapTo(sortedSetOf()) { it.id }.immutableSet(),
                 requiredApprovals = analysis.report.adapterDecisions
                     .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
-                    .mapTo(sortedSetOf()) { it.id }.toSet(),
+                    .mapTo(sortedSetOf()) { it.id }.immutableSet(),
             )
             val context = DesktopSessionContext(
                 lease, resolvedInput, service, profileSnapshot, analysis.report.status,
@@ -294,11 +297,17 @@ class DesktopConversionEngine private constructor(
         )
 
         private fun BrowserProfile.snapshot(): BrowserProfile = copy(
-            supportedApis = supportedApis.toSet(),
-            detectedApis = detectedApis.toSet(),
-            profileDifferences = profileDifferences.toList(),
-            supportedFeatures = supportedFeatures.toSet(),
-            unavailableFeatures = unavailableFeatures.toSet(),
+            supportedApis = supportedApis.immutableSet(),
+            detectedApis = detectedApis.immutableSet(),
+            profileDifferences = profileDifferences.immutableList(),
+            supportedFeatures = supportedFeatures.immutableSet(),
+            unavailableFeatures = unavailableFeatures.immutableSet(),
         )
+
+        private fun <T> Collection<T>.immutableSet(): Set<T> =
+            Collections.unmodifiableSet(LinkedHashSet(this))
+
+        private fun <T> Collection<T>.immutableList(): List<T> =
+            Collections.unmodifiableList(ArrayList(this))
     }
 }
