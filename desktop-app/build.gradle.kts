@@ -13,6 +13,7 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":bundle-contract"))
     implementation(compose.desktop.currentOs)
+    implementation("com.google.jimfs:jimfs:1.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     testImplementation(kotlin("test"))
