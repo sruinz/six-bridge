@@ -8,23 +8,27 @@ import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 
 class DesktopProfileJsonReadException internal constructor() :
     IllegalArgumentException("profile JSON을 안전하게 읽지 못했습니다.")
 
 class DesktopProfileJsonReader private constructor(
-    private val afterOpen: (Path) -> Unit,
+    private val afterFirstSnapshot: (Path) -> Unit,
 ) {
     constructor() : this({})
 
     fun read(path: Path): ByteArray = try {
         val before = signature(path)
-        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
-            afterOpen(path)
-            val bytes = readBounded(channel)
-            if (before != signature(path)) throw DesktopProfileJsonReadException()
-            bytes
+        val first = readSnapshot(path)
+        afterFirstSnapshot(path)
+        val between = signature(path)
+        if (before != between) throw DesktopProfileJsonReadException()
+        val second = readSnapshot(path)
+        if (between != signature(path) || !first.contentEquals(second)) {
+            throw DesktopProfileJsonReadException()
         }
+        first
     } catch (error: DesktopProfileJsonReadException) {
         throw error
     } catch (_: Exception) {
@@ -43,9 +47,12 @@ class DesktopProfileJsonReader private constructor(
         return FileSignature(
             fileKey = fileKey,
             size = attributes.size(),
-            lastModified = attributes.lastModifiedTime().toMillis(),
+            lastModified = attributes.lastModifiedTime(),
         )
     }
+
+    private fun readSnapshot(path: Path): ByteArray =
+        FileChannel.open(path, READ, NOFOLLOW_LINKS).use(::readBounded)
 
     private fun readBounded(channel: FileChannel): ByteArray {
         val output = ByteArrayOutputStream(DEFAULT_BUFFER_BYTES)
@@ -65,14 +72,14 @@ class DesktopProfileJsonReader private constructor(
     private data class FileSignature(
         val fileKey: Any,
         val size: Long,
-        val lastModified: Long,
+        val lastModified: FileTime,
     )
 
     internal companion object {
         const val MAX_BYTES = 1024 * 1024
         private const val DEFAULT_BUFFER_BYTES = 8192
 
-        fun testing(afterOpen: (Path) -> Unit): DesktopProfileJsonReader =
-            DesktopProfileJsonReader(afterOpen)
+        fun testing(afterFirstSnapshot: (Path) -> Unit): DesktopProfileJsonReader =
+            DesktopProfileJsonReader(afterFirstSnapshot)
     }
 }

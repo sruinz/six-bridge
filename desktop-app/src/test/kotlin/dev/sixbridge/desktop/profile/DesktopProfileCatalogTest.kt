@@ -16,6 +16,7 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.util.Base64
+import java.util.concurrent.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -42,6 +43,22 @@ class DesktopProfileCatalogTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
+
+    @Test
+    fun `APK prepare는 extractor에 cancellation을 전달하고 취소를 untrusted로 바꾸지 않는다`() {
+        val apk = Files.createTempFile("cancel-sbrowser", ".apk")
+        val catalog = DesktopProfileCatalog.testingCancelable(
+            dataRoot = Files.createTempDirectory("cancel-catalog"),
+            extractProfile = { _, checkCancelled ->
+                checkCancelled()
+                profile
+            },
+        )
+
+        assertFailsWith<CancellationException> {
+            catalog.prepareApk(apk) { throw CancellationException("취소") }
+        }
+    }
 
     @Test
     fun `기본 profile은 최신 내장 30점0점2점61이다`() {
@@ -116,6 +133,28 @@ class DesktopProfileCatalogTest {
             reloaded.map(DesktopProfileOption::trust).toSet(),
         )
         assertEquals(2, Files.list(dataRoot.resolve("profiles")).use { it.count() })
+    }
+
+    @Test
+    fun `profile prepare는 영속화하지 않고 current commit만 저장한다`() {
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val dataRoot = Files.createTempDirectory("six-bridge-catalog")
+        val catalog = catalog(
+            dataRoot = dataRoot,
+            trustedKeys = mapOf("test-key" to pair.public),
+        )
+        val envelope = SignedBrowserProfile.sign(
+            BrowserProfileJson.encode(profile).encodeToByteArray(),
+            "test-key",
+            pair.private,
+        )
+
+        val prepared = catalog.prepareJson(envelope.encodeToByteArray())
+
+        assertFalse(Files.exists(dataRoot.resolve("profiles")))
+        val committed = catalog.commit(prepared)
+        assertEquals(DesktopProfileTrust.SIGNED, committed.trust)
+        assertEquals(1, Files.list(dataRoot.resolve("profiles")).use { it.count() })
     }
 
     @Test

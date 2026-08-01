@@ -1,15 +1,85 @@
 package dev.sixbridge.core.profile
 
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CancellationException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class BrowserProfileExtractorTest {
+    @Test
+    fun `외부 분석기 대기 thread가 interrupt되면 process를 강제 종료한다`() {
+        val analyzer = Files.createTempFile("fake-apkanalyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val process = BlockingTestProcess()
+        val executor = Executors.newSingleThreadExecutor()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { process },
+        )
+
+        try {
+            val future = executor.submit<BrowserProfile> { extractor.extract(apk) }
+            assertTrue(process.entered.await(5, TimeUnit.SECONDS))
+
+            future.cancel(true)
+
+            assertTrue(process.destroyed.await(5, TimeUnit.SECONDS))
+        } finally {
+            process.destroyForcibly()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `APK SHA 읽기 중 cancellation checkpoint를 호출한다`() {
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val extractor = BrowserProfileExtractor.testing(
+            checkCancelled = {
+                if (Thread.currentThread().stackTrace.any { it.methodName == "sha256" }) {
+                    throw CancellationException("sha 취소")
+                }
+            },
+            analyzerCandidates = { emptyList() },
+            signerCandidates = { emptyList() },
+        )
+
+        assertFailsWith<CancellationException> { extractor.extract(apk) }
+    }
+
+    @Test
+    fun `APK evidence scan에 cancellation checkpoint를 전달한다`() {
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val extractor = BrowserProfileExtractor.testing(
+            checkCancelled = {
+                if (
+                    Thread.currentThread().stackTrace.any {
+                        it.className == BrowserArchiveEvidenceScanner::class.java.name
+                    }
+                ) {
+                    throw CancellationException("scan 취소")
+                }
+            },
+            analyzerCandidates = { emptyList() },
+            signerCandidates = { emptyList() },
+        )
+
+        assertFailsWith<CancellationException> { extractor.extract(apk) }
+    }
+
     @Test
     fun `records option page accessibility only with the complete Samsung contract`() {
         val complete = browserApk(
@@ -174,5 +244,41 @@ class BrowserProfileExtractorTest {
             }
         }
         return apk
+    }
+
+    private class BlockingTestProcess : Process() {
+        val entered = CountDownLatch(1)
+        val destroyed = CountDownLatch(1)
+
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+
+        override fun waitFor(): Int {
+            entered.countDown()
+            destroyed.await()
+            return -1
+        }
+
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            entered.countDown()
+            return destroyed.await(timeout, unit)
+        }
+
+        override fun exitValue(): Int {
+            if (destroyed.count != 0L) throw IllegalThreadStateException()
+            return -1
+        }
+
+        override fun destroy() {
+            destroyed.countDown()
+        }
+
+        override fun destroyForcibly(): Process {
+            destroyed.countDown()
+            return this
+        }
+
+        override fun isAlive(): Boolean = destroyed.count != 0L
     }
 }

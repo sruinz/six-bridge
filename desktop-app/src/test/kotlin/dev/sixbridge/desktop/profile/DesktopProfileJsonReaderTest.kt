@@ -29,7 +29,7 @@ class DesktopProfileJsonReaderTest {
     fun `channel open 후 파일이 커져도 MAX plus one에서 거부한다`() {
         val growing = Files.createTempFile("profile-growing-", ".json")
         Files.writeString(growing, "{}")
-        val reader = DesktopProfileJsonReader.testing(afterOpen = { path ->
+        val reader = DesktopProfileJsonReader.testing(afterFirstSnapshot = { path ->
             Files.newByteChannel(path, WRITE, TRUNCATE_EXISTING).use { output ->
                 output.write(java.nio.ByteBuffer.wrap(ByteArray(DesktopProfileJsonReader.MAX_BYTES + 1)))
             }
@@ -50,11 +50,27 @@ class DesktopProfileJsonReaderTest {
 
         val input = root.resolve("input.json")
         Files.writeString(input, "{}")
-        val replacingReader = DesktopProfileJsonReader.testing(afterOpen = { path ->
+        val replacingReader = DesktopProfileJsonReader.testing(afterFirstSnapshot = { path ->
             val replacement = Files.createTempFile(path.parent, "replacement-", ".json")
             Files.writeString(replacement, "{\"changed\":true}")
             Files.move(replacement, path, ATOMIC_MOVE, REPLACE_EXISTING)
         })
         assertFailsWith<DesktopProfileJsonReadException> { replacingReader.read(input) }
+    }
+
+    @Test
+    fun `첫 snapshot 뒤 동일 inode 내용을 같은 길이로 바꾸고 mtime을 복원해도 거부한다`() {
+        val input = Files.createTempFile("profile-same-inode-", ".json")
+        val original = "{\"a\":1}"
+        val changed = "{\"b\":2}"
+        check(original.length == changed.length)
+        Files.writeString(input, original)
+        val originalTime = Files.getLastModifiedTime(input)
+        val reader = DesktopProfileJsonReader.testing(afterFirstSnapshot = { path ->
+            Files.writeString(path, changed, WRITE, TRUNCATE_EXISTING)
+            Files.setLastModifiedTime(path, originalTime)
+        })
+
+        assertFailsWith<DesktopProfileJsonReadException> { reader.read(input) }
     }
 }

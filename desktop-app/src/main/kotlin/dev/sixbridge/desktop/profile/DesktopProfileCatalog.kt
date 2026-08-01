@@ -24,6 +24,7 @@ import java.security.PublicKey
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -45,6 +46,23 @@ data class DesktopProfileOption(
     val explanation: String,
 )
 
+internal sealed interface DesktopPreparedProfileImport {
+    val option: DesktopProfileOption
+
+    data class WithoutPersistence(
+        override val option: DesktopProfileOption,
+    ) : DesktopPreparedProfileImport
+
+    data class SignedJson(
+        override val option: DesktopProfileOption,
+        val envelope: String,
+    ) : DesktopPreparedProfileImport
+
+    data class ExtractedApk(
+        override val option: DesktopProfileOption,
+    ) : DesktopPreparedProfileImport
+}
+
 internal enum class DesktopProfilePersistenceCheckpoint {
     LOAD_DIRECTORY_READY,
     LOAD_DIRECTORY_OPENED,
@@ -59,14 +77,16 @@ internal enum class DesktopProfilePersistenceCheckpoint {
 class DesktopProfileCatalog private constructor(
     private val dataRoot: Path,
     private val trustedKeys: Map<String, PublicKey>,
-    private val extractProfile: (Path) -> BrowserProfile,
+    private val extractProfile: (Path, () -> Unit) -> BrowserProfile,
     private val resources: ClassLoader,
     private val persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit,
 ) {
     constructor(dataRoot: Path) : this(
         dataRoot = dataRoot,
         trustedKeys = loadBundledTrustedProfileKeys(DesktopProfileCatalog::class.java.classLoader),
-        extractProfile = BrowserProfileExtractor()::extract,
+        extractProfile = { path, checkCancelled ->
+            BrowserProfileExtractor(checkCancelled).extract(path)
+        },
         resources = DesktopProfileCatalog::class.java.classLoader,
         persistenceCheckpoint = { _, _ -> },
     )
@@ -78,26 +98,60 @@ class DesktopProfileCatalog private constructor(
             .thenBy { it.profile!!.versionCode },
     )
 
-    fun importJson(bytes: ByteArray): DesktopProfileOption {
+    fun importJson(bytes: ByteArray): DesktopProfileOption = commit(prepareJson(bytes))
+
+    internal fun prepareJson(bytes: ByteArray): DesktopPreparedProfileImport {
         val text = runCatching { bytes.decodeToString() }.getOrNull() ?: return untrusted()
+            .let(DesktopPreparedProfileImport::WithoutPersistence)
         val signed = runCatching { SignedBrowserProfile.verify(text, trustedKeys) }.getOrNull()
         if (signed != null) {
             val option = signedOption(signed.profile, DesktopProfileTrust.SIGNED)
-            persistSigned(option.profile!!, text)
-            return option
+            return DesktopPreparedProfileImport.SignedJson(option, text)
         }
-        val profile = runCatching { BrowserProfileJson.decode(text) }.getOrNull() ?: return untrusted()
-        return builtInProfiles().firstOrNull { it.canonicalSha256() == profile.canonicalSha256() }
+        val profile = runCatching { BrowserProfileJson.decode(text) }.getOrNull()
+            ?: return DesktopPreparedProfileImport.WithoutPersistence(untrusted())
+        val option = builtInProfiles().firstOrNull {
+            it.canonicalSha256() == profile.canonicalSha256()
+        }
             ?.let(::builtInOption)
             ?: untrusted(profile)
+        return DesktopPreparedProfileImport.WithoutPersistence(option)
     }
 
-    fun importApk(path: Path): DesktopProfileOption {
-        val profile = runCatching { extractProfile(path) }.getOrNull() ?: return untrusted()
-        if (profile.support != ProfileSupport.SUPPORTED) return untrusted(profile)
+    fun importApk(path: Path): DesktopProfileOption = commit(prepareApk(path))
+
+    internal fun prepareApk(
+        path: Path,
+        checkCancelled: () -> Unit = {},
+    ): DesktopPreparedProfileImport {
+        val profile = try {
+            extractProfile(path, checkCancelled)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            return DesktopPreparedProfileImport.WithoutPersistence(untrusted())
+        }
+        if (profile.support != ProfileSupport.SUPPORTED) {
+            return DesktopPreparedProfileImport.WithoutPersistence(untrusted(profile))
+        }
         val option = signedOption(profile, DesktopProfileTrust.APK_EXTRACTED_SUPPORTED)
-        persistExtracted(profile)
-        return option
+        return DesktopPreparedProfileImport.ExtractedApk(option)
+    }
+
+    internal fun commit(
+        prepared: DesktopPreparedProfileImport,
+        checkCancelled: () -> Unit = {},
+    ): DesktopProfileOption {
+        checkCancelled()
+        when (prepared) {
+            is DesktopPreparedProfileImport.SignedJson ->
+                persistSigned(prepared.option.profile!!, prepared.envelope, checkCancelled)
+            is DesktopPreparedProfileImport.ExtractedApk ->
+                persistExtracted(prepared.option.profile!!, checkCancelled)
+            is DesktopPreparedProfileImport.WithoutPersistence -> Unit
+        }
+        checkCancelled()
+        return prepared.option
     }
 
     fun loadPersisted(): List<DesktopProfileOption> {
@@ -156,7 +210,11 @@ class DesktopProfileCatalog private constructor(
         }
     }.getOrNull()
 
-    private fun persistSigned(profile: BrowserProfile, envelope: String) {
+    private fun persistSigned(
+        profile: BrowserProfile,
+        envelope: String,
+        checkCancelled: () -> Unit,
+    ) {
         persist(
             profile,
             PersistedProfile(
@@ -164,10 +222,11 @@ class DesktopProfileCatalog private constructor(
                 profileSha256 = profile.canonicalSha256(),
                 envelopeBase64 = Base64.getEncoder().encodeToString(envelope.encodeToByteArray()),
             ),
+            checkCancelled,
         )
     }
 
-    private fun persistExtracted(profile: BrowserProfile) {
+    private fun persistExtracted(profile: BrowserProfile, checkCancelled: () -> Unit) {
         persist(
             profile,
             PersistedProfile(
@@ -177,13 +236,20 @@ class DesktopProfileCatalog private constructor(
                     BrowserProfileJson.encode(profile).encodeToByteArray(),
                 ),
             ),
+            checkCancelled,
         )
     }
 
-    private fun persist(profile: BrowserProfile, record: PersistedProfile) {
+    private fun persist(
+        profile: BrowserProfile,
+        record: PersistedProfile,
+        checkCancelled: () -> Unit,
+    ) {
+        checkCancelled()
         val profileSha256 = profile.canonicalSha256()
         require(record.profileSha256 == profileSha256)
         val encoded = encodeRecord(record)
+        checkCancelled()
         val directory = profilesDirectory(create = true) ?: return
         checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_DIRECTORY_READY)
         val destination = directory.path.resolve("$profileSha256.json")
@@ -197,10 +263,12 @@ class DesktopProfileCatalog private constructor(
             "profile 저장 경로가 올바르지 않습니다."
         }
         if (Files.exists(destination, NOFOLLOW_LINKS)) {
+            checkCancelled()
             validateExistingDestination(directory, destination, encoded, record)
             return
         }
         val temporary = directory.path.resolve(".$profileSha256.${UUID.randomUUID()}.tmp")
+        checkCancelled()
         checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_TEMP_OPEN)
         // Path 기반 delete는 stat 이후 다른 파일로 교체될 수 있으므로 실패한 temp는 지우지 않는다.
         // temp 파일명은 persisted profile hash 규칙과 일치하지 않아 load 대상이 되지 않는다.
@@ -217,6 +285,7 @@ class DesktopProfileCatalog private constructor(
                 "profile 임시 파일이 완전히 기록되지 않았습니다."
             }
             channel.force(true)
+            checkCancelled()
             checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_AFTER_FORCE)
             openedFileKey
         }
@@ -229,6 +298,7 @@ class DesktopProfileCatalog private constructor(
         ) {
             "profile 임시 파일이 게시 전에 변경되었습니다."
         }
+        checkCancelled()
         checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_BEFORE_MOVE)
         if (Files.exists(destination, NOFOLLOW_LINKS)) {
             validateExistingDestination(directory, destination, encoded, record)
@@ -237,10 +307,12 @@ class DesktopProfileCatalog private constructor(
         // macOS의 ATOMIC_MOVE는 이 확인 뒤 나타난 target을 덮어쓸 수 있다. Java 17 Path API만으로
         // parent-bound openat를 만들 수 없어 직전·직후 directory/file identity 확인으로 범위를 줄인다.
         try {
+            checkCancelled()
             Files.move(temporary, destination, ATOMIC_MOVE)
         } catch (error: AtomicMoveNotSupportedException) {
             throw IllegalStateException("profile 저장소는 atomic move를 지원해야 합니다.", error)
         }
+        checkCancelled()
         checkpoint(directory, DesktopProfilePersistenceCheckpoint.PERSIST_AFTER_MOVE)
         val destinationAttributes = fileAttributes(destination)
         require(
@@ -477,6 +549,20 @@ class DesktopProfileCatalog private constructor(
             dataRoot: Path,
             trustedKeys: Map<String, PublicKey> = emptyMap(),
             extractProfile: (Path) -> BrowserProfile = BrowserProfileExtractor()::extract,
+            resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
+            persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
+        ): DesktopProfileCatalog = DesktopProfileCatalog(
+            dataRoot,
+            trustedKeys,
+            { path, _ -> extractProfile(path) },
+            resources,
+            persistenceCheckpoint,
+        )
+
+        internal fun testingCancelable(
+            dataRoot: Path,
+            trustedKeys: Map<String, PublicKey> = emptyMap(),
+            extractProfile: (Path, () -> Unit) -> BrowserProfile,
             resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
             persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
         ): DesktopProfileCatalog = DesktopProfileCatalog(

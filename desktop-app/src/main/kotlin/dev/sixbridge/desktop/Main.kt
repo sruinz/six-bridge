@@ -14,21 +14,17 @@ import androidx.compose.ui.window.rememberWindowState
 import dev.sixbridge.desktop.app.DesktopConversionController
 import dev.sixbridge.desktop.app.DesktopConversionState
 import dev.sixbridge.desktop.profile.DesktopProfileCatalog
+import dev.sixbridge.desktop.profile.DesktopProfileImportController
 import dev.sixbridge.desktop.profile.DesktopProfileJsonReader
 import dev.sixbridge.desktop.profile.DesktopProfileOption
 import dev.sixbridge.desktop.ui.DesktopAction
 import dev.sixbridge.desktop.ui.DesktopApp
 import dev.sixbridge.desktop.ui.DesktopProfileImportKind
 import dev.sixbridge.desktop.ui.DesktopProfileImportModel
-import dev.sixbridge.desktop.ui.DesktopProfileImportOutcome
 import dev.sixbridge.desktop.ui.beginProfileImport
 import dev.sixbridge.desktop.ui.finishProfileImport
 import dev.sixbridge.desktop.ui.invalidateProfileImports
 import dev.sixbridge.desktop.ui.reduceInputState
-import java.util.concurrent.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 fun main() = application {
     val controller = remember { DesktopConversionController() }
@@ -47,9 +43,22 @@ fun main() = application {
     }
     val conversionState by controller.state.collectAsState()
     val scope = rememberCoroutineScope()
+    val profileImportController = remember(scope, catalog, profileReader) {
+        DesktopProfileImportController(
+            scope = scope,
+            catalog = catalog,
+            reader = profileReader,
+            onOutcome = { ticket, outcome ->
+                profileImports = finishProfileImport(profileImports, ticket, outcome)
+            },
+        )
+    }
 
-    DisposableEffect(controller) {
-        onDispose(controller::close)
+    DisposableEffect(controller, profileImportController) {
+        onDispose {
+            profileImportController.close()
+            controller.close()
+        }
     }
 
     Window(
@@ -70,13 +79,16 @@ fun main() = application {
                     is DesktopAction.UrlChanged,
                     is DesktopAction.LocalInputSelected,
                     is DesktopAction.ProfileSelected,
-                    -> profileImports = profileImports.copy(
-                        inputState = reduceInputState(
-                            profileImports.inputState,
-                            action,
-                            profileImports.profiles,
-                        ),
-                    ).invalidateProfileImports()
+                    -> {
+                        profileImportController.invalidate()
+                        profileImports = profileImports.copy(
+                            inputState = reduceInputState(
+                                profileImports.inputState,
+                                action,
+                                profileImports.profiles,
+                            ),
+                        ).invalidateProfileImports()
+                    }
 
                     is DesktopAction.ProfileJsonSelected -> {
                         val started = beginProfileImport(
@@ -84,16 +96,7 @@ fun main() = application {
                             DesktopProfileImportKind.JSON,
                         )
                         profileImports = started.model
-                        scope.launch {
-                            val outcome = importProfile {
-                                catalog.importJson(profileReader.read(action.path))
-                            }
-                            profileImports = finishProfileImport(
-                                profileImports,
-                                started.ticket,
-                                outcome,
-                            )
-                        }
+                        profileImportController.start(started.ticket, action.path)
                     }
 
                     is DesktopAction.BrowserApkSelected -> {
@@ -102,17 +105,11 @@ fun main() = application {
                             DesktopProfileImportKind.BROWSER_APK,
                         )
                         profileImports = started.model
-                        scope.launch {
-                            val outcome = importProfile { catalog.importApk(action.path) }
-                            profileImports = finishProfileImport(
-                                profileImports,
-                                started.ticket,
-                                outcome,
-                            )
-                        }
+                        profileImportController.start(started.ticket, action.path)
                     }
 
                     DesktopAction.Analyze -> {
+                        profileImportController.invalidate()
                         profileImports = profileImports.invalidateProfileImports()
                         val input = profileImports.inputState.selectedInput
                         val profile = profileImports.inputState.selectedProfile
@@ -133,6 +130,7 @@ fun main() = application {
                     DesktopAction.Back,
                     DesktopAction.Cancel,
                     -> {
+                        profileImportController.invalidate()
                         profileImports = profileImports.invalidateProfileImports()
                         controller.cancel()
                     }
@@ -140,14 +138,4 @@ fun main() = application {
             },
         )
     }
-}
-
-private suspend fun importProfile(
-    import: () -> DesktopProfileOption,
-): DesktopProfileImportOutcome = try {
-    DesktopProfileImportOutcome.Success(withContext(Dispatchers.IO) { import() })
-} catch (error: CancellationException) {
-    throw error
-} catch (_: Exception) {
-    DesktopProfileImportOutcome.Failure
 }
