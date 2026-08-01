@@ -15,6 +15,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -54,7 +55,7 @@ class DesktopConversionControllerTest {
     }
 
     @Test
-    fun `BuildingDraft의 새 분석 취소 종료와 stale 완료는 lease를 정확히 한 번 해제한다`() {
+    fun `BuildingDraft의 새 분석 취소 종료는 lease를 정확히 한 번 해제한다`() {
         listOf("new", "cancel", "close").forEach { boundary ->
             val entered = CountDownLatch(1)
             val proceed = CountDownLatch(1)
@@ -113,14 +114,18 @@ class DesktopConversionControllerTest {
         val entered = CountDownLatch(1)
         val finishFirst = CountDownLatch(1)
         val firstOnly = AtomicBoolean(true)
+        val oldToken = AtomicReference<String>()
+        val staleReleaseLookups = AtomicInteger()
         Fixture(
             DesktopConversionEngineTestHooks(
-                beforeContextRegistration = {
+                afterAnalysisRegistration = { session ->
                     if (firstOnly.compareAndSet(true, false)) {
+                        oldToken.set(session.token)
                         entered.countDown()
-                        check(finishFirst.await(10, TimeUnit.SECONDS))
+                        awaitIgnoringInterrupts(finishFirst)
                     }
                 },
+                beforeRelease = { staleReleaseLookups.incrementAndGet() },
             ),
         ).use { fixture ->
             val controller = DesktopConversionController(fixture.engine)
@@ -135,6 +140,52 @@ class DesktopConversionControllerTest {
 
             val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
             assertEquals(second, (ready as DesktopConversionState.AnalysisReady).session.input)
+            await { staleReleaseLookups.get() == 1 }
+            await { !fixture.engine.isRegisteredForTesting(oldToken.get()) }
+            assertFalse(fixture.engine.release(oldToken.get()), "stale analysis token은 두 번 해제될 수 없습니다.")
+            assertEquals(1, fixture.closeCount.get(), "stale analysis lease는 정확히 한 번 닫혀야 합니다.")
+            controller.close()
+        }
+    }
+
+    @Test
+    fun `새 분석 뒤 늦게 성공한 이전 draft 결과는 새 분석 상태를 덮어쓰지 않는다`() {
+        val entered = CountDownLatch(1)
+        val finishFirst = CountDownLatch(1)
+        val oldToken = AtomicReference<String>()
+        val artifactCreated = AtomicBoolean(false)
+        val staleReleaseLookups = AtomicInteger()
+        Fixture(
+            DesktopConversionEngineTestHooks(
+                afterDraftCreation = { artifact ->
+                    oldToken.set(artifact.token)
+                    artifactCreated.set(true)
+                    entered.countDown()
+                    awaitIgnoringInterrupts(finishFirst)
+                },
+                beforeRelease = {
+                    if (artifactCreated.get()) staleReleaseLookups.incrementAndGet()
+                },
+            ),
+        ).use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            val second = DesktopExtensionInput.Local(fixture.secondSource)
+
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+            controller.continueToApproval()
+            controller.buildDraft()
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+
+            controller.analyze(second, profile)
+            finishFirst.countDown()
+
+            val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+            assertEquals(second, (ready as DesktopConversionState.AnalysisReady).session.input)
+            await { staleReleaseLookups.get() == 2 }
+            await { !fixture.engine.isRegisteredForTesting(oldToken.get()) }
+            assertFalse(fixture.engine.release(oldToken.get()), "stale draft token은 두 번 해제될 수 없습니다.")
+            assertEquals(1, fixture.closeCount.get(), "stale draft lease는 정확히 한 번 닫혀야 합니다.")
             controller.close()
         }
     }
@@ -188,6 +239,16 @@ class DesktopConversionControllerTest {
             Thread.sleep(25)
         }
         assertTrue(matches(), "상태 전이를 기다리는 시간이 초과되었습니다.")
+    }
+
+    private fun awaitIgnoringInterrupts(latch: CountDownLatch) {
+        while (latch.count != 0L) {
+            try {
+                check(latch.await(10, TimeUnit.SECONDS))
+            } catch (_: InterruptedException) {
+                // Controller cancellation must not turn this test-only completion barrier into cancellation.
+            }
+        }
     }
 
     private class Fixture(

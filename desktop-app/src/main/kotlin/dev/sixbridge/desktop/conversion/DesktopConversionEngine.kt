@@ -28,6 +28,9 @@ internal data class DesktopConversionEngineTestHooks(
     val afterContextLookup: (() -> Unit)? = null,
     val beforeDraft: (() -> Unit)? = null,
     val beforeContextRegistration: (() -> Unit)? = null,
+    val afterAnalysisRegistration: ((DesktopAnalysisSession) -> Unit)? = null,
+    val afterDraftCreation: ((DesktopDraftArtifact) -> Unit)? = null,
+    val beforeRelease: ((String) -> Unit)? = null,
     val sourceSha256Override: ((String) -> String)? = null,
     val afterMapRemoval: ((String) -> Unit)? = null,
     val cleanupOverride: ((String) -> Boolean)? = null,
@@ -114,6 +117,7 @@ class DesktopConversionEngine private constructor(
                     "desktop analysis session이 중복되었습니다."
                 }
             }
+            testHooks?.afterAnalysisRegistration?.invoke(session)
             return session
         } catch (error: Throwable) {
             closeUnregistered(lease, error)
@@ -162,13 +166,15 @@ class DesktopConversionEngine private constructor(
                 verified,
                 signerFingerprint,
             )
-            DesktopDraftArtifact(
+            val artifact = DesktopDraftArtifact(
                 token = token,
                 privateFile = result.draft,
                 suggestedFileName = suggestedFileName,
                 sha256 = DraftSignature.sha256(Files.readAllBytes(result.draft)),
                 signerFingerprint = signerFingerprint,
             )
+            testHooks?.afterDraftCreation?.invoke(artifact)
+            artifact
             } catch (error: Throwable) {
             closeRegistered(token, context, error)
             throw error
@@ -182,6 +188,7 @@ class DesktopConversionEngine private constructor(
         } catch (_: IllegalArgumentException) {
             return false
         }
+        testHooks?.beforeRelease?.invoke(canonical)
         val context = contexts[canonical] ?: return false
         testHooks?.afterContextLookup?.invoke()
         return context.lock.withLock {

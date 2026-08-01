@@ -14,6 +14,7 @@ import java.nio.file.Path
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -109,8 +110,13 @@ class DesktopConversionController private constructor(
             currentOperation = operation
             currentJob = scope.launch {
                 try {
-                    val session = runInterruptible(Dispatchers.IO) {
-                        engine.analyze(input, profile, operation.control)
+                    val completedSession = AtomicReference<DesktopAnalysisSession>()
+                    val session = try {
+                        runInterruptible(Dispatchers.IO) {
+                            engine.analyze(input, profile, operation.control).also(completedSession::set)
+                        }
+                    } catch (error: CancellationException) {
+                        completedSession.get() ?: throw error
                     }
                     synchronized(lock) {
                         if (nextGeneration != generation.get() || closed) {
@@ -194,8 +200,18 @@ class DesktopConversionController private constructor(
             currentOperation = operation
             currentJob = scope.launch {
                 try {
-                    val artifact = runInterruptible(Dispatchers.IO) {
-                        engine.buildDraft(ready.session, ready.selectedAdapters, ready.projectIdentity, operation.control)
+                    val completedArtifact = AtomicReference<DesktopDraftArtifact>()
+                    val artifact = try {
+                        runInterruptible(Dispatchers.IO) {
+                            engine.buildDraft(
+                                ready.session,
+                                ready.selectedAdapters,
+                                ready.projectIdentity,
+                                operation.control,
+                            ).also(completedArtifact::set)
+                        }
+                    } catch (error: CancellationException) {
+                        completedArtifact.get() ?: throw error
                     }
                     synchronized(lock) {
                         if (nextGeneration != generation.get() || closed) {
