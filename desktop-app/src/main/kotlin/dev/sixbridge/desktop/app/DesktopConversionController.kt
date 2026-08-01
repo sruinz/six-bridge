@@ -18,6 +18,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -28,6 +29,8 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.swing.Swing
+import kotlinx.coroutines.withContext
 
 enum class DesktopFailureStage {
     INPUT,
@@ -84,12 +87,14 @@ class DesktopConversionController private constructor(
     private val engine: DesktopConversionEngine,
     private val saver: DesktopDraftSaver,
     private val revealer: DesktopSavedDraftRevealer,
+    private val uiDispatcher: CoroutineDispatcher,
     @Suppress("UNUSED_PARAMETER") marker: Unit,
 ) : AutoCloseable {
     constructor() : this(
         DesktopConversionEngine(),
         DesktopDraftSaver(),
         DesktopSavedDraftRevealer(),
+        Dispatchers.Swing,
         Unit,
     )
 
@@ -97,7 +102,8 @@ class DesktopConversionController private constructor(
         engine: DesktopConversionEngine,
         saver: DesktopDraftSaver = DesktopDraftSaver(),
         revealer: DesktopSavedDraftRevealer = DesktopSavedDraftRevealer(),
-    ) : this(engine, saver, revealer, Unit)
+        uiDispatcher: CoroutineDispatcher = Dispatchers.Swing,
+    ) : this(engine, saver, revealer, uiDispatcher, Unit)
 
     private val lock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -311,21 +317,44 @@ class DesktopConversionController private constructor(
     fun revealSavedDraft() {
         val draft: DesktopConversionState.DraftReady
         val savedPath: Path
+        val operation = Operation()
+        val nextGeneration: Long
         synchronized(lock) {
             if (closed || currentJob?.isActive == true) return
             draft = savedDraftForRetry(_state.value) ?: return
             savedPath = draft.savedPath ?: return
-        }
-        when (val result = revealer.reveal(savedPath)) {
-            DesktopRevealResult.Opened -> Unit
-            is DesktopRevealResult.Failed -> synchronized(lock) {
-                val current = savedDraftForRetry(_state.value)
-                if (!closed && current?.artifact == draft.artifact && current.savedPath == savedPath) {
-                    _state.value = DesktopConversionState.Failed(
-                        DesktopFailureStage.REVEAL,
-                        result.message,
-                        draft.copy(isSaving = false),
-                    )
+            nextGeneration = generation.incrementAndGet()
+            currentOperation = operation
+            currentJob = scope.launch {
+                try {
+                    val result = runInterruptible(Dispatchers.IO) {
+                        revealer.reveal(savedPath)
+                    }
+                    withContext(uiDispatcher) {
+                        if (result is DesktopRevealResult.Failed) {
+                            synchronized(lock) {
+                                val current = savedDraftForRetry(_state.value)
+                                if (
+                                    nextGeneration == generation.get() &&
+                                    !closed &&
+                                    current?.artifact == draft.artifact &&
+                                    current.savedPath == savedPath
+                                ) {
+                                    _state.value = DesktopConversionState.Failed(
+                                        DesktopFailureStage.REVEAL,
+                                        result.message,
+                                        draft.copy(isSaving = false),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Error) {
+                    throw error
+                } finally {
+                    clearCurrent(nextGeneration, operation)
                 }
             }
         }

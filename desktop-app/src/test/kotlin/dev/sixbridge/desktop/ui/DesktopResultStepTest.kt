@@ -4,6 +4,7 @@ import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.v2.runComposeUiTest
@@ -60,6 +61,7 @@ class DesktopResultStepTest {
             )
         }
         onNodeWithTag("result:reveal").assertIsEnabled().performClick()
+        onNodeWithTag("result:saved").assertTextEquals("저장됨: saved.sixdraft")
         runOnIdle { assertEquals(DesktopAction.RevealSavedDraft, actions.last()) }
     }
 

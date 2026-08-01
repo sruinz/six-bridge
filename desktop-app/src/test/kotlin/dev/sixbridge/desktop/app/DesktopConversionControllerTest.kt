@@ -16,6 +16,7 @@ import dev.sixbridge.desktop.input.DesktopInputSealer
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -316,6 +317,52 @@ class DesktopConversionControllerTest {
             assertFalse(controller.isBusy())
             controller.close()
         }
+    }
+
+    @Test
+    fun `지연되는 위치 opener는 reveal action handler를 막지 않는다`() {
+        val openerEntered = CountDownLatch(1)
+        val releaseOpener = CountDownLatch(1)
+        val callerReturned = CountDownLatch(1)
+        val caller = Executors.newSingleThreadExecutor()
+        Fixture().use { fixture ->
+            val revealer = dev.sixbridge.desktop.ui.DesktopSavedDraftRevealer {
+                openerEntered.countDown()
+                releaseOpener.await()
+                true
+            }
+            val controller = DesktopConversionController(
+                engine = fixture.engine,
+                revealer = revealer,
+            )
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+            controller.continueToApproval()
+            controller.buildDraft()
+            awaitState(controller) { it is DesktopConversionState.DraftReady }
+            val destination = Files.createTempDirectory("controller-reveal-").toRealPath()
+                .resolve("saved.sixdraft")
+            controller.saveDraft(destination)
+            awaitState(controller) {
+                it is DesktopConversionState.DraftReady && it.savedPath != null
+            }
+
+            caller.submit {
+                controller.revealSavedDraft()
+                callerReturned.countDown()
+            }
+            assertTrue(openerEntered.await(5, TimeUnit.SECONDS))
+            assertTrue(
+                callerReturned.await(1, TimeUnit.SECONDS),
+                "reveal action handler는 opener 완료를 기다리면 안 됩니다.",
+            )
+
+            releaseOpener.countDown()
+            await { !controller.isBusy() }
+            controller.close()
+        }
+        releaseOpener.countDown()
+        caller.shutdownNow()
     }
 
     private fun awaitState(

@@ -70,7 +70,12 @@ fun ResultStep(
                     "Signer: ${artifact.signerFingerprint}",
                     modifier = Modifier.semantics { testTag = "result:signer" },
                 )
-                state.savedPath?.let { Text("저장됨: $it") }
+                state.savedPath?.let {
+                    Text(
+                        "저장됨: ${it.fileName}",
+                        modifier = Modifier.semantics { testTag = "result:saved" },
+                    )
+                }
             }
         }
         state.message?.let {

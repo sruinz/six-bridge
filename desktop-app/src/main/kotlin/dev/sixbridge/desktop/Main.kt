@@ -1,6 +1,5 @@
 package dev.sixbridge.desktop
 
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -17,6 +16,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import dev.sixbridge.desktop.app.DesktopConversionController
 import dev.sixbridge.desktop.app.DesktopConversionState
 import dev.sixbridge.desktop.profile.DesktopProfileCatalog
@@ -65,21 +66,19 @@ fun main() = application {
             closeProfileImports = profileImportController::close,
             closeConversion = controller::close,
             exit = ::exitApplication,
+            launchInBackground = { action ->
+                scope.launch(Dispatchers.IO) { action() }
+            },
+            postToUi = { action -> scope.launch { action() } },
         )
     }
     var showCloseConfirmation by remember { mutableStateOf(false) }
-
-    DisposableEffect(controller, profileImportController) {
-        onDispose {
-            profileImportController.close()
-            controller.close()
-        }
-    }
 
     Window(
         onCloseRequest = {
             showCloseConfirmation = when (closeCoordinator.requestClose()) {
                 DesktopCloseRequest.CONFIRM_REQUIRED -> true
+                DesktopCloseRequest.CLOSE_STARTED,
                 DesktopCloseRequest.EXITED -> false
             }
         },
