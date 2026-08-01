@@ -14,6 +14,7 @@ import java.security.KeyPairGenerator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -22,6 +23,72 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
+    @Test
+    fun `registered AnalysisReady와 DraftReady의 새 분석 취소 종료는 이전 lease를 정확히 한 번 해제한다`() {
+        listOf("analysis", "draft").forEach { phase ->
+            listOf("new", "cancel", "close").forEach { boundary ->
+                Fixture().use { fixture ->
+                    val controller = DesktopConversionController(fixture.engine)
+                    controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+                    val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady } as DesktopConversionState.AnalysisReady
+                    val token = if (phase == "analysis") {
+                        ready.session.token
+                    } else {
+                        controller.continueToApproval()
+                        controller.buildDraft()
+                        (awaitState(controller) { it is DesktopConversionState.DraftReady } as DesktopConversionState.DraftReady).artifact.token
+                    }
+
+                    when (boundary) {
+                        "new" -> controller.analyze(DesktopExtensionInput.Local(fixture.secondSource), profile)
+                        "cancel" -> controller.cancel()
+                        else -> controller.close()
+                    }
+                    await { !fixture.engine.isRegisteredForTesting(token) }
+                    assertFalse(fixture.engine.release(token), "$phase/$boundary token은 두 번 해제될 수 없습니다.")
+                    assertEquals(1, fixture.closeCount.get(), "$phase/$boundary lease는 정확히 한 번 닫혀야 합니다.")
+                    if (boundary == "new") controller.close()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `BuildingDraft의 새 분석 취소 종료와 stale 완료는 lease를 정확히 한 번 해제한다`() {
+        listOf("new", "cancel", "close").forEach { boundary ->
+            val entered = CountDownLatch(1)
+            val proceed = CountDownLatch(1)
+            Fixture(DesktopConversionEngineTestHooks(beforeDraft = {
+                entered.countDown()
+                check(proceed.await(10, TimeUnit.SECONDS))
+            })).use { fixture ->
+                val controller = DesktopConversionController(fixture.engine)
+                controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+                val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady } as DesktopConversionState.AnalysisReady
+                controller.continueToApproval()
+                controller.buildDraft()
+                assertTrue(entered.await(10, TimeUnit.SECONDS))
+                assertIs<DesktopConversionState.BuildingDraft>(controller.state.value)
+                val token = ready.session.token
+
+                when (boundary) {
+                    "new" -> controller.analyze(DesktopExtensionInput.Local(fixture.secondSource), profile)
+                    "cancel" -> controller.cancel()
+                    else -> controller.close()
+                }
+                proceed.countDown()
+                await { !fixture.engine.isRegisteredForTesting(token) }
+                assertFalse(fixture.engine.release(token), "BuildingDraft/$boundary token은 두 번 해제될 수 없습니다.")
+                assertEquals(1, fixture.closeCount.get(), "BuildingDraft/$boundary lease는 정확히 한 번 닫혀야 합니다.")
+                if (boundary == "new") {
+                    val current = awaitState(controller) { it is DesktopConversionState.AnalysisReady } as DesktopConversionState.AnalysisReady
+                    assertEquals(DesktopExtensionInput.Local(fixture.secondSource), current.session.input)
+                    controller.close()
+                }
+            }
+        }
+    }
+
     @Test
     fun `승인 실패 뒤 adapter 선택을 고쳐 draft 생성을 재시도한다`() {
         Fixture().use { fixture ->
@@ -126,7 +193,8 @@ class DesktopConversionControllerTest {
     private class Fixture(
         hooks: DesktopConversionEngineTestHooks = DesktopConversionEngineTestHooks(),
     ) : AutoCloseable {
-        private val manager = DesktopWorkspaceManager.testing {}
+        val closeCount = AtomicInteger()
+        private val manager = DesktopWorkspaceManager.testing(closeCount::incrementAndGet)
         private val signer = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         val engine = DesktopConversionEngine.testing(
             manager,
