@@ -18,7 +18,8 @@ import dev.sixbridge.desktop.security.DesktopDraftSigningIdentityStore
 import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CancellationException
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class DesktopConversionEngine private constructor(
     private val workspaceManager: DesktopWorkspaceManager,
@@ -35,6 +36,13 @@ class DesktopConversionEngine private constructor(
         val lease: DesktopWorkspaceLease,
         val resolvedInput: ResolvedExtensionInput,
         val service: SixBridgeService,
+        val profile: BrowserProfile,
+        val status: CompatibilityStatus,
+        val sourceSha256: String?,
+        val extensionName: String?,
+        val selectedAutomaticAdapters: Set<String>,
+        val requiredApprovals: Set<String>,
+        val lock: ReentrantLock = ReentrantLock(),
     )
 
     private val contexts = ConcurrentHashMap<String, DesktopSessionContext>()
@@ -47,28 +55,33 @@ class DesktopConversionEngine private constructor(
     ): DesktopAnalysisSession {
         val lease = workspaceManager.create()
         try {
+            val profileSnapshot = profile.snapshot()
             val resolvedInput = inputSealer.seal(input, lease.workspace, control)
             val service = SixBridgeService(
                 workspaceRoot = lease.workspace.root,
                 secureConversionRoot = lease.secureRoot,
                 draftSigningIdentityProvider = signingIdentityProvider,
             )
-            val analysis = service.analyzeResolvedDraft(resolvedInput, profile, control)
+            val analysis = service.analyzeResolvedDraft(resolvedInput, profileSnapshot, control)
             val token = canonicalToken(lease.workspace.token)
             val session = DesktopAnalysisSession(
                 token = token,
                 input = input,
-                profile = profile,
+                profile = profileSnapshot,
                 report = analysis.report,
                 logicalSourceIdentity = analysis.logicalSourceIdentity,
                 selectedAutomaticAdapters = analysis.report.adapterDecisions
                     .filter { it.disposition == AdapterDisposition.AUTOMATIC }
-                    .mapTo(sortedSetOf()) { it.id },
+                    .mapTo(sortedSetOf()) { it.id }.toSet(),
                 requiredApprovals = analysis.report.adapterDecisions
                     .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
-                    .mapTo(sortedSetOf()) { it.id },
+                    .mapTo(sortedSetOf()) { it.id }.toSet(),
             )
-            val context = DesktopSessionContext(lease, resolvedInput, service)
+            val context = DesktopSessionContext(
+                lease, resolvedInput, service, profileSnapshot, analysis.report.status,
+                analysis.report.sourceSha256, analysis.report.extensionName,
+                session.selectedAutomaticAdapters, session.requiredApprovals,
+            )
             check(contexts.putIfAbsent(token, context) == null) {
                 "desktop analysis token이 중복되었습니다."
             }
@@ -94,14 +107,15 @@ class DesktopConversionEngine private constructor(
         }
         val context = contexts[token]
             ?: throw DesktopConversionException("활성 desktop analysis session이 없습니다.")
-        try {
+        return context.lock.withLock {
+            try {
             validateSession(token, session)
-            validateBuildRequest(session, approvedAdapterIds)
-            val suggestedFileName = suggestedFileName(session.report.extensionName)
+            validateBuildRequest(context, approvedAdapterIds)
+            val suggestedFileName = suggestedFileName(context.extensionName)
             val output = context.lease.workspace.artifactRoot.resolve(suggestedFileName)
             val result = context.service.draftPortableResolved(
                 resolved = context.resolvedInput,
-                profile = session.profile,
+                profile = context.profile,
                 outputDraft = output,
                 projectIdentity = projectIdentity,
                 approvedAdapterIds = approvedAdapterIds,
@@ -112,17 +126,18 @@ class DesktopConversionEngine private constructor(
             val signerFingerprint = DraftSignature.fingerprint(
                 signingIdentityProvider.getOrCreate().public.encoded,
             )
-            verifyArtifact(session, result.sourceSha256, result.draft, verified, signerFingerprint)
-            return DesktopDraftArtifact(
+            verifyArtifact(context, result.sourceSha256, result.draft, verified, signerFingerprint)
+            DesktopDraftArtifact(
                 token = token,
                 privateFile = result.draft,
                 suggestedFileName = suggestedFileName,
                 sha256 = DraftSignature.sha256(Files.readAllBytes(result.draft)),
                 signerFingerprint = signerFingerprint,
             )
-        } catch (error: Throwable) {
+            } catch (error: Throwable) {
             closeRegistered(token, context, error)
             throw error
+            }
         }
     }
 
@@ -133,8 +148,9 @@ class DesktopConversionEngine private constructor(
             return false
         }
         val context = contexts[canonical] ?: return false
-        closeRegistered(canonical, context, null)
-        return true
+        return context.lock.withLock {
+            closeRegistered(canonical, context, null)
+        }
     }
 
     internal fun resolvedInputForTesting(
@@ -149,7 +165,7 @@ class DesktopConversionEngine private constructor(
         var failure: Throwable? = null
         contexts.entries.forEach { (token, context) ->
             try {
-                closeRegistered(token, context, null)
+                context.lock.withLock { closeRegistered(token, context, null) }
             } catch (error: Throwable) {
                 val previous = failure
                 if (previous == null) failure = error else previous.addSuppressed(error)
@@ -167,22 +183,22 @@ class DesktopConversionEngine private constructor(
     }
 
     private fun validateBuildRequest(
-        session: DesktopAnalysisSession,
+        context: DesktopSessionContext,
         approvedAdapterIds: Set<String>,
     ) {
-        if (session.report.status in setOf(CompatibilityStatus.BLOCKED, CompatibilityStatus.UNKNOWN)) {
+        if (context.status in setOf(CompatibilityStatus.BLOCKED, CompatibilityStatus.UNKNOWN)) {
             throw DesktopConversionException("차단되었거나 알 수 없는 분석 결과는 draft로 만들 수 없습니다.")
         }
-        if (!approvedAdapterIds.containsAll(session.requiredApprovals)) {
+        if (!approvedAdapterIds.containsAll(context.requiredApprovals)) {
             throw DesktopConversionException("필수 승인 adapter가 누락되었습니다.")
         }
-        if (!session.requiredApprovals.containsAll(approvedAdapterIds)) {
+        if (!context.requiredApprovals.containsAll(approvedAdapterIds)) {
             throw DesktopConversionException("분석 결과에 없는 adapter 승인이 포함되었습니다.")
         }
     }
 
     private fun verifyArtifact(
-        session: DesktopAnalysisSession,
+        context: DesktopSessionContext,
         resultSourceSha256: String,
         artifact: java.nio.file.Path,
         verified: dev.sixbridge.core.draft.VerifiedSixDraft,
@@ -190,7 +206,7 @@ class DesktopConversionEngine private constructor(
     ) {
         val payload = verified.payload
         if (
-            resultSourceSha256 != session.report.sourceSha256 ||
+            resultSourceSha256 != context.sourceSha256 ||
             payload.draft.schemaVersion != 2 ||
             payload.sourceKind !in setOf(DraftSourceKind.ZIP, DraftSourceKind.CRX) ||
             verified.signerFingerprint != signerFingerprint ||
@@ -213,8 +229,8 @@ class DesktopConversionEngine private constructor(
         token: String,
         context: DesktopSessionContext,
         primary: Throwable?,
-    ) {
-        if (!contexts.remove(token, context)) return
+    ): Boolean {
+        if (!contexts.remove(token, context)) return false
         sessions.remove(token)
         try {
             check(workspaceManager.cleanup(context.lease.workspace.token)) {
@@ -228,6 +244,7 @@ class DesktopConversionEngine private constructor(
             }
         }
         if (primary != null) throw primary
+        return true
     }
 
     private fun canonicalToken(token: String): String {
@@ -239,10 +256,11 @@ class DesktopConversionEngine private constructor(
     private fun suggestedFileName(extensionName: String?): String {
         val stem = (extensionName?.ifBlank { null } ?: "sixbridge-draft")
             .map { character ->
-                if (character.code < 0x20 || character in INVALID_FILE_NAME_CHARACTERS) '_' else character
+                if (character.isISOControl() || character in INVALID_FILE_NAME_CHARACTERS) '_' else character
             }
             .joinToString("")
             .take(MAX_STEM_CODE_UNITS)
+            .let { if (it.lastOrNull()?.isHighSurrogate() == true) it.dropLast(1) else it }
         return "$stem.sixdraft"
     }
 
@@ -273,6 +291,14 @@ class DesktopConversionEngine private constructor(
             workspaceManager,
             inputSealer,
             signingIdentityProvider,
+        )
+
+        private fun BrowserProfile.snapshot(): BrowserProfile = copy(
+            supportedApis = supportedApis.toSet(),
+            detectedApis = detectedApis.toSet(),
+            profileDifferences = profileDifferences.toList(),
+            supportedFeatures = supportedFeatures.toSet(),
+            unavailableFeatures = unavailableFeatures.toSet(),
         )
     }
 }

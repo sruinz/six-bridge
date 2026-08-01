@@ -52,6 +52,53 @@ class DesktopConversionEngineTest {
     }
 
     @Test
+    fun `build는 변경 가능한 profile과 승인 공개 session 대신 분석 snapshot을 사용한다`() {
+        Fixture().use { fixture ->
+            val mutableFeatures = profile.supportedFeatures.toMutableSet()
+            val mutableDifferences = mutableListOf<String>()
+            val mutableProfile = profile.copy(
+                supportedFeatures = mutableFeatures,
+                profileDifferences = mutableDifferences,
+            )
+            val session = fixture.engine.analyze(
+                DesktopExtensionInput.Local(fixture.popupSource),
+                mutableProfile,
+                AnalysisControl(),
+            )
+            val expectedProfileHash = session.profile.canonicalSha256()
+            mutableFeatures += "changed-after-analysis"
+            mutableDifferences += "changed-after-analysis"
+            assertFailsWith<UnsupportedOperationException> {
+                (session.requiredApprovals as MutableSet<String>).clear()
+            }
+            val artifact = fixture.engine.buildDraft(
+                session,
+                session.requiredApprovals,
+                null,
+                AnalysisControl(),
+            )
+            assertEquals(expectedProfileHash, SixDraft.read(artifact.privateFile).payload.compatibilityBefore.browserProfileSha256)
+            assertTrue(fixture.engine.release(session.token))
+            assertEquals(expectedProfileHash, session.profile.canonicalSha256())
+        }
+    }
+
+    @Test
+    fun `suggested filename은 unicode control을 치환하고 surrogate pair를 보존한다`() {
+        Fixture().use { fixture ->
+            val name = "a".repeat(110) + "😀" + '\u007f' + '\u0085'
+            val source = fixture.sourceWithName(name)
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(source), profile, AnalysisControl())
+            val artifact = fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl())
+
+            assertTrue(artifact.suggestedFileName.length <= 120)
+            assertFalse(artifact.suggestedFileName.any(Char::isISOControl))
+            assertFalse(artifact.suggestedFileName.dropLast(DRAFT_EXTENSION.length).last().isHighSurrogate())
+            assertTrue(fixture.engine.release(session.token))
+        }
+    }
+
+    @Test
     fun `차단 또는 unknown session은 draft 생성 전에 정리한다`() {
         Fixture().use { fixture ->
             listOf(
@@ -127,10 +174,16 @@ class DesktopConversionEngineTest {
         val blockedSource = Files.createTempDirectory("desktop-engine-blocked").also { root ->
             root.resolve("manifest.json").writeText("""{"manifest_version":2,"name":"blocked","version":"1"}""")
         }
+        fun sourceWithName(name: String) = Files.createTempDirectory("desktop-engine-name").also { root ->
+            root.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"$name","version":"1"}""",
+            )
+        }
         override fun close() { engine.close() }
     }
 
     private companion object {
+        const val DRAFT_EXTENSION = ".sixdraft"
         val profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser", versionName = BrowserProfile.BASELINE_VERSION, versionCode = 1_300_261_502,
             majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION, supportedApis = BrowserProfile.POC_SUPPORTED_APIS,

@@ -2913,7 +2913,12 @@ internal object SecureBuildPublisher {
         try {
             FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
         } catch (error: java.nio.file.FileSystemException) {
-            if (path.fileSystem.provider().scheme != "jimfs") throw error
+            if (
+                path.fileSystem.provider().scheme != "jimfs" ||
+                error.reason != "not a regular file"
+            ) {
+                throw error
+            }
         }
     }
 
