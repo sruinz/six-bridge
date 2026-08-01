@@ -59,6 +59,27 @@ fun reduceInputState(
     else -> state
 }
 
+internal class DesktopInputFeedback(
+    private val onAction: (DesktopAction) -> Unit,
+) {
+    var dropMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun reject(message: String) {
+        dropMessage = message
+    }
+
+    fun selectLocal(path: java.nio.file.Path) {
+        dropMessage = null
+        onAction(DesktopAction.LocalInputSelected(path))
+    }
+
+    fun changeUrl(value: String) {
+        dropMessage = null
+        onAction(DesktopAction.UrlChanged(value))
+    }
+}
+
 @Composable
 fun InputStep(
     state: DesktopConversionState.Input,
@@ -67,11 +88,11 @@ fun InputStep(
 ) {
     var profileMenuExpanded by remember { mutableStateOf(false) }
     var advancedExpanded by remember { mutableStateOf(false) }
-    var dropMessage by remember { mutableStateOf<String?>(null) }
-    val dropTarget = remember(onAction) {
+    val feedback = remember(onAction) { DesktopInputFeedback(onAction) }
+    val dropTarget = remember(feedback) {
         DesktopDropTarget(
-            onLocalPath = { onAction(DesktopAction.LocalInputSelected(it)) },
-            onRejected = { dropMessage = it },
+            onLocalPath = feedback::selectLocal,
+            onRejected = feedback::reject,
         )
     }
 
@@ -86,7 +107,7 @@ fun InputStep(
         Text("확장 프로그램 입력과 Samsung Internet profile을 선택하세요.")
         OutlinedTextField(
             value = state.urlText,
-            onValueChange = { onAction(DesktopAction.UrlChanged(it)) },
+            onValueChange = feedback::changeUrl,
             label = { Text("Chrome 웹 스토어 URL") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth().semantics { testTag = "input:url" },
@@ -95,7 +116,7 @@ fun InputStep(
             OutlinedButton(
                 onClick = {
                     DesktopFileDialogs.pickFolder()?.let {
-                        onAction(DesktopAction.LocalInputSelected(it))
+                        feedback.selectLocal(it)
                     }
                 },
                 modifier = Modifier.semantics { testTag = "input:pick-folder" },
@@ -103,7 +124,7 @@ fun InputStep(
             OutlinedButton(
                 onClick = {
                     DesktopFileDialogs.pickArchive()?.let {
-                        onAction(DesktopAction.LocalInputSelected(it))
+                        feedback.selectLocal(it)
                     }
                 },
                 modifier = Modifier.semantics { testTag = "input:pick-archive" },
@@ -121,7 +142,9 @@ fun InputStep(
                 .padding(28.dp),
         ) {
             Text("로컬 파일 또는 폴더 하나를 여기에 놓으세요.")
-            (dropMessage ?: state.message)?.let { Text(it, color = MaterialTheme.colors.error) }
+            (feedback.dropMessage ?: state.message)?.let {
+                Text(it, color = MaterialTheme.colors.error)
+            }
         }
         Column {
             OutlinedButton(

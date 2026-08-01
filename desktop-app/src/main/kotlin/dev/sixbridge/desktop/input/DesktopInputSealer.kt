@@ -136,21 +136,11 @@ class DesktopInputSealer private constructor(
         child: Path,
         control: AnalysisControl,
     ): ResolvedExtensionInput {
-        val extension = input.fileName.toString().substringAfterLast('.', "").lowercase()
-        val kind = when (extension) {
-            "zip" -> ExtensionInputKind.ZIP
-            "crx", "crx3" -> ExtensionInputKind.CRX3
-            else -> throw UnsupportedInputException(
-                "지원하지 않는 local archive 형식입니다.",
-            )
-        }
         val before = stableHostFile(input)
         require(before.size <= MAX_ARCHIVE_BYTES) {
             "local archive가 허용 크기를 초과합니다."
         }
-        val archive = child.resolve(
-            if (kind == ExtensionInputKind.ZIP) "input.zip" else "input.crx",
-        )
+        val archive = child.resolve("input.archive")
         copyHostFileOnce(input, before, archive, control)
         afterLocalRead(input)
         val after = stableHostFile(input)
@@ -158,6 +148,7 @@ class DesktopInputSealer private constructor(
         control.checkCancelled()
 
         val sealedBytes = Files.readAllBytes(archive)
+        val kind = archiveKind(sealedBytes)
         return if (kind == ExtensionInputKind.ZIP) {
             requireArchiveDepth(sealedBytes)
             val extraction = Files.createDirectory(child.resolve("extracted"))
@@ -182,6 +173,17 @@ class DesktopInputSealer private constructor(
             )
         }
     }
+
+    private fun archiveKind(bytes: ByteArray): ExtensionInputKind = when {
+        bytes.startsWith(CRX3_MAGIC) -> ExtensionInputKind.CRX3
+        bytes.startsWith(ZIP_LOCAL_MAGIC) ||
+            bytes.startsWith(ZIP_EMPTY_MAGIC) ||
+            bytes.startsWith(ZIP_SPANNED_MAGIC) -> ExtensionInputKind.ZIP
+        else -> throw UnsupportedInputException("지원하지 않는 local archive 형식입니다.")
+    }
+
+    private fun ByteArray.startsWith(magic: ByteArray): Boolean =
+        size >= magic.size && magic.indices.all { this[it] == magic[it] }
 
     private fun sealSource(
         source: Path,
@@ -567,6 +569,10 @@ class DesktopInputSealer private constructor(
             Regex("$PROJECT_MARKER_PREFIX([0-9a-f]{32})")
         private val EXCLUDED_DIRECTORIES = setOf(".git", ".gradle", "node_modules")
         private val EXCLUDED_FILES = setOf(".DS_Store")
+        private val CRX3_MAGIC = byteArrayOf(0x43, 0x72, 0x32, 0x34)
+        private val ZIP_LOCAL_MAGIC = byteArrayOf(0x50, 0x4b, 0x03, 0x04)
+        private val ZIP_EMPTY_MAGIC = byteArrayOf(0x50, 0x4b, 0x05, 0x06)
+        private val ZIP_SPANNED_MAGIC = byteArrayOf(0x50, 0x4b, 0x07, 0x08)
         private const val ZIP_END_SIGNATURE = 0x06054b50
         private const val ZIP_CENTRAL_SIGNATURE = 0x02014b50
         private const val ZIP_END_SIZE = 22

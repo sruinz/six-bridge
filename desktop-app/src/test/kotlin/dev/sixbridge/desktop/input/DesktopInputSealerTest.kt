@@ -148,6 +148,52 @@ class DesktopInputSealerTest {
     }
 
     @Test
+    fun `로컬 archive는 파일명이 아니라 봉인된 bytes로 ZIP과 CRX3를 판별한다`() {
+        val source = extensionSource()
+        val zipBytes = ExtensionZip.createBytes(source)
+        val crx = validCrx(source)
+        val root = Files.createTempDirectory("desktop-magic-")
+        val cases = listOf(
+            root.resolve("crx-disguised.zip").also { Files.write(it, crx.bytes) } to ExtensionInputKind.CRX3,
+            root.resolve("zip-disguised.crx").also { Files.write(it, zipBytes) } to ExtensionInputKind.ZIP,
+            root.resolve("zip-without-extension").also { Files.write(it, zipBytes) } to ExtensionInputKind.ZIP,
+            root.resolve("crx-without-extension").also { Files.write(it, crx.bytes) } to ExtensionInputKind.CRX3,
+        )
+        val manager = DesktopWorkspaceManager()
+
+        cases.forEach { (input, expectedKind) ->
+            manager.create().use { lease ->
+                val resolved = DesktopInputSealer(CountingDownloader(byteArrayOf())).seal(
+                    DesktopExtensionInput.Local(input),
+                    lease.workspace,
+                    AnalysisControl(),
+                )
+
+                assertEquals(expectedKind, resolved.kind, input.fileName.toString())
+                assertTrue(requireNotNull(resolved.sourceRoot).resolve("manifest.json").readText().contains("Fixture"))
+            }
+        }
+    }
+
+    @Test
+    fun `확장자만 ZIP인 위장 입력은 fail closed한다`() {
+        val disguised = Files.createTempFile("desktop-disguised-", ".zip")
+        Files.write(disguised, "not-an-archive".encodeToByteArray())
+        val manager = DesktopWorkspaceManager()
+
+        manager.create().use { lease ->
+            assertFailsWith<UnsupportedInputException> {
+                DesktopInputSealer(CountingDownloader(byteArrayOf())).seal(
+                    DesktopExtensionInput.Local(disguised),
+                    lease.workspace,
+                    AnalysisControl(),
+                )
+            }
+            assertTrue(Files.list(lease.workspace.inputRoot).use { it.findAny().isEmpty })
+        }
+    }
+
+    @Test
     fun `source는 marker를 포함한 canonical ZIP으로 한 번 봉인한다`() {
         val source = extensionSource()
         val manager = DesktopWorkspaceManager()

@@ -14,6 +14,7 @@ import dev.sixbridge.desktop.profile.DesktopProfileTrust
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 
 @OptIn(ExperimentalTestApi::class)
 class DesktopInputStepTest {
@@ -105,6 +106,25 @@ class DesktopInputStepTest {
         assertEquals(false, canAnalyze(input, blocked, busy = false))
         assertEquals(false, canAnalyze(null, selectable, busy = false))
         assertEquals(true, canAnalyze(input, selectable, busy = false))
+    }
+
+    @Test
+    fun `거부된 drop 문구는 다음 정상 입력을 선택하면 지운다`() {
+        val actions = mutableListOf<DesktopAction>()
+        val feedback = DesktopInputFeedback(actions::add)
+        feedback.reject("파일 하나만 놓으세요.")
+
+        feedback.selectLocal(Path.of("valid.zip"))
+
+        assertNull(feedback.dropMessage)
+        assertEquals(
+            listOf<DesktopAction>(DesktopAction.LocalInputSelected(Path.of("valid.zip"))),
+            actions,
+        )
+
+        feedback.reject("다시 실패")
+        feedback.changeUrl("https://chromewebstore.google.com/detail/example")
+        assertNull(feedback.dropMessage)
     }
 
     private fun profiles() = listOf(
