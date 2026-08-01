@@ -7,7 +7,10 @@ import java.nio.file.Files
 import java.nio.file.StandardOpenOption
 import java.util.UUID
 
-class DesktopSecureWorkspaceProvider {
+class DesktopSecureWorkspaceProvider private constructor(
+    private val closeObserver: (() -> Unit)?,
+) {
+    constructor() : this(null)
     fun create(): DesktopWorkspaceLease {
         val fileSystem = Jimfs.newFileSystem(
             Configuration.unix().toBuilder()
@@ -36,6 +39,7 @@ class DesktopSecureWorkspaceProvider {
                     artifactRoot = artifactRoot,
                 ),
                 secureRoot = secureRoot,
+                closeObserver = closeObserver,
             )
         } catch (error: Throwable) {
             fileSystem.close()
@@ -43,8 +47,11 @@ class DesktopSecureWorkspaceProvider {
         }
     }
 
-    private companion object {
+    companion object {
         const val OWNER_MARKER_FILE = ".sixbridge-owner"
         const val OWNER_MARKER = "sixbridge-desktop-work-v1"
+
+        internal fun testing(closeObserver: () -> Unit): DesktopSecureWorkspaceProvider =
+            DesktopSecureWorkspaceProvider(closeObserver)
     }
 }

@@ -1,6 +1,9 @@
 package dev.sixbridge.core.conversion
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import java.nio.file.Files
+import java.nio.file.FileSystemException
 import java.nio.file.Path
 import java.nio.ByteBuffer
 import java.nio.file.attribute.PosixFilePermission
@@ -17,6 +20,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -305,6 +309,40 @@ class SecureBuildPublisherTest {
         assertEquals("old", Files.readString(output))
         SecureBuildPublisher.recoverPending(listOf(output), null)
         assertEquals("old", Files.readString(output))
+    }
+
+    @Test
+    fun `Jimfs directory fsync unsupported outcome만 publication에 허용한다`() {
+        Jimfs.newFileSystem(jimfsConfiguration()).use { fileSystem ->
+            val parent = fileSystem.getPath("/publisher")
+            Files.createDirectory(parent)
+            val output = parent.resolve("extension.crx")
+
+            BuildPublicationFaultInjection.directoryFsyncForTesting(
+                operation = { DirectoryFsyncResult.UNSUPPORTED },
+                block = { SecureBuildPublisher.publish(mapOf(output to "new".toByteArray())) },
+            )
+
+            assertEquals("new", Files.readString(output))
+        }
+    }
+
+    @Test
+    fun `Jimfs directory fsync의 임의 FileSystemException은 재전파한다`() {
+        Jimfs.newFileSystem(jimfsConfiguration()).use { fileSystem ->
+            val parent = fileSystem.getPath("/publisher")
+            Files.createDirectory(parent)
+            val output = parent.resolve("extension.crx")
+
+            assertFailsWith<FileSystemException> {
+                BuildPublicationFaultInjection.directoryFsyncForTesting(
+                    operation = { path -> throw FileSystemException(path.toString(), null, "injected failure") },
+                    block = { SecureBuildPublisher.publish(mapOf(output to "new".toByteArray())) },
+                )
+            }
+
+            assertFalse(Files.exists(output))
+        }
     }
 
     @Test
@@ -1330,4 +1368,8 @@ class SecureBuildPublisherTest {
         return (attributes.getValue("dev") as Number).toLong() to
             (attributes.getValue("ino") as Number).toLong()
     }
+
+    private fun jimfsConfiguration() = Configuration.unix().toBuilder()
+        .setAttributeViews("basic", "owner", "posix", "unix")
+        .build()
 }

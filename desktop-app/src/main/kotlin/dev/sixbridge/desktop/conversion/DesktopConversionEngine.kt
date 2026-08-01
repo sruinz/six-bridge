@@ -24,10 +24,19 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+internal data class DesktopConversionEngineTestHooks(
+    val afterContextLookup: (() -> Unit)? = null,
+    val beforeDraft: (() -> Unit)? = null,
+    val sourceSha256Override: ((String) -> String)? = null,
+    val afterMapRemoval: ((String) -> Unit)? = null,
+    val cleanupOverride: ((String) -> Boolean)? = null,
+)
+
 class DesktopConversionEngine private constructor(
     private val workspaceManager: DesktopWorkspaceManager,
     private val inputSealer: DesktopInputSealer,
     private val signingIdentityProvider: DraftSigningIdentityProvider,
+    private val testHooks: DesktopConversionEngineTestHooks? = null,
 ) : AutoCloseable {
     constructor() : this(
         workspaceManager = DesktopWorkspaceManager(),
@@ -110,10 +119,12 @@ class DesktopConversionEngine private constructor(
         }
         val context = contexts[token]
             ?: throw DesktopConversionException("활성 desktop analysis session이 없습니다.")
+        testHooks?.afterContextLookup?.invoke()
         return context.lock.withLock {
             try {
             validateSession(token, session)
             validateBuildRequest(context, approvedAdapterIds)
+            testHooks?.beforeDraft?.invoke()
             val suggestedFileName = suggestedFileName(context.extensionName)
             val output = context.lease.workspace.artifactRoot.resolve(suggestedFileName)
             val result = context.service.draftPortableResolved(
@@ -129,7 +140,14 @@ class DesktopConversionEngine private constructor(
             val signerFingerprint = DraftSignature.fingerprint(
                 signingIdentityProvider.getOrCreate().public.encoded,
             )
-            verifyArtifact(context, result.sourceSha256, result.draft, verified, signerFingerprint)
+            verifyArtifact(
+                context,
+                testHooks?.sourceSha256Override?.invoke(result.sourceSha256)
+                    ?: result.sourceSha256,
+                result.draft,
+                verified,
+                signerFingerprint,
+            )
             DesktopDraftArtifact(
                 token = token,
                 privateFile = result.draft,
@@ -151,6 +169,7 @@ class DesktopConversionEngine private constructor(
             return false
         }
         val context = contexts[canonical] ?: return false
+        testHooks?.afterContextLookup?.invoke()
         return context.lock.withLock {
             closeRegistered(canonical, context, null)
         }
@@ -163,6 +182,9 @@ class DesktopConversionEngine private constructor(
         validateSession(token, session)
         return requireNotNull(contexts[token]).resolvedInput
     }
+
+    internal fun isRegisteredForTesting(token: String): Boolean =
+        contexts.containsKey(canonicalToken(token))
 
     override fun close() {
         var failure: Throwable? = null
@@ -235,8 +257,11 @@ class DesktopConversionEngine private constructor(
     ): Boolean {
         if (!contexts.remove(token, context)) return false
         sessions.remove(token)
+        testHooks?.afterMapRemoval?.invoke(token)
         try {
-            check(workspaceManager.cleanup(context.lease.workspace.token)) {
+            val cleaned = testHooks?.cleanupOverride?.invoke(context.lease.workspace.token)
+                ?: workspaceManager.cleanup(context.lease.workspace.token)
+            check(cleaned) {
                 "desktop workspace lease가 등록 중 사라졌습니다."
             }
         } catch (cleanupError: Throwable) {
@@ -290,10 +315,12 @@ class DesktopConversionEngine private constructor(
             workspaceManager: DesktopWorkspaceManager,
             inputSealer: DesktopInputSealer,
             signingIdentityProvider: DraftSigningIdentityProvider,
+            testHooks: DesktopConversionEngineTestHooks = DesktopConversionEngineTestHooks(),
         ): DesktopConversionEngine = DesktopConversionEngine(
             workspaceManager,
             inputSealer,
             signingIdentityProvider,
+            testHooks,
         )
 
         private fun BrowserProfile.snapshot(): BrowserProfile = copy(

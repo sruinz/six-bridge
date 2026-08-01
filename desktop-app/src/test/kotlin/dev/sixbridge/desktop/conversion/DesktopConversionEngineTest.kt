@@ -10,9 +10,14 @@ import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.desktop.input.DesktopInputSealer
+import java.io.IOException
 import java.nio.file.Files
 import java.security.KeyPairGenerator
 import java.util.concurrent.CancellationException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -160,21 +165,199 @@ class DesktopConversionEngineTest {
         }
     }
 
-    private class Fixture : AutoCloseable {
-        val manager = DesktopWorkspaceManager()
+    @Test
+    fun `report 밖 extra approval은 build 전에 거부하고 정확히 한 번 정리한다`() {
+        Fixture().use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.popupSource), profile, AnalysisControl())
+            assertFailsWith<DesktopConversionException> {
+                fixture.engine.buildDraft(session, session.requiredApprovals + "not-in-report", null, AnalysisControl())
+            }
+            assertFalse(fixture.engine.release(session.token))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `build result source SHA mismatch는 artifact를 반환하지 않고 정리한다`() {
+        Fixture(hooks = DesktopConversionEngineTestHooks(sourceSha256Override = { "0".repeat(64) })).use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            assertFailsWith<DesktopConversionException> { fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl()) }
+            assertFalse(fixture.engine.release(session.token))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `internal build failure은 session을 정리하고 원인 오류를 보존한다`() {
+        Fixture(hooks = DesktopConversionEngineTestHooks(beforeDraft = { throw IOException("injected build failure") })).use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            val failure = assertFailsWith<IOException> { fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl()) }
+            assertEquals("injected build failure", failure.message)
+            assertFalse(fixture.engine.release(session.token))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `build failure 중 cleanup exception은 suppressed로 보존한다`() {
+        val hooks = DesktopConversionEngineTestHooks(
+            beforeDraft = { throw IOException("primary failure") },
+            cleanupOverride = { throw IllegalStateException("cleanup failure") },
+        )
+        Fixture(hooks = hooks).use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            val failure = assertFailsWith<IOException> { fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl()) }
+            assertEquals("cleanup failure", failure.suppressed.single().message)
+            assertFalse(fixture.engine.release(session.token))
+        }
+    }
+
+    @Test
+    fun `explicit cancellation과 release 경쟁은 map first로 한 번만 정리한다`() {
+        cancellationReleaseRace("explicit cancellation")
+    }
+
+    @Test
+    fun `deadline cancellation과 release 경쟁은 map first로 한 번만 정리한다`() {
+        cancellationReleaseRace("deadline cancellation")
+    }
+
+    @Test
+    fun `build와 release 경쟁은 성공 artifact를 release 전까지 유지한다`() {
+        val entered = CountDownLatch(1)
+        val continueBuild = CountDownLatch(1)
+        val releaseLookedUp = CountDownLatch(1)
+        val continueRelease = CountDownLatch(1)
+        val lookups = AtomicInteger()
+        val hooks = DesktopConversionEngineTestHooks(beforeDraft = {
+            entered.countDown()
+            check(continueBuild.await(10, TimeUnit.SECONDS))
+        }, afterContextLookup = {
+            if (lookups.incrementAndGet() == 2) {
+                releaseLookedUp.countDown()
+                check(continueRelease.await(10, TimeUnit.SECONDS))
+            }
+        })
+        Fixture(hooks = hooks).use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            var artifact: DesktopDraftArtifact? = null
+            val build = thread { artifact = fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl()) }
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            var released: Boolean? = null
+            val release = thread { released = fixture.engine.release(session.token) }
+            assertTrue(releaseLookedUp.await(10, TimeUnit.SECONDS))
+            continueBuild.countDown()
+            build.join(10_000)
+            assertTrue(Files.isRegularFile(requireNotNull(artifact).privateFile))
+            continueRelease.countDown()
+            release.join(10_000)
+            assertTrue(released == true)
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `build와 close 경쟁은 build가 끝난 뒤 단 한 번만 정리한다`() {
+        val entered = CountDownLatch(1)
+        val continueBuild = CountDownLatch(1)
+        val hooks = DesktopConversionEngineTestHooks(beforeDraft = {
+            entered.countDown()
+            check(continueBuild.await(10, TimeUnit.SECONDS))
+        })
+        Fixture(hooks = hooks).use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            val build = thread { fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl()) }
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            val close = thread { fixture.engine.close() }
+            assertTrue(close.isAlive)
+            continueBuild.countDown()
+            build.join(10_000)
+            close.join(10_000)
+            assertFalse(fixture.engine.release(session.token))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `동시 두 release는 하나만 true이고 map 제거가 cleanup보다 먼저다`() {
+        val lookedUp = CountDownLatch(2)
+        val continueRelease = CountDownLatch(1)
+        lateinit var engine: DesktopConversionEngine
+        val hooks = DesktopConversionEngineTestHooks(
+            afterContextLookup = { lookedUp.countDown(); check(continueRelease.await(10, TimeUnit.SECONDS)) },
+            afterMapRemoval = { token -> assertFalse(engine.isRegisteredForTesting(token)) },
+        )
+        Fixture(hooks = hooks).use { fixture ->
+            engine = fixture.engine
+            val session = engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            var first: Boolean? = null
+            var second: Boolean? = null
+            val releaseOne = thread { first = engine.release(session.token) }
+            val releaseTwo = thread { second = engine.release(session.token) }
+            assertTrue(lookedUp.await(10, TimeUnit.SECONDS))
+            continueRelease.countDown()
+            releaseOne.join(10_000)
+            releaseTwo.join(10_000)
+            assertEquals(1, listOf(first, second).count { it == true })
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `host input과 Jimfs workspace 양쪽에 CRX key directory를 만들지 않는다`() {
+        Fixture().use { fixture ->
+            val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            val artifact = fixture.engine.buildDraft(session, emptySet(), null, AnalysisControl())
+            assertFalse(Files.exists(fixture.hostAppData.resolve(".local/keystore/crx")))
+            assertFalse(Files.exists(artifact.privateFile.fileSystem.getPath("/sixbridge/${session.token}/.local/keystore/crx")))
+            assertTrue(fixture.engine.release(session.token))
+        }
+    }
+
+    private fun cancellationReleaseRace(reason: String) {
+        val entered = CountDownLatch(1)
+        val continueBuild = CountDownLatch(1)
+        lateinit var engine: DesktopConversionEngine
+        val hooks = DesktopConversionEngineTestHooks(
+            beforeDraft = { entered.countDown(); check(continueBuild.await(10, TimeUnit.SECONDS)) },
+            afterMapRemoval = { token -> assertFalse(engine.isRegisteredForTesting(token)) },
+        )
+        Fixture(hooks = hooks).use { fixture ->
+            engine = fixture.engine
+            val session = engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            var failure: Throwable? = null
+            val build = thread { failure = runCatching { engine.buildDraft(session, emptySet(), null, AnalysisControl { throw CancellationException(reason) }) }.exceptionOrNull() }
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            var released: Boolean? = null
+            val release = thread { released = engine.release(session.token) }
+            continueBuild.countDown()
+            build.join(10_000)
+            release.join(10_000)
+            assertTrue(failure is CancellationException)
+            assertFalse(released == true)
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    private class Fixture(
+        hooks: DesktopConversionEngineTestHooks = DesktopConversionEngineTestHooks(),
+    ) : AutoCloseable {
+        val closeCount = AtomicInteger()
+        val manager = DesktopWorkspaceManager.testing(closeCount::incrementAndGet)
         val signer = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         val provider = DraftSigningIdentityProvider { signer }
         val sealer = DesktopInputSealer { error("Chrome input is not used in this test") }
-        val engine = DesktopConversionEngine.testing(manager, sealer, provider)
-        val source = Files.createTempDirectory("desktop-engine-source").also { root -> root.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"sealed source","version":"1"}""") }
-        val popupSource = Files.createTempDirectory("desktop-engine-popup").also { root ->
+        val engine = DesktopConversionEngine.testing(manager, sealer, provider, hooks)
+        val hostAppData = Files.createTempDirectory("desktop-engine-app-data")
+        val source = Files.createDirectory(hostAppData.resolve("source")).also { root -> root.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"sealed source","version":"1"}""") }
+        val popupSource = Files.createDirectory(hostAppData.resolve("popup")).also { root ->
             root.resolve("popup.html").writeText("<p>popup</p>")
             root.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
         }
-        val blockedSource = Files.createTempDirectory("desktop-engine-blocked").also { root ->
+        val blockedSource = Files.createDirectory(hostAppData.resolve("blocked")).also { root ->
             root.resolve("manifest.json").writeText("""{"manifest_version":2,"name":"blocked","version":"1"}""")
         }
-        fun sourceWithName(name: String) = Files.createTempDirectory("desktop-engine-name").also { root ->
+        fun sourceWithName(name: String) = Files.createTempDirectory(hostAppData, "name-").also { root ->
             root.resolve("manifest.json").writeText(
                 """{"manifest_version":3,"name":"$name","version":"1"}""",
             )

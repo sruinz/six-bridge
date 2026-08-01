@@ -49,6 +49,7 @@ data class DesktopWorkspace(
 class DesktopWorkspaceLease internal constructor(
     val workspace: DesktopWorkspace,
     val secureRoot: SecureConversionRoot,
+    private val closeObserver: (() -> Unit)? = null,
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
 
@@ -57,6 +58,7 @@ class DesktopWorkspaceLease internal constructor(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
+            closeObserver?.invoke()
             workspace.root.fileSystem.close()
         }
     }

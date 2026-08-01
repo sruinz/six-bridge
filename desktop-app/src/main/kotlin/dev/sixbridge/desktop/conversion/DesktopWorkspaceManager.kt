@@ -32,4 +32,9 @@ class DesktopWorkspaceManager(
         }
         return cleaned
     }
+
+    companion object {
+        internal fun testing(closeObserver: () -> Unit): DesktopWorkspaceManager =
+            DesktopWorkspaceManager(DesktopSecureWorkspaceProvider.testing(closeObserver))
+    }
 }

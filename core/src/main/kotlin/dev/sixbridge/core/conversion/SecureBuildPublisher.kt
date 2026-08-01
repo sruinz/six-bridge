@@ -68,6 +68,11 @@ internal enum class OutputStageCrashPoint {
     AFTER_OWNER_MARKER,
 }
 
+internal enum class DirectoryFsyncResult {
+    FORCED,
+    UNSUPPORTED,
+}
+
 internal object SecureBuildPublisher {
     @JvmSynthetic
     fun copyExistingOutput(
@@ -2910,14 +2915,27 @@ internal object SecureBuildPublisher {
                 "publisher output parent identity가 fsync 전에 변경되었습니다."
             }
         }
-        try {
-            FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
-        } catch (error: java.nio.file.FileSystemException) {
-            if (
-                path.fileSystem.provider().scheme != "jimfs" ||
-                error.reason != "not a regular file"
+        val result = BuildPublicationFaultInjection.directoryFsync(path) {
+            try {
+                FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
+                DirectoryFsyncResult.FORCED
+            } catch (error: java.nio.file.FileSystemException) {
+                if (
+                    path.fileSystem.provider().scheme == "jimfs" &&
+                    Files.isDirectory(path, NOFOLLOW_LINKS)
+                ) {
+                    DirectoryFsyncResult.UNSUPPORTED
+                } else {
+                    throw error
+                }
+            }
+        }
+        if (result == DirectoryFsyncResult.UNSUPPORTED) {
+            require(
+                path.fileSystem.provider().scheme == "jimfs" &&
+                    Files.isDirectory(path, NOFOLLOW_LINKS),
             ) {
-                throw error
+                "Jimfs directory fsync 미지원 결과만 허용됩니다."
             }
         }
     }
@@ -3013,6 +3031,8 @@ internal object BuildPublicationFaultInjection {
     private val directoryFsyncObserver = ThreadLocal<((Path) -> Unit)?>()
     private val directoryFsyncFailurePredicate =
         ThreadLocal<((Path) -> Boolean)?>()
+    private val directoryFsyncOperation =
+        ThreadLocal<((Path) -> DirectoryFsyncResult)?>()
     private val localFileFsyncObserver = ThreadLocal<((Path) -> Unit)?>()
     private val localFileFsyncFailurePredicate =
         ThreadLocal<((Path) -> Boolean)?>()
@@ -3139,6 +3159,27 @@ internal object BuildPublicationFaultInjection {
             directoryFsyncFailurePredicate.remove()
         }
     }
+
+    @JvmSynthetic
+    fun <T> directoryFsyncForTesting(
+        operation: (Path) -> DirectoryFsyncResult,
+        block: () -> T,
+    ): T {
+        check(directoryFsyncOperation.get() == null)
+        directoryFsyncOperation.set(operation)
+        return try {
+            block()
+        } finally {
+            directoryFsyncOperation.remove()
+        }
+    }
+
+    @JvmSynthetic
+    fun directoryFsync(
+        path: Path,
+        productionOperation: () -> DirectoryFsyncResult,
+    ): DirectoryFsyncResult = directoryFsyncOperation.get()?.invoke(path)
+        ?: productionOperation()
 
     @JvmSynthetic
     fun beforeDirectoryFsync(path: Path) {
