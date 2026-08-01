@@ -1,11 +1,14 @@
 package dev.sixbridge.desktop
 
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class DesktopCloseCoordinatorTest {
@@ -84,6 +87,99 @@ class DesktopCloseCoordinatorTest {
         assertEquals(listOf("profile", "conversion", "exit"), calls)
         assertEquals(DesktopCloseRequest.EXITED, coordinator.requestClose())
         assertEquals(1, background.size)
+    }
+
+    @Test
+    fun `cleanup과 exit의 여러 fatal은 첫 fatal을 보존하고 발생 순서로 suppressed한다`() {
+        val calls = mutableListOf<String>()
+        val coordinator = DesktopCloseCoordinator(
+            isBusy = { false },
+            closeProfileImports = {
+                calls += "profile"
+                throw AssertionError("profile-fatal")
+            },
+            closeConversion = {
+                calls += "conversion"
+                throw LinkageError("conversion-fatal")
+            },
+            exit = {
+                calls += "exit"
+                throw OutOfMemoryError("exit-fatal")
+            },
+            launchInBackground = { it() },
+            postToUi = { it() },
+        )
+
+        val fatal = assertFailsWith<AssertionError> { coordinator.requestClose() }
+
+        assertEquals(listOf("profile", "conversion", "exit"), calls)
+        assertEquals("profile-fatal", fatal.message)
+        assertEquals(
+            listOf("conversion-fatal", "exit-fatal"),
+            fatal.suppressed.map { it.message },
+        )
+    }
+
+    @Test
+    fun `cleanup CancellationException은 나머지 정리와 exit 뒤 원형으로 재전파한다`() {
+        val calls = mutableListOf<String>()
+        val cancellation = CancellationException("cancel-fatal")
+        val coordinator = DesktopCloseCoordinator(
+            isBusy = { false },
+            closeProfileImports = {
+                calls += "profile"
+                throw cancellation
+            },
+            closeConversion = { calls += "conversion" },
+            exit = { calls += "exit" },
+            launchInBackground = { it() },
+            postToUi = { it() },
+        )
+
+        val thrown = assertFailsWith<CancellationException> { coordinator.requestClose() }
+
+        assertTrue(thrown === cancellation)
+        assertEquals(listOf("profile", "conversion", "exit"), calls)
+        assertEquals(DesktopCloseRequest.EXITED, coordinator.requestClose())
+    }
+
+    @Test
+    fun `launch post exit의 fatal은 소거하지 않고 실패한 종료를 재시도할 수 있다`() {
+        listOf("launch", "post", "exit").forEach { fatalStage ->
+            val shouldFail = AtomicBoolean(true)
+            val calls = mutableListOf<String>()
+            val coordinator = DesktopCloseCoordinator(
+                isBusy = { false },
+                closeProfileImports = { calls += "profile" },
+                closeConversion = { calls += "conversion" },
+                exit = {
+                    calls += "exit"
+                    if (fatalStage == "exit" && shouldFail.compareAndSet(true, false)) {
+                        throw LinkageError("exit-fatal")
+                    }
+                },
+                launchInBackground = {
+                    if (fatalStage == "launch" && shouldFail.compareAndSet(true, false)) {
+                        throw LinkageError("launch-fatal")
+                    }
+                    it()
+                },
+                postToUi = {
+                    if (fatalStage == "post" && shouldFail.compareAndSet(true, false)) {
+                        throw LinkageError("post-fatal")
+                    }
+                    it()
+                },
+            )
+
+            val fatal = assertFailsWith<LinkageError>(fatalStage) {
+                coordinator.requestClose()
+            }
+            assertEquals("$fatalStage-fatal", fatal.message)
+
+            assertEquals(DesktopCloseRequest.CLOSE_STARTED, coordinator.requestClose())
+            assertEquals(DesktopCloseRequest.EXITED, coordinator.requestClose())
+        }
     }
 
     @Test

@@ -1,5 +1,6 @@
 package dev.sixbridge.desktop
 
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicReference
 
 internal enum class DesktopCloseRequest {
@@ -44,29 +45,66 @@ internal class DesktopCloseCoordinator(
         }
         try {
             launchInBackground {
-                // 종료 중 cleanup은 best-effort다. 한 단계가 실패해도 다음 controller와
-                // exit을 반드시 시도하며, exit 자체가 실패한 경우에만 재시도 가능하게 연다.
-                runCatching(closeProfileImports)
-                runCatching(closeConversion)
+                val fatalFailures = FatalFailures()
+                attemptCleanup(closeProfileImports, fatalFailures)
+                attemptCleanup(closeConversion, fatalFailures)
                 try {
                     postToUi {
                         try {
                             exit()
                             lifecycle.set(Lifecycle.EXITED)
-                        } catch (_: Throwable) {
+                        } catch (error: Throwable) {
                             lifecycle.set(Lifecycle.OPEN)
+                            fatalFailures.record(error)
                         }
+                        fatalFailures.throwIfPresent()
                     }
-                } catch (_: Throwable) {
-                    lifecycle.set(Lifecycle.OPEN)
+                } catch (error: Throwable) {
+                    if (lifecycle.get() != Lifecycle.EXITED) {
+                        lifecycle.set(Lifecycle.OPEN)
+                    }
+                    fatalFailures.record(error)
+                    fatalFailures.throwIfPresent()
                 }
             }
-        } catch (_: Throwable) {
-            lifecycle.set(Lifecycle.OPEN)
+        } catch (error: Throwable) {
+            if (lifecycle.get() != Lifecycle.EXITED) {
+                lifecycle.set(Lifecycle.OPEN)
+            }
+            if (error.isDesktopCloseFatal()) throw error
             return DesktopCloseRequest.CONFIRM_REQUIRED
         }
         return DesktopCloseRequest.CLOSE_STARTED
     }
 
+    private fun attemptCleanup(action: () -> Unit, fatalFailures: FatalFailures) {
+        try {
+            action()
+        } catch (error: Throwable) {
+            fatalFailures.record(error)
+        }
+    }
+
+    private class FatalFailures {
+        private var first: Throwable? = null
+
+        fun record(error: Throwable) {
+            if (!error.isDesktopCloseFatal()) return
+            val original = first
+            if (original == null) {
+                first = error
+            } else if (error !== original && original.suppressed.none { it === error }) {
+                original.addSuppressed(error)
+            }
+        }
+
+        fun throwIfPresent() {
+            first?.let { throw it }
+        }
+    }
+
     private enum class Lifecycle { OPEN, CLOSING, EXITED }
 }
+
+private fun Throwable.isDesktopCloseFatal(): Boolean =
+    this is CancellationException || this is Error
