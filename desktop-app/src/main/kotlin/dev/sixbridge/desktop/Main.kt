@@ -7,6 +7,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.material.AlertDialog
+import androidx.compose.material.Button
+import androidx.compose.material.OutlinedButton
+import androidx.compose.material.Text
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -53,6 +59,15 @@ fun main() = application {
             },
         )
     }
+    val closeCoordinator = remember(controller, profileImportController) {
+        DesktopCloseCoordinator(
+            isBusy = { controller.isBusy() || profileImportController.isBusy() },
+            closeProfileImports = profileImportController::close,
+            closeConversion = controller::close,
+            exit = ::exitApplication,
+        )
+    }
+    var showCloseConfirmation by remember { mutableStateOf(false) }
 
     DisposableEffect(controller, profileImportController) {
         onDispose {
@@ -62,7 +77,12 @@ fun main() = application {
     }
 
     Window(
-        onCloseRequest = ::exitApplication,
+        onCloseRequest = {
+            showCloseConfirmation = when (closeCoordinator.requestClose()) {
+                DesktopCloseRequest.CONFIRM_REQUIRED -> true
+                DesktopCloseRequest.EXITED -> false
+            }
+        },
         title = DesktopApplicationMetadata.NAME,
         state = rememberWindowState(width = 1024.dp, height = 768.dp),
     ) {
@@ -127,15 +147,59 @@ fun main() = application {
                     }
 
                     DesktopAction.ContinueToApproval -> controller.continueToApproval()
-                    DesktopAction.Back,
-                    DesktopAction.Cancel,
-                    -> {
+                    DesktopAction.Back -> controller.back()
+                    DesktopAction.Cancel -> {
                         profileImportController.invalidate()
                         profileImports = profileImports.invalidateProfileImports()
                         controller.cancel()
                     }
+                    is DesktopAction.AdapterToggled -> controller.toggleAdapter(action.id)
+                    is DesktopAction.PartialConfirmationChanged ->
+                        controller.setPartialConfirmed(action.confirmed)
+                    is DesktopAction.ProjectIdentitySelected ->
+                        controller.selectProjectIdentity(action.value)
+                    DesktopAction.BuildDraft -> controller.buildDraft()
+                    is DesktopAction.SaveDraft -> controller.saveDraft(action.destination)
+                    DesktopAction.RevealSavedDraft -> controller.revealSavedDraft()
+                    DesktopAction.NewConversion -> {
+                        profileImportController.invalidate()
+                        profileImports = profileImports.invalidateProfileImports()
+                        controller.reset()
+                    }
                 }
             },
         )
+        if (showCloseConfirmation) {
+            AlertDialog(
+                onDismissRequest = {
+                    closeCoordinator.cancelClose()
+                    showCloseConfirmation = false
+                },
+                title = { Text("진행 중인 작업 종료") },
+                text = { Text("분석·변환·저장 작업을 취소하고 SIX Bridge를 종료할까요?") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showCloseConfirmation = false
+                            closeCoordinator.confirmClose()
+                        },
+                        modifier = androidx.compose.ui.Modifier.semantics {
+                            testTag = "close:confirm"
+                        },
+                    ) { Text("종료") }
+                },
+                dismissButton = {
+                    OutlinedButton(
+                        onClick = {
+                            closeCoordinator.cancelClose()
+                            showCloseConfirmation = false
+                        },
+                        modifier = androidx.compose.ui.Modifier.semantics {
+                            testTag = "close:cancel"
+                        },
+                    ) { Text("계속 사용") }
+                },
+            )
+        }
     }
 }

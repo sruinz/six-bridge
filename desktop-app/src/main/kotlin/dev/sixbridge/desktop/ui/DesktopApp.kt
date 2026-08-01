@@ -31,6 +31,13 @@ sealed interface DesktopAction {
     data object ContinueToApproval : DesktopAction
     data object Back : DesktopAction
     data object Cancel : DesktopAction
+    data class AdapterToggled(val id: String) : DesktopAction
+    data class PartialConfirmationChanged(val confirmed: Boolean) : DesktopAction
+    data class ProjectIdentitySelected(val value: String) : DesktopAction
+    data object BuildDraft : DesktopAction
+    data class SaveDraft(val destination: Path) : DesktopAction
+    data object RevealSavedDraft : DesktopAction
+    data object NewConversion : DesktopAction
 }
 
 @Composable
@@ -47,16 +54,26 @@ fun DesktopApp(
                 is DesktopConversionState.AnalysisReady -> if (state.reviewStep == DesktopReviewStep.ANALYSIS) {
                     AnalysisStep(state, onAction)
                 } else {
-                    PendingStep("승인 단계")
+                    ApprovalStep(state, onAction)
                 }
-                is DesktopConversionState.Failed -> FailureStep(state.message, onAction)
-                is DesktopConversionState.BuildingDraft -> BusyStep("변환 초안을 생성하는 중입니다.")
-                is DesktopConversionState.DraftReady -> PendingStep("변환 초안이 준비되었습니다.")
+                is DesktopConversionState.Failed -> {
+                    val result = state.previous as? DesktopConversionState.DraftReady
+                    if (state.stage in setOf(
+                            dev.sixbridge.desktop.app.DesktopFailureStage.SAVE,
+                            dev.sixbridge.desktop.app.DesktopFailureStage.REVEAL,
+                        ) && result != null
+                    ) {
+                        ResultStep(result.copy(message = state.message), onAction)
+                    } else {
+                        FailureStep(state.message, onAction)
+                    }
+                }
+                is DesktopConversionState.BuildingDraft -> BuildingDraftStep(onAction)
+                is DesktopConversionState.DraftReady -> ResultStep(state, onAction)
             }
         }
     }
 }
-
 @Composable
 private fun FailureStep(message: String, onAction: (DesktopAction) -> Unit) {
     Column(
@@ -83,12 +100,5 @@ private fun BusyStep(message: String) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         CircularProgressIndicator()
         Text(message, Modifier.padding(top = 96.dp))
-    }
-}
-
-@Composable
-private fun PendingStep(message: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(message)
     }
 }

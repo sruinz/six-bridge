@@ -85,6 +85,8 @@ internal class DesktopProfileImportController private constructor(
         operation?.cancel()
     }
 
+    fun isBusy(): Boolean = synchronized(lock) { !closed && current != null }
+
     override fun close() {
         val operation = synchronized(lock) {
             if (closed) return

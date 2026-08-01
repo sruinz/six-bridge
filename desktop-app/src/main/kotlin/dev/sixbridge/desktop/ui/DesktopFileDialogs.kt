@@ -14,6 +14,23 @@ object DesktopFileDialogs {
 
     fun pickBrowserApk(): Path? = pickFile("Samsung Internet APK 선택", setOf("apk"))
 
+    fun saveDraft(defaultFileName: String): Path? {
+        val dialog = FileDialog(null as Frame?, "SixDraft 저장", FileDialog.SAVE).apply {
+            file = defaultFileName.takeIf { it.endsWith(".sixdraft", ignoreCase = true) }
+                ?: "$defaultFileName.sixdraft"
+        }
+        return try {
+            dialog.isVisible = true
+            dialog.file?.let { selected ->
+                val fileName = selected.takeIf { it.endsWith(".sixdraft", ignoreCase = true) }
+                    ?: "$selected.sixdraft"
+                Path.of(dialog.directory, fileName)
+            }
+        } finally {
+            dialog.dispose()
+        }
+    }
+
     fun pickFolder(): Path? {
         val chooser = JFileChooser().apply {
             dialogTitle = "확장 프로그램 폴더 선택"

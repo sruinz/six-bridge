@@ -9,6 +9,9 @@ import dev.sixbridge.desktop.conversion.DesktopDraftArtifact
 import dev.sixbridge.desktop.conversion.DesktopDraftSaver
 import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import dev.sixbridge.desktop.profile.DesktopProfileOption
+import dev.sixbridge.desktop.ui.DesktopRevealResult
+import dev.sixbridge.desktop.ui.DesktopSavedDraftRevealer
+import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import java.io.IOException
 import java.nio.file.Path
 import java.util.concurrent.CancellationException
@@ -66,6 +69,8 @@ sealed interface DesktopConversionState {
     data class DraftReady(
         val artifact: DesktopDraftArtifact,
         val savedPath: Path? = null,
+        val isSaving: Boolean = false,
+        val message: String? = null,
     ) : DesktopConversionState
 
     data class Failed(
@@ -78,14 +83,21 @@ sealed interface DesktopConversionState {
 class DesktopConversionController private constructor(
     private val engine: DesktopConversionEngine,
     private val saver: DesktopDraftSaver,
+    private val revealer: DesktopSavedDraftRevealer,
     @Suppress("UNUSED_PARAMETER") marker: Unit,
 ) : AutoCloseable {
-    constructor() : this(DesktopConversionEngine(), DesktopDraftSaver(), Unit)
+    constructor() : this(
+        DesktopConversionEngine(),
+        DesktopDraftSaver(),
+        DesktopSavedDraftRevealer(),
+        Unit,
+    )
 
     internal constructor(
         engine: DesktopConversionEngine,
         saver: DesktopDraftSaver = DesktopDraftSaver(),
-    ) : this(engine, saver, Unit)
+        revealer: DesktopSavedDraftRevealer = DesktopSavedDraftRevealer(),
+    ) : this(engine, saver, revealer, Unit)
 
     private val lock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -176,8 +188,23 @@ class DesktopConversionController private constructor(
     fun selectProjectIdentity(value: String) {
         synchronized(lock) {
             val ready = approvalReady(_state.value) ?: return
+            if (ready.session.logicalSourceIdentity !is LogicalSourceIdentityResult.NeedsUserSelection) return
+            if (!PROJECT_IDENTITY.matches(value)) return
             _state.value = ready.copy(projectIdentity = value)
         }
+    }
+
+    fun back() {
+        val returnToInput: Boolean
+        synchronized(lock) {
+            val ready = approvalReady(_state.value)
+            if (ready?.reviewStep == DesktopReviewStep.APPROVAL) {
+                _state.value = ready.copy(reviewStep = DesktopReviewStep.ANALYSIS)
+                return
+            }
+            returnToInput = true
+        }
+        if (returnToInput) replaceWithInput(release = true)
     }
 
     fun buildDraft() {
@@ -195,6 +222,17 @@ class DesktopConversionController private constructor(
                 _state.value = DesktopConversionState.Failed(DesktopFailureStage.APPROVAL, "부분 호환 결과를 확인해야 합니다.", ready)
                 return
             }
+            val requiresProjectIdentity =
+                ready.session.logicalSourceIdentity is LogicalSourceIdentityResult.NeedsUserSelection
+            if (requiresProjectIdentity && ready.projectIdentity?.matches(PROJECT_IDENTITY) != true) {
+                _state.value = DesktopConversionState.Failed(
+                    DesktopFailureStage.APPROVAL,
+                    "project identity를 생성하거나 이전 변환 값을 입력하세요.",
+                    ready,
+                )
+                return
+            }
+            val projectIdentity = ready.projectIdentity.takeIf { requiresProjectIdentity }
             nextGeneration = generation.incrementAndGet()
             _state.value = DesktopConversionState.BuildingDraft(nextGeneration, ready)
             currentOperation = operation
@@ -206,7 +244,7 @@ class DesktopConversionController private constructor(
                             engine.buildDraft(
                                 ready.session,
                                 ready.selectedAdapters,
-                                ready.projectIdentity,
+                                projectIdentity,
                                 operation.control,
                             ).also(completedArtifact::set)
                         }
@@ -242,13 +280,18 @@ class DesktopConversionController private constructor(
             if (currentJob?.isActive == true) return
             draft = savedDraftForRetry(_state.value) ?: return
             nextGeneration = generation.incrementAndGet()
+            _state.value = draft.copy(isSaving = true, message = null)
             currentOperation = operation
             currentJob = scope.launch {
                 try {
                     runInterruptible(Dispatchers.IO) { saver.save(draft.artifact, destination) }
                     synchronized(lock) {
                         if (nextGeneration == generation.get() && !closed) {
-                            _state.value = draft.copy(savedPath = destination.toAbsolutePath().normalize())
+                            _state.value = draft.copy(
+                                savedPath = destination.toAbsolutePath().normalize(),
+                                isSaving = false,
+                                message = null,
+                            )
                         }
                     }
                 } catch (error: CancellationException) {
@@ -263,6 +306,37 @@ class DesktopConversionController private constructor(
                 }
             }
         }
+    }
+
+    fun revealSavedDraft() {
+        val draft: DesktopConversionState.DraftReady
+        val savedPath: Path
+        synchronized(lock) {
+            if (closed || currentJob?.isActive == true) return
+            draft = savedDraftForRetry(_state.value) ?: return
+            savedPath = draft.savedPath ?: return
+        }
+        when (val result = revealer.reveal(savedPath)) {
+            DesktopRevealResult.Opened -> Unit
+            is DesktopRevealResult.Failed -> synchronized(lock) {
+                val current = savedDraftForRetry(_state.value)
+                if (!closed && current?.artifact == draft.artifact && current.savedPath == savedPath) {
+                    _state.value = DesktopConversionState.Failed(
+                        DesktopFailureStage.REVEAL,
+                        result.message,
+                        draft.copy(isSaving = false),
+                    )
+                }
+            }
+        }
+    }
+
+    fun isBusy(): Boolean = synchronized(lock) {
+        !closed && (
+            currentOperation != null ||
+                _state.value is DesktopConversionState.Analyzing ||
+                _state.value is DesktopConversionState.BuildingDraft
+            )
     }
 
     fun cancel() = replaceWithInput(release = true)
@@ -334,7 +408,7 @@ class DesktopConversionController private constructor(
                 _state.value = DesktopConversionState.Failed(
                     DesktopFailureStage.SAVE,
                     failureMessage(error),
-                    previous,
+                    previous.copy(isSaving = false),
                 )
             }
         }
@@ -379,8 +453,9 @@ class DesktopConversionController private constructor(
 
     private fun failureMessage(error: Exception): String = when (error) {
         is IOException -> "파일 또는 네트워크 처리에 실패했습니다."
-        is IllegalArgumentException -> error.message ?: "입력값이 올바르지 않습니다."
-        is IllegalStateException -> error.message ?: "변환 상태가 올바르지 않습니다."
+        is IllegalArgumentException -> "입력값이 올바르지 않습니다."
+        is IllegalStateException -> "변환 상태 또는 저장 위치를 확인하세요."
+        is SecurityException -> "파일 접근 권한을 확인하세요."
         else -> "변환 중 예상하지 못한 오류가 발생했습니다."
     }
 
@@ -400,5 +475,9 @@ class DesktopConversionController private constructor(
         fun cancel() {
             cancelled.set(true)
         }
+    }
+
+    private companion object {
+        val PROJECT_IDENTITY = Regex("[0-9a-f]{32}")
     }
 }

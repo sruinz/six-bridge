@@ -33,6 +33,36 @@ import kotlinx.coroutines.withTimeout
 
 class DesktopProfileImportControllerTest {
     @Test
+    fun `profile import는 prepare 중에만 busy로 보고 invalidate 후 즉시 해제한다`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val controller = DesktopProfileImportController.testing(
+            scope = scope,
+            prepare = { _, _, _ ->
+                entered.countDown()
+                release.await()
+                DesktopPreparedProfileImport.WithoutPersistence(option("ok"))
+            },
+            commit = { prepared, _ -> prepared.option },
+            onOutcome = { _, _ -> },
+        )
+
+        try {
+            controller.start(ticket(1), Path.of("slow.json"))
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            assertTrue(controller.isBusy())
+
+            controller.invalidate()
+            assertFalse(controller.isBusy())
+        } finally {
+            release.countDown()
+            controller.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `raw InterruptedException 취소 뒤 UI dispatcher 다음 task는 interrupt되지 않는다`() {
         val dispatcher = NonClearingSingleThreadDispatcher()
         val scope = CoroutineScope(SupervisorJob() + dispatcher)

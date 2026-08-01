@@ -2,10 +2,14 @@ package dev.sixbridge.desktop.app
 
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
+import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.desktop.conversion.DesktopConversionEngine
 import dev.sixbridge.desktop.conversion.DesktopConversionEngineTestHooks
+import dev.sixbridge.desktop.conversion.DesktopDraftSaver
+import dev.sixbridge.desktop.conversion.DesktopDraftSaverTestHooks
 import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import dev.sixbridge.desktop.conversion.DesktopWorkspaceManager
 import dev.sixbridge.desktop.input.DesktopInputSealer
@@ -24,6 +28,54 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
+    @Test
+    fun `markerless input은 엄격한 project identity 선택 전에 draft를 생성하지 않는다`() {
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.markerlessArchive), profile)
+            val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            assertIs<LogicalSourceIdentityResult.NeedsUserSelection>(ready.session.logicalSourceIdentity)
+            controller.continueToApproval()
+
+            controller.selectProjectIdentity("A".repeat(32))
+            assertEquals(null, (controller.state.value as DesktopConversionState.AnalysisReady).projectIdentity)
+            controller.buildDraft()
+            assertEquals(
+                DesktopFailureStage.APPROVAL,
+                (awaitState(controller) { it is DesktopConversionState.Failed } as DesktopConversionState.Failed).stage,
+            )
+
+            controller.selectProjectIdentity("c".repeat(32))
+            assertEquals(
+                "c".repeat(32),
+                (controller.state.value as DesktopConversionState.AnalysisReady).projectIdentity,
+            )
+            controller.buildDraft()
+            assertIs<DesktopConversionState.DraftReady>(
+                awaitState(controller) { it is DesktopConversionState.DraftReady },
+            )
+            controller.close()
+        }
+    }
+
+    @Test
+    fun `stable identity input은 사용자 project identity로 덮어쓰지 않는다`() {
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            assertIs<LogicalSourceIdentityResult.Stable>(ready.session.logicalSourceIdentity)
+            controller.continueToApproval()
+
+            controller.selectProjectIdentity("d".repeat(32))
+
+            assertEquals(null, (controller.state.value as DesktopConversionState.AnalysisReady).projectIdentity)
+            controller.close()
+        }
+    }
+
     @Test
     fun `registered AnalysisReady와 DraftReady의 새 분석 취소 종료는 이전 lease를 정확히 한 번 해제한다`() {
         listOf("analysis", "draft").forEach { phase ->
@@ -218,9 +270,50 @@ class DesktopConversionControllerTest {
             assertEquals(draft.artifact, savedState.artifact)
             assertTrue(fixture.engine.isRegisteredForTesting(draft.artifact.token))
 
+            controller.saveDraft(saved)
+            val secondFailure = awaitState(controller) { it is DesktopConversionState.Failed }
+                as DesktopConversionState.Failed
+            val preserved = secondFailure.previous as DesktopConversionState.DraftReady
+            assertEquals(saved.toAbsolutePath().normalize(), preserved.savedPath)
+            assertTrue(fixture.engine.isRegisteredForTesting(draft.artifact.token))
+
             controller.reset()
             await { !fixture.engine.isRegisteredForTesting(draft.artifact.token) }
             assertIs<DesktopConversionState.Input>(controller.state.value)
+            controller.close()
+        }
+    }
+
+    @Test
+    fun `실제 저장 작업을 실행하는 동안 busy이고 취소하면 lease를 해제한다`() {
+        val entered = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        Fixture().use { fixture ->
+            val saver = DesktopDraftSaver(
+                DesktopDraftSaverTestHooks(
+                    beforeCopy = {
+                        entered.countDown()
+                        awaitIgnoringInterrupts(proceed)
+                    },
+                ),
+            )
+            val controller = DesktopConversionController(fixture.engine, saver)
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+            controller.continueToApproval()
+            controller.buildDraft()
+            val draft = awaitState(controller) { it is DesktopConversionState.DraftReady }
+                as DesktopConversionState.DraftReady
+            val saved = Files.createTempDirectory("controller-save-").resolve("saved.sixdraft")
+
+            controller.saveDraft(saved)
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            assertTrue(controller.isBusy())
+            controller.cancel()
+            proceed.countDown()
+
+            await { !fixture.engine.isRegisteredForTesting(draft.artifact.token) }
+            assertFalse(controller.isBusy())
             controller.close()
         }
     }
@@ -266,6 +359,9 @@ class DesktopConversionControllerTest {
         private val root = Files.createTempDirectory("desktop-controller-")
         val firstSource = source("first")
         val secondSource = source("second")
+        val markerlessArchive = root.resolve("markerless.zip").also {
+            Files.write(it, ExtensionZip.createBytes(firstSource, includeProjectMarker = false))
+        }
         val popupSource = Files.createDirectory(root.resolve("popup")).also {
             it.resolve("popup.html").writeText("<p>popup</p>")
             it.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
