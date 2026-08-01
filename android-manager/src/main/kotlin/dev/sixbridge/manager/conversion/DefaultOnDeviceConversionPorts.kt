@@ -132,6 +132,7 @@ internal class DefaultConversionRuntime(
                     inputKind = prepared.input.inputKind,
                     profileChanged = !sameProfile,
                     identityMode = InstallationIdentityMode.PREPARED,
+                    draftSignerFingerprint = prepared.signerFingerprint,
                 )
             }
             is ControlledSixDraft.Legacy -> {
@@ -151,12 +152,14 @@ internal class DefaultConversionRuntime(
                         replay.prepared.compatibilityBefore,
                         replay.prepared.logicalSourceIdentity.toManagerIdentity(),
                         payload.input.inputKind,
+                        draftSignerFingerprint = draft.signerFingerprint,
                     )
                     is DraftReplayResult.ProfileChanged -> snapshot(
                         replay.currentAnalysis,
                         logicalIdentity(payload.draft.sourceIdentity),
                         payload.input.inputKind,
                         profileChanged = true,
+                        draftSignerFingerprint = draft.signerFingerprint,
                     )
                 }
             }
@@ -414,6 +417,7 @@ internal class DefaultConversionRuntime(
         inputKind: ExtensionInputKind,
         profileChanged: Boolean = false,
         identityMode: InstallationIdentityMode? = null,
+        draftSignerFingerprint: String? = null,
     ) = ConversionAnalysisSnapshot(
         report = report,
         selectedAutomaticAdapters = report.adapterDecisions
@@ -426,6 +430,7 @@ internal class DefaultConversionRuntime(
         identityMode = identityMode
             ?: installationIdentityMode(inputKind, report.conversionState),
         profileChanged = profileChanged,
+        draftSignerFingerprint = draftSignerFingerprint,
     )
 
     private fun logicalIdentity(value: String?): LogicalSourceIdentity? =

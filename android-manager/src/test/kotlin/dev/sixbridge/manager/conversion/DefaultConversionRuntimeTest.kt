@@ -109,6 +109,23 @@ class DefaultConversionRuntimeTest {
         assertEquals(0, prepared.transformedSourceZip.size)
     }
 
+    @Test
+    fun `SixDraft 분석은 검증된 signer fingerprint를 UI snapshot까지 유지한다`() {
+        val input = preparedDraftFile()
+        val expected = SixDraft.read(input.toPath()).signerFingerprint
+        val runtime = DefaultConversionRuntime()
+        val control = AnalysisControl(AnalysisSafetyPolicy.mobile)
+
+        val analysis = runtime.analyze(
+            input,
+            OnDeviceInputKind.SIX_DRAFT,
+            profile(),
+            control,
+        )
+        assertEquals(expected, analysis.draftSignerFingerprint)
+        assertEquals(64, analysis.draftSignerFingerprint?.length)
+    }
+
     private fun crxFileWithScriptBytes(scriptBytes: Int): File {
         val zip = ByteArrayOutputStream().use { bytes ->
             ZipOutputStream(bytes).use { output ->

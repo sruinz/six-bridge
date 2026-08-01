@@ -140,6 +140,7 @@ class ManagerViewModel(
     private var documentLaunchSequence =
         savedStateHandle.get<Long>(DOCUMENT_LAUNCH_SEQUENCE_KEY) ?: 0L
     private var pendingSixPicker = restorePendingSixPicker()
+    private var pendingDraftPicker = restorePendingDraftPicker()
     private var pendingConversionPicker = restorePendingConversionPicker()
     private var pendingConversionSave = restorePendingConversionSave()
 
@@ -201,6 +202,7 @@ class ManagerViewModel(
             action !is ManagerAction.GeneratedShareLaunchSucceeded &&
             action !is ManagerAction.GeneratedShareLaunchFailed &&
             action !is ManagerAction.ImportSelected &&
+            action !is ManagerAction.DraftFileSelected &&
             action !is ManagerAction.ConversionFileSelected &&
             action !is ManagerAction.SaveGeneratedConversionTo &&
             action !is ManagerAction.SystemInstallApkCreated &&
@@ -218,6 +220,8 @@ class ManagerViewModel(
             ManagerAction.OpenSixFilePicker ->
                 requestSixFilePicker()
             is ManagerAction.ImportSelected -> acceptSixFileResult(action)
+            ManagerAction.OpenDraftFilePicker -> requestDraftFilePicker()
+            is ManagerAction.DraftFileSelected -> acceptDraftFileResult(action)
             ManagerAction.OpenConversionInput -> openConversionInput()
             is ManagerAction.ConversionUrlChanged -> updateConversionUrl(action.value)
             ManagerAction.OpenConversionFilePicker -> requestConversionFilePicker()
@@ -454,6 +458,18 @@ class ManagerViewModel(
         )
     }
 
+    private fun requestDraftFilePicker() {
+        val launch = newDocumentLaunch()
+        pendingDraftPicker = launch
+        savePendingDraftPicker(launch)
+        enqueueEffect(
+            ManagerEffect.PickDraftDocument(
+                ownerGeneration = launch.ownerGeneration,
+                launchId = launch.launchId,
+            ),
+        )
+    }
+
     private fun acceptSixFileResult(action: ManagerAction.ImportSelected) {
         pendingSixPicker
             ?.takeIf {
@@ -467,6 +483,18 @@ class ManagerViewModel(
         action.uri?.let { uri ->
             startImport { repository.import(uri) }
         }
+    }
+
+    private fun acceptDraftFileResult(action: ManagerAction.DraftFileSelected) {
+        pendingDraftPicker
+            ?.takeIf {
+                it.ownerGeneration == action.ownerGeneration &&
+                    it.launchId == action.launchId &&
+                    it.ownerGeneration == documentOwnerGeneration
+            }
+            ?: return
+        clearPendingDraftPicker()
+        action.uri?.let { beginConversion(OnDeviceInputRequest.Saf(it)) }
     }
 
     private fun acceptConversionFileResult(
@@ -2110,6 +2138,8 @@ class ManagerViewModel(
 
     private fun ManagerAction.mutatesGeneratedCleanupOwners(): Boolean = when (this) {
         is ManagerAction.ImportSelected,
+        ManagerAction.OpenDraftFilePicker,
+        is ManagerAction.DraftFileSelected,
         ManagerAction.OpenConversionInput,
         ManagerAction.FinishConversion,
         ManagerAction.CancelConversion,
@@ -2119,6 +2149,8 @@ class ManagerViewModel(
     }
 
     private fun ManagerAction.startsConversionWork(): Boolean = when (this) {
+        ManagerAction.OpenDraftFilePicker,
+        is ManagerAction.DraftFileSelected,
         ManagerAction.OpenConversionInput,
         ManagerAction.OpenConversionFilePicker,
         is ManagerAction.ConversionFileSelected,
@@ -2312,6 +2344,7 @@ class ManagerViewModel(
         documentOwnerGeneration += 1
         savedStateHandle[DOCUMENT_OWNER_GENERATION_KEY] = documentOwnerGeneration
         clearPendingSixPicker()
+        clearPendingDraftPicker()
         clearPendingConversionPicker()
         clearPendingConversionSave()
         clearPendingSystemInstallApkDocument()
@@ -2320,6 +2353,11 @@ class ManagerViewModel(
     private fun savePendingSixPicker(launch: PendingDocumentLaunch) {
         savedStateHandle[PENDING_SIX_PICKER_OWNER_GENERATION_KEY] = launch.ownerGeneration
         savedStateHandle[PENDING_SIX_PICKER_LAUNCH_ID_KEY] = launch.launchId
+    }
+
+    private fun savePendingDraftPicker(launch: PendingDocumentLaunch) {
+        savedStateHandle[PENDING_DRAFT_PICKER_OWNER_GENERATION_KEY] = launch.ownerGeneration
+        savedStateHandle[PENDING_DRAFT_PICKER_LAUNCH_ID_KEY] = launch.launchId
     }
 
     private fun savePendingConversionPicker(launch: PendingDocumentLaunch) {
@@ -2343,6 +2381,12 @@ class ManagerViewModel(
         pendingSixPicker = null
         savedStateHandle[PENDING_SIX_PICKER_OWNER_GENERATION_KEY] = null
         savedStateHandle[PENDING_SIX_PICKER_LAUNCH_ID_KEY] = null
+    }
+
+    private fun clearPendingDraftPicker() {
+        pendingDraftPicker = null
+        savedStateHandle[PENDING_DRAFT_PICKER_OWNER_GENERATION_KEY] = null
+        savedStateHandle[PENDING_DRAFT_PICKER_LAUNCH_ID_KEY] = null
     }
 
     private fun clearPendingConversionSave() {
@@ -2369,6 +2413,19 @@ class ManagerViewModel(
         val owner = savedStateHandle.get<Long>(PENDING_SIX_PICKER_OWNER_GENERATION_KEY)
             ?: return null
         val launchId = savedStateHandle.get<Long>(PENDING_SIX_PICKER_LAUNCH_ID_KEY)
+            ?: return null
+        if (owner != documentOwnerGeneration) return null
+        return PendingDocumentLaunch(
+            token = null,
+            ownerGeneration = owner,
+            launchId = launchId,
+        )
+    }
+
+    private fun restorePendingDraftPicker(): PendingDocumentLaunch? {
+        val owner = savedStateHandle.get<Long>(PENDING_DRAFT_PICKER_OWNER_GENERATION_KEY)
+            ?: return null
+        val launchId = savedStateHandle.get<Long>(PENDING_DRAFT_PICKER_LAUNCH_ID_KEY)
             ?: return null
         if (owner != documentOwnerGeneration) return null
         return PendingDocumentLaunch(
@@ -4361,6 +4418,13 @@ class ManagerViewModel(
                     pending.launchId == effect.launchId &&
                     pending.ownerGeneration == documentOwnerGeneration
             }
+            is ManagerEffect.PickDraftDocument -> {
+                val pending = pendingDraftPicker ?: return false
+                return mutableState.value.route == ManagerRoute.Home &&
+                    pending.ownerGeneration == effect.ownerGeneration &&
+                    pending.launchId == effect.launchId &&
+                    pending.ownerGeneration == documentOwnerGeneration
+            }
             is ManagerEffect.RequestInstallNotificationPermission -> {
                 return isInstallPermissionOwnerCurrent(
                     reviewToken = effect.reviewToken,
@@ -4480,6 +4544,9 @@ class ManagerViewModel(
         const val PENDING_SIX_PICKER_OWNER_GENERATION_KEY =
             "pending_six_picker_owner_generation"
         const val PENDING_SIX_PICKER_LAUNCH_ID_KEY = "pending_six_picker_launch_id"
+        const val PENDING_DRAFT_PICKER_OWNER_GENERATION_KEY =
+            "pending_draft_picker_owner_generation"
+        const val PENDING_DRAFT_PICKER_LAUNCH_ID_KEY = "pending_draft_picker_launch_id"
         const val PENDING_PICKER_OWNER_GENERATION_KEY = "pending_picker_owner_generation"
         const val PENDING_PICKER_LAUNCH_ID_KEY = "pending_picker_launch_id"
         const val PENDING_SAVE_TOKEN_KEY = "pending_save_token"
@@ -4678,6 +4745,7 @@ private fun ConversionBeginResult.AnalysisReady.toUiState() =
         requiredApprovals = requiredApprovals,
         identityRequirement = identityRequirement,
         profileChanged = profileChanged,
+        draftSignerFingerprint = draftSignerFingerprint,
     )
 
 internal fun conversionFailureMessage(code: ConversionFailureCode): UserMessage = when (code) {

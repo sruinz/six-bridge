@@ -58,6 +58,23 @@ class ActivityDocumentLaunchGateTest {
     }
 
     @Test
+    fun `draft launcher는 active와 하나의 latest queued launch만 유지한다`() {
+        val first = PendingActivityDocumentLaunch(null, 10, 20)
+        val replaced = PendingActivityDocumentLaunch(null, 11, 21)
+        val latest = PendingActivityDocumentLaunch(null, 12, 22)
+        val gate = ActivityDocumentLaunchGate()
+
+        assertEquals(first, gate.enqueue(first))
+        assertNull(gate.enqueue(replaced))
+        assertNull(gate.enqueue(latest))
+
+        assertEquals(
+            ActivityDocumentLaunchCompletion(first, latest),
+            gate.complete(),
+        )
+    }
+
+    @Test
     fun `APK export handoff recreation은 새 effect의 구조적 소유권을 보존한다`() {
         val effect = ManagerEffect.CreateInstallApkDocument(
             importToken = "11111111-1111-1111-1111-111111111111",

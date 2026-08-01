@@ -53,6 +53,7 @@ sealed interface ConversionBeginResult {
         val requiredApprovals: Set<String>,
         val identityRequirement: IdentityRequirement,
         val profileChanged: Boolean = false,
+        val draftSignerFingerprint: String? = null,
     ) : ConversionBeginResult
 
     data class Failure(
@@ -107,6 +108,7 @@ internal data class ConversionAnalysisSnapshot(
     val logicalSourceIdentity: LogicalSourceIdentity?,
     val identityMode: InstallationIdentityMode,
     val profileChanged: Boolean = false,
+    val draftSignerFingerprint: String? = null,
 )
 
 internal data class PreparedConversionSnapshot(

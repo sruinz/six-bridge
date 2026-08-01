@@ -44,6 +44,7 @@ import java.util.concurrent.CancellationException
 class MainActivity : ComponentActivity() {
     private lateinit var managerViewModel: ManagerViewModel
     private var sixPickerLaunchGate = ActivityDocumentLaunchGate()
+    private var draftPickerLaunchGate = ActivityDocumentLaunchGate()
     private var pendingConversionPicker: PendingActivityDocumentLaunch? = null
     private var pendingConversionSave: PendingActivityDocumentLaunch? = null
     private var installApkExportHandoff = InstallApkExportDocumentHandoff()
@@ -68,6 +69,18 @@ class MainActivity : ComponentActivity() {
         pendingConversionPicker = null
         pending?.let {
             managerViewModel.accept(it.conversionFileAction(uri))
+        }
+    }
+
+    private val openDraftDocument = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        val completion = draftPickerLaunchGate.complete()
+        completion?.completed?.let {
+            managerViewModel.accept(it.draftFileAction(uri))
+        }
+        completion?.launchNext?.let {
+            launchDraftDocumentPicker()
         }
     }
 
@@ -147,6 +160,18 @@ class MainActivity : ComponentActivity() {
                 launchKey = QUEUED_SIX_PICKER_LAUNCH_ID,
             ),
         )
+        draftPickerLaunchGate = ActivityDocumentLaunchGate(
+            active = savedInstanceState?.restorePendingDocumentLaunch(
+                tokenKey = null,
+                ownerKey = PENDING_DRAFT_PICKER_OWNER,
+                launchKey = PENDING_DRAFT_PICKER_LAUNCH_ID,
+            ),
+            queued = savedInstanceState?.restorePendingDocumentLaunch(
+                tokenKey = null,
+                ownerKey = QUEUED_DRAFT_PICKER_OWNER,
+                launchKey = QUEUED_DRAFT_PICKER_LAUNCH_ID,
+            ),
+        )
         pendingConversionPicker = savedInstanceState?.restorePendingDocumentLaunch(
             tokenKey = null,
             ownerKey = PENDING_CONVERSION_PICKER_OWNER,
@@ -202,6 +227,16 @@ class MainActivity : ComponentActivity() {
                             )
                             if (sixPickerLaunchGate.enqueue(launch) != null) {
                                 launchSixDocumentPicker()
+                            }
+                        }
+                        is ManagerEffect.PickDraftDocument -> {
+                            val launch = PendingActivityDocumentLaunch(
+                                token = null,
+                                ownerGeneration = effect.ownerGeneration,
+                                launchId = effect.launchId,
+                            )
+                            if (draftPickerLaunchGate.enqueue(launch) != null) {
+                                launchDraftDocumentPicker()
                             }
                         }
                         is ManagerEffect.RequestInstallNotificationPermission -> Unit
@@ -277,6 +312,18 @@ class MainActivity : ComponentActivity() {
             ownerKey = QUEUED_SIX_PICKER_OWNER,
             launchKey = QUEUED_SIX_PICKER_LAUNCH_ID,
         )
+        draftPickerLaunchGate.active?.save(
+            outState = outState,
+            tokenKey = null,
+            ownerKey = PENDING_DRAFT_PICKER_OWNER,
+            launchKey = PENDING_DRAFT_PICKER_LAUNCH_ID,
+        )
+        draftPickerLaunchGate.queued?.save(
+            outState = outState,
+            tokenKey = null,
+            ownerKey = QUEUED_DRAFT_PICKER_OWNER,
+            launchKey = QUEUED_DRAFT_PICKER_LAUNCH_ID,
+        )
         pendingConversionPicker?.save(
             outState = outState,
             tokenKey = null,
@@ -301,6 +348,10 @@ class MainActivity : ComponentActivity() {
         openDocument.launch(SIX_MIME_TYPES)
     }
 
+    private fun launchDraftDocumentPicker() {
+        openDraftDocument.launch(DRAFT_MIME_TYPES)
+    }
+
     override fun onStop() {
         ManagerAppVisibility.onActivityStopped()
         super.onStop()
@@ -311,6 +362,10 @@ class MainActivity : ComponentActivity() {
         const val PENDING_SIX_PICKER_LAUNCH_ID = "pending_six_picker_launch_id"
         const val QUEUED_SIX_PICKER_OWNER = "queued_six_picker_owner"
         const val QUEUED_SIX_PICKER_LAUNCH_ID = "queued_six_picker_launch_id"
+        const val PENDING_DRAFT_PICKER_OWNER = "pending_draft_picker_owner"
+        const val PENDING_DRAFT_PICKER_LAUNCH_ID = "pending_draft_picker_launch_id"
+        const val QUEUED_DRAFT_PICKER_OWNER = "queued_draft_picker_owner"
+        const val QUEUED_DRAFT_PICKER_LAUNCH_ID = "queued_draft_picker_launch_id"
         const val PENDING_CONVERSION_SAVE_TOKEN = "pending_conversion_save_token"
         const val PENDING_CONVERSION_SAVE_OWNER = "pending_conversion_save_owner"
         const val PENDING_CONVERSION_SAVE_LAUNCH_ID = "pending_conversion_save_launch_id"
@@ -324,7 +379,10 @@ class MainActivity : ComponentActivity() {
         val CONVERSION_MIME_TYPES = arrayOf(
             "application/zip",
             "application/octet-stream",
+        )
+        val DRAFT_MIME_TYPES = arrayOf(
             "application/vnd.sixbridge.draft",
+            "application/octet-stream",
         )
     }
 }
@@ -504,6 +562,14 @@ internal class ActivityDocumentLaunchGate(
 internal fun PendingActivityDocumentLaunch.conversionFileAction(
     uri: Uri?,
 ): ManagerAction.ConversionFileSelected = ManagerAction.ConversionFileSelected(
+    uri = uri,
+    ownerGeneration = ownerGeneration,
+    launchId = launchId,
+)
+
+internal fun PendingActivityDocumentLaunch.draftFileAction(
+    uri: Uri?,
+): ManagerAction.DraftFileSelected = ManagerAction.DraftFileSelected(
     uri = uri,
     ownerGeneration = ownerGeneration,
     launchId = launchId,

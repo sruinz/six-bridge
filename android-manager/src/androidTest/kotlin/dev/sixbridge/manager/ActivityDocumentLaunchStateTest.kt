@@ -37,6 +37,30 @@ class ActivityDocumentLaunchStateTest {
     }
 
     @Test
+    fun draft_picker_rotation_keeps_identity_and_returns_the_real_uri_without_saving_it() {
+        val pending = PendingActivityDocumentLaunch(
+            token = null,
+            ownerGeneration = 23,
+            launchId = 29,
+        )
+        val bundle = Bundle()
+        pending.save(bundle, tokenKey = null, ownerKey = "draft-owner", launchKey = "draft-launch")
+
+        val restored = bundle.restorePendingDocumentLaunch(
+            tokenKey = null,
+            ownerKey = "draft-owner",
+            launchKey = "draft-launch",
+        )
+        val uri = Uri.parse("content://provider/desktop.sixdraft")
+        val action = requireNotNull(restored).draftFileAction(uri)
+
+        assertEquals(23, action.ownerGeneration)
+        assertEquals(29, action.launchId)
+        assertSame(uri, action.uri)
+        assertEquals(setOf("draft-owner", "draft-launch"), bundle.keySet())
+    }
+
+    @Test
     fun save_rotation_keeps_token_identity_but_cancel_returns_no_destination() {
         val pending = PendingActivityDocumentLaunch(
             token = "conversion-token",

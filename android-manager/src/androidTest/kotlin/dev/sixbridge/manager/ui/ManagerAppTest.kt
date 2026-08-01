@@ -31,6 +31,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -132,6 +133,7 @@ class ManagerAppTest {
 
         listOf(
             "home:convert-on-device",
+            "home:import-draft",
             "home:open-addons",
             "extension:$PACKAGE:report",
             "extension:$PACKAGE:remove",
@@ -145,6 +147,7 @@ class ManagerAppTest {
         assertEquals(
             listOf(
                 ManagerAction.OpenConversionInput,
+                ManagerAction.OpenDraftFilePicker,
                 ManagerAction.OpenSamsungAddOns,
                 ManagerAction.OpenReport(PACKAGE),
                 ManagerAction.Remove(PACKAGE),
@@ -175,6 +178,7 @@ class ManagerAppTest {
             composeRule.runOnIdle { startupState = expectedState }
             listOf(
                 "home:convert-on-device",
+                "home:import-draft",
                 "home:add-six",
                 "home:open-addons",
                 "extension:$PACKAGE:remove",
@@ -184,6 +188,27 @@ class ManagerAppTest {
             }
             composeRule.onNodeWithTag("extension:$PACKAGE:report").assertIsEnabled()
         }
+    }
+
+    @Test
+    fun home_exposes_desktop_draft_import_with_exact_copy() {
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    startupRecoveryState = StartupRecoveryUiState.READY,
+                ),
+                onAction = actions::add,
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("home:import-draft")
+            .assertTextContains("데스크탑 변환 파일 가져오기")
+            .assertIsEnabled()
+            .performClick()
+
+        assertEquals(listOf(ManagerAction.OpenDraftFilePicker), actions)
     }
 
     @Test
@@ -243,6 +268,34 @@ class ManagerAppTest {
         composeRule.onNodeWithTag("conversion:adapter:action-popup-entry").performClick()
         composeRule.onNodeWithTag("conversion:confirm-partial").performClick()
         composeRule.onNodeWithTag("conversion:build").assertIsEnabled()
+    }
+
+    @Test
+    fun draft_analysis_exposes_verified_signer_and_unpaired_notice() {
+        val fingerprint = "a".repeat(64)
+        val initial = conversionAnalysisState()
+        val ready = initial.conversionState as ConversionUiState.AnalysisReady
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = initial.copy(
+                    conversionState = ready.copy(
+                        draftSignerFingerprint = fingerprint,
+                    ),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("데스크탑 변환 파일 서명자")
+            .assertIsDisplayed()
+        composeRule.onNodeWithTag("conversion:draft-signer")
+            .assertTextContains(fingerprint)
+        composeRule.onNodeWithText(
+            "사용자가 직접 선택한 데스크탑 변환 파일입니다. " +
+                "서명은 파일이 생성된 뒤 변경되지 않았음을 확인하지만, " +
+                "아직 신뢰된 기기와의 페어링을 뜻하지는 않습니다.",
+        ).assertIsDisplayed()
     }
 
     @Test

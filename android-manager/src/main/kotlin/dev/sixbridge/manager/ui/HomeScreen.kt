@@ -62,6 +62,13 @@ fun HomeScreen(
             Text(text = stringResource(R.string.home_convert_on_device))
         }
         Button(
+            onClick = { onAction(ManagerAction.OpenDraftFilePicker) },
+            enabled = newConversionEnabled,
+            modifier = Modifier.fillMaxWidth().testTag("home:import-draft"),
+        ) {
+            Text(text = stringResource(R.string.home_import_draft))
+        }
+        Button(
             onClick = onAddSix,
             enabled = mutationsEnabled && state.importState != ImportUiState.Importing,
             modifier = Modifier.fillMaxWidth().testTag("home:add-six"),

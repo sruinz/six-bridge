@@ -77,6 +77,7 @@ sealed interface ConversionUiState {
         val identitySelection: InstallationIdentitySelection? = null,
         val existingIdentityConfirmed: Boolean = false,
         val profileChanged: Boolean = false,
+        val draftSignerFingerprint: String? = null,
     ) : ConversionUiState {
         val canBuild: Boolean
             get() = report.status in setOf(
@@ -214,6 +215,12 @@ sealed interface ManagerAction {
         val ownerGeneration: Long,
         val launchId: Long,
     ) : ManagerAction
+    data object OpenDraftFilePicker : ManagerAction
+    data class DraftFileSelected(
+        val uri: Uri?,
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerAction
     data object OpenConversionInput : ManagerAction
     data class ConversionUrlChanged(val value: String) : ManagerAction
     data object OpenConversionFilePicker : ManagerAction
@@ -292,6 +299,10 @@ enum class LaunchDestination {
 
 sealed interface ManagerEffect {
     data class PickSixDocument(
+        val ownerGeneration: Long,
+        val launchId: Long,
+    ) : ManagerEffect
+    data class PickDraftDocument(
         val ownerGeneration: Long,
         val launchId: Long,
     ) : ManagerEffect

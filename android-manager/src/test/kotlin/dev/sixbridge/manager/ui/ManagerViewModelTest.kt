@@ -640,6 +640,151 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `홈의 데스크탑 변환 파일 버튼은 draft 전용 picker를 요청한다`() =
+        runTest(dispatcher.scheduler) {
+            val viewModel = ManagerViewModel(FakeManagerRepository(), SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+
+            val picker = assertIs<ManagerEffect.PickDraftDocument>(
+                viewModel.effects.first(),
+            )
+            assertTrue(picker.ownerGeneration > 0)
+            assertTrue(picker.launchId > 0)
+        }
+
+    @Test
+    fun `draft picker 취소 뒤 홈에서 새 picker를 다시 열 수 있다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository()
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+            val cancelled = assertIs<ManagerEffect.PickDraftDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.DraftFileSelected(
+                    uri = null,
+                    ownerGeneration = cancelled.ownerGeneration,
+                    launchId = cancelled.launchId,
+                ),
+            )
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+            val reopened = assertIs<ManagerEffect.PickDraftDocument>(
+                viewModel.effects.first(),
+            )
+
+            assertTrue(cancelled.ownerGeneration != reopened.ownerGeneration)
+            assertTrue(cancelled.launchId != reopened.launchId)
+            assertTrue(repository.conversionRequests.isEmpty())
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `draft 선택은 SAF 분석 route와 검증된 signer를 UI까지 유지한다`() =
+        runTest(dispatcher.scheduler) {
+            val fingerprint = "a".repeat(64)
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis().copy(
+                    draftSignerFingerprint = fingerprint,
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+            val effect = assertIs<ManagerEffect.PickDraftDocument>(
+                viewModel.effects.first(),
+            )
+            val uri = unitTestUri()
+
+            viewModel.accept(
+                ManagerAction.DraftFileSelected(
+                    uri = uri,
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertTrue(
+                uri === assertIs<OnDeviceInputRequest.Saf>(
+                    repository.conversionRequests.single(),
+                ).uri,
+            )
+            assertEquals(ManagerRoute.ConversionAnalysis(TOKEN), viewModel.state.value.route)
+            assertEquals(
+                fingerprint,
+                assertIs<ConversionUiState.AnalysisReady>(
+                    viewModel.state.value.conversionState,
+                ).draftSignerFingerprint,
+            )
+        }
+
+    @Test
+    fun `새 draft picker B 뒤 늦은 A result는 분석을 시작하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+            val first = assertIs<ManagerEffect.PickDraftDocument>(viewModel.effects.first())
+            viewModel.accept(ManagerAction.OpenDraftFilePicker)
+            val second = assertIs<ManagerEffect.PickDraftDocument>(viewModel.effects.first())
+
+            viewModel.accept(
+                ManagerAction.DraftFileSelected(
+                    unitTestUri(),
+                    first.ownerGeneration,
+                    first.launchId,
+                ),
+            )
+            dispatcher.scheduler.runCurrent()
+            assertTrue(repository.conversionRequests.isEmpty())
+
+            viewModel.accept(
+                ManagerAction.DraftFileSelected(
+                    unitTestUri(),
+                    second.ownerGeneration,
+                    second.launchId,
+                ),
+            )
+            advanceUntilIdle()
+            assertEquals(1, repository.conversionRequests.size)
+        }
+
+    @Test
+    fun `pending draft picker ownership은 ViewModel 재생성 뒤 exact callback을 한 번 소비한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val savedState = SavedStateHandle()
+            val first = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            first.accept(ManagerAction.OpenDraftFilePicker)
+            val effect = assertIs<ManagerEffect.PickDraftDocument>(first.effects.first())
+
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            val callback = ManagerAction.DraftFileSelected(
+                unitTestUri(),
+                effect.ownerGeneration,
+                effect.launchId,
+            )
+            recreated.accept(callback)
+            advanceUntilIdle()
+            recreated.accept(callback)
+            advanceUntilIdle()
+
+            assertEquals(1, repository.conversionRequests.size)
+        }
+
+    @Test
     fun `Six OpenDocument callback은 exact launch identity만 한 번 import한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {

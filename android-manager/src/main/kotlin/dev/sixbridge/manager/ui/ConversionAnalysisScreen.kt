@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -100,6 +101,17 @@ private fun AnalysisReadyContent(
         ready.report.usedApis.ifEmpty { setOf(stringResource(R.string.review_none)) }
             .forEach { Text(it) }
         ready.report.unsupportedApis.forEach { Text("지원되지 않음: $it") }
+    }
+    ready.draftSignerFingerprint?.let { fingerprint ->
+        SectionCard(stringResource(R.string.conversion_draft_signer_title)) {
+            Text(stringResource(R.string.conversion_draft_signer_notice))
+            SelectionContainer {
+                Text(
+                    text = fingerprint,
+                    modifier = Modifier.testTag("conversion:draft-signer"),
+                )
+            }
+        }
     }
     if (ready.report.adapterDecisions.isNotEmpty()) {
         SectionCard(stringResource(R.string.review_adapters)) {

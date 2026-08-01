@@ -537,6 +537,7 @@ internal class OnDeviceConversionCoordinator(
             requiredApprovals = analysis.requiredApprovals,
             identityRequirement = identityRequirement,
             profileChanged = analysis.profileChanged,
+            draftSignerFingerprint = analysis.draftSignerFingerprint,
         )
     }
 

@@ -65,6 +65,17 @@ class ConversionScreenTest {
     }
 
     @Test
+    fun `draft signer는 원문을 보존하고 일반 입력은 signer가 없다`() {
+        val fingerprint = "a".repeat(64)
+
+        assertEquals(null, analysis().draftSignerFingerprint)
+        assertEquals(
+            fingerprint,
+            analysis().copy(draftSignerFingerprint = fingerprint).draftSignerFingerprint,
+        )
+    }
+
+    @Test
     fun `변환 실패 코드는 서로 다른 한글 원인과 복구 행동으로 표시한다`() {
         val messages = ConversionFailureCode.entries.map(::conversionFailureMessage)
 
