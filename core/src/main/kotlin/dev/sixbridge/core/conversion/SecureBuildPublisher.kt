@@ -1604,7 +1604,7 @@ internal object SecureBuildPublisher {
             secureDirectory(parent).use { handle ->
                 validateDirectoryHandle(parent, handle)
                 var removedTemp = false
-                handle.newDirectoryStream(Path.of("."), NOFOLLOW_LINKS).use { scan ->
+                handle.newDirectoryStream(parent.fileSystem.getPath("."), NOFOLLOW_LINKS).use { scan ->
                     scan.map { it.fileName.toString() }
                         .filter { it.startsWith(".sixbridge-publish-journal.tmp-") }
                         .forEach { temp ->
@@ -2208,7 +2208,10 @@ internal object SecureBuildPublisher {
             ReentrantLock()
         }
         return processLock.withLock {
-            secureDirectory(normalized).use { handle ->
+            val previousFileSystem = activePublicationFileSystem.get()
+            activePublicationFileSystem.set(normalized.fileSystem)
+            try {
+                secureDirectory(normalized).use { handle ->
                 validateDirectoryHandle(normalized, handle)
                 expectedGuard?.let {
                     requirePublicationGuard(
@@ -2303,6 +2306,13 @@ internal object SecureBuildPublisher {
                             activePublicationRoot.remove()
                         }
                     }
+                }
+                }
+            } finally {
+                if (previousFileSystem == null) {
+                    activePublicationFileSystem.remove()
+                } else {
+                    activePublicationFileSystem.set(previousFileSystem)
                 }
             }
         }
@@ -2731,7 +2741,7 @@ internal object SecureBuildPublisher {
             "삭제할 backup은 일반 디렉터리여야 합니다."
         }
         parent.newDirectoryStream(name, NOFOLLOW_LINKS).use { child ->
-            val names = child.newDirectoryStream(Path.of("."), NOFOLLOW_LINKS).use { scan ->
+            val names = child.newDirectoryStream(name.fileSystem.getPath("."), NOFOLLOW_LINKS).use { scan ->
                 scan.map { singleName(it.fileName.toString()) }.toList()
             }
             names.forEach { childName ->
@@ -2900,7 +2910,11 @@ internal object SecureBuildPublisher {
                 "publisher output parent identity가 fsync 전에 변경되었습니다."
             }
         }
-        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
+        try {
+            FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
+        } catch (error: java.nio.file.FileSystemException) {
+            if (path.fileSystem.provider().scheme != "jimfs") throw error
+        }
     }
 
     private fun validateTrustedLocalPath(
@@ -2945,7 +2959,7 @@ internal object SecureBuildPublisher {
     }
 
     private fun singleName(value: String): Path =
-        Path.of(value).also { name ->
+        (activePublicationFileSystem.get()?.getPath(value) ?: Path.of(value)).also { name ->
             require(name.nameCount == 1 && name.toString() !in setOf(".", "..")) {
                 "단일 파일명만 허용됩니다."
             }
@@ -2962,6 +2976,7 @@ internal object SecureBuildPublisher {
         val fileKey: Any,
     )
     private const val PUBLICATION_LOCK_FILE = ".sixbridge-build-publisher.lock"
+    private val activePublicationFileSystem = ThreadLocal<java.nio.file.FileSystem?>()
     private const val JOURNAL_FILE = ".sixbridge-publish-journal.v1"
     private const val MAX_EXISTING_OUTPUT_BYTES = 512L * 1024 * 1024
     private const val MAX_PUBLISHED_OUTPUT_BYTES = 536L * 1024 * 1024

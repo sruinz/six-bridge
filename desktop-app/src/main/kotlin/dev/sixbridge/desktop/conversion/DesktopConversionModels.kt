@@ -1,6 +1,9 @@
 package dev.sixbridge.desktop.conversion
 
+import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.SecureConversionRoot
+import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
@@ -11,6 +14,27 @@ sealed interface DesktopExtensionInput {
 
     data class Local(val path: Path) : DesktopExtensionInput
 }
+
+data class DesktopAnalysisSession(
+    val token: String,
+    val input: DesktopExtensionInput,
+    val profile: BrowserProfile,
+    val report: CompatibilityReport,
+    val logicalSourceIdentity: LogicalSourceIdentityResult,
+    val selectedAutomaticAdapters: Set<String>,
+    val requiredApprovals: Set<String>,
+)
+
+data class DesktopDraftArtifact(
+    val token: String,
+    val privateFile: Path,
+    val suggestedFileName: String,
+    val sha256: String,
+    val signerFingerprint: String,
+)
+
+class DesktopConversionException(message: String, cause: Throwable? = null) :
+    IllegalStateException(message, cause)
 
 data class DesktopWorkspace(
     val token: String,

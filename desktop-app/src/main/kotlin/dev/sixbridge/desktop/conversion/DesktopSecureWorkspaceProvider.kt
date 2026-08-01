@@ -9,7 +9,11 @@ import java.util.UUID
 
 class DesktopSecureWorkspaceProvider {
     fun create(): DesktopWorkspaceLease {
-        val fileSystem = Jimfs.newFileSystem(Configuration.unix())
+        val fileSystem = Jimfs.newFileSystem(
+            Configuration.unix().toBuilder()
+                .setAttributeViews("basic", "owner", "posix", "unix")
+                .build(),
+        )
         try {
             val token = UUID.randomUUID().toString()
             val root = fileSystem.getPath("/sixbridge").resolve(token)
