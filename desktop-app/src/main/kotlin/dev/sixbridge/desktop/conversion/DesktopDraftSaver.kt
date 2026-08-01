@@ -19,6 +19,8 @@ class DesktopDraftSaveException(message: String, cause: Throwable? = null) :
 internal data class DesktopDraftSaverTestHooks(
     val createLink: ((Path, Path) -> Path)? = null,
     val beforeCopy: (() -> Unit)? = null,
+    val afterCopyChunk: ((Int) -> Unit)? = null,
+    val beforeLink: (() -> Unit)? = null,
     val deletePublishedTemporary: ((Path) -> Unit)? = null,
 )
 
@@ -30,7 +32,7 @@ class DesktopDraftSaver private constructor(
 
     internal constructor(hooks: DesktopDraftSaverTestHooks) : this(hooks, Unit)
 
-    private val pendingTemporaryCleanup = ConcurrentHashMap.newKeySet<Path>()
+    private val pendingTemporaryCleanup = ConcurrentHashMap.newKeySet<PublishedTempCleanup>()
 
     fun save(artifact: DesktopDraftArtifact, destination: Path) {
         retryPendingTemporaryCleanup()
@@ -58,11 +60,12 @@ class DesktopDraftSaver private constructor(
 
             // ATOMIC_MOVE는 기존 목적지를 덮어쓸 수 있다. 같은 directory의 hard link는
             // 검증·fsync가 끝난 inode를 no-replace로 원자 공개한다.
+            hooks?.beforeLink?.invoke()
             createLink(target, temporary)
             verifyParent(parent)
             check(Files.isSameFile(target, temporary)) { "초안 공개 inode 검증에 실패했습니다." }
             published = true
-            deletePublishedTemporary(temporary)
+            deletePublishedTemporary(temporary, parent)
             temporaryCreated = false
         } finally {
             if (temporaryCreated && !published) deleteOwnedTemporary(temporary)
@@ -151,6 +154,7 @@ class DesktopDraftSaver private constructor(
                         buffer.flip()
                         digest.update(buffer.asReadOnlyBuffer())
                         while (buffer.hasRemaining()) output.write(buffer)
+                        hooks?.afterCopyChunk?.invoke(read)
                     }
                     output.force(true)
                 }
@@ -193,28 +197,42 @@ class DesktopDraftSaver private constructor(
     private fun createLink(link: Path, existing: Path): Path =
         hooks?.createLink?.invoke(link, existing) ?: Files.createLink(link, existing)
 
-    private fun deletePublishedTemporary(temporary: Path) {
+    private fun deletePublishedTemporary(temporary: Path, parent: ParentIdentity) {
+        val cleanup = PublishedTempCleanup(parent, fileIdentity(temporary, "공개된 임시 초안 파일"))
         try {
             hooks?.deletePublishedTemporary?.invoke(temporary) ?: Files.delete(temporary)
         } catch (_: Exception) {
-            pendingTemporaryCleanup.add(temporary)
-            try {
-                Files.deleteIfExists(temporary)
-                pendingTemporaryCleanup.remove(temporary)
-            } catch (_: Exception) {
-                // 공개는 이미 완료됐다. 다음 save에서 재시도하며 결과 파일은 성공으로 유지한다.
-            }
+            pendingTemporaryCleanup.add(cleanup)
+            cleanupPublishedTemporary(cleanup)
         }
     }
 
     private fun retryPendingTemporaryCleanup() {
-        pendingTemporaryCleanup.toList().forEach { temporary ->
-            try {
-                Files.deleteIfExists(temporary)
-                pendingTemporaryCleanup.remove(temporary)
-            } catch (_: Exception) {
-                // 완성된 destination은 유효하므로 다음 저장 전 다시 시도한다.
+        pendingTemporaryCleanup.toList().forEach(::cleanupPublishedTemporary)
+    }
+
+    private fun cleanupPublishedTemporary(cleanup: PublishedTempCleanup) {
+        val temporary = cleanup.file.path
+        val owned = try {
+            verifyParent(cleanup.parent)
+            val actual = fileIdentity(temporary, "공개된 임시 초안 파일")
+            actual.fileKey == cleanup.file.fileKey &&
+                actual.size == cleanup.file.size &&
+                actual.modifiedMillis == cleanup.file.modifiedMillis
+        } catch (_: Exception) {
+            if (Files.notExists(temporary, NOFOLLOW_LINKS)) {
+                pendingTemporaryCleanup.remove(cleanup)
+            } else {
+                pendingTemporaryCleanup.remove(cleanup)
             }
+            false
+        }
+        if (!owned) return
+        try {
+            hooks?.deletePublishedTemporary?.invoke(temporary) ?: Files.delete(temporary)
+            pendingTemporaryCleanup.remove(cleanup)
+        } catch (_: Exception) {
+            // 완성된 destination은 유효하므로 다음 save 전 같은 소유 identity만 다시 시도한다.
         }
     }
 
@@ -228,6 +246,7 @@ class DesktopDraftSaver private constructor(
 
     private data class ParentIdentity(val path: Path, val fileKey: Any)
     private data class FileIdentity(val path: Path, val fileKey: Any, val size: Long, val modifiedMillis: Long)
+    private data class PublishedTempCleanup(val parent: ParentIdentity, val file: FileIdentity)
 
     private companion object {
         const val BUFFER_SIZE = 64 * 1024

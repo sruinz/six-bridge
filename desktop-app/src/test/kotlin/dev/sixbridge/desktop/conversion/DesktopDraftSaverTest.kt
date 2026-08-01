@@ -5,6 +5,7 @@ import com.google.common.jimfs.Jimfs
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -108,15 +109,93 @@ class DesktopDraftSaverTest {
     fun `취소된 복사는 임시 파일을 남기지 않는다`() {
         Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
             val source = source(fileSystem)
-            Files.writeString(source, "signed-draft")
+            val contents = "a".repeat(128 * 1024)
+            Files.writeString(source, contents)
             val destination = Files.createTempDirectory("sixbridge-saver-").resolve("draft")
 
             assertFailsWith<CancellationException> {
-                DesktopDraftSaver(DesktopDraftSaverTestHooks(beforeCopy = {
+                DesktopDraftSaver(DesktopDraftSaverTestHooks(afterCopyChunk = {
                     throw CancellationException("cancel")
-                })).save(artifact(source, "signed-draft"), destination)
+                })).save(artifact(source, contents), destination)
             }
             assertTrue(Files.list(destination.parent).use { it.noneMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+        }
+    }
+
+    @Test
+    fun `공개 뒤 temp 삭제가 두 번 실패해도 저장은 성공하고 다음 저장에서 재시도한다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val directory = Files.createTempDirectory("sixbridge-saver-")
+            val attempts = AtomicInteger()
+            val saver = DesktopDraftSaver(DesktopDraftSaverTestHooks(deletePublishedTemporary = { temporary ->
+                if (attempts.incrementAndGet() <= 2) throw java.io.IOException("locked")
+                Files.delete(temporary)
+            }))
+
+            saver.save(artifact(source, "signed-draft"), directory.resolve("first"))
+            assertEquals("signed-draft", Files.readString(directory.resolve("first")))
+            assertTrue(Files.list(directory).use { it.anyMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+
+            saver.save(artifact(source, "signed-draft"), directory.resolve("second"))
+            assertEquals("signed-draft", Files.readString(directory.resolve("second")))
+            assertTrue(Files.list(directory).use { it.noneMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+        }
+    }
+
+    @Test
+    fun `pending temp가 교체되면 다음 cleanup은 공격자 파일을 보존한다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val directory = Files.createTempDirectory("sixbridge-saver-")
+            val attempts = AtomicInteger()
+            val saver = DesktopDraftSaver(DesktopDraftSaverTestHooks(deletePublishedTemporary = {
+                if (attempts.incrementAndGet() <= 2) throw java.io.IOException("locked")
+                Files.delete(it)
+            }))
+            saver.save(artifact(source, "signed-draft"), directory.resolve("first"))
+            val pending = Files.list(directory).use { paths -> paths.filter { it.fileName.toString().startsWith(".sixbridge-save-") }.findFirst().orElseThrow() }
+            Files.delete(pending)
+            Files.writeString(pending, "attacker-data")
+
+            saver.save(artifact(source, "signed-draft"), directory.resolve("second"))
+
+            assertEquals("attacker-data", Files.readString(pending))
+        }
+    }
+
+    @Test
+    fun `link 직전 destination 생성 경쟁은 기존 파일을 보존한다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val destination = Files.createTempDirectory("sixbridge-saver-").resolve("draft")
+            val saver = DesktopDraftSaver(DesktopDraftSaverTestHooks(beforeLink = {
+                Files.writeString(destination, "racing-user-data")
+            }))
+
+            assertFailsWith<Exception> { saver.save(artifact(source, "signed-draft"), destination) }
+
+            assertEquals("racing-user-data", Files.readString(destination))
+            assertTrue(Files.list(destination.parent).use { it.noneMatch { path -> path.fileName.toString().startsWith(".sixbridge-save-") } })
+        }
+    }
+
+    @Test
+    fun `심볼릭 링크 destination parent는 거부한다`() {
+        Jimfs.newFileSystem(Configuration.unix()).use { fileSystem ->
+            val source = source(fileSystem)
+            Files.writeString(source, "signed-draft")
+            val root = Files.createTempDirectory("sixbridge-saver-")
+            val actual = Files.createDirectory(root.resolve("actual"))
+            val link = root.resolve("link")
+            Files.createSymbolicLink(link, actual)
+
+            assertFailsWith<DesktopDraftSaveException> {
+                DesktopDraftSaver().save(artifact(source, "signed-draft"), link.resolve("draft"))
+            }
         }
     }
 
