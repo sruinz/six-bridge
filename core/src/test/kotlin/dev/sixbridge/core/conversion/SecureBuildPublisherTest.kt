@@ -346,6 +346,19 @@ class SecureBuildPublisherTest {
     }
 
     @Test
+    fun `production directory fsync operation의 임의 FileSystemException은 재전파한다`() {
+        val directory = Files.createTempDirectory("six-publish-fsync-production-operation")
+
+        val failure = assertFailsWith<FileSystemException> {
+            SecureBuildPublisher.forceDirectoryForTesting(directory) { path ->
+                throw FileSystemException(path.toString(), null, "injected production operation failure")
+            }
+        }
+
+        assertEquals("injected production operation failure", failure.reason)
+    }
+
+    @Test
     fun `recovery removes an owner-only orphan journal temp without a journal`() {
         val outputParent = Files.createTempDirectory("six-publish-journal-orphan")
         val orphan = outputParent.resolve(

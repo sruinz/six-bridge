@@ -2901,7 +2901,18 @@ internal object SecureBuildPublisher {
         return FileProof(digest, state.identity.encode())
     }
 
-    private fun forceDirectory(path: Path) {
+    @JvmSynthetic
+    internal fun forceDirectoryForTesting(
+        path: Path,
+        operation: (Path) -> Unit,
+    ) {
+        forceDirectory(path, operation)
+    }
+
+    private fun forceDirectory(
+        path: Path,
+        operation: (Path) -> Unit = ::forceDirectoryChannel,
+    ) {
         BuildPublicationFaultInjection.beforeDirectoryFsync(path)
         activePublicationRoot.get()?.takeIf {
             path.toAbsolutePath().normalize() == it.path
@@ -2916,18 +2927,11 @@ internal object SecureBuildPublisher {
             }
         }
         val result = BuildPublicationFaultInjection.directoryFsync(path) {
-            try {
-                FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
+            if (isJimfsDirectoryFsyncUnsupported(path)) {
+                DirectoryFsyncResult.UNSUPPORTED
+            } else {
+                operation(path)
                 DirectoryFsyncResult.FORCED
-            } catch (error: java.nio.file.FileSystemException) {
-                if (
-                    path.fileSystem.provider().scheme == "jimfs" &&
-                    Files.isDirectory(path, NOFOLLOW_LINKS)
-                ) {
-                    DirectoryFsyncResult.UNSUPPORTED
-                } else {
-                    throw error
-                }
             }
         }
         if (result == DirectoryFsyncResult.UNSUPPORTED) {
@@ -2938,6 +2942,32 @@ internal object SecureBuildPublisher {
                 "Jimfs directory fsync 미지원 결과만 허용됩니다."
             }
         }
+    }
+
+    private fun forceDirectoryChannel(path: Path) {
+        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
+    }
+
+    private fun isJimfsDirectoryFsyncUnsupported(path: Path): Boolean {
+        if (path.fileSystem.provider().scheme != "jimfs") return false
+        val normalized = path.toAbsolutePath().normalize()
+        val initial = Files.readAttributes(
+            normalized,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(initial.isDirectory && !Files.isSymbolicLink(normalized)) {
+            "Jimfs directory fsync 미지원은 실제 directory에만 허용됩니다."
+        }
+        val verified = Files.readAttributes(
+            normalized,
+            BasicFileAttributes::class.java,
+            NOFOLLOW_LINKS,
+        )
+        require(initial.fileKey() == verified.fileKey() && verified.isDirectory) {
+            "Jimfs directory fsync 대상 identity가 변경되었습니다."
+        }
+        return true
     }
 
     private fun validateTrustedLocalPath(

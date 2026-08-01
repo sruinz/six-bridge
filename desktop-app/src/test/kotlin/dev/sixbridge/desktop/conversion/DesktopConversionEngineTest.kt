@@ -3,6 +3,7 @@ package dev.sixbridge.desktop.conversion
 import dev.sixbridge.core.SixBridgeService
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.draft.DraftSignature
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
 import dev.sixbridge.core.draft.DraftSourceKind
@@ -314,6 +315,73 @@ class DesktopConversionEngineTest {
         }
     }
 
+    @Test
+    fun `analyze 등록 직전 close는 lease를 한 번 정리하고 이후 분석을 거부한다`() {
+        val beforeRegistration = CountDownLatch(1)
+        val continueRegistration = CountDownLatch(1)
+        val hooks = DesktopConversionEngineTestHooks(
+            beforeContextRegistration = {
+                beforeRegistration.countDown()
+                check(continueRegistration.await(10, TimeUnit.SECONDS))
+            },
+        )
+        Fixture(hooks = hooks).use { fixture ->
+            var failure: Throwable? = null
+            val analyze = thread {
+                failure = runCatching {
+                    fixture.engine.analyze(
+                        DesktopExtensionInput.Local(fixture.source),
+                        profile,
+                        AnalysisControl(),
+                    )
+                }.exceptionOrNull()
+            }
+            assertTrue(beforeRegistration.await(10, TimeUnit.SECONDS))
+
+            fixture.engine.close()
+            assertEquals(0, fixture.engine.activeContextCountForTesting())
+            continueRegistration.countDown()
+            analyze.join(10_000)
+
+            assertTrue(failure is DesktopConversionException)
+            assertEquals(1, fixture.closeCount.get())
+            assertEquals(0, fixture.engine.activeContextCountForTesting())
+            assertFailsWith<DesktopConversionException> {
+                fixture.engine.analyze(DesktopExtensionInput.Local(fixture.source), profile, AnalysisControl())
+            }
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
+    @Test
+    fun `CRX 분석부터 guarded portable draft 게시까지 원본과 signer를 보존한다`() {
+        Fixture().use { fixture ->
+            val crx = fixture.validCrx()
+            val session = fixture.engine.analyze(
+                DesktopExtensionInput.Local(crx.path),
+                profile,
+                AnalysisControl(),
+            )
+            val artifact = fixture.engine.buildDraft(
+                session,
+                session.requiredApprovals,
+                "b".repeat(32),
+                AnalysisControl(),
+            )
+            val verified = SixDraft.read(artifact.privateFile)
+
+            assertEquals(2, verified.payload.draft.schemaVersion)
+            assertEquals(DraftSourceKind.CRX, verified.payload.sourceKind)
+            assertContentEquals(crx.bytes, verified.payload.source)
+            assertEquals(DraftSignature.sha256(Files.readAllBytes(artifact.privateFile)), artifact.sha256)
+            assertEquals(DraftSignature.fingerprint(fixture.signer.public.encoded), artifact.signerFingerprint)
+            assertFalse(Files.exists(fixture.hostAppData.resolve(".local/keystore/crx")))
+            assertFalse(Files.exists(artifact.privateFile.fileSystem.getPath("/sixbridge/${session.token}/.local/keystore/crx")))
+            assertTrue(fixture.engine.release(session.token))
+            assertEquals(1, fixture.closeCount.get())
+        }
+    }
+
     private fun cancellationReleaseRace(reason: String) {
         val entered = CountDownLatch(1)
         val continueBuild = CountDownLatch(1)
@@ -362,8 +430,22 @@ class DesktopConversionEngineTest {
                 """{"manifest_version":3,"name":"$name","version":"1"}""",
             )
         }
+        fun validCrx(): CrxFixture {
+            val packed = Crx3.pack(
+                source,
+                KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair(),
+            )
+            val path = hostAppData.resolve("sealed-source.crx")
+            Files.write(path, packed.bytes)
+            return CrxFixture(path, packed.bytes)
+        }
         override fun close() { engine.close() }
     }
+
+    private data class CrxFixture(
+        val path: java.nio.file.Path,
+        val bytes: ByteArray,
+    )
 
     private companion object {
         const val DRAFT_EXTENSION = ".sixdraft"

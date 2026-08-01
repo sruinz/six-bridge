@@ -27,6 +27,7 @@ import kotlin.concurrent.withLock
 internal data class DesktopConversionEngineTestHooks(
     val afterContextLookup: (() -> Unit)? = null,
     val beforeDraft: (() -> Unit)? = null,
+    val beforeContextRegistration: (() -> Unit)? = null,
     val sourceSha256Override: ((String) -> String)? = null,
     val afterMapRemoval: ((String) -> Unit)? = null,
     val cleanupOverride: ((String) -> Boolean)? = null,
@@ -57,14 +58,23 @@ class DesktopConversionEngine private constructor(
         val lock: ReentrantLock = ReentrantLock(),
     )
 
+    private enum class Lifecycle {
+        OPEN,
+        CLOSING,
+        CLOSED,
+    }
+
     private val contexts = ConcurrentHashMap<String, DesktopSessionContext>()
     private val sessions = ConcurrentHashMap<String, DesktopAnalysisSession>()
+    private val lifecycleLock = ReentrantLock()
+    private var lifecycle = Lifecycle.OPEN
 
     fun analyze(
         input: DesktopExtensionInput,
         profile: BrowserProfile,
         control: AnalysisControl,
     ): DesktopAnalysisSession {
+        requireOpen()
         val lease = workspaceManager.create()
         try {
             val profileSnapshot = profile.snapshot()
@@ -94,11 +104,15 @@ class DesktopConversionEngine private constructor(
                 analysis.report.sourceSha256, analysis.report.extensionName,
                 session.selectedAutomaticAdapters, session.requiredApprovals,
             )
-            check(contexts.putIfAbsent(token, context) == null) {
-                "desktop analysis token이 중복되었습니다."
-            }
-            check(sessions.putIfAbsent(token, session) == null) {
-                "desktop analysis session이 중복되었습니다."
+            testHooks?.beforeContextRegistration?.invoke()
+            lifecycleLock.withLock {
+                requireOpen()
+                check(contexts.putIfAbsent(token, context) == null) {
+                    "desktop analysis token이 중복되었습니다."
+                }
+                check(sessions.putIfAbsent(token, session) == null) {
+                    "desktop analysis session이 중복되었습니다."
+                }
             }
             return session
         } catch (error: Throwable) {
@@ -186,9 +200,17 @@ class DesktopConversionEngine private constructor(
     internal fun isRegisteredForTesting(token: String): Boolean =
         contexts.containsKey(canonicalToken(token))
 
+    internal fun activeContextCountForTesting(): Int = contexts.size
+
     override fun close() {
+        val registered = lifecycleLock.withLock {
+            if (lifecycle != Lifecycle.OPEN) return
+            lifecycle = Lifecycle.CLOSING
+            lifecycle = Lifecycle.CLOSED
+            contexts.entries.map { it.key to it.value }
+        }
         var failure: Throwable? = null
-        contexts.entries.forEach { (token, context) ->
+        registered.forEach { (token, context) ->
             try {
                 context.lock.withLock { closeRegistered(token, context, null) }
             } catch (error: Throwable) {
@@ -197,6 +219,14 @@ class DesktopConversionEngine private constructor(
             }
         }
         failure?.let { throw DesktopConversionException("desktop session 정리에 실패했습니다.", it) }
+    }
+
+    private fun requireOpen() {
+        lifecycleLock.withLock {
+            if (lifecycle != Lifecycle.OPEN) {
+                throw DesktopConversionException("닫힌 desktop conversion engine은 분석할 수 없습니다.")
+            }
+        }
     }
 
     private fun validateSession(token: String, session: DesktopAnalysisSession) {
