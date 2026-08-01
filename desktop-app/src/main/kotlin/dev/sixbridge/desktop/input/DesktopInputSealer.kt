@@ -31,15 +31,23 @@ import java.util.UUID
 class DesktopInputChangedException internal constructor() :
     IllegalArgumentException("입력이 봉인 중 변경되었습니다.")
 
+class DesktopInputCleanupException internal constructor(cause: Exception) :
+    IllegalStateException(
+        "입력 child 정리에 실패했습니다. workspace를 즉시 닫아야 합니다.",
+        cause,
+    )
+
 class DesktopInputSealer private constructor(
     private val chromeDownloader: ChromeCrxDownloader,
     private val afterLocalRead: (Path) -> Unit,
     private val afterSourceRead: (Path) -> Unit,
+    private val cleanupChildOverride: ((Path) -> Unit)?,
 ) {
     constructor(chromeDownloader: ChromeCrxDownloader) : this(
         chromeDownloader,
         {},
         {},
+        null,
     )
 
     fun seal(
@@ -66,7 +74,11 @@ class DesktopInputSealer private constructor(
                     sealLocal(input.path.toAbsolutePath().normalize(), child, control)
             }
         } catch (error: Throwable) {
-            deleteTreeBestEffort(child)
+            try {
+                cleanupChildOverride?.invoke(child) ?: deleteTreeExact(child)
+            } catch (cleanupError: Exception) {
+                error.addSuppressed(DesktopInputCleanupException(cleanupError))
+            }
             throw error
         }
     }
@@ -502,30 +514,29 @@ class DesktopInputSealer private constructor(
         return match.groupValues[1]
     }
 
-    private fun deleteTreeBestEffort(root: Path) {
-        runCatching {
-            if (!Files.exists(root, NOFOLLOW_LINKS)) return@runCatching
-            Files.walkFileTree(
-                root,
-                object : SimpleFileVisitor<Path>() {
-                    override fun visitFile(
-                        file: Path,
-                        attrs: BasicFileAttributes,
-                    ): FileVisitResult {
-                        Files.deleteIfExists(file)
-                        return FileVisitResult.CONTINUE
-                    }
+    private fun deleteTreeExact(root: Path) {
+        if (!Files.exists(root, NOFOLLOW_LINKS)) return
+        Files.walkFileTree(
+            root,
+            object : SimpleFileVisitor<Path>() {
+                override fun visitFile(
+                    file: Path,
+                    attrs: BasicFileAttributes,
+                ): FileVisitResult {
+                    Files.deleteIfExists(file)
+                    return FileVisitResult.CONTINUE
+                }
 
-                    override fun postVisitDirectory(
-                        dir: Path,
-                        exc: IOException?,
-                    ): FileVisitResult {
-                        Files.deleteIfExists(dir)
-                        return FileVisitResult.CONTINUE
-                    }
-                },
-            )
-        }
+                override fun postVisitDirectory(
+                    dir: Path,
+                    exc: IOException?,
+                ): FileVisitResult {
+                    if (exc != null) throw exc
+                    Files.deleteIfExists(dir)
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
     }
 
     private fun int32(bytes: ByteArray, offset: Int): Int =
@@ -566,10 +577,12 @@ class DesktopInputSealer private constructor(
             chromeDownloader: ChromeCrxDownloader,
             afterLocalRead: (Path) -> Unit,
             afterSourceRead: (Path) -> Unit = {},
+            cleanupChild: ((Path) -> Unit)? = null,
         ): DesktopInputSealer = DesktopInputSealer(
             chromeDownloader,
             afterLocalRead,
             afterSourceRead,
+            cleanupChild,
         )
 
         internal fun portableRelativeForTesting(relative: Path): String =

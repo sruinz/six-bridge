@@ -7,8 +7,10 @@ import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ChromeCrxDownloader
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.input.UnsupportedInputException
 import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import dev.sixbridge.desktop.conversion.DesktopWorkspaceManager
+import java.io.IOException
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.channels.ServerSocketChannel
@@ -30,6 +32,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -358,6 +361,39 @@ class DesktopInputSealerTest {
                 }
                 assertTrue(Files.list(lease.workspace.inputRoot).use { it.findAny().isEmpty })
             }
+        }
+    }
+
+    @Test
+    fun `실패 후 child 정리 예외는 원 예외에 노출하고 형제를 지우지 않는다`() {
+        val unsupported = Files.createTempFile("desktop-sealer-", ".txt")
+        unsupported.writeText("unsupported")
+        val manager = DesktopWorkspaceManager()
+
+        manager.create().use { lease ->
+            val sibling = Files.createDirectory(lease.workspace.inputRoot.resolve("keep"))
+            var cleanupTarget: Path? = null
+            val sealer = DesktopInputSealer.testing(
+                chromeDownloader = CountingDownloader(byteArrayOf()),
+                afterLocalRead = {},
+                cleanupChild = { child ->
+                    cleanupTarget = child
+                    throw IOException("forced cleanup failure")
+                },
+            )
+
+            val error = assertFailsWith<UnsupportedInputException> {
+                sealer.seal(
+                    DesktopExtensionInput.Local(unsupported),
+                    lease.workspace,
+                    AnalysisControl(),
+                )
+            }
+
+            assertEquals(lease.workspace.inputRoot, cleanupTarget?.parent)
+            assertTrue(Files.isDirectory(sibling))
+            assertEquals(1, error.suppressed.size)
+            assertIs<DesktopInputCleanupException>(error.suppressed.single())
         }
     }
 
