@@ -6,10 +6,13 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption.APPEND
+import java.nio.file.StandardOpenOption.CREATE
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
@@ -19,6 +22,120 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class BrowserProfileExtractorTest {
+    @Test
+    fun `pipe capacity보다 큰 stdout과 stderr를 concurrent drain해 교착 없이 완료한다`() {
+        val analyzer = Files.createTempFile("large-output-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val readerPrefix = "large-tool-reader-${System.nanoTime()}"
+        val executor = Executors.newSingleThreadExecutor()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { fixtureProcess("large") },
+            maxToolOutputBytes = 512 * 1024,
+            toolTimeoutMillis = 5_000,
+            cleanupTimeoutMillis = 2_000,
+            readerThreadNamePrefix = readerPrefix,
+        )
+
+        try {
+            val profile = executor.submit<BrowserProfile> { extractor.extract(apk) }
+                .get(10, TimeUnit.SECONDS)
+
+            assertEquals("unknown", profile.versionName)
+            assertNoReaderThreads(readerPrefix)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `stdout overflow는 process를 bounded 종료하고 reader를 남기지 않는다`() {
+        val analyzer = Files.createTempFile("overflow-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val pidFile = Files.createTempFile("overflow-process-", ".pid")
+        Files.delete(pidFile)
+        val readerPrefix = "overflow-tool-reader-${System.nanoTime()}"
+        val executor = Executors.newSingleThreadExecutor()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { fixtureProcess("overflow", pidFile.toString()) },
+            maxToolOutputBytes = 1_024,
+            toolTimeoutMillis = 5_000,
+            cleanupTimeoutMillis = 2_000,
+            readerThreadNamePrefix = readerPrefix,
+        )
+
+        try {
+            executor.submit<BrowserProfile> { extractor.extract(apk) }
+                .get(10, TimeUnit.SECONDS)
+            val pid = waitForPids(pidFile, 1).single()
+
+            assertProcessDead(pid)
+            assertNoReaderThreads(readerPrefix)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `cancel은 process tree와 pipe reader를 모두 종료한다`() {
+        val analyzer = Files.createTempFile("cancel-tree-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val pidFile = Files.createTempFile("cancel-tree-", ".pid")
+        Files.delete(pidFile)
+        val readerPrefix = "cancel-tool-reader-${System.nanoTime()}"
+        val executor = Executors.newSingleThreadExecutor()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { fixtureProcess("tree", pidFile.toString()) },
+            maxToolOutputBytes = 512 * 1024,
+            toolTimeoutMillis = 30_000,
+            cleanupTimeoutMillis = 2_000,
+            readerThreadNamePrefix = readerPrefix,
+        )
+
+        try {
+            val future = executor.submit<BrowserProfile> { extractor.extract(apk) }
+            val pids = waitForPids(pidFile, 2)
+
+            future.cancel(true)
+
+            pids.forEach(::assertProcessDead)
+            assertNoReaderThreads(readerPrefix)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `waitFor 성공 뒤에도 살아 있는 process는 도구 성공으로 처리하지 않는다`() {
+        val analyzer = Files.createTempFile("stubborn-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val started = AtomicInteger()
+        val processes = mutableListOf<StubbornSuccessfulProcess>()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { command ->
+                started.incrementAndGet()
+                StubbornSuccessfulProcess(
+                    if ("version-name" in command) "31.0.0.1" else "1300000000",
+                ).also(processes::add)
+            },
+            toolTimeoutMillis = 1_000,
+            cleanupTimeoutMillis = 50,
+        )
+
+        val profile = extractor.extract(apk)
+
+        assertEquals("unknown", profile.versionName)
+        assertEquals(1, started.get())
+        assertTrue(processes.single().destroyCalls.get() > 0)
+    }
+
     @Test
     fun `외부 분석기 대기 thread가 interrupt되면 process를 강제 종료한다`() {
         val analyzer = Files.createTempFile("fake-apkanalyzer-", "")
@@ -246,6 +363,48 @@ class BrowserProfileExtractorTest {
         return apk
     }
 
+    private fun fixtureProcess(vararg arguments: String): Process = ProcessBuilder(
+        Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+        "-cp",
+        System.getProperty("java.class.path"),
+        BrowserProfileExtractorProcessFixture::class.java.name,
+        *arguments,
+    ).start()
+
+    private fun waitForPids(path: Path, count: Int): List<Long> {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            val pids = runCatching {
+                Files.readAllLines(path).filter(String::isNotBlank).map(String::toLong)
+            }.getOrDefault(emptyList())
+            if (pids.size >= count) return pids.take(count)
+            Thread.sleep(10)
+        }
+        error("fixture PID를 확인하지 못했습니다.")
+    }
+
+    private fun assertProcessDead(pid: Long) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            if (ProcessHandle.of(pid).map { !it.isAlive }.orElse(true)) return
+            Thread.sleep(10)
+        }
+        assertFalse(ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false))
+    }
+
+    private fun assertNoReaderThreads(prefix: String) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            if (Thread.getAllStackTraces().keys.none { it.isAlive && it.name.startsWith(prefix) }) {
+                return
+            }
+            Thread.sleep(10)
+        }
+        assertTrue(
+            Thread.getAllStackTraces().keys.none { it.isAlive && it.name.startsWith(prefix) },
+        )
+    }
+
     private class BlockingTestProcess : Process() {
         val entered = CountDownLatch(1)
         val destroyed = CountDownLatch(1)
@@ -280,5 +439,75 @@ class BrowserProfileExtractorTest {
         }
 
         override fun isAlive(): Boolean = destroyed.count != 0L
+    }
+
+    private class StubbornSuccessfulProcess(output: String) : Process() {
+        val destroyCalls = AtomicInteger()
+        private val stdout = ByteArrayInputStream(output.encodeToByteArray())
+        private val stderr = ByteArrayInputStream(ByteArray(0))
+
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = stdout
+        override fun getErrorStream(): InputStream = stderr
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyCalls.incrementAndGet()
+        }
+        override fun destroyForcibly(): Process {
+            destroyCalls.incrementAndGet()
+            return this
+        }
+        override fun isAlive(): Boolean = true
+    }
+}
+
+object BrowserProfileExtractorProcessFixture {
+    @JvmStatic
+    fun main(arguments: Array<String>) {
+        when (arguments.first()) {
+            "large" -> {
+                val bytes = ByteArray(256 * 1024) { 'x'.code.toByte() }
+                System.out.write(bytes)
+                System.out.flush()
+                System.err.write(bytes)
+                System.err.flush()
+            }
+            "overflow" -> {
+                writePid(Path.of(arguments[1]), ProcessHandle.current().pid())
+                val bytes = ByteArray(8 * 1024) { 'o'.code.toByte() }
+                while (true) {
+                    System.out.write(bytes)
+                    System.out.flush()
+                }
+            }
+            "tree" -> {
+                val descendant = ProcessBuilder(
+                    Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-cp",
+                    System.getProperty("java.class.path"),
+                    BrowserProfileExtractorProcessFixture::class.java.name,
+                    "descendant",
+                ).start()
+                val pidFile = Path.of(arguments[1])
+                writePid(pidFile, ProcessHandle.current().pid())
+                writePid(pidFile, descendant.pid())
+                val bytes = ByteArray(4 * 1024) { 'c'.code.toByte() }
+                while (true) {
+                    System.out.write(bytes)
+                    System.out.flush()
+                    System.err.write(bytes)
+                    System.err.flush()
+                    Thread.sleep(5)
+                }
+            }
+            "descendant" -> while (true) Thread.sleep(1_000)
+            else -> error("unknown fixture mode")
+        }
+    }
+
+    private fun writePid(path: Path, pid: Long) {
+        Files.writeString(path, "$pid\n", CREATE, APPEND)
     }
 }

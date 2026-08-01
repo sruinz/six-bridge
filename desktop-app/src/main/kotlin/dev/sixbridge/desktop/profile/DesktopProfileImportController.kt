@@ -30,6 +30,7 @@ internal class DesktopProfileImportController private constructor(
         DesktopProfileImportOutcome,
     ) -> Unit,
     private val ioDispatcher: CoroutineDispatcher,
+    private val beforeOutcomeDelivery: () -> Unit,
 ) : AutoCloseable {
     constructor(
         scope: CoroutineScope,
@@ -49,6 +50,7 @@ internal class DesktopProfileImportController private constructor(
         commit = catalog::commit,
         onOutcome = onOutcome,
         ioDispatcher = Dispatchers.IO,
+        beforeOutcomeDelivery = {},
     )
 
     private val lock = Any()
@@ -106,19 +108,14 @@ internal class DesktopProfileImportController private constructor(
                 commit(prepared, operation::checkCancelled)
             }
             operation.checkCancelled()
-            if (isCurrent(operation)) {
-                onOutcome(
-                    operation.ticket,
-                    DesktopProfileImportOutcome.Success(option),
-                )
-            }
+            deliverIfCurrent(
+                operation,
+                DesktopProfileImportOutcome.Success(option),
+            )
         } catch (_: CancellationException) {
         } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
         } catch (_: Exception) {
-            if (isCurrent(operation)) {
-                onOutcome(operation.ticket, DesktopProfileImportOutcome.Failure)
-            }
+            deliverIfCurrent(operation, DesktopProfileImportOutcome.Failure)
         } finally {
             synchronized(lock) {
                 if (current === operation) current = null
@@ -128,6 +125,18 @@ internal class DesktopProfileImportController private constructor(
 
     private fun requireCurrent(operation: ImportOperation) {
         if (!isCurrent(operation)) throw CancellationException()
+    }
+
+    private fun deliverIfCurrent(
+        operation: ImportOperation,
+        outcome: DesktopProfileImportOutcome,
+    ) {
+        beforeOutcomeDelivery()
+        synchronized(lock) {
+            if (!closed && current === operation) {
+                onOutcome(operation.ticket, outcome)
+            }
+        }
     }
 
     private fun isCurrent(operation: ImportOperation): Boolean = synchronized(lock) {
@@ -169,12 +178,14 @@ internal class DesktopProfileImportController private constructor(
                 DesktopProfileImportTicket,
                 DesktopProfileImportOutcome,
             ) -> Unit,
+            beforeOutcomeDelivery: () -> Unit = {},
         ): DesktopProfileImportController = DesktopProfileImportController(
             scope,
             prepare,
             commit,
             onOutcome,
             Dispatchers.IO,
+            beforeOutcomeDelivery,
         )
     }
 }

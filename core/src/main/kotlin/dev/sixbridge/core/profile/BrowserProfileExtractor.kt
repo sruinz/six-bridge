@@ -1,10 +1,19 @@
 package dev.sixbridge.core.profile
 
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.LockSupport
 import kotlin.io.path.exists
 import kotlin.io.path.inputStream
 
@@ -13,12 +22,20 @@ class BrowserProfileExtractor private constructor(
     private val analyzerCandidates: () -> List<Path>,
     private val signerCandidates: () -> List<Path>,
     private val startProcess: (List<String>) -> Process,
+    private val maxToolOutputBytes: Int,
+    private val toolTimeoutMillis: Long,
+    private val cleanupTimeoutMillis: Long,
+    private val readerThreadNamePrefix: String,
 ) {
     constructor() : this(
         checkCancelled = {},
         analyzerCandidates = ::defaultApkAnalyzerCandidates,
         signerCandidates = ::defaultApkSignerCandidates,
         startProcess = { command -> ProcessBuilder(command).start() },
+        maxToolOutputBytes = MAX_TOOL_OUTPUT_BYTES,
+        toolTimeoutMillis = TOOL_TIMEOUT_MILLIS,
+        cleanupTimeoutMillis = CLEANUP_TIMEOUT_MILLIS,
+        readerThreadNamePrefix = "six-profile-tool-reader",
     )
 
     constructor(checkCancelled: () -> Unit) : this(
@@ -26,7 +43,18 @@ class BrowserProfileExtractor private constructor(
         analyzerCandidates = ::defaultApkAnalyzerCandidates,
         signerCandidates = ::defaultApkSignerCandidates,
         startProcess = { command -> ProcessBuilder(command).start() },
+        maxToolOutputBytes = MAX_TOOL_OUTPUT_BYTES,
+        toolTimeoutMillis = TOOL_TIMEOUT_MILLIS,
+        cleanupTimeoutMillis = CLEANUP_TIMEOUT_MILLIS,
+        readerThreadNamePrefix = "six-profile-tool-reader",
     )
+
+    init {
+        require(maxToolOutputBytes > 0)
+        require(toolTimeoutMillis > 0)
+        require(cleanupTimeoutMillis > 0)
+        require(readerThreadNamePrefix.isNotBlank())
+    }
 
     fun extract(browserApk: Path): BrowserProfile {
         checkCancelled()
@@ -103,13 +131,28 @@ class BrowserProfileExtractor private constructor(
         } catch (_: Exception) {
             return null
         }
+        val readerSequence = AtomicInteger()
+        val readers = Executors.newFixedThreadPool(2) { runnable ->
+            Thread(
+                runnable,
+                "$readerThreadNamePrefix-${readerSequence.incrementAndGet()}",
+            ).apply { isDaemon = true }
+        }
+        val stdout = readers.submit<ByteArray> {
+            readToolStream(process.inputStream, capture = true)
+        }
+        val stderr = readers.submit<ByteArray> {
+            readToolStream(process.errorStream, capture = false)
+        }
         return try {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(toolTimeoutMillis)
             while (true) {
                 checkCancelled()
+                throwCompletedReaderFailure(stdout)
+                throwCompletedReaderFailure(stderr)
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0L) {
-                    destroyProcess(process)
+                    terminateProcessSession(process, stdout, stderr, readers)
                     return null
                 }
                 val waitMillis = minOf(
@@ -119,32 +162,143 @@ class BrowserProfileExtractor private constructor(
                 if (process.waitFor(waitMillis, TimeUnit.MILLISECONDS)) break
             }
             checkCancelled()
-            if (process.exitValue() != 0) return null
-            process.inputStream.bufferedReader().use { reader ->
-                reader.readText().trim().takeIf(String::isNotEmpty)
+            if (process.isAlive) {
+                terminateProcessSession(process, stdout, stderr, readers)
+                return null
             }
+            val readerDeadline = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(cleanupTimeoutMillis)
+            val output = awaitReader(stdout, readerDeadline)
+            awaitReader(stderr, readerDeadline)
+            val exitValue = process.exitValue()
+            if (!finishExitedProcessSession(process, readers)) return null
+            if (exitValue != 0) return null
+            output.decodeToString().trim().takeIf(String::isNotEmpty)
         } catch (error: InterruptedException) {
-            destroyProcess(process)
+            terminateProcessSession(process, stdout, stderr, readers)
             Thread.currentThread().interrupt()
             throw CancellationException("browser profile 외부 분석이 취소되었습니다.").also {
                 it.initCause(error)
             }
         } catch (error: CancellationException) {
-            destroyProcess(process)
+            terminateProcessSession(process, stdout, stderr, readers)
+            throw error
+        } catch (error: Error) {
+            terminateProcessSession(process, stdout, stderr, readers)
             throw error
         } catch (_: Exception) {
-            if (process.isAlive) destroyProcess(process)
+            terminateProcessSession(process, stdout, stderr, readers)
             null
         }
     }
 
-    private fun destroyProcess(process: Process) {
-        process.destroyForcibly()
-        try {
-            process.waitFor(PROCESS_DESTROY_WAIT_MILLIS, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
+    private fun readToolStream(input: InputStream, capture: Boolean): ByteArray {
+        val output = if (capture) ByteArrayOutputStream() else null
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        var total = 0
+        input.use {
+            while (true) {
+                checkCancelled()
+                val read = it.read(buffer)
+                if (read < 0) break
+                if (read == 0) continue
+                if (total.toLong() + read > maxToolOutputBytes.toLong()) {
+                    throw ToolOutputLimitException()
+                }
+                total += read
+                output?.write(buffer, 0, read)
+            }
         }
+        return output?.toByteArray() ?: ByteArray(0)
+    }
+
+    private fun throwCompletedReaderFailure(reader: Future<ByteArray>) {
+        if (!reader.isDone) return
+        try {
+            reader.get()
+        } catch (error: ExecutionException) {
+            throwReaderCause(error.cause)
+        }
+    }
+
+    private fun awaitReader(reader: Future<ByteArray>, deadline: Long): ByteArray {
+        val remaining = deadline - System.nanoTime()
+        if (remaining <= 0L) throw ToolReaderFailureException()
+        return try {
+            reader.get(remaining, TimeUnit.NANOSECONDS)
+        } catch (error: ExecutionException) {
+            throwReaderCause(error.cause)
+        } catch (_: TimeoutException) {
+            throw ToolReaderFailureException()
+        }
+    }
+
+    private fun throwReaderCause(cause: Throwable?): Nothing = when (cause) {
+        is CancellationException -> throw cause
+        is Error -> throw cause
+        else -> throw ToolReaderFailureException()
+    }
+
+    private fun finishExitedProcessSession(
+        process: Process,
+        readers: ExecutorService,
+    ): Boolean {
+        closeProcessStreams(process)
+        readers.shutdown()
+        try {
+            return readers.awaitTermination(cleanupTimeoutMillis, TimeUnit.MILLISECONDS) &&
+                !process.isAlive
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw CancellationException("browser profile output 정리가 취소되었습니다.").also {
+                it.initCause(error)
+            }
+        }
+    }
+
+    private fun terminateProcessSession(
+        process: Process,
+        stdout: Future<ByteArray>,
+        stderr: Future<ByteArray>,
+        readers: ExecutorService,
+    ): Boolean {
+        val handles = processHandles(process)
+        // processHandles는 descendants 뒤에 parent를 두므로 자식부터 종료한다.
+        handles.forEach { handle ->
+            runCatching { if (handle.isAlive) handle.destroyForcibly() }
+        }
+        runCatching { process.destroyForcibly() }
+        closeProcessStreams(process)
+        stdout.cancel(true)
+        stderr.cancel(true)
+        readers.shutdownNow()
+        val deadline = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(cleanupTimeoutMillis)
+        while (System.nanoTime() < deadline) {
+            val processAlive = runCatching { process.isAlive }.getOrDefault(true)
+            val descendantAlive = handles.any { handle ->
+                runCatching { handle.isAlive }.getOrDefault(true)
+            }
+            if (!processAlive && !descendantAlive && readers.isTerminated) return true
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1))
+        }
+        closeProcessStreams(process)
+        return !runCatching { process.isAlive }.getOrDefault(true) &&
+            handles.none { runCatching { it.isAlive }.getOrDefault(true) } &&
+            readers.isTerminated
+    }
+
+    private fun processHandles(process: Process): List<ProcessHandle> = try {
+        val parent = process.toHandle()
+        parent.descendants().use { descendants -> descendants.toList() } + parent
+    } catch (_: UnsupportedOperationException) {
+        emptyList()
+    }
+
+    private fun closeProcessStreams(process: Process) {
+        runCatching { process.outputStream.close() }
+        runCatching { process.inputStream.close() }
+        runCatching { process.errorStream.close() }
     }
 
     private fun sha256(path: Path): String {
@@ -172,7 +326,9 @@ class BrowserProfileExtractor private constructor(
 
     companion object {
         private const val PROCESS_POLL_MILLIS = 100L
-        private const val PROCESS_DESTROY_WAIT_MILLIS = 1_000L
+        private const val MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
+        private const val TOOL_TIMEOUT_MILLIS = 30_000L
+        private const val CLEANUP_TIMEOUT_MILLIS = 2_000L
         private val VERSION_NAME_REGEX =
             Regex("""(?:versionName[\s:=_-]*)?(\d{2}\.\d+\.\d+\.\d+)""")
         private val VERSION_CODE_FILENAME_REGEX =
@@ -187,14 +343,25 @@ class BrowserProfileExtractor private constructor(
             startProcess: (List<String>) -> Process = { command ->
                 ProcessBuilder(command).start()
             },
+            maxToolOutputBytes: Int = MAX_TOOL_OUTPUT_BYTES,
+            toolTimeoutMillis: Long = TOOL_TIMEOUT_MILLIS,
+            cleanupTimeoutMillis: Long = CLEANUP_TIMEOUT_MILLIS,
+            readerThreadNamePrefix: String = "six-profile-tool-reader-test",
         ): BrowserProfileExtractor = BrowserProfileExtractor(
             checkCancelled,
             analyzerCandidates,
             signerCandidates,
             startProcess,
+            maxToolOutputBytes,
+            toolTimeoutMillis,
+            cleanupTimeoutMillis,
+            readerThreadNamePrefix,
         )
     }
 }
+
+private class ToolOutputLimitException : IllegalStateException()
+private class ToolReaderFailureException : IllegalStateException()
 
 private fun defaultApkAnalyzerCandidates(): List<Path> = buildList {
     System.getenv("ANDROID_SDK_ROOT")?.let { root ->

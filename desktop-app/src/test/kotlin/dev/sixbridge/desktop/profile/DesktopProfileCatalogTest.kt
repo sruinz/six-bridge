@@ -45,6 +45,25 @@ class DesktopProfileCatalogTest {
     )
 
     @Test
+    fun `profile JSON parse의 CancellationException과 Error는 전파한다`() {
+        val cancelled = DesktopProfileCatalog.testing(
+            dataRoot = Files.createTempDirectory("cancel-json-catalog"),
+            parseProfileJson = { throw CancellationException("취소") },
+        )
+        val failed = DesktopProfileCatalog.testing(
+            dataRoot = Files.createTempDirectory("error-json-catalog"),
+            parseProfileJson = { throw AssertionError("fatal") },
+        )
+
+        assertFailsWith<CancellationException> {
+            cancelled.prepareJson("{}".encodeToByteArray())
+        }
+        assertFailsWith<AssertionError> {
+            failed.prepareJson("{}".encodeToByteArray())
+        }
+    }
+
+    @Test
     fun `APK prepare는 extractor에 cancellation을 전달하고 취소를 untrusted로 바꾸지 않는다`() {
         val apk = Files.createTempFile("cancel-sbrowser", ".apk")
         val catalog = DesktopProfileCatalog.testingCancelable(

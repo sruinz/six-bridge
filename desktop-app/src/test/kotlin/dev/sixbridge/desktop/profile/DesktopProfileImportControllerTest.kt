@@ -11,21 +11,91 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
 import java.util.Collections
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 
 class DesktopProfileImportControllerTest {
+    @Test
+    fun `raw InterruptedException 취소 뒤 UI dispatcher 다음 task는 interrupt되지 않는다`() {
+        val dispatcher = NonClearingSingleThreadDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val nextTaskRan = CountDownLatch(1)
+        val nextTaskInterrupted = AtomicBoolean(true)
+        val controller = DesktopProfileImportController.testing(
+            scope = scope,
+            prepare = { _, _, _ -> throw InterruptedException("worker interrupt") },
+            commit = { prepared, _ -> prepared.option },
+            onOutcome = { _, _ -> error("취소는 outcome을 게시하지 않아야 합니다.") },
+        )
+
+        try {
+            val job = controller.start(ticket(1), Path.of("interrupted.json"))
+            scope.launch {
+                job.join()
+                nextTaskInterrupted.set(Thread.currentThread().isInterrupted)
+                nextTaskRan.countDown()
+            }
+
+            assertTrue(nextTaskRan.await(5, TimeUnit.SECONDS))
+            assertFalse(nextTaskInterrupted.get())
+        } finally {
+            controller.close()
+            scope.cancel()
+            dispatcher.close()
+        }
+    }
+
+    @Test
+    fun `close가 outcome 직전에 실행되면 callback을 게시하지 않는다`() {
+        val beforeOutcome = CountDownLatch(1)
+        val releaseOutcome = CountDownLatch(1)
+        val outcomes = Collections.synchronizedList(
+            mutableListOf<Pair<DesktopProfileImportTicket, DesktopProfileImportOutcome>>(),
+        )
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val controller = DesktopProfileImportController.testing(
+            scope = scope,
+            prepare = { _, _, _ -> DesktopPreparedProfileImport.WithoutPersistence(option("ok")) },
+            commit = { prepared, _ -> prepared.option },
+            onOutcome = { ticket, outcome -> outcomes += ticket to outcome },
+            beforeOutcomeDelivery = {
+                beforeOutcome.countDown()
+                releaseOutcome.await()
+            },
+        )
+
+        try {
+            val job = controller.start(ticket(1), Path.of("close-race.json"))
+            assertTrue(beforeOutcome.await(5, TimeUnit.SECONDS))
+
+            controller.close()
+            releaseOutcome.countDown()
+
+            runBlocking { withTimeout(5_000) { job.join() } }
+            assertTrue(outcomes.isEmpty())
+        } finally {
+            releaseOutcome.countDown()
+            controller.close()
+            scope.cancel()
+        }
+    }
+
     @Test
     fun `invalidate는 현재 장시간 prepare를 interrupt하고 outcome을 게시하지 않는다`() {
         val entered = CountDownLatch(1)
@@ -200,6 +270,26 @@ class DesktopProfileImportControllerTest {
         selectable = true,
         explanation = id,
     )
+
+    private class NonClearingSingleThreadDispatcher : CoroutineDispatcher(), AutoCloseable {
+        private val tasks = ConcurrentLinkedQueue<Runnable>()
+        private val running = AtomicBoolean(true)
+        private val thread = Thread({
+            while (running.get() || tasks.isNotEmpty()) {
+                tasks.poll()?.run() ?: Thread.onSpinWait()
+            }
+        }, "profile-import-ui-test").also(Thread::start)
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            tasks.add(block)
+        }
+
+        override fun close() {
+            running.set(false)
+            thread.join(5_000)
+            check(!thread.isAlive) { "test dispatcher가 종료되지 않았습니다." }
+        }
+    }
 
     private val profile = BrowserProfile(
         browserPackage = "com.sec.android.app.sbrowser",

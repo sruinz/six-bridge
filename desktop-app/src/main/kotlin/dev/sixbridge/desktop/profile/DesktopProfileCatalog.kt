@@ -78,6 +78,7 @@ class DesktopProfileCatalog private constructor(
     private val dataRoot: Path,
     private val trustedKeys: Map<String, PublicKey>,
     private val extractProfile: (Path, () -> Unit) -> BrowserProfile,
+    private val parseProfileJson: (String) -> BrowserProfile,
     private val resources: ClassLoader,
     private val persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit,
 ) {
@@ -87,6 +88,7 @@ class DesktopProfileCatalog private constructor(
         extractProfile = { path, checkCancelled ->
             BrowserProfileExtractor(checkCancelled).extract(path)
         },
+        parseProfileJson = BrowserProfileJson::decode,
         resources = DesktopProfileCatalog::class.java.classLoader,
         persistenceCheckpoint = { _, _ -> },
     )
@@ -101,14 +103,14 @@ class DesktopProfileCatalog private constructor(
     fun importJson(bytes: ByteArray): DesktopProfileOption = commit(prepareJson(bytes))
 
     internal fun prepareJson(bytes: ByteArray): DesktopPreparedProfileImport {
-        val text = runCatching { bytes.decodeToString() }.getOrNull() ?: return untrusted()
+        val text = recoverExpected { bytes.decodeToString() } ?: return untrusted()
             .let(DesktopPreparedProfileImport::WithoutPersistence)
-        val signed = runCatching { SignedBrowserProfile.verify(text, trustedKeys) }.getOrNull()
+        val signed = recoverExpected { SignedBrowserProfile.verify(text, trustedKeys) }
         if (signed != null) {
             val option = signedOption(signed.profile, DesktopProfileTrust.SIGNED)
             return DesktopPreparedProfileImport.SignedJson(option, text)
         }
-        val profile = runCatching { BrowserProfileJson.decode(text) }.getOrNull()
+        val profile = recoverExpected { parseProfileJson(text) }
             ?: return DesktopPreparedProfileImport.WithoutPersistence(untrusted())
         val option = builtInProfiles().firstOrNull {
             it.canonicalSha256() == profile.canonicalSha256()
@@ -549,12 +551,14 @@ class DesktopProfileCatalog private constructor(
             dataRoot: Path,
             trustedKeys: Map<String, PublicKey> = emptyMap(),
             extractProfile: (Path) -> BrowserProfile = BrowserProfileExtractor()::extract,
+            parseProfileJson: (String) -> BrowserProfile = BrowserProfileJson::decode,
             resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
             persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
         ): DesktopProfileCatalog = DesktopProfileCatalog(
             dataRoot,
             trustedKeys,
             { path, _ -> extractProfile(path) },
+            parseProfileJson,
             resources,
             persistenceCheckpoint,
         )
@@ -563,16 +567,28 @@ class DesktopProfileCatalog private constructor(
             dataRoot: Path,
             trustedKeys: Map<String, PublicKey> = emptyMap(),
             extractProfile: (Path, () -> Unit) -> BrowserProfile,
+            parseProfileJson: (String) -> BrowserProfile = BrowserProfileJson::decode,
             resources: ClassLoader = DesktopProfileCatalog::class.java.classLoader,
             persistenceCheckpoint: (DesktopProfilePersistenceCheckpoint, Path) -> Unit = { _, _ -> },
         ): DesktopProfileCatalog = DesktopProfileCatalog(
             dataRoot,
             trustedKeys,
             extractProfile,
+            parseProfileJson,
             resources,
             persistenceCheckpoint,
         )
     }
+}
+
+private inline fun <T> recoverExpected(block: () -> T): T? = try {
+    block()
+} catch (error: CancellationException) {
+    throw error
+} catch (error: Error) {
+    throw error
+} catch (_: Exception) {
+    null
 }
 
 internal fun loadBundledTrustedProfileKeys(resources: ClassLoader): Map<String, PublicKey> {
