@@ -111,6 +111,38 @@ class BrowserProfileExtractorTest {
     }
 
     @Test
+    fun `orphan child holding inherited pipes is terminated after parent exits`() {
+        val analyzer = Files.createTempFile("orphan-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val pidFile = Files.createTempFile("orphan-tree-", ".pid")
+        Files.delete(pidFile)
+        val threadPrefix = "orphan-tool-session-${System.nanoTime()}"
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { fixtureProcess("orphan-parent", pidFile.toString()) },
+            toolTimeoutMillis = 5_000,
+            cleanupTimeoutMillis = 250,
+            readerThreadNamePrefix = threadPrefix,
+        )
+        var pids = emptyList<Long>()
+
+        try {
+            extractor.extract(apk)
+            pids = waitForPids(pidFile, 2)
+
+            assertProcessDead(pids[1])
+            assertNoReaderThreads(threadPrefix)
+        } finally {
+            pids.forEach { pid ->
+                ProcessHandle.of(pid).ifPresent { handle ->
+                    if (handle.isAlive) handle.destroyForcibly()
+                }
+            }
+        }
+    }
+
+    @Test
     fun `waitFor 성공 뒤에도 살아 있는 process는 도구 성공으로 처리하지 않는다`() {
         val analyzer = Files.createTempFile("stubborn-analyzer-", "")
         val apk = browserApk(dex = "extension-id", terrace = "storage")
@@ -129,11 +161,93 @@ class BrowserProfileExtractorTest {
             cleanupTimeoutMillis = 50,
         )
 
-        val profile = extractor.extract(apk)
+        assertFailsWith<ToolProcessCleanupException> { extractor.extract(apk) }
 
-        assertEquals("unknown", profile.versionName)
         assertEquals(1, started.get())
         assertTrue(processes.single().destroyCalls.get() > 0)
+        assertTrue(processes.single().closedStreams.get() >= 3)
+    }
+
+    @Test
+    fun `reader executor that ignores close and interrupt fails cleanup closed`() {
+        val analyzer = Files.createTempFile("stuck-reader-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val readerPrefix = "stuck-tool-reader-${System.nanoTime()}"
+        val process = ReaderStuckProcess()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { process },
+            cleanupTimeoutMillis = 50,
+            readerThreadNamePrefix = readerPrefix,
+        )
+
+        try {
+            assertFailsWith<ToolProcessCleanupException> { extractor.extract(apk) }
+
+            assertTrue(process.destroyCalls.get() > 0)
+            assertTrue(process.closedStreams.get() >= 3)
+        } finally {
+            process.releaseReader.countDown()
+            assertNoReaderThreads(readerPrefix)
+        }
+    }
+
+    @Test
+    fun `process handle enumeration failure still kills parent and closes streams`() {
+        val analyzer = Files.createTempFile("handle-failure-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val process = HandleEnumerationFailureProcess()
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { process },
+            toolTimeoutMillis = 20,
+            cleanupTimeoutMillis = 50,
+        )
+
+        assertFailsWith<ToolProcessCleanupException> { extractor.extract(apk) }
+
+        assertTrue(process.destroyCalls.get() > 0)
+        assertTrue(process.closedStreams.get() >= 3)
+    }
+
+    @Test
+    fun `cancellation is propagated after process and streams are cleaned`() {
+        val analyzer = Files.createTempFile("cancel-propagation-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val marker = CancellationException("marker")
+        val process = WaitFailureProcess(marker)
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { process },
+        )
+
+        val caught = assertFailsWith<CancellationException> { extractor.extract(apk) }
+
+        assertTrue(caught === marker)
+        assertTrue(process.destroyCalls.get() > 0)
+        assertTrue(process.closedStreams.get() >= 3)
+    }
+
+    @Test
+    fun `error is propagated after process and streams are cleaned`() {
+        val analyzer = Files.createTempFile("error-propagation-analyzer-", "")
+        val apk = browserApk(dex = "extension-id", terrace = "storage")
+        val marker = AssertionError("marker")
+        val process = WaitFailureProcess(marker)
+        val extractor = BrowserProfileExtractor.testing(
+            analyzerCandidates = { listOf(analyzer) },
+            signerCandidates = { emptyList() },
+            startProcess = { process },
+        )
+
+        val caught = assertFailsWith<AssertionError> { extractor.extract(apk) }
+
+        assertTrue(caught === marker)
+        assertTrue(process.destroyCalls.get() > 0)
+        assertTrue(process.closedStreams.get() >= 3)
     }
 
     @Test
@@ -443,10 +557,27 @@ class BrowserProfileExtractorTest {
 
     private class StubbornSuccessfulProcess(output: String) : Process() {
         val destroyCalls = AtomicInteger()
-        private val stdout = ByteArrayInputStream(output.encodeToByteArray())
-        private val stderr = ByteArrayInputStream(ByteArray(0))
+        val closedStreams = AtomicInteger()
+        private val stdin = object : ByteArrayOutputStream() {
+            override fun close() {
+                closedStreams.incrementAndGet()
+                super.close()
+            }
+        }
+        private val stdout = object : ByteArrayInputStream(output.encodeToByteArray()) {
+            override fun close() {
+                closedStreams.incrementAndGet()
+                super.close()
+            }
+        }
+        private val stderr = object : ByteArrayInputStream(ByteArray(0)) {
+            override fun close() {
+                closedStreams.incrementAndGet()
+                super.close()
+            }
+        }
 
-        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getOutputStream(): OutputStream = stdin
         override fun getInputStream(): InputStream = stdout
         override fun getErrorStream(): InputStream = stderr
         override fun waitFor(): Int = 0
@@ -460,6 +591,127 @@ class BrowserProfileExtractorTest {
             return this
         }
         override fun isAlive(): Boolean = true
+    }
+
+    private class ReaderStuckProcess : Process() {
+        val releaseReader = CountDownLatch(1)
+        val destroyCalls = AtomicInteger()
+        val closedStreams = AtomicInteger()
+        private val stdin = trackedOutput(closedStreams)
+        private val stdout = object : InputStream() {
+            override fun read(): Int {
+                while (releaseReader.count != 0L) {
+                    try {
+                        releaseReader.await()
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                return -1
+            }
+
+            override fun close() {
+                closedStreams.incrementAndGet()
+            }
+        }
+        private val stderr = trackedInput(ByteArray(0), closedStreams)
+
+        override fun getOutputStream(): OutputStream = stdin
+        override fun getInputStream(): InputStream = stdout
+        override fun getErrorStream(): InputStream = stderr
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyCalls.incrementAndGet()
+        }
+        override fun destroyForcibly(): Process {
+            destroyCalls.incrementAndGet()
+            return this
+        }
+        override fun isAlive(): Boolean = false
+    }
+
+    private class HandleEnumerationFailureProcess : Process() {
+        val destroyCalls = AtomicInteger()
+        val closedStreams = AtomicInteger()
+        private val destroyed = CountDownLatch(1)
+        private val stdin = trackedOutput(closedStreams)
+        private val stdout = trackedInput(ByteArray(0), closedStreams)
+        private val stderr = trackedInput(ByteArray(0), closedStreams)
+
+        override fun getOutputStream(): OutputStream = stdin
+        override fun getInputStream(): InputStream = stdout
+        override fun getErrorStream(): InputStream = stderr
+        override fun waitFor(): Int {
+            destroyed.await()
+            return -1
+        }
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean =
+            destroyed.await(timeout, unit)
+        override fun exitValue(): Int {
+            if (destroyed.count != 0L) throw IllegalThreadStateException()
+            return -1
+        }
+        override fun destroy() {
+            destroyCalls.incrementAndGet()
+            destroyed.countDown()
+        }
+        override fun destroyForcibly(): Process {
+            destroyCalls.incrementAndGet()
+            destroyed.countDown()
+            return this
+        }
+        override fun isAlive(): Boolean = destroyed.count != 0L
+        override fun toHandle(): ProcessHandle = throw IllegalStateException("private path")
+    }
+
+    private class WaitFailureProcess(
+        private val failure: Throwable,
+    ) : Process() {
+        val destroyCalls = AtomicInteger()
+        val closedStreams = AtomicInteger()
+        private val destroyed = CountDownLatch(1)
+        private val stdin = trackedOutput(closedStreams)
+        private val stdout = trackedInput(ByteArray(0), closedStreams)
+        private val stderr = trackedInput(ByteArray(0), closedStreams)
+
+        override fun getOutputStream(): OutputStream = stdin
+        override fun getInputStream(): InputStream = stdout
+        override fun getErrorStream(): InputStream = stderr
+        override fun waitFor(): Int = throw failure
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = throw failure
+        override fun exitValue(): Int {
+            if (destroyed.count != 0L) throw IllegalThreadStateException()
+            return -1
+        }
+        override fun destroy() {
+            destroyCalls.incrementAndGet()
+            destroyed.countDown()
+        }
+        override fun destroyForcibly(): Process {
+            destroyCalls.incrementAndGet()
+            destroyed.countDown()
+            return this
+        }
+        override fun isAlive(): Boolean = destroyed.count != 0L
+    }
+
+    private companion object {
+        fun trackedInput(bytes: ByteArray, closes: AtomicInteger): InputStream =
+            object : ByteArrayInputStream(bytes) {
+                override fun close() {
+                    closes.incrementAndGet()
+                    super.close()
+                }
+            }
+
+        fun trackedOutput(closes: AtomicInteger): OutputStream =
+            object : ByteArrayOutputStream() {
+                override fun close() {
+                    closes.incrementAndGet()
+                    super.close()
+                }
+            }
     }
 }
 
@@ -502,6 +754,20 @@ object BrowserProfileExtractorProcessFixture {
                     Thread.sleep(5)
                 }
             }
+            "orphan-parent" -> {
+                val descendant = ProcessBuilder(
+                    Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-cp",
+                    System.getProperty("java.class.path"),
+                    BrowserProfileExtractorProcessFixture::class.java.name,
+                    "pipe-holder",
+                ).inheritIO().start()
+                val pidFile = Path.of(arguments[1])
+                writePid(pidFile, ProcessHandle.current().pid())
+                writePid(pidFile, descendant.pid())
+                Thread.sleep(300)
+            }
+            "pipe-holder" -> while (true) Thread.sleep(1_000)
             "descendant" -> while (true) Thread.sleep(1_000)
             else -> error("unknown fixture mode")
         }

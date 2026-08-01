@@ -132,11 +132,15 @@ internal class DesktopProfileImportController private constructor(
         outcome: DesktopProfileImportOutcome,
     ) {
         beforeOutcomeDelivery()
-        synchronized(lock) {
+        val accepted = synchronized(lock) {
             if (!closed && current === operation) {
-                onOutcome(operation.ticket, outcome)
+                current = null
+                true
+            } else {
+                false
             }
         }
+        if (accepted) onOutcome(operation.ticket, outcome)
     }
 
     private fun isCurrent(operation: ImportOperation): Boolean = synchronized(lock) {

@@ -13,6 +13,7 @@ import java.security.KeyPairGenerator
 import java.util.Collections
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -91,6 +92,70 @@ class DesktopProfileImportControllerTest {
             assertTrue(outcomes.isEmpty())
         } finally {
             releaseOutcome.countDown()
+            controller.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `outcome callback does not hold controller lock while another thread invalidates`() {
+        val callbackEntered = CountDownLatch(1)
+        val invalidationReturned = CountDownLatch(1)
+        val callbackObservedInvalidation = AtomicBoolean()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val invalidator = Executors.newSingleThreadExecutor()
+        val controller = DesktopProfileImportController.testing(
+            scope = scope,
+            prepare = { _, _, _ -> DesktopPreparedProfileImport.WithoutPersistence(option("ok")) },
+            commit = { prepared, _ -> prepared.option },
+            onOutcome = { _, _ ->
+                callbackEntered.countDown()
+                callbackObservedInvalidation.set(
+                    invalidationReturned.await(1, TimeUnit.SECONDS),
+                )
+            },
+        )
+
+        try {
+            val job = controller.start(ticket(1), Path.of("cross-thread.json"))
+            assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+
+            invalidator.submit {
+                controller.invalidate()
+                invalidationReturned.countDown()
+            }
+
+            runBlocking { withTimeout(5_000) { job.join() } }
+            assertTrue(callbackObservedInvalidation.get())
+        } finally {
+            controller.close()
+            scope.cancel()
+            invalidator.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `outcome callback may reenter invalidate and close without deadlock`() {
+        val completed = CountDownLatch(1)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        lateinit var controller: DesktopProfileImportController
+        controller = DesktopProfileImportController.testing(
+            scope = scope,
+            prepare = { _, _, _ -> DesktopPreparedProfileImport.WithoutPersistence(option("ok")) },
+            commit = { prepared, _ -> prepared.option },
+            onOutcome = { _, _ ->
+                controller.invalidate()
+                controller.close()
+                completed.countDown()
+            },
+        )
+
+        try {
+            val job = controller.start(ticket(1), Path.of("reentrant.json"))
+
+            assertTrue(completed.await(5, TimeUnit.SECONDS))
+            runBlocking { withTimeout(5_000) { job.join() } }
+        } finally {
             controller.close()
             scope.cancel()
         }

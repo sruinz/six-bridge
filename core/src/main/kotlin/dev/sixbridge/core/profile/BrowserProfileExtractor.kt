@@ -6,12 +6,14 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.LockSupport
 import kotlin.io.path.exists
@@ -131,6 +133,10 @@ class BrowserProfileExtractor private constructor(
         } catch (_: Exception) {
             return null
         }
+        val descendants = ProcessDescendantTracker(
+            process,
+            "$readerThreadNamePrefix-descendant-watcher",
+        )
         val readerSequence = AtomicInteger()
         val readers = Executors.newFixedThreadPool(2) { runnable ->
             Thread(
@@ -152,7 +158,7 @@ class BrowserProfileExtractor private constructor(
                 throwCompletedReaderFailure(stderr)
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0L) {
-                    terminateProcessSession(process, stdout, stderr, readers)
+                    cleanupOrThrow(process, descendants, stdout, stderr, readers)
                     return null
                 }
                 val waitMillis = minOf(
@@ -163,7 +169,7 @@ class BrowserProfileExtractor private constructor(
             }
             checkCancelled()
             if (process.isAlive) {
-                terminateProcessSession(process, stdout, stderr, readers)
+                cleanupOrThrow(process, descendants, stdout, stderr, readers)
                 return null
             }
             val readerDeadline = System.nanoTime() +
@@ -171,25 +177,54 @@ class BrowserProfileExtractor private constructor(
             val output = awaitReader(stdout, readerDeadline)
             awaitReader(stderr, readerDeadline)
             val exitValue = process.exitValue()
-            if (!finishExitedProcessSession(process, readers)) return null
+            cleanupOrThrow(process, descendants, stdout, stderr, readers)
             if (exitValue != 0) return null
             output.decodeToString().trim().takeIf(String::isNotEmpty)
         } catch (error: InterruptedException) {
-            terminateProcessSession(process, stdout, stderr, readers)
+            val cleanupFailure = cleanupFailure(process, descendants, stdout, stderr, readers)
             Thread.currentThread().interrupt()
             throw CancellationException("browser profile 외부 분석이 취소되었습니다.").also {
                 it.initCause(error)
+                cleanupFailure?.let(it::addSuppressed)
             }
         } catch (error: CancellationException) {
-            terminateProcessSession(process, stdout, stderr, readers)
+            cleanupFailure(process, descendants, stdout, stderr, readers)
+                ?.let(error::addSuppressed)
             throw error
         } catch (error: Error) {
-            terminateProcessSession(process, stdout, stderr, readers)
+            cleanupFailure(process, descendants, stdout, stderr, readers)
+                ?.let(error::addSuppressed)
+            throw error
+        } catch (error: ToolProcessCleanupException) {
             throw error
         } catch (_: Exception) {
-            terminateProcessSession(process, stdout, stderr, readers)
+            cleanupOrThrow(process, descendants, stdout, stderr, readers)
             null
         }
+    }
+
+    private fun cleanupOrThrow(
+        process: Process,
+        descendants: ProcessDescendantTracker,
+        stdout: Future<ByteArray>,
+        stderr: Future<ByteArray>,
+        readers: ExecutorService,
+    ) {
+        cleanupFailure(process, descendants, stdout, stderr, readers)?.let { throw it }
+    }
+
+    private fun cleanupFailure(
+        process: Process,
+        descendants: ProcessDescendantTracker,
+        stdout: Future<ByteArray>,
+        stderr: Future<ByteArray>,
+        readers: ExecutorService,
+    ): ToolProcessCleanupException? = if (
+        terminateProcessSession(process, descendants, stdout, stderr, readers)
+    ) {
+        null
+    } else {
+        ToolProcessCleanupException()
     }
 
     private fun readToolStream(input: InputStream, capture: Boolean): ByteArray {
@@ -239,35 +274,24 @@ class BrowserProfileExtractor private constructor(
         else -> throw ToolReaderFailureException()
     }
 
-    private fun finishExitedProcessSession(
-        process: Process,
-        readers: ExecutorService,
-    ): Boolean {
-        closeProcessStreams(process)
-        readers.shutdown()
-        try {
-            return readers.awaitTermination(cleanupTimeoutMillis, TimeUnit.MILLISECONDS) &&
-                !process.isAlive
-        } catch (error: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw CancellationException("browser profile output 정리가 취소되었습니다.").also {
-                it.initCause(error)
-            }
-        }
-    }
-
     private fun terminateProcessSession(
         process: Process,
+        descendants: ProcessDescendantTracker,
         stdout: Future<ByteArray>,
         stderr: Future<ByteArray>,
         readers: ExecutorService,
     ): Boolean {
-        val handles = processHandles(process)
-        // processHandles는 descendants 뒤에 parent를 두므로 자식부터 종료한다.
-        handles.forEach { handle ->
+        descendants.observeNow()
+        val initialHandles = descendants.snapshot()
+        // 관찰 기록의 깊이로 자식을 먼저 종료한다.
+        initialHandles.forEach { handle ->
             runCatching { if (handle.isAlive) handle.destroyForcibly() }
         }
         runCatching { process.destroyForcibly() }
+        val tracked = descendants.stopAndSnapshot(cleanupTimeoutMillis)
+        tracked.handles.forEach { handle ->
+            runCatching { if (handle.isAlive) handle.destroyForcibly() }
+        }
         closeProcessStreams(process)
         stdout.cancel(true)
         stderr.cancel(true)
@@ -276,23 +300,24 @@ class BrowserProfileExtractor private constructor(
             TimeUnit.MILLISECONDS.toNanos(cleanupTimeoutMillis)
         while (System.nanoTime() < deadline) {
             val processAlive = runCatching { process.isAlive }.getOrDefault(true)
-            val descendantAlive = handles.any { handle ->
+            val descendantAlive = tracked.handles.any { handle ->
                 runCatching { handle.isAlive }.getOrDefault(true)
             }
-            if (!processAlive && !descendantAlive && readers.isTerminated) return true
+            if (
+                !processAlive &&
+                !descendantAlive &&
+                readers.isTerminated &&
+                tracked.stopped &&
+                !tracked.observationFailed
+            ) return true
             LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1))
         }
         closeProcessStreams(process)
         return !runCatching { process.isAlive }.getOrDefault(true) &&
-            handles.none { runCatching { it.isAlive }.getOrDefault(true) } &&
-            readers.isTerminated
-    }
-
-    private fun processHandles(process: Process): List<ProcessHandle> = try {
-        val parent = process.toHandle()
-        parent.descendants().use { descendants -> descendants.toList() } + parent
-    } catch (_: UnsupportedOperationException) {
-        emptyList()
+            tracked.handles.none { runCatching { it.isAlive }.getOrDefault(true) } &&
+            readers.isTerminated &&
+            tracked.stopped &&
+            !tracked.observationFailed
     }
 
     private fun closeProcessStreams(process: Process) {
@@ -360,8 +385,126 @@ class BrowserProfileExtractor private constructor(
     }
 }
 
+private data class TrackedProcessSnapshot(
+    val handles: List<ProcessHandle>,
+    val stopped: Boolean,
+    val observationFailed: Boolean,
+)
+
+private class ProcessDescendantTracker(
+    process: Process,
+    threadName: String,
+) {
+    private val failed = AtomicBoolean()
+    private val parent = try {
+        process.toHandle()
+    } catch (_: UnsupportedOperationException) {
+        null
+    } catch (_: RuntimeException) {
+        failed.set(true)
+        null
+    }
+    private val running = AtomicBoolean(parent != null)
+    private val observed = ConcurrentHashMap<Long, ObservedProcess>()
+    private val watcher = parent?.let {
+        Thread({ watch() }, threadName).apply { isDaemon = true }
+    }
+
+    init {
+        observeNow()
+        watcher?.start()
+    }
+
+    fun observeNow() {
+        val root = parent ?: return
+        try {
+            root.descendants().use { descendants ->
+                descendants.forEach { handle ->
+                    val candidate = ObservedProcess(handle, depthFromRoot(root, handle))
+                    observed.compute(handle.pid()) { _, previous ->
+                        if (previous == null || candidate.depth > previous.depth) {
+                            candidate
+                        } else {
+                            previous
+                        }
+                    }
+                }
+            }
+        } catch (_: UnsupportedOperationException) {
+            running.set(false)
+        } catch (_: RuntimeException) {
+            failed.set(true)
+            running.set(false)
+        }
+    }
+
+    fun snapshot(): List<ProcessHandle> = observed.values
+        .sortedByDescending(ObservedProcess::depth)
+        .map(ObservedProcess::handle)
+
+    fun stopAndSnapshot(timeoutMillis: Long): TrackedProcessSnapshot {
+        observeNow()
+        running.set(false)
+        watcher?.interrupt()
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (watcher?.isAlive == true && System.nanoTime() < deadline) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1))
+        }
+        return TrackedProcessSnapshot(
+            handles = snapshot(),
+            stopped = watcher?.isAlive != true,
+            observationFailed = failed.get(),
+        )
+    }
+
+    private fun watch() {
+        val root = parent ?: return
+        while (running.get()) {
+            observeNow()
+            val rootAlive = try {
+                root.isAlive
+            } catch (_: RuntimeException) {
+                failed.set(true)
+                false
+            }
+            if (!rootAlive) break
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(WATCH_POLL_MILLIS))
+        }
+        observeNow()
+        running.set(false)
+    }
+
+    private fun depthFromRoot(root: ProcessHandle, handle: ProcessHandle): Int {
+        var cursor = handle
+        var depth = 1
+        repeat(MAX_TRACKED_PROCESS_DEPTH) {
+            val parentHandle = try {
+                cursor.parent().orElse(null)
+            } catch (_: RuntimeException) {
+                failed.set(true)
+                return depth
+            } ?: return depth
+            if (parentHandle.pid() == root.pid()) return depth
+            cursor = parentHandle
+            depth += 1
+        }
+        return depth
+    }
+
+    private data class ObservedProcess(
+        val handle: ProcessHandle,
+        val depth: Int,
+    )
+
+    private companion object {
+        const val MAX_TRACKED_PROCESS_DEPTH = 64
+        const val WATCH_POLL_MILLIS = 5L
+    }
+}
+
 private class ToolOutputLimitException : IllegalStateException()
 private class ToolReaderFailureException : IllegalStateException()
+internal class ToolProcessCleanupException : IllegalStateException()
 
 private fun defaultApkAnalyzerCandidates(): List<Path> = buildList {
     System.getenv("ANDROID_SDK_ROOT")?.let { root ->
