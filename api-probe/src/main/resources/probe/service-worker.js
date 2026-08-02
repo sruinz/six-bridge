@@ -354,13 +354,13 @@ function createOffscreenLeaseManager(environment, requestedLifecycleTimeoutMs) {
     acquire(deadlineAt) {
       return serialize(async () => {
         if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
+        if (closeAttempt) throw new Error('offscreen lifecycle is closing');
         if (leaseCount === 0) {
           const existed = await withDeadline(
             () => environment.chrome.offscreen.hasDocument(),
             boundedTimeout(deadlineAt),
           );
           if (!existed) {
-            if (closeAttempt) throw new Error('offscreen close is still pending');
             if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
             await beginCreate(deadlineAt);
           } else if (!closeAttempt && !ownedByProbe) {

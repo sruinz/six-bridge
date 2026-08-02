@@ -538,7 +538,12 @@ class ProbeCaseSafetyTest {
               const events = [];
               const first = descriptor(`${'$'}{prefix}-first`);
               const second = descriptor(`${'$'}{prefix}-second`);
-              const tokens = [`${'$'}{prefix}-run-token-0001`, `${'$'}{prefix}-run-token-0002`];
+              const third = descriptor(`${'$'}{prefix}-third`);
+              const tokens = [
+                `${'$'}{prefix}-run-token-0001`,
+                `${'$'}{prefix}-run-token-0002`,
+                `${'$'}{prefix}-run-token-0003`,
+              ];
               let listener;
               const chrome = {
                 offscreen: lifecycle(events),
@@ -572,7 +577,10 @@ class ProbeCaseSafetyTest {
               };
               listener = installServiceWorkerBridge(
                 { chrome },
-                async () => ({ ok: true, json: async () => ({ groupId: 'base-runtime', cases: [first, second] }) }),
+                async () => ({
+                  ok: true,
+                  json: async () => ({ groupId: 'base-runtime', cases: [first, second, third] }),
+                }),
                 {
                   lifecycleTimeoutMs: 10,
                   timeoutMs: operationTimeoutMs,
@@ -583,7 +591,7 @@ class ProbeCaseSafetyTest {
               const run = (caseId) => new Promise((resolve) => listener(
                 { caseId, type: 'six-probe-run' }, sender, resolve,
               ));
-              return { events, first, run, second };
+              return { events, first, run, second, third };
             }
 
             let createCalls = 0;
@@ -614,6 +622,26 @@ class ProbeCaseSafetyTest {
             }));
             const closeHangFirst = await terminal(closeHang.run(closeHang.first.id), 1_200);
             const closeHangSecond = await terminal(closeHang.run(closeHang.second.id));
+
+            let lateCloseExists = false;
+            let lateCloseCalls = 0;
+            const lateClose = harness('late-close', (events) => ({
+              hasDocument: async () => lateCloseExists,
+              createDocument: async () => { events.push('create'); lateCloseExists = true; },
+              closeDocument: async () => {
+                lateCloseCalls += 1;
+                events.push(`close:${'$'}{lateCloseCalls}`);
+                if (lateCloseCalls === 1) await wait(50);
+                lateCloseExists = false;
+                events.push(`close-resolved:${'$'}{lateCloseCalls}`);
+              },
+            }));
+            const lateCloseFirst = await terminal(lateClose.run(lateClose.first.id), 1_200);
+            const lateCloseSecondStartedAt = Date.now();
+            const lateCloseSecond = await terminal(lateClose.run(lateClose.second.id));
+            const lateCloseSecondElapsed = Date.now() - lateCloseSecondStartedAt;
+            await wait(70);
+            const lateCloseThird = await terminal(lateClose.run(lateClose.third.id));
 
             let lateCreateCalls = 0;
             let lateExists = false;
@@ -648,6 +676,12 @@ class ProbeCaseSafetyTest {
               lateCreateFirst,
               lateCreateSecond,
               lateFirstElapsed,
+              lateCloseCalls,
+              lateCloseEvents: lateClose.events,
+              lateCloseFirst,
+              lateCloseSecond,
+              lateCloseSecondElapsed,
+              lateCloseThird,
             }));
             """.trimIndent(),
         ).let { Json.parseToJsonElement(it).jsonObject }
@@ -664,10 +698,24 @@ class ProbeCaseSafetyTest {
         assertTerminal("createHangFirst", "FAILED")
         assertTerminal("createHangSecond", "VERIFIED")
         assertTerminal("closeHangFirst", "VERIFIED")
-        assertTerminal("closeHangSecond", "VERIFIED")
+        assertTerminal("closeHangSecond", "FAILED")
+        assertTerminal("lateCloseFirst", "VERIFIED")
+        assertTerminal("lateCloseSecond", "FAILED")
+        assertTerminal("lateCloseThird", "VERIFIED")
         assertTerminal("lateCreateFirst", "FAILED")
         assertTerminal("lateCreateSecond", "VERIFIED")
         assertEquals("1", output.getValue("closeCalls").jsonPrimitive.content)
+        val closeHangEvents = output.getValue("closeHangEvents").jsonArray.map { it.jsonPrimitive.content }
+        assertFalse("send:close-hang-second" in closeHangEvents)
+        val lateCloseEvents = output.getValue("lateCloseEvents").jsonArray.map { it.jsonPrimitive.content }
+        assertFalse("send:late-close-second" in lateCloseEvents)
+        assertTrue(lateCloseEvents.indexOf("close-resolved:1") < lateCloseEvents.indexOf("send:late-close-third"))
+        assertEquals("2", output.getValue("lateCloseCalls").jsonPrimitive.content)
+        assertTrue(output.getValue("lateCloseSecondElapsed").jsonPrimitive.content.toInt() < 45)
+        val lateCloseMessage = output.getValue("lateCloseSecond").jsonObject
+            .getValue("result").jsonObject.getValue("detail").jsonObject
+            .getValue("message").jsonPrimitive.content
+        assertTrue(lateCloseMessage.contains("offscreen lifecycle is closing"))
         val lateEvents = output.getValue("lateCreateEvents").jsonArray.map { it.jsonPrimitive.content }
         assertEquals(1, lateEvents.count { it == "close" })
         assertTrue(lateEvents.indexOf("close") > lateEvents.indexOf("result:late-create-second"))
