@@ -295,10 +295,45 @@ async function fixtureWorker(directory, behavior, firstOnly = true) {
     else if (selected === 'stdout-overflow') { process.stdout.write('x'.repeat(300)); setInterval(() => {}, 1000); }
     else if (selected === 'stderr-overflow') { process.stderr.write('x'.repeat(5000)); setInterval(() => {}, 1000); }
     else if (selected === 'invalid-json') { process.stdout.write('{"bad":\\n'); process.exit(0); }
+    else if (selected === 'duplicate-status') { process.stdout.write('{"status":"error","status":"created","version":1}\\n'); process.exit(0); }
+    else if (selected === 'duplicate-version') { process.stdout.write('{"status":"created","version":2,"version":1}\\n'); process.exit(0); }
+    else if (selected === 'leading-whitespace') { process.stdout.write(' {"status":"created","version":1}\\n'); process.exit(0); }
+    else if (selected === 'trailing-whitespace') { process.stdout.write('{"status":"created","version":1} \\n'); process.exit(0); }
+    else if (selected === 'bom') { process.stdout.write('\\ufeff{"status":"created","version":1}\\n'); process.exit(0); }
+    else if (selected === 'extra-newline') { process.stdout.write('{"status":"created","version":1}\\n\\n'); process.exit(0); }
+    else if (selected === 'concatenated-json') { process.stdout.write('{"status":"created","version":1}{"status":"created","version":1}\\n'); process.exit(0); }
+    else if (selected === 'leading-log') { process.stdout.write('fixture log\\n{"status":"created","version":1}\\n'); process.exit(0); }
+    else if (selected === 'noncanonical-key-order') { process.stdout.write('{"version":1,"status":"created"}\\n'); process.exit(0); }
     else if (selected === 'abnormal-exit') process.exit(42);
     else throw new Error('unknown fixture behavior');
   `);
   return workerPath;
+}
+
+async function fifoWorker(directory) {
+  const workerPath = path.join(directory, 'fixture-fifo.cjs');
+  const startedPath = path.join(directory, 'started');
+  const readyPath = path.join(directory, 'ready');
+  const releasePath = path.join(directory, 'release');
+  await writeFile(workerPath, `
+    const fs = require('node:fs');
+    if (process.argv[2] !== '--storage-worker') process.exit(99);
+    const id = process.env.SIX_PROBE_SESSION_ID;
+    fs.appendFileSync(${JSON.stringify(startedPath)}, id + '\\n');
+    const done = () => {
+      process.stdout.write(JSON.stringify({ status: 'created', version: 1 }) + '\\n');
+      process.exit(0);
+    };
+    if (id !== 'fifo-1') done();
+    fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready');
+    const timer = setInterval(() => {
+      if (fs.existsSync(${JSON.stringify(releasePath)})) {
+        clearInterval(timer);
+        done();
+      }
+    }, 5);
+  `);
+  return { readyPath, releasePath, startedPath, workerPath };
 }
 
 function instrumentedSpawn() {
@@ -306,11 +341,15 @@ function instrumentedSpawn() {
   let cleanup = 0;
   let maximum = 0;
   const signals = [];
+  const started = [];
   let storage = 0;
   return {
     spawnProcess(command, args, options) {
       if (args[1] === '--cleanup-worker') cleanup += 1;
-      else storage += 1;
+      else {
+        storage += 1;
+        started.push(options.env.SIX_PROBE_SESSION_ID);
+      }
       const child = spawn(command, args, options);
       const originalKill = child.kill.bind(child);
       child.kill = (signal) => {
@@ -322,7 +361,7 @@ function instrumentedSpawn() {
       child.once('close', () => { active -= 1; });
       return child;
     },
-    stats() { return { active, cleanup, maximum, signals: [...signals], storage }; },
+    stats() { return { active, cleanup, maximum, signals: [...signals], started: [...started], storage }; },
   };
 }
 
@@ -630,7 +669,22 @@ test('부모 receiver는 시작 CWD가 교체되어도 chdir 없이 계속 처�
 
 test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot을 반환한다', async (t) => {
   const productionWorker = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
-  const behaviors = ['timeout', 'stdout-overflow', 'stderr-overflow', 'invalid-json', 'abnormal-exit'];
+  const behaviors = [
+    'timeout',
+    'stdout-overflow',
+    'stderr-overflow',
+    'invalid-json',
+    'duplicate-status',
+    'duplicate-version',
+    'leading-whitespace',
+    'trailing-whitespace',
+    'bom',
+    'extra-newline',
+    'concatenated-json',
+    'leading-log',
+    'noncanonical-key-order',
+    'abnormal-exit',
+  ];
   for (const behavior of behaviors) {
     await t.test(behavior, async () => {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), `six-probe-boundary-${behavior}-`));
@@ -697,32 +751,45 @@ test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot�
 });
 
 test('global worker pool은 FIFO 상한과 503 backpressure를 적용한다', async (t) => {
-  const productionWorker = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-pool-'));
   const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
-  const storageWorkerPath = await fixtureWorker(fixtureDir, 'timeout');
+  const fifo = await fifoWorker(fixtureDir);
   const tracker = instrumentedSpawn();
   const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
-    cleanupWorkerPath: productionWorker,
-    pool: evidenceReceiverTestHooks.workerPool(1, 1),
+    cleanupWorkerPath: fifo.workerPath,
+    pool: evidenceReceiverTestHooks.workerPool(1, 2),
     spawnProcess: tracker.spawnProcess,
-    storageWorkerPath,
-    workerTimeoutMs: 50,
+    storageWorkerPath: fifo.workerPath,
+    workerTimeoutMs: 1_000,
   });
   await receiver.listen({ host: '127.0.0.1', port: 0 });
   t.after(() => receiver.close());
   const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
 
-  const responses = await Promise.all([
-    post(baseUrl, evidence()),
-    post(baseUrl, evidence()),
-    post(baseUrl, evidence()),
-  ]);
-  assert.deepEqual(responses.map((value) => value.status).sort(), [201, 409, 503]);
-  assert.equal(responses.find((value) => value.status === 503).headers['retry-after'], '1');
+  const taskIds = ['fifo-1', 'fifo-2', 'fifo-3', 'fifo-4'];
+  const submitted = [];
+  const submit = (sessionId) => {
+    submitted.push(sessionId);
+    return post(baseUrl, evidence({ sessionId }));
+  };
+  const requests = [submit(taskIds[0])];
+  await waitForFile(fifo.readyPath);
+  for (const sessionId of taskIds.slice(1)) {
+    requests.push(submit(sessionId));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  await writeFile(fifo.releasePath, 'release');
+
+  const responses = await Promise.all(requests);
+  assert.deepEqual(responses.map((value) => value.status), [201, 201, 201, 503]);
+  assert.equal(responses[3].headers['retry-after'], '1');
+  const childStarted = (await readFile(fifo.startedPath, 'utf8')).trimEnd().split('\n');
+  assert.deepEqual(submitted, taskIds);
+  assert.deepEqual(childStarted, submitted.slice(0, 3));
+  assert.deepEqual(tracker.stats().started, submitted.slice(0, 3));
   assert.equal(tracker.stats().maximum, 1);
   assert.equal(tracker.stats().active, 0);
-  assert.equal(tracker.stats().cleanup, 1);
+  assert.equal(tracker.stats().cleanup, 0);
 });
 
 test('원점 위조 flood는 worker를 만들지 않고 6개 group은 bounded pool에서 처리된다', async (t) => {

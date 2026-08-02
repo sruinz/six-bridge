@@ -717,15 +717,22 @@ function parseWorkerResult(result, allowed) {
   if (!text.endsWith('\n') || text.indexOf('\n') !== text.length - 1) {
     throw new WorkerBoundaryError('invalid storage worker framing');
   }
+  const raw = text.slice(0, -1);
   let value;
   try {
-    value = JSON.parse(text.slice(0, -1));
+    rejectDuplicateKeys(raw);
+    value = JSON.parse(raw);
   } catch {
     throw new WorkerBoundaryError('invalid storage worker JSON');
   }
-  if (!exactFields(value, ['status', 'version']) || value.version !== 1
+  if (!exactFields(value, ['status', 'version'])
+    || Object.keys(value).join('\0') !== 'status\0version'
+    || value.version !== 1
     || typeof value.status !== 'string') {
     throw new WorkerBoundaryError('invalid storage worker protocol');
+  }
+  if (JSON.stringify(value) !== raw) {
+    throw new WorkerBoundaryError('noncanonical storage worker protocol');
   }
   const key = `${result.code}:${value.status}`;
   if (!allowed.has(key)) throw new WorkerBoundaryError('invalid storage worker result');
