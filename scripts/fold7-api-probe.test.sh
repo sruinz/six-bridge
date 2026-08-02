@@ -53,6 +53,7 @@ assert_no_log() {
 }
 
 new_fixture() {
+  hash -r
   case_root=$(mktemp -d "${TMPDIR:-/tmp}/six-probe-runner-test.XXXXXX")
   fixture_project="$case_root/project"
   fake_bin="$case_root/bin"
@@ -67,6 +68,11 @@ new_fixture() {
 
   cat >"$fake_bin/date" <<'EOF'
 #!/bin/bash
+if [ -n "${SIX_TEST_DATE_REPLACE_PROFILE:-}" ]; then
+  replacement="${SIX_TEST_DATE_REPLACE_PROFILE}.replacement.$$"
+  printf '%s\n' '{"fixture":"replaced"}' >"$replacement"
+  mv "$replacement" "$SIX_TEST_DATE_REPLACE_PROFILE"
+fi
 printf '%s\n' '20990102-030405'
 EOF
 
@@ -76,6 +82,23 @@ if [ "${SIX_TEST_SLEEP_MODE:-fast}" = block ] || [ "${1:-}" = 0.05 ]; then
   exec /bin/sleep "$@"
 fi
 exit 0
+EOF
+
+  cat >"$fake_bin/mkdir" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+target=
+for argument in "$@"; do target=$argument; done
+case "$target" in
+  */.local/evidence/api-probe/20990102-030405)
+    if [ "${SIX_TEST_MKDIR_MODE:-normal}" = evidence_race ] && [ ! -e "$target" ]; then
+      /bin/mkdir "$target"
+      printf '%s\n' 'competitor' >"$target/owner.txt"
+      exit 98
+    fi
+    ;;
+esac
+exec /bin/mkdir "$@"
 EOF
 
   cat >"$fake_bin/adb" <<'EOF'
@@ -98,8 +121,19 @@ case "$1" in
     if [ "$2" = --remove ]; then
       printf '%s\n' 'reverse-removed' >>"$SIX_TEST_EVENTS"
       [ "${SIX_TEST_ADB_MODE:-device}" != reverse_remove_fail ] || exit 75
-    elif [ "${SIX_TEST_ADB_MODE:-device}" = reverse_fail ]; then
-      exit 72
+    else
+      [ "$2" = --no-rebind ] && [ "$3" = tcp:47171 ] && [ "$4" = tcp:47171 ] || {
+        printf '%s\n' 'unsafe reverse rebind' >&2
+        exit 77
+      }
+      if [ "${SIX_TEST_ADB_MODE:-device}" = preexisting_reverse ]; then
+        printf '%s\n' 'pre-existing-mapping-preserved' >>"$SIX_TEST_EVENTS"
+        exit 76
+      fi
+      if [ "${SIX_TEST_ADB_MODE:-device}" = reverse_fail ]; then
+        exit 72
+      fi
+      printf '%s\n' 'reverse-set' >>"$SIX_TEST_EVENTS"
     fi
     ;;
   install)
@@ -204,6 +238,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 session_id=$(basename -- "$(dirname -- "$config")")
+[ -d "$root/$session_id" ] && [ ! -L "$root/$session_id" ] || {
+  printf '%s\n' 'receiver requires pre-owned safe session directory' >&2
+  exit 93
+}
+permissions=$(LC_ALL=C ls -ld "$root/$session_id")
+case "$permissions" in
+  d???------*) ;;
+  *) printf '%s\n' 'receiver requires owner-only session directory' >&2; exit 94 ;;
+esac
 trap 'printf "node-term=%s\\n" "$$" >>"$SIX_TEST_EVENTS"; exit 0' TERM INT
 if [ "$mode" != never_ready ]; then
   printf '%s\n' 'SIX API probe receiver: http://127.0.0.1:47171/evidence'
@@ -219,7 +262,7 @@ fi
 while :; do /bin/sleep 1; done
 EOF
 
-  chmod +x "$fake_bin/date" "$fake_bin/sleep" "$fake_bin/adb" "$fake_bin/sixbridge" "$fake_bin/node"
+  chmod +x "$fake_bin/date" "$fake_bin/sleep" "$fake_bin/mkdir" "$fake_bin/adb" "$fake_bin/sixbridge" "$fake_bin/node"
   events="$case_root/events.log"
   install_count="$case_root/install-count"
   : >"$events"
@@ -230,7 +273,7 @@ EOF
   export PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin"
   unset SIX_TEST_ADB_MODE SIX_TEST_BUILD_FAIL_GROUP SIX_TEST_INSTALL_FAIL_AT
   unset SIX_TEST_NODE_MODE SIX_TEST_PREPARE_FAIL SIX_TEST_VERIFY_FAIL SIX_TEST_PROFILE_FAIL
-  unset SIX_TEST_SLEEP_MODE
+  unset SIX_TEST_SLEEP_MODE SIX_TEST_MKDIR_MODE SIX_TEST_DATE_REPLACE_PROFILE
   runner="$fixture_project/scripts/fold7-api-probe.sh"
 }
 
@@ -241,6 +284,10 @@ cleanup_fixture() {
 [ -f "$runner_source" ] || fail "runner가 없어 RED: $runner_source"
 
 new_fixture
+expect_status 0 "$runner" --help
+expect_status 2 "$runner" --help --unknown value
+expect_status 2 "$runner" --help --serial serial-1 --profile "$profile"
+expect_status 2 "$runner" --help --help
 expect_status 2 "$runner"
 expect_status 2 "$runner" --serial serial-1
 expect_status 2 "$runner" --profile "$profile"
@@ -252,15 +299,25 @@ ln -s "$profile" "$case_root/profile-link.json"
 expect_status 2 "$runner" --serial serial-1 --profile "$case_root/profile-link.json"
 assert_no_log 'ADB '
 cleanup_fixture
-pass '인자·serial·profile symlink를 device 접근 전 거부'
+pass '단독 help만 허용하고 혼합 help·인자·serial·profile symlink를 device 접근 전 거부'
 
 new_fixture
 export SIX_TEST_ADB_MODE=offline
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'ADB -s serial-1 get-state'
-assert_no_log 'reverse tcp:47171'
+assert_no_log 'reverse --no-rebind tcp:47171'
 cleanup_fixture
 pass 'offline device 거부'
+
+new_fixture
+export SIX_TEST_ADB_MODE=preexisting_reverse
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
+assert_no_log 'ADB -s serial-1 install -r '
+assert_no_log 'ADB -s serial-1 reverse --remove tcp:47171'
+grep -Fx 'pre-existing-mapping-preserved' "$events" >/dev/null || fail '기존 reverse mapping 보존 증거가 없습니다'
+cleanup_fixture
+pass '기존 reverse mapping이 있으면 rebind·install·remove 없이 실패'
 
 new_fixture
 expect_status 0 "$runner" --serial serial-1 --profile "$profile"
@@ -273,6 +330,7 @@ assert_log_count 1 'ADB -s serial-1 shell am start -a android.intent.action.VIEW
 assert_log_count 1 'SIX probe verify-evidence --input '
 assert_log_count 1 'SIX probe build-profile --base '
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
+assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
 generate_line=$(grep -n -F 'SIX probe generate --output ' "$command_log" | cut -d: -f1)
 last_build_line=$(grep -n -F 'SIX build --input ' "$command_log" | tail -1 | cut -d: -f1)
 prepare_number=$(grep -n -F 'SIX probe prepare-session ' "$command_log" | cut -d: -f1)
@@ -295,6 +353,19 @@ node_term=$(sed -n 's/^node-term=//p' "$events")
 [ -n "$node_pid" ] && [ "$node_pid" = "$node_term" ] || fail "exact receiver PID를 종료하지 않았습니다"
 cleanup_fixture
 pass '정상 흐름의 6-group 순서·session·evidence·cleanup'
+
+new_fixture
+export SIX_TEST_DATE_REPLACE_PROFILE="$profile"
+expect_status 0 "$runner" --serial serial-1 --profile "$profile"
+fixture_project_real=$(CDPATH= cd -- "$fixture_project" && pwd -P)
+profile_snapshot="$fixture_project_real/.local/probe-build/20990102-030405/base-profile.json"
+grep -F '"fixture":"profile"' "$profile_snapshot" >/dev/null || fail '고정 FD의 원본 profile snapshot이 아닙니다'
+grep -F '"fixture":"replaced"' "$profile" >/dev/null || fail 'source profile 교체 fixture가 실행되지 않았습니다'
+assert_log_count 7 "--profile $profile_snapshot"
+assert_log_count 1 "--base $profile_snapshot"
+assert_no_log "$profile"
+cleanup_fixture
+pass '검증 직후 고정 FD에서 private profile snapshot을 만들고 source 교체를 격리'
 
 new_fixture
 export SIX_TEST_NODE_MODE=never_ready
@@ -368,6 +439,15 @@ grep -Fx keep "$fixture_project/.local/evidence/api-probe/20990102-030405/owner.
 assert_no_log 'ADB '
 cleanup_fixture
 pass '기존 evidence session no-overwrite'
+
+new_fixture
+export SIX_TEST_MKDIR_MODE=evidence_race
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+evidence_dir="$fixture_project/.local/evidence/api-probe/20990102-030405"
+grep -Fx competitor "$evidence_dir/owner.txt" >/dev/null || fail 'evidence mkdir 경쟁자 데이터를 보존하지 않았습니다'
+assert_no_log 'ADB '
+cleanup_fixture
+pass 'evidence session mkdir 경쟁에서 no-overwrite·device 접근 금지'
 
 new_fixture
 export SIX_TEST_NODE_MODE=partial

@@ -61,6 +61,7 @@ trap 'on_signal 143' TERM
 
 serial_seen=false
 profile_seen=false
+help_count=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --serial)
@@ -78,8 +79,8 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
-      usage
-      exit 0
+      help_count=$((help_count + 1))
+      shift
       ;;
     *)
       usage >&2
@@ -87,6 +88,15 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$help_count" -gt 0 ]; then
+  if [ "$help_count" -eq 1 ] && [ "$serial_seen" = false ] && [ "$profile_seen" = false ]; then
+    usage
+    exit 0
+  fi
+  usage >&2
+  exit 2
+fi
 
 [ "$serial_seen" = true ] && [ "$profile_seen" = true ] || {
   usage >&2
@@ -109,6 +119,10 @@ profile="$profile_parent/$(basename -- "$profile_input")"
   echo "오류: canonical profile을 검증할 수 없습니다." >&2
   exit 2
 }
+if ! exec 9<"$profile"; then
+  echo "오류: 검증한 profile을 open descriptor로 고정할 수 없습니다." >&2
+  exit 2
+fi
 
 adb_bin=$(command -v adb) || die "adb를 찾을 수 없습니다."
 node_bin=$(command -v node) || die "node를 찾을 수 없습니다."
@@ -149,10 +163,19 @@ evidence_dir="$project_dir/.local/evidence/api-probe/$session_id"
 [ ! -e "$build_dir" ] && [ ! -L "$build_dir" ] || die "기존 probe build session을 덮어쓸 수 없습니다: $build_dir"
 [ ! -e "$evidence_dir" ] && [ ! -L "$evidence_dir" ] || die "기존 probe evidence session을 덮어쓸 수 없습니다: $evidence_dir"
 mkdir "$build_dir" || die "probe build session을 만들 수 없습니다."
+mkdir "$evidence_dir" || die "probe evidence session을 만들 수 없습니다."
+profile_snapshot="$build_dir/base-profile.json"
+if ! cat <&9 >"$profile_snapshot"; then
+  exec 9<&-
+  die "고정된 profile descriptor에서 session snapshot을 만들 수 없습니다."
+fi
+exec 9<&-
+chmod 600 "$profile_snapshot"
+[ -f "$profile_snapshot" ] && [ ! -L "$profile_snapshot" ] || die "profile session snapshot을 검증할 수 없습니다."
 
 device_state=$("$adb_bin" -s "$serial" get-state) || die "ADB device 상태를 확인하지 못했습니다."
 [ "$device_state" = device ] || die "ADB device가 online device 상태가 아닙니다: $device_state"
-"$adb_bin" -s "$serial" reverse tcp:47171 tcp:47171
+"$adb_bin" -s "$serial" reverse --no-rebind tcp:47171 tcp:47171
 reverse_set=true
 
 source_dir="$build_dir/source"
@@ -162,7 +185,7 @@ artifact_args=()
 for group in "${groups[@]}"; do
   group_source="$source_dir/$group"
   bundle="$build_dir/$group.six"
-  "$sixbridge_bin" build --input "$group_source" --profile "$profile" --output "$bundle"
+  "$sixbridge_bin" build --input "$group_source" --profile "$profile_snapshot" --output "$bundle"
   crx="$build_dir/$group.crx"
   wrapper="$build_dir/$group-wrapper.apk"
   for artifact in "$bundle" "$crx" "$wrapper"; do
@@ -174,7 +197,7 @@ done
 session_config="$build_dir/session-config.json"
 "$sixbridge_bin" probe prepare-session \
   --session-id "$session_id" \
-  --profile "$profile" \
+  --profile "$profile_snapshot" \
   "${artifact_args[@]}" \
   --output "$session_config"
 [ -f "$session_config" ] && [ ! -L "$session_config" ] || die "session config를 검증할 수 없습니다."
@@ -266,7 +289,7 @@ fi
 candidate_profile="$build_dir/candidate-profile.json"
 [ ! -e "$candidate_profile" ] && [ ! -L "$candidate_profile" ] || die "후보 profile을 덮어쓸 수 없습니다."
 "$sixbridge_bin" probe build-profile \
-  --base "$profile" \
+  --base "$profile_snapshot" \
   --evidence "$evidence_dir" \
   --output "$candidate_profile"
 
