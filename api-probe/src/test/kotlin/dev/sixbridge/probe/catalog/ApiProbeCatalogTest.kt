@@ -19,9 +19,10 @@ class ApiProbeCatalogTest {
         assertEquals(58, catalog.entries.size)
         assertEquals(
             mapOf(
-                CatalogDisposition.PROBE to 37,
-                CatalogDisposition.PLATFORM_RESTRICTED to 5,
+                CatalogDisposition.PROBE to 33,
+                CatalogDisposition.PLATFORM_RESTRICTED to 6,
                 CatalogDisposition.LEGACY_APP to 2,
+                CatalogDisposition.LEGACY_MV2 to 3,
                 CatalogDisposition.INTERNAL to 14,
             ),
             catalog.entries.groupingBy { it.disposition }.eachCount(),
@@ -46,7 +47,14 @@ class ApiProbeCatalogTest {
             byDisposition.getValue(CatalogDisposition.LEGACY_APP),
         )
         assertEquals(
-            setOf("automation", "fileHandlers", "gcm", "inputMethodPrivate", "ttsEngine"),
+            setOf("browserAction", "declarativeWebRequest", "pageAction"),
+            byDisposition.getValue(CatalogDisposition.LEGACY_MV2),
+        )
+        assertEquals(
+            setOf(
+                "automation", "clipboard", "fileHandlers", "gcm", "inputMethodPrivate",
+                "ttsEngine",
+            ),
             byDisposition.getValue(CatalogDisposition.PLATFORM_RESTRICTED),
         )
     }
@@ -67,9 +75,7 @@ class ApiProbeCatalogTest {
             },
         )
         assertTrue(
-            probes.filter {
-                it.namespace in setOf("clipboard", "cookies", "debugger", "history", "proxy")
-            }
+            probes.filter { it.namespace in setOf("cookies", "debugger", "history", "proxy") }
                 .flatMap { it.cases }
                 .all {
                     it.mode == ProbeMode.PRESENCE_ONLY &&
@@ -104,12 +110,16 @@ class ApiProbeCatalogTest {
                     case.permissions.sorted().joinToString(","),
                     case.manifestKeys.sorted().joinToString(","),
                     case.expectedOutcome.name,
+                    case.cleanup?.member.orEmpty(),
+                    case.cleanup?.target?.name.orEmpty(),
+                    case.cleanup?.fixtureId.orEmpty(),
                 ).joinToString("|")
             }
 
         assertEquals(EXPECTED_DESCRIPTORS, actual)
         assertEquals(18, actual.values.count { "|SAFE_CALL|" in it })
-        assertEquals(19, actual.values.count { "|PRESENCE_ONLY|" in it })
+        assertEquals(2, actual.values.count { "|SAFE_CALL_WITH_CLEANUP|" in it })
+        assertEquals(13, actual.values.count { "|PRESENCE_ONLY|" in it })
     }
 
     @Test
@@ -138,7 +148,75 @@ class ApiProbeCatalogTest {
             entries.filterValues { it.sourceUrls.isNotEmpty() }.mapValues { it.value.sourceUrls },
         )
         assertTrue(expectedSources.keys.all { !entries.getValue(it).reason.isNullOrBlank() })
+        assertEquals(
+            CatalogDisposition.PLATFORM_RESTRICTED,
+            entries.getValue("clipboard").disposition,
+        )
+        assertTrue(
+            setOf("browserAction", "declarativeWebRequest", "pageAction").all {
+                entries.getValue(it).disposition == CatalogDisposition.LEGACY_MV2
+            },
+        )
         assertEquals(CatalogDisposition.INTERNAL, entries.getValue("protocolHandlers").disposition)
+    }
+
+    @Test
+    fun `생성 호출은 정확한 cleanup target 계약을 가져야 한다`() {
+        val entries = loadCatalog().entries.associateBy { it.namespace }
+        val contextMenus = entries.getValue("contextMenus").cases.single()
+        val tabs = entries.getValue("tabs").cases.single()
+
+        assertEquals(ProbeMode.SAFE_CALL_WITH_CLEANUP, contextMenus.mode)
+        assertEquals(
+            ProbeCleanupContract(
+                member = "remove",
+                target = ProbeCleanupTarget.FIXTURE_ID,
+                fixtureId = "sixbridge-probe-context-menu",
+            ),
+            contextMenus.cleanup,
+        )
+        assertEquals(ProbeMode.SAFE_CALL_WITH_CLEANUP, tabs.mode)
+        assertEquals(
+            ProbeCleanupContract(
+                member = "remove",
+                target = ProbeCleanupTarget.CREATED_RESOURCE_ID,
+                fixtureId = null,
+            ),
+            tabs.cleanup,
+        )
+    }
+
+    @Test
+    fun `public load는 baseline namespace의 잘못된 descriptor 조합을 거부한다`() {
+        val invalid = listOf(
+            VALID_CATALOG.replace("\"service_worker\"", "\"extension_page\""),
+            VALID_CATALOG.replace("\"permissions\": []", "\"permissions\": [\"alarms\"]"),
+            VALID_CATALOG.replace("\"manifestKeys\": []", "\"manifestKeys\": [\"action\"]"),
+            VALID_CATALOG.replace("\"safe_call\"", "\"presence_only\"")
+                .replace("\"verified\"", "\"exposed\""),
+            catalogWithEntries(
+                VALID_NON_PROBE_ENTRY.replace("\"automation\"", "\"madeUp\""),
+            ),
+            catalogWithEntries(
+                VALID_NON_PROBE_ENTRY.replace(
+                    "\"platform_restricted\"",
+                    "\"internal\"",
+                ),
+            ),
+            catalogWithEntries(
+                CONTEXT_MENUS_ENTRY.replace("\"member\": \"remove\"", "\"member\": \"removeAll\""),
+            ),
+            catalogWithEntries(
+                CONTEXT_MENUS_ENTRY.replace(
+                    "\"sixbridge-probe-context-menu\"",
+                    "\"wrong-fixture\"",
+                ),
+            ),
+        )
+
+        invalid.forEach { json ->
+            assertFailsWith<IllegalArgumentException> { load(json) }
+        }
     }
 
     @Test
@@ -196,8 +274,8 @@ class ApiProbeCatalogTest {
     fun `root entry case의 duplicate JSON key를 거부한다`() {
         val invalid = listOf(
             VALID_CATALOG.replace(
-                "\"schemaVersion\": 2",
-                "\"schemaVersion\": 2, \"schemaVersion\": 2",
+                "\"schemaVersion\": 3",
+                "\"schemaVersion\": 3, \"schemaVersion\": 3",
             ),
             VALID_CATALOG.replace(
                 "\"namespace\": \"runtime\"",
@@ -293,10 +371,11 @@ class ApiProbeCatalogTest {
             .replace("\"runtime-platform-info-worker\"", "\"action-get-title-page\"")
             .replace("\"getPlatformInfo\"", "\"getTitle\"")
             .replace("\"service_worker\"", "\"extension_page\"")
+            .replace("\"base-runtime\"", "\"user-interface\"")
             .replace("\"manifestKeys\": []", "\"manifestKeys\": [\"action\"]")
         val first = load(catalogWithEntries(VALID_ENTRY, actionEntry))
         val second = load(
-            """{"entries":[$actionEntry,$VALID_ENTRY],"schemaVersion":2}""",
+            """{"entries":[$actionEntry,$VALID_ENTRY],"schemaVersion":3}""",
         )
 
         assertEquals(listOf("action", "runtime"), first.entries.map { it.namespace })
@@ -330,47 +409,43 @@ class ApiProbeCatalogTest {
         ByteArrayInputStream(value.toByteArray(UTF_8)).use(ApiProbeCatalog::load)
 
     private fun catalogWithEntries(vararg entries: String): String =
-        """{"schemaVersion":2,"entries":[${entries.joinToString(",")}]}"""
+        """{"schemaVersion":3,"entries":[${entries.joinToString(",")}]}"""
 
     companion object {
         private val EXPECTED_DESCRIPTORS = mapOf(
-            "action" to "user-interface|getTitle|EXTENSION_PAGE|SAFE_CALL||action|VERIFIED",
-            "alarms" to "base-runtime|get|SERVICE_WORKER|SAFE_CALL|alarms|permissions|VERIFIED",
-            "browserAction" to "user-interface|getTitle|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED",
-            "clipboard" to "identity-privacy|setImageData|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED",
-            "commands" to "user-interface|getAll|EXTENSION_PAGE|SAFE_CALL||commands|VERIFIED",
-            "contentSettings" to "identity-privacy|cookies|EXTENSION_PAGE|PRESENCE_ONLY|contentSettings|permissions|EXPOSED",
-            "contextMenus" to "user-interface|create|SERVICE_WORKER|PRESENCE_ONLY|contextMenus|permissions|EXPOSED",
-            "cookies" to "identity-privacy|get|SERVICE_WORKER|PRESENCE_ONLY|cookies|permissions|EXPOSED",
-            "debugger" to "advanced-runtime|attach|SERVICE_WORKER|PRESENCE_ONLY|debugger|permissions|EXPOSED",
-            "declarativeContent" to "network|onPageChanged|SERVICE_WORKER|PRESENCE_ONLY|declarativeContent|permissions|EXPOSED",
-            "declarativeNetRequest" to "network|getAvailableStaticRuleCount|SERVICE_WORKER|SAFE_CALL|declarativeNetRequest|permissions|VERIFIED",
-            "declarativeWebRequest" to "network|onRequest|SERVICE_WORKER|PRESENCE_ONLY|||EXPOSED",
-            "extension" to "base-runtime|isAllowedIncognitoAccess|SERVICE_WORKER|SAFE_CALL|||VERIFIED",
-            "history" to "identity-privacy|search|SERVICE_WORKER|PRESENCE_ONLY|history|permissions|EXPOSED",
-            "i18n" to "base-runtime|getUILanguage|EXTENSION_PAGE|SAFE_CALL|||VERIFIED",
-            "identity" to "identity-privacy|getRedirectURL|EXTENSION_PAGE|SAFE_CALL|identity|permissions|VERIFIED",
-            "idle" to "identity-privacy|queryState|SERVICE_WORKER|SAFE_CALL|idle|permissions|VERIFIED",
-            "management" to "advanced-runtime|getSelf|SERVICE_WORKER|SAFE_CALL|||VERIFIED",
-            "notifications" to "user-interface|getPermissionLevel|SERVICE_WORKER|SAFE_CALL|notifications|permissions|VERIFIED",
-            "offscreen" to "advanced-runtime|hasDocument|SERVICE_WORKER|SAFE_CALL|offscreen|permissions|VERIFIED",
-            "pageAction" to "user-interface|getTitle|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED",
-            "permissions" to "base-runtime|contains|SERVICE_WORKER|SAFE_CALL|||VERIFIED",
-            "privacy" to "identity-privacy|network|EXTENSION_PAGE|PRESENCE_ONLY|privacy|permissions|EXPOSED",
-            "proxy" to "network|settings|SERVICE_WORKER|PRESENCE_ONLY|proxy|permissions|EXPOSED",
-            "runtime" to "base-runtime|getPlatformInfo|SERVICE_WORKER|SAFE_CALL|||VERIFIED",
-            "scripting" to "advanced-runtime|getRegisteredContentScripts|SERVICE_WORKER|SAFE_CALL|scripting|permissions|VERIFIED",
-            "search" to "tab-page|query|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED",
-            "sidePanel" to "user-interface|getOptions|EXTENSION_PAGE|SAFE_CALL|sidePanel|permissions,side_panel|VERIFIED",
-            "storage" to "base-runtime|local|SERVICE_WORKER|PRESENCE_ONLY|storage|permissions|EXPOSED",
-            "tabGroups" to "tab-page|query|EXTENSION_PAGE|PRESENCE_ONLY|tabGroups|permissions|EXPOSED",
-            "tabs" to "tab-page|create|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED",
-            "tts" to "user-interface|getVoices|EXTENSION_PAGE|SAFE_CALL|tts|permissions|VERIFIED",
-            "userScripts" to "advanced-runtime|getScripts|SERVICE_WORKER|SAFE_CALL|userScripts|permissions|VERIFIED",
-            "webAuthenticationProxy" to "identity-privacy|onRemoteSessionStateChange|SERVICE_WORKER|PRESENCE_ONLY|webAuthenticationProxy|permissions|EXPOSED",
-            "webNavigation" to "network|getAllFrames|SERVICE_WORKER|PRESENCE_ONLY|webNavigation|permissions|EXPOSED",
-            "webRequest" to "network|onBeforeRequest|SERVICE_WORKER|PRESENCE_ONLY|webRequest|permissions|EXPOSED",
-            "windows" to "tab-page|getCurrent|EXTENSION_PAGE|SAFE_CALL|||VERIFIED",
+            "action" to "user-interface|getTitle|EXTENSION_PAGE|SAFE_CALL||action|VERIFIED|||",
+            "alarms" to "base-runtime|get|SERVICE_WORKER|SAFE_CALL|alarms|permissions|VERIFIED|||",
+            "commands" to "user-interface|getAll|EXTENSION_PAGE|SAFE_CALL||commands|VERIFIED|||",
+            "contentSettings" to "identity-privacy|cookies|EXTENSION_PAGE|PRESENCE_ONLY|contentSettings|permissions|EXPOSED|||",
+            "contextMenus" to "user-interface|create|SERVICE_WORKER|SAFE_CALL_WITH_CLEANUP|contextMenus|permissions|VERIFIED|remove|FIXTURE_ID|sixbridge-probe-context-menu",
+            "cookies" to "identity-privacy|get|SERVICE_WORKER|PRESENCE_ONLY|cookies|permissions|EXPOSED|||",
+            "debugger" to "advanced-runtime|attach|SERVICE_WORKER|PRESENCE_ONLY|debugger|permissions|EXPOSED|||",
+            "declarativeContent" to "network|onPageChanged|SERVICE_WORKER|PRESENCE_ONLY|declarativeContent|permissions|EXPOSED|||",
+            "declarativeNetRequest" to "network|getAvailableStaticRuleCount|SERVICE_WORKER|SAFE_CALL|declarativeNetRequest|permissions|VERIFIED|||",
+            "extension" to "base-runtime|isAllowedIncognitoAccess|SERVICE_WORKER|SAFE_CALL|||VERIFIED|||",
+            "history" to "identity-privacy|search|SERVICE_WORKER|PRESENCE_ONLY|history|permissions|EXPOSED|||",
+            "i18n" to "base-runtime|getUILanguage|EXTENSION_PAGE|SAFE_CALL|||VERIFIED|||",
+            "identity" to "identity-privacy|getRedirectURL|EXTENSION_PAGE|SAFE_CALL|identity|permissions|VERIFIED|||",
+            "idle" to "identity-privacy|queryState|SERVICE_WORKER|SAFE_CALL|idle|permissions|VERIFIED|||",
+            "management" to "advanced-runtime|getSelf|SERVICE_WORKER|SAFE_CALL|||VERIFIED|||",
+            "notifications" to "user-interface|getPermissionLevel|SERVICE_WORKER|SAFE_CALL|notifications|permissions|VERIFIED|||",
+            "offscreen" to "advanced-runtime|hasDocument|SERVICE_WORKER|SAFE_CALL|offscreen|permissions|VERIFIED|||",
+            "permissions" to "base-runtime|contains|SERVICE_WORKER|SAFE_CALL|||VERIFIED|||",
+            "privacy" to "identity-privacy|network|EXTENSION_PAGE|PRESENCE_ONLY|privacy|permissions|EXPOSED|||",
+            "proxy" to "network|settings|SERVICE_WORKER|PRESENCE_ONLY|proxy|permissions|EXPOSED|||",
+            "runtime" to "base-runtime|getPlatformInfo|SERVICE_WORKER|SAFE_CALL|||VERIFIED|||",
+            "scripting" to "advanced-runtime|getRegisteredContentScripts|SERVICE_WORKER|SAFE_CALL|scripting|permissions|VERIFIED|||",
+            "search" to "tab-page|query|EXTENSION_PAGE|PRESENCE_ONLY|||EXPOSED|||",
+            "sidePanel" to "user-interface|getOptions|EXTENSION_PAGE|SAFE_CALL|sidePanel|permissions|VERIFIED|||",
+            "storage" to "base-runtime|local|SERVICE_WORKER|PRESENCE_ONLY|storage|permissions|EXPOSED|||",
+            "tabGroups" to "tab-page|query|EXTENSION_PAGE|PRESENCE_ONLY|tabGroups|permissions|EXPOSED|||",
+            "tabs" to "tab-page|create|EXTENSION_PAGE|SAFE_CALL_WITH_CLEANUP|||VERIFIED|remove|CREATED_RESOURCE_ID|",
+            "tts" to "user-interface|getVoices|EXTENSION_PAGE|SAFE_CALL|tts|permissions|VERIFIED|||",
+            "userScripts" to "advanced-runtime|getScripts|SERVICE_WORKER|SAFE_CALL|userScripts|permissions|VERIFIED|||",
+            "webAuthenticationProxy" to "identity-privacy|onRemoteSessionStateChange|SERVICE_WORKER|PRESENCE_ONLY|webAuthenticationProxy|permissions|EXPOSED|||",
+            "webNavigation" to "network|getAllFrames|SERVICE_WORKER|PRESENCE_ONLY|webNavigation|permissions|EXPOSED|||",
+            "webRequest" to "network|onBeforeRequest|SERVICE_WORKER|PRESENCE_ONLY|webRequest|permissions|EXPOSED|||",
+            "windows" to "tab-page|getCurrent|EXTENSION_PAGE|SAFE_CALL|||VERIFIED|||",
         )
 
         private val VALID_CASE =
@@ -382,7 +457,8 @@ class ApiProbeCatalogTest {
               "mode": "safe_call",
               "permissions": [],
               "manifestKeys": [],
-              "expectedOutcome": "verified"
+              "expectedOutcome": "verified",
+              "cleanup": null
             }
             """.trimIndent()
 
@@ -401,8 +477,45 @@ class ApiProbeCatalogTest {
         private val VALID_CATALOG =
             """
             {
-              "schemaVersion": 2,
+              "schemaVersion": 3,
               "entries": [$VALID_ENTRY]
+            }
+            """.trimIndent()
+
+        private val VALID_NON_PROBE_ENTRY =
+            """
+            {
+              "namespace": "automation",
+              "disposition": "platform_restricted",
+              "groupId": null,
+              "sourceUrls": [],
+              "reason": null,
+              "cases": []
+            }
+            """.trimIndent()
+
+        private val CONTEXT_MENUS_ENTRY =
+            """
+            {
+              "namespace": "contextMenus",
+              "disposition": "probe",
+              "groupId": "user-interface",
+              "sourceUrls": [],
+              "reason": null,
+              "cases": [{
+                "id": "context-menus-create-worker",
+                "member": "create",
+                "context": "service_worker",
+                "mode": "safe_call_with_cleanup",
+                "permissions": ["contextMenus"],
+                "manifestKeys": ["permissions"],
+                "expectedOutcome": "verified",
+                "cleanup": {
+                  "member": "remove",
+                  "target": "fixture_id",
+                  "fixtureId": "sixbridge-probe-context-menu"
+                }
+              }]
             }
             """.trimIndent()
     }

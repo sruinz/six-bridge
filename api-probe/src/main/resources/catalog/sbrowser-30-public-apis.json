@@ -1,5 +1,5 @@
 {
-    "schemaVersion": 2,
+    "schemaVersion": 3,
     "entries": [
         {
             "namespace": "action",
@@ -15,7 +15,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": ["action"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -33,7 +34,8 @@
                     "mode": "safe_call",
                     "permissions": ["alarms"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -51,47 +53,27 @@
             "reason": null, "cases": []},
         {
             "namespace": "browserAction",
-            "disposition": "probe",
-            "groupId": "user-interface",
+            "disposition": "legacy_mv2",
+            "groupId": null,
             "sourceUrls": [
                 "https://developer.chrome.com/docs/extensions/mv2/reference/browserAction",
                 "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
             ],
             "reason": "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 노출 여부만 확인한다.",
-            "cases": [
-                {
-                    "id": "browser-action-get-title-page",
-                    "member": "getTitle",
-                    "context": "extension_page",
-                    "mode": "presence_only",
-                    "permissions": [],
-                    "manifestKeys": [],
-                    "expectedOutcome": "exposed"
-                }
-            ]
+            "cases": []
         },
         {"namespace": "clientService", "disposition": "internal", "groupId": null,
             "sourceUrls": [],
             "reason": null, "cases": []},
         {
             "namespace": "clipboard",
-            "disposition": "probe",
-            "groupId": "identity-privacy",
+            "disposition": "platform_restricted",
+            "groupId": null,
             "sourceUrls": [
                 "https://developer.chrome.com/docs/apps/reference/clipboard"
             ],
             "reason": "ChromeOS 전용 플랫폼 앱 API이지만 삼성의 비표준 노출 가능성만 확인하며 setImageData는 호출하지 않는다.",
-            "cases": [
-                {
-                    "id": "clipboard-set-image-data-page",
-                    "member": "setImageData",
-                    "context": "extension_page",
-                    "mode": "presence_only",
-                    "permissions": [],
-                    "manifestKeys": [],
-                    "expectedOutcome": "exposed"
-                }
-            ]
+            "cases": []
         },
         {
             "namespace": "commands",
@@ -107,7 +89,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": ["commands"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -125,7 +108,8 @@
                     "mode": "presence_only",
                     "permissions": ["contentSettings"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -140,10 +124,15 @@
                     "id": "context-menus-create-worker",
                     "member": "create",
                     "context": "service_worker",
-                    "mode": "presence_only",
+                    "mode": "safe_call_with_cleanup",
                     "permissions": ["contextMenus"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "verified",
+                    "cleanup": {
+                        "member": "remove",
+                        "target": "fixture_id",
+                        "fixtureId": "sixbridge-probe-context-menu"
+                    }
                 }
             ]
         },
@@ -161,7 +150,8 @@
                     "mode": "presence_only",
                     "permissions": ["cookies"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -179,7 +169,8 @@
                     "mode": "presence_only",
                     "permissions": ["debugger"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -197,7 +188,8 @@
                     "mode": "presence_only",
                     "permissions": ["declarativeContent"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -215,29 +207,20 @@
                     "mode": "safe_call",
                     "permissions": ["declarativeNetRequest"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
         {
             "namespace": "declarativeWebRequest",
-            "disposition": "probe",
-            "groupId": "network",
+            "disposition": "legacy_mv2",
+            "groupId": null,
             "sourceUrls": [
                 "https://developer.chrome.com/docs/extensions/mv2/reference/declarativeWebRequest"
             ],
             "reason": "Beta 채널의 Manifest V2 이하 API이므로 삼성의 alias 노출 여부만 확인한다.",
-            "cases": [
-                {
-                    "id": "declarative-web-request-on-request-worker",
-                    "member": "onRequest",
-                    "context": "service_worker",
-                    "mode": "presence_only",
-                    "permissions": [],
-                    "manifestKeys": [],
-                    "expectedOutcome": "exposed"
-                }
-            ]
+            "cases": []
         },
         {"namespace": "dom", "disposition": "internal", "groupId": null,
             "sourceUrls": [],
@@ -259,7 +242,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -286,7 +270,8 @@
                     "mode": "presence_only",
                     "permissions": ["history"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -304,7 +289,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -325,7 +311,8 @@
                     "mode": "safe_call",
                     "permissions": ["identity"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -343,7 +330,8 @@
                     "mode": "safe_call",
                     "permissions": ["idle"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -364,7 +352,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -382,7 +371,8 @@
                     "mode": "safe_call",
                     "permissions": ["notifications"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -400,30 +390,21 @@
                     "mode": "safe_call",
                     "permissions": ["offscreen"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
         {
             "namespace": "pageAction",
-            "disposition": "probe",
-            "groupId": "user-interface",
+            "disposition": "legacy_mv2",
+            "groupId": null,
             "sourceUrls": [
                 "https://developer.chrome.com/docs/extensions/mv2/reference/pageAction",
                 "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
             ],
             "reason": "pageAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 노출 여부만 확인한다.",
-            "cases": [
-                {
-                    "id": "page-action-get-title-page",
-                    "member": "getTitle",
-                    "context": "extension_page",
-                    "mode": "presence_only",
-                    "permissions": [],
-                    "manifestKeys": [],
-                    "expectedOutcome": "exposed"
-                }
-            ]
+            "cases": []
         },
         {
             "namespace": "permissions",
@@ -439,7 +420,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -457,7 +439,8 @@
                     "mode": "presence_only",
                     "permissions": ["privacy"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -485,7 +468,8 @@
                     "mode": "presence_only",
                     "permissions": ["proxy"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -503,7 +487,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -521,7 +506,8 @@
                     "mode": "safe_call",
                     "permissions": ["scripting"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -542,7 +528,8 @@
                     "mode": "presence_only",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -559,8 +546,9 @@
                     "context": "extension_page",
                     "mode": "safe_call",
                     "permissions": ["sidePanel"],
-                    "manifestKeys": ["permissions", "side_panel"],
-                    "expectedOutcome": "verified"
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -581,7 +569,8 @@
                     "mode": "presence_only",
                     "permissions": ["storage"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -599,7 +588,8 @@
                     "mode": "presence_only",
                     "permissions": ["tabGroups"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -614,10 +604,15 @@
                     "id": "tabs-create-fixture-page",
                     "member": "create",
                     "context": "extension_page",
-                    "mode": "presence_only",
+                    "mode": "safe_call_with_cleanup",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "verified",
+                    "cleanup": {
+                        "member": "remove",
+                        "target": "created_resource_id",
+                        "fixtureId": null
+                    }
                 }
             ]
         },
@@ -638,7 +633,8 @@
                     "mode": "safe_call",
                     "permissions": ["tts"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -662,7 +658,8 @@
                     "mode": "safe_call",
                     "permissions": ["userScripts"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         },
@@ -680,7 +677,8 @@
                     "mode": "presence_only",
                     "permissions": ["webAuthenticationProxy"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -698,7 +696,8 @@
                     "mode": "presence_only",
                     "permissions": ["webNavigation"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -716,7 +715,8 @@
                     "mode": "presence_only",
                     "permissions": ["webRequest"],
                     "manifestKeys": ["permissions"],
-                    "expectedOutcome": "exposed"
+                    "expectedOutcome": "exposed",
+                    "cleanup": null
                 }
             ]
         },
@@ -743,7 +743,8 @@
                     "mode": "safe_call",
                     "permissions": [],
                     "manifestKeys": [],
-                    "expectedOutcome": "verified"
+                    "expectedOutcome": "verified",
+                    "cleanup": null
                 }
             ]
         }
