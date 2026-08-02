@@ -1,0 +1,595 @@
+{
+    "schemaVersion": 1,
+    "entries": [
+        {
+            "namespace": "action",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "action-get-title-page",
+                    "member": "getTitle",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": ["action"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "alarms",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "alarms-get-worker",
+                    "member": "get",
+                    "context": "service_worker",
+                    "permissions": ["alarms"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "app", "disposition": "legacy_app", "groupId": null, "cases": []},
+        {"namespace": "app.runtime", "disposition": "legacy_app", "groupId": null, "cases": []},
+        {"namespace": "appstoreService", "disposition": "internal", "groupId": null, "cases": []},
+        {"namespace": "automation", "disposition": "platform_restricted", "groupId": null, "cases": []},
+        {
+            "namespace": "browserAction",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "browser-action-get-title-page",
+                    "member": "getTitle",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": ["action"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {"namespace": "clientService", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "clipboard",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "clipboard-set-image-data-page",
+                    "member": "setImageData",
+                    "context": "extension_page",
+                    "permissions": ["clipboardWrite"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "commands",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "commands-get-all-page",
+                    "member": "getAll",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": ["commands"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "contentSettings",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "content-settings-cookies-page",
+                    "member": "cookies",
+                    "context": "extension_page",
+                    "permissions": ["contentSettings"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "contextMenus",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "context-menus-create-worker",
+                    "member": "create",
+                    "context": "service_worker",
+                    "permissions": ["contextMenus"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "cookies",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "cookies-get-worker",
+                    "member": "get",
+                    "context": "service_worker",
+                    "permissions": ["cookies"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "debugger",
+            "disposition": "probe",
+            "groupId": "advanced-runtime",
+            "cases": [
+                {
+                    "id": "debugger-attach-worker",
+                    "member": "attach",
+                    "context": "service_worker",
+                    "permissions": ["debugger"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "declarativeContent",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "declarative-content-on-page-changed-worker",
+                    "member": "onPageChanged",
+                    "context": "service_worker",
+                    "permissions": ["declarativeContent"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "declarativeNetRequest",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "declarative-net-request-static-count-worker",
+                    "member": "getAvailableStaticRuleCount",
+                    "context": "service_worker",
+                    "permissions": ["declarativeNetRequest"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "declarativeWebRequest",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "declarative-web-request-on-request-worker",
+                    "member": "onRequest",
+                    "context": "service_worker",
+                    "permissions": ["declarativeWebRequest"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {"namespace": "dom", "disposition": "internal", "groupId": null, "cases": []},
+        {"namespace": "events", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "extension",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "extension-incognito-access-worker",
+                    "member": "isAllowedIncognitoAccess",
+                    "context": "service_worker",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "extensionTypes", "disposition": "internal", "groupId": null, "cases": []},
+        {"namespace": "fileHandlers", "disposition": "platform_restricted", "groupId": null, "cases": []},
+        {"namespace": "gcm", "disposition": "platform_restricted", "groupId": null, "cases": []},
+        {
+            "namespace": "history",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "history-search-worker",
+                    "member": "search",
+                    "context": "service_worker",
+                    "permissions": ["history"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "i18n",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "i18n-ui-language-page",
+                    "member": "getUILanguage",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "iconVariants", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "identity",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "identity-redirect-url-page",
+                    "member": "getRedirectURL",
+                    "context": "extension_page",
+                    "permissions": ["identity"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "idle",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "idle-query-state-worker",
+                    "member": "queryState",
+                    "context": "service_worker",
+                    "permissions": ["idle"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "inputMethodPrivate", "disposition": "platform_restricted", "groupId": null, "cases": []},
+        {
+            "namespace": "management",
+            "disposition": "probe",
+            "groupId": "advanced-runtime",
+            "cases": [
+                {
+                    "id": "management-get-self-worker",
+                    "member": "getSelf",
+                    "context": "service_worker",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "notifications",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "notifications-permission-level-worker",
+                    "member": "getPermissionLevel",
+                    "context": "service_worker",
+                    "permissions": ["notifications"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "offscreen",
+            "disposition": "probe",
+            "groupId": "advanced-runtime",
+            "cases": [
+                {
+                    "id": "offscreen-has-document-worker",
+                    "member": "hasDocument",
+                    "context": "service_worker",
+                    "permissions": ["offscreen"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "pageAction",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "page-action-get-title-page",
+                    "member": "getTitle",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": ["action"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "permissions",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "permissions-contains-worker",
+                    "member": "contains",
+                    "context": "service_worker",
+                    "permissions": [],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "privacy",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "privacy-network-page",
+                    "member": "network",
+                    "context": "extension_page",
+                    "permissions": ["privacy"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "protocolHandlers",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "protocol-handlers-register-page",
+                    "member": "registerProtocolHandler",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": ["protocol_handlers"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "proxy",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "proxy-settings-worker",
+                    "member": "settings",
+                    "context": "service_worker",
+                    "permissions": ["proxy"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "runtime",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "runtime-platform-info-worker",
+                    "member": "getPlatformInfo",
+                    "context": "service_worker",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "scripting",
+            "disposition": "probe",
+            "groupId": "advanced-runtime",
+            "cases": [
+                {
+                    "id": "scripting-get-registered-worker",
+                    "member": "getRegisteredContentScripts",
+                    "context": "service_worker",
+                    "permissions": ["scripting"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "scriptsInternal", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "search",
+            "disposition": "probe",
+            "groupId": "tab-page",
+            "cases": [
+                {
+                    "id": "search-query-page",
+                    "member": "query",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "sidePanel",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "side-panel-get-options-page",
+                    "member": "getOptions",
+                    "context": "extension_page",
+                    "permissions": ["sidePanel"],
+                    "manifestKeys": ["permissions", "side_panel"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "sixLogging", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "storage",
+            "disposition": "probe",
+            "groupId": "base-runtime",
+            "cases": [
+                {
+                    "id": "storage-local-worker",
+                    "member": "local",
+                    "context": "service_worker",
+                    "permissions": ["storage"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "tabGroups",
+            "disposition": "probe",
+            "groupId": "tab-page",
+            "cases": [
+                {
+                    "id": "tab-groups-query-page",
+                    "member": "query",
+                    "context": "extension_page",
+                    "permissions": ["tabGroups"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "tabs",
+            "disposition": "probe",
+            "groupId": "tab-page",
+            "cases": [
+                {
+                    "id": "tabs-create-fixture-page",
+                    "member": "create",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "trans", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "tts",
+            "disposition": "probe",
+            "groupId": "user-interface",
+            "cases": [
+                {
+                    "id": "tts-get-voices-page",
+                    "member": "getVoices",
+                    "context": "extension_page",
+                    "permissions": ["tts"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {"namespace": "ttsEngine", "disposition": "platform_restricted", "groupId": null, "cases": []},
+        {"namespace": "types", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "userScripts",
+            "disposition": "probe",
+            "groupId": "advanced-runtime",
+            "cases": [
+                {
+                    "id": "user-scripts-get-scripts-worker",
+                    "member": "getScripts",
+                    "context": "service_worker",
+                    "permissions": ["userScripts"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        },
+        {
+            "namespace": "webAuthenticationProxy",
+            "disposition": "probe",
+            "groupId": "identity-privacy",
+            "cases": [
+                {
+                    "id": "web-auth-proxy-session-event-worker",
+                    "member": "onRemoteSessionStateChange",
+                    "context": "service_worker",
+                    "permissions": ["webAuthenticationProxy"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "webNavigation",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "web-navigation-get-all-frames-worker",
+                    "member": "getAllFrames",
+                    "context": "service_worker",
+                    "permissions": ["webNavigation"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {
+            "namespace": "webRequest",
+            "disposition": "probe",
+            "groupId": "network",
+            "cases": [
+                {
+                    "id": "web-request-before-request-worker",
+                    "member": "onBeforeRequest",
+                    "context": "service_worker",
+                    "permissions": ["webRequest"],
+                    "manifestKeys": ["permissions"],
+                    "expectedOutcome": "exposed"
+                }
+            ]
+        },
+        {"namespace": "webRequestInternal", "disposition": "internal", "groupId": null, "cases": []},
+        {"namespace": "webViewRequest", "disposition": "internal", "groupId": null, "cases": []},
+        {"namespace": "webstorePrivate", "disposition": "internal", "groupId": null, "cases": []},
+        {
+            "namespace": "windows",
+            "disposition": "probe",
+            "groupId": "tab-page",
+            "cases": [
+                {
+                    "id": "windows-get-current-page",
+                    "member": "getCurrent",
+                    "context": "extension_page",
+                    "permissions": [],
+                    "manifestKeys": [],
+                    "expectedOutcome": "verified"
+                }
+            ]
+        }
+    ]
+}

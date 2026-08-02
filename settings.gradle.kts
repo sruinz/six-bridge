@@ -20,6 +20,7 @@ include(
     "android-wrapper-template",
     "bundle-contract",
     "core",
+    "api-probe",
     "cli",
     "desktop-app",
 )
