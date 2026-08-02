@@ -13,9 +13,11 @@ kotlin {
 
 dependencies {
     implementation(project(":core"))
+    implementation(project(":api-probe"))
     implementation("info.picocli:picocli:4.7.7")
 
     testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 }
 
 application {

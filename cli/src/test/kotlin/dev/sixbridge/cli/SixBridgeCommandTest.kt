@@ -15,6 +15,8 @@ import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
+import dev.sixbridge.probe.catalog.ApiProbeCatalog
+import dev.sixbridge.probe.catalog.CatalogDisposition
 import picocli.CommandLine
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -36,6 +38,10 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 class SixBridgeCommandTest {
     private val projectIdentity = "0123456789abcdef0123456789abcdef"
@@ -69,6 +75,143 @@ class SixBridgeCommandTest {
         assertTrue("draft" in output.toString())
         assertTrue("build" in output.toString())
         assertTrue("device" in output.toString())
+        assertTrue("probe" in output.toString())
+    }
+
+    @Test
+    fun `probe option 누락 중복 unknown은 exit 2이고 stdout을 남기지 않는다`() {
+        listOf(
+            arrayOf("probe", "generate"),
+            arrayOf("probe", "generate", "--output", "one", "--output", "two"),
+            arrayOf("probe", "generate", "--unknown", "value"),
+            arrayOf("probe", "verify-evidence"),
+            arrayOf("probe", "build-profile", "--base", "base.json"),
+        ).forEach { arguments ->
+            val result = execute(*arguments)
+            assertEquals(2, result.exitCode, arguments.joinToString(" "))
+            assertEquals("", result.output, arguments.joinToString(" "))
+        }
+    }
+
+    @Test
+    fun `probe generate는 정확한 여섯 source를 만들고 기존 output을 보존한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-generate")
+        val output = workspace.resolve("probe-source")
+
+        val first = execute("probe", "generate", "--output", output.toString())
+        assertEquals(0, first.exitCode, first.error)
+        assertEquals(6, Files.list(output).use { it.count() })
+        assertTrue("생성 그룹=6" in first.output)
+
+        val sentinel = output.resolve("sentinel.txt").also { it.writeText("user-owned") }
+        val second = execute("probe", "generate", "--output", output.toString())
+        assertEquals(2, second.exitCode)
+        assertEquals("user-owned", sentinel.readText())
+        assertEquals("", second.output)
+    }
+
+    @Test
+    fun `probe verify-evidence는 여섯 group과 33 case를 한글로 결정론 출력한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-verify")
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+
+        val result = execute("probe", "verify-evidence", "--input", evidence.toString())
+
+        assertEquals(0, result.exitCode, result.error)
+        assertTrue("그룹=6/6" in result.output)
+        assertTrue("case=33/33" in result.output)
+        assertTrue("증거 검증 완료" in result.output)
+        assertEquals(result.output, execute("probe", "verify-evidence", "--input", evidence.toString()).output)
+    }
+
+    @Test
+    fun `probe build-profile은 browser provenance 불일치를 거부하고 output을 만들지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-provenance")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = true)
+        val output = workspace.resolve("candidate.json")
+
+        val result = execute(
+            "probe", "build-profile",
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(2, result.exitCode)
+        assertFalse(output.exists())
+        assertEquals("", result.output)
+    }
+
+    @Test
+    fun `probe build-profile은 검증된 schema v4를 새 output에만 게시한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-profile")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val output = workspace.resolve("candidate.json")
+
+        val result = execute(
+            "probe", "build-profile",
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, result.exitCode, result.error)
+        val candidate = BrowserProfileJson.decode(output.readText())
+        assertEquals(33, candidate.apiCapabilities.size)
+        assertTrue("runtime" in candidate.supportedApis)
+        assertTrue("후보 profile=" in result.output)
+
+        val bytes = output.readBytes()
+        val repeated = execute(
+            "probe", "build-profile",
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", output.toString(),
+        )
+        assertEquals(2, repeated.exitCode)
+        assertContentEquals(bytes, output.readBytes())
+        assertEquals("", repeated.output)
+    }
+
+    @Test
+    fun `probe evidence directory는 symlink와 unknown file을 거부한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-unsafe-evidence")
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        evidence.resolve("unknown.txt").writeText("user-owned")
+
+        val unknown = execute("probe", "verify-evidence", "--input", evidence.toString())
+        assertEquals(2, unknown.exitCode)
+        assertEquals("", unknown.output)
+
+        Files.delete(evidence.resolve("unknown.txt"))
+        Files.delete(evidence.resolve("base-runtime.json"))
+        Files.createSymbolicLink(
+            evidence.resolve("base-runtime.json"),
+            evidence.resolve("advanced-runtime.json"),
+        )
+        val linked = execute("probe", "verify-evidence", "--input", evidence.toString())
+        assertEquals(2, linked.exitCode)
+        assertEquals("", linked.output)
+    }
+
+    @Test
+    fun `probe output은 symlink parent를 따라 쓰지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-output-link")
+        val realParent = workspace.resolve("real").also(Files::createDirectory)
+        val linkedParent = workspace.resolve("linked").also {
+            Files.createSymbolicLink(it, realParent)
+        }
+
+        val result = execute(
+            "probe", "generate",
+            "--output", linkedParent.resolve("probe-source").toString(),
+        )
+
+        assertEquals(2, result.exitCode)
+        assertFalse(realParent.resolve("probe-source").exists())
+        assertEquals("", result.output)
     }
 
     @Test
@@ -817,6 +960,81 @@ class SixBridgeCommandTest {
         )
         assertTrue(bundle.exists())
     }
+
+    private fun writeProbeEvidence(root: Path, mismatchProvenance: Boolean): Path {
+        Files.createDirectory(root)
+        val catalog = ApiProbeCatalog.load(
+            checkNotNull(javaClass.getResourceAsStream("/catalog/sbrowser-30-public-apis.json")),
+        )
+        val groups = catalog.entries
+            .filter { it.disposition == CatalogDisposition.PROBE }
+            .groupBy { requireNotNull(it.groupId) }
+            .toSortedMap()
+        groups.forEach { (groupId, entries) ->
+            val results = entries.flatMap { entry ->
+                entry.cases.map { case -> entry to case }
+            }.mapIndexed { index, (entry, case) ->
+                    val verified = case.expectedOutcome.name == "VERIFIED"
+                    JsonObject(
+                        linkedMapOf(
+                            "caseId" to JsonPrimitive(case.id),
+                            "context" to JsonPrimitive(case.context.name.lowercase()),
+                            "detail" to if (verified) {
+                                JsonObject(
+                                    linkedMapOf(
+                                        "kind" to JsonPrimitive("success"),
+                                        "valueType" to JsonPrimitive("object"),
+                                    ),
+                                )
+                            } else {
+                                JsonObject(linkedMapOf("kind" to JsonPrimitive("exposed")))
+                            },
+                            "durationMs" to JsonPrimitive(1),
+                            "member" to JsonPrimitive(case.member),
+                            "namespace" to JsonPrimitive(entry.namespace),
+                            "runToken" to JsonPrimitive(
+                                "run-${groupId.take(6)}-${index.toString().padStart(8, '0')}",
+                            ),
+                            "status" to JsonPrimitive(if (verified) "VERIFIED" else "EXPOSED"),
+                        ),
+                    )
+            }
+            val rootObject = JsonObject(
+                linkedMapOf(
+                    "schemaVersion" to JsonPrimitive(1),
+                    "sessionId" to JsonPrimitive("session-20260802"),
+                    "groupId" to JsonPrimitive(groupId),
+                    "catalogSha256" to JsonPrimitive(catalog.sha256),
+                    "extensionId" to JsonPrimitive(probeExtensionId(groupId)),
+                    "wrapperSignerSha256" to JsonPrimitive("d".repeat(64)),
+                    "browserPackage" to JsonPrimitive("com.sec.android.app.sbrowser"),
+                    "browserVersionName" to JsonPrimitive("30.0.2.61"),
+                    "browserVersionCode" to JsonPrimitive(1_300_261_502),
+                    "browserApkSetSha256" to JsonPrimitive(
+                        if (mismatchProvenance && groupId == groups.firstKey()) {
+                            "e".repeat(64)
+                        } else {
+                            BrowserProfile.BASELINE_APK_SHA256
+                        },
+                    ),
+                    "browserSignerSha256" to JsonPrimitive(BrowserProfile.SAMSUNG_SIGNER_SHA256),
+                    "results" to JsonArray(results),
+                ),
+            )
+            root.resolve("$groupId.json").writeText(
+                Json.encodeToString(JsonObject.serializer(), rootObject),
+            )
+        }
+        return root
+    }
+
+    private fun probeExtensionId(groupId: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(groupId.toByteArray())
+        .take(16)
+        .joinToString("") { byte ->
+            val value = byte.toInt() and 0xff
+            "${('a'.code + (value ushr 4)).toChar()}${('a'.code + (value and 0xf)).toChar()}"
+        }
 
     private fun execute(vararg arguments: String): Execution {
         return executeWith(::SixBridgeService, *arguments)

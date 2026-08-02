@@ -35,6 +35,7 @@ fun createCommandLine(
     serviceFactory: (Path) -> SixBridgeService = ::createDesktopService,
 ): CommandLine {
     val command = CommandLine(SixBridgeCommand(serviceFactory))
+    command.isOverwrittenOptionsAllowed = false
     command.executionExceptionHandler = CommandLine.IExecutionExceptionHandler { error, line, _ ->
         line.err.println("오류: ${error.message}")
         if (System.getenv("SIXBRIDGE_DEBUG") == "1") {
@@ -66,6 +67,7 @@ fun createCommandLine(
         VerifyCrxCommand::class,
         VerifyBuildCommand::class,
         BuildCommand::class,
+        ProbeCommand::class,
         DeviceCommand::class,
     ],
 )
