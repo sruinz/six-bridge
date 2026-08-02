@@ -209,12 +209,20 @@ internal object RuntimeSourceScanner {
             normalizedType == "module" ||
             normalizedType.substringBefore(';').trim() in JAVA_SCRIPT_MIME_TYPES
 
-    fun javaScriptDependencies(source: String): JavaScriptDependencyScan {
+    fun javaScriptDependencies(
+        source: String,
+        checkCancelled: () -> Unit = {},
+    ): JavaScriptDependencyScan {
         val sourceWithoutComments = JavaScriptLexicalMask.mask(
             source,
             maskLiterals = false,
+            checkCancelled = checkCancelled,
         )
-        val codeOnly = JavaScriptLexicalMask.mask(source, maskLiterals = true)
+        val codeOnly = JavaScriptLexicalMask.mask(
+            source,
+            maskLiterals = true,
+            checkCancelled = checkCancelled,
+        )
         val dependencies = JavaScriptDependencyCollector()
         var cursor = 0
         while (cursor < codeOnly.length) {
@@ -625,10 +633,17 @@ internal object RuntimeSourceScanner {
 }
 
 internal object JavaScriptLexicalMask {
-    fun mask(source: String, maskLiterals: Boolean): String {
+    private const val CHECKPOINT_INTERVAL = 16_384
+
+    fun mask(
+        source: String,
+        maskLiterals: Boolean,
+        checkCancelled: () -> Unit = {},
+    ): String {
         val masked = source.toCharArray()
         var state = CODE
         var index = 0
+        var nextCheckpoint = 0
         var regexCharacterClass = false
         var regexAllowed = true
         var pendingControlKeyword: String? = null
@@ -637,6 +652,8 @@ internal object JavaScriptLexicalMask {
         var blockExpected = false
         var expectedBlockResult = true
         var statementPosition = true
+        var previousCodeWord: String? = null
+        var previousSignificantCharacter: Char? = null
         val templateExpressionDepths = mutableListOf<Int>()
         val controlParentheses = mutableListOf<String?>()
         val blockBraces = mutableListOf<Boolean>()
@@ -647,18 +664,20 @@ internal object JavaScriptLexicalMask {
             }
         }
 
-        fun declarationPosition(position: Int): Boolean {
-            var cursor = position - 1
-            while (cursor >= 0 && source[cursor].isWhitespace()) cursor--
-            if (cursor < 0 || source[cursor] in setOf(';', '{', '}')) return true
-            val prefix = source.substring(0, cursor + 1)
-            val previousWord = Regex("""[A-Za-z_$][\w$]*$""")
-                .find(prefix)
-                ?.value
-            return previousWord in setOf("async", "default", "export")
+        fun checkCancellationCheckpoint(position: Int) {
+            while (position >= nextCheckpoint) {
+                checkCancelled()
+                nextCheckpoint += CHECKPOINT_INTERVAL
+            }
+        }
+
+        fun recordCodeToken(word: String? = null, significant: Char) {
+            previousCodeWord = word
+            previousSignificantCharacter = significant
         }
 
         while (index < masked.size) {
+            checkCancellationCheckpoint(index)
             val current = source[index]
             when (state) {
                 CODE -> when {
@@ -667,6 +686,7 @@ internal object JavaScriptLexicalMask {
                         templateExpressionDepths[last]++
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     templateExpressionDepths.isNotEmpty() && current == '}' -> {
@@ -679,24 +699,30 @@ internal object JavaScriptLexicalMask {
                         }
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current.isWhitespace() -> index++
                     current.isJavaIdentifierStart() -> {
                         var end = index + 1
-                        while (source.getOrNull(end)?.isJavaIdentifierPart() == true) end++
+                        while (source.getOrNull(end)?.isJavaIdentifierPart() == true) {
+                            end++
+                            checkCancellationCheckpoint(end)
+                        }
                         val word = source.substring(index, end)
                         if (!(pendingControlKeyword == "for" && word == "await")) {
                             pendingControlKeyword = word.takeIf {
                                 it in CONTROL_PAREN_KEYWORDS
                             }
                         }
+                        val declaration = statementPosition ||
+                            previousCodeWord in DECLARATION_PREFIX_KEYWORDS ||
+                            previousSignificantCharacter in DECLARATION_PREFIX_CHARS
                         if (word == "function") {
-                            pendingFunctionBlockResult =
-                                declarationPosition(index)
+                            pendingFunctionBlockResult = declaration
                         }
                         if (word == "class") {
-                            pendingClassBlockResult = declarationPosition(index)
+                            pendingClassBlockResult = declaration
                         }
                         blockExpected = if (pendingClassBlockResult != null) {
                             true
@@ -710,12 +736,14 @@ internal object JavaScriptLexicalMask {
                             statementPosition = false
                         }
                         regexAllowed = word in REGEX_PREFIX_KEYWORDS
+                        recordCodeToken(word, source[end - 1])
                         index = end
                     }
                     current.isDigit() -> {
                         statementPosition = false
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '\'' -> {
@@ -724,6 +752,7 @@ internal object JavaScriptLexicalMask {
                         regexAllowed = false
                         state = SINGLE_QUOTED
                         if (maskLiterals) maskAt(index)
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '"' -> {
@@ -732,6 +761,7 @@ internal object JavaScriptLexicalMask {
                         regexAllowed = false
                         state = DOUBLE_QUOTED
                         if (maskLiterals) maskAt(index)
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '`' -> {
@@ -740,18 +770,21 @@ internal object JavaScriptLexicalMask {
                         regexAllowed = false
                         state = TEMPLATE_TEXT
                         maskAt(index)
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '/' && source.getOrNull(index + 1) == '/' -> {
                         maskAt(index)
                         maskAt(index + 1)
                         state = LINE_COMMENT
+                        recordCodeToken(significant = '/')
                         index += 2
                     }
                     current == '/' && source.getOrNull(index + 1) == '*' -> {
                         maskAt(index)
                         maskAt(index + 1)
                         state = BLOCK_COMMENT
+                        recordCodeToken(significant = '*')
                         index += 2
                     }
                     current == '/' && regexAllowed -> {
@@ -760,11 +793,13 @@ internal object JavaScriptLexicalMask {
                         maskAt(index)
                         regexCharacterClass = false
                         state = REGEX_LITERAL
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '/' -> {
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '(' -> {
@@ -783,6 +818,7 @@ internal object JavaScriptLexicalMask {
                         blockExpected = false
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == ')' -> {
@@ -796,6 +832,7 @@ internal object JavaScriptLexicalMask {
                             context != FUNCTION_EXPRESSION_CONTEXT
                         regexAllowed = blockExpected
                         pendingControlKeyword = null
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '{' -> {
@@ -811,6 +848,7 @@ internal object JavaScriptLexicalMask {
                         statementPosition = true
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '}' -> {
@@ -823,6 +861,7 @@ internal object JavaScriptLexicalMask {
                         expectedBlockResult = true
                         statementPosition = regexAllowed
                         pendingControlKeyword = null
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '[' -> {
@@ -830,6 +869,7 @@ internal object JavaScriptLexicalMask {
                         blockExpected = false
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == ']' || current == '.' -> {
@@ -837,6 +877,7 @@ internal object JavaScriptLexicalMask {
                         blockExpected = false
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '=' && source.getOrNull(index + 1) == '>' -> {
@@ -845,23 +886,27 @@ internal object JavaScriptLexicalMask {
                         expectedBlockResult = false
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = '>')
                         index += 2
                     }
                     (current == '+' || current == '-') &&
                         source.getOrNull(index + 1) == current -> {
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index += 2
                     }
                     current in REGEX_PREFIX_CHARS -> {
                         statementPosition = current == ';'
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = current)
                         index++
                     }
                     else -> {
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index++
                     }
                 }
@@ -876,7 +921,10 @@ internal object JavaScriptLexicalMask {
                     } else {
                         if (maskLiterals) maskAt(index)
                         index++
-                        if (current == closing) state = CODE
+                        if (current == closing) {
+                            state = CODE
+                            recordCodeToken(significant = current)
+                        }
                     }
                 }
                 TEMPLATE_TEXT -> when {
@@ -890,6 +938,7 @@ internal object JavaScriptLexicalMask {
                         state = CODE
                         pendingControlKeyword = null
                         regexAllowed = false
+                        recordCodeToken(significant = current)
                         index++
                     }
                     current == '$' && source.getOrNull(index + 1) == '{' -> {
@@ -899,6 +948,7 @@ internal object JavaScriptLexicalMask {
                         state = CODE
                         pendingControlKeyword = null
                         regexAllowed = true
+                        recordCodeToken(significant = '{')
                         index += 2
                     }
                     else -> {
@@ -951,10 +1001,12 @@ internal object JavaScriptLexicalMask {
                         while (source.getOrNull(index)?.isLetter() == true) {
                             maskAt(index)
                             index++
+                            checkCancellationCheckpoint(index)
                         }
                         pendingControlKeyword = null
                         regexAllowed = false
                         state = CODE
+                        recordCodeToken(significant = current)
                     }
                     else -> {
                         maskAt(index)
@@ -963,6 +1015,7 @@ internal object JavaScriptLexicalMask {
                 }
             }
         }
+        checkCancelled()
         return masked.concatToString()
     }
 
@@ -998,6 +1051,8 @@ internal object JavaScriptLexicalMask {
         setOf("class", "do", "else", "finally", "try")
     private val STATEMENT_PREFIX_KEYWORDS =
         setOf("class", "do", "else", "finally", "try")
+    private val DECLARATION_PREFIX_KEYWORDS = setOf("async", "default", "export")
+    private val DECLARATION_PREFIX_CHARS = setOf(';', '{', '}')
     private const val FUNCTION_DECLARATION_CONTEXT = "function-declaration"
     private const val FUNCTION_EXPRESSION_CONTEXT = "function-expression"
 }

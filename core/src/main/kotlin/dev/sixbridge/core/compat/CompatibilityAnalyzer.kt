@@ -296,11 +296,13 @@ class CompatibilityAnalyzer(
                 val sourceWithoutComments = JavaScriptLexicalMask.mask(
                     apiSource,
                     maskLiterals = false,
+                    checkCancelled = control::checkCancelled,
                 )
                 control.checkCancelled()
                 val codeOnly = JavaScriptLexicalMask.mask(
                     apiSource,
                     maskLiterals = true,
+                    checkCancelled = control::checkCancelled,
                 )
                 control.checkCancelled()
                 val aliases = mutableSetOf<String>()
@@ -314,6 +316,7 @@ class CompatibilityAnalyzer(
                     val dynamicExpression = JavaScriptLexicalMask.mask(
                         expression,
                         maskLiterals = true,
+                        checkCancelled = control::checkCancelled,
                     )
                     val directAlias = aliases.singleOrNull { it == expression }
                     val referencesAlias = aliases.any {

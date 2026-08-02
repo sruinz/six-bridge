@@ -220,7 +220,10 @@ class RuntimeResourceIndex private constructor(
                             ) {
                                 val body = source.substring(script.bodyRange)
                                 val inlineDependencies =
-                                    RuntimeSourceScanner.javaScriptDependencies(body)
+                                    RuntimeSourceScanner.javaScriptDependencies(
+                                        body,
+                                        control::checkCancelled,
+                                    )
                                 dependencies += inlineDependencies.dependencies
                                 if (inlineDependencies.unresolvedDependency) {
                                     unresolvedDependency = true
@@ -234,7 +237,10 @@ class RuntimeResourceIndex private constructor(
                         )
                     }
                     "js", "mjs", "cjs" ->
-                        RuntimeSourceScanner.javaScriptDependencies(source)
+                        RuntimeSourceScanner.javaScriptDependencies(
+                            source,
+                            control::checkCancelled,
+                        )
                     else -> RuntimeSourceScanner.JavaScriptDependencyScan(
                         emptySet(),
                         false,
