@@ -1,6 +1,7 @@
 import { callbackResult, createRuntimeCase } from '../probe-runtime.js';
 
 const FIXTURE_URL = 'https://example.com/#sixbridge-api-probe=';
+const CLEANUP_TIMEOUT_MS = 1_000;
 
 export const CASE_IDS = Object.freeze([
   'search-query-page',
@@ -15,26 +16,26 @@ const SAFE_RUNNERS = Object.freeze({
       throw new Error('tabs cleanup contract mismatch');
     }
     const fixtureUrl = `${FIXTURE_URL}tabs-create-fixture-page&runToken=${encodeURIComponent(runToken)}`;
-    const deadline = Date.now() + timeoutMs;
-    const remaining = () => Math.max(1, deadline - Date.now());
     let createdTabId;
     try {
       const tab = await callbackResult(
         environment,
         (done) => environment.chrome.tabs.create({ active: false, url: fixtureUrl }, done),
-        remaining(),
+        timeoutMs,
       );
       createdTabId = tab?.id;
       if (!Number.isInteger(createdTabId)) throw new Error('created tab ID is missing');
       return { created: true };
     } finally {
+      const cleanupDeadline = Date.now() + CLEANUP_TIMEOUT_MS;
+      const cleanupRemaining = () => Math.max(1, cleanupDeadline - Date.now());
       try {
         let cleanupIds = Number.isInteger(createdTabId) ? [createdTabId] : [];
         if (cleanupIds.length === 0) {
           const tabs = await callbackResult(
             environment,
             (done) => environment.chrome.tabs.query({ url: 'https://example.com/*' }, done),
-            remaining(),
+            cleanupRemaining(),
           );
           cleanupIds = (Array.isArray(tabs) ? tabs : [])
             .filter((tab) => tab?.url === fixtureUrl && Number.isInteger(tab?.id))
@@ -44,7 +45,7 @@ const SAFE_RUNNERS = Object.freeze({
           await callbackResult(
             environment,
             (done) => environment.chrome.tabs.remove(tabId, done),
-            remaining(),
+            cleanupRemaining(),
           );
         }
       } catch (_cleanupError) {

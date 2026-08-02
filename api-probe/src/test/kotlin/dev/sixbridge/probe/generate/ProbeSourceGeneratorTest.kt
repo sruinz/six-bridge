@@ -78,7 +78,14 @@ class ProbeSourceGeneratorTest {
             assertEquals(3, manifest.getValue("manifest_version").jsonPrimitive.content.toInt())
             assertEquals("SIX API Probe · ${probe.groupId}", manifest.getValue("name").jsonPrimitive.content)
             assertEquals(expectedPermissions.getValue(probe.groupId), manifest.getValue("permissions").jsonArray.strings())
-            assertFalse("host_permissions" in manifest)
+            if (probe.groupId == "tab-page") {
+                assertEquals(
+                    listOf("https://example.com/*"),
+                    manifest.getValue("host_permissions").jsonArray.strings(),
+                )
+            } else {
+                assertFalse("host_permissions" in manifest)
+            }
             assertEquals(
                 "service-worker.js",
                 manifest.getValue("background").jsonObject.getValue("service_worker").jsonPrimitive.content,

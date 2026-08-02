@@ -238,6 +238,12 @@ class ProbeCaseSafetyTest {
             .associateBy { it.getValue("id").jsonPrimitive.content }
         val contextJson = Json.encodeToString(JsonObject.serializer(), descriptors.getValue("context-menus-create-worker"))
         val tabsJson = Json.encodeToString(JsonObject.serializer(), descriptors.getValue("tabs-create-fixture-page"))
+        val tabManifest = generated.single { it.groupId == "tab-page" }.sourceRoot
+            .resolve("manifest.json").readText()
+        val hasFixtureHost = Json.parseToJsonElement(tabManifest).jsonObject["host_permissions"]
+            ?.jsonArray
+            ?.any { it.jsonPrimitive.content == "https://example.com/*" }
+            ?: false
 
         val output = runNodeModule(
             workspace,
@@ -246,6 +252,7 @@ class ProbeCaseSafetyTest {
             import { createCase as createTabs } from '${root.resolve("cases/tab-page.js").toUri()}';
             import { createCase as createUi } from '${root.resolve("cases/user-interface.js").toUri()}';
             const events = [];
+            const hasFixtureHost = $hasFixtureHost;
             let fixtureUrl;
             const chrome = {
               contextMenus: {
@@ -255,7 +262,12 @@ class ProbeCaseSafetyTest {
               runtime: {},
               tabs: {
                 create: (details, _done) => { fixtureUrl = details.url; events.push('tab:create'); },
-                query: (_query, done) => { events.push('tab:query'); done([{ id: 41, url: fixtureUrl }, { id: 42, url: 'https://example.com/#other' }]); },
+                query: (_query, done) => {
+                  events.push('tab:query');
+                  setTimeout(() => done(hasFixtureHost
+                    ? [{ id: 41, url: fixtureUrl }, { id: 42, url: 'https://example.com/#other' }]
+                    : [{ id: 41 }, { id: 42 }]), 10);
+                },
                 remove: (id, done) => { events.push(`tab:remove:${'$'}{id}`); done(); },
               },
             };
@@ -387,6 +399,121 @@ class ProbeCaseSafetyTest {
             listOf("offscreen:create", "offscreen:send", "offscreen:close"),
             events.filter { it.startsWith("offscreen:") },
         )
+    }
+
+    @Test
+    fun `offscreen lease는 동시 run이 끝난 뒤 probe 생성 document만 한 번 닫는다`() = withWorkspace { workspace ->
+        val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
+        val root = generated.first().sourceRoot
+        Files.writeString(root.resolve("package.json"), "{\"type\":\"module\"}\n", UTF_8)
+        val output = runNodeModule(
+            workspace,
+            """
+            import { installServiceWorkerBridge } from '${root.resolve("service-worker.js").toUri()}';
+            const events = [];
+            const descriptor = (id) => ({
+              id, namespace: 'alarms', member: 'get', context: 'offscreen_document',
+              mode: 'safe_call', permissions: ['alarms'],
+            });
+            const first = descriptor('offscreen-first');
+            const second = descriptor('offscreen-second');
+            const hanging = descriptor('offscreen-hanging');
+            const throwing = descriptor('offscreen-throwing');
+            const existing = descriptor('offscreen-existing');
+            const tokens = [
+              'run-token-00000001', 'run-token-00000002', 'run-token-00000003',
+              'run-token-00000004', 'run-token-00000005',
+            ];
+            let exists = false;
+            let creating = false;
+            let listener;
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const chrome = {
+              offscreen: {
+                hasDocument: async () => { events.push('has'); await wait(5); return exists; },
+                createDocument: async () => {
+                  events.push('create');
+                  if (creating) throw new Error('concurrent create');
+                  creating = true;
+                  await wait(5);
+                  exists = true;
+                  creating = false;
+                },
+                closeDocument: async () => { events.push('close'); exists = false; },
+              },
+              runtime: {
+                id: 'runtime-id',
+                getURL: (path) => `chrome-extension://runtime-id/${'$'}{String(path).replace(/^\//, '')}`,
+                onMessage: { addListener: (value) => { listener = value; } },
+                sendMessage: (message, done) => {
+                  events.push(`send:${'$'}{message.caseId}`);
+                  if (message.caseId === throwing.id) throw new Error('dispatch throw');
+                  done({ caseId: message.caseId, runToken: message.runToken, type: 'six-probe-dispatched' });
+                  if (message.caseId === hanging.id) return;
+                  const delay = message.caseId === second.id ? 30 : 10;
+                  setTimeout(() => {
+                    events.push(`result:${'$'}{message.caseId}`);
+                    const result = {
+                      caseId: message.caseId,
+                      context: message.descriptor.context,
+                      detail: { kind: 'success', valueType: 'string' },
+                      durationMs: delay,
+                      member: message.descriptor.member,
+                      namespace: message.descriptor.namespace,
+                      runToken: message.runToken,
+                      status: 'VERIFIED',
+                    };
+                    listener(
+                      { result, type: 'six-probe-result' },
+                      { id: 'runtime-id', url: chrome.runtime.getURL('offscreen-probe.html') },
+                      (ack) => events.push(`ack:${'$'}{ack.caseId}`),
+                    );
+                  }, delay);
+                },
+              },
+            };
+            listener = installServiceWorkerBridge(
+              { chrome },
+              async () => ({
+                ok: true,
+                json: async () => ({ groupId: 'base-runtime', cases: [first, second, hanging, throwing, existing] }),
+              }),
+              { timeoutMs: 60, tokenFactory: () => tokens.shift() },
+            );
+            const pageSender = { id: 'runtime-id', url: chrome.runtime.getURL('probe.html') };
+            const run = (caseId) => new Promise((resolve) => listener(
+              { caseId, type: 'six-probe-run' }, pageSender, resolve,
+            ));
+            const [firstResult, secondResult] = await Promise.all([run(first.id), run(second.id)]);
+            const hangingResult = await run(hanging.id);
+            const throwingResult = await run(throwing.id);
+            exists = true;
+            const closeCountBeforeExisting = events.filter((event) => event === 'close').length;
+            const existingResult = await run(existing.id);
+            process.stdout.write(JSON.stringify({
+              closeCountBeforeExisting,
+              events,
+              existingResult,
+              firstResult,
+              hangingResult,
+              secondResult,
+              throwingResult,
+            }));
+            """.trimIndent(),
+        ).let { Json.parseToJsonElement(it).jsonObject }
+
+        fun status(name: String): String = output.getValue(name).jsonObject.getValue("result").jsonObject
+            .getValue("status").jsonPrimitive.content
+        assertEquals("VERIFIED", status("firstResult"))
+        assertEquals("VERIFIED", status("secondResult"))
+        assertEquals("FAILED", status("hangingResult"))
+        assertEquals("FAILED", status("throwingResult"))
+        assertEquals("VERIFIED", status("existingResult"))
+        val events = output.getValue("events").jsonArray.map { it.jsonPrimitive.content }
+        assertEquals(3, events.count { it == "create" })
+        assertEquals(3, events.count { it == "close" })
+        assertTrue(events.indexOf("close") > events.indexOf("result:offscreen-second"))
+        assertEquals("3", output.getValue("closeCountBeforeExisting").jsonPrimitive.content)
     }
 
     @Test
@@ -615,12 +742,19 @@ class ProbeCaseSafetyTest {
     }
 
     @Test
-    fun `현재 catalog에 content case가 없으면 fixture host 권한과 content script를 선언하지 않는다`() = withWorkspace { workspace ->
+    fun `fixture host 권한은 tab fixture group에만 exact match로 선언한다`() = withWorkspace { workspace ->
         val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
 
         generated.forEach { probe ->
             val manifest = Json.parseToJsonElement(probe.sourceRoot.resolve("manifest.json").readText()).jsonObject
-            assertFalse("host_permissions" in manifest)
+            if (probe.groupId == "tab-page") {
+                assertEquals(
+                    listOf("https://example.com/*"),
+                    manifest.getValue("host_permissions").jsonArray.map { it.jsonPrimitive.content },
+                )
+            } else {
+                assertFalse("host_permissions" in manifest)
+            }
             assertFalse("content_scripts" in manifest)
         }
     }

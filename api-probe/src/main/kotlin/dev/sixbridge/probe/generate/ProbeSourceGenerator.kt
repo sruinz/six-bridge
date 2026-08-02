@@ -106,6 +106,7 @@ class ProbeSourceGenerator(
         val manifestKeys = entries.flatMap { entry ->
             entry.cases.flatMap(ProbeCatalogCase::manifestKeys)
         }.toSet()
+        val needsFixtureHost = groupId == "tab-page" || ApiExecutionContext.CONTENT_SCRIPT in contexts
         val iconMap = jsonObject(
             "128" to JsonPrimitive("icons/probe-128.png"),
             "16" to JsonPrimitive("icons/probe-16.png"),
@@ -131,8 +132,10 @@ class ProbeSourceGenerator(
                 ),
             )
         }
-        if (ApiExecutionContext.CONTENT_SCRIPT in contexts) {
+        if (needsFixtureHost) {
             fields["host_permissions"] = JsonArray(listOf(JsonPrimitive(FIXTURE_MATCH)))
+        }
+        if (ApiExecutionContext.CONTENT_SCRIPT in contexts) {
             fields["web_accessible_resources"] = JsonArray(
                 listOf(
                     jsonObject(

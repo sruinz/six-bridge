@@ -2,6 +2,7 @@ import {
   callbackResult,
   failedResult,
   notRunResult,
+  ProbeTimeoutError,
   runCase,
   validateResultEnvelope,
   withDeadline,
@@ -22,6 +23,7 @@ const CASE_FACTORIES = Object.freeze({
   'user-interface': createUserInterface,
 });
 const DEFAULT_TIMEOUT_MS = 10_000;
+const CLEANUP_TIMEOUT_MS = 1_000;
 const FIXTURE_URL = 'https://example.com/';
 const FIXTURE_ORIGIN = new URL(FIXTURE_URL).origin;
 
@@ -194,14 +196,16 @@ export function createProbeController({
   };
 }
 
-async function cleanupFixtureTabs(environment, markerUrl, knownTabId, timeoutMs) {
+async function cleanupFixtureTabs(environment, markerUrl, knownTabId) {
+  const cleanupDeadline = Date.now() + CLEANUP_TIMEOUT_MS;
+  const cleanupRemaining = () => Math.max(1, cleanupDeadline - Date.now());
   let ids = Number.isInteger(knownTabId) ? [knownTabId] : [];
   if (ids.length === 0) {
     try {
       const tabs = await callbackResult(
         environment,
         (done) => environment.chrome.tabs.query({ url: `${FIXTURE_URL}*` }, done),
-        Math.min(timeoutMs, 1_000),
+        cleanupRemaining(),
       );
       ids = (tabs ?? []).filter((tab) => tab.url === markerUrl && Number.isInteger(tab.id)).map((tab) => tab.id);
     } catch {
@@ -213,7 +217,7 @@ async function cleanupFixtureTabs(environment, markerUrl, knownTabId, timeoutMs)
       await callbackResult(
         environment,
         (done) => environment.chrome.tabs.remove(id, done),
-        Math.min(timeoutMs, 1_000),
+        cleanupRemaining(),
       );
     } catch {
       // The owned tab is already gone or the browser rejected cleanup.
@@ -255,12 +259,77 @@ async function dispatchContentCase(environment, testCase, groupId, runToken, rec
       return record.resultPromise;
     }, timeoutMs);
   } finally {
-    await cleanupFixtureTabs(environment, markerUrl, tabId, timeoutMs);
+    await cleanupFixtureTabs(environment, markerUrl, tabId);
   }
 }
 
-async function dispatchOffscreenCase(environment, testCase, groupId, runToken, record, timeoutMs) {
-  let created = false;
+function createOffscreenLeaseManager(environment) {
+  let leaseCount = 0;
+  let ownedByProbe = false;
+  let queue = Promise.resolve();
+
+  const serialize = (operation) => {
+    const result = queue.then(operation, operation);
+    queue = result.catch(() => {});
+    return result;
+  };
+
+  return {
+    acquire(deadlineAt) {
+      return serialize(async () => {
+        const remaining = () => Math.max(1, deadlineAt - Date.now());
+        if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
+        if (leaseCount === 0) {
+          const existed = await withDeadline(
+            () => environment.chrome.offscreen.hasDocument(),
+            remaining(),
+          );
+          if (!existed) {
+            if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
+            await environment.chrome.offscreen.createDocument({
+              justification: 'SIX API capability probe context',
+              reasons: ['DOM_PARSER'],
+              url: 'offscreen-probe.html',
+            });
+            ownedByProbe = true;
+          } else {
+            ownedByProbe = false;
+          }
+        }
+        leaseCount += 1;
+        let released = false;
+        return () => {
+          if (released) return Promise.resolve();
+          released = true;
+          return serialize(async () => {
+            leaseCount = Math.max(0, leaseCount - 1);
+            if (leaseCount !== 0 || !ownedByProbe) return;
+            try {
+              await environment.chrome.offscreen.closeDocument();
+            } catch {
+              // The owned offscreen document is already gone or cleanup was rejected.
+            } finally {
+              ownedByProbe = false;
+            }
+          });
+        };
+      });
+    },
+  };
+}
+
+async function dispatchOffscreenCase(
+  environment,
+  testCase,
+  groupId,
+  runToken,
+  record,
+  timeoutMs,
+  leases,
+) {
+  const deadlineAt = Date.now() + timeoutMs;
+  const acquired = leases.acquire(deadlineAt);
+  let release;
   record.expectedSender = {
     id: environment.chrome.runtime.id,
     origin: new URL(environment.chrome.runtime.getURL('/')).origin,
@@ -269,15 +338,7 @@ async function dispatchOffscreenCase(environment, testCase, groupId, runToken, r
   };
   try {
     return await withDeadline(async () => {
-      const existed = await environment.chrome.offscreen.hasDocument();
-      if (!existed) {
-        await environment.chrome.offscreen.createDocument({
-          justification: 'SIX API capability probe context',
-          reasons: ['DOM_PARSER'],
-          url: 'offscreen-probe.html',
-        });
-        created = true;
-      }
+      release = await acquired;
       const dispatched = await callbackResult(
         environment,
         (done) => environment.chrome.runtime.sendMessage(
@@ -303,11 +364,21 @@ async function dispatchOffscreenCase(environment, testCase, groupId, runToken, r
       return record.resultPromise;
     }, timeoutMs);
   } finally {
-    if (created) {
+    if (!release) {
       try {
-        await withDeadline(() => environment.chrome.offscreen.closeDocument(), Math.min(timeoutMs, 1_000));
+        release = await withDeadline(() => acquired, CLEANUP_TIMEOUT_MS);
       } catch {
-        // The owned offscreen document is already gone or cleanup was rejected.
+        void acquired.then(
+          (lateRelease) => lateRelease().catch(() => {}),
+          () => {},
+        );
+      }
+    }
+    if (release) {
+      try {
+        await withDeadline(() => release(), CLEANUP_TIMEOUT_MS);
+      } catch {
+        // Release remains serialized and continues after this bounded wait.
       }
     }
   }
@@ -320,12 +391,21 @@ async function loadController(environment, fetchImpl, options) {
   const factory = CASE_FACTORIES[bundle.groupId];
   if (!factory) throw new Error('unknown probe group');
   const descriptors = new Map(bundle.cases.map((testCase) => [testCase.id, testCase]));
+  const offscreenLeases = createOffscreenLeaseManager(environment);
   return createProbeController({
     descriptors,
     executeContextCase: (testCase, runToken, record, timeoutMs) => (
       testCase.context === 'content_script'
         ? dispatchContentCase(environment, testCase, bundle.groupId, runToken, record, timeoutMs)
-        : dispatchOffscreenCase(environment, testCase, bundle.groupId, runToken, record, timeoutMs)
+        : dispatchOffscreenCase(
+          environment,
+          testCase,
+          bundle.groupId,
+          runToken,
+          record,
+          timeoutMs,
+          offscreenLeases,
+        )
     ),
     executeWorkerCase: (testCase, runToken, timeoutMs) => runCase(
       factory(testCase, environment),
