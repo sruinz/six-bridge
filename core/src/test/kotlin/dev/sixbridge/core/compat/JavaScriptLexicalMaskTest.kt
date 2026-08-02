@@ -2,6 +2,7 @@ package dev.sixbridge.core.compat
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class JavaScriptLexicalMaskTest {
@@ -32,5 +33,18 @@ class JavaScriptLexicalMaskTest {
         JavaScriptLexicalMask.mask(source, true) { checkpoints++ }
 
         assertTrue(checkpoints >= source.length / 16_384)
+    }
+
+    @Test
+    fun `주석 사이의 선언 뒤 regex literal body를 mask한다`() {
+        val source = """
+            export /* comment */ function named() {} /chrome.runtime/.test('function')
+            export default /* comment */ class Named {} /chrome.runtime/.test('class')
+            async /* comment */ function task() {} /chrome.runtime/.test('async')
+        """.trimIndent()
+
+        val masked = JavaScriptLexicalMask.mask(source, maskLiterals = true)
+
+        assertFalse("chrome.runtime" in masked)
     }
 }

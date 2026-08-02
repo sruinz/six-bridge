@@ -777,14 +777,12 @@ internal object JavaScriptLexicalMask {
                         maskAt(index)
                         maskAt(index + 1)
                         state = LINE_COMMENT
-                        recordCodeToken(significant = '/')
                         index += 2
                     }
                     current == '/' && source.getOrNull(index + 1) == '*' -> {
                         maskAt(index)
                         maskAt(index + 1)
                         state = BLOCK_COMMENT
-                        recordCodeToken(significant = '*')
                         index += 2
                     }
                     current == '/' && regexAllowed -> {
