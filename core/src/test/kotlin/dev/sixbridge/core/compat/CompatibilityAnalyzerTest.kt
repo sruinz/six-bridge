@@ -32,6 +32,30 @@ class CompatibilityAnalyzerTest {
     )
 
     @Test
+    fun `분석 보고서는 지역화된 manifest 이름과 locale issue를 포함한다`() {
+        val source = Files.createTempDirectory("six-localized-name")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"__MSG_extName__","version":"1","default_locale":"en"}""",
+        )
+        source.resolve("_locales").resolve("en").toFile().mkdirs()
+        source.resolve("_locales/en/messages.json").writeText(
+            """{"extName":{"message":"Localized extension"}}""",
+        )
+
+        val resolved = CompatibilityAnalyzer().analyzeStable(source, profile, sourceSha256 = null)
+
+        assertEquals("Localized extension", resolved.extensionName)
+        assertTrue(resolved.issues.isEmpty())
+
+        source.resolve("_locales/en/messages.json").toFile().delete()
+        val missing = CompatibilityAnalyzer().analyzeStable(source, profile, sourceSha256 = null)
+
+        assertEquals("__MSG_extName__", missing.extensionName)
+        assertEquals("manifest_name_locale_missing", missing.issues.single().code)
+        assertEquals(false, missing.issues.single().blocking)
+    }
+
+    @Test
     fun `모바일 분석 예산 초과는 이름과 권한을 보존한 UNKNOWN이다`() {
         val source = Files.createTempDirectory("six-budget")
         source.resolve("manifest.json").writeText(

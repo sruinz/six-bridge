@@ -88,7 +88,9 @@ class CompatibilityAnalyzer(
         }
 
         val manifestVersion = (manifest["manifest_version"] as? JsonPrimitive)?.intOrNull
-        val name = manifest.stringOrNull("name")
+        val localizedName = ManifestLocalization.resolveName(extensionRoot, manifest)
+        val name = localizedName?.value
+        val manifestIssues = listOfNotNull(localizedName?.issue)
         val version = manifest.stringOrNull("version")
         val manifestKey = manifest.stringOrNull("key")
         val manifestKeyExtensionId = manifestKey?.let(::extensionIdFromManifestKey)
@@ -108,7 +110,7 @@ class CompatibilityAnalyzer(
                 name = name,
                 version = version,
                 permissions = permissions,
-            )
+            ).withAdditionalIssues(manifestIssues)
         }
         val apiScan = try {
             scanApiCalls(extensionRoot, manifest, ledger)
@@ -119,13 +121,13 @@ class CompatibilityAnalyzer(
                 name,
                 version,
                 permissions,
-            )
+            ).withAdditionalIssues(manifestIssues)
         }
         val usedApis = (
             apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
             ).toSortedSet()
         val unsupported = (usedApis - profile.supportedApis).toSortedSet()
-        val issues = mutableListOf<CompatibilityIssue>()
+        val issues = manifestIssues.toMutableList()
 
         if (manifestVersion != 3) {
             issues += CompatibilityIssue(
@@ -458,6 +460,10 @@ class CompatibilityAnalyzer(
             ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() }
             ?.toSet()
             .orEmpty()
+
+    private fun CompatibilityReport.withAdditionalIssues(
+        additionalIssues: List<CompatibilityIssue>,
+    ): CompatibilityReport = copy(issues = additionalIssues + issues)
 
     private fun blocked(code: String, message: String) = CompatibilityReport(
         status = CompatibilityStatus.BLOCKED,
