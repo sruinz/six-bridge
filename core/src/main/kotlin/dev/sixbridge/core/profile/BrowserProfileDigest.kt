@@ -35,7 +35,28 @@ internal object BrowserProfileDigest {
         digest.list("profileDifferences", profile.profileDifferences)
         digest.set("supportedFeatures", profile.supportedFeatures)
         digest.set("unavailableFeatures", profile.unavailableFeatures)
+        digest.capabilities("apiCapabilities", profile.apiCapabilities)
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun MessageDigest.capabilities(
+        name: String,
+        values: List<ApiCapabilityEvidence>,
+    ) {
+        val sorted = values.sortedWith(API_CAPABILITY_COMPARATOR)
+        field("$name.size", sorted.size.toString())
+        sorted.forEachIndexed { index, evidence ->
+            val prefix = "$name[$index]"
+            field("$prefix.key.namespace", evidence.key.namespace)
+            field("$prefix.key.member", evidence.key.member)
+            field("$prefix.key.context", evidence.key.context.name)
+            field("$prefix.status", evidence.status.name)
+            set("$prefix.permissions", evidence.permissions)
+            set("$prefix.manifestKeys", evidence.manifestKeys)
+            field("$prefix.detail", evidence.detail)
+            field("$prefix.probeId", evidence.probeId)
+            field("$prefix.probeCatalogSha256", evidence.probeCatalogSha256)
+        }
     }
 
     private fun MessageDigest.set(name: String, values: Set<String>) {

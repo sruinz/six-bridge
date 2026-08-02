@@ -21,9 +21,150 @@ class BrowserProfileJsonTest {
 
         val encoded = BrowserProfileJson.encode(profile)
 
-        assertTrue("\"schemaVersion\": 3" in encoded)
+        assertTrue("\"schemaVersion\": 4" in encoded)
         assertTrue("\"installationApkSetSha256\": \"def456\"" in encoded)
         assertEquals(profile, BrowserProfileJson.decode(encoded))
+    }
+
+    @Test
+    fun `schema v4 capability evidence를 결정론적으로 round trip한다`() {
+        val first = capability(
+            namespace = "tabs",
+            member = "query",
+            context = ApiExecutionContext.SERVICE_WORKER,
+            permissions = linkedSetOf("tabs", "activeTab"),
+            manifestKeys = linkedSetOf("permissions", "host_permissions"),
+        )
+        val second = capability(
+            namespace = "alarms",
+            member = "getAll",
+            context = ApiExecutionContext.EXTENSION_PAGE,
+            permissions = linkedSetOf("alarms"),
+            manifestKeys = emptySet(),
+        )
+        val profile = baseline().copy(apiCapabilities = listOf(first, second))
+        val reordered = profile.copy(
+            apiCapabilities = listOf(
+                second,
+                first.copy(
+                    permissions = linkedSetOf("activeTab", "tabs"),
+                    manifestKeys = linkedSetOf("host_permissions", "permissions"),
+                ),
+            ),
+        )
+
+        val encoded = BrowserProfileJson.encode(profile)
+
+        assertEquals(encoded, BrowserProfileJson.encode(reordered))
+        assertTrue(
+            encoded.indexOf("\"namespace\": \"alarms\"") <
+                encoded.indexOf("\"namespace\": \"tabs\""),
+        )
+        assertEquals(
+            profile,
+            BrowserProfileJson.decode(encoded),
+        )
+    }
+
+    @Test
+    fun `profile v1부터 v3 decode는 빈 capability 목록을 부여한다`() {
+        (1..3).forEach { schemaVersion ->
+            assertEquals(
+                emptyList(),
+                BrowserProfileJson.decode(legacyProfileJson(schemaVersion)).apiCapabilities,
+            )
+        }
+    }
+
+    @Test
+    fun `schema v4 capability는 exact field set과 scalar type을 검증한다`() {
+        val encoded = BrowserProfileJson.encode(
+            baseline().copy(apiCapabilities = listOf(capability())),
+        )
+        val unknownEvidenceField = encoded.replace(
+            "\"status\": \"verified\"",
+            "\"status\": \"verified\",\n            \"unexpected\": true",
+        )
+        val unknownKeyField = encoded.replace(
+            "\"context\": \"service_worker\"",
+            "\"context\": \"service_worker\",\n                \"unexpected\": true",
+        )
+        val missingEvidenceField = encoded.lines()
+            .filterNot { "\"detail\"" in it }
+            .joinToString("\n")
+        val wrongPermissionsType = encoded.replace(
+            "\"permissions\": [\n                \"tabs\"\n            ]",
+            "\"permissions\": \"tabs\"",
+        )
+
+        listOf(
+            unknownEvidenceField,
+            unknownKeyField,
+            missingEvidenceField,
+            wrongPermissionsType,
+        ).forEach { malformed ->
+            assertFailsWith<IllegalArgumentException> {
+                BrowserProfileJson.decode(malformed)
+            }
+        }
+    }
+
+    @Test
+    fun `schema v4 capability는 duplicate field와 set 원소를 거부한다`() {
+        val encoded = BrowserProfileJson.encode(
+            baseline().copy(apiCapabilities = listOf(capability())),
+        )
+        val duplicateField = encoded.replace(
+            "\"status\": \"verified\"",
+            "\"status\": \"verified\",\n            \"status\": \"absent\"",
+        )
+        val duplicateSetValue = encoded.replace(
+            "\"permissions\": [\n                \"tabs\"\n            ]",
+            "\"permissions\": [\n                \"tabs\",\n                \"tabs\"\n            ]",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(duplicateField)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(duplicateSetValue)
+        }
+    }
+
+    @Test
+    fun `schema v4 capability는 status context digest를 엄격히 검증한다`() {
+        val encoded = BrowserProfileJson.encode(
+            baseline().copy(apiCapabilities = listOf(capability())),
+        )
+        val invalidStatus = encoded.replace("\"status\": \"verified\"", "\"status\": \"VERIFIED\"")
+        val invalidContext = encoded.replace(
+            "\"context\": \"service_worker\"",
+            "\"context\": \"background_page\"",
+        )
+        val invalidDigest = encoded.replace("\"${"a".repeat(64)}\"", "\"${"A".repeat(64)}\"")
+
+        listOf(invalidStatus, invalidContext, invalidDigest).forEach { malformed ->
+            assertFailsWith<IllegalArgumentException> {
+                BrowserProfileJson.decode(malformed)
+            }
+        }
+    }
+
+    @Test
+    fun `schema v4 decode는 duplicate capability key를 거부한다`() {
+        val evidence = capability()
+        val encoded = BrowserProfileJson.encode(
+            baseline().copy(apiCapabilities = listOf(evidence)),
+        )
+        val evidenceObject = encoded.substringAfter("\"apiCapabilities\": [\n").substringBefore("\n    ],")
+        val duplicateArray = encoded.replace(
+            "\"apiCapabilities\": [\n$evidenceObject\n    ]",
+            "\"apiCapabilities\": [\n$evidenceObject,\n$evidenceObject\n    ]",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            BrowserProfileJson.decode(duplicateArray)
+        }
     }
 
     @Test
@@ -177,9 +318,7 @@ class BrowserProfileJsonTest {
 
     @Test
     fun `profile v3는 installation set hash 누락을 거부한다`() {
-        val encoded = BrowserProfileJson.encode(
-            baseline().copy(installationApkSetSha256 = "2".repeat(64)),
-        )
+        val encoded = legacyProfileJson(schemaVersion = 3)
         val missing = encoded.lines()
             .filterNot { "\"installationApkSetSha256\"" in it }
             .joinToString("\n")
@@ -217,6 +356,22 @@ class BrowserProfileJsonTest {
         sourceApkSha256 = "abc123",
     )
 
+    private fun capability(
+        namespace: String = "tabs",
+        member: String = "query",
+        context: ApiExecutionContext = ApiExecutionContext.SERVICE_WORKER,
+        permissions: Set<String> = setOf("tabs"),
+        manifestKeys: Set<String> = setOf("permissions"),
+    ) = ApiCapabilityEvidence(
+        key = ApiCapabilityKey(namespace, member, context),
+        status = ApiCapabilityStatus.VERIFIED,
+        permissions = permissions,
+        manifestKeys = manifestKeys,
+        detail = "안전한 호출 성공",
+        probeId = "$namespace-$member",
+        probeCatalogSha256 = "a".repeat(64),
+    )
+
     private fun legacyProfileJson(schemaVersion: Int): String {
         val featureFields = if (schemaVersion == 1) {
             ""
@@ -225,6 +380,13 @@ class BrowserProfileJsonTest {
             ,
               "supportedFeatures": [],
               "unavailableFeatures": []
+            """.trimIndent()
+        }
+        val installationField = if (schemaVersion < 3) {
+            ""
+        } else {
+            """,
+              "installationApkSetSha256": "${"0".repeat(64)}"
             """.trimIndent()
         }
         return """
@@ -242,7 +404,7 @@ class BrowserProfileJsonTest {
             "contentProvider": true,
             "devExtensionPath": true
           },
-          "sourceApkSha256": "${"0".repeat(64)}",
+          "sourceApkSha256": "${"0".repeat(64)}"$installationField,
           "sourceApkSignerSha256": "${"1".repeat(64)}",
           "profileDifferences": []$featureFields,
           "support": "unknown"

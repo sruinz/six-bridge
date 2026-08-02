@@ -35,6 +35,21 @@ object BrowserProfileJson {
         "unavailableFeatures",
     )
     private val version3Fields = version2Fields + "installationApkSetSha256"
+    private val version4Fields = version3Fields + "apiCapabilities"
+    private val capabilityFields = setOf(
+        "detail",
+        "key",
+        "manifestKeys",
+        "permissions",
+        "probeCatalogSha256",
+        "probeId",
+        "status",
+    )
+    private val capabilityKeyFields = setOf(
+        "context",
+        "member",
+        "namespace",
+    )
 
     fun encode(profile: BrowserProfile): String {
         profile.validate()
@@ -42,7 +57,7 @@ object BrowserProfileJson {
             JsonObject.serializer(),
             JsonObject(
                 linkedMapOf(
-                    "schemaVersion" to JsonPrimitive(3),
+                    "schemaVersion" to JsonPrimitive(4),
                     "browserPackage" to JsonPrimitive(profile.browserPackage),
                     "versionName" to JsonPrimitive(profile.versionName),
                     "versionCode" to JsonPrimitive(profile.versionCode),
@@ -52,6 +67,35 @@ object BrowserProfileJson {
                     ),
                     "supportedApis" to JsonArray(
                         profile.supportedApis.sorted().map(::JsonPrimitive),
+                    ),
+                    "apiCapabilities" to JsonArray(
+                        profile.apiCapabilities.map {
+                            JsonObject(
+                                linkedMapOf(
+                                    "key" to JsonObject(
+                                        linkedMapOf(
+                                            "namespace" to JsonPrimitive(it.key.namespace),
+                                            "member" to JsonPrimitive(it.key.member),
+                                            "context" to JsonPrimitive(
+                                                it.key.context.name.lowercase(),
+                                            ),
+                                        ),
+                                    ),
+                                    "status" to JsonPrimitive(it.status.name.lowercase()),
+                                    "permissions" to JsonArray(
+                                        it.permissions.sorted().map(::JsonPrimitive),
+                                    ),
+                                    "manifestKeys" to JsonArray(
+                                        it.manifestKeys.sorted().map(::JsonPrimitive),
+                                    ),
+                                    "detail" to JsonPrimitive(it.detail),
+                                    "probeId" to JsonPrimitive(it.probeId),
+                                    "probeCatalogSha256" to JsonPrimitive(
+                                        it.probeCatalogSha256,
+                                    ),
+                                ),
+                            )
+                        },
                     ),
                     "wrapperContract" to JsonObject(
                         linkedMapOf(
@@ -101,13 +145,14 @@ object BrowserProfileJson {
             throw IllegalArgumentException("browser profile JSON을 읽을 수 없습니다.", error)
         }
         val schemaVersion = root.int("schemaVersion")
-        require(schemaVersion in 1..3) {
+        require(schemaVersion in 1..4) {
             "지원하지 않는 browser profile schemaVersion입니다."
         }
         val expectedFields = when (schemaVersion) {
             1 -> version1Fields
             2 -> version2Fields
-            else -> version3Fields
+            3 -> version3Fields
+            else -> version4Fields
         }
         require(root.keys == expectedFields) {
             "browser profile schema 항목이 정확하지 않습니다."
@@ -147,6 +192,11 @@ object BrowserProfileJson {
                 emptySet()
             } else {
                 root.stringSet("unavailableFeatures")
+            },
+            apiCapabilities = if (schemaVersion < 4) {
+                emptyList()
+            } else {
+                root.capabilities("apiCapabilities")
             },
         ).also(BrowserProfile::validate)
         require(root.string("support") == profile.support.name.lowercase()) {
@@ -196,6 +246,37 @@ object BrowserProfileJson {
 
     private fun JsonObject.stringSet(name: String): Set<String> =
         stringList(name).toSet()
+
+    private fun JsonObject.capabilities(name: String): List<ApiCapabilityEvidence> =
+        required(name).jsonArray.map { value ->
+            val evidence = value.jsonObject
+            require(evidence.keys == capabilityFields) {
+                "API capability evidence 항목이 정확하지 않습니다."
+            }
+            val key = evidence.required("key").jsonObject
+            require(key.keys == capabilityKeyFields) {
+                "API capability key 항목이 정확하지 않습니다."
+            }
+            ApiCapabilityEvidence(
+                key = ApiCapabilityKey(
+                    namespace = key.string("namespace"),
+                    member = key.string("member"),
+                    context = key.enum("context"),
+                ),
+                status = evidence.enum("status"),
+                permissions = evidence.stringSet("permissions"),
+                manifestKeys = evidence.stringSet("manifestKeys"),
+                detail = evidence.string("detail"),
+                probeId = evidence.string("probeId"),
+                probeCatalogSha256 = evidence.string("probeCatalogSha256"),
+            )
+        }
+
+    private inline fun <reified T : Enum<T>> JsonObject.enum(name: String): T {
+        val value = string(name)
+        return enumValues<T>().singleOrNull { it.name.lowercase() == value }
+            ?: throw IllegalArgumentException("$name enum 값이 올바르지 않습니다.")
+    }
 
     private fun rejectDuplicateObjectKeys(value: String) {
         JsonStructureScanner(value).parse()

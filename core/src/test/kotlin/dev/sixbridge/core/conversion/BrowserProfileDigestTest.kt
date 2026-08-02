@@ -1,5 +1,9 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.core.profile.ApiCapabilityEvidence
+import dev.sixbridge.core.profile.ApiCapabilityKey
+import dev.sixbridge.core.profile.ApiCapabilityStatus
+import dev.sixbridge.core.profile.ApiExecutionContext
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileDigest
 import dev.sixbridge.core.profile.WrapperContract
@@ -97,4 +101,68 @@ class BrowserProfileDigestTest {
             twoValues.canonicalSha256(),
         )
     }
+
+    @Test
+    fun `capability evidence digest는 key 순서와 set 순서에 결정적이다`() {
+        val tabs = capability(
+            namespace = "tabs",
+            member = "query",
+            permissions = linkedSetOf("tabs", "activeTab"),
+            manifestKeys = linkedSetOf("permissions", "host_permissions"),
+        )
+        val alarms = capability(namespace = "alarms", member = "getAll")
+        val first = base.copy(apiCapabilities = listOf(tabs, alarms))
+        val reordered = base.copy(
+            apiCapabilities = listOf(
+                alarms,
+                tabs.copy(
+                    permissions = linkedSetOf("activeTab", "tabs"),
+                    manifestKeys = linkedSetOf("host_permissions", "permissions"),
+                ),
+            ),
+        )
+
+        assertEquals(first.canonicalSha256(), reordered.canonicalSha256())
+    }
+
+    @Test
+    fun `canonical profile digest는 capability evidence의 모든 필드를 봉인한다`() {
+        val evidence = capability()
+        val profile = base.copy(apiCapabilities = listOf(evidence))
+        val variations = listOf(
+            evidence.copy(key = evidence.key.copy(namespace = "alarms")),
+            evidence.copy(key = evidence.key.copy(member = "getAll")),
+            evidence.copy(key = evidence.key.copy(context = ApiExecutionContext.EXTENSION_PAGE)),
+            evidence.copy(status = ApiCapabilityStatus.EXPOSED),
+            evidence.copy(permissions = evidence.permissions + "activeTab"),
+            evidence.copy(manifestKeys = evidence.manifestKeys + "host_permissions"),
+            evidence.copy(detail = "다른 결과"),
+            evidence.copy(probeId = "tabs-query-other"),
+            evidence.copy(probeCatalogSha256 = "b".repeat(64)),
+        )
+        val digest = profile.canonicalSha256()
+
+        variations.forEach { changed ->
+            assertNotEquals(
+                digest,
+                base.copy(apiCapabilities = listOf(changed)).canonicalSha256(),
+                changed.toString(),
+            )
+        }
+    }
+
+    private fun capability(
+        namespace: String = "tabs",
+        member: String = "query",
+        permissions: Set<String> = setOf("tabs"),
+        manifestKeys: Set<String> = setOf("permissions"),
+    ) = ApiCapabilityEvidence(
+        key = ApiCapabilityKey(namespace, member, ApiExecutionContext.SERVICE_WORKER),
+        status = ApiCapabilityStatus.VERIFIED,
+        permissions = permissions,
+        manifestKeys = manifestKeys,
+        detail = "안전한 호출 성공",
+        probeId = "$namespace-$member",
+        probeCatalogSha256 = "a".repeat(64),
+    )
 }
