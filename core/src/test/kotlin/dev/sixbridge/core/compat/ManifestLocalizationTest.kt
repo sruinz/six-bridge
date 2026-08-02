@@ -12,6 +12,7 @@ import kotlin.test.assertFalse
 
 class ManifestLocalizationTest {
     private val root = Files.createTempDirectory("six-manifest-localization")
+    private val outside = Files.createTempDirectory("six-manifest-localization-outside")
     private val manifest get() = Json.parseToJsonElement(
         root.resolve("manifest.json").toFile().readText(),
     ).jsonObject
@@ -19,6 +20,7 @@ class ManifestLocalizationTest {
     @AfterTest
     fun cleanUp() {
         root.toFile().deleteRecursively()
+        outside.toFile().deleteRecursively()
     }
 
     @Test
@@ -62,6 +64,37 @@ class ManifestLocalizationTest {
         assertEquals("manifest_name_locale_missing", result?.issue?.code)
     }
 
+    @Test
+    fun `_locales symlink는 token과 issue를 보존한다`() {
+        writeManifest("__MSG_extName__", defaultLocale = "en")
+        outside.resolve("en").createDirectories().resolve("messages.json")
+            .writeText("""{"extName":{"message":"Outside"}}""")
+        Files.createSymbolicLink(root.resolve("_locales"), outside)
+
+        assertMissingName()
+    }
+
+    @Test
+    fun `locale directory symlink는 token과 issue를 보존한다`() {
+        writeManifest("__MSG_extName__", defaultLocale = "en")
+        root.resolve("_locales").createDirectories()
+        outside.resolve("messages.json").writeText("""{"extName":{"message":"Outside"}}""")
+        Files.createSymbolicLink(root.resolve("_locales/en"), outside)
+
+        assertMissingName()
+    }
+
+    @Test
+    fun `messages symlink는 token과 issue를 보존한다`() {
+        writeManifest("__MSG_extName__", defaultLocale = "en")
+        root.resolve("_locales/en").createDirectories()
+        val outsideMessages = outside.resolve("messages.json")
+        outsideMessages.writeText("""{"extName":{"message":"Outside"}}""")
+        Files.createSymbolicLink(root.resolve("_locales/en/messages.json"), outsideMessages)
+
+        assertMissingName()
+    }
+
     private fun writeManifest(name: String, defaultLocale: String) {
         root.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"$name","version":"1","default_locale":"$defaultLocale"}""",
@@ -72,5 +105,11 @@ class ManifestLocalizationTest {
         root.resolve("_locales").resolve(locale).createDirectories()
             .resolve("messages.json")
             .writeText(contents)
+    }
+
+    private fun assertMissingName() {
+        val result = ManifestLocalization.resolveName(root, manifest)
+        assertEquals("__MSG_extName__", result?.value)
+        assertEquals("manifest_name_locale_missing", result?.issue?.code)
     }
 }

@@ -30,7 +30,7 @@ internal object ManifestLocalization {
             ?: return LocalizedManifestName(raw, missingIssue(key))
         if (!localeName.matches(locale)) return LocalizedManifestName(raw, missingIssue(key))
 
-        val message = readMessages(root.resolve("_locales").resolve(locale).resolve("messages.json"))
+        val message = readMessages(root, locale)
             ?.get(key)
             .let { it as? JsonObject }
             ?.stringOrNull("message")
@@ -42,7 +42,11 @@ internal object ManifestLocalization {
         }
     }
 
-    private fun readMessages(path: Path): JsonObject? = runCatching {
+    private fun readMessages(root: Path, locale: String): JsonObject? = runCatching {
+        requireDirectory(root)
+        val locales = requireDirectory(root.resolve("_locales"))
+        val localeDirectory = requireDirectory(locales.resolve(locale))
+        val path = localeDirectory.resolve("messages.json")
         val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
         require(attributes.isRegularFile && !attributes.isSymbolicLink)
         require(attributes.size() <= AnalysisSafetyPolicy.mobile.maxManifestBytes)
@@ -63,6 +67,12 @@ internal object ManifestLocalization {
         require(StrictJsonKeyValidator(contents).isValidWithoutDuplicates())
         json.parseToJsonElement(contents) as? JsonObject
     }.getOrNull()
+
+    private fun requireDirectory(path: Path): Path {
+        val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(attributes.isDirectory && !attributes.isSymbolicLink)
+        return path
+    }
 
     private fun missingIssue(key: String) = CompatibilityIssue(
         code = "manifest_name_locale_missing",
