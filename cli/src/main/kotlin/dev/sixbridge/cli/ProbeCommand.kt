@@ -21,7 +21,7 @@ import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
-import java.util.Comparator
+import java.security.MessageDigest
 import java.util.concurrent.Callable
 import picocli.CommandLine
 import picocli.CommandLine.Command
@@ -72,15 +72,18 @@ class ProbeGenerateCommand internal constructor(
             "API probe output은 존재하지 않아야 합니다."
         }
         val parentIdentity = directoryIdentity(parent)
-        var movedIdentity: ProbePublicationIdentity? = null
+        var movedSnapshot: ProbePublicationSnapshot? = null
         try {
             val generated = ProbeSourceGenerator(directoryMover = { source, destination ->
                 forceGeneratedTree(source, publication)
                 require(directoryIdentity(parent) == parentIdentity) {
                     "API probe output parent가 생성 중 변경되었습니다."
                 }
-                val sourceIdentity = publication.identity(source)
-                movedIdentity = sourceIdentity
+                val sourceSnapshot = publication.snapshot(source)
+                require(sourceSnapshot.stable) {
+                    "API probe staging tree가 publication 직전 변경되었습니다."
+                }
+                movedSnapshot = sourceSnapshot
                 publication.moveNew(source, destination)
                 publication.forceDirectory(parent)
             }).generate(catalog, target)
@@ -95,7 +98,7 @@ class ProbeGenerateCommand internal constructor(
             spec.commandLine().out.println("출력=${target}")
             0
         } catch (error: Exception) {
-            movedIdentity?.let { rollbackMovedTarget(target, parent, it, publication, error) }
+            movedSnapshot?.let { rollbackMovedTarget(target, parent, it, publication, error) }
             throw error
         }
     }
@@ -233,7 +236,7 @@ private fun publishNewProfile(
     }
     val parentIdentity = directoryIdentity(parent)
     val temporary = Files.createTempFile(parent, ".${target.fileName}.tmp-", ".json")
-    var movedIdentity: ProbePublicationIdentity? = null
+    var movedSnapshot: ProbePublicationSnapshot? = null
     try {
         publication.writeAndForce(temporary, encoded.toByteArray(Charsets.UTF_8))
         val decoded = BrowserProfileJson.decode(readStrictFile(temporary, MAX_PROFILE_BYTES))
@@ -243,8 +246,11 @@ private fun publishNewProfile(
         require(directoryIdentity(parent) == parentIdentity) {
             "후보 browser profile parent가 생성 중 변경되었습니다."
         }
-        val sourceIdentity = publication.identity(temporary)
-        movedIdentity = sourceIdentity
+        val sourceSnapshot = publication.snapshot(temporary)
+        require(sourceSnapshot.stable) {
+            "후보 browser profile 임시 파일이 publication 직전 변경되었습니다."
+        }
+        movedSnapshot = sourceSnapshot
         publication.moveNew(temporary, target)
         publication.forceDirectory(parent)
         require(directoryIdentity(parent) == parentIdentity) {
@@ -255,7 +261,7 @@ private fun publishNewProfile(
             "후보 browser profile publication digest가 일치하지 않습니다."
         }
     } catch (error: Exception) {
-        movedIdentity?.let { rollbackMovedTarget(target, parent, it, publication, error) }
+        movedSnapshot?.let { rollbackMovedTarget(target, parent, it, publication, error) }
         throw error
     } finally {
         Files.deleteIfExists(temporary)
@@ -300,12 +306,14 @@ private fun forceGeneratedTree(root: Path, publication: ProbePublicationFileOps)
 private fun rollbackMovedTarget(
     target: Path,
     parent: Path,
-    identity: ProbePublicationIdentity,
+    snapshot: ProbePublicationSnapshot,
     publication: ProbePublicationFileOps,
     original: Exception,
 ) {
     try {
-        if (publication.deleteIfIdentity(target, identity)) {
+        val result = publication.quarantineAfterFailure(target, snapshot)
+        original.addSuppressed(ProbeRollbackDiagnosticException(result))
+        if (result.publicTargetChanged) {
             try {
                 publication.forceDirectory(parent)
             } catch (rollbackFsync: Exception) {
@@ -320,11 +328,19 @@ private fun rollbackMovedTarget(
 internal interface ProbePublicationFileOps {
     fun writeAndForce(path: Path, bytes: ByteArray)
     fun forceFile(path: Path)
-    fun identity(path: Path): ProbePublicationIdentity
+    fun snapshot(path: Path): ProbePublicationSnapshot
     fun moveNew(source: Path, target: Path)
     fun forceDirectory(path: Path)
-    fun deleteIfIdentity(path: Path, expected: ProbePublicationIdentity): Boolean
+    fun quarantineAfterFailure(
+        path: Path,
+        expected: ProbePublicationSnapshot,
+    ): ProbeRollbackResult
 }
+
+internal data class ProbePublicationSnapshot(
+    val entries: Map<String, ProbePublicationIdentity>,
+    val stable: Boolean,
+)
 
 internal data class ProbePublicationIdentity(
     val fileKey: Any?,
@@ -333,9 +349,29 @@ internal data class ProbePublicationIdentity(
     val size: Long,
     val regularFile: Boolean,
     val directory: Boolean,
+    val sha256: String?,
+)
+
+internal enum class ProbeRollbackState {
+    OWN_OUTPUT_ISOLATED,
+    COMPETITOR_RESTORED,
+    RESTORE_COLLISION,
+}
+
+internal data class ProbeRollbackResult(
+    val state: ProbeRollbackState,
+    val quarantinePath: Path,
+    val publicTargetChanged: Boolean,
+    val failure: Exception? = null,
+)
+
+internal class ProbeRollbackDiagnosticException(result: ProbeRollbackResult) : IOException(
+    "probe rollback=${result.state}; quarantine=${result.quarantinePath.toAbsolutePath().normalize()}",
+    result.failure,
 )
 
 internal class NioProbePublicationFileOps(
+    private val afterQuarantineInspection: (Path) -> Unit = {},
     private val mover: (Path, Path) -> Unit = { source, target -> Files.move(source, target) },
 ) : ProbePublicationFileOps {
     override fun writeAndForce(path: Path, bytes: ByteArray) {
@@ -353,20 +389,10 @@ internal class NioProbePublicationFileOps(
         FileChannel.open(path, WRITE, NOFOLLOW_LINKS).use { it.force(true) }
     }
 
-    override fun identity(path: Path): ProbePublicationIdentity {
-        require(!Files.isSymbolicLink(path)) { "publication identity 대상은 symlink일 수 없습니다." }
-        val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
-        require(attributes.isRegularFile || attributes.isDirectory) {
-            "publication identity 대상 종류가 올바르지 않습니다."
-        }
-        return ProbePublicationIdentity(
-            fileKey = attributes.fileKey(),
-            creationTime = attributes.creationTime(),
-            lastModifiedTime = attributes.lastModifiedTime(),
-            size = attributes.size(),
-            regularFile = attributes.isRegularFile,
-            directory = attributes.isDirectory,
-        )
+    override fun snapshot(path: Path): ProbePublicationSnapshot {
+        val first = readTreeSnapshot(path)
+        val second = readTreeSnapshot(path)
+        return ProbePublicationSnapshot(second, stable = first == second)
     }
 
     override fun moveNew(source: Path, target: Path) {
@@ -385,73 +411,135 @@ internal class NioProbePublicationFileOps(
         FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
     }
 
-    override fun deleteIfIdentity(path: Path, expected: ProbePublicationIdentity): Boolean {
+    override fun quarantineAfterFailure(
+        path: Path,
+        expected: ProbePublicationSnapshot,
+    ): ProbeRollbackResult {
         val parent = requireNotNull(path.parent) { "rollback target에 parent가 필요합니다." }
         val quarantine = Files.createTempDirectory(parent, ".${path.fileName}.rollback-")
+            .toAbsolutePath().normalize()
         val entry = quarantine.resolve("entry")
+        if (!Files.exists(path, NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) {
+            return ProbeRollbackResult(
+                ProbeRollbackState.OWN_OUTPUT_ISOLATED,
+                quarantine,
+                publicTargetChanged = false,
+            )
+        }
+        val publicSnapshot = runCatching { snapshot(path) }.getOrElse { inspectionFailure ->
+            return ProbeRollbackResult(
+                ProbeRollbackState.COMPETITOR_RESTORED,
+                quarantine,
+                publicTargetChanged = false,
+                failure = IOException("rollback public target을 안정적으로 검사하지 못했습니다.", inspectionFailure),
+            )
+        }
+        if (!publicSnapshot.stable || publicSnapshot.entries != expected.entries) {
+            return ProbeRollbackResult(
+                ProbeRollbackState.COMPETITOR_RESTORED,
+                quarantine,
+                publicTargetChanged = false,
+            )
+        }
         try {
-            if (!Files.exists(path, NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) return false
-            if (identity(path) != expected) return false
-            try {
-                mover(path, entry)
-            } catch (moveError: Exception) {
+            mover(path, entry)
+        } catch (moveFailure: Exception) {
+            return ProbeRollbackResult(
                 if (Files.exists(entry, NOFOLLOW_LINKS)) {
-                    recoverQuarantinedEntry(path, entry, expected, moveError)
-                }
-                throw moveError
+                    ProbeRollbackState.RESTORE_COLLISION
+                } else {
+                    ProbeRollbackState.COMPETITOR_RESTORED
+                },
+                quarantine,
+                publicTargetChanged = Files.exists(entry, NOFOLLOW_LINKS),
+                failure = IOException("rollback target을 quarantine으로 이동하지 못했습니다.", moveFailure),
+            )
+        }
+        val quarantinedSnapshot = runCatching { snapshot(entry) }
+        val confirmedSnapshot = runCatching {
+            afterQuarantineInspection(entry)
+            snapshot(entry)
+        }
+        val quarantineIsOwnOutput = quarantinedSnapshot.getOrNull()?.let { first ->
+            confirmedSnapshot.getOrNull()?.let { second ->
+                first.stable && second.stable &&
+                    first.entries == expected.entries && second.entries == expected.entries
             }
-            if (identity(entry) != expected) {
-                try {
-                    mover(entry, path)
-                    forceDirectory(parent)
-                } catch (restoreError: Exception) {
-                    throw IOException(
-                        "rollback quarantine의 경쟁자 target을 복원하지 못했습니다: $entry",
-                        restoreError,
-                    )
-                }
-                return false
-            }
-            deleteQuarantinedEntry(entry)
-            return true
-        } finally {
-            if (!Files.exists(entry, NOFOLLOW_LINKS)) Files.deleteIfExists(quarantine)
+        } == true
+        if (quarantineIsOwnOutput) {
+            return ProbeRollbackResult(
+                ProbeRollbackState.OWN_OUTPUT_ISOLATED,
+                quarantine,
+                publicTargetChanged = true,
+            )
+        }
+        return try {
+            mover(entry, path)
+            ProbeRollbackResult(
+                ProbeRollbackState.COMPETITOR_RESTORED,
+                quarantine,
+                publicTargetChanged = true,
+                failure = (quarantinedSnapshot.exceptionOrNull()
+                    ?: confirmedSnapshot.exceptionOrNull())?.let {
+                    IOException("quarantine target을 안정적으로 검사하지 못했습니다.", it)
+                },
+            )
+        } catch (restoreFailure: Exception) {
+            ProbeRollbackResult(
+                ProbeRollbackState.RESTORE_COLLISION,
+                quarantine,
+                publicTargetChanged = true,
+                failure = IOException(
+                    "rollback quarantine의 경쟁자 target을 복원하지 못했습니다: $entry",
+                    restoreFailure,
+                ),
+            )
         }
     }
 
-    private fun recoverQuarantinedEntry(
-        target: Path,
-        entry: Path,
-        expected: ProbePublicationIdentity,
-        moveError: Exception,
-    ) {
-        if (identity(entry) == expected) {
-            runCatching { deleteQuarantinedEntry(entry) }
-                .onFailure(moveError::addSuppressed)
+    private fun readTreeSnapshot(root: Path): Map<String, ProbePublicationIdentity> {
+        require(!Files.isSymbolicLink(root)) { "publication snapshot 대상은 symlink일 수 없습니다." }
+        val paths = if (Files.isDirectory(root, NOFOLLOW_LINKS)) {
+            Files.walk(root).use { stream -> stream.sorted().toList() }
         } else {
-            runCatching {
-                mover(entry, target)
-                forceDirectory(requireNotNull(target.parent))
+            listOf(root)
+        }
+        return paths.associate { path ->
+            require(!Files.isSymbolicLink(path)) {
+                "publication snapshot tree에 symlink가 포함될 수 없습니다."
             }
-                .onFailure { restore ->
-                    moveError.addSuppressed(
-                        IOException(
-                            "move 실패 후 quarantine target을 복원하지 못했습니다: $entry",
-                            restore,
-                        ),
-                    )
-                }
+            val attributes = Files.readAttributes(
+                path,
+                BasicFileAttributes::class.java,
+                NOFOLLOW_LINKS,
+            )
+            require(attributes.isRegularFile || attributes.isDirectory) {
+                "publication snapshot 대상 종류가 올바르지 않습니다."
+            }
+            val key = if (path == root) "." else root.relativize(path).toString()
+            key to ProbePublicationIdentity(
+                fileKey = attributes.fileKey(),
+                creationTime = attributes.creationTime(),
+                lastModifiedTime = attributes.lastModifiedTime(),
+                size = attributes.size(),
+                regularFile = attributes.isRegularFile,
+                directory = attributes.isDirectory,
+                sha256 = if (attributes.isRegularFile) sha256(path) else null,
+            )
         }
     }
 
-    private fun deleteQuarantinedEntry(entry: Path) {
-        if (Files.isDirectory(entry, NOFOLLOW_LINKS)) {
-            Files.walk(entry).use { paths ->
-                paths.sorted(Comparator.reverseOrder()).forEach(Files::delete)
+    private fun sha256(path: Path): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { channel ->
+            val buffer = ByteBuffer.allocate(16 * 1024)
+            while (channel.read(buffer) >= 0) {
+                buffer.flip()
+                digest.update(buffer)
+                buffer.clear()
             }
-        } else {
-            Files.delete(entry)
         }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 }
 
