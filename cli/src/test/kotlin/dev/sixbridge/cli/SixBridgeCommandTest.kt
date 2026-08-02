@@ -36,6 +36,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
@@ -242,7 +243,7 @@ class SixBridgeCommandTest {
         )
 
         assertEquals(0, profileExit.exitCode, profileExit.error)
-        assertEquals(listOf("write-force", "move-new", "fsync-directory"), profileOps.events)
+        assertEquals(listOf("write-force", "identity", "move-new", "fsync-directory"), profileOps.events)
 
         val sourceOutput = workspace.resolve("sources")
         val generateOps = RecordingProbePublicationFileOps()
@@ -252,6 +253,13 @@ class SixBridgeCommandTest {
         )
         assertEquals(0, generateExit.exitCode, generateExit.error)
         assertTrue(generateOps.events.indexOf("move-new") > generateOps.events.lastIndexOf("force-file"))
+        val moveIndex = generateOps.events.indexOf("move-new")
+        val fileEnd = generateOps.events.lastIndexOf("force-file")
+        val internalDirectories = generateOps.directoryForcesBeforeMove
+        assertTrue(internalDirectories.isNotEmpty())
+        assertTrue(fileEnd < generateOps.firstDirectoryForceIndex)
+        assertTrue(generateOps.firstDirectoryForceIndex < moveIndex)
+        assertEquals(internalDirectories.sortedByDescending { it.nameCount }, internalDirectories)
         assertEquals("fsync-directory", generateOps.events.last())
     }
 
@@ -277,12 +285,12 @@ class SixBridgeCommandTest {
     }
 
     @Test
-    fun `probe fsync 실패는 임시 파일을 남기지 않는다`() {
+    fun `probe profile parent fsync 실패는 target을 rollback하고 parent를 다시 fsync한다`() {
         val workspace = Files.createTempDirectory("six-cli-probe-fsync-failure")
         val base = writeProfile(workspace)
         val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
         val target = workspace.resolve("candidate.json")
-        val ops = RecordingProbePublicationFileOps(failDirectoryFsync = true)
+        val ops = RecordingProbePublicationFileOps(failParentFsyncOnce = workspace)
 
         val result = executeProbe(
             ProbeBuildProfileCommand(ops),
@@ -292,9 +300,144 @@ class SixBridgeCommandTest {
         )
 
         assertNotEquals(0, result.exitCode)
+        assertFalse(target.exists())
+        assertEquals(2, ops.parentFsyncAttempts)
+        assertEquals(1, ops.rollbackAttempts)
         assertTrue(Files.list(workspace).use { entries ->
             entries.noneMatch { it.fileName.toString().contains(".tmp-") }
         })
+    }
+
+    @Test
+    fun `probe generate parent fsync 실패는 target을 rollback하고 staging을 남기지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-generate-fsync-failure")
+        val target = workspace.resolve("sources")
+        val ops = RecordingProbePublicationFileOps(failParentFsyncOnce = workspace)
+
+        val result = executeProbe(
+            ProbeGenerateCommand(ops),
+            "--output", target.toString(),
+        )
+
+        assertNotEquals(0, result.exitCode)
+        assertFalse(target.exists())
+        assertEquals(2, ops.parentFsyncAttempts)
+        assertEquals(1, ops.rollbackAttempts)
+        assertTrue(Files.list(workspace).use { entries ->
+            entries.noneMatch { it.fileName.toString().contains("staging") }
+        })
+    }
+
+    @Test
+    fun `probe rollback 직전 target identity가 바뀌면 경쟁자 target을 보존한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-rollback-race")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val target = workspace.resolve("candidate.json")
+        val ops = RecordingProbePublicationFileOps(
+            failParentFsyncOnce = workspace,
+            replaceBeforeRollback = { path ->
+                Files.delete(path)
+                path.writeText("competitor-owned")
+            },
+        )
+
+        val result = executeProbe(
+            ProbeBuildProfileCommand(ops),
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", target.toString(),
+        )
+
+        assertNotEquals(0, result.exitCode)
+        assertEquals("competitor-owned", target.readText())
+        assertEquals(1, ops.rollbackAttempts)
+        assertEquals(1, ops.parentFsyncAttempts)
+    }
+
+    @Test
+    fun `probe NIO quarantine은 identity 확인 후 교체된 경쟁자 target을 복원한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-quarantine-race")
+        val target = workspace.resolve("candidate.json").also { it.writeText("published") }
+        val displacedPublished = workspace.resolve("published-backup.json")
+        var injected = false
+        val nio = NioProbePublicationFileOps { source, destination ->
+            if (!injected && source == target && destination.fileName.toString() == "entry") {
+                injected = true
+                Files.move(source, displacedPublished)
+                source.writeText("competitor-owned")
+            }
+            Files.move(source, destination)
+        }
+        val expected = nio.identity(target)
+
+        val deleted = nio.deleteIfIdentity(target, expected)
+
+        assertFalse(deleted)
+        assertEquals("competitor-owned", target.readText())
+        assertEquals("published", displacedPublished.readText())
+        assertTrue(Files.list(workspace).use { entries ->
+            entries.noneMatch { it.fileName.toString().contains("rollback-") }
+        })
+    }
+
+    @Test
+    fun `probe NIO quarantine은 directory에 나중에 추가된 경쟁자 파일을 삭제하지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-directory-race")
+        val target = workspace.resolve("sources").also(Files::createDirectory)
+        target.resolve("generated.txt").writeText("published")
+        var injected = false
+        val nio = NioProbePublicationFileOps { source, destination ->
+            if (!injected && source == target && destination.fileName.toString() == "entry") {
+                injected = true
+                source.resolve("user-added.txt").writeText("competitor-owned")
+            }
+            Files.move(source, destination)
+        }
+        val expected = nio.identity(target)
+
+        val deleted = nio.deleteIfIdentity(target, expected)
+
+        assertFalse(deleted)
+        assertEquals("published", target.resolve("generated.txt").readText())
+        assertEquals("competitor-owned", target.resolve("user-added.txt").readText())
+    }
+
+    @Test
+    fun `probe rollback과 re-fsync 실패는 원래 publication 오류에 suppressed로 보존한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-rollback-diagnostic")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val target = workspace.resolve("candidate.json")
+        val deleteFailure = RecordingProbePublicationFileOps(
+            failParentFsyncOnce = workspace,
+            failRollback = true,
+        )
+        val deleteCommand = ProbeBuildProfileCommand(deleteFailure).apply {
+            this.base = base
+            this.evidence = evidence
+            this.output = target
+        }
+
+        val deleteError = assertFailsWith<dev.sixbridge.core.SixBridgeUserInputException> {
+            deleteCommand.call()
+        }
+        assertTrue(deleteError.cause!!.suppressed.any { "rollback delete" in it.message.orEmpty() })
+
+        Files.deleteIfExists(target)
+        val refsyncFailure = RecordingProbePublicationFileOps(
+            failParentFsyncOnce = workspace,
+            failParentRefsync = workspace,
+        )
+        val refsyncCommand = ProbeBuildProfileCommand(refsyncFailure).apply {
+            this.base = base
+            this.evidence = evidence
+            this.output = target
+        }
+        val refsyncError = assertFailsWith<dev.sixbridge.core.SixBridgeUserInputException> {
+            refsyncCommand.call()
+        }
+        assertTrue(refsyncError.cause!!.suppressed.any { "re-fsync" in it.message.orEmpty() })
     }
 
     @Test
@@ -1134,30 +1277,60 @@ class SixBridgeCommandTest {
 
     private class RecordingProbePublicationFileOps(
         private val onMove: (Path, Path) -> Unit = { _, _ -> },
-        private val failDirectoryFsync: Boolean = false,
+        private val failParentFsyncOnce: Path? = null,
+        private val failParentRefsync: Path? = null,
+        private val replaceBeforeRollback: (Path) -> Unit = {},
+        private val failRollback: Boolean = false,
     ) : ProbePublicationFileOps {
+        private val nio = NioProbePublicationFileOps()
         val events = mutableListOf<String>()
+        val directoryForcesBeforeMove = mutableListOf<Path>()
+        var firstDirectoryForceIndex = -1
+        var parentFsyncAttempts = 0
+        var rollbackAttempts = 0
 
         override fun writeAndForce(path: Path, bytes: ByteArray) {
             events += "write-force"
-            NioProbePublicationFileOps.writeAndForce(path, bytes)
+            nio.writeAndForce(path, bytes)
         }
 
         override fun forceFile(path: Path) {
             events += "force-file"
-            NioProbePublicationFileOps.forceFile(path)
+            nio.forceFile(path)
+        }
+
+        override fun identity(path: Path): ProbePublicationIdentity {
+            events += "identity"
+            return nio.identity(path)
         }
 
         override fun moveNew(source: Path, target: Path) {
             events += "move-new"
             onMove(source, target)
-            NioProbePublicationFileOps.moveNew(source, target)
+            nio.moveNew(source, target)
         }
 
         override fun forceDirectory(path: Path) {
             events += "fsync-directory"
-            if (failDirectoryFsync) throw IOException("injected directory fsync failure")
-            NioProbePublicationFileOps.forceDirectory(path)
+            if (firstDirectoryForceIndex == -1) firstDirectoryForceIndex = events.lastIndex
+            if ("move-new" !in events) directoryForcesBeforeMove.add(path)
+            if (path == failParentFsyncOnce || path == failParentRefsync) {
+                parentFsyncAttempts += 1
+                if (path == failParentFsyncOnce && parentFsyncAttempts == 1) {
+                    throw IOException("injected parent fsync failure")
+                }
+                if (path == failParentRefsync && parentFsyncAttempts >= 2) {
+                    throw IOException("injected parent re-fsync failure")
+                }
+            }
+            nio.forceDirectory(path)
+        }
+
+        override fun deleteIfIdentity(path: Path, expected: ProbePublicationIdentity): Boolean {
+            rollbackAttempts += 1
+            replaceBeforeRollback(path)
+            if (failRollback) throw IOException("injected rollback delete failure")
+            return nio.deleteIfIdentity(path, expected)
         }
     }
 
