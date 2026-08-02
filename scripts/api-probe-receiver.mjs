@@ -286,15 +286,59 @@ function respond(response, status, body = '', headers = {}) {
 
 class UnsafePathError extends Error {}
 class EvidenceConflictError extends Error {}
+class ReceiverBusyError extends Error {}
+class WorkerBoundaryError extends UnsafePathError {}
+
+class WorkerPool {
+  constructor(maxActive, maxQueued) {
+    this.active = 0;
+    this.maxActive = maxActive;
+    this.maxQueued = maxQueued;
+    this.queue = [];
+  }
+
+  run(operation) {
+    return new Promise((resolve, reject) => {
+      const entry = { operation, reject, resolve };
+      if (this.active < this.maxActive) this.start(entry);
+      else if (this.queue.length < this.maxQueued) this.queue.push(entry);
+      else reject(new ReceiverBusyError('storage worker queue is full'));
+    });
+  }
+
+  start(entry) {
+    this.active += 1;
+    Promise.resolve().then(entry.operation).then(
+      (value) => {
+        this.release();
+        entry.resolve(value);
+      },
+      (error) => {
+        this.release();
+        entry.reject(error);
+      },
+    );
+  }
+
+  release() {
+    this.active -= 1;
+    const next = this.queue.shift();
+    if (next) this.start(next);
+  }
+}
+
+const DEFAULT_WORKER_POOL = new WorkerPool(2, 8);
+const DEFAULT_WORKER_PATH = fileURLToPath(import.meta.url);
 
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const TEMP_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 const WORKER_TOKEN = /^[0-9a-f]{32}$/;
 const WORKER_IDENTITY = /^[0-9]{1,32}$/;
-const WORKER_RESULTS = new Map([
+const STORAGE_WORKER_RESULTS = new Map([
   ['0:created', true],
   ['10:existing', false],
 ]);
+const CLEANUP_WORKER_RESULTS = new Set(['0:cleaned', '10:missing']);
 
 function assertSafePlatform() {
   if (!Number.isInteger(constants.O_DIRECTORY) || constants.O_DIRECTORY <= 0
@@ -520,7 +564,7 @@ function saveEvidenceInWorker(config, root, session, bytes) {
 }
 
 function emitWorkerResult(status, code) {
-  process.stdout.end(`${status}\n`, () => process.exit(code));
+  process.stdout.end(`${JSON.stringify({ status, version: 1 })}\n`, () => process.exit(code));
 }
 
 async function runStorageWorker() {
@@ -553,57 +597,87 @@ async function runStorageWorker() {
   }
 }
 
-function cleanupWorkerTemp(prepared, groupId, token) {
-  let session;
+function cleanupEvidenceTemp(config) {
+  if (!sameExpectedIdentity(statSync('.'), config.session)) {
+    throw new UnsafePathError('cleanup worker cwd identity mismatch');
+  }
+  const session = openDirectory('.', 'evidence session');
   try {
-    session = openDirectory(prepared.sessionDir, 'evidence session');
-    if (!sameExpectedIdentity(session.stat, prepared.session)) return;
-    const tempPath = path.join(prepared.sessionDir, `.${groupId}.${token}.tmp`);
-    const stat = lstatSync(tempPath);
-    if (!stat.isSymbolicLink() && stat.isFile()
-      && (stat.mode & 0o022) === 0
-      && (typeof process.getuid !== 'function' || stat.uid === process.getuid())) {
-      unlinkSync(tempPath);
-      fsyncSync(session.descriptor);
+    if (!sameExpectedIdentity(session.stat, config.session)) {
+      throw new UnsafePathError('cleanup worker session identity mismatch');
     }
-  } catch {
-    // Timeout cleanup is best effort and never follows a replaced session path.
+    const tempName = `.${config.groupId}.${config.token}.tmp`;
+    let stat;
+    try {
+      stat = lstatSync(tempName);
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1
+      || (stat.mode & 0o077) !== 0
+      || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
+      throw new UnsafePathError('unsafe cleanup temp');
+    }
+    unlinkSync(tempName);
+    fsyncSync(session.descriptor);
+    return true;
   } finally {
-    if (session) closeSync(session.descriptor);
+    closeSync(session.descriptor);
   }
 }
 
-function saveEvidence(rootDir, evidence, bytes) {
-  const prepared = prepareStorage(rootDir, evidence);
-  const token = randomBytes(16).toString('hex');
-  const workerPath = fileURLToPath(import.meta.url);
+function runCleanupWorker() {
+  try {
+    assertSafePlatform();
+    const cleaned = cleanupEvidenceTemp(workerConfiguration());
+    emitWorkerResult(cleaned ? 'cleaned' : 'missing', cleaned ? 0 : 10);
+  } catch {
+    emitWorkerResult('unsafe', 21);
+  }
+}
+
+function workerEnvironment(prepared, evidence, token) {
+  return {
+    SIX_PROBE_GROUP_ID: evidence.groupId,
+    SIX_PROBE_ROOT: path.dirname(prepared.sessionDir),
+    SIX_PROBE_ROOT_DEV: prepared.root.dev,
+    SIX_PROBE_ROOT_INO: prepared.root.ino,
+    SIX_PROBE_SESSION: prepared.sessionDir,
+    SIX_PROBE_SESSION_DEV: prepared.session.dev,
+    SIX_PROBE_SESSION_ID: evidence.sessionId,
+    SIX_PROBE_SESSION_INO: prepared.session.ino,
+    SIX_PROBE_TOKEN: token,
+  };
+}
+
+function spawnWorker(mode, workerPath, prepared, evidence, token, input, dependencies) {
   return new Promise((resolve, reject) => {
     let stdout = Buffer.alloc(0);
     let stderrBytes = 0;
     let timedOut = false;
     let protocolOverflow = false;
     let forceKill;
-    const worker = spawn(process.execPath, [workerPath, '--storage-worker'], {
-      cwd: prepared.sessionDir,
-      env: {
-        SIX_PROBE_GROUP_ID: evidence.groupId,
-        SIX_PROBE_ROOT: rootDir,
-        SIX_PROBE_ROOT_DEV: prepared.root.dev,
-        SIX_PROBE_ROOT_INO: prepared.root.ino,
-        SIX_PROBE_SESSION: prepared.sessionDir,
-        SIX_PROBE_SESSION_DEV: prepared.session.dev,
-        SIX_PROBE_SESSION_ID: evidence.sessionId,
-        SIX_PROBE_SESSION_INO: prepared.session.ino,
-        SIX_PROBE_TOKEN: token,
-      },
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    let worker;
+    try {
+      worker = dependencies.spawnProcess(process.execPath, [workerPath, mode], {
+        cwd: prepared.sessionDir,
+        env: workerEnvironment(prepared, evidence, token),
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      reject(new WorkerBoundaryError(`storage worker spawn failed: ${error.code ?? 'unknown'}`));
+      return;
+    }
+    const workerTimeoutMs = mode === '--cleanup-worker'
+      ? dependencies.cleanupWorkerTimeoutMs
+      : dependencies.workerTimeoutMs;
     const timeout = setTimeout(() => {
       timedOut = true;
       worker.kill('SIGTERM');
       forceKill = setTimeout(() => worker.kill('SIGKILL'), 250);
-    }, WORKER_TIMEOUT_MS);
+    }, workerTimeoutMs);
     worker.stdout.on('data', (chunk) => {
       if (stdout.length + chunk.length > WORKER_OUTPUT_BYTES) {
         protocolOverflow = true;
@@ -622,34 +696,119 @@ function saveEvidence(rootDir, evidence, bytes) {
     worker.on('error', (error) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
-      reject(new UnsafePathError(`storage worker failed: ${error.code ?? 'unknown'}`));
+      reject(new WorkerBoundaryError(`storage worker failed: ${error.code ?? 'unknown'}`));
     });
     worker.on('close', (code, signal) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
-      cleanupWorkerTemp(prepared, evidence.groupId, token);
       if (timedOut || protocolOverflow || signal) {
-        reject(new UnsafePathError('storage worker did not terminate safely'));
+        reject(new WorkerBoundaryError('storage worker did not terminate safely'));
         return;
       }
-      const output = stdout.toString('utf8');
-      const result = WORKER_RESULTS.get(`${code}:${output.trimEnd()}`);
-      if (result !== undefined && output === `${output.trimEnd()}\n`) {
-        resolve(result);
-      } else if ((code === 20 && output === 'conflict\n') || (code === 21 && output === 'unsafe\n')) {
-        reject(code === 20
-          ? new EvidenceConflictError('evidence conflict')
-          : new UnsafePathError('unsafe evidence path'));
-      } else {
-        reject(new UnsafePathError('invalid storage worker result'));
-      }
+      resolve({ code, output: stdout });
     });
     worker.stdin.on('error', () => {});
-    worker.stdin.end(bytes);
+    worker.stdin.end(input);
   });
 }
 
-export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
+function parseWorkerResult(result, allowed) {
+  const text = result.output.toString('utf8');
+  if (!text.endsWith('\n') || text.indexOf('\n') !== text.length - 1) {
+    throw new WorkerBoundaryError('invalid storage worker framing');
+  }
+  let value;
+  try {
+    value = JSON.parse(text.slice(0, -1));
+  } catch {
+    throw new WorkerBoundaryError('invalid storage worker JSON');
+  }
+  if (!exactFields(value, ['status', 'version']) || value.version !== 1
+    || typeof value.status !== 'string') {
+    throw new WorkerBoundaryError('invalid storage worker protocol');
+  }
+  const key = `${result.code}:${value.status}`;
+  if (!allowed.has(key)) throw new WorkerBoundaryError('invalid storage worker result');
+  return key;
+}
+
+async function cleanupAfterWorkerFailure(prepared, evidence, token, dependencies) {
+  try {
+    await dependencies.pool.run(async () => {
+      const result = await spawnWorker(
+        '--cleanup-worker',
+        dependencies.cleanupWorkerPath,
+        prepared,
+        evidence,
+        token,
+        Buffer.alloc(0),
+        dependencies,
+      );
+      parseWorkerResult(result, CLEANUP_WORKER_RESULTS);
+    });
+  } catch {
+    // Cleanup is fail-closed: a temp leak is safer than following a replaced path.
+  }
+}
+
+async function saveEvidence(rootDir, evidence, bytes, dependencies) {
+  const prepared = prepareStorage(rootDir, evidence);
+  const token = randomBytes(16).toString('hex');
+  let started = false;
+  try {
+    return await dependencies.pool.run(async () => {
+      started = true;
+      const result = await spawnWorker(
+        '--storage-worker',
+        dependencies.storageWorkerPath,
+        prepared,
+        evidence,
+        token,
+        bytes,
+        dependencies,
+      );
+      const key = parseWorkerResult(result, new Set([
+        ...STORAGE_WORKER_RESULTS.keys(),
+        '20:conflict',
+        '21:unsafe',
+      ]));
+      if (STORAGE_WORKER_RESULTS.has(key)) return STORAGE_WORKER_RESULTS.get(key);
+      if (key === '20:conflict') throw new EvidenceConflictError('evidence conflict');
+      throw new UnsafePathError('unsafe evidence path');
+    });
+  } catch (error) {
+    if (started && error instanceof WorkerBoundaryError) {
+      await cleanupAfterWorkerFailure(prepared, evidence, token, dependencies);
+    }
+    throw error;
+  }
+}
+
+function normalizedDependencies(overrides = {}) {
+  const dependencies = {
+    cleanupWorkerTimeoutMs: overrides.cleanupWorkerTimeoutMs ?? WORKER_TIMEOUT_MS,
+    cleanupWorkerPath: overrides.cleanupWorkerPath ?? DEFAULT_WORKER_PATH,
+    pool: overrides.pool ?? DEFAULT_WORKER_POOL,
+    spawnProcess: overrides.spawnProcess ?? spawn,
+    storageWorkerPath: overrides.storageWorkerPath ?? DEFAULT_WORKER_PATH,
+    workerTimeoutMs: overrides.workerTimeoutMs ?? WORKER_TIMEOUT_MS,
+  };
+  if (!path.isAbsolute(dependencies.cleanupWorkerPath)
+    || !path.isAbsolute(dependencies.storageWorkerPath)
+    || typeof dependencies.spawnProcess !== 'function'
+    || typeof dependencies.pool?.run !== 'function'
+    || !Number.isInteger(dependencies.workerTimeoutMs)
+    || dependencies.workerTimeoutMs < 10
+    || dependencies.workerTimeoutMs > 60_000
+    || !Number.isInteger(dependencies.cleanupWorkerTimeoutMs)
+    || dependencies.cleanupWorkerTimeoutMs < 10
+    || dependencies.cleanupWorkerTimeoutMs > 60_000) {
+    throw new TypeError('invalid receiver worker dependencies');
+  }
+  return dependencies;
+}
+
+function createEvidenceReceiverInternal({ expectedOrigin, rootDir }, dependencies) {
   assertSafePlatform();
   if (!ORIGIN.test(String(expectedOrigin))) {
     throw new TypeError('expectedOrigin must be an exact chrome-extension origin');
@@ -720,10 +879,12 @@ export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
       const bytes = Buffer.concat(chunks);
       try {
         const evidence = parseEvidence(bytes, expectedExtensionId);
-        const created = await saveEvidence(resolvedRoot, evidence, bytes);
+        const created = await saveEvidence(resolvedRoot, evidence, bytes, dependencies);
         respond(response, created ? 201 : 200, created ? 'stored' : 'already stored', cors);
       } catch (error) {
-        if (error instanceof EvidenceConflictError || error instanceof UnsafePathError) {
+        if (error instanceof ReceiverBusyError) {
+          respond(response, 503, 'receiver busy', { 'retry-after': '1', ...cors });
+        } else if (error instanceof EvidenceConflictError || error instanceof UnsafePathError) {
           respond(response, 409, 'evidence conflict', cors);
         } else {
           respond(response, 400, 'invalid evidence', cors);
@@ -758,6 +919,23 @@ export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
   };
 }
 
+export function createEvidenceReceiver(options) {
+  return createEvidenceReceiverInternal(options, normalizedDependencies());
+}
+
+export const evidenceReceiverTestHooks = Object.freeze({
+  create(options, dependencies) {
+    return createEvidenceReceiverInternal(options, normalizedDependencies(dependencies));
+  },
+  workerPool(maxActive, maxQueued) {
+    if (!Number.isInteger(maxActive) || maxActive < 1 || maxActive > 8
+      || !Number.isInteger(maxQueued) || maxQueued < 0 || maxQueued > 64) {
+      throw new TypeError('invalid test worker pool limits');
+    }
+    return new WorkerPool(maxActive, maxQueued);
+  },
+});
+
 function parseArgs(argv) {
   const result = {
     expectedOrigin: process.env.SIXBRIDGE_PROBE_ORIGIN ?? '',
@@ -782,6 +960,8 @@ function parseArgs(argv) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.length === 3 && process.argv[2] === '--storage-worker') {
     await runStorageWorker();
+  } else if (process.argv.length === 3 && process.argv[2] === '--cleanup-worker') {
+    runCleanupWorker();
   } else {
     try {
       const options = parseArgs(process.argv.slice(2));

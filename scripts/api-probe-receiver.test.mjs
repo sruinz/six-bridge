@@ -17,8 +17,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
-import { createEvidenceReceiver } from './api-probe-receiver.mjs';
+import { createEvidenceReceiver, evidenceReceiverTestHooks } from './api-probe-receiver.mjs';
 
 const ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const SHA_A = 'a'.repeat(64);
@@ -271,6 +272,67 @@ function startCwdHarness(cwd, rootDir) {
     child.on('exit', onExit);
   });
   return { child, message };
+}
+
+async function fixtureWorker(directory, behavior, firstOnly = true) {
+  const workerPath = path.join(directory, `fixture-${behavior}-${firstOnly}.cjs`);
+  const counterPath = path.join(directory, `counter-${behavior}-${firstOnly}`);
+  await writeFile(workerPath, `
+    const fs = require('node:fs');
+    const counterPath = ${JSON.stringify(counterPath)};
+    const mode = process.argv[2];
+    if (mode !== '--storage-worker') process.exit(99);
+    let count = 0;
+    try { count = Number(fs.readFileSync(counterPath, 'utf8')); } catch {}
+    fs.writeFileSync(counterPath, String(count + 1));
+    const behavior = ${JSON.stringify(behavior)};
+    const selected = ${JSON.stringify(firstOnly)} && count > 0 ? 'success' : behavior;
+    const temp = \`.\${process.env.SIX_PROBE_GROUP_ID}.\${process.env.SIX_PROBE_TOKEN}.tmp\`;
+    if (selected !== 'success') fs.writeFileSync(temp, 'fixture-temp', { flag: 'wx', mode: 0o600 });
+    const protocol = (status) => JSON.stringify({ status, version: 1 }) + '\\n';
+    if (selected === 'success') { process.stdout.write(protocol('created')); process.exit(0); }
+    if (selected === 'timeout') { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); }
+    else if (selected === 'stdout-overflow') { process.stdout.write('x'.repeat(300)); setInterval(() => {}, 1000); }
+    else if (selected === 'stderr-overflow') { process.stderr.write('x'.repeat(5000)); setInterval(() => {}, 1000); }
+    else if (selected === 'invalid-json') { process.stdout.write('{"bad":\\n'); process.exit(0); }
+    else if (selected === 'abnormal-exit') process.exit(42);
+    else throw new Error('unknown fixture behavior');
+  `);
+  return workerPath;
+}
+
+function instrumentedSpawn() {
+  let active = 0;
+  let cleanup = 0;
+  let maximum = 0;
+  const signals = [];
+  let storage = 0;
+  return {
+    spawnProcess(command, args, options) {
+      if (args[1] === '--cleanup-worker') cleanup += 1;
+      else storage += 1;
+      const child = spawn(command, args, options);
+      const originalKill = child.kill.bind(child);
+      child.kill = (signal) => {
+        signals.push(signal);
+        return originalKill(signal);
+      };
+      active += 1;
+      maximum = Math.max(maximum, active);
+      child.once('close', () => { active -= 1; });
+      return child;
+    },
+    stats() { return { active, cleanup, maximum, signals: [...signals], storage }; },
+  };
+}
+
+async function waitForFile(file, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await access(file); return; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`file wait timed out: ${file}`);
 }
 
 test('127.0.0.1 외 주소 bind를 거부한다', async () => {
@@ -564,4 +626,191 @@ test('부모 receiver는 시작 CWD가 교체되어도 chdir 없이 계속 처�
     await readFile(path.join(rootDir, 'session-20260802', 'base-runtime.json')),
     Buffer.from(JSON.stringify(evidence())),
   );
+});
+
+test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot을 반환한다', async (t) => {
+  const productionWorker = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
+  const behaviors = ['timeout', 'stdout-overflow', 'stderr-overflow', 'invalid-json', 'abnormal-exit'];
+  for (const behavior of behaviors) {
+    await t.test(behavior, async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), `six-probe-boundary-${behavior}-`));
+      const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
+      const storageWorkerPath = await fixtureWorker(fixtureDir, behavior);
+      const tracker = instrumentedSpawn();
+      const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
+        cleanupWorkerPath: productionWorker,
+        pool: evidenceReceiverTestHooks.workerPool(1, 2),
+        spawnProcess: tracker.spawnProcess,
+        storageWorkerPath,
+        workerTimeoutMs: 50,
+      });
+      await receiver.listen({ host: '127.0.0.1', port: 0 });
+      const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+      try {
+        assert.equal((await post(baseUrl, evidence())).status, 409);
+        assert.equal(tracker.stats().cleanup, 1);
+        const sessionFiles = await readdir(path.join(rootDir, 'session-20260802'));
+        assert.equal(sessionFiles.some((name) => name.endsWith('.tmp')), false);
+        if (behavior === 'timeout') {
+          assert.deepEqual(tracker.stats().signals, ['SIGTERM', 'SIGKILL']);
+        }
+        assert.equal((await post(baseUrl, evidence())).status, 201);
+        assert.equal(tracker.stats().active, 0);
+      } finally {
+        await receiver.close();
+      }
+    });
+  }
+
+  await t.test('spawn-error', async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-boundary-spawn-'));
+    const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
+    const storageWorkerPath = await fixtureWorker(fixtureDir, 'success', false);
+    const tracker = instrumentedSpawn();
+    let failStorageSpawn = true;
+    const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
+      cleanupWorkerPath: productionWorker,
+      pool: evidenceReceiverTestHooks.workerPool(1, 2),
+      spawnProcess(command, args, options) {
+        if (args[1] === '--storage-worker' && failStorageSpawn) {
+          failStorageSpawn = false;
+          const error = new Error('fixture spawn error');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return tracker.spawnProcess(command, args, options);
+      },
+      storageWorkerPath,
+      workerTimeoutMs: 50,
+    });
+    await receiver.listen({ host: '127.0.0.1', port: 0 });
+    const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+    try {
+      assert.equal((await post(baseUrl, evidence())).status, 409);
+      assert.equal(tracker.stats().cleanup, 1);
+      assert.equal((await post(baseUrl, evidence())).status, 201);
+      assert.equal(tracker.stats().active, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+});
+
+test('global worker pool은 FIFO 상한과 503 backpressure를 적용한다', async (t) => {
+  const productionWorker = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-pool-'));
+  const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
+  const storageWorkerPath = await fixtureWorker(fixtureDir, 'timeout');
+  const tracker = instrumentedSpawn();
+  const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
+    cleanupWorkerPath: productionWorker,
+    pool: evidenceReceiverTestHooks.workerPool(1, 1),
+    spawnProcess: tracker.spawnProcess,
+    storageWorkerPath,
+    workerTimeoutMs: 50,
+  });
+  await receiver.listen({ host: '127.0.0.1', port: 0 });
+  t.after(() => receiver.close());
+  const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+
+  const responses = await Promise.all([
+    post(baseUrl, evidence()),
+    post(baseUrl, evidence()),
+    post(baseUrl, evidence()),
+  ]);
+  assert.deepEqual(responses.map((value) => value.status).sort(), [201, 409, 503]);
+  assert.equal(responses.find((value) => value.status === 503).headers['retry-after'], '1');
+  assert.equal(tracker.stats().maximum, 1);
+  assert.equal(tracker.stats().active, 0);
+  assert.equal(tracker.stats().cleanup, 1);
+});
+
+test('원점 위조 flood는 worker를 만들지 않고 6개 group은 bounded pool에서 처리된다', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-pool-groups-'));
+  const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
+  const storageWorkerPath = await fixtureWorker(fixtureDir, 'success', false);
+  const tracker = instrumentedSpawn();
+  const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
+    cleanupWorkerPath: storageWorkerPath,
+    pool: evidenceReceiverTestHooks.workerPool(2, 8),
+    spawnProcess: tracker.spawnProcess,
+    storageWorkerPath,
+    workerTimeoutMs: 500,
+  });
+  await receiver.listen({ host: '127.0.0.1', port: 0 });
+  t.after(() => receiver.close());
+  const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+
+  const forged = await Promise.all(Array.from({ length: 20 }, () => request(baseUrl, {
+    body: JSON.stringify(evidence()),
+    headers: { 'content-type': 'application/json', origin: 'https://attacker.invalid' },
+  })));
+  assert.ok(forged.every((value) => value.status === 403));
+  assert.equal(tracker.stats().storage, 0);
+
+  const groups = [
+    'advanced-runtime', 'base-runtime', 'identity-privacy', 'network', 'tab-page', 'user-interface',
+  ];
+  const responses = await Promise.all(groups.map((groupId, index) => post(baseUrl, evidence({
+    groupId,
+    sessionId: `session-group-${index}`,
+  }))));
+  assert.ok(responses.every((value) => value.status === 201));
+  assert.ok(tracker.stats().maximum <= 2);
+  assert.equal(tracker.stats().storage, 6);
+});
+
+test('cleanup worker는 session path swap 후도 pinned inode temp만 삭제한다', async (t) => {
+  const productionWorker = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-cleanup-race-'));
+  const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-worker-fixture-'));
+  const storageWorkerPath = await fixtureWorker(fixtureDir, 'abnormal-exit', false);
+  const readyMarker = path.join(fixtureDir, 'cleanup-ready');
+  const cleanupWrapper = path.join(fixtureDir, 'cleanup-wrapper.cjs');
+  await writeFile(cleanupWrapper, `
+    const fs = require('node:fs');
+    const { spawnSync } = require('node:child_process');
+    fs.writeFileSync(${JSON.stringify(readyMarker)}, 'ready');
+    process.kill(process.pid, 'SIGSTOP');
+    const result = spawnSync(process.execPath, [${JSON.stringify(productionWorker)}, '--cleanup-worker'], {
+      env: process.env,
+      stdio: 'inherit',
+    });
+    process.exit(result.status ?? 23);
+  `);
+  let cleanupChild;
+  let cleanupEnvironment;
+  const receiver = evidenceReceiverTestHooks.create({ expectedOrigin: ORIGIN, rootDir }, {
+    cleanupWorkerPath: cleanupWrapper,
+    pool: evidenceReceiverTestHooks.workerPool(1, 2),
+    spawnProcess(command, args, options) {
+      const child = spawn(command, args, options);
+      if (args[1] === '--cleanup-worker') {
+        cleanupChild = child;
+        cleanupEnvironment = options.env;
+      }
+      return child;
+    },
+    storageWorkerPath,
+    workerTimeoutMs: 1_000,
+  });
+  await receiver.listen({ host: '127.0.0.1', port: 0 });
+  t.after(() => receiver.close());
+  const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+  const response = post(baseUrl, evidence());
+  await waitForFile(readyMarker);
+
+  const session = path.join(rootDir, 'session-20260802');
+  const moved = path.join(rootDir, 'moved-session');
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'six-probe-cleanup-outside-'));
+  await rename(session, moved);
+  await symlink(outside, session);
+  const tempName = `.base-runtime.${cleanupEnvironment.SIX_PROBE_TOKEN}.tmp`;
+  const sentinel = Buffer.from('attacker-file');
+  await writeFile(path.join(outside, tempName), sentinel, { mode: 0o600 });
+  cleanupChild.kill('SIGCONT');
+
+  assert.equal((await response).status, 409);
+  assert.equal((await readdir(moved)).some((name) => name.endsWith('.tmp')), false);
+  assert.deepEqual(await readFile(path.join(outside, tempName)), sentinel);
 });
