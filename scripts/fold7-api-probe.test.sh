@@ -20,7 +20,7 @@ expect_status() {
   expected=$1
   shift
   set +e
-  "$@" >"$case_root/stdout" 2>"$case_root/stderr"
+  "$@" 9<&- >"$case_root/stdout" 2>"$case_root/stderr"
   actual=$?
   set -e
   [ "$actual" -eq "$expected" ] || {
@@ -32,7 +32,7 @@ expect_status() {
 
 expect_nonzero() {
   set +e
-  "$@" >"$case_root/stdout" 2>"$case_root/stderr"
+  "$@" 9<&- >"$case_root/stdout" 2>"$case_root/stderr"
   actual=$?
   set -e
   [ "$actual" -ne 0 ] || fail "실패해야 하는데 성공했습니다: $*"
@@ -52,6 +52,13 @@ assert_no_log() {
   fi
 }
 
+assert_event_count() {
+  expected=$1
+  pattern=$2
+  actual=$(grep -F -c -- "$pattern" "$events" || true)
+  [ "$actual" -eq "$expected" ] || fail "event '$pattern' count $expected 예상, 실제 $actual"
+}
+
 new_fixture() {
   hash -r
   case_root=$(mktemp -d "${TMPDIR:-/tmp}/six-probe-runner-test.XXXXXX")
@@ -68,6 +75,10 @@ new_fixture() {
 
   cat >"$fake_bin/date" <<'EOF'
 #!/bin/bash
+if [ -r /dev/fd/9 ]; then
+  printf '%s\n' 'fd9-leaked-before:date' >>"$SIX_TEST_EVENTS"
+fi
+printf 'runner-pid=%s\n' "$PPID" >>"$SIX_TEST_EVENTS"
 if [ -n "${SIX_TEST_DATE_REPLACE_PROFILE:-}" ]; then
   replacement="${SIX_TEST_DATE_REPLACE_PROFILE}.replacement.$$"
   printf '%s\n' '{"fixture":"replaced"}' >"$replacement"
@@ -87,9 +98,26 @@ EOF
   cat >"$fake_bin/mkdir" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [ -r /dev/fd/9 ]; then
+  printf '%s\n' 'fd9-leaked-before:mkdir' >>"$SIX_TEST_EVENTS"
+fi
 target=
 for argument in "$@"; do target=$argument; done
 case "$target" in
+  */.local/probe-build/20990102-030405)
+    case "${SIX_TEST_SNAPSHOT_PRECLAIM:-none}" in
+      regular)
+        /bin/mkdir "$target"
+        printf '%s\n' 'victim-regular' >"$target/base-profile.json"
+        exit 0
+        ;;
+      symlink)
+        /bin/mkdir "$target"
+        /bin/ln -s "$SIX_TEST_SNAPSHOT_VICTIM" "$target/base-profile.json"
+        exit 0
+        ;;
+    esac
+    ;;
   */.local/evidence/api-probe/20990102-030405)
     if [ "${SIX_TEST_MKDIR_MODE:-normal}" = evidence_race ] && [ ! -e "$target" ]; then
       /bin/mkdir "$target"
@@ -104,6 +132,9 @@ EOF
   cat >"$fake_bin/adb" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [ -r /dev/fd/9 ]; then
+  printf '%s\n' 'fd9-leaked-after:adb' >>"$SIX_TEST_EVENTS"
+fi
 printf 'ADB' >>"$SIX_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
 printf '\n' >>"$SIX_TEST_COMMAND_LOG"
@@ -134,6 +165,16 @@ case "$1" in
         exit 72
       fi
       printf '%s\n' 'reverse-set' >>"$SIX_TEST_EVENTS"
+      case "${SIX_TEST_ADB_MODE:-device}" in
+        signal_after_reverse_term)
+          printf 'signal-target=%s\n' "$PPID" >>"$SIX_TEST_EVENTS"
+          kill -TERM "$PPID"
+          ;;
+        signal_after_reverse_int)
+          printf 'signal-target=%s\n' "$PPID" >>"$SIX_TEST_EVENTS"
+          kill -INT "$PPID"
+          ;;
+      esac
     fi
     ;;
   install)
@@ -157,6 +198,9 @@ EOF
   cat >"$fake_bin/sixbridge" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [ -r /dev/fd/9 ]; then
+  printf '%s\n' 'fd9-leaked-after:sixbridge' >>"$SIX_TEST_EVENTS"
+fi
 printf 'SIX' >>"$SIX_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
 printf '\n' >>"$SIX_TEST_COMMAND_LOG"
@@ -215,6 +259,9 @@ EOF
   cat >"$fake_bin/node" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [ -r /dev/fd/9 ]; then
+  printf '%s\n' 'fd9-leaked-after:node' >>"$SIX_TEST_EVENTS"
+fi
 printf 'NODE' >>"$SIX_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
 printf '\n' >>"$SIX_TEST_COMMAND_LOG"
@@ -274,6 +321,7 @@ EOF
   unset SIX_TEST_ADB_MODE SIX_TEST_BUILD_FAIL_GROUP SIX_TEST_INSTALL_FAIL_AT
   unset SIX_TEST_NODE_MODE SIX_TEST_PREPARE_FAIL SIX_TEST_VERIFY_FAIL SIX_TEST_PROFILE_FAIL
   unset SIX_TEST_SLEEP_MODE SIX_TEST_MKDIR_MODE SIX_TEST_DATE_REPLACE_PROFILE
+  unset SIX_TEST_SNAPSHOT_PRECLAIM SIX_TEST_SNAPSHOT_VICTIM
   runner="$fixture_project/scripts/fold7-api-probe.sh"
 }
 
@@ -320,6 +368,34 @@ cleanup_fixture
 pass '기존 reverse mapping이 있으면 rebind·install·remove 없이 실패'
 
 new_fixture
+export SIX_TEST_ADB_MODE=signal_after_reverse_term
+expect_status 143 "$runner" --serial serial-1 --profile "$profile"
+assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
+assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
+assert_no_log 'ADB -s serial-1 install -r '
+assert_event_count 1 'reverse-set'
+assert_event_count 1 'reverse-removed'
+runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
+signal_target=$(sed -n 's/^signal-target=//p' "$events")
+[ -n "$runner_pid" ] && [ "$runner_pid" = "$signal_target" ] || fail "SIGTERM target이 실제 runner PID가 아닙니다: runner=$runner_pid target=$signal_target"
+cleanup_fixture
+pass 'reverse 성공 직후 SIGTERM에서도 ownership 확정 뒤 정확히 한 번 cleanup'
+
+new_fixture
+export SIX_TEST_ADB_MODE=signal_after_reverse_int
+expect_status 130 "$runner" --serial serial-1 --profile "$profile"
+assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
+assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
+assert_no_log 'ADB -s serial-1 install -r '
+assert_event_count 1 'reverse-set'
+assert_event_count 1 'reverse-removed'
+runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
+signal_target=$(sed -n 's/^signal-target=//p' "$events")
+[ -n "$runner_pid" ] && [ "$runner_pid" = "$signal_target" ] || fail "SIGINT target이 실제 runner PID가 아닙니다: runner=$runner_pid target=$signal_target"
+cleanup_fixture
+pass 'reverse 성공 직후 SIGINT에서도 ownership 확정 뒤 정확히 한 번 cleanup'
+
+new_fixture
 expect_status 0 "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'SIX probe generate --output '
 assert_log_count 6 'SIX build --input '
@@ -347,6 +423,16 @@ esac
 build_dir="$fixture_project/.local/probe-build/20990102-030405"
 evidence_dir="$fixture_project/.local/evidence/api-probe/20990102-030405"
 [ -f "$build_dir/candidate-profile.json" ] || fail "후보 profile이 없습니다"
+[ -f "$build_dir/base-profile.json" ] && [ ! -L "$build_dir/base-profile.json" ] || fail 'profile snapshot이 owner session의 regular file이 아닙니다'
+cmp -s "$profile" "$build_dir/base-profile.json" || fail 'profile snapshot bytes가 source와 다릅니다'
+snapshot_permissions=$(LC_ALL=C ls -ld "$build_dir/base-profile.json")
+case "$snapshot_permissions" in
+  -rw-------*) ;;
+  *) fail "profile snapshot이 owner-only mode가 아닙니다: $snapshot_permissions" ;;
+esac
+if grep -F 'fd9-leaked-' "$events" >/dev/null 2>&1; then
+  fail "profile FD9가 의도한 snapshot writer 이외의 child에 노출됨: $(grep -F 'fd9-leaked-' "$events" | tr '\n' ' ')"
+fi
 [ "$(find "$evidence_dir" -type f -name '*.json' | wc -l | tr -d ' ')" -eq 6 ] || fail "evidence 6개가 보존되지 않았습니다"
 node_pid=$(sed -n 's/^node-pid=//p' "$events")
 node_term=$(sed -n 's/^node-term=//p' "$events")
@@ -359,13 +445,13 @@ export SIX_TEST_DATE_REPLACE_PROFILE="$profile"
 expect_status 0 "$runner" --serial serial-1 --profile "$profile"
 fixture_project_real=$(CDPATH= cd -- "$fixture_project" && pwd -P)
 profile_snapshot="$fixture_project_real/.local/probe-build/20990102-030405/base-profile.json"
-grep -F '"fixture":"profile"' "$profile_snapshot" >/dev/null || fail '고정 FD의 원본 profile snapshot이 아닙니다'
 grep -F '"fixture":"replaced"' "$profile" >/dev/null || fail 'source profile 교체 fixture가 실행되지 않았습니다'
+cmp -s "$profile" "$profile_snapshot" || fail '사전 child 완료 뒤 재검증한 source bytes가 snapshot과 다릅니다'
 assert_log_count 7 "--profile $profile_snapshot"
 assert_log_count 1 "--base $profile_snapshot"
 assert_no_log "$profile"
 cleanup_fixture
-pass '검증 직후 고정 FD에서 private profile snapshot을 만들고 source 교체를 격리'
+pass '사전 child 완료 뒤 profile을 재검증하고 private snapshot으로 고정'
 
 new_fixture
 export SIX_TEST_NODE_MODE=never_ready
@@ -448,6 +534,28 @@ grep -Fx competitor "$evidence_dir/owner.txt" >/dev/null || fail 'evidence mkdir
 assert_no_log 'ADB '
 cleanup_fixture
 pass 'evidence session mkdir 경쟁에서 no-overwrite·device 접근 금지'
+
+new_fixture
+export SIX_TEST_SNAPSHOT_PRECLAIM=regular
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+snapshot="$fixture_project/.local/probe-build/20990102-030405/base-profile.json"
+grep -Fx 'victim-regular' "$snapshot" >/dev/null || fail '선점된 regular snapshot bytes를 변경했습니다'
+assert_no_log 'ADB '
+cleanup_fixture
+pass 'regular profile snapshot 선점 시 no-replace·device 접근 금지'
+
+new_fixture
+victim="$case_root/snapshot-victim.json"
+printf '%s\n' 'victim-symlink' >"$victim"
+export SIX_TEST_SNAPSHOT_PRECLAIM=symlink
+export SIX_TEST_SNAPSHOT_VICTIM="$victim"
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+snapshot="$fixture_project/.local/probe-build/20990102-030405/base-profile.json"
+[ -L "$snapshot" ] || fail '선점된 snapshot symlink를 교체했습니다'
+grep -Fx 'victim-symlink' "$victim" >/dev/null || fail 'snapshot symlink victim bytes를 변경했습니다'
+assert_no_log 'ADB '
+cleanup_fixture
+pass 'symlink profile snapshot 선점 시 no-follow·device 접근 금지'
 
 new_fixture
 export SIX_TEST_NODE_MODE=partial

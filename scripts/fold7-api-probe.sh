@@ -12,6 +12,8 @@ groups=(
 )
 receiver_pid=
 reverse_set=false
+reverse_critical=false
+pending_signal=0
 serial=
 profile_input=
 
@@ -27,6 +29,12 @@ die() {
 }
 
 on_signal() {
+  if [ "$reverse_critical" = true ]; then
+    if [ "$pending_signal" -eq 0 ]; then
+      pending_signal=$1
+    fi
+    return 0
+  fi
   exit "$1"
 }
 
@@ -115,14 +123,6 @@ esac
 }
 profile_parent=$(CDPATH= cd -- "$(dirname -- "$profile_input")" && pwd -P)
 profile="$profile_parent/$(basename -- "$profile_input")"
-[ -f "$profile" ] && [ ! -L "$profile" ] || {
-  echo "오류: canonical profile을 검증할 수 없습니다." >&2
-  exit 2
-}
-if ! exec 9<"$profile"; then
-  echo "오류: 검증한 profile을 open descriptor로 고정할 수 없습니다." >&2
-  exit 2
-fi
 
 adb_bin=$(command -v adb) || die "adb를 찾을 수 없습니다."
 node_bin=$(command -v node) || die "node를 찾을 수 없습니다."
@@ -165,9 +165,22 @@ evidence_dir="$project_dir/.local/evidence/api-probe/$session_id"
 mkdir "$build_dir" || die "probe build session을 만들 수 없습니다."
 mkdir "$evidence_dir" || die "probe evidence session을 만들 수 없습니다."
 profile_snapshot="$build_dir/base-profile.json"
-if ! cat <&9 >"$profile_snapshot"; then
+
+[ -f "$profile_input" ] && [ ! -L "$profile_input" ] || {
+  echo "오류: snapshot 직전 profile을 다시 검증할 수 없습니다." >&2
+  exit 2
+}
+[ -f "$profile" ] && [ ! -L "$profile" ] || {
+  echo "오류: snapshot 직전 canonical profile을 다시 검증할 수 없습니다." >&2
+  exit 2
+}
+if ! exec 9<"$profile"; then
+  echo "오류: 검증한 profile을 open descriptor로 고정할 수 없습니다." >&2
+  exit 2
+fi
+if ! (set -C; cat <&9 >"$profile_snapshot"); then
   exec 9<&-
-  die "고정된 profile descriptor에서 session snapshot을 만들 수 없습니다."
+  die "profile session snapshot을 안전하게 새로 만들 수 없습니다."
 fi
 exec 9<&-
 chmod 600 "$profile_snapshot"
@@ -175,8 +188,18 @@ chmod 600 "$profile_snapshot"
 
 device_state=$("$adb_bin" -s "$serial" get-state) || die "ADB device 상태를 확인하지 못했습니다."
 [ "$device_state" = device ] || die "ADB device가 online device 상태가 아닙니다: $device_state"
-"$adb_bin" -s "$serial" reverse --no-rebind tcp:47171 tcp:47171
-reverse_set=true
+reverse_critical=true
+if "$adb_bin" -s "$serial" reverse --no-rebind tcp:47171 tcp:47171; then
+  reverse_status=0
+  reverse_set=true
+else
+  reverse_status=$?
+fi
+reverse_critical=false
+if [ "$pending_signal" -ne 0 ]; then
+  exit "$pending_signal"
+fi
+[ "$reverse_status" -eq 0 ] || die "ADB reverse mapping을 설정하지 못했습니다."
 
 source_dir="$build_dir/source"
 "$sixbridge_bin" probe generate --output "$source_dir"
