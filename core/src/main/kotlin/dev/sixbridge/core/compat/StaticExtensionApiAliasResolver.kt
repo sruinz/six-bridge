@@ -16,24 +16,15 @@ internal class StaticExtensionApiAliasResolver {
         require(source.length == codeOnly.length)
 
         val aliases = linkedMapOf<String, Alias>()
-        val declarationOffsets = mutableSetOf<Int>()
+        val safeReferenceOffsets = mutableSetOf<Int>()
         val roots = linkedSetOf<String>()
         val namespaces = linkedSetOf<String>()
         val consumedRootOffsets = mutableSetOf<Int>()
         var dynamicUsage = false
-        var braceDepth = 0
-        var scopeCursor = 0
+        val declarationScope = ScopeCursor(codeOnly)
 
         DECLARATION.findAll(codeOnly).forEach { declaration ->
             checkCancelled()
-            while (scopeCursor < declaration.range.first) {
-                when (codeOnly[scopeCursor++]) {
-                    '{' -> braceDepth++
-                    '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
-                }
-            }
-            if (braceDepth != 0) return@forEach
-
             val kind = declaration.groupValues[1]
             val binding = declaration.groupValues[2]
             val name = declaration.groups[3]?.value
@@ -41,19 +32,27 @@ internal class StaticExtensionApiAliasResolver {
             val expression = rawExpression.trim()
             val expressionOffset = declaration.groups[4]!!.range.first +
                 rawExpression.indexOf(expression)
+            declarationScope.advanceTo(declaration.range.first)
+            if (!declarationScope.isTopLevel) {
+                if (referencesExtensionState(expression, aliases)) dynamicUsage = true
+                return@forEach
+            }
 
             if (name != null) {
                 val nameOffset = declaration.groups[3]!!.range.first
-                declarationOffsets += nameOffset
                 val alias = resolveExpression(expression, aliases)
                 if (kind == "const" && alias != null) {
                     if (alias.depth >= MAX_ALIAS_DEPTH || aliases.size >= MAX_ALIASES) {
                         dynamicUsage = true
                     } else {
-                        val resolved = alias.copy(depth = alias.depth + 1)
+                        val resolved = alias.copy(
+                            depth = alias.depth + 1,
+                            declarationOffset = nameOffset,
+                        )
                         aliases[name] = resolved
                         if (resolved.kind == AliasKind.EXTENSION_ROOT) roots += name
                         consumeStaticRoot(expression, expressionOffset, consumedRootOffsets)
+                        if (expression in aliases) safeReferenceOffsets += expressionOffset
                     }
                 } else if (referencesExtensionState(expression, aliases)) {
                     dynamicUsage = true
@@ -70,6 +69,7 @@ internal class StaticExtensionApiAliasResolver {
                 }
                 if (kind == "const" && sourceAlias != null) {
                     consumeStaticRoot(expression, expressionOffset, consumedRootOffsets)
+                    if (expression in aliases) safeReferenceOffsets += expressionOffset
                     bindings.split(',').forEachIndexed { index, rawBinding ->
                         checkCancelled()
                         val property = rawBinding.substringBefore(':').trim()
@@ -86,7 +86,9 @@ internal class StaticExtensionApiAliasResolver {
                             dynamicUsage = true
                             return@forEachIndexed
                         }
-                        val propertyOffset = bindingsOffset + bindingOffset(bindings, index)
+                        val bindingStart = bindingStartOffset(bindings, index)
+                        val propertyOffset = bindingsOffset + bindingStart +
+                            rawBinding.indexOfFirst { !it.isWhitespace() }
                         if (property in ROOT_NAMES) consumedRootOffsets += propertyOffset
                         when (sourceAlias.kind) {
                             AliasKind.GLOBAL_OBJECT -> {
@@ -97,9 +99,12 @@ internal class StaticExtensionApiAliasResolver {
                                         ) {
                                             dynamicUsage = true
                                         } else {
+                                            val aliasNameOffset = bindingsOffset + bindingStart +
+                                                rawBinding.indexOf(aliasName)
                                             aliases[aliasName] = Alias(
                                                 AliasKind.EXTENSION_ROOT,
                                                 sourceAlias.depth + 1,
+                                                aliasNameOffset,
                                             )
                                             roots += aliasName
                                         }
@@ -120,37 +125,45 @@ internal class StaticExtensionApiAliasResolver {
         if (DYNAMIC_GLOBAL_MEMBER.findAll(source).any { it.startsInCode(codeOnly) }) {
             dynamicUsage = true
         }
-        aliases.forEach { (name, alias) ->
+        val usages = aliases.flatMap { (name, alias) ->
+            identifierRegex(name).findAll(source)
+                .filter { it.startsInCode(codeOnly) }
+                .map { Usage(it.range.first, name, alias) }
+                .toList()
+        }.sortedBy(Usage::offset)
+        val usageScope = ScopeCursor(codeOnly)
+        usages.forEach { usage ->
             checkCancelled()
-            if (assignmentTo(name, source, codeOnly, declarationOffsets)) {
-                dynamicUsage = true
+            usageScope.advanceTo(usage.offset)
+            if (usage.offset == usage.alias.declarationOffset ||
+                usage.offset in safeReferenceOffsets
+            ) {
+                return@forEach
             }
-            when (alias.kind) {
+            if (usage.offset < usage.alias.declarationOffset || !usageScope.isTopLevel) {
+                dynamicUsage = true
+                return@forEach
+            }
+            when (usage.alias.kind) {
                 AliasKind.EXTENSION_ROOT -> {
-                    aliasMemberRegex(name).findAll(source)
-                        .filter { it.startsInCode(codeOnly) }
-                        .forEach { namespaces += it.groupValues[1] }
-                    aliasBracketRegex(name).findAll(source)
-                        .filter { it.startsInCode(codeOnly) }
-                        .forEach { namespaces += it.groupValues[1] }
-                    if (dynamicBracketRegex(name).findAll(source)
-                            .any { it.startsInCode(codeOnly) }
-                    ) {
-                        dynamicUsage = true
+                    when (val usageKind = extensionRootUsage(source, usage.offset, usage.name)) {
+                        is AliasUsage.Namespace -> namespaces += usageKind.name
+                        AliasUsage.Dynamic -> dynamicUsage = true
+                        AliasUsage.None -> Unit
+                        else -> dynamicUsage = true
                     }
                 }
 
                 AliasKind.GLOBAL_OBJECT -> {
-                    globalRootMemberRegex(name).findAll(source)
-                        .filter { it.startsInCode(codeOnly) }
-                        .forEach { match ->
-                            consumedRootOffsets += match.groups[1]!!.range.first
-                            match.groups[2]?.value?.let(namespaces::add)
+                    when (val usageKind = globalObjectUsage(source, usage.offset, usage.name)) {
+                        is AliasUsage.RootNamespace -> {
+                            consumedRootOffsets += usageKind.rootOffset
+                            usageKind.namespace?.let(namespaces::add)
                         }
-                    if (dynamicBracketRegex(name).findAll(source)
-                            .any { it.startsInCode(codeOnly) }
-                    ) {
-                        dynamicUsage = true
+
+                        AliasUsage.Dynamic -> dynamicUsage = true
+                        AliasUsage.None -> Unit
+                        else -> dynamicUsage = true
                     }
                 }
             }
@@ -168,13 +181,13 @@ internal class StaticExtensionApiAliasResolver {
         expression: String,
         aliases: Map<String, Alias>,
     ): Alias? = when {
-        expression in GLOBAL_OBJECTS -> Alias(AliasKind.GLOBAL_OBJECT, 0)
-        expression in ROOT_NAMES -> Alias(AliasKind.EXTENSION_ROOT, 0)
-        STATIC_GLOBAL_ROOT.matches(expression) -> Alias(AliasKind.EXTENSION_ROOT, 0)
+        expression in GLOBAL_OBJECTS -> Alias(AliasKind.GLOBAL_OBJECT, 0, -1)
+        expression in ROOT_NAMES -> Alias(AliasKind.EXTENSION_ROOT, 0, -1)
+        STATIC_GLOBAL_ROOT.matches(expression) -> Alias(AliasKind.EXTENSION_ROOT, 0, -1)
         else -> STATIC_ALIAS_ROOT.matchEntire(expression)?.let { match ->
             aliases[match.groupValues[1]]
                 ?.takeIf { it.kind == AliasKind.GLOBAL_OBJECT }
-                ?.let { Alias(AliasKind.EXTENSION_ROOT, it.depth) }
+                ?.let { Alias(AliasKind.EXTENSION_ROOT, it.depth, -1) }
         } ?: aliases[expression]
     }
 
@@ -196,22 +209,88 @@ internal class StaticExtensionApiAliasResolver {
             GLOBAL_OBJECT_TOKEN.containsMatchIn(expression) ||
             aliases.keys.any { alias -> identifierRegex(alias).containsMatchIn(expression) }
 
-    private fun bindingOffset(bindings: String, bindingIndex: Int): Int {
+    private fun bindingStartOffset(bindings: String, bindingIndex: Int): Int {
         var offset = 0
         repeat(bindingIndex) {
             offset = bindings.indexOf(',', offset) + 1
         }
-        return offset + bindings.substring(offset).indexOfFirst { !it.isWhitespace() }
+        return offset
     }
 
-    private fun assignmentTo(
-        name: String,
-        source: String,
-        codeOnly: String,
-        declarationOffsets: Set<Int>,
-    ): Boolean = assignmentRegex(name).findAll(source).any { match ->
-        match.range.first !in declarationOffsets && match.startsInCode(codeOnly)
+    private fun extensionRootUsage(source: String, offset: Int, name: String): AliasUsage {
+        val position = skipWhitespace(source, offset + name.length)
+        if (startsAssignmentToken(source, position)) return AliasUsage.Dynamic
+        val bracketPosition = if (source.startsWith("?.", position)) {
+            skipWhitespace(source, position + 2)
+        } else {
+            position
+        }
+        val member = memberAt(source, position) ?: bracketMemberAt(source, bracketPosition)
+            ?: return AliasUsage.Dynamic
+        val namespace = member.name.takeIf { API_NAME.matches(it) } ?: return AliasUsage.Dynamic
+        return AliasUsage.Namespace(namespace)
     }
+
+    private fun globalObjectUsage(source: String, offset: Int, name: String): AliasUsage {
+        val position = skipWhitespace(source, offset + name.length)
+        if (startsAssignmentToken(source, position) || source.getOrNull(position) == '[') {
+            return AliasUsage.Dynamic
+        }
+        val root = memberAt(source, position) ?: return AliasUsage.Dynamic
+        if (root.name !in ROOT_NAMES) return AliasUsage.None
+        val next = memberAt(source, skipWhitespace(source, root.end))
+        return AliasUsage.RootNamespace(
+            root.offset,
+            next?.name?.takeIf { API_NAME.matches(it) },
+        )
+    }
+
+    private fun memberAt(source: String, position: Int): Member? {
+        val start = when {
+            source.startsWith("?.", position) -> position + 2
+            source.getOrNull(position) == '.' -> position + 1
+            else -> return null
+        }
+        val nameStart = skipWhitespace(source, start)
+        if (source.getOrNull(nameStart)?.isAsciiApiIdentifierStart() != true) return null
+        var end = nameStart + 1
+        while (source.getOrNull(end)?.isAsciiApiIdentifierPart() == true) {
+            end++
+        }
+        return Member(source.substring(nameStart, end), nameStart, end)
+    }
+
+    private fun bracketMemberAt(source: String, position: Int): Member? {
+        if (source.getOrNull(position) != '[') return null
+        val quotePosition = skipWhitespace(source, position + 1)
+        val quote = source.getOrNull(quotePosition)
+        if (quote != '\'' && quote != '"') return null
+        val nameStart = quotePosition + 1
+        if (source.getOrNull(nameStart)?.isAsciiApiIdentifierStart() != true) return null
+        var end = nameStart + 1
+        while (source.getOrNull(end)?.isAsciiApiIdentifierPart() == true) end++
+        val closingQuote = skipWhitespace(source, end)
+        val closingBracket = skipWhitespace(source, closingQuote + 1)
+        if (source.getOrNull(closingQuote) != quote || source.getOrNull(closingBracket) != ']') {
+            return null
+        }
+        return Member(source.substring(nameStart, end), nameStart, closingBracket + 1)
+    }
+
+    private fun skipWhitespace(source: String, start: Int): Int {
+        var position = start
+        while (source.getOrNull(position)?.isWhitespace() == true) position++
+        return position
+    }
+
+    private fun startsAssignmentToken(source: String, position: Int): Boolean =
+        ASSIGNMENT_TOKENS.any { source.startsWith(it, position) }
+
+    private fun Char.isAsciiApiIdentifierStart(): Boolean =
+        this in 'A'..'Z' || this in 'a'..'z'
+
+    private fun Char.isAsciiApiIdentifierPart(): Boolean =
+        isAsciiApiIdentifierStart() || isDigit() || this == '_'
 
     private fun MatchResult.startsInCode(codeOnly: String): Boolean =
         codeOnly.getOrNull(range.first)?.isJavaIdentifierStart() == true
@@ -224,14 +303,60 @@ internal class StaticExtensionApiAliasResolver {
     private data class Alias(
         val kind: AliasKind,
         val depth: Int,
+        val declarationOffset: Int,
     )
+
+    private data class Usage(
+        val offset: Int,
+        val name: String,
+        val alias: Alias,
+    )
+
+    private data class Member(
+        val name: String,
+        val offset: Int,
+        val end: Int,
+    )
+
+    private sealed interface AliasUsage {
+        data class Namespace(val name: String) : AliasUsage
+        data class RootNamespace(val rootOffset: Int, val namespace: String?) : AliasUsage
+        data object Dynamic : AliasUsage
+        data object None : AliasUsage
+    }
+
+    private class ScopeCursor(private val codeOnly: String) {
+        private var cursor = 0
+        private var braceDepth = 0
+        private var parenthesisDepth = 0
+
+        val isTopLevel: Boolean
+            get() = braceDepth == 0 && parenthesisDepth == 0
+
+        fun advanceTo(offset: Int) {
+            while (cursor < offset) {
+                when (codeOnly[cursor++]) {
+                    '{' -> braceDepth++
+                    '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+                    '(' -> parenthesisDepth++
+                    ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                }
+            }
+        }
+    }
 
     private companion object {
         private const val MAX_ALIAS_DEPTH = 32
         private const val MAX_ALIASES = 256
+        private val ASSIGNMENT_TOKENS = listOf(
+            ">>>=", "**=", "<<=", ">>=", "&&=", "||=", "??=",
+            "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=",
+            "=", "++", "--",
+        )
         private val ROOT_NAMES = setOf("chrome", "browser")
         private val GLOBAL_OBJECTS = setOf("globalThis", "window", "self")
         private val IDENTIFIER = Regex("[A-Za-z_$][A-Za-z0-9_$]*")
+        private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val DECLARATION = Regex(
             """\b(const|let|var)\s+(?:(\{[^}\r\n]*})|([A-Za-z_$][\w$]*))\s*=\s*([^;\r\n]+)""",
         )
@@ -241,34 +366,15 @@ internal class StaticExtensionApiAliasResolver {
         private val STATIC_ALIAS_ROOT = Regex(
             """([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\?\.|\.)\s*(?:chrome|browser)""",
         )
-        private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
-        private val GLOBAL_OBJECT_TOKEN = Regex("""\b(?:globalThis|window|self)\b""")
+        private val ROOT_TOKEN = Regex("""(?<![A-Za-z0-9_$])(?:chrome|browser)(?![A-Za-z0-9_$])""")
+        private val GLOBAL_OBJECT_TOKEN =
+            Regex("""(?<![A-Za-z0-9_$])(?:globalThis|window|self)(?![A-Za-z0-9_$])""")
         private val DYNAMIC_GLOBAL_MEMBER = Regex(
             """\b(?:globalThis|window|self)\s*(?:\?\.)?\s*\[""",
         )
 
-        private fun identifierRegex(name: String) = Regex("""\b${Regex.escape(name)}\b""")
-
-        private fun aliasMemberRegex(name: String) = Regex(
-            """\b${Regex.escape(name)}\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""",
-        )
-
-        private fun aliasBracketRegex(name: String) = Regex(
-            """\b${Regex.escape(name)}\s*(?:\?\.)?\s*""" +
-                """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
-        )
-
-        private fun dynamicBracketRegex(name: String) = Regex(
-            """\b${Regex.escape(name)}\s*(?:\?\.)?\s*\[\s*(?!["'])""",
-        )
-
-        private fun globalRootMemberRegex(name: String) = Regex(
-            """\b${Regex.escape(name)}\s*(?:\?\.|\.)\s*""" +
-                """(chrome|browser)(?:\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*))?""",
-        )
-
-        private fun assignmentRegex(name: String) = Regex(
-            """\b${Regex.escape(name)}\s*(?:=(?!=|>)|[+\-*/%&|^]=|\+\+|--)""",
+        private fun identifierRegex(name: String) = Regex(
+            """(?<![A-Za-z0-9_$])${Regex.escape(name)}(?![A-Za-z0-9_$])""",
         )
     }
 }
