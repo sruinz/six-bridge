@@ -84,10 +84,39 @@ class JavaScriptTokenRewriter private constructor(
                 scan.unsafeAccesses.isNotEmpty() ||
                 (
                     unsafe.isNotEmpty() &&
-                        RAW_STORAGE_MENTION.containsMatchIn(sourceWithoutComments)
+                        hasRawStorageSyncMention(sourceWithoutComments)
                     ),
         )
     }
+
+    private fun hasRawStorageSyncMention(source: String): Boolean {
+        var state = 0
+        var cursor = 0
+        while (cursor < source.length) {
+            checkLoop(cursor, 0)
+            if (!source[cursor].isJavaIdentifierStart() && source[cursor] != '$') {
+                cursor++
+                continue
+            }
+            val start = cursor++
+            while (source.getOrNull(cursor)?.let(::isIdentifierPart) == true) {
+                checkLoop(cursor, 0)
+                cursor++
+            }
+            state = when {
+                state == 0 && source.tokenEquals(start, cursor, "chrome") -> 1
+                state == 0 && source.tokenEquals(start, cursor, "browser") -> 1
+                state == 1 && source.tokenEquals(start, cursor, STORAGE) -> 2
+                state == 2 && source.tokenEquals(start, cursor, SYNC) -> return true
+                else -> state
+            }
+        }
+        checkCancelled()
+        return false
+    }
+
+    private fun String.tokenEquals(start: Int, end: Int, expected: String): Boolean =
+        end - start == expected.length && regionMatches(start, expected, 0, expected.length)
 
     private fun scanRootMembers(
         source: String,
@@ -402,10 +431,6 @@ class JavaScriptTokenRewriter private constructor(
         val ROOT_IDENTIFIER = Regex("""\b(?:chrome|browser)\b""")
         val EVAL_IDENTIFIER = Regex("""\beval\b""")
         val WITH_STATEMENT = Regex("""\bwith\s*\(""")
-        val RAW_STORAGE_MENTION = Regex(
-            """\b(?:chrome|browser)\b.*\bstorage\b.*\bsync\b""",
-            setOf(RegexOption.DOT_MATCHES_ALL),
-        )
         val GLOBAL_ROOT_IDENTIFIER = Regex("""\b(?:globalThis|window)\b""")
         val COMPUTED_STRING = Regex("""(["'])([A-Za-z_$][\w$]*)\1""")
         val COMPUTED_TEMPLATE = Regex("""`([A-Za-z_$][\w$]*)`""")

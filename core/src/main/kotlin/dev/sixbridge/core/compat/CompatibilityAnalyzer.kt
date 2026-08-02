@@ -27,6 +27,7 @@ class CompatibilityAnalyzer(
         CompatibilityAnalyzer(control, json)
 
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
+        control.beginOperation()
         return StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
             val report = analyzeStable(
                 stable.root,

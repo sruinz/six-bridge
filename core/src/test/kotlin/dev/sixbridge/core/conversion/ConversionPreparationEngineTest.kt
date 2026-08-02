@@ -3,6 +3,7 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
@@ -29,6 +30,35 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class ConversionPreparationEngineTest {
+    @Test
+    fun `prepare 전체 분석 단계를 단조 순서로 한 번씩 전달한다`() {
+        val stages = mutableListOf<AnalysisStage>()
+        val control = AnalysisControl(onStage = stages::add)
+        val operation = PreparationAnalysisOperation(control)
+
+        repeat(2) {
+            operation.pass { emitFinalizingStage ->
+                assertFalse(emitFinalizingStage)
+                control.stage(AnalysisStage.ARCHIVE_INVENTORY)
+                control.stage(AnalysisStage.RUNTIME_CLOSURE)
+                control.stage(AnalysisStage.API_SCAN)
+                control.stage(AnalysisStage.MOBILE_PATTERNS)
+            }
+        }
+        operation.complete(Unit)
+
+        assertEquals(
+            listOf(
+                AnalysisStage.ARCHIVE_INVENTORY,
+                AnalysisStage.RUNTIME_CLOSURE,
+                AnalysisStage.API_SCAN,
+                AnalysisStage.MOBILE_PATTERNS,
+                AnalysisStage.FINALIZING,
+            ),
+            stages,
+        )
+    }
+
     @Test
     fun `준비 결과는 플랫폼 CRX 키와 무관하다`() {
         val input = PortableExtensionInput.fromZip(

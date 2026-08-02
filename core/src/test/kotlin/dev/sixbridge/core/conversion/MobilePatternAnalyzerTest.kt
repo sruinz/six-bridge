@@ -18,6 +18,7 @@ import java.util.Base64
 import java.util.concurrent.CancellationException
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
+import kotlin.system.measureTimeMillis
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -50,6 +51,73 @@ class MobilePatternAnalyzerTest {
                 profile,
             )
         }
+    }
+
+    @Test
+    fun `storage 없는 반복 root를 전체 경로에서 선형으로 판정한다`() {
+        fun analyze(repetitions: Int): Pair<dev.sixbridge.core.compat.CompatibilityReport, Long> {
+            val source = buildString {
+                append("globalThis;\n")
+                repeat(repetitions) { append("chrome.runtime.id;\n") }
+            }
+            val root = extension(
+                contentFile = "content.js",
+                contentSource = source,
+            )
+            lateinit var report: dev.sixbridge.core.compat.CompatibilityReport
+            val elapsed = measureTimeMillis {
+                report = MobilePatternAnalyzer().analyzeStableForTesting(root, fallbackProfile)
+            }
+            return report to elapsed
+        }
+
+        analyze(200)
+        val (smallReport, smallMillis) = analyze(4_000)
+        val (largeReport, largeMillis) = analyze(8_000)
+
+        assertEquals(CompatibilityStatus.COMPATIBLE, smallReport.status)
+        assertEquals(CompatibilityStatus.COMPATIBLE, largeReport.status)
+        assertEquals(setOf("runtime"), largeReport.usedApis)
+        assertNull(largeReport.decision("storage-fallback"))
+        assertFalse(largeReport.issues.any { it.code == "storage_area_unknown" })
+        assertTrue(largeMillis < 5_000, "8,000 roots took ${largeMillis}ms")
+        assertTrue(
+            largeMillis <= smallMillis * 3 + 200,
+            "4,000 roots=${smallMillis}ms, 8,000 roots=${largeMillis}ms",
+        )
+    }
+
+    @Test
+    fun `storage 없는 반복 root의 raw 단서 순회에서 취소한다`() {
+        val repetitions = 8_000
+        val source = buildString {
+            append("globalThis;\n")
+            repeat(repetitions) { append("chrome.runtime.id;\n") }
+        }
+        val root = extension(
+            contentFile = "content.js",
+            contentSource = source,
+        )
+        var mobilePatterns = false
+        var mobileCheckpoints = 0
+        val control = AnalysisControl(
+            checkpoint = {
+                if (mobilePatterns && ++mobileCheckpoints == repetitions * 2 + 58) {
+                    throw CancellationException("raw-storage-cancel")
+                }
+            },
+            onStage = { mobilePatterns = it == dev.sixbridge.core.compat.AnalysisStage.MOBILE_PATTERNS },
+        )
+
+        val failure = runCatching {
+            MobilePatternAnalyzer(control).analyzeStableForTesting(root, fallbackProfile)
+        }.exceptionOrNull()
+
+        assertTrue(
+            failure is CancellationException,
+            "mobile checkpoints=$mobileCheckpoints, failure=$failure",
+        )
+        assertEquals("raw-storage-cancel", failure.message)
     }
 
     @Test

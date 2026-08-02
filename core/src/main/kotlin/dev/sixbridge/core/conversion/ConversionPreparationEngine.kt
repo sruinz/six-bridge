@@ -3,6 +3,7 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -62,6 +63,22 @@ internal fun retainAnalyzedOriginalExtensionId(
     originalExtensionId = proofExtensionId ?: report.manifestKeyExtensionId,
 ).also(CompatibilityReport::validate)
 
+internal class PreparationAnalysisOperation(
+    private val control: AnalysisControl,
+) {
+    init {
+        control.beginOperation()
+    }
+
+    fun <T> pass(analyze: (emitFinalizingStage: Boolean) -> T): T = analyze(false)
+
+    fun <T> complete(result: T): T {
+        control.checkCancelled()
+        control.stage(AnalysisStage.FINALIZING)
+        return result
+    }
+}
+
 class ConversionPreparationEngine private constructor(
     private val compatibilityAnalyzer: CompatibilityAnalyzer,
     private val tempTreeFactory: ConversionTempTreeFactory,
@@ -114,6 +131,7 @@ class ConversionPreparationEngine private constructor(
         control: AnalysisControl = AnalysisControl(),
     ): PreparedConversion {
         control.checkCancelled()
+        val analysisOperation = PreparationAnalysisOperation(control)
         val controlledAnalyzer = MobilePatternAnalyzer(
             control = control,
             compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
@@ -122,7 +140,14 @@ class ConversionPreparationEngine private constructor(
         val approvals = approvedAdapterIds.toSet()
         val snapshot = workspace.snapshot(input.canonicalOriginalZip)
         control.checkCancelled()
-        val beforeRaw = controlledAnalyzer.analyzeArchive(snapshot.sourceZip, profile)
+        val beforeRaw = analysisOperation.pass { emitFinalizingStage ->
+            controlledAnalyzer.analyzeArchive(
+                snapshot.sourceZip,
+                profile,
+                emitFinalizingStage = emitFinalizingStage,
+                beginOperation = false,
+            )
+        }
         requireCrxManifestBinding(input, beforeRaw)
         val originalSourceSha256 =
             input.verifiedCrxPayloadSha256 ?: snapshot.sourceSha256
@@ -169,7 +194,14 @@ class ConversionPreparationEngine private constructor(
         } else {
             null
         }
-        val rawAfter = controlledAnalyzer.analyzeArchive(transformedArchive, profile)
+        val rawAfter = analysisOperation.pass { emitFinalizingStage ->
+            controlledAnalyzer.analyzeArchive(
+                transformedArchive,
+                profile,
+                emitFinalizingStage = emitFinalizingStage,
+                beginOperation = false,
+            )
+        }
         control.checkCancelled()
         validateCompatibility(before, rawAfter)
         val after = conversionReport(
@@ -205,22 +237,24 @@ class ConversionPreparationEngine private constructor(
         } else {
             transformedArchive
         }
-        return PreparedConversion(
-            compatibilityBefore = before,
-            compatibilityAfter = after,
-            originalSourceSha256 = originalSourceSha256,
-            transformedSourceSha256 = sha256(resultSourceZip),
-            planSha256 = proofPlan.proofSha256,
-            reportSha256 = reportSha256,
-            appliedAdapterIds = applied.mapTo(sortedSetOf()) { it.id },
-            transformedSourceZip = resultSourceZip,
-            originalExtensionId = originalExtensionId,
-            logicalSourceIdentity = logicalSourceIdentity(
-                input,
-                snapshot.sourceProjectIdentity,
-                before,
+        return analysisOperation.complete(
+            PreparedConversion(
+                compatibilityBefore = before,
+                compatibilityAfter = after,
+                originalSourceSha256 = originalSourceSha256,
+                transformedSourceSha256 = sha256(resultSourceZip),
+                planSha256 = proofPlan.proofSha256,
+                reportSha256 = reportSha256,
+                appliedAdapterIds = applied.mapTo(sortedSetOf()) { it.id },
+                transformedSourceZip = resultSourceZip,
+                originalExtensionId = originalExtensionId,
+                logicalSourceIdentity = logicalSourceIdentity(
+                    input,
+                    snapshot.sourceProjectIdentity,
+                    before,
+                ),
+                passthroughCrx = passthrough,
             ),
-            passthroughCrx = passthrough,
         )
     }
 

@@ -27,10 +27,38 @@ class AnalysisControlTest {
         val control = AnalysisControl(onStage = stages::add)
 
         control.stage(AnalysisStage.API_SCAN)
+        control.stage(AnalysisStage.RUNTIME_CLOSURE)
         control.stage(AnalysisStage.API_SCAN)
         control.stage(AnalysisStage.FINALIZING)
 
         assertEquals(listOf(AnalysisStage.API_SCAN, AnalysisStage.FINALIZING), stages)
+    }
+
+    @Test
+    fun `같은 control을 독립 분석에 재사용하면 새 단계 sequence를 전달한다`() {
+        val source = extension("console.log('stage reuse');")
+        val stages = mutableListOf<AnalysisStage>()
+        val control = AnalysisControl(onStage = stages::add)
+        val analyzer = MobilePatternAnalyzer(control)
+
+        analyzer.analyzeStableForTesting(source, profile)
+        analyzer.analyzeStableForTesting(source, profile)
+
+        assertEquals(
+            listOf(
+                AnalysisStage.ARCHIVE_INVENTORY,
+                AnalysisStage.RUNTIME_CLOSURE,
+                AnalysisStage.API_SCAN,
+                AnalysisStage.MOBILE_PATTERNS,
+                AnalysisStage.FINALIZING,
+                AnalysisStage.ARCHIVE_INVENTORY,
+                AnalysisStage.RUNTIME_CLOSURE,
+                AnalysisStage.API_SCAN,
+                AnalysisStage.MOBILE_PATTERNS,
+                AnalysisStage.FINALIZING,
+            ),
+            stages,
+        )
     }
 
     @Test

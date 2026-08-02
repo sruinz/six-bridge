@@ -66,6 +66,7 @@ class MobilePatternAnalyzer private constructor(
         extensionRoot: Path,
         profile: BrowserProfile,
     ): CompatibilityReport {
+        control.beginOperation()
         return StableExtensionAnalysis.captureLive(extensionRoot, control, tempTreeFactory).use { stable ->
             val report = analyzeStable(
                 stable.root,
@@ -81,15 +82,30 @@ class MobilePatternAnalyzer private constructor(
     internal fun analyzeArchive(
         sourceArchive: ByteArray,
         profile: BrowserProfile,
-    ): CompatibilityReport = analyzeArchiveWithIdentity(sourceArchive, profile).report
+        emitFinalizingStage: Boolean = true,
+        beginOperation: Boolean = true,
+    ): CompatibilityReport = analyzeArchiveWithIdentity(
+        sourceArchive,
+        profile,
+        emitFinalizingStage,
+        beginOperation,
+    ).report
 
     @JvmSynthetic
     internal fun analyzeArchiveWithIdentity(
         sourceArchive: ByteArray,
         profile: BrowserProfile,
+        emitFinalizingStage: Boolean = true,
+        beginOperation: Boolean = true,
     ): MobileArchiveAnalysis {
+        if (beginOperation) control.beginOperation()
         return StableExtensionAnalysis.fromArchive(sourceArchive, control, tempTreeFactory).use { stable ->
-            val report = analyzeStable(stable.root, profile, stable.sourceSha256)
+            val report = analyzeStable(
+                stable.root,
+                profile,
+                stable.sourceSha256,
+                emitFinalizingStage,
+            )
             control.checkCancelled()
             MobileArchiveAnalysis(
                 report = report,
@@ -105,16 +121,20 @@ class MobilePatternAnalyzer private constructor(
     internal fun analyzeStableForTesting(
         extensionRoot: Path,
         profile: BrowserProfile,
-    ): CompatibilityReport = analyzeStable(
-        extensionRoot,
-        profile,
-        sourceSha256 = null,
-    )
+    ): CompatibilityReport {
+        control.beginOperation()
+        return analyzeStable(
+            extensionRoot,
+            profile,
+            sourceSha256 = null,
+        )
+    }
 
     private fun analyzeStable(
         extensionRoot: Path,
         profile: BrowserProfile,
         sourceSha256: String?,
+        emitFinalizingStage: Boolean = true,
     ): CompatibilityReport {
         control.checkCancelled()
         val ledger = AnalysisBudgetLedger(control.policy)
@@ -143,11 +163,12 @@ class MobilePatternAnalyzer private constructor(
                         conversionState = ConversionState.UNAVAILABLE,
                         adapterDecisions = listOf(invalidOptionPage),
                     ),
+                    emitFinalizingStage,
                 )
             }
-            return finalizeReport(compatibility)
+            return finalizeReport(compatibility, emitFinalizingStage)
         }
-        manifest ?: return finalizeReport(compatibility)
+        manifest ?: return finalizeReport(compatibility, emitFinalizingStage)
         control.checkCancelled()
         val index = try {
             RuntimeResourceIndex.create(
@@ -169,11 +190,12 @@ class MobilePatternAnalyzer private constructor(
                     sourceSha256 = sourceSha256,
                     browserProfileSha256 = profile.canonicalSha256(),
                 ).also(CompatibilityReport::validate),
+                emitFinalizingStage,
             )
         }
         control.checkCancelled()
         if (index.unresolvedDependency) {
-            return finalizeReport(compatibility)
+            return finalizeReport(compatibility, emitFinalizingStage)
         }
 
         control.stage(AnalysisStage.MOBILE_PATTERNS)
@@ -203,12 +225,16 @@ class MobilePatternAnalyzer private constructor(
                 conversionState = conversionState(sortedDecisions),
                 adapterDecisions = sortedDecisions,
             ),
+            emitFinalizingStage,
         )
     }
 
-    private fun finalizeReport(report: CompatibilityReport): CompatibilityReport {
+    private fun finalizeReport(
+        report: CompatibilityReport,
+        emitFinalizingStage: Boolean,
+    ): CompatibilityReport {
         control.checkCancelled()
-        control.stage(AnalysisStage.FINALIZING)
+        if (emitFinalizingStage) control.stage(AnalysisStage.FINALIZING)
         return report
     }
 
