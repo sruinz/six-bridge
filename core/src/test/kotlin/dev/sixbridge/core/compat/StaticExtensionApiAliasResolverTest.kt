@@ -116,6 +116,22 @@ class StaticExtensionApiAliasResolverTest {
         assertFalse(result.dynamicUsage)
     }
 
+    @Test
+    fun `grouping 안의 immutable alias namespace를 해석한다`() {
+        val result = resolve("const api=chrome; (api.tabs.query({}));")
+
+        assertEquals(setOf("tabs"), result.namespaces)
+        assertFalse(result.dynamicUsage)
+    }
+
+    @Test
+    fun `if 조건의 immutable alias namespace를 해석한다`() {
+        val result = resolve("const api=chrome; if (api.tabs) {}")
+
+        assertEquals(setOf("tabs"), result.namespaces)
+        assertFalse(result.dynamicUsage)
+    }
+
     private fun resolve(source: String): StaticExtensionApiAliases = resolver.resolve(
         source = JavaScriptLexicalMask.mask(source, maskLiterals = false),
         codeOnly = JavaScriptLexicalMask.mask(source, maskLiterals = true),

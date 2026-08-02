@@ -21,7 +21,7 @@ internal class StaticExtensionApiAliasResolver {
         val namespaces = linkedSetOf<String>()
         val consumedRootOffsets = mutableSetOf<Int>()
         var dynamicUsage = false
-        val declarationScope = ScopeCursor(codeOnly)
+        val declarationScope = ScopeCursor(codeOnly, trackParentheses = true)
 
         DECLARATION.findAll(codeOnly).forEach { declaration ->
             checkCancelled()
@@ -131,7 +131,7 @@ internal class StaticExtensionApiAliasResolver {
                 .map { Usage(it.range.first, name, alias) }
                 .toList()
         }.sortedBy(Usage::offset)
-        val usageScope = ScopeCursor(codeOnly)
+        val usageScope = ScopeCursor(codeOnly, trackParentheses = false)
         usages.forEach { usage ->
             checkCancelled()
             usageScope.advanceTo(usage.offset)
@@ -325,21 +325,26 @@ internal class StaticExtensionApiAliasResolver {
         data object None : AliasUsage
     }
 
-    private class ScopeCursor(private val codeOnly: String) {
+    private class ScopeCursor(
+        private val codeOnly: String,
+        private val trackParentheses: Boolean,
+    ) {
         private var cursor = 0
         private var braceDepth = 0
         private var parenthesisDepth = 0
 
         val isTopLevel: Boolean
-            get() = braceDepth == 0 && parenthesisDepth == 0
+            get() = braceDepth == 0 && (!trackParentheses || parenthesisDepth == 0)
 
         fun advanceTo(offset: Int) {
             while (cursor < offset) {
                 when (codeOnly[cursor++]) {
                     '{' -> braceDepth++
                     '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
-                    '(' -> parenthesisDepth++
-                    ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                    '(' -> if (trackParentheses) parenthesisDepth++
+                    ')' -> if (trackParentheses) {
+                        parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                    }
                 }
             }
         }
