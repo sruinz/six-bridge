@@ -457,7 +457,9 @@ class MobilePatternAnalyzer private constructor(
         index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): StorageDecision {
-        val rewriter = JavaScriptTokenRewriter(control::checkCancelled)
+        val rewriter = JavaScriptTokenRewriter.ControlledFactory.create(
+            control::checkCancelled,
+        )
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
         val convertedSources = mutableMapOf<String, String>()

@@ -3,9 +3,17 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import java.security.MessageDigest
 
-class JavaScriptTokenRewriter(
-    private val checkCancelled: () -> Unit = {},
+class JavaScriptTokenRewriter private constructor(
+    private val checkCancelled: () -> Unit,
 ) {
+    constructor() : this({})
+
+    internal object ControlledFactory {
+        @JvmSynthetic
+        fun create(checkCancelled: () -> Unit): JavaScriptTokenRewriter =
+            JavaScriptTokenRewriter(checkCancelled)
+    }
+
     fun rewrite(source: String): RewriteResult {
         checkCancelled()
         val inspection = inspect(source)

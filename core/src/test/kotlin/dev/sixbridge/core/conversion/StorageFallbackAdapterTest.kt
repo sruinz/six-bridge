@@ -22,6 +22,30 @@ class StorageFallbackAdapterTest {
     )
 
     @Test
+    fun `public API exposes only no argument construction`() {
+        val kotlinConstructor: () -> JavaScriptTokenRewriter =
+            ::JavaScriptTokenRewriter
+
+        val sourceVisibleParameterTypes = JavaScriptTokenRewriter::class.java
+            .constructors
+            .filterNot { it.isSynthetic }
+            .map { it.parameterTypes.toList() }
+        val javaVisibleControlledFactories =
+            JavaScriptTokenRewriter.ControlledFactory::class.java
+                .declaredMethods
+                .filterNot { it.isSynthetic }
+
+        assertEquals(listOf(emptyList()), sourceVisibleParameterTypes)
+        assertEquals(emptyList(), javaVisibleControlledFactories)
+        assertEquals(
+            "chrome.storage.local.get();",
+            kotlinConstructor()
+                .rewrite("chrome.storage.sync.get();")
+                .source,
+        )
+    }
+
+    @Test
     fun `rewrites only exact executable static member tokens`() {
         val source = """
             chrome.storage.sync.get("a");
