@@ -948,19 +948,30 @@ class ProbeCaseSafetyTest {
     }
 
     @Test
-    fun `fixture host 권한은 tab fixture group에만 exact match로 선언한다`() = withWorkspace { workspace ->
+    fun `receiver host는 모든 group에 fixture host는 tab group에만 exact match로 선언한다`() = withWorkspace { workspace ->
         val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
 
         generated.forEach { probe ->
             val manifest = Json.parseToJsonElement(probe.sourceRoot.resolve("manifest.json").readText()).jsonObject
-            if (probe.groupId == "tab-page") {
-                assertEquals(
-                    listOf("https://example.com/*"),
-                    manifest.getValue("host_permissions").jsonArray.map { it.jsonPrimitive.content },
-                )
-            } else {
-                assertFalse("host_permissions" in manifest)
-            }
+            assertEquals(
+                if (probe.groupId == "tab-page") {
+                    listOf("https://example.com/*")
+                } else {
+                    emptyList()
+                },
+                manifest.getValue("host_permissions").jsonArray
+                    .map { it.jsonPrimitive.content }
+                    .filterNot { it == "http://127.0.0.1:47171/*" },
+            )
+            assertTrue(
+                manifest.getValue("host_permissions").jsonArray
+                    .any { it.jsonPrimitive.content == "http://127.0.0.1:47171/*" },
+            )
+            assertEquals(
+                "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:47171",
+                manifest.getValue("content_security_policy").jsonObject
+                    .getValue("extension_pages").jsonPrimitive.content,
+            )
             assertFalse("content_scripts" in manifest)
         }
     }

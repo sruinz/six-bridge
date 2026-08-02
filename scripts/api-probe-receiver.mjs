@@ -41,6 +41,12 @@ const ROOT_FIELDS = [
   'sessionId',
   'wrapperSignerSha256',
 ];
+const SUBMISSION_FIELDS = ['catalogSha256', 'groupId', 'results', 'schemaVersion'];
+const SESSION_FIELDS = [
+  'bindings', 'browserApkSetSha256', 'browserPackage', 'browserSignerSha256',
+  'browserVersionCode', 'browserVersionName', 'catalogSha256', 'schemaVersion', 'sessionId',
+];
+const BINDING_FIELDS = ['extensionId', 'groupId', 'wrapperSignerSha256'];
 const RESULT_FIELDS = [
   'caseId',
   'context',
@@ -261,6 +267,123 @@ function parseEvidence(bytes, expectedExtensionId) {
     runTokens.add(result.runToken);
   }
   return value;
+}
+
+function validateSessionConfig(input) {
+  if (!exactFields(input, SESSION_FIELDS) || input.schemaVersion !== 1) {
+    throw new TypeError('invalid session config fields');
+  }
+  if (!ID.test(input.sessionId) || !SHA256.test(input.catalogSha256)
+    || !BROWSER_PACKAGE.test(input.browserPackage) || input.browserPackage.length > 200
+    || typeof input.browserVersionName !== 'string'
+    || input.browserVersionName.length < 1 || input.browserVersionName.length > 100
+    || input.browserVersionName !== input.browserVersionName.trim()
+    || !/^[\x20-\x7e]+$/.test(input.browserVersionName)
+    || !Number.isSafeInteger(input.browserVersionCode) || input.browserVersionCode < 0
+    || !SHA256.test(input.browserApkSetSha256) || !SHA256.test(input.browserSignerSha256)
+    || !Array.isArray(input.bindings) || input.bindings.length !== GROUP_IDS.size) {
+    throw new TypeError('invalid session config provenance');
+  }
+  const groups = new Set();
+  const extensions = new Set();
+  const signers = new Set();
+  for (const binding of input.bindings) {
+    if (!exactFields(binding, BINDING_FIELDS) || !GROUP_IDS.has(binding.groupId)
+      || !EXTENSION_ID.test(binding.extensionId) || !SHA256.test(binding.wrapperSignerSha256)) {
+      throw new TypeError('invalid session binding');
+    }
+    if (groups.has(binding.groupId) || extensions.has(binding.extensionId)) {
+      throw new TypeError('duplicate session binding');
+    }
+    groups.add(binding.groupId);
+    extensions.add(binding.extensionId);
+    signers.add(binding.wrapperSignerSha256);
+  }
+  if (groups.size !== GROUP_IDS.size || signers.size !== 1) {
+    throw new TypeError('incomplete session bindings');
+  }
+  return structuredClone(input);
+}
+
+function readSessionConfigFile(file) {
+  assertSafePlatform();
+  const resolved = path.resolve(String(file));
+  const before = lstatSync(resolved, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || (Number(before.mode) & 0o777) !== 0o600) {
+    throw new TypeError('session config must be a regular 0600 file');
+  }
+  const descriptor = openSync(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const openedBefore = fstatSync(descriptor, { bigint: true });
+    if (!sameIdentity(before, openedBefore) || openedBefore.size < 1n || openedBefore.size > 65_536n) {
+      throw new TypeError('unsafe session config file');
+    }
+    const bytes = readFileSync(descriptor);
+    const openedAfter = fstatSync(descriptor, { bigint: true });
+    if (!sameIdentity(openedBefore, openedAfter) || BigInt(bytes.length) !== openedAfter.size) {
+      throw new TypeError('session config changed while reading');
+    }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    rejectDuplicateKeys(text);
+    const value = JSON.parse(text);
+    const expectedOrder = [
+      'schemaVersion', 'sessionId', 'catalogSha256', 'browserPackage',
+      'browserVersionName', 'browserVersionCode', 'browserApkSetSha256',
+      'browserSignerSha256', 'bindings',
+    ];
+    if (Object.keys(value).join('\0') !== expectedOrder.join('\0')
+      || value.bindings.some((binding) => Object.keys(binding).join('\0')
+        !== 'groupId\0extensionId\0wrapperSignerSha256')
+      || value.bindings.map((binding) => binding.groupId).join('\0')
+        !== [...value.bindings].map((binding) => binding.groupId).sort().join('\0')) {
+      throw new TypeError('session config must use canonical field order');
+    }
+    return validateSessionConfig(value);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+  }
+  return value;
+}
+
+function assembleSessionEvidence(bytes, binding, config) {
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  rejectDuplicateKeys(text);
+  const submission = JSON.parse(text);
+  if (!exactFields(submission, SUBMISSION_FIELDS) || submission.schemaVersion !== 1
+    || submission.groupId !== binding.groupId
+    || submission.catalogSha256 !== config.catalogSha256
+    || !Array.isArray(submission.results)
+    || submission.results.some((result) => result?.status === 'NOT_RUN')) {
+    throw new TypeError('invalid partial evidence');
+  }
+  const canonicalSubmission = `${JSON.stringify(canonicalize({
+    ...submission,
+    results: submission.results.slice().sort((left, right) => String(left?.caseId).localeCompare(String(right?.caseId))),
+  }))}\n`;
+  if (text !== canonicalSubmission) throw new TypeError('partial evidence must be canonical');
+  const full = {
+    schemaVersion: 1,
+    sessionId: config.sessionId,
+    groupId: binding.groupId,
+    catalogSha256: config.catalogSha256,
+    extensionId: binding.extensionId,
+    wrapperSignerSha256: binding.wrapperSignerSha256,
+    browserPackage: config.browserPackage,
+    browserVersionName: config.browserVersionName,
+    browserVersionCode: config.browserVersionCode,
+    browserApkSetSha256: config.browserApkSetSha256,
+    browserSignerSha256: config.browserSignerSha256,
+    results: submission.results.slice().sort((left, right) => String(left?.caseId).localeCompare(String(right?.caseId))),
+  };
+  const canonicalBytes = Buffer.from(`${JSON.stringify(canonicalize(full))}\n`);
+  return { bytes: canonicalBytes, evidence: parseEvidence(canonicalBytes, binding.extensionId) };
 }
 
 function corsHeaders(origin) {
@@ -815,12 +938,26 @@ function normalizedDependencies(overrides = {}) {
   return dependencies;
 }
 
-function createEvidenceReceiverInternal({ expectedOrigin, rootDir }, dependencies) {
+function createEvidenceReceiverInternal(options, dependencies) {
   assertSafePlatform();
-  if (!ORIGIN.test(String(expectedOrigin))) {
-    throw new TypeError('expectedOrigin must be an exact chrome-extension origin');
+  const { expectedOrigin, rootDir } = options;
+  const sessionConfig = options.sessionConfig === undefined
+    ? null : validateSessionConfig(options.sessionConfig);
+  let originBindings;
+  if (sessionConfig) {
+    originBindings = new Map(sessionConfig.bindings.map((binding) => [
+      `chrome-extension://${binding.extensionId}`,
+      binding,
+    ]));
+    if (expectedOrigin !== undefined) throw new TypeError('session receiver cannot use expectedOrigin');
+  } else {
+    if (!ORIGIN.test(String(expectedOrigin))) {
+      throw new TypeError('expectedOrigin must be an exact chrome-extension origin');
+    }
+    originBindings = new Map([[expectedOrigin, {
+      extensionId: expectedOrigin.slice('chrome-extension://'.length),
+    }]]);
   }
-  const expectedExtensionId = expectedOrigin.slice('chrome-extension://'.length);
   const resolvedRoot = path.resolve(String(rootDir));
   const server = http.createServer((request, response) => {
     const origin = request.headers.origin;
@@ -829,7 +966,8 @@ function createEvidenceReceiverInternal({ expectedOrigin, rootDir }, dependencie
       request.resume();
       return;
     }
-    if (origin !== expectedOrigin) {
+    const binding = originBindings.get(origin);
+    if (!binding) {
       respond(response, 403, 'forbidden');
       request.resume();
       return;
@@ -885,8 +1023,15 @@ function createEvidenceReceiverInternal({ expectedOrigin, rootDir }, dependencie
       if (rejected || response.writableEnded) return;
       const bytes = Buffer.concat(chunks);
       try {
-        const evidence = parseEvidence(bytes, expectedExtensionId);
-        const created = await saveEvidence(resolvedRoot, evidence, bytes, dependencies);
+        const resolved = sessionConfig
+          ? assembleSessionEvidence(bytes, binding, sessionConfig)
+          : { bytes, evidence: parseEvidence(bytes, binding.extensionId) };
+        const created = await saveEvidence(
+          resolvedRoot,
+          resolved.evidence,
+          resolved.bytes,
+          dependencies,
+        );
         respond(response, created ? 201 : 200, created ? 'stored' : 'already stored', cors);
       } catch (error) {
         if (error instanceof ReceiverBusyError) {
@@ -930,6 +1075,10 @@ export function createEvidenceReceiver(options) {
   return createEvidenceReceiverInternal(options, normalizedDependencies());
 }
 
+export function createSessionEvidenceReceiver(options) {
+  return createEvidenceReceiverInternal(options, normalizedDependencies());
+}
+
 export const evidenceReceiverTestHooks = Object.freeze({
   create(options, dependencies) {
     return createEvidenceReceiverInternal(options, normalizedDependencies(dependencies));
@@ -948,18 +1097,23 @@ function parseArgs(argv) {
     expectedOrigin: process.env.SIXBRIDGE_PROBE_ORIGIN ?? '',
     port: DEFAULT_PORT,
     rootDir: path.resolve('.local/evidence/api-probe'),
+    sessionConfig: null,
   };
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
     const value = argv[index + 1];
     if (!value) throw new TypeError(`missing value for ${flag}`);
     if (flag === '--origin') result.expectedOrigin = value;
+    else if (flag === '--session-config') result.sessionConfig = readSessionConfigFile(value);
     else if (flag === '--port') result.port = Number(value);
     else if (flag === '--root') result.rootDir = path.resolve(value);
     else throw new TypeError(`unknown option: ${flag}`);
   }
   if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) {
     throw new TypeError('invalid port');
+  }
+  if ((result.sessionConfig === null) === (result.expectedOrigin === '')) {
+    throw new TypeError('exactly one of --session-config or --origin is required');
   }
   return result;
 }
@@ -972,7 +1126,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   } else {
     try {
       const options = parseArgs(process.argv.slice(2));
-      const receiver = createEvidenceReceiver(options);
+      const receiver = options.sessionConfig
+        ? createSessionEvidenceReceiver({
+          rootDir: options.rootDir,
+          sessionConfig: options.sessionConfig,
+        })
+        : createEvidenceReceiver(options);
       await receiver.listen({ port: options.port });
       process.stdout.write(`SIX API probe receiver: http://${LOOPBACK}:${options.port}/evidence\n`);
     } catch (error) {

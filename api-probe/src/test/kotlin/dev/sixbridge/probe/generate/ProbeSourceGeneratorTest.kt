@@ -78,14 +78,19 @@ class ProbeSourceGeneratorTest {
             assertEquals(3, manifest.getValue("manifest_version").jsonPrimitive.content.toInt())
             assertEquals("SIX API Probe · ${probe.groupId}", manifest.getValue("name").jsonPrimitive.content)
             assertEquals(expectedPermissions.getValue(probe.groupId), manifest.getValue("permissions").jsonArray.strings())
-            if (probe.groupId == "tab-page") {
-                assertEquals(
-                    listOf("https://example.com/*"),
-                    manifest.getValue("host_permissions").jsonArray.strings(),
-                )
-            } else {
-                assertFalse("host_permissions" in manifest)
-            }
+            assertEquals(
+                if (probe.groupId == "tab-page") {
+                    listOf("http://127.0.0.1:47171/*", "https://example.com/*")
+                } else {
+                    listOf("http://127.0.0.1:47171/*")
+                },
+                manifest.getValue("host_permissions").jsonArray.strings(),
+            )
+            assertEquals(
+                "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:47171",
+                manifest.getValue("content_security_policy").jsonObject
+                    .getValue("extension_pages").jsonPrimitive.content,
+            )
             assertEquals(
                 "service-worker.js",
                 manifest.getValue("background").jsonObject.getValue("service_worker").jsonPrimitive.content,
@@ -185,6 +190,7 @@ class ProbeSourceGeneratorTest {
         val source = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).first().sourceRoot
         val html = source.resolve("probe.html").readText()
         val ui = source.resolve("probe-ui.js").readText()
+        val submission = source.resolve("probe-submission.js").readText()
         val runtime = source.resolve("probe-runtime.js").readText()
 
         listOf("전체", "현재", "OK", "제한", "없음", "실패", "미실행", "실행 context", "증거 전송").forEach {
@@ -195,6 +201,9 @@ class ProbeSourceGeneratorTest {
         assertTrue("export async function runCase" in runtime)
         assertTrue("startedAt" in runtime)
         assertTrue("VERIFIED" in runtime)
+        assertTrue("createSubmissionController" in ui)
+        assertTrue("recordResult" in ui)
+        assertTrue("http://127.0.0.1:47171/evidence" in submission)
     }
 
     @Test
@@ -241,6 +250,8 @@ class ProbeSourceGeneratorTest {
     fun `UI와 evidence 상태는 exposed를 OK에 포함하고 나머지를 각 버킷으로 집계한다`() = withWorkspace { workspace ->
         val source = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).first().sourceRoot
         val uiModule = workspace.resolve("probe-ui.mjs")
+        Files.writeString(workspace.resolve("package.json"), "{\"type\":\"module\"}\n")
+        Files.copy(source.resolve("probe-submission.js"), workspace.resolve("probe-submission.js"))
         Files.copy(source.resolve("probe-ui.js"), uiModule)
 
         runNodeModule(

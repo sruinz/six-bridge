@@ -1,3 +1,5 @@
+import { createSubmissionController } from './probe-submission.js';
+
 const byId = (id) => document.getElementById(id);
 const GROUP_IDS = new Set([
   'advanced-runtime',
@@ -67,7 +69,7 @@ export function createGestureRunner({ button, execute, onResult }) {
     started = true;
     button.disabled = true;
     const result = await execute();
-    onResult(result);
+    await onResult(result);
     button.hidden = true;
     return result;
   };
@@ -167,6 +169,13 @@ export async function startProbe() {
     import(`./cases/${String(bundle.groupId)}.js`),
   ]);
   const counts = { ABSENT: 0, EXPOSED: 0, FAILED: 0, NOT_RUN: 0, RESTRICTED: 0, VERIFIED: 0 };
+  const submission = createSubmissionController({
+    catalogSha256: bundle.catalogSha256,
+    caseIds: bundle.cases.map((testCase) => testCase.id),
+    groupId: bundle.groupId,
+    onStatus: setEvidenceStatus,
+  });
+  const gestureQueue = [];
   setSummary(counts);
   setProgress(0, bundle.cases.length, '미실행');
 
@@ -176,9 +185,9 @@ export async function startProbe() {
       const waiting = runtime.notRunResult(testCase, uiFailureToken());
       const item = appendResult(waiting);
       transitionCounts(counts, null, 'NOT_RUN');
-      const button = setGesture(`${testCase.namespace}.${testCase.member}`, null);
-      button.onclick = createGestureRunner({
-        button,
+      await submission.recordResult(waiting);
+      gestureQueue.push({
+        description: `${testCase.namespace}.${testCase.member}`,
         execute: async () => {
           let dispatch;
           try {
@@ -196,10 +205,11 @@ export async function startProbe() {
             return runtime.failedResult(testCase, dispatch?.runToken ?? uiFailureToken(), error);
           }
         },
-        onResult: (result) => {
+        onResult: async (result) => {
           replaceResult(item, result);
           transitionCounts(counts, 'NOT_RUN', result.status);
           setSummary(counts);
+          await submission.recordResult(result);
         },
       });
       setSummary(counts);
@@ -210,8 +220,28 @@ export async function startProbe() {
     transitionCounts(counts, null, result.status);
     appendResult(result);
     setSummary(counts);
+    await submission.recordResult(result);
   }
-  setEvidenceStatus('준비');
+
+  const runNextGesture = () => {
+    const next = gestureQueue[0];
+    if (!next) {
+      byId('gesture').hidden = true;
+      return;
+    }
+    const button = setGesture(next.description, null);
+    button.onclick = createGestureRunner({
+      button,
+      execute: next.execute,
+      onResult: async (result) => {
+        await next.onResult(result);
+        gestureQueue.shift();
+        runNextGesture();
+      },
+    });
+  };
+  runNextGesture();
+  if (gestureQueue.length > 0) setEvidenceStatus('gesture 대기');
 }
 
 if (globalThis.document && globalThis.chrome?.runtime) {

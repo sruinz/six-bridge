@@ -132,9 +132,17 @@ class ProbeSourceGenerator(
                 ),
             )
         }
-        if (needsFixtureHost) {
-            fields["host_permissions"] = JsonArray(listOf(JsonPrimitive(FIXTURE_MATCH)))
-        }
+        fields["content_security_policy"] = jsonObject(
+            "extension_pages" to JsonPrimitive(
+                "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:47171",
+            ),
+        )
+        fields["host_permissions"] = JsonArray(
+            buildList {
+                add(LOOPBACK_MATCH)
+                if (needsFixtureHost) add(FIXTURE_MATCH)
+            }.sorted().map(::JsonPrimitive),
+        )
         if (ApiExecutionContext.CONTENT_SCRIPT in contexts) {
             fields["web_accessible_resources"] = JsonArray(
                 listOf(
@@ -222,10 +230,12 @@ class ProbeSourceGenerator(
 
     private companion object {
         const val FIXTURE_MATCH = "https://example.com/*"
+        const val LOOPBACK_MATCH = "http://127.0.0.1:47171/*"
         val COMMON_ASSETS = listOf(
             "probe.html",
             "probe.css",
             "probe-ui.js",
+            "probe-submission.js",
             "probe-runtime.js",
             "service-worker.js",
             "content-probe.js",

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   access,
   chmod,
@@ -19,13 +19,65 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { createEvidenceReceiver, evidenceReceiverTestHooks } from './api-probe-receiver.mjs';
+import {
+  createEvidenceReceiver,
+  createSessionEvidenceReceiver,
+  evidenceReceiverTestHooks,
+} from './api-probe-receiver.mjs';
 
 const ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const SHA_A = 'a'.repeat(64);
 const SHA_B = 'b'.repeat(64);
 const SHA_C = 'c'.repeat(64);
 const SHA_D = 'd'.repeat(64);
+const GROUP_IDS = [
+  'advanced-runtime', 'base-runtime', 'identity-privacy',
+  'network', 'tab-page', 'user-interface',
+];
+
+function sessionConfig() {
+  return {
+    schemaVersion: 1,
+    sessionId: 'session-20260802',
+    catalogSha256: SHA_A,
+    browserPackage: 'com.sec.android.app.sbrowser',
+    browserVersionName: '30.0.2.61',
+    browserVersionCode: 300020061,
+    browserApkSetSha256: SHA_C,
+    browserSignerSha256: SHA_D,
+    bindings: GROUP_IDS.map((groupId, index) => ({
+      groupId,
+      extensionId: String.fromCharCode('a'.charCodeAt(0) + index).repeat(32),
+      wrapperSignerSha256: SHA_B,
+    })),
+  };
+}
+
+function submission(groupId, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    groupId,
+    catalogSha256: SHA_A,
+    results: [{
+      caseId: `${groupId}-case`,
+      context: 'extension_page',
+      detail: { kind: 'exposed' },
+      durationMs: 1,
+      member: 'getURL',
+      namespace: 'runtime',
+      runToken: `run-token-${groupId.replaceAll('-', '').padEnd(16, '0').slice(0, 16)}`,
+      status: 'EXPOSED',
+    }],
+    ...overrides,
+  };
+}
+
+async function sessionFixture() {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-session-receiver-'));
+  const receiver = createSessionEvidenceReceiver({ sessionConfig: sessionConfig(), rootDir });
+  await receiver.listen({ host: '127.0.0.1', port: 0 });
+  return { baseUrl: `http://127.0.0.1:${receiver.address().port}`, receiver, rootDir };
+}
 
 function evidence(overrides = {}) {
   return {
@@ -97,6 +149,30 @@ function post(baseUrl, value, extra = {}) {
     },
     pathname: extra.pathname,
   });
+}
+
+function sessionPost(baseUrl, origin, value, extra = {}) {
+  const body = typeof value === 'string' || Buffer.isBuffer(value)
+    ? value : Buffer.from(`${JSON.stringify(canonicalTestValue(value))}\n`);
+  return request(baseUrl, {
+    body,
+    headers: {
+      'content-length': String(Buffer.byteLength(body)),
+      'content-type': 'application/json; charset=utf-8',
+      origin,
+      ...(extra.headers ?? {}),
+    },
+    method: extra.method ?? 'POST',
+    pathname: extra.pathname,
+  });
+}
+
+function canonicalTestValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalTestValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalTestValue(value[key])]));
+  }
+  return value;
 }
 
 async function loadRejectCorpus() {
@@ -880,4 +956,91 @@ test('cleanup worker는 session path swap 후도 pinned inode temp만 삭제한�
   assert.equal((await response).status, 409);
   assert.equal((await readdir(moved)).some((name) => name.endsWith('.tmp')), false);
   assert.deepEqual(await readFile(path.join(outside, tempName)), sentinel);
+});
+
+test('session receiver는 exact 6 origins을 group과 binding해 full evidence로 저장한다', async (t) => {
+  const current = await sessionFixture();
+  t.after(() => current.receiver.close());
+  const config = sessionConfig();
+  for (const binding of config.bindings) {
+    const origin = `chrome-extension://${binding.extensionId}`;
+    const response = await sessionPost(current.baseUrl, origin, submission(binding.groupId));
+    assert.equal(response.status, 201);
+    assert.equal(response.headers['access-control-allow-origin'], origin);
+    const stored = JSON.parse(await readFile(
+      path.join(current.rootDir, config.sessionId, `${binding.groupId}.json`),
+      'utf8',
+    ));
+    assert.equal(stored.extensionId, binding.extensionId);
+    assert.equal(stored.wrapperSignerSha256, binding.wrapperSignerSha256);
+    assert.equal(stored.browserPackage, config.browserPackage);
+    assert.equal(stored.groupId, binding.groupId);
+  }
+});
+
+test('session receiver는 origin group catalog client provenance NOT_RUN malformed JSON을 거부한다', async (t) => {
+  const current = await sessionFixture();
+  t.after(() => current.receiver.close());
+  const [first, second] = sessionConfig().bindings;
+  const origin = `chrome-extension://${first.extensionId}`;
+  assert.equal((await sessionPost(current.baseUrl, ORIGIN, submission(first.groupId))).status, 403);
+  assert.equal((await sessionPost(current.baseUrl, origin, submission(second.groupId))).status, 400);
+  assert.equal((await sessionPost(current.baseUrl, origin, submission(first.groupId, { catalogSha256: SHA_D }))).status, 400);
+  assert.equal((await sessionPost(current.baseUrl, origin, {
+    ...submission(first.groupId), extensionId: first.extensionId,
+  })).status, 400);
+  const notRun = submission(first.groupId);
+  notRun.results[0].status = 'NOT_RUN';
+  notRun.results[0].context = 'user_gesture';
+  notRun.results[0].detail = { kind: 'gesture-required' };
+  assert.equal((await sessionPost(current.baseUrl, origin, notRun)).status, 400);
+  assert.equal((await sessionPost(current.baseUrl, origin, '{"schemaVersion":1,"schemaVersion":1}')).status, 400);
+});
+
+test('session receiver는 canonical 동일 submission은 200 비canonical은 400 다른 bytes는 409로 보존한다', async (t) => {
+  const current = await sessionFixture();
+  t.after(() => current.receiver.close());
+  const binding = sessionConfig().bindings[0];
+  const origin = `chrome-extension://${binding.extensionId}`;
+  const value = submission(binding.groupId);
+  assert.equal((await sessionPost(current.baseUrl, origin, value)).status, 201);
+  const noncanonical = JSON.stringify({
+    schemaVersion: value.schemaVersion,
+    results: value.results,
+    groupId: value.groupId,
+    catalogSha256: value.catalogSha256,
+  });
+  assert.equal((await sessionPost(current.baseUrl, origin, noncanonical)).status, 400);
+  assert.equal((await sessionPost(current.baseUrl, origin, value)).status, 200);
+  const changed = structuredClone(value);
+  changed.results[0].durationMs = 2;
+  assert.equal((await sessionPost(current.baseUrl, origin, changed)).status, 409);
+});
+
+test('session receiver CLI는 0600 config와 origin mode의 배타적 선택을 강제한다', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'six-probe-session-cli-'));
+  const configPath = path.join(root, 'session.json');
+  const receiverPath = fileURLToPath(new URL('./api-probe-receiver.mjs', import.meta.url));
+  const canonical = {
+    schemaVersion: 1,
+    sessionId: sessionConfig().sessionId,
+    catalogSha256: sessionConfig().catalogSha256,
+    browserPackage: sessionConfig().browserPackage,
+    browserVersionName: sessionConfig().browserVersionName,
+    browserVersionCode: sessionConfig().browserVersionCode,
+    browserApkSetSha256: sessionConfig().browserApkSetSha256,
+    browserSignerSha256: sessionConfig().browserSignerSha256,
+    bindings: sessionConfig().bindings,
+  };
+  await writeFile(configPath, `${JSON.stringify(canonical)}\n`, { mode: 0o644 });
+  const unsafe = spawnSync(process.execPath, [receiverPath, '--session-config', configPath]);
+  assert.equal(unsafe.status, 1);
+  assert.match(unsafe.stderr.toString(), /0600/);
+
+  await chmod(configPath, 0o600);
+  const ambiguous = spawnSync(process.execPath, [
+    receiverPath, '--session-config', configPath, '--origin', ORIGIN,
+  ]);
+  assert.equal(ambiguous.status, 1);
+  assert.match(ambiguous.stderr.toString(), /exactly one/);
 });

@@ -1,6 +1,9 @@
 package dev.sixbridge.cli
 
 import dev.sixbridge.core.SixBridgeUserInputException
+import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.device.BuildArtifactVerifier
+import dev.sixbridge.core.device.BuildVerificationResult
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.evidence.ProbeEvidence
@@ -8,6 +11,9 @@ import dev.sixbridge.probe.evidence.ProbeEvidenceJson
 import dev.sixbridge.probe.generate.ProbeSourceGenerator
 import dev.sixbridge.probe.profile.CapabilityEvidenceSummary
 import dev.sixbridge.probe.profile.CapabilityProfileBuilder
+import dev.sixbridge.probe.session.ProbeSessionBinding
+import dev.sixbridge.probe.session.ProbeSessionConfig
+import dev.sixbridge.probe.session.ProbeSessionConfigJson
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.ByteBuffer
@@ -34,6 +40,7 @@ import picocli.CommandLine.Spec
     description = ["삼성 인터넷 API capability probe를 생성하고 evidence를 검증합니다."],
     subcommands = [
         ProbeGenerateCommand::class,
+        ProbePrepareSessionCommand::class,
         ProbeVerifyEvidenceCommand::class,
         ProbeBuildProfileCommand::class,
     ],
@@ -47,6 +54,169 @@ class ProbeCommand : Runnable {
 
     override fun run() {
         spec.commandLine().usage(spec.commandLine().out)
+    }
+}
+
+@Command(
+    name = "prepare-session",
+    mixinStandardHelpOptions = true,
+    description = ["검증된 6개 probe build artifact로 다중-origin session config를 생성합니다."],
+)
+internal class ProbePrepareSessionCommand(
+    private val publication: ProbePublicationFileOps = NioProbePublicationFileOps(),
+    private val artifactVerifier: (Path, Path, Path) -> BuildVerificationResult =
+        BuildArtifactVerifier()::verify,
+) : Callable<Int> {
+    @Option(names = ["--session-id"], required = true)
+    lateinit var sessionId: String
+
+    @Option(names = ["--profile"], required = true)
+    lateinit var profile: Path
+
+    @Option(names = ["--artifact-set"], required = true)
+    var artifactSets: MutableList<String> = mutableListOf()
+
+    @Option(names = ["--output"], required = true)
+    lateinit var output: Path
+
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
+    override fun call(): Int = probeUserInput {
+        val baseProfile = BrowserProfileJson.decode(readStrictFile(profile, MAX_PROFILE_BYTES))
+        val profileDigest = baseProfile.canonicalSha256()
+        val catalog = loadProbeCatalog()
+        val bundles = parseArtifactSets(artifactSets)
+        val bindings = bundles.toSortedMap().map { (groupId, bundle) ->
+            val paths = artifactPaths(bundle)
+            listOf(paths.bundle, paths.crx, paths.wrapper).forEach { path ->
+                require(Files.isRegularFile(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) {
+                    "probe build artifact는 symlink가 아닌 regular file이어야 합니다: $path"
+                }
+            }
+            val contents = SixBundle.read(paths.bundle)
+            val descriptor = contents.extension
+            require(descriptor.name == "SIX API Probe · $groupId") {
+                "probe bundle name이 groupId와 일치하지 않습니다: $groupId"
+            }
+            require(contents.compatibility.browserProfileSha256 == profileDigest) {
+                "probe bundle browser profile digest가 base profile과 일치하지 않습니다: $groupId"
+            }
+            val verification = artifactVerifier(paths.bundle, paths.crx, paths.wrapper)
+            require(verification.extensionId == descriptor.extensionId &&
+                verification.wrapperPackage == descriptor.wrapperPackage &&
+                verification.wrapperVersionCode == descriptor.wrapperVersionCode
+            ) { "probe build artifact 검증 결과가 SixBundle descriptor와 일치하지 않습니다: $groupId" }
+            ProbeSessionBinding(groupId, descriptor.extensionId, descriptor.signerSha256)
+        }
+        val config = ProbeSessionConfig(
+            schemaVersion = 1,
+            sessionId = sessionId,
+            catalogSha256 = catalog.sha256,
+            browserPackage = baseProfile.browserPackage,
+            browserVersionName = baseProfile.versionName,
+            browserVersionCode = baseProfile.versionCode,
+            browserApkSetSha256 = baseProfile.installationApkSetSha256,
+            browserSignerSha256 = baseProfile.sourceApkSignerSha256,
+            bindings = bindings,
+        ).also(ProbeSessionConfig::validate)
+        publishNewSessionConfig(output, config, publication)
+        spec.commandLine().out.println("session ID=${config.sessionId}")
+        spec.commandLine().out.println("catalog SHA-256=${config.catalogSha256}")
+        spec.commandLine().out.println("session config=${output.toAbsolutePath().normalize()}")
+        0
+    }
+
+    private fun parseArtifactSets(values: List<String>): Map<String, Path> {
+        require(values.size == ApiProbeCatalog.PROBE_GROUP_IDS.size) {
+            "--artifact-set은 정확히 6번 지정해야 합니다."
+        }
+        val parsed = linkedMapOf<String, Path>()
+        values.forEach { raw ->
+            val parts = raw.split('=', limit = 2)
+            require(parts.size == 2 && parts.all(String::isNotBlank)) {
+                "--artifact-set은 groupId=bundle.six 형식이어야 합니다."
+            }
+            val groupId = parts[0]
+            require(groupId in ApiProbeCatalog.PROBE_GROUP_IDS) { "알 수 없는 probe groupId입니다: $groupId" }
+            require(parsed.put(groupId, Path.of(parts[1]).toAbsolutePath().normalize()) == null) {
+                "probe artifact groupId는 중복될 수 없습니다: $groupId"
+            }
+        }
+        require(parsed.keys == ApiProbeCatalog.PROBE_GROUP_IDS) {
+            "probe artifact set은 정확한 6개 group을 포함해야 합니다."
+        }
+        return parsed
+    }
+
+    private fun artifactPaths(bundle: Path): ProbeBuildArtifactPaths {
+        val filename = bundle.fileName?.toString()
+            ?: throw IllegalArgumentException("probe bundle filename이 없습니다.")
+        require(filename.endsWith(".six") && filename.length > 4) {
+            "probe bundle은 .six 확장자여야 합니다."
+        }
+        val basename = filename.removeSuffix(".six")
+        return ProbeBuildArtifactPaths(
+            bundle = bundle,
+            crx = bundle.resolveSibling("$basename.crx"),
+            wrapper = bundle.resolveSibling("$basename-wrapper.apk"),
+        )
+    }
+}
+
+private data class ProbeBuildArtifactPaths(
+    val bundle: Path,
+    val crx: Path,
+    val wrapper: Path,
+)
+
+private fun publishNewSessionConfig(
+    output: Path,
+    config: ProbeSessionConfig,
+    publication: ProbePublicationFileOps,
+) {
+    val target = output.toAbsolutePath().normalize()
+    val parent = prepareOutputParent(target)
+    require(Files.getFileStore(parent).supportsFileAttributeView("posix")) {
+        "probe session config는 POSIX 0600 permission을 검증할 수 있는 filesystem에서만 지원합니다."
+    }
+    require(!Files.exists(target, NOFOLLOW_LINKS)) {
+        "probe session output은 존재하지 않아야 합니다."
+    }
+    val parentIdentity = directoryIdentity(parent)
+    val temporary = Files.createTempFile(parent, ".${target.fileName}.tmp-", ".json")
+    var movedSnapshot: ProbePublicationSnapshot? = null
+    try {
+        Files.setPosixFilePermissions(
+            temporary,
+            setOf(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+            ),
+        )
+        publication.writeAndForce(temporary, ProbeSessionConfigJson.encode(config).toByteArray(Charsets.UTF_8))
+        require(ProbeSessionConfigJson.readStrict(temporary) == config) {
+            "probe session config 임시 파일 자기 검증에 실패했습니다."
+        }
+        require(directoryIdentity(parent) == parentIdentity) {
+            "probe session output parent가 생성 중 변경되었습니다."
+        }
+        movedSnapshot = publication.snapshot(temporary).also { snapshot ->
+            require(snapshot.stable) { "probe session config 임시 파일이 publication 직전 변경되었습니다." }
+        }
+        publication.moveNew(temporary, target)
+        publication.forceDirectory(parent)
+        require(directoryIdentity(parent) == parentIdentity) {
+            "probe session output parent가 publication 중 변경되었습니다."
+        }
+        require(ProbeSessionConfigJson.readStrict(target) == config) {
+            "probe session config publication 자기 검증에 실패했습니다."
+        }
+    } catch (error: Exception) {
+        movedSnapshot?.let { rollbackMovedTarget(target, parent, it, publication, error) }
+        throw error
+    } finally {
+        Files.deleteIfExists(temporary)
     }
 }
 
