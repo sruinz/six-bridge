@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -23,6 +24,9 @@ const LOOPBACK = '127.0.0.1';
 const DEFAULT_PORT = 47_171;
 const MAX_BYTES = 1_048_576;
 const MAX_RESULTS = 512;
+const WORKER_OUTPUT_BYTES = 256;
+const WORKER_STDERR_BYTES = 4_096;
+const WORKER_TIMEOUT_MS = 5_000;
 const ROOT_FIELDS = [
   'browserApkSetSha256',
   'browserPackage',
@@ -285,6 +289,19 @@ class EvidenceConflictError extends Error {}
 
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const TEMP_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+const WORKER_TOKEN = /^[0-9a-f]{32}$/;
+const WORKER_IDENTITY = /^[0-9]{1,32}$/;
+const WORKER_RESULTS = new Map([
+  ['0:created', true],
+  ['10:existing', false],
+]);
+
+function assertSafePlatform() {
+  if (!Number.isInteger(constants.O_DIRECTORY) || constants.O_DIRECTORY <= 0
+    || !Number.isInteger(constants.O_NOFOLLOW) || constants.O_NOFOLLOW <= 0) {
+    throw new UnsafePathError('safe directory handles are not supported on this platform');
+  }
+}
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
@@ -352,51 +369,103 @@ function assertDirectoryIdentity(rootDir, sessionId, root, session) {
   }
 }
 
-function saveEvidence(rootDir, evidence, bytes, receiverState) {
-  if (receiverState.poisoned) throw new UnsafePathError('receiver storage is unavailable');
+function identity(stat) {
+  return { dev: String(stat.dev), ino: String(stat.ino) };
+}
+
+function sameExpectedIdentity(stat, expected) {
+  return String(stat.dev) === expected.dev && String(stat.ino) === expected.ino;
+}
+
+function prepareStorage(rootDir, evidence) {
   try {
     mkdirSync(rootDir, { mode: 0o700 });
   } catch (error) {
     if (error.code !== 'EEXIST') throw error;
   }
-
-  const originalCwd = process.cwd();
-  const originalStat = statSync('.');
   const root = openDirectory(rootDir, 'evidence root');
   let session;
-  let tempName;
-  let cwdChanged = false;
   try {
-    process.chdir(rootDir);
-    cwdChanged = true;
-    if (!sameIdentity(statSync('.'), root.stat)) throw new UnsafePathError('evidence root identity changed');
-
+    const sessionDir = path.join(rootDir, evidence.sessionId);
     try {
-      mkdirSync(evidence.sessionId, { mode: 0o700 });
+      mkdirSync(sessionDir, { mode: 0o700 });
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
     }
-    session = openDirectory(evidence.sessionId, 'evidence session');
-    process.chdir(evidence.sessionId);
-    if (!sameIdentity(statSync('.'), session.stat)) {
-      throw new UnsafePathError('evidence session identity changed');
-    }
+    session = openDirectory(sessionDir, 'evidence session');
+    assertDirectoryIdentity(rootDir, evidence.sessionId, root, session);
+    return {
+      root: identity(root.stat),
+      session: identity(session.stat),
+      sessionDir,
+    };
+  } finally {
+    if (session) closeSync(session.descriptor);
+    closeSync(root.descriptor);
+  }
+}
 
-    const targetName = `${evidence.groupId}.json`;
+function workerConfiguration() {
+  const rootDir = String(process.env.SIX_PROBE_ROOT ?? '');
+  const sessionDir = String(process.env.SIX_PROBE_SESSION ?? '');
+  const sessionId = String(process.env.SIX_PROBE_SESSION_ID ?? '');
+  const groupId = String(process.env.SIX_PROBE_GROUP_ID ?? '');
+  const token = String(process.env.SIX_PROBE_TOKEN ?? '');
+  const root = {
+    dev: String(process.env.SIX_PROBE_ROOT_DEV ?? ''),
+    ino: String(process.env.SIX_PROBE_ROOT_INO ?? ''),
+  };
+  const session = {
+    dev: String(process.env.SIX_PROBE_SESSION_DEV ?? ''),
+    ino: String(process.env.SIX_PROBE_SESSION_INO ?? ''),
+  };
+  if (!path.isAbsolute(rootDir) || path.resolve(rootDir) !== rootDir || rootDir.length > 4_096
+    || !path.isAbsolute(sessionDir) || path.resolve(sessionDir) !== sessionDir || sessionDir.length > 4_096
+    || !ID.test(sessionId) || !GROUP_IDS.has(groupId) || !WORKER_TOKEN.test(token)
+    || sessionDir !== path.join(rootDir, sessionId)
+    || !WORKER_IDENTITY.test(root.dev) || !WORKER_IDENTITY.test(root.ino)
+    || !WORKER_IDENTITY.test(session.dev) || !WORKER_IDENTITY.test(session.ino)) {
+    throw new TypeError('invalid storage worker configuration');
+  }
+  return { groupId, root, rootDir, session, sessionDir, sessionId, token };
+}
+
+async function readWorkerInput() {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    total += chunk.length;
+    if (total > MAX_BYTES) throw new TypeError('storage worker input too large');
+    chunks.push(chunk);
+  }
+  if (total < 1) throw new TypeError('storage worker input is empty');
+  return Buffer.concat(chunks, total);
+}
+
+function saveEvidenceInWorker(config, root, session, bytes) {
+  let tempName;
+  let tempIdentity;
+  let published = false;
+  let completed = false;
+  const targetName = `${config.groupId}.json`;
+  try {
+    assertDirectoryIdentity(config.rootDir, config.sessionId, root, session);
     const existing = existingTarget(targetName, bytes);
     if (existing !== null) return existing;
 
-    tempName = `.${evidence.groupId}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+    tempName = `.${config.groupId}.${config.token}.tmp`;
     const tempDescriptor = openSync(tempName, TEMP_FLAGS, 0o600);
     try {
-      validateOwnedFile(fstatSync(tempDescriptor), 'evidence temp');
+      const tempStat = fstatSync(tempDescriptor);
+      validateOwnedFile(tempStat, 'evidence temp');
+      tempIdentity = identity(tempStat);
       writeFileSync(tempDescriptor, bytes);
       fsyncSync(tempDescriptor);
     } finally {
       closeSync(tempDescriptor);
     }
 
-    assertDirectoryIdentity(rootDir, evidence.sessionId, root, session);
+    assertDirectoryIdentity(config.rootDir, config.sessionId, root, session);
 
     try {
       linkSync(tempName, targetName);
@@ -406,44 +475,187 @@ function saveEvidence(rootDir, evidence, bytes, receiverState) {
       if (raced === false) return false;
       throw new EvidenceConflictError('evidence target appeared while writing');
     }
-    try {
-      assertDirectoryIdentity(rootDir, evidence.sessionId, root, session);
-    } catch (error) {
-      unlinkSync(targetName);
-      throw error;
+    published = true;
+    if (!sameExpectedIdentity(lstatSync(targetName), tempIdentity)) {
+      throw new UnsafePathError('published evidence identity mismatch');
     }
+    assertDirectoryIdentity(config.rootDir, config.sessionId, root, session);
     unlinkSync(tempName);
     tempName = undefined;
-    validateOwnedFile(lstatSync(targetName), 'evidence target');
+    const targetStat = lstatSync(targetName);
+    validateOwnedFile(targetStat, 'evidence target');
+    if (!sameExpectedIdentity(targetStat, tempIdentity)) {
+      throw new UnsafePathError('evidence target was replaced');
+    }
     fsyncSync(session.descriptor);
+    completed = true;
     return true;
   } finally {
+    let cleanupError;
+    if (published && !completed) {
+      try {
+        const targetStat = lstatSync(targetName);
+        if (!sameExpectedIdentity(targetStat, tempIdentity)) {
+          throw new UnsafePathError('refusing to remove replaced evidence target');
+        }
+        unlinkSync(targetName);
+        fsyncSync(session.descriptor);
+      } catch (error) {
+        if (error.code !== 'ENOENT') cleanupError = new UnsafePathError('evidence rollback failed');
+      }
+    }
     if (tempName) {
-      try { unlinkSync(tempName); } catch (error) { if (error.code !== 'ENOENT') receiverState.poisoned = true; }
+      try {
+        const tempStat = lstatSync(tempName);
+        if (!sameExpectedIdentity(tempStat, tempIdentity)) {
+          throw new UnsafePathError('refusing to remove replaced evidence temp');
+        }
+        unlinkSync(tempName);
+      } catch (error) {
+        if (error.code !== 'ENOENT') cleanupError ??= error;
+      }
     }
-    try {
-      if (cwdChanged) process.chdir(originalCwd);
-      if (!sameIdentity(statSync('.'), originalStat)) throw new UnsafePathError('original cwd identity changed');
-    } catch {
-      receiverState.poisoned = true;
-    }
-    if (session) closeSync(session.descriptor);
-    closeSync(root.descriptor);
-    if (receiverState.poisoned) throw new UnsafePathError('receiver cwd restoration failed');
+    if (cleanupError) throw cleanupError;
   }
 }
 
-export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
-  if (!Number.isInteger(constants.O_DIRECTORY) || constants.O_DIRECTORY <= 0
-    || !Number.isInteger(constants.O_NOFOLLOW) || constants.O_NOFOLLOW <= 0) {
-    throw new UnsafePathError('safe directory handles are not supported on this platform');
+function emitWorkerResult(status, code) {
+  process.stdout.end(`${status}\n`, () => process.exit(code));
+}
+
+async function runStorageWorker() {
+  let root;
+  let session;
+  try {
+    assertSafePlatform();
+    const config = workerConfiguration();
+    if (!sameExpectedIdentity(statSync('.'), config.session)) {
+      throw new UnsafePathError('storage worker cwd identity mismatch');
+    }
+    root = openDirectory(config.rootDir, 'evidence root');
+    session = openDirectory('.', 'evidence session');
+    if (!sameExpectedIdentity(root.stat, config.root)
+      || !sameExpectedIdentity(session.stat, config.session)) {
+      throw new UnsafePathError('storage worker directory identity mismatch');
+    }
+    assertDirectoryIdentity(config.rootDir, config.sessionId, root, session);
+    const bytes = await readWorkerInput();
+    const created = saveEvidenceInWorker(config, root, session, bytes);
+    emitWorkerResult(created ? 'created' : 'existing', created ? 0 : 10);
+  } catch (error) {
+    if (error instanceof EvidenceConflictError) emitWorkerResult('conflict', 20);
+    else if (error instanceof UnsafePathError) emitWorkerResult('unsafe', 21);
+    else if (error instanceof TypeError) emitWorkerResult('invalid', 22);
+    else emitWorkerResult('error', 23);
+  } finally {
+    if (session) closeSync(session.descriptor);
+    if (root) closeSync(root.descriptor);
   }
+}
+
+function cleanupWorkerTemp(prepared, groupId, token) {
+  let session;
+  try {
+    session = openDirectory(prepared.sessionDir, 'evidence session');
+    if (!sameExpectedIdentity(session.stat, prepared.session)) return;
+    const tempPath = path.join(prepared.sessionDir, `.${groupId}.${token}.tmp`);
+    const stat = lstatSync(tempPath);
+    if (!stat.isSymbolicLink() && stat.isFile()
+      && (stat.mode & 0o022) === 0
+      && (typeof process.getuid !== 'function' || stat.uid === process.getuid())) {
+      unlinkSync(tempPath);
+      fsyncSync(session.descriptor);
+    }
+  } catch {
+    // Timeout cleanup is best effort and never follows a replaced session path.
+  } finally {
+    if (session) closeSync(session.descriptor);
+  }
+}
+
+function saveEvidence(rootDir, evidence, bytes) {
+  const prepared = prepareStorage(rootDir, evidence);
+  const token = randomBytes(16).toString('hex');
+  const workerPath = fileURLToPath(import.meta.url);
+  return new Promise((resolve, reject) => {
+    let stdout = Buffer.alloc(0);
+    let stderrBytes = 0;
+    let timedOut = false;
+    let protocolOverflow = false;
+    let forceKill;
+    const worker = spawn(process.execPath, [workerPath, '--storage-worker'], {
+      cwd: prepared.sessionDir,
+      env: {
+        SIX_PROBE_GROUP_ID: evidence.groupId,
+        SIX_PROBE_ROOT: rootDir,
+        SIX_PROBE_ROOT_DEV: prepared.root.dev,
+        SIX_PROBE_ROOT_INO: prepared.root.ino,
+        SIX_PROBE_SESSION: prepared.sessionDir,
+        SIX_PROBE_SESSION_DEV: prepared.session.dev,
+        SIX_PROBE_SESSION_ID: evidence.sessionId,
+        SIX_PROBE_SESSION_INO: prepared.session.ino,
+        SIX_PROBE_TOKEN: token,
+      },
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      worker.kill('SIGTERM');
+      forceKill = setTimeout(() => worker.kill('SIGKILL'), 250);
+    }, WORKER_TIMEOUT_MS);
+    worker.stdout.on('data', (chunk) => {
+      if (stdout.length + chunk.length > WORKER_OUTPUT_BYTES) {
+        protocolOverflow = true;
+        worker.kill('SIGKILL');
+        return;
+      }
+      stdout = Buffer.concat([stdout, chunk]);
+    });
+    worker.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > WORKER_STDERR_BYTES) {
+        protocolOverflow = true;
+        worker.kill('SIGKILL');
+      }
+    });
+    worker.on('error', (error) => {
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      reject(new UnsafePathError(`storage worker failed: ${error.code ?? 'unknown'}`));
+    });
+    worker.on('close', (code, signal) => {
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      cleanupWorkerTemp(prepared, evidence.groupId, token);
+      if (timedOut || protocolOverflow || signal) {
+        reject(new UnsafePathError('storage worker did not terminate safely'));
+        return;
+      }
+      const output = stdout.toString('utf8');
+      const result = WORKER_RESULTS.get(`${code}:${output.trimEnd()}`);
+      if (result !== undefined && output === `${output.trimEnd()}\n`) {
+        resolve(result);
+      } else if ((code === 20 && output === 'conflict\n') || (code === 21 && output === 'unsafe\n')) {
+        reject(code === 20
+          ? new EvidenceConflictError('evidence conflict')
+          : new UnsafePathError('unsafe evidence path'));
+      } else {
+        reject(new UnsafePathError('invalid storage worker result'));
+      }
+    });
+    worker.stdin.on('error', () => {});
+    worker.stdin.end(bytes);
+  });
+}
+
+export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
+  assertSafePlatform();
   if (!ORIGIN.test(String(expectedOrigin))) {
     throw new TypeError('expectedOrigin must be an exact chrome-extension origin');
   }
   const expectedExtensionId = expectedOrigin.slice('chrome-extension://'.length);
   const resolvedRoot = path.resolve(String(rootDir));
-  const receiverState = { poisoned: false };
   const server = http.createServer((request, response) => {
     const origin = request.headers.origin;
     if (request.url !== '/evidence') {
@@ -503,12 +715,12 @@ export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
       rejected = true;
       respond(response, 400, 'request error', cors);
     });
-    request.on('end', () => {
+    request.on('end', async () => {
       if (rejected || response.writableEnded) return;
       const bytes = Buffer.concat(chunks);
       try {
         const evidence = parseEvidence(bytes, expectedExtensionId);
-        const created = saveEvidence(resolvedRoot, evidence, bytes, receiverState);
+        const created = await saveEvidence(resolvedRoot, evidence, bytes);
         respond(response, created ? 201 : 200, created ? 'stored' : 'already stored', cors);
       } catch (error) {
         if (error instanceof EvidenceConflictError || error instanceof UnsafePathError) {
@@ -568,13 +780,17 @@ function parseArgs(argv) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    const options = parseArgs(process.argv.slice(2));
-    const receiver = createEvidenceReceiver(options);
-    await receiver.listen({ port: options.port });
-    process.stdout.write(`SIX API probe receiver: http://${LOOPBACK}:${options.port}/evidence\n`);
-  } catch (error) {
-    process.stderr.write(`${error.message}\n`);
-    process.exitCode = 1;
+  if (process.argv.length === 3 && process.argv[2] === '--storage-worker') {
+    await runStorageWorker();
+  } else {
+    try {
+      const options = parseArgs(process.argv.slice(2));
+      const receiver = createEvidenceReceiver(options);
+      await receiver.listen({ port: options.port });
+      process.stdout.write(`SIX API probe receiver: http://${LOOPBACK}:${options.port}/evidence\n`);
+    } catch (error) {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    }
   }
 }

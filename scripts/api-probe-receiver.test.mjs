@@ -8,6 +8,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   symlink,
   writeFile,
 } from 'node:fs/promises';
@@ -210,6 +211,66 @@ function startRaceChild(script, argumentsList) {
       else reject(new Error(`race child failed (${code}): ${error}`));
     })),
   };
+}
+
+function startCwdHarness(cwd, rootDir) {
+  const receiverModule = new URL('./api-probe-receiver.mjs', import.meta.url).href;
+  const child = spawn(process.execPath, ['-e', `
+    const fs = require('node:fs');
+    (async () => {
+      const originalChdir = process.chdir.bind(process);
+      let chdirCalls = 0;
+      process.chdir = (directory) => { chdirCalls += 1; return originalChdir(directory); };
+      const before = fs.statSync('.');
+      const { createEvidenceReceiver } = await import(process.env.RECEIVER_MODULE);
+      const receiver = createEvidenceReceiver({
+        expectedOrigin: process.env.RECEIVER_ORIGIN,
+        rootDir: process.env.RECEIVER_ROOT,
+      });
+      await receiver.listen({ host: '127.0.0.1', port: 0 });
+      process.send({ port: receiver.address().port, type: 'ready' });
+      process.on('message', async (message) => {
+        if (message !== 'report') return;
+        const after = fs.statSync('.');
+        process.send({
+          chdirCalls,
+          identityStable: before.dev === after.dev && before.ino === after.ino,
+          type: 'report',
+        });
+        await receiver.close();
+        process.exit(0);
+      });
+    })().catch((error) => { console.error(error); process.exit(1); });
+  `], {
+    cwd,
+    env: {
+      ...process.env,
+      RECEIVER_MODULE: receiverModule,
+      RECEIVER_ORIGIN: ORIGIN,
+      RECEIVER_ROOT: rootDir,
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  let error = '';
+  child.stderr.on('data', (chunk) => { error += chunk.toString(); });
+  const message = (type) => new Promise((resolve, reject) => {
+    const onMessage = (value) => {
+      if (value?.type !== type) return;
+      cleanup();
+      resolve(value);
+    };
+    const onExit = (code) => {
+      cleanup();
+      reject(new Error(`cwd harness exited (${code}): ${error}`));
+    };
+    const cleanup = () => {
+      child.off('message', onMessage);
+      child.off('exit', onExit);
+    };
+    child.on('message', onMessage);
+    child.on('exit', onExit);
+  });
+  return { child, message };
 }
 
 test('127.0.0.1 외 주소 bind를 거부한다', async () => {
@@ -476,4 +537,31 @@ test('group writable directory와 hardlink target을 거부한다', async (t) =>
 
   assert.equal((await post(linked.baseUrl, evidence())).status, 409);
   assert.deepEqual(await readFile(source), sentinel);
+});
+
+test('부모 receiver는 시작 CWD가 교체되어도 chdir 없이 계속 처리한다', async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), 'six-probe-parent-cwd-'));
+  const movedCwd = `${cwd}-moved`;
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-parent-root-'));
+  const harness = startCwdHarness(cwd, rootDir);
+  t.after(() => { if (!harness.child.killed) harness.child.kill('SIGKILL'); });
+  const ready = await harness.message('ready');
+  const baseUrl = `http://127.0.0.1:${ready.port}`;
+
+  await rename(cwd, movedCwd);
+  await mkdir(cwd);
+  assert.equal((await post(baseUrl, evidence())).status, 201);
+  assert.equal((await post(baseUrl, evidence())).status, 200);
+
+  const reported = harness.message('report');
+  harness.child.send('report');
+  const report = await reported;
+  assert.equal(report.chdirCalls, 0);
+  assert.equal(report.identityStable, true);
+  assert.deepEqual(await readdir(cwd), []);
+  assert.deepEqual(await readdir(movedCwd), []);
+  assert.deepEqual(
+    await readFile(path.join(rootDir, 'session-20260802', 'base-runtime.json')),
+    Buffer.from(JSON.stringify(evidence())),
+  );
 });
