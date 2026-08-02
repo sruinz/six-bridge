@@ -36,6 +36,10 @@ class DesktopAnalysisStepTest {
 
         onNodeWithTag("analysis:identity").assertTextContains("예시 확장", substring = true)
         onNodeWithTag("analysis:identity").assertTextContains("1.2.3", substring = true)
+        onNodeWithTag("analysis:identity").assertTextContains(
+            "abcdefghijklmnopabcdefghijklmnop",
+            substring = true,
+        )
         onNodeWithTag("analysis:status").assertTextContains("BLOCKED", substring = true)
         onNodeWithTag("analysis:permissions").assertExists()
         onNodeWithTag("analysis:apis").assertExists()

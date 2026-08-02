@@ -86,12 +86,16 @@ class ConversionPreparationEngine private constructor(
         )
             .analyzeArchiveWithIdentity(input.canonicalOriginalZip, profile)
         requireCrxManifestBinding(input, analyzed.report)
+        val report = analyzed.report.copy(
+            originalExtensionId = input.expectedExtensionId
+                ?: analyzed.report.manifestKeyExtensionId,
+        ).also(CompatibilityReport::validate)
         return AnalyzedConversion(
-            report = analyzed.report,
+            report = report,
             logicalSourceIdentity = logicalSourceIdentity(
                 input,
                 analyzed.sourceProjectIdentity,
-                analyzed.report,
+                report,
             ),
         )
     }

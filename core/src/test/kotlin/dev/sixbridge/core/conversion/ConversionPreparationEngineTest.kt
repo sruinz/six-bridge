@@ -211,6 +211,22 @@ class ConversionPreparationEngineTest {
     }
 
     @Test
+    fun `CRX proof ID를 analyzeWithIdentity 보고서에 보존한다`() {
+        val validCrx = packedCrx()
+        val input = PortableExtensionInput.fromCrx(
+            ExtensionInputKind.CRX3,
+            validCrx.bytes,
+            validCrx.extensionId,
+        )
+
+        val result = ConversionPreparationEngine().use {
+            it.analyzeWithIdentity(input, profile())
+        }
+
+        assertEquals(validCrx.extensionId, result.report.originalExtensionId)
+    }
+
+    @Test
     fun `안정적 표식이 없는 ZIP은 신원을 자동 추정하지 않는다`() {
         val analyzed = ConversionPreparationEngine().use {
             it.prepare(

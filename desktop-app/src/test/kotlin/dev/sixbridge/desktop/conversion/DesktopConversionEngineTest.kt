@@ -362,6 +362,7 @@ class DesktopConversionEngineTest {
                 profile,
                 AnalysisControl(),
             )
+            assertEquals(crx.extensionId, session.report.originalExtensionId)
             val artifact = fixture.engine.buildDraft(
                 session,
                 session.requiredApprovals,
@@ -437,7 +438,7 @@ class DesktopConversionEngineTest {
             )
             val path = hostAppData.resolve("sealed-source.crx")
             Files.write(path, packed.bytes)
-            return CrxFixture(path, packed.bytes)
+            return CrxFixture(path, packed.bytes, packed.extensionId)
         }
         override fun close() { engine.close() }
     }
@@ -445,6 +446,7 @@ class DesktopConversionEngineTest {
     private data class CrxFixture(
         val path: java.nio.file.Path,
         val bytes: ByteArray,
+        val extensionId: String,
     )
 
     private companion object {
