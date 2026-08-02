@@ -25,6 +25,22 @@ function normalize(testCase, status, detail, startedAt) {
 export async function runCase(testCase) {
   const startedAt = Date.now();
   try {
+    if (typeof testCase.resolve !== 'function') {
+      throw new TypeError('probe case resolver is required');
+    }
+    const member = testCase.resolve();
+    if (member === undefined || member === null) {
+      return normalize(testCase, 'ABSENT', null, startedAt);
+    }
+    if (testCase.mode === 'PRESENCE_ONLY') {
+      return normalize(testCase, 'EXPOSED', null, startedAt);
+    }
+    if (testCase.mode !== 'SAFE_CALL' && testCase.mode !== 'SAFE_CALL_WITH_CLEANUP') {
+      throw new TypeError('unsupported probe mode');
+    }
+    if (typeof testCase.run !== 'function') {
+      throw new TypeError('safe probe runner is required');
+    }
     const result = await testCase.run();
     return normalize(testCase, 'VERIFIED', result, startedAt);
   } catch (error) {

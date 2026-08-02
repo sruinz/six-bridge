@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.isSymbolicLink
 import kotlin.io.path.name
@@ -105,7 +106,25 @@ class ProbeSourceGeneratorTest {
         val expectedByGroup = catalog.entries
             .filter { it.disposition == CatalogDisposition.PROBE }
             .groupBy { requireNotNull(it.groupId) }
-            .mapValues { (_, entries) -> entries.flatMap { it.cases }.map { it.id }.sorted() }
+            .mapValues { (_, entries) ->
+                entries.flatMap { entry ->
+                    entry.cases.map { case ->
+                        Descriptor(
+                            namespace = entry.namespace,
+                            member = case.member,
+                            context = case.context.name.lowercase(),
+                            mode = case.mode.name.lowercase(),
+                            expectedOutcome = case.expectedOutcome.name.lowercase(),
+                            permissions = case.permissions.sorted(),
+                            manifestKeys = case.manifestKeys.sorted(),
+                            cleanupMember = case.cleanup?.member,
+                            cleanupTarget = case.cleanup?.target?.name?.lowercase(),
+                            cleanupFixtureId = case.cleanup?.fixtureId,
+                            id = case.id,
+                        )
+                    }
+                }.sortedBy(Descriptor::id)
+            }
 
         val actualByGroup = generated.associate { probe ->
             val descriptor = Json.parseToJsonElement(
@@ -116,12 +135,42 @@ class ProbeSourceGeneratorTest {
             assertEquals(catalog.sha256, descriptor.getValue("catalogSha256").jsonPrimitive.content)
             assertCanonicalObjectOrder(descriptor)
             probe.groupId to descriptor.getValue("cases").jsonArray.map {
-                it.jsonObject.getValue("id").jsonPrimitive.content
-            }
+                val value = it.jsonObject
+                val cleanup = value.getValue("cleanup")
+                val cleanupObject = if (cleanup is JsonObject) cleanup else null
+                Descriptor(
+                    namespace = value.getValue("namespace").jsonPrimitive.content,
+                    member = value.getValue("member").jsonPrimitive.content,
+                    context = value.getValue("context").jsonPrimitive.content,
+                    mode = value.getValue("mode").jsonPrimitive.content,
+                    expectedOutcome = value.getValue("expectedOutcome").jsonPrimitive.content,
+                    permissions = value.getValue("permissions").jsonArray.strings(),
+                    manifestKeys = value.getValue("manifestKeys").jsonArray.strings(),
+                    cleanupMember = cleanupObject?.getValue("member")?.jsonPrimitive?.content,
+                    cleanupTarget = cleanupObject?.getValue("target")?.jsonPrimitive?.content,
+                    cleanupFixtureId = cleanupObject?.get("fixtureId")?.let { fixture ->
+                        if (fixture is kotlinx.serialization.json.JsonNull) null else fixture.jsonPrimitive.content
+                    },
+                    id = value.getValue("id").jsonPrimitive.content,
+                )
+            }.sortedBy(Descriptor::id)
         }
 
         assertEquals(expectedByGroup, actualByGroup)
-        assertEquals(catalog.probeCaseIds, actualByGroup.values.flatten().toSet())
+        assertEquals(catalog.probeCaseIds, actualByGroup.values.flatten().map(Descriptor::id).toSet())
+        assertEquals(
+            DescriptorCleanup("remove", "fixture_id", "sixbridge-probe-context-menu"),
+            actualByGroup.values.flatten().single { it.namespace == "contextMenus" }.cleanup(),
+        )
+        assertEquals(
+            DescriptorCleanup("remove", "created_resource_id", null),
+            actualByGroup.values.flatten().single { it.namespace == "tabs" }.cleanup(),
+        )
+        val nonProbeNamespaces = catalog.entries
+            .filter { it.disposition != CatalogDisposition.PROBE }
+            .map { it.namespace }
+            .toSet()
+        assertTrue(actualByGroup.values.flatten().none { it.namespace in nonProbeNamespaces })
     }
 
     @Test
@@ -139,6 +188,52 @@ class ProbeSourceGeneratorTest {
         assertTrue("export async function runCase" in runtime)
         assertTrue("startedAt" in runtime)
         assertTrue("VERIFIED" in runtime)
+    }
+
+    @Test
+    fun `runtime은 presence only member를 호출하지 않고 mode별 상태를 정규화한다`() = withWorkspace { workspace ->
+        val source = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).first().sourceRoot
+        val runtimeModule = workspace.resolve("probe-runtime.mjs")
+        Files.copy(source.resolve("probe-runtime.js"), runtimeModule)
+
+        runNodeModule(
+            workspace,
+            """
+            import { runCase } from '${runtimeModule.toUri()}';
+            let calls = 0;
+            const base = { id: 'case', context: 'extension_page', member: 'member', namespace: 'namespace' };
+            const absent = await runCase({ ...base, mode: 'PRESENCE_ONLY', resolve: () => undefined, run: () => { calls += 100; } });
+            const exposed = await runCase({ ...base, mode: 'PRESENCE_ONLY', resolve: () => () => { calls += 10; }, run: () => { calls += 100; } });
+            const verified = await runCase({ ...base, mode: 'SAFE_CALL', resolve: () => (() => {}), run: async () => { calls += 1; return 'ok'; } });
+            const cleaned = await runCase({ ...base, mode: 'SAFE_CALL_WITH_CLEANUP', resolve: () => ({}), run: async () => { calls += 1; return 'clean'; } });
+            const restricted = await runCase({ ...base, mode: 'SAFE_CALL', resolve: () => ({}), run: async () => { throw new Error('permission denied'); } });
+            if (absent.status !== 'ABSENT') throw new Error(`absent: ${'$'}{absent.status}`);
+            if (exposed.status !== 'EXPOSED') throw new Error(`exposed: ${'$'}{exposed.status}`);
+            if (verified.status !== 'VERIFIED') throw new Error(`verified: ${'$'}{verified.status}`);
+            if (cleaned.status !== 'VERIFIED') throw new Error(`cleaned: ${'$'}{cleaned.status}`);
+            if (restricted.status !== 'RESTRICTED') throw new Error(`restricted: ${'$'}{restricted.status}`);
+            if (calls !== 2) throw new Error(`unexpected calls: ${'$'}{calls}`);
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun `UI와 evidence 상태는 exposed를 OK에 포함하고 나머지를 각 버킷으로 집계한다`() = withWorkspace { workspace ->
+        val source = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).first().sourceRoot
+        val uiModule = workspace.resolve("probe-ui.mjs")
+        Files.copy(source.resolve("probe-ui.js"), uiModule)
+
+        runNodeModule(
+            workspace,
+            """
+            import { summaryBuckets } from '${uiModule.toUri()}';
+            const buckets = summaryBuckets({ VERIFIED: 2, EXPOSED: 3, RESTRICTED: 4, ABSENT: 5, FAILED: 6, NOT_RUN: 7 });
+            const expected = { ok: 5, restricted: 4, absent: 5, failed: 6, notRun: 7 };
+            if (JSON.stringify(buckets) !== JSON.stringify(expected)) {
+              throw new Error(JSON.stringify(buckets));
+            }
+            """.trimIndent(),
+        )
     }
 
     @Test
@@ -188,6 +283,53 @@ class ProbeSourceGeneratorTest {
     }
 
     @Test
+    fun `빈 output root도 기존 경로로 거부하고 삭제하지 않는다`() = withWorkspace { workspace ->
+        val output = workspace.resolve("existing-empty").also(Files::createDirectory)
+
+        assertFailsWith<IllegalArgumentException> {
+            ProbeSourceGenerator().generate(loadCatalog(), output)
+        }
+
+        assertTrue(Files.isDirectory(output, NOFOLLOW_LINKS))
+        assertTrue(Files.list(output).use { it.findAny().isEmpty })
+    }
+
+    @Test
+    fun `asset 누락 실패는 target을 만들지 않고 staging을 정리한다`() = withWorkspace { workspace ->
+        val output = workspace.resolve("asset-failure")
+        val generator = ProbeSourceGenerator(
+            assetLoader = { name ->
+                if (name == "probe/probe.css") error("missing asset") else bundledAsset(name)
+            },
+        )
+
+        assertFailsWith<IllegalStateException> {
+            generator.generate(loadCatalog(), output)
+        }
+
+        assertFalse(Files.exists(output, NOFOLLOW_LINKS))
+        assertNoStaging(workspace, output.fileName.toString())
+    }
+
+    @Test
+    fun `atomic move 실패는 target과 sibling을 변경하지 않고 staging을 정리한다`() = withWorkspace { workspace ->
+        val output = workspace.resolve("move-failure")
+        val sibling = workspace.resolve("keep.txt")
+        Files.writeString(sibling, "keep", UTF_8)
+        val generator = ProbeSourceGenerator(
+            directoryMover = { _, _ -> error("atomic move failed") },
+        )
+
+        assertFailsWith<IllegalStateException> {
+            generator.generate(loadCatalog(), output)
+        }
+
+        assertFalse(Files.exists(output, NOFOLLOW_LINKS))
+        assertEquals("keep", sibling.readText())
+        assertNoStaging(workspace, output.fileName.toString())
+    }
+
+    @Test
     fun `서로 다른 catalog digest는 서로 다른 source tree를 만든다`() = withWorkspace { workspace ->
         val catalog = loadCatalog()
         val first = ProbeSourceGenerator().generate(catalog, workspace.resolve("first"))
@@ -203,6 +345,10 @@ class ProbeSourceGeneratorTest {
     private fun loadCatalog(): ApiProbeCatalog = ApiProbeCatalog.load(
         checkNotNull(javaClass.getResourceAsStream("/catalog/sbrowser-30-public-apis.json")),
     )
+
+    private fun bundledAsset(name: String): ByteArray = checkNotNull(
+        javaClass.classLoader.getResourceAsStream(name),
+    ).use { it.readBytes() }
 
     private fun treeDigest(generated: List<GeneratedProbe>): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -230,6 +376,27 @@ class ProbeSourceGeneratorTest {
         .joinToString("") { "%02x".format(it) }
 
     private fun JsonArray.strings(): List<String> = map { it.jsonPrimitive.content }
+
+    private fun assertNoStaging(parent: Path, outputName: String) {
+        assertTrue(Files.list(parent).use { entries ->
+            entries.noneMatch { it.name.startsWith(".$outputName.staging-") }
+        })
+    }
+
+    private fun runNodeModule(workspace: Path, source: String) {
+        val runner = workspace.resolve("runner-${System.nanoTime()}.mjs")
+        Files.writeString(runner, source, UTF_8)
+        val process = ProcessBuilder("node", runner.toString())
+            .redirectErrorStream(true)
+            .start()
+        if (!process.waitFor(10, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            process.waitFor()
+            throw AssertionError("Node runtime contract test가 timeout되었습니다.")
+        }
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        assertEquals(0, process.exitValue(), output)
+    }
 
     private fun assertCanonicalObjectOrder(value: JsonObject) {
         assertEquals(value.keys.sorted(), value.keys.toList())
@@ -263,4 +430,30 @@ class ProbeSourceGeneratorTest {
             "identity-privacy",
         )
     }
+
+    private data class Descriptor(
+        val namespace: String,
+        val member: String,
+        val context: String,
+        val mode: String,
+        val expectedOutcome: String,
+        val permissions: List<String>,
+        val manifestKeys: List<String>,
+        val cleanupMember: String?,
+        val cleanupTarget: String?,
+        val cleanupFixtureId: String?,
+        val id: String,
+    ) {
+        fun cleanup(): DescriptorCleanup = DescriptorCleanup(
+            cleanupMember,
+            cleanupTarget,
+            cleanupFixtureId,
+        )
+    }
+
+    private data class DescriptorCleanup(
+        val member: String?,
+        val target: String?,
+        val fixtureId: String?,
+    )
 }

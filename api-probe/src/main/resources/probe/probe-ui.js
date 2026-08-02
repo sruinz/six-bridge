@@ -1,23 +1,28 @@
 const byId = (id) => document.getElementById(id);
 
-const STATUS_IDS = Object.freeze({
-  VERIFIED: 'count-ok',
-  RESTRICTED: 'count-restricted',
-  ABSENT: 'count-absent',
-  FAILED: 'count-failed',
-  NOT_RUN: 'count-not-run',
-});
-
 export function setProgress(current, total, context) {
   byId('progress-current').textContent = String(current);
   byId('progress-total').textContent = String(total);
   byId('current-context').textContent = `실행 context: ${String(context)}`;
 }
 
+export function summaryBuckets(counts) {
+  return {
+    ok: Number(counts?.VERIFIED ?? 0) + Number(counts?.EXPOSED ?? 0),
+    restricted: Number(counts?.RESTRICTED ?? 0),
+    absent: Number(counts?.ABSENT ?? 0),
+    failed: Number(counts?.FAILED ?? 0),
+    notRun: Number(counts?.NOT_RUN ?? 0),
+  };
+}
+
 export function setSummary(counts) {
-  for (const [status, elementId] of Object.entries(STATUS_IDS)) {
-    byId(elementId).textContent = String(counts?.[status] ?? 0);
-  }
+  const buckets = summaryBuckets(counts);
+  byId('count-ok').textContent = String(buckets.ok);
+  byId('count-restricted').textContent = String(buckets.restricted);
+  byId('count-absent').textContent = String(buckets.absent);
+  byId('count-failed').textContent = String(buckets.failed);
+  byId('count-not-run').textContent = String(buckets.notRun);
 }
 
 export function appendResult(result) {

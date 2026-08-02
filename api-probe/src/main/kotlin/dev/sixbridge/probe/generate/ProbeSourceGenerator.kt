@@ -19,7 +19,11 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 class ProbeSourceGenerator(
-    private val resourceLoader: ClassLoader = ProbeSourceGenerator::class.java.classLoader,
+    private val assetLoader: (String) -> ByteArray = ::loadBundledAsset,
+    private val directoryMover: (Path, Path) -> Unit = { source, target ->
+        Files.move(source, target, ATOMIC_MOVE)
+        Unit
+    },
 ) {
     fun generate(catalog: ApiProbeCatalog, outputRoot: Path): List<GeneratedProbe> {
         val output = outputRoot.toAbsolutePath().normalize()
@@ -28,7 +32,9 @@ class ProbeSourceGenerator(
         require(!Files.isSymbolicLink(parent)) {
             "API probe output root의 parent는 symlink일 수 없습니다."
         }
-        validateVacantOutput(output)
+        require(!Files.exists(output, NOFOLLOW_LINKS)) {
+            "API probe output root는 존재하지 않아야 합니다."
+        }
 
         val staging = Files.createTempDirectory(parent, ".${output.fileName}.staging-")
         try {
@@ -42,10 +48,13 @@ class ProbeSourceGenerator(
                 writeGroup(staging.resolve(groupId), groupId, entries, catalog.sha256)
             }
 
-            if (Files.exists(output, NOFOLLOW_LINKS)) {
-                Files.delete(output)
+            directoryMover(staging, output)
+            require(Files.isDirectory(output, NOFOLLOW_LINKS)) {
+                "API probe atomic move가 target을 생성하지 않았습니다."
             }
-            Files.move(staging, output, ATOMIC_MOVE)
+            require(!Files.exists(staging, NOFOLLOW_LINKS)) {
+                "API probe atomic move 후 staging directory가 남았습니다."
+            }
         } catch (error: Exception) {
             deleteTree(staging)
             throw error
@@ -59,19 +68,6 @@ class ProbeSourceGenerator(
                 manifestSha256 = sha256(Files.readAllBytes(sourceRoot.resolve("manifest.json"))),
                 catalogSha256 = catalog.sha256,
             )
-        }
-    }
-
-    private fun validateVacantOutput(output: Path) {
-        if (!Files.exists(output, NOFOLLOW_LINKS)) return
-        require(!Files.isSymbolicLink(output)) {
-            "API probe output root는 symlink일 수 없습니다."
-        }
-        require(Files.isDirectory(output, NOFOLLOW_LINKS)) {
-            "API probe output root는 directory여야 합니다."
-        }
-        require(Files.list(output).use { entries -> entries.findAny().isEmpty }) {
-            "API probe output root에 예상 밖 파일이 있습니다."
         }
     }
 
@@ -89,7 +85,7 @@ class ProbeSourceGenerator(
             UTF_8,
         )
         COMMON_ASSETS.forEach { name ->
-            Files.write(root.resolve(name), resourceBytes("probe/$name"))
+            Files.write(root.resolve(name), assetLoader("probe/$name"))
         }
         Files.writeString(
             root.resolve("service-worker.js"),
@@ -180,10 +176,6 @@ class ProbeSourceGenerator(
         "permissions" to JsonArray(case.permissions.sorted().map(::JsonPrimitive)),
     )
 
-    private fun resourceBytes(name: String): ByteArray = checkNotNull(
-        resourceLoader.getResourceAsStream(name),
-    ) { "API probe resource를 찾을 수 없습니다: $name" }.use { it.readBytes() }
-
     private fun canonicalJson(value: JsonElement): String = Json.encodeToString(
         JsonElement.serializer(),
         canonicalize(value),
@@ -216,5 +208,9 @@ class ProbeSourceGenerator(
         val PROBE_ICON: ByteArray = Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
         )
+
+        fun loadBundledAsset(name: String): ByteArray = checkNotNull(
+            ProbeSourceGenerator::class.java.classLoader.getResourceAsStream(name),
+        ) { "API probe resource를 찾을 수 없습니다: $name" }.use { it.readBytes() }
     }
 }
