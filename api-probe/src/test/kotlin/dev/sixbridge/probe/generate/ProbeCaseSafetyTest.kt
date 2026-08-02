@@ -517,6 +517,164 @@ class ProbeCaseSafetyTest {
     }
 
     @Test
+    fun `offscreen lifecycle hang과 late create 뒤에도 queue가 다음 case를 실행한다`() = withWorkspace { workspace ->
+        val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
+        val root = generated.first().sourceRoot
+        Files.writeString(root.resolve("package.json"), "{\"type\":\"module\"}\n", UTF_8)
+        val output = runNodeModule(
+            workspace,
+            """
+            import { installServiceWorkerBridge } from '${root.resolve("service-worker.js").toUri()}';
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const terminal = (promise, timeoutMs = 150) => Promise.race([
+              promise,
+              wait(timeoutMs).then(() => ({ timeout: true })),
+            ]);
+            const descriptor = (id) => ({
+              id, namespace: 'alarms', member: 'get', context: 'offscreen_document',
+              mode: 'safe_call', permissions: ['alarms'],
+            });
+            function harness(prefix, lifecycle, resultDelay = 0, operationTimeoutMs = 20) {
+              const events = [];
+              const first = descriptor(`${'$'}{prefix}-first`);
+              const second = descriptor(`${'$'}{prefix}-second`);
+              const tokens = [`${'$'}{prefix}-run-token-0001`, `${'$'}{prefix}-run-token-0002`];
+              let listener;
+              const chrome = {
+                offscreen: lifecycle(events),
+                runtime: {
+                  id: `${'$'}{prefix}-runtime`,
+                  getURL: (path) => `chrome-extension://${'$'}{prefix}-runtime/${'$'}{String(path).replace(/^\//, '')}`,
+                  onMessage: { addListener: (value) => { listener = value; } },
+                  sendMessage: (message, done) => {
+                    events.push(`send:${'$'}{message.caseId}`);
+                    done({ caseId: message.caseId, runToken: message.runToken, type: 'six-probe-dispatched' });
+                    setTimeout(() => {
+                      events.push(`result:${'$'}{message.caseId}`);
+                      const result = {
+                        caseId: message.caseId,
+                        context: message.descriptor.context,
+                        detail: { kind: 'success', valueType: 'string' },
+                        durationMs: resultDelay,
+                        member: message.descriptor.member,
+                        namespace: message.descriptor.namespace,
+                        runToken: message.runToken,
+                        status: 'VERIFIED',
+                      };
+                      listener(
+                        { result, type: 'six-probe-result' },
+                        { id: chrome.runtime.id, url: chrome.runtime.getURL('offscreen-probe.html') },
+                        () => {},
+                      );
+                    }, resultDelay);
+                  },
+                },
+              };
+              listener = installServiceWorkerBridge(
+                { chrome },
+                async () => ({ ok: true, json: async () => ({ groupId: 'base-runtime', cases: [first, second] }) }),
+                {
+                  lifecycleTimeoutMs: 10,
+                  timeoutMs: operationTimeoutMs,
+                  tokenFactory: () => tokens.shift(),
+                },
+              );
+              const sender = { id: chrome.runtime.id, url: chrome.runtime.getURL('probe.html') };
+              const run = (caseId) => new Promise((resolve) => listener(
+                { caseId, type: 'six-probe-run' }, sender, resolve,
+              ));
+              return { events, first, run, second };
+            }
+
+            let createCalls = 0;
+            let createExists = false;
+            const createHang = harness('create-hang', (events) => ({
+              hasDocument: async () => createExists,
+              createDocument: async () => {
+                createCalls += 1;
+                events.push(`create:${'$'}{createCalls}`);
+                if (createCalls === 1) return new Promise(() => {});
+                createExists = true;
+              },
+              closeDocument: async () => { events.push('close'); createExists = false; },
+            }));
+            const createHangFirst = await terminal(createHang.run(createHang.first.id), 1_200);
+            const createHangSecond = await terminal(createHang.run(createHang.second.id));
+
+            let closeExists = false;
+            let closeCalls = 0;
+            const closeHang = harness('close-hang', (events) => ({
+              hasDocument: async () => closeExists,
+              createDocument: async () => { events.push('create'); closeExists = true; },
+              closeDocument: async () => {
+                closeCalls += 1;
+                events.push(`close:${'$'}{closeCalls}`);
+                return new Promise(() => {});
+              },
+            }));
+            const closeHangFirst = await terminal(closeHang.run(closeHang.first.id), 1_200);
+            const closeHangSecond = await terminal(closeHang.run(closeHang.second.id));
+
+            let lateCreateCalls = 0;
+            let lateExists = false;
+            const lateCreate = harness('late-create', (events) => ({
+              hasDocument: async () => lateExists,
+              createDocument: async () => {
+                lateCreateCalls += 1;
+                events.push(`create:${'$'}{lateCreateCalls}`);
+                if (lateCreateCalls === 1) await wait(50);
+                lateExists = true;
+              },
+              closeDocument: async () => { events.push('close'); lateExists = false; },
+            }), 70, 100);
+            const lateStartedAt = Date.now();
+            const lateFirstPromise = lateCreate.run(lateCreate.first.id);
+            await wait(15);
+            const lateSecondPromise = lateCreate.run(lateCreate.second.id);
+            const lateCreateFirst = await terminal(lateFirstPromise);
+            const lateFirstElapsed = Date.now() - lateStartedAt;
+            const lateCreateSecond = await terminal(lateSecondPromise);
+            await wait(20);
+
+            process.stdout.write(JSON.stringify({
+              closeCalls,
+              closeHangEvents: closeHang.events,
+              closeHangFirst,
+              closeHangSecond,
+              createHangEvents: createHang.events,
+              createHangFirst,
+              createHangSecond,
+              lateCreateEvents: lateCreate.events,
+              lateCreateFirst,
+              lateCreateSecond,
+              lateFirstElapsed,
+            }));
+            """.trimIndent(),
+        ).let { Json.parseToJsonElement(it).jsonObject }
+
+        fun assertTerminal(name: String, expectedStatus: String) {
+            val response = output.getValue(name).jsonObject
+            assertFalse("timeout" in response, "$name queue가 settle되지 않았습니다.")
+            assertEquals(
+                expectedStatus,
+                response.getValue("result").jsonObject.getValue("status").jsonPrimitive.content,
+                name,
+            )
+        }
+        assertTerminal("createHangFirst", "FAILED")
+        assertTerminal("createHangSecond", "VERIFIED")
+        assertTerminal("closeHangFirst", "VERIFIED")
+        assertTerminal("closeHangSecond", "VERIFIED")
+        assertTerminal("lateCreateFirst", "FAILED")
+        assertTerminal("lateCreateSecond", "VERIFIED")
+        assertEquals("1", output.getValue("closeCalls").jsonPrimitive.content)
+        val lateEvents = output.getValue("lateCreateEvents").jsonArray.map { it.jsonPrimitive.content }
+        assertEquals(1, lateEvents.count { it == "close" })
+        assertTrue(lateEvents.indexOf("close") > lateEvents.indexOf("result:late-create-second"))
+        assertTrue(output.getValue("lateFirstElapsed").jsonPrimitive.content.toInt() < 45)
+    }
+
+    @Test
     fun `실제 content listener는 hash token을 검증하고 dispatch와 result를 분리한다`() = withWorkspace { workspace ->
         val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
         val root = generated.first().sourceRoot

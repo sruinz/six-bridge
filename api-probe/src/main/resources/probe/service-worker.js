@@ -263,9 +263,14 @@ async function dispatchContentCase(environment, testCase, groupId, runToken, rec
   }
 }
 
-function createOffscreenLeaseManager(environment) {
+function createOffscreenLeaseManager(environment, requestedLifecycleTimeoutMs) {
+  const lifecycleTimeoutMs = Number.isInteger(requestedLifecycleTimeoutMs)
+    ? Math.max(1, Math.min(requestedLifecycleTimeoutMs, 10_000))
+    : CLEANUP_TIMEOUT_MS;
   let leaseCount = 0;
   let ownedByProbe = false;
+  let closeAttempt = null;
+  let lifecycleSequence = 0;
   let queue = Promise.resolve();
 
   const serialize = (operation) => {
@@ -274,25 +279,91 @@ function createOffscreenLeaseManager(environment) {
     return result;
   };
 
+  const boundedTimeout = (deadlineAt) => Math.max(
+    1,
+    Math.min(lifecycleTimeoutMs, deadlineAt - Date.now()),
+  );
+
+  const beginClose = async () => {
+    if (leaseCount !== 0 || !ownedByProbe || closeAttempt) return;
+    const token = `close-${lifecycleSequence += 1}`;
+    const completion = Promise.resolve().then(
+      () => environment.chrome.offscreen.closeDocument(),
+    );
+    closeAttempt = token;
+    completion.then(
+      () => {
+        void serialize(async () => {
+          if (closeAttempt !== token) return;
+          closeAttempt = null;
+          ownedByProbe = false;
+        });
+      },
+      () => {
+        void serialize(async () => {
+          if (closeAttempt !== token) return;
+          closeAttempt = null;
+          try {
+            const exists = await withDeadline(
+              () => environment.chrome.offscreen.hasDocument(),
+              lifecycleTimeoutMs,
+            );
+            if (!exists) ownedByProbe = false;
+          } catch {
+            // Preserve ownership until a later acquire can re-check the document.
+          }
+        });
+      },
+    );
+    try {
+      await withDeadline(() => completion, lifecycleTimeoutMs);
+    } catch {
+      // Detached completion reconciles ownership and keeps this queue bounded.
+    }
+  };
+
+  const beginCreate = async (deadlineAt) => {
+    const completion = Promise.resolve().then(
+      () => environment.chrome.offscreen.createDocument({
+        justification: 'SIX API capability probe context',
+        reasons: ['DOM_PARSER'],
+        url: 'offscreen-probe.html',
+      }),
+    );
+    try {
+      await withDeadline(() => completion, boundedTimeout(deadlineAt));
+      ownedByProbe = true;
+    } catch (error) {
+      let reconciled = false;
+      completion.then(
+        () => {
+          if (reconciled) return;
+          reconciled = true;
+          void serialize(async () => {
+            ownedByProbe = true;
+            if (leaseCount === 0) await beginClose();
+          });
+        },
+        () => { reconciled = true; },
+      );
+      throw error;
+    }
+  };
+
   return {
     acquire(deadlineAt) {
       return serialize(async () => {
-        const remaining = () => Math.max(1, deadlineAt - Date.now());
         if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
         if (leaseCount === 0) {
           const existed = await withDeadline(
             () => environment.chrome.offscreen.hasDocument(),
-            remaining(),
+            boundedTimeout(deadlineAt),
           );
           if (!existed) {
+            if (closeAttempt) throw new Error('offscreen close is still pending');
             if (Date.now() >= deadlineAt) throw new ProbeTimeoutError(0);
-            await environment.chrome.offscreen.createDocument({
-              justification: 'SIX API capability probe context',
-              reasons: ['DOM_PARSER'],
-              url: 'offscreen-probe.html',
-            });
-            ownedByProbe = true;
-          } else {
+            await beginCreate(deadlineAt);
+          } else if (!closeAttempt && !ownedByProbe) {
             ownedByProbe = false;
           }
         }
@@ -303,14 +374,7 @@ function createOffscreenLeaseManager(environment) {
           released = true;
           return serialize(async () => {
             leaseCount = Math.max(0, leaseCount - 1);
-            if (leaseCount !== 0 || !ownedByProbe) return;
-            try {
-              await environment.chrome.offscreen.closeDocument();
-            } catch {
-              // The owned offscreen document is already gone or cleanup was rejected.
-            } finally {
-              ownedByProbe = false;
-            }
+            await beginClose();
           });
         };
       });
@@ -391,7 +455,10 @@ async function loadController(environment, fetchImpl, options) {
   const factory = CASE_FACTORIES[bundle.groupId];
   if (!factory) throw new Error('unknown probe group');
   const descriptors = new Map(bundle.cases.map((testCase) => [testCase.id, testCase]));
-  const offscreenLeases = createOffscreenLeaseManager(environment);
+  const offscreenLeases = createOffscreenLeaseManager(
+    environment,
+    options.lifecycleTimeoutMs,
+  );
   return createProbeController({
     descriptors,
     executeContextCase: (testCase, runToken, record, timeoutMs) => (
