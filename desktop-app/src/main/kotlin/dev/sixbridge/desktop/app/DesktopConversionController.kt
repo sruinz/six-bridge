@@ -1,6 +1,7 @@
 package dev.sixbridge.desktop.app
 
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.desktop.conversion.DesktopAnalysisSession
@@ -23,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
@@ -31,6 +33,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.swing.Swing
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 enum class DesktopFailureStage {
     INPUT,
@@ -54,7 +57,10 @@ sealed interface DesktopConversionState {
         val message: String? = null,
     ) : DesktopConversionState
 
-    data class Analyzing(val generation: Long) : DesktopConversionState
+    data class Analyzing(
+        val generation: Long,
+        val stage: AnalysisStage,
+    ) : DesktopConversionState
 
     data class AnalysisReady(
         val session: DesktopAnalysisSession,
@@ -88,6 +94,8 @@ class DesktopConversionController private constructor(
     private val saver: DesktopDraftSaver,
     private val revealer: DesktopSavedDraftRevealer,
     private val uiDispatcher: CoroutineDispatcher,
+    private val analysisTimeoutMillis: Long,
+    private val afterAnalysisStageForTesting: (AnalysisStage) -> Unit,
     @Suppress("UNUSED_PARAMETER") marker: Unit,
 ) : AutoCloseable {
     constructor() : this(
@@ -95,6 +103,8 @@ class DesktopConversionController private constructor(
         DesktopDraftSaver(),
         DesktopSavedDraftRevealer(),
         Dispatchers.Swing,
+        ANALYSIS_TIMEOUT_MILLIS,
+        {},
         Unit,
     )
 
@@ -103,7 +113,17 @@ class DesktopConversionController private constructor(
         saver: DesktopDraftSaver = DesktopDraftSaver(),
         revealer: DesktopSavedDraftRevealer = DesktopSavedDraftRevealer(),
         uiDispatcher: CoroutineDispatcher = Dispatchers.Swing,
-    ) : this(engine, saver, revealer, uiDispatcher, Unit)
+        analysisTimeoutMillis: Long = ANALYSIS_TIMEOUT_MILLIS,
+        afterAnalysisStageForTesting: (AnalysisStage) -> Unit = {},
+    ) : this(
+        engine,
+        saver,
+        revealer,
+        uiDispatcher,
+        analysisTimeoutMillis,
+        afterAnalysisStageForTesting,
+        Unit,
+    )
 
     private val lock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -117,22 +137,34 @@ class DesktopConversionController private constructor(
 
     fun analyze(input: DesktopExtensionInput, profile: BrowserProfile) {
         val oldToken: String?
-        val operation = Operation()
+        val operation: Operation
         val nextGeneration: Long
         synchronized(lock) {
             if (closed) return
             oldToken = tokenOf(_state.value)
             cancelCurrentLocked()
             nextGeneration = generation.incrementAndGet()
-            _state.value = DesktopConversionState.Analyzing(nextGeneration)
+            operation = Operation { stage ->
+                val applied = updateAnalysisStage(nextGeneration, stage)
+                if (applied) afterAnalysisStageForTesting(stage)
+            }
+            _state.value = DesktopConversionState.Analyzing(
+                nextGeneration,
+                AnalysisStage.INPUT_VALIDATION,
+            )
             currentOperation = operation
             currentJob = scope.launch {
+                val completedSession = AtomicReference<DesktopAnalysisSession>()
                 try {
-                    val completedSession = AtomicReference<DesktopAnalysisSession>()
                     val session = try {
-                        runInterruptible(Dispatchers.IO) {
-                            engine.analyze(input, profile, operation.control).also(completedSession::set)
+                        withTimeout(analysisTimeoutMillis) {
+                            runInterruptible(Dispatchers.IO) {
+                                engine.analyze(input, profile, operation.control)
+                                    .also(completedSession::set)
+                            }
                         }
+                    } catch (error: TimeoutCancellationException) {
+                        throw error
                     } catch (error: CancellationException) {
                         completedSession.get() ?: throw error
                     }
@@ -149,6 +181,12 @@ class DesktopConversionController private constructor(
                             )
                         }
                     }
+                } catch (_: TimeoutCancellationException) {
+                    completedSession.get()?.let { releaseAsync(it.token) }
+                    failAnalysisTimeoutIfCurrent(
+                        nextGeneration,
+                        DesktopConversionState.Input(selectedInput = input),
+                    )
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Error) {
@@ -411,6 +449,32 @@ class DesktopConversionController private constructor(
         }
     }
 
+    private fun updateAnalysisStage(
+        expectedGeneration: Long,
+        stage: AnalysisStage,
+    ): Boolean = synchronized(lock) {
+        if (generation.get() != expectedGeneration || closed) return@synchronized false
+        val current = _state.value as? DesktopConversionState.Analyzing
+            ?: return@synchronized false
+        _state.value = current.copy(stage = stage)
+        true
+    }
+
+    private fun failAnalysisTimeoutIfCurrent(
+        expectedGeneration: Long,
+        previous: DesktopConversionState,
+    ) {
+        synchronized(lock) {
+            if (generation.get() == expectedGeneration && !closed) {
+                _state.value = DesktopConversionState.Failed(
+                    DesktopFailureStage.ANALYSIS,
+                    "분석 제한 시간 5분을 초과했습니다.",
+                    previous,
+                )
+            }
+        }
+    }
+
     private fun failIfCurrent(
         expectedGeneration: Long,
         stage: DesktopFailureStage,
@@ -493,13 +557,18 @@ class DesktopConversionController private constructor(
         error is IllegalStateException ||
         error is SecurityException
 
-    private class Operation {
+    private class Operation(
+        onStage: (AnalysisStage) -> Unit = {},
+    ) {
         private val cancelled = AtomicBoolean()
-        val control = AnalysisControl {
-            if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                throw CancellationException("사용자가 변환을 취소했습니다.")
-            }
-        }
+        val control = AnalysisControl(
+            checkpoint = {
+                if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                    throw CancellationException("사용자가 변환을 취소했습니다.")
+                }
+            },
+            onStage = onStage,
+        )
 
         fun cancel() {
             cancelled.set(true)
@@ -507,6 +576,7 @@ class DesktopConversionController private constructor(
     }
 
     private companion object {
+        const val ANALYSIS_TIMEOUT_MILLIS = 300_000L
         val PROJECT_IDENTITY = Regex("[0-9a-f]{32}")
     }
 }

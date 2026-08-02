@@ -1,12 +1,10 @@
 package dev.sixbridge.desktop.ui
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.Button
-import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.material.MaterialTheme
 import androidx.compose.material.Surface
 import androidx.compose.material.Text
@@ -50,7 +48,9 @@ fun DesktopApp(
         Surface(modifier = Modifier.fillMaxSize()) {
             when (state) {
                 is DesktopConversionState.Input -> InputStep(state, profiles, onAction)
-                is DesktopConversionState.Analyzing -> BusyStep("확장 프로그램을 분석하는 중입니다.")
+                is DesktopConversionState.Analyzing -> AnalyzingStep(state) {
+                    onAction(DesktopAction.Cancel)
+                }
                 is DesktopConversionState.AnalysisReady -> if (state.reviewStep == DesktopReviewStep.ANALYSIS) {
                     AnalysisStep(state, onAction)
                 } else {
@@ -92,13 +92,5 @@ private fun FailureStep(message: String, onAction: (DesktopAction) -> Unit) {
         ) {
             Text("입력 단계로 돌아가기")
         }
-    }
-}
-
-@Composable
-private fun BusyStep(message: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        CircularProgressIndicator()
-        Text(message, Modifier.padding(top = 96.dp))
     }
 }

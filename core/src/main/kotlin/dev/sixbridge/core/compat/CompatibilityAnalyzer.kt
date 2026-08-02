@@ -47,6 +47,7 @@ class CompatibilityAnalyzer(
     ): CompatibilityReport {
         profile.validate()
         val report = analyzeUnsealed(extensionRoot, profile, ledger)
+        control.stage(AnalysisStage.FINALIZING)
         return report.copy(
             sourceSha256 = sourceSha256,
             browserProfileSha256 = profile.canonicalSha256(),
@@ -98,6 +99,7 @@ class CompatibilityAnalyzer(
             readStringSet(manifest["permissions"]) +
                 readStringSet(manifest["optional_permissions"])
             ).toSet()
+        control.stage(AnalysisStage.ARCHIVE_INVENTORY)
         when (val inventory = AnalysisInventory.inspect(
             extensionRoot,
             ledger,
@@ -269,6 +271,7 @@ class CompatibilityAnalyzer(
             ledger,
         )
         var dynamicUsage = runtimeClosure.unresolvedDependency
+        control.stage(AnalysisStage.API_SCAN)
         Files.walk(root).use { paths ->
             paths.filter { path ->
                 path.isRegularFile() &&

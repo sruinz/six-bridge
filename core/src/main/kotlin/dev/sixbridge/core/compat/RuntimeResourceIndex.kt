@@ -86,6 +86,7 @@ class RuntimeResourceIndex private constructor(
             readSource: (Path) -> String,
             ledger: AnalysisBudgetLedger,
         ): RuntimeResourceIndex {
+            control.stage(AnalysisStage.RUNTIME_CLOSURE)
             val normalizedRoot = root.toAbsolutePath().normalize()
             val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
                 ?: return RuntimeResourceIndex(

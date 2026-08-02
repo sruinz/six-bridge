@@ -1,6 +1,7 @@
 package dev.sixbridge.desktop.app
 
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
@@ -29,6 +30,76 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
+    @Test
+    fun `API scan 단계는 현재 분석 상태에 반영되고 취소하면 입력으로 돌아간다`() {
+        val apiScanEntered = CountDownLatch(1)
+        val releaseApiScan = CountDownLatch(1)
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(
+                engine = fixture.engine,
+                analysisTimeoutMillis = 30_000L,
+                afterAnalysisStageForTesting = { stage ->
+                    if (stage == AnalysisStage.API_SCAN) {
+                        apiScanEntered.countDown()
+                        awaitIgnoringInterrupts(releaseApiScan)
+                    }
+                },
+            )
+
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            assertTrue(apiScanEntered.await(10, TimeUnit.SECONDS))
+            assertEquals(
+                AnalysisStage.API_SCAN,
+                (controller.state.value as DesktopConversionState.Analyzing).stage,
+            )
+
+            controller.cancel()
+            assertIs<DesktopConversionState.Input>(controller.state.value)
+            releaseApiScan.countDown()
+            controller.close()
+        }
+        releaseApiScan.countDown()
+    }
+
+    @Test
+    fun `분석 제한 시간을 넘으면 5분 제한 실패로 전환한다`() {
+        val analysisCompleted = CountDownLatch(1)
+        val releaseAnalysis = CountDownLatch(1)
+        val timedOutToken = AtomicReference<String>()
+        Fixture(
+            DesktopConversionEngineTestHooks(
+                afterAnalysisRegistration = { session ->
+                    timedOutToken.set(session.token)
+                    analysisCompleted.countDown()
+                    awaitIgnoringInterrupts(releaseAnalysis)
+                },
+            ),
+        ).use { fixture ->
+            val controller = DesktopConversionController(
+                engine = fixture.engine,
+                analysisTimeoutMillis = 50L,
+            )
+
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            assertTrue(analysisCompleted.await(10, TimeUnit.SECONDS))
+            Thread.sleep(100L)
+            releaseAnalysis.countDown()
+
+            val failed = awaitState(controller) { it is DesktopConversionState.Failed }
+                as DesktopConversionState.Failed
+            assertEquals(DesktopFailureStage.ANALYSIS, failed.stage)
+            assertEquals("분석 제한 시간 5분을 초과했습니다.", failed.message)
+            await { !fixture.engine.isRegisteredForTesting(timedOutToken.get()) }
+            assertFalse(
+                fixture.engine.release(timedOutToken.get()),
+                "timeout session lease는 두 번 해제될 수 없습니다.",
+            )
+            assertEquals(1, fixture.closeCount.get())
+            controller.close()
+        }
+        releaseAnalysis.countDown()
+    }
+
     @Test
     fun `markerless input은 엄격한 project identity 선택 전에 draft를 생성하지 않는다`() {
         Fixture().use { fixture ->

@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.compat.AnalysisBudgetExceededException
 import dev.sixbridge.core.compat.AnalysisBudgetLedger
 import dev.sixbridge.core.compat.analysisBudgetExceededReport
@@ -121,15 +122,18 @@ class MobilePatternAnalyzer private constructor(
         if (compatibility.status == CompatibilityStatus.BLOCKED ||
             compatibility.status == CompatibilityStatus.UNKNOWN
         ) {
+            control.stage(AnalysisStage.MOBILE_PATTERNS)
             val invalidOptionPage = manifest?.let {
                 invalidExistingOptionPageDecision(manifestPath, it, profile)
             }
             if (invalidOptionPage != null) {
+                control.stage(AnalysisStage.FINALIZING)
                 return compatibility.copy(
                     conversionState = ConversionState.UNAVAILABLE,
                     adapterDecisions = listOf(invalidOptionPage),
                 )
             }
+            control.stage(AnalysisStage.FINALIZING)
             return compatibility
         }
         manifest ?: return compatibility
@@ -137,6 +141,7 @@ class MobilePatternAnalyzer private constructor(
         val index = try {
             RuntimeResourceIndex.create(extensionRoot, manifest, control, ledger)
         } catch (error: AnalysisBudgetExceededException) {
+            control.stage(AnalysisStage.FINALIZING)
             return analysisBudgetExceededReport(
                 error.exceeded,
                 compatibility.manifestVersion,
@@ -150,9 +155,11 @@ class MobilePatternAnalyzer private constructor(
         }
         control.checkCancelled()
         if (index.unresolvedDependency) {
+            control.stage(AnalysisStage.FINALIZING)
             return compatibility
         }
 
+        control.stage(AnalysisStage.MOBILE_PATTERNS)
         val decisions = mutableListOf<AdapterDecision>()
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
@@ -173,6 +180,7 @@ class MobilePatternAnalyzer private constructor(
         val sortedDecisions = decisions.sortedWith(
             compareBy(AdapterDecision::id, AdapterDecision::version),
         )
+        control.stage(AnalysisStage.FINALIZING)
         return compatibility.copy(
             issues = issues,
             conversionState = conversionState(sortedDecisions),
