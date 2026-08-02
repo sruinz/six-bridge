@@ -232,6 +232,36 @@ stdout의 `configUrl`을 VDtN options에 저장한 뒤 검증할 페이지에서
 CRX 키나 래퍼 PKCS12 키를 잃으면 확장 ID 또는 Android 업데이트 서명이
 바뀌므로 안전하게 백업해야 한다.
 
+## macOS SixDraft → Fold7 게이트
+
+macOS SIX Bridge가 만든 `.sixdraft`는 Fold7에서 Android 관리자가 다시
+분석·변환한다. strict host 검증과 hash, 사용자 전송 뒤 package·logcat 증거는
+다음 게이트로 수집한다. `.sixdraft`나 APK 설치는 사용자가 Android 파일 앱에서
+직접 승인하며, 이 스크립트는 설치를 수행하지 않는다.
+
+```sh
+./scripts/fold7-desktop-sixdraft-gate.sh \
+  --draft /안전한/경로/extension.sixdraft \
+  --serial 192.0.2.10:44085 \
+  --expected-name '스마트 컨텍스트 메뉴' \
+  --expected-package dev.sixbridge.ext.oicemipaegdpdgncidiplligilkmfkip
+```
+
+serial은 `192.0.2.10:44085`만 사용한다. mDNS 중복 대상은 사용하지 않는다.
+최신 `dev.sixbridge.manager` APK가 Android user 0에 설치되었는지 먼저 사용자
+화면과 `pm path --user 0`로 확인한다. Secure Folder user 150은 이 게이트 대상이
+아니며, package 수집도 `--user 0`으로 제한한다. 스크립트는 manager APK를
+설치하지 않는다.
+자동 수집 뒤에도 삼성 인터넷 Add-ons 화면의 이름·아이콘·`지원 안 함` 상태,
+텍스트 선택 기능, 설정 저장, 브라우저 재시작 뒤 활성 유지와 관리자 앱 제거를
+사용자가 수동으로 확인해야 한다. 상세 절차는
+[macOS SixDraft → Fold7 게이트](docs/DESKTOP_SIXDRAFT_FOLD7_GATE_KO.md)를
+참고한다.
+
+Windows x86-64 MSI 구성과 owner-only ACL 코드는 포함되어 있으나,
+실제 Windows MSI 생성·설치·코드 서명·SmartScreen 검증은 아직 완료되지
+않았습니다.
+
 상세 내용은 [아키텍처](docs/architecture.md),
 [Fold7 검증 절차](docs/fold7-validation.md),
 [PoC 검증 결과](docs/poc-results.md)를 참고한다.

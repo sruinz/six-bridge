@@ -625,6 +625,44 @@ class ConversionPipelineTest {
     }
 
     @Test
+    fun `reconciliation rejects changed evidence path on an unselected decision`() {
+        assertFailsWith<ConversionValidationException> {
+            reconcileWithStorageEvidence(
+                listOf(SourceEvidence("other.js", 1, "원본 근거")),
+            )
+        }
+    }
+
+    @Test
+    fun `reconciliation rejects changed semantic fields on an unselected decision`() {
+        val mutations = listOf<(AdapterDecision) -> AdapterDecision>(
+            { it.copy(risk = AdapterRisk.BEHAVIOR_CHANGE) },
+            { it.copy(disposition = AdapterDisposition.REQUIRES_APPROVAL) },
+            { it.copy(changes = listOf("변경된 작업")) },
+            { it.copy(remainingLimitations = listOf("변경된 제한")) },
+        )
+
+        mutations.forEach { mutation ->
+            assertFailsWith<ConversionValidationException> {
+                reconcileWithStorageDecision(mutation)
+            }
+        }
+    }
+
+    @Test
+    fun `reconciliation preserves an unselected decision when only its evidence line moves`() {
+        val result = reconcileWithStorageEvidence(
+            listOf(SourceEvidence("content.js", 27, "원본 근거")),
+        )
+
+        assertEquals(
+            SourceEvidence("content.js", 1, "원본 근거"),
+            result.single { it.id == MobilePatternAnalyzer.STORAGE_FALLBACK }
+                .evidence.single(),
+        )
+    }
+
+    @Test
     fun `reconciliation rejects a duplicate raw decision with the same identity`() {
         val selected = AdapterDecision(
             id = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
@@ -788,6 +826,12 @@ class ConversionPipelineTest {
 
     private fun reconcileWithStorageEvidence(
         currentEvidence: List<SourceEvidence>,
+    ): List<AdapterDecision> = reconcileWithStorageDecision {
+        it.copy(evidence = currentEvidence)
+    }
+
+    private fun reconcileWithStorageDecision(
+        mutate: (AdapterDecision) -> AdapterDecision,
     ): List<AdapterDecision> {
         val selected = AdapterDecision(
             id = MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
@@ -815,7 +859,7 @@ class ConversionPipelineTest {
             appliedDecisions = listOf(applied),
             rawAfterDecisions = listOf(
                 applied,
-                unavailable.copy(evidence = currentEvidence),
+                mutate(unavailable),
             ),
         )
     }

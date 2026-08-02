@@ -438,16 +438,25 @@ internal fun reconcileAdapterDecisions(
             ?: throw ConversionValidationException(
                 "변환본 재분석에서 미선택 adapter 근거가 사라졌습니다: ${before.id}",
             )
-        if (current != before) {
+        if (!sameDecisionIgnoringEvidenceLines(current, before)) {
             throw ConversionValidationException(
                 "변환본 재분석에서 미선택 adapter 근거가 달라졌습니다: ${before.id}",
             )
         }
-        current
+        before
     }
     return (verifiedApplied + preserved)
         .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
 }
+
+private fun sameDecisionIgnoringEvidenceLines(
+    first: AdapterDecision,
+    second: AdapterDecision,
+): Boolean = first.copy(
+    evidence = first.evidence.map { it.copy(line = null) },
+) == second.copy(
+    evidence = second.evidence.map { it.copy(line = null) },
+)
 
 class ConversionPipelineResult private constructor(
     sourceZip: ByteArray,
