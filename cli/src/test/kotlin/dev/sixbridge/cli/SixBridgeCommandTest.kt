@@ -421,6 +421,75 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `probe NIO file move 완료 후 예외는 자체 산출물을 quarantine에 격리한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-file-move-then-fail")
+        val target = workspace.resolve("candidate.json").also { it.writeText("published") }
+        val nio = NioProbePublicationFileOps { source, destination ->
+            Files.move(source, destination)
+            if (source == target && destination.fileName.toString() == "entry") {
+                throw IOException("injected failure after completed move")
+            }
+        }
+        val expected = nio.snapshot(target)
+
+        val result = nio.quarantineAfterFailure(target, expected)
+
+        assertEquals(ProbeRollbackState.OWN_OUTPUT_ISOLATED, result.state)
+        assertTrue(result.publicTargetChanged)
+        assertFalse(target.exists())
+        assertEquals("published", result.quarantinePath.resolve("entry").readText())
+        assertTrue("completed move" in result.failure?.cause?.message.orEmpty())
+    }
+
+    @Test
+    fun `probe NIO directory move 완료 후 예외는 경쟁자 tree를 public target으로 복원한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-directory-move-then-fail")
+        val target = workspace.resolve("sources").also(Files::createDirectory)
+        target.resolve("generated.txt").writeText("published")
+        val nio = NioProbePublicationFileOps { source, destination ->
+            if (source == target && destination.fileName.toString() == "entry") {
+                source.resolve("group").also(Files::createDirectory)
+                    .resolve("user-added.txt").writeText("competitor-owned")
+                Files.move(source, destination)
+                throw IOException("injected failure after completed directory move")
+            }
+            Files.move(source, destination)
+        }
+        val expected = nio.snapshot(target)
+
+        val result = nio.quarantineAfterFailure(target, expected)
+
+        assertEquals(ProbeRollbackState.COMPETITOR_RESTORED, result.state)
+        assertTrue(result.publicTargetChanged)
+        assertEquals("published", target.resolve("generated.txt").readText())
+        assertEquals("competitor-owned", target.resolve("group/user-added.txt").readText())
+        assertFalse(result.quarantinePath.resolve("entry").exists())
+        assertTrue(result.quarantinePath.exists())
+    }
+
+    @Test
+    fun `probe NIO move 완료 후 예외과 restore collision은 public과 quarantine을 모두 보존한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-move-failure-collision")
+        val target = workspace.resolve("candidate.json").also { it.writeText("published") }
+        val nio = NioProbePublicationFileOps { source, destination ->
+            Files.move(source, destination)
+            if (source == target && destination.fileName.toString() == "entry") {
+                target.writeText("public-competitor")
+                throw IOException("injected failure after move and collision")
+            }
+        }
+        val expected = nio.snapshot(target)
+
+        val result = nio.quarantineAfterFailure(target, expected)
+
+        assertEquals(ProbeRollbackState.RESTORE_COLLISION, result.state)
+        assertTrue(result.publicTargetChanged)
+        assertEquals("public-competitor", target.readText())
+        assertEquals("published", result.quarantinePath.resolve("entry").readText())
+        assertTrue(result.quarantinePath.exists())
+    }
+
+    @Test
     fun `probe NIO quarantine 2차 검사 직후 추가된 경쟁자 파일을 절대 삭제하지 않는다`() {
         val workspace = Files.createTempDirectory("six-cli-probe-nio-after-inspection-race")
         val target = workspace.resolve("sources").also(Files::createDirectory)
@@ -514,6 +583,38 @@ class SixBridgeCommandTest {
         val quarantine = Path.of(diagnostic.message!!.substringAfter("quarantine="))
         assertTrue(quarantine.isAbsolute)
         assertTrue(quarantine.exists())
+    }
+
+    @Test
+    fun `probe rollback move가 public 경로를 변경하지 않으면 parent를 re-fsync하지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-no-move-no-refsync")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val target = workspace.resolve("candidate.json")
+        val rollbackPublication = NioProbePublicationFileOps { _, _ ->
+            throw IOException("injected failure before move")
+        }
+        val ops = RecordingProbePublicationFileOps(
+            failParentFsyncOnce = workspace,
+            rollbackPublication = rollbackPublication,
+        )
+        val command = ProbeBuildProfileCommand(ops).apply {
+            this.base = base
+            this.evidence = evidence
+            this.output = target
+        }
+
+        val error = assertFailsWith<dev.sixbridge.core.SixBridgeUserInputException> {
+            command.call()
+        }
+
+        assertTrue(target.exists())
+        assertEquals(1, ops.parentFsyncAttempts)
+        val diagnostic = error.cause!!.suppressed
+            .filterIsInstance<ProbeRollbackDiagnosticException>()
+            .single()
+        assertTrue("rollback=RESTORE_COLLISION" in diagnostic.message.orEmpty())
+        assertTrue("quarantine=/" in diagnostic.message.orEmpty())
     }
 
     @Test

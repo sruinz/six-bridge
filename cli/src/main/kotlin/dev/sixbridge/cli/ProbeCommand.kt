@@ -444,15 +444,12 @@ internal class NioProbePublicationFileOps(
         try {
             mover(path, entry)
         } catch (moveFailure: Exception) {
-            return ProbeRollbackResult(
-                if (Files.exists(entry, NOFOLLOW_LINKS)) {
-                    ProbeRollbackState.RESTORE_COLLISION
-                } else {
-                    ProbeRollbackState.COMPETITOR_RESTORED
-                },
-                quarantine,
-                publicTargetChanged = Files.exists(entry, NOFOLLOW_LINKS),
-                failure = IOException("rollback target을 quarantine으로 이동하지 못했습니다.", moveFailure),
+            return classifyAfterFailedMove(
+                path = path,
+                entry = entry,
+                quarantine = quarantine,
+                expected = expected,
+                moveFailure = moveFailure,
             )
         }
         val quarantinedSnapshot = runCatching { snapshot(entry) }
@@ -493,6 +490,96 @@ internal class NioProbePublicationFileOps(
                     "rollback quarantine의 경쟁자 target을 복원하지 못했습니다: $entry",
                     restoreFailure,
                 ),
+            )
+        }
+    }
+
+    private fun classifyAfterFailedMove(
+        path: Path,
+        entry: Path,
+        quarantine: Path,
+        expected: ProbePublicationSnapshot,
+        moveFailure: Exception,
+    ): ProbeRollbackResult {
+        val entryExists = Files.exists(entry, NOFOLLOW_LINKS)
+        val publicExists = Files.exists(path, NOFOLLOW_LINKS)
+        val publicSnapshot = if (publicExists && !Files.isSymbolicLink(path)) {
+            runCatching { snapshot(path) }
+        } else {
+            null
+        }
+        val inspectedPublic = publicSnapshot?.getOrNull()
+        val publicIsStableCompetitor = inspectedPublic?.let {
+            it.stable && it.entries != expected.entries
+        } == true
+        val publicChanged = !publicExists || publicIsStableCompetitor
+        val moveDiagnostic = IOException(
+            "rollback target move가 예외로 종료되어 파일 상태를 재검사했습니다.",
+            moveFailure,
+        )
+        if (!entryExists) {
+            publicSnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+            return ProbeRollbackResult(
+                state = if (publicIsStableCompetitor) {
+                    ProbeRollbackState.COMPETITOR_RESTORED
+                } else {
+                    ProbeRollbackState.RESTORE_COLLISION
+                },
+                quarantinePath = quarantine,
+                publicTargetChanged = publicChanged,
+                failure = moveDiagnostic,
+            )
+        }
+        val entrySnapshot = if (!Files.isSymbolicLink(entry)) {
+            runCatching { snapshot(entry) }
+        } else {
+            Result.failure(IOException("quarantine entry가 symlink로 변경되었습니다."))
+        }
+        if (publicExists) {
+            publicSnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+            entrySnapshot.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+            return ProbeRollbackResult(
+                ProbeRollbackState.RESTORE_COLLISION,
+                quarantine,
+                publicTargetChanged = publicChanged,
+                failure = moveDiagnostic,
+            )
+        }
+        val inspectedEntry = entrySnapshot.getOrNull()
+        if (inspectedEntry == null || !inspectedEntry.stable) {
+            entrySnapshot.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+            return ProbeRollbackResult(
+                ProbeRollbackState.RESTORE_COLLISION,
+                quarantine,
+                publicTargetChanged = true,
+                failure = moveDiagnostic,
+            )
+        }
+        if (inspectedEntry.entries == expected.entries) {
+            return ProbeRollbackResult(
+                ProbeRollbackState.OWN_OUTPUT_ISOLATED,
+                quarantine,
+                publicTargetChanged = true,
+                failure = moveDiagnostic,
+            )
+        }
+        return try {
+            mover(entry, path)
+            ProbeRollbackResult(
+                ProbeRollbackState.COMPETITOR_RESTORED,
+                quarantine,
+                publicTargetChanged = true,
+                failure = moveDiagnostic,
+            )
+        } catch (restoreFailure: Exception) {
+            ProbeRollbackResult(
+                ProbeRollbackState.RESTORE_COLLISION,
+                quarantine,
+                publicTargetChanged = true,
+                failure = IOException(
+                    "move 예외 후 quarantine target을 복원하지 못했습니다: $entry",
+                    restoreFailure,
+                ).also { it.addSuppressed(moveDiagnostic) },
             )
         }
     }
