@@ -2,7 +2,6 @@ package dev.sixbridge.core.profile
 
 import java.lang.reflect.Modifier
 import java.util.Base64
-import kotlin.jvm.internal.DefaultConstructorMarker
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -113,12 +112,32 @@ class BrowserProfileAbiTest {
         val legacyConstructor =
             BrowserProfile::class.java.getDeclaredConstructor(*legacyParameters)
         assertFalse(legacyConstructor.isSynthetic)
+        val defaultConstructorMarker =
+            Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
         val defaultConstructor = BrowserProfile::class.java.getDeclaredConstructor(
             *legacyParameters,
             Int::class.javaPrimitiveType,
-            DefaultConstructorMarker::class.java,
+            defaultConstructorMarker,
         )
         assertTrue(defaultConstructor.isSynthetic)
+        val newParameters = legacyParameters + List::class.java
+        val expectedConstructorParameters = setOf(
+            legacyParameters.map { requireNotNull(it).name },
+            (legacyParameters + Int::class.javaPrimitiveType + defaultConstructorMarker)
+                .map { requireNotNull(it).name },
+            newParameters.map { requireNotNull(it).name },
+        )
+        assertEquals(
+            expectedConstructorParameters,
+            BrowserProfile::class.java.declaredConstructors
+                .map { constructor -> constructor.parameterTypes.map { it.name } }
+                .toSet(),
+        )
+        assertFalse(
+            BrowserProfile::class.java.declaredConstructors.any {
+                it.parameterCount == 0
+            },
+        )
 
         (1..13).forEach { index ->
             BrowserProfile::class.java.getDeclaredMethod("component$index")
@@ -232,9 +251,26 @@ class BrowserProfileAbiTest {
             probeCatalogSha256 = "a".repeat(64),
         )
         val profile = profile().copy(apiCapabilities = listOf(evidence))
+        val constructed = BrowserProfile(
+            browserPackage = "com.sec.android.app.sbrowser",
+            versionName = "30.0.2.61",
+            versionCode = 1_300_261_502,
+            majorVersion = 30,
+            supportedApis = setOf("tabs"),
+            detectedApis = setOf("tabs"),
+            wrapperContract = WrapperContract.complete(),
+            sourceApkSha256 = "source",
+            installationApkSetSha256 = "installation",
+            sourceApkSignerSha256 = "signer",
+            profileDifferences = emptyList(),
+            supportedFeatures = emptySet(),
+            unavailableFeatures = emptySet(),
+            apiCapabilities = listOf(evidence),
+        )
 
         val changed = profile.copy(versionName = "30.0.2.62")
 
+        assertEquals(listOf(evidence), constructed.apiCapabilities)
         assertEquals(profile.apiCapabilities, changed.apiCapabilities)
         assertEquals(profile, BrowserProfileJson.decode(BrowserProfileJson.encode(profile)))
         assertEquals(profile.hashCode(), profile.copy().hashCode())
