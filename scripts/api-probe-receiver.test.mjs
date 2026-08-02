@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { writeFileSync } from 'node:fs';
 
 import {
   createEvidenceReceiver,
@@ -49,6 +50,14 @@ function sessionConfig() {
       groupId,
       extensionId: String.fromCharCode('a'.charCodeAt(0) + index).repeat(32),
       wrapperSignerSha256: SHA_B,
+      cases: [{
+        caseId: `${groupId}-case`,
+        namespace: 'runtime',
+        member: 'getURL',
+        context: 'extension_page',
+        mode: 'presence_only',
+        expectedOutcome: 'exposed',
+      }],
     })),
   };
 }
@@ -997,6 +1006,38 @@ test('session receiver는 origin group catalog client provenance NOT_RUN malform
   assert.equal((await sessionPost(current.baseUrl, origin, '{"schemaVersion":1,"schemaVersion":1}')).status, 400);
 });
 
+test('session receiver는 exact case coverage descriptor mode outcome status를 검증하고 파일을 만들지 않는다', async (t) => {
+  const current = await sessionFixture();
+  t.after(() => current.receiver.close());
+  const config = sessionConfig();
+  const binding = config.bindings[0];
+  const origin = `chrome-extension://${binding.extensionId}`;
+  const invalid = [];
+
+  invalid.push(submission(binding.groupId, { results: [] }));
+  const unknown = submission(binding.groupId);
+  unknown.results[0].caseId = 'unknown-case';
+  invalid.push(unknown);
+  const duplicate = submission(binding.groupId);
+  duplicate.results.push(structuredClone(duplicate.results[0]));
+  invalid.push(duplicate);
+  const mismatch = submission(binding.groupId);
+  mismatch.results[0].member = 'wrongMember';
+  invalid.push(mismatch);
+  const impossibleStatus = submission(binding.groupId);
+  impossibleStatus.results[0].status = 'VERIFIED';
+  impossibleStatus.results[0].detail = { kind: 'success', valueType: 'object' };
+  invalid.push(impossibleStatus);
+
+  for (const value of invalid) {
+    assert.equal((await sessionPost(current.baseUrl, origin, value)).status, 400);
+  }
+  await assert.rejects(
+    readFile(path.join(current.rootDir, config.sessionId, `${binding.groupId}.json`)),
+    { code: 'ENOENT' },
+  );
+});
+
 test('session receiver는 canonical 동일 submission은 200 비canonical은 400 다른 bytes는 409로 보존한다', async (t) => {
   const current = await sessionFixture();
   t.after(() => current.receiver.close());
@@ -1032,7 +1073,7 @@ test('session receiver CLI는 0600 config와 origin mode의 배타적 선택을 
     browserSignerSha256: sessionConfig().browserSignerSha256,
     bindings: sessionConfig().bindings,
   };
-  await writeFile(configPath, `${JSON.stringify(canonical)}\n`, { mode: 0o644 });
+  await writeFile(configPath, `${JSON.stringify(canonical, null, 4)}\n`, { mode: 0o644 });
   const unsafe = spawnSync(process.execPath, [receiverPath, '--session-config', configPath]);
   assert.equal(unsafe.status, 1);
   assert.match(unsafe.stderr.toString(), /0600/);
@@ -1043,4 +1084,52 @@ test('session receiver CLI는 0600 config와 origin mode의 배타적 선택을 
   ]);
   assert.equal(ambiguous.status, 1);
   assert.match(ambiguous.stderr.toString(), /exactly one/);
+});
+
+test('session config loader는 Kotlin canonical exact bytes만 받고 순서와 whitespace 변형을 거부한다', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'six-probe-session-canonical-'));
+  const configPath = path.join(root, 'session.json');
+  const config = sessionConfig();
+  config.bindings[0].cases.push({
+    ...config.bindings[0].cases[0],
+    caseId: `${config.bindings[0].groupId}-case-z`,
+  });
+  const canonical = `${JSON.stringify(config, null, 4)}\n`;
+  await writeFile(configPath, canonical, { mode: 0o600 });
+  assert.deepEqual(evidenceReceiverTestHooks.readSessionConfigFile(configPath), config);
+
+  const variants = [
+    ['compact JSON', JSON.stringify(config)],
+    ['extra newline', `${canonical}\n`],
+    ['reversed bindings', `${JSON.stringify({ ...config, bindings: [...config.bindings].reverse() }, null, 4)}\n`],
+    ['reversed cases', `${JSON.stringify({
+      ...config,
+      bindings: config.bindings.map((binding, index) => index === 0
+        ? { ...binding, cases: [...binding.cases].reverse() } : binding),
+    }, null, 4)}\n`],
+  ];
+  for (const [label, value] of variants) {
+    await writeFile(configPath, value, { mode: 0o600 });
+    assert.throws(
+      () => evidenceReceiverTestHooks.readSessionConfigFile(configPath),
+      /(canonical|invalid session)/,
+      label,
+    );
+  }
+});
+
+test('session config loader는 같은 inode와 size의 overwrite를 fstat metadata로 거부한다', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'six-probe-session-overwrite-'));
+  const configPath = path.join(root, 'session.json');
+  const config = sessionConfig();
+  const canonical = `${JSON.stringify(config, null, 4)}\n`;
+  const changed = canonical.replace(config.sessionId, 'session-20260803');
+  assert.equal(Buffer.byteLength(changed), Buffer.byteLength(canonical));
+  await writeFile(configPath, canonical, { mode: 0o600 });
+
+  assert.throws(() => evidenceReceiverTestHooks.readSessionConfigFile(configPath, {
+    afterRead() {
+      writeFileSync(configPath, changed, { mode: 0o600 });
+    },
+  }), /changed while reading/);
 });

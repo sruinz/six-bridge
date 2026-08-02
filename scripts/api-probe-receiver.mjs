@@ -46,7 +46,10 @@ const SESSION_FIELDS = [
   'bindings', 'browserApkSetSha256', 'browserPackage', 'browserSignerSha256',
   'browserVersionCode', 'browserVersionName', 'catalogSha256', 'schemaVersion', 'sessionId',
 ];
-const BINDING_FIELDS = ['extensionId', 'groupId', 'wrapperSignerSha256'];
+const BINDING_FIELDS = ['cases', 'extensionId', 'groupId', 'wrapperSignerSha256'];
+const CASE_DESCRIPTOR_FIELDS = [
+  'caseId', 'context', 'expectedOutcome', 'member', 'mode', 'namespace',
+];
 const RESULT_FIELDS = [
   'caseId',
   'context',
@@ -83,6 +86,11 @@ const MEMBER = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
 const RUN_TOKEN = /^[A-Za-z0-9_-]{16,64}$/;
 const ORIGIN = /^chrome-extension:\/\/[a-p]{32}$/;
 const CONTENT_TYPE = /^application\/json(?:\s*;\s*charset=utf-8)?$/i;
+const MODE_OUTCOME = new Map([
+  ['presence_only', 'exposed'],
+  ['safe_call', 'verified'],
+  ['safe_call_with_cleanup', 'verified'],
+]);
 
 function exactFields(value, expected) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -287,9 +295,13 @@ function validateSessionConfig(input) {
   const groups = new Set();
   const extensions = new Set();
   const signers = new Set();
-  for (const binding of input.bindings) {
+  const caseIds = new Set();
+  const expectedGroups = [...GROUP_IDS];
+  for (const [bindingIndex, binding] of input.bindings.entries()) {
     if (!exactFields(binding, BINDING_FIELDS) || !GROUP_IDS.has(binding.groupId)
-      || !EXTENSION_ID.test(binding.extensionId) || !SHA256.test(binding.wrapperSignerSha256)) {
+      || binding.groupId !== expectedGroups[bindingIndex]
+      || !EXTENSION_ID.test(binding.extensionId) || !SHA256.test(binding.wrapperSignerSha256)
+      || !Array.isArray(binding.cases) || binding.cases.length < 1 || binding.cases.length > MAX_RESULTS) {
       throw new TypeError('invalid session binding');
     }
     if (groups.has(binding.groupId) || extensions.has(binding.extensionId)) {
@@ -298,6 +310,19 @@ function validateSessionConfig(input) {
     groups.add(binding.groupId);
     extensions.add(binding.extensionId);
     signers.add(binding.wrapperSignerSha256);
+    let previousCaseId = null;
+    for (const descriptor of binding.cases) {
+      if (!exactFields(descriptor, CASE_DESCRIPTOR_FIELDS)
+        || !CASE_ID.test(descriptor.caseId) || !NAMESPACE.test(descriptor.namespace)
+        || !MEMBER.test(descriptor.member) || !CONTEXTS.has(descriptor.context)
+        || MODE_OUTCOME.get(descriptor.mode) !== descriptor.expectedOutcome
+        || (previousCaseId !== null && previousCaseId.localeCompare(descriptor.caseId) >= 0)
+        || caseIds.has(descriptor.caseId)) {
+        throw new TypeError('invalid session case descriptor');
+      }
+      previousCaseId = descriptor.caseId;
+      caseIds.add(descriptor.caseId);
+    }
   }
   if (groups.size !== GROUP_IDS.size || signers.size !== 1) {
     throw new TypeError('incomplete session bindings');
@@ -305,43 +330,66 @@ function validateSessionConfig(input) {
   return structuredClone(input);
 }
 
-function readSessionConfigFile(file) {
+function readSessionConfigFile(file, hooks = {}) {
   assertSafePlatform();
   const resolved = path.resolve(String(file));
-  const before = lstatSync(resolved, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || (Number(before.mode) & 0o777) !== 0o600) {
-    throw new TypeError('session config must be a regular 0600 file');
-  }
   const descriptor = openSync(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const openedBefore = fstatSync(descriptor, { bigint: true });
-    if (!sameIdentity(before, openedBefore) || openedBefore.size < 1n || openedBefore.size > 65_536n) {
-      throw new TypeError('unsafe session config file');
+    if (!openedBefore.isFile() || openedBefore.nlink !== 1n
+      || (Number(openedBefore.mode) & 0o777) !== 0o600
+      || openedBefore.size < 1n || openedBefore.size > 65_536n) {
+      throw new TypeError('session config must be a regular 0600 file');
     }
     const bytes = readFileSync(descriptor);
+    hooks.afterRead?.(descriptor);
     const openedAfter = fstatSync(descriptor, { bigint: true });
-    if (!sameIdentity(openedBefore, openedAfter) || BigInt(bytes.length) !== openedAfter.size) {
+    if (!sameReadIdentity(openedBefore, openedAfter) || BigInt(bytes.length) !== openedAfter.size) {
       throw new TypeError('session config changed while reading');
     }
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     rejectDuplicateKeys(text);
     const value = JSON.parse(text);
-    const expectedOrder = [
-      'schemaVersion', 'sessionId', 'catalogSha256', 'browserPackage',
-      'browserVersionName', 'browserVersionCode', 'browserApkSetSha256',
-      'browserSignerSha256', 'bindings',
-    ];
-    if (Object.keys(value).join('\0') !== expectedOrder.join('\0')
-      || value.bindings.some((binding) => Object.keys(binding).join('\0')
-        !== 'groupId\0extensionId\0wrapperSignerSha256')
-      || value.bindings.map((binding) => binding.groupId).join('\0')
-        !== [...value.bindings].map((binding) => binding.groupId).sort().join('\0')) {
-      throw new TypeError('session config must use canonical field order');
+    const config = validateSessionConfig(value);
+    if (text !== encodeSessionConfig(config)) {
+      throw new TypeError('session config must use canonical Kotlin bytes');
     }
-    return validateSessionConfig(value);
+    return config;
   } finally {
     closeSync(descriptor);
   }
+}
+
+function encodeSessionConfig(config) {
+  const canonical = {
+    schemaVersion: config.schemaVersion,
+    sessionId: config.sessionId,
+    catalogSha256: config.catalogSha256,
+    browserPackage: config.browserPackage,
+    browserVersionName: config.browserVersionName,
+    browserVersionCode: config.browserVersionCode,
+    browserApkSetSha256: config.browserApkSetSha256,
+    browserSignerSha256: config.browserSignerSha256,
+    bindings: config.bindings.map((binding) => ({
+      groupId: binding.groupId,
+      extensionId: binding.extensionId,
+      wrapperSignerSha256: binding.wrapperSignerSha256,
+      cases: binding.cases.map((descriptor) => ({
+        caseId: descriptor.caseId,
+        namespace: descriptor.namespace,
+        member: descriptor.member,
+        context: descriptor.context,
+        mode: descriptor.mode,
+        expectedOutcome: descriptor.expectedOutcome,
+      })),
+    })),
+  };
+  return `${JSON.stringify(canonical, null, 4)}\n`;
+}
+
+function sameReadIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 function canonicalize(value) {
@@ -368,6 +416,21 @@ function assembleSessionEvidence(bytes, binding, config) {
     results: submission.results.slice().sort((left, right) => String(left?.caseId).localeCompare(String(right?.caseId))),
   }))}\n`;
   if (text !== canonicalSubmission) throw new TypeError('partial evidence must be canonical');
+  const descriptors = new Map(binding.cases.map((descriptor) => [descriptor.caseId, descriptor]));
+  if (submission.results.length !== descriptors.size) {
+    throw new TypeError('partial evidence case coverage mismatch');
+  }
+  const resultIds = new Set();
+  for (const result of submission.results) {
+    const descriptor = descriptors.get(result?.caseId);
+    if (!descriptor || resultIds.has(result.caseId)
+      || result.namespace !== descriptor.namespace || result.member !== descriptor.member
+      || result.context !== descriptor.context || !allowedStatus(descriptor, result.status)) {
+      throw new TypeError('partial evidence case descriptor mismatch');
+    }
+    resultIds.add(result.caseId);
+  }
+  if (resultIds.size !== descriptors.size) throw new TypeError('partial evidence case coverage mismatch');
   const full = {
     schemaVersion: 1,
     sessionId: config.sessionId,
@@ -384,6 +447,15 @@ function assembleSessionEvidence(bytes, binding, config) {
   };
   const canonicalBytes = Buffer.from(`${JSON.stringify(canonicalize(full))}\n`);
   return { bytes: canonicalBytes, evidence: parseEvidence(canonicalBytes, binding.extensionId) };
+}
+
+function allowedStatus(descriptor, status) {
+  if (status === 'ABSENT' || status === 'FAILED' || status === 'RESTRICTED') return true;
+  if (descriptor.mode === 'presence_only' && descriptor.expectedOutcome === 'exposed') {
+    return status === 'EXPOSED';
+  }
+  return (descriptor.mode === 'safe_call' || descriptor.mode === 'safe_call_with_cleanup')
+    && descriptor.expectedOutcome === 'verified' && status === 'VERIFIED';
 }
 
 function corsHeaders(origin) {
@@ -1083,6 +1155,7 @@ export const evidenceReceiverTestHooks = Object.freeze({
   create(options, dependencies) {
     return createEvidenceReceiverInternal(options, normalizedDependencies(dependencies));
   },
+  readSessionConfigFile,
   workerPool(maxActive, maxQueued) {
     if (!Number.isInteger(maxActive) || maxActive < 1 || maxActive > 8
       || !Number.isInteger(maxQueued) || maxQueued < 0 || maxQueued > 64) {

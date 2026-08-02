@@ -11,6 +11,7 @@ import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.session.ProbeSessionConfigJson
+import java.io.IOException
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.nio.file.Files
@@ -48,7 +49,7 @@ class ProbeSessionCommandTest {
 
         assertEquals(0, result.exitCode, result.error)
         assertEquals(6, verified.size)
-        val config = ProbeSessionConfigJson.readStrict(output)
+        val config = ProbeSessionConfigJson.decodeStrict(output.readText())
         assertEquals("20260802-143000", config.sessionId)
         assertEquals(profile.browserPackage, config.browserPackage)
         assertEquals(profile.installationApkSetSha256, config.browserApkSetSha256)
@@ -106,6 +107,45 @@ class ProbeSessionCommandTest {
 
         assertTrue(result.exitCode != 0)
         assertEquals("user-owned", output.readText())
+        assertFalse(Files.list(root).use { entries ->
+            entries.anyMatch { it.fileName.toString().contains(".tmp-") }
+        })
+    }
+
+    @Test
+    fun `parent fsync 실패 후 교체된 경쟁자 output을 보존한다`() = withWorkspace { root ->
+        val profile = profile()
+        val profilePath = root.resolve("profile.json").also { it.writeText(BrowserProfileJson.encode(profile)) }
+        val artifacts = writeArtifacts(root.resolve("artifacts"), profile.canonicalSha256())
+        val output = root.resolve("session.json")
+        val nio = NioProbePublicationFileOps()
+        var publicationFailed = false
+        val publication = object : ProbePublicationFileOps by nio {
+            override fun forceDirectory(path: Path) {
+                if (!publicationFailed) {
+                    publicationFailed = true
+                    throw IOException("injected parent fsync failure")
+                }
+                nio.forceDirectory(path)
+            }
+
+            override fun quarantineAfterFailure(
+                path: Path,
+                expected: ProbePublicationSnapshot,
+            ): ProbeRollbackResult {
+                Files.delete(path)
+                path.writeText("competitor-owned")
+                return nio.quarantineAfterFailure(path, expected)
+            }
+        }
+
+        val result = execute(
+            ProbePrepareSessionCommand(publication, ::verifyFixture),
+            prepareArgs(profilePath, artifacts, output),
+        )
+
+        assertTrue(result.exitCode != 0)
+        assertEquals("competitor-owned", output.readText())
         assertFalse(Files.list(root).use { entries ->
             entries.anyMatch { it.fileName.toString().contains(".tmp-") }
         })

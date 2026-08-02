@@ -12,6 +12,7 @@ import dev.sixbridge.probe.generate.ProbeSourceGenerator
 import dev.sixbridge.probe.profile.CapabilityEvidenceSummary
 import dev.sixbridge.probe.profile.CapabilityProfileBuilder
 import dev.sixbridge.probe.session.ProbeSessionBinding
+import dev.sixbridge.probe.session.ProbeSessionCaseDescriptor
 import dev.sixbridge.probe.session.ProbeSessionConfig
 import dev.sixbridge.probe.session.ProbeSessionConfigJson
 import java.io.IOException
@@ -107,7 +108,12 @@ internal class ProbePrepareSessionCommand(
                 verification.wrapperPackage == descriptor.wrapperPackage &&
                 verification.wrapperVersionCode == descriptor.wrapperVersionCode
             ) { "probe build artifact 검증 결과가 SixBundle descriptor와 일치하지 않습니다: $groupId" }
-            ProbeSessionBinding(groupId, descriptor.extensionId, descriptor.signerSha256)
+            ProbeSessionBinding(
+                groupId = groupId,
+                extensionId = descriptor.extensionId,
+                wrapperSignerSha256 = descriptor.signerSha256,
+                cases = ProbeSessionCaseDescriptor.forGroup(catalog, groupId),
+            )
         }
         val config = ProbeSessionConfig(
             schemaVersion = 1,
@@ -194,22 +200,28 @@ private fun publishNewSessionConfig(
                 java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
             ),
         )
-        publication.writeAndForce(temporary, ProbeSessionConfigJson.encode(config).toByteArray(Charsets.UTF_8))
-        require(ProbeSessionConfigJson.readStrict(temporary) == config) {
-            "probe session config 임시 파일 자기 검증에 실패했습니다."
-        }
+        val encoded = ProbeSessionConfigJson.encode(config).toByteArray(Charsets.UTF_8)
+        val expectedSha256 = MessageDigest.getInstance("SHA-256").digest(encoded)
+            .joinToString("") { "%02x".format(it) }
+        publication.writeAndForce(temporary, encoded)
         require(directoryIdentity(parent) == parentIdentity) {
             "probe session output parent가 생성 중 변경되었습니다."
         }
         movedSnapshot = publication.snapshot(temporary).also { snapshot ->
-            require(snapshot.stable) { "probe session config 임시 파일이 publication 직전 변경되었습니다." }
+            val root = snapshot.entries["."]
+            require(snapshot.stable && snapshot.entries.size == 1 && root?.regularFile == true &&
+                root.size == encoded.size.toLong() && root.sha256 == expectedSha256
+            ) { "probe session config 임시 파일이 publication 직전 변경되었습니다." }
         }
         publication.moveNew(temporary, target)
         publication.forceDirectory(parent)
         require(directoryIdentity(parent) == parentIdentity) {
             "probe session output parent가 publication 중 변경되었습니다."
         }
-        require(ProbeSessionConfigJson.readStrict(target) == config) {
+        val publishedSnapshot = publication.snapshot(target)
+        require(publishedSnapshot.stable &&
+            publishedSnapshot.entries == checkNotNull(movedSnapshot).entries
+        ) {
             "probe session config publication 자기 검증에 실패했습니다."
         }
     } catch (error: Exception) {

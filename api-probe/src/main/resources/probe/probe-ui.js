@@ -90,6 +90,25 @@ export function setEvidenceStatus(status) {
   byId('evidence-status').textContent = `증거 전송: ${String(status)}`;
 }
 
+export function createEvidenceSubmission({ catalogSha256, caseIds, fetchImpl, groupId }) {
+  const retryButton = byId('evidence-retry');
+  let submission;
+  const onStatus = (message, state) => {
+    setEvidenceStatus(message);
+    retryButton.hidden = state !== 'RETRYABLE';
+  };
+  submission = createSubmissionController({
+    catalogSha256,
+    caseIds,
+    ...(fetchImpl ? { fetchImpl } : {}),
+    groupId,
+    onStatus,
+  });
+  retryButton.hidden = true;
+  retryButton.onclick = () => submission.retry();
+  return submission;
+}
+
 function uiFailureToken() {
   return `ui-failure-${Date.now().toString(36).padStart(16, '0')}`.slice(0, 64);
 }
@@ -169,11 +188,10 @@ export async function startProbe() {
     import(`./cases/${String(bundle.groupId)}.js`),
   ]);
   const counts = { ABSENT: 0, EXPOSED: 0, FAILED: 0, NOT_RUN: 0, RESTRICTED: 0, VERIFIED: 0 };
-  const submission = createSubmissionController({
+  const submission = createEvidenceSubmission({
     catalogSha256: bundle.catalogSha256,
     caseIds: bundle.cases.map((testCase) => testCase.id),
     groupId: bundle.groupId,
-    onStatus: setEvidenceStatus,
   });
   const gestureQueue = [];
   setSummary(counts);

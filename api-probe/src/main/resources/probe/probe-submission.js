@@ -51,7 +51,7 @@ export function createSubmissionController({
   async function postFrozen() {
     if (!frozen || submissionState === 'STORED' || submissionState === 'CONFLICT') return submissionState;
     submissionState = 'SENDING';
-    onStatus('전송 중');
+    onStatus('전송 중', submissionState);
     try {
       const response = await fetchImpl(ENDPOINT, {
         body: frozen,
@@ -62,17 +62,17 @@ export function createSubmissionController({
       });
       if (response.status === 200 || response.status === 201) {
         submissionState = 'STORED';
-        onStatus('완료');
+        onStatus('완료', submissionState);
       } else if (response.status === 409) {
         submissionState = 'CONFLICT';
-        onStatus('충돌 · 새 session 필요');
+        onStatus('충돌 · 새 session 필요', submissionState);
       } else {
         submissionState = 'RETRYABLE';
-        onStatus(`실패 · HTTP ${String(response.status)}`);
+        onStatus(`실패 · HTTP ${String(response.status)}`, submissionState);
       }
     } catch (error) {
       submissionState = 'RETRYABLE';
-      onStatus(`실패 · ${String(error?.message ?? error)}`);
+      onStatus(`실패 · ${String(error?.message ?? error)}`, submissionState);
     }
     return submissionState;
   }

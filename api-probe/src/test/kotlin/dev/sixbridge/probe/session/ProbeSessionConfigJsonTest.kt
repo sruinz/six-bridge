@@ -1,15 +1,9 @@
 package dev.sixbridge.probe.session
 
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.Files
-import java.nio.file.attribute.PosixFilePermission
-import kotlin.io.path.createSymbolicLinkPointingTo
-import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ProbeSessionConfigJsonTest {
@@ -54,6 +48,9 @@ class ProbeSessionConfigJsonTest {
     fun `binding은 exact group과 unique extension ID 및 동일 signer를 요구한다`() {
         val base = config()
         assertFailsWith<IllegalArgumentException> {
+            base.copy(bindings = base.bindings.reversed()).validate()
+        }
+        assertFailsWith<IllegalArgumentException> {
             base.copy(bindings = base.bindings.dropLast(1)).validate()
         }
         assertFailsWith<IllegalArgumentException> {
@@ -69,55 +66,60 @@ class ProbeSessionConfigJsonTest {
     }
 
     @Test
+    fun `binding case는 bundled catalog의 group별 descriptor를 정확히 한 번씩 포함한다`() {
+        val base = config()
+        val first = base.bindings.first()
+        assertFailsWith<IllegalArgumentException> {
+            base.copy(bindings = listOf(first.copy(cases = first.cases.dropLast(1))) + base.bindings.drop(1)).validate()
+        }
+        assertFailsWith<IllegalArgumentException> {
+            base.copy(bindings = listOf(first.copy(cases = first.cases + first.cases.first())) + base.bindings.drop(1)).validate()
+        }
+        assertFailsWith<IllegalArgumentException> {
+            val changed = first.cases.first().copy(member = "wrongMember")
+            base.copy(bindings = listOf(first.copy(cases = listOf(changed) + first.cases.drop(1))) + base.bindings.drop(1)).validate()
+        }
+        assertFailsWith<IllegalArgumentException> {
+            base.copy(bindings = listOf(first.copy(cases = first.cases.reversed())) + base.bindings.drop(1)).validate()
+        }
+    }
+
+    @Test
+    fun `case descriptor unknown missing duplicate field를 거부한다`() {
+        val encoded = ProbeSessionConfigJson.encode(config())
+        assertFailsWith<IllegalArgumentException> {
+            ProbeSessionConfigJson.decodeStrict(encoded.replaceFirst(
+                "\"caseId\":",
+                "\"unknown\": true,\n                    \"caseId\":",
+            ))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ProbeSessionConfigJson.decodeStrict(encoded.replaceFirst(
+                Regex("\\s+\\\"expectedOutcome\\\": \\\"[^\\\"]+\\\",?"),
+                "",
+            ))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ProbeSessionConfigJson.decodeStrict(encoded.replaceFirst(
+                "\"caseId\":",
+                "\"caseId\": \"duplicate\", \"caseId\":",
+            ))
+        }
+    }
+
+    @Test
     fun `origin은 extension ID에서만 계산한다`() {
         val binding = config().bindings.first()
         assertEquals("chrome-extension://${binding.extensionId}", binding.origin)
     }
 
-    @Test
-    fun `config는 owner only regular file로 durable no replace publish한다`() = withDirectory { root ->
-        val output = root.resolve("session.json")
-
-        ProbeSessionConfigJson.writeNew(output, config())
-
-        assertEquals(config(), ProbeSessionConfigJson.readStrict(output))
-        assertEquals(
-            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
-            Files.getPosixFilePermissions(output),
-        )
-        val original = output.readText()
-        assertFailsWith<IllegalArgumentException> { ProbeSessionConfigJson.writeNew(output, config()) }
-        assertEquals(original, output.readText())
-        assertFalse(Files.list(root).use { entries -> entries.anyMatch { it.fileName.toString().contains(".tmp-") } })
-    }
-
-    @Test
-    fun `symlink과 0644 config를 거부한다`() = withDirectory { root ->
-        val target = root.resolve("target.json")
-        Files.writeString(target, ProbeSessionConfigJson.encode(config()), UTF_8)
-        Files.setPosixFilePermissions(target, setOf(
-            PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE,
-            PosixFilePermission.GROUP_READ,
-            PosixFilePermission.OTHERS_READ,
-        ))
-        assertFailsWith<IllegalArgumentException> { ProbeSessionConfigJson.readStrict(target) }
-
-        Files.setPosixFilePermissions(target, setOf(
-            PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE,
-        ))
-        val link = root.resolve("link.json")
-        link.createSymbolicLinkPointingTo(target)
-        assertFailsWith<IllegalArgumentException> { ProbeSessionConfigJson.readStrict(link) }
-    }
-
     private fun config(): ProbeSessionConfig {
+        val catalog = catalog()
         val signer = "b".repeat(64)
         return ProbeSessionConfig(
             schemaVersion = 1,
             sessionId = "20260802-143000",
-            catalogSha256 = "a".repeat(64),
+            catalogSha256 = catalog.sha256,
             browserPackage = "com.sec.android.app.sbrowser",
             browserVersionName = "30.0.2.61",
             browserVersionCode = 300020061,
@@ -128,17 +130,28 @@ class ProbeSessionConfigJsonTest {
                     groupId = groupId,
                     extensionId = ('a'.code + index).toChar().toString().repeat(32),
                     wrapperSignerSha256 = signer,
+                    cases = catalog.entries
+                        .filter { it.groupId == groupId }
+                        .flatMap { entry ->
+                            entry.cases.map { case ->
+                                ProbeSessionCaseDescriptor(
+                                    caseId = case.id,
+                                    namespace = entry.namespace,
+                                    member = case.member,
+                                    context = case.context,
+                                    mode = case.mode,
+                                    expectedOutcome = case.expectedOutcome,
+                                )
+                            }
+                        }
+                        .sortedBy(ProbeSessionCaseDescriptor::caseId),
                 )
             },
         ).also(ProbeSessionConfig::validate)
     }
 
-    private fun withDirectory(block: (java.nio.file.Path) -> Unit) {
-        val root = Files.createTempDirectory("probe-session-test-")
-        try {
-            block(root)
-        } finally {
-            Files.walk(root).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists) }
-        }
-    }
+    private fun catalog(): ApiProbeCatalog = ApiProbeCatalog.load(
+        checkNotNull(javaClass.getResourceAsStream("/catalog/sbrowser-30-public-apis.json")),
+    )
+
 }
