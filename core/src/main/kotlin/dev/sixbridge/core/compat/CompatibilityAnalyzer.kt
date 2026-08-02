@@ -44,10 +44,11 @@ class CompatibilityAnalyzer(
         profile: BrowserProfile,
         sourceSha256: String?,
         ledger: AnalysisBudgetLedger = AnalysisBudgetLedger(control.policy),
+        emitFinalizingStage: Boolean = true,
     ): CompatibilityReport {
         profile.validate()
         val report = analyzeUnsealed(extensionRoot, profile, ledger)
-        control.stage(AnalysisStage.FINALIZING)
+        if (emitFinalizingStage) control.stage(AnalysisStage.FINALIZING)
         return report.copy(
             sourceSha256 = sourceSha256,
             browserProfileSha256 = profile.canonicalSha256(),

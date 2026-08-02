@@ -71,12 +71,14 @@ class RuntimeResourceIndex private constructor(
             manifest: JsonObject,
             control: AnalysisControl,
             ledger: AnalysisBudgetLedger,
+            emitStage: Boolean = true,
         ): RuntimeResourceIndex = create(
             root,
             manifest,
             control,
             Files::readString,
             ledger,
+            emitStage,
         )
 
         private fun create(
@@ -85,8 +87,9 @@ class RuntimeResourceIndex private constructor(
             control: AnalysisControl,
             readSource: (Path) -> String,
             ledger: AnalysisBudgetLedger,
+            emitStage: Boolean = true,
         ): RuntimeResourceIndex {
-            control.stage(AnalysisStage.RUNTIME_CLOSURE)
+            if (emitStage) control.stage(AnalysisStage.RUNTIME_CLOSURE)
             val normalizedRoot = root.toAbsolutePath().normalize()
             val realRoot = runCatching { normalizedRoot.toRealPath() }.getOrNull()
                 ?: return RuntimeResourceIndex(

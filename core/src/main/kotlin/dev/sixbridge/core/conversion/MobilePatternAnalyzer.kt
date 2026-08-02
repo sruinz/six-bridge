@@ -101,6 +101,16 @@ class MobilePatternAnalyzer private constructor(
         }
     }
 
+    @JvmSynthetic
+    internal fun analyzeStableForTesting(
+        extensionRoot: Path,
+        profile: BrowserProfile,
+    ): CompatibilityReport = analyzeStable(
+        extensionRoot,
+        profile,
+        sourceSha256 = null,
+    )
+
     private fun analyzeStable(
         extensionRoot: Path,
         profile: BrowserProfile,
@@ -113,6 +123,7 @@ class MobilePatternAnalyzer private constructor(
             profile,
             sourceSha256,
             ledger,
+            emitFinalizingStage = false,
         )
         control.checkCancelled()
         val manifestPath = extensionRoot.resolve("manifest.json")
@@ -127,36 +138,42 @@ class MobilePatternAnalyzer private constructor(
                 invalidExistingOptionPageDecision(manifestPath, it, profile)
             }
             if (invalidOptionPage != null) {
-                control.stage(AnalysisStage.FINALIZING)
-                return compatibility.copy(
-                    conversionState = ConversionState.UNAVAILABLE,
-                    adapterDecisions = listOf(invalidOptionPage),
+                return finalizeReport(
+                    compatibility.copy(
+                        conversionState = ConversionState.UNAVAILABLE,
+                        adapterDecisions = listOf(invalidOptionPage),
+                    ),
                 )
             }
-            control.stage(AnalysisStage.FINALIZING)
-            return compatibility
+            return finalizeReport(compatibility)
         }
-        manifest ?: return compatibility
+        manifest ?: return finalizeReport(compatibility)
         control.checkCancelled()
         val index = try {
-            RuntimeResourceIndex.create(extensionRoot, manifest, control, ledger)
+            RuntimeResourceIndex.create(
+                extensionRoot,
+                manifest,
+                control,
+                ledger,
+                emitStage = false,
+            )
         } catch (error: AnalysisBudgetExceededException) {
-            control.stage(AnalysisStage.FINALIZING)
-            return analysisBudgetExceededReport(
-                error.exceeded,
-                compatibility.manifestVersion,
-                compatibility.extensionName,
-                compatibility.extensionVersion,
-                compatibility.declaredPermissions,
-            ).copy(
-                sourceSha256 = sourceSha256,
-                browserProfileSha256 = profile.canonicalSha256(),
-            ).also(CompatibilityReport::validate)
+            return finalizeReport(
+                analysisBudgetExceededReport(
+                    error.exceeded,
+                    compatibility.manifestVersion,
+                    compatibility.extensionName,
+                    compatibility.extensionVersion,
+                    compatibility.declaredPermissions,
+                ).copy(
+                    sourceSha256 = sourceSha256,
+                    browserProfileSha256 = profile.canonicalSha256(),
+                ).also(CompatibilityReport::validate),
+            )
         }
         control.checkCancelled()
         if (index.unresolvedDependency) {
-            control.stage(AnalysisStage.FINALIZING)
-            return compatibility
+            return finalizeReport(compatibility)
         }
 
         control.stage(AnalysisStage.MOBILE_PATTERNS)
@@ -180,36 +197,51 @@ class MobilePatternAnalyzer private constructor(
         val sortedDecisions = decisions.sortedWith(
             compareBy(AdapterDecision::id, AdapterDecision::version),
         )
-        control.stage(AnalysisStage.FINALIZING)
-        return compatibility.copy(
-            issues = issues,
-            conversionState = conversionState(sortedDecisions),
-            adapterDecisions = sortedDecisions,
+        return finalizeReport(
+            compatibility.copy(
+                issues = issues,
+                conversionState = conversionState(sortedDecisions),
+                adapterDecisions = sortedDecisions,
+            ),
         )
+    }
+
+    private fun finalizeReport(report: CompatibilityReport): CompatibilityReport {
+        control.checkCancelled()
+        control.stage(AnalysisStage.FINALIZING)
+        return report
     }
 
     private fun selectionDecision(
         index: RuntimeResourceIndex,
     ): AdapterDecision? {
         val scripts = index.scripts.filter {
+            control.checkCancelled()
             RuntimeResourceIndex.ResourceRole.CONTENT_SCRIPT in it.roles
         }
         val mouseEvidence = scripts.firstNotNullOfOrNull { script ->
+            control.checkCancelled()
             eventEvidence(script, MOUSEUP_LISTENER, "정적인 mouseup 선택 listener")
         } ?: return null
         val usesSelection = scripts.any { script ->
+            control.checkCancelled()
             GET_SELECTION.containsMatchIn(codeOnly(script.source))
         }
         if (!usesSelection) return null
         val handlesMobileInput = scripts.any { script ->
+            control.checkCancelled()
             listOf(POINTERUP_LISTENER, TOUCHEND_LISTENER, SELECTIONCHANGE_LISTENER)
-                .any { event -> eventInCode(script.source, event) != null }
+                .any { event ->
+                    control.checkCancelled()
+                    eventInCode(script.source, event) != null
+                }
         }
         if (handlesMobileInput) return null
 
-        val unsafeEvidence = scripts.firstNotNullOfOrNull(
-            ::sensitiveMouseEventEvidence,
-        )
+        val unsafeEvidence = scripts.firstNotNullOfOrNull { script ->
+            control.checkCancelled()
+            sensitiveMouseEventEvidence(script)
+        }
         val unavailable = unsafeEvidence != null
         return AdapterDecision(
             id = DESKTOP_SELECTION_EVENT_BRIDGE,
@@ -425,16 +457,24 @@ class MobilePatternAnalyzer private constructor(
         index: RuntimeResourceIndex,
         profile: BrowserProfile,
     ): StorageDecision {
-        val rewriter = JavaScriptTokenRewriter()
+        val rewriter = JavaScriptTokenRewriter(control::checkCancelled)
         val safeEvidence = mutableListOf<SourceEvidence>()
         val unsafeEvidence = mutableListOf<SourceEvidence>()
         val convertedSources = mutableMapOf<String, String>()
         val inspected = index.scripts
-            .map { script -> script to rewriter.inspect(script.source) }
-        if (inspected.none { (_, inspection) -> inspection.storageIntent }) {
+            .map { script ->
+                control.checkCancelled()
+                script to rewriter.inspect(script.source)
+            }
+        if (inspected.none { (_, inspection) ->
+                control.checkCancelled()
+                inspection.storageIntent
+            }
+        ) {
             return StorageDecision()
         }
         inspected.forEach { (script, inspection) ->
+            control.checkCancelled()
             val rewrite = rewriter.rewrite(script.source)
             if (isStandaloneJavaScript(script.relativePath)) {
                 if (inspection.unsafeAccesses.isEmpty() &&
@@ -443,6 +483,7 @@ class MobilePatternAnalyzer private constructor(
                     convertedSources[script.relativePath] = rewrite.source
                 }
                 safeEvidence += inspection.syncAccesses.map { access ->
+                    control.checkCancelled()
                     SourceEvidence(
                         relativePath = script.relativePath,
                         line = script.lineOffset + access.line,
@@ -455,6 +496,7 @@ class MobilePatternAnalyzer private constructor(
                 }
             } else {
                 unsafeEvidence += inspection.syncAccesses.map { access ->
+                    control.checkCancelled()
                     SourceEvidence(
                         relativePath = script.relativePath,
                         line = script.lineOffset + access.line,
@@ -463,6 +505,7 @@ class MobilePatternAnalyzer private constructor(
                 }
             }
             unsafeEvidence += inspection.unsafeAccesses.map { access ->
+                control.checkCancelled()
                 SourceEvidence(
                     relativePath = script.relativePath,
                     line = script.lineOffset + access.line,
@@ -577,13 +620,16 @@ class MobilePatternAnalyzer private constructor(
         val sourceWithoutComments = JavaScriptLexicalMask.mask(
             script.source,
             maskLiterals = false,
+            checkCancelled = control::checkCancelled,
         )
         val codeOnly = codeOnly(script.source)
         MOUSEUP_LISTENER.findAll(sourceWithoutComments)
             .filter {
+                control.checkCancelled()
                 codeOnly.getOrNull(it.range.first)?.isJavaIdentifierStart() == true
             }
             .forEach { listener ->
+                control.checkCancelled()
                 val callback = readCallbackBody(
                     codeOnly,
                     listener.range.last + 1,
@@ -592,8 +638,10 @@ class MobilePatternAnalyzer private constructor(
                     listener.range.first,
                     "mouseup callback을 정적으로 해석할 수 없음",
                 )
+                control.checkCancelled()
                 val member = eventMemberRegex(callback.parameter)
                     .find(codeOnly, callback.bodyStart)
+                    .also { control.checkCancelled() }
                     ?.takeIf { it.range.first < callback.bodyEnd }
                     ?: return@forEach
                 return evidence(
@@ -650,9 +698,11 @@ class MobilePatternAnalyzer private constructor(
         codeOnly: String,
         name: String,
     ): CallbackBody? {
+        control.checkCancelled()
         val declaration = Regex(
             """\bfunction\s+${Regex.escape(name)}\s*\(""",
         ).find(codeOnly) ?: return null
+        control.checkCancelled()
         return readFunctionCallback(
             codeOnly,
             declaration.range.first + "function".length,
@@ -711,6 +761,7 @@ class MobilePatternAnalyzer private constructor(
         var brackets = 0
         var braces = 0
         for (index in start until source.length) {
+            checkLoop(index, start)
             when (source[index]) {
                 '(' -> parentheses++
                 ')' -> if (parentheses == 0 && brackets == 0 && braces == 0) {
@@ -753,6 +804,7 @@ class MobilePatternAnalyzer private constructor(
     ): Int? {
         var depth = 0
         for (index in start until source.length) {
+            checkLoop(index, start)
             when (source[index]) {
                 opening -> depth++
                 closing -> {
@@ -772,13 +824,19 @@ class MobilePatternAnalyzer private constructor(
 
     private fun readIdentifierEnd(source: String, start: Int): Int {
         var cursor = start + 1
-        while (source.getOrNull(cursor)?.isJavaIdentifierPart() == true) cursor++
+        while (source.getOrNull(cursor)?.isJavaIdentifierPart() == true) {
+            checkLoop(cursor, start)
+            cursor++
+        }
         return cursor
     }
 
     private fun skipWhitespace(source: String, start: Int): Int {
         var cursor = start
-        while (source.getOrNull(cursor)?.isWhitespace() == true) cursor++
+        while (source.getOrNull(cursor)?.isWhitespace() == true) {
+            checkLoop(cursor, start)
+            cursor++
+        }
         return cursor
     }
 
@@ -786,16 +844,24 @@ class MobilePatternAnalyzer private constructor(
         val sourceWithoutComments = JavaScriptLexicalMask.mask(
             source,
             maskLiterals = false,
+            checkCancelled = control::checkCancelled,
         )
         val codeOnly = codeOnly(source)
         return event.findAll(sourceWithoutComments)
-            .firstOrNull { codeOnly.getOrNull(it.range.first)?.isJavaIdentifierStart() == true }
+            .firstOrNull {
+                control.checkCancelled()
+                codeOnly.getOrNull(it.range.first)?.isJavaIdentifierStart() == true
+            }
             ?.range
             ?.first
     }
 
     private fun codeOnly(source: String): String =
-        JavaScriptLexicalMask.mask(source, maskLiterals = true)
+        JavaScriptLexicalMask.mask(
+            source,
+            maskLiterals = true,
+            checkCancelled = control::checkCancelled,
+        )
 
     private fun evidence(
         script: RuntimeResourceIndex.RuntimeScript,
@@ -807,8 +873,21 @@ class MobilePatternAnalyzer private constructor(
         detail = detail,
     )
 
-    private fun lineAt(source: String, offset: Int): Int =
-        source.substring(0, offset.coerceIn(0, source.length)).count { it == '\n' } + 1
+    private fun lineAt(source: String, offset: Int): Int {
+        var lines = 1
+        val end = offset.coerceIn(0, source.length)
+        for (index in 0 until end) {
+            checkLoop(index, 0)
+            if (source[index] == '\n') lines++
+        }
+        return lines
+    }
+
+    private fun checkLoop(position: Int, start: Int) {
+        if ((position - start) % CHECKPOINT_INTERVAL == 0) {
+            control.checkCancelled()
+        }
+    }
 
     private fun conversionState(decisions: List<AdapterDecision>): ConversionState =
         when {
@@ -872,6 +951,7 @@ class MobilePatternAnalyzer private constructor(
             "extension.options-page.user-accessible"
         private const val STORAGE_LOCAL_FEATURE = "storage.local"
         private const val STORAGE_SYNC_FEATURE = "storage.sync"
+        private const val CHECKPOINT_INTERVAL = 16_384
 
         private val MOUSEUP_LISTENER = eventListenerRegex("mouseup")
         private val POINTERUP_LISTENER = eventListenerRegex("pointerup")

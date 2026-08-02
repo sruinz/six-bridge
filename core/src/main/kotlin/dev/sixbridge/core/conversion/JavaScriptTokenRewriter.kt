@@ -3,9 +3,13 @@ package dev.sixbridge.core.conversion
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import java.security.MessageDigest
 
-class JavaScriptTokenRewriter {
+class JavaScriptTokenRewriter(
+    private val checkCancelled: () -> Unit = {},
+) {
     fun rewrite(source: String): RewriteResult {
+        checkCancelled()
         val inspection = inspect(source)
+        checkCancelled()
         if (inspection.unsafeAccesses.isNotEmpty()) {
             return RewriteResult(
                 source = source,
@@ -18,6 +22,7 @@ class JavaScriptTokenRewriter {
         inspection.syncAccesses
             .sortedByDescending(StaticStorageAccess::areaStart)
             .forEach { access ->
+                checkCancelled()
                 rewritten.replace(
                     access.areaStart,
                     access.areaEndExclusive,
@@ -33,11 +38,18 @@ class JavaScriptTokenRewriter {
     }
 
     internal fun inspect(source: String): StorageTokenInspection {
-        val codeOnly = JavaScriptLexicalMask.mask(source, maskLiterals = true)
+        checkCancelled()
+        val codeOnly = JavaScriptLexicalMask.mask(
+            source,
+            maskLiterals = true,
+            checkCancelled = checkCancelled,
+        )
         val sourceWithoutComments = JavaScriptLexicalMask.mask(
             source,
             maskLiterals = false,
+            checkCancelled = checkCancelled,
         )
+        checkCancelled()
         val scan = scanRootMembers(source, codeOnly)
         val hazards = environmentHazards(
             source,
@@ -78,6 +90,7 @@ class JavaScriptTokenRewriter {
         val unsafe = mutableListOf<UnsafeStorageAccess>()
         val recognized = mutableSetOf<Int>()
         ROOT_IDENTIFIER.findAll(codeOnly).forEach { rootMatch ->
+            checkCancelled()
             val rootStart = rootMatch.range.first
             if (codeOnly.getOrNull(rootStart - 1)?.let(::isIdentifierPart) == true) {
                 return@forEach
@@ -160,12 +173,15 @@ class JavaScriptTokenRewriter {
         recognizedRootStarts: Set<Int>,
     ): List<UnsafeStorageAccess> = buildList {
         EVAL_IDENTIFIER.findAll(codeOnly).forEach { match ->
+            checkCancelled()
             add(unsafe(source, match.range.first, "eval 실행 환경은 자동 변환할 수 없습니다."))
         }
         WITH_STATEMENT.findAll(codeOnly).forEach { match ->
+            checkCancelled()
             add(unsafe(source, match.range.first, "with 실행 환경은 자동 변환할 수 없습니다."))
         }
         GLOBAL_ROOT_IDENTIFIER.findAll(codeOnly).forEach { match ->
+            checkCancelled()
             add(
                 unsafe(
                     source,
@@ -175,6 +191,7 @@ class JavaScriptTokenRewriter {
             )
         }
         ROOT_IDENTIFIER.findAll(codeOnly).forEach { match ->
+            checkCancelled()
             val start = match.range.first
             if (codeOnly.getOrNull(start - 1)?.let(::isIdentifierPart) == true ||
                 start in recognizedRootStarts ||
@@ -263,6 +280,7 @@ class JavaScriptTokenRewriter {
         val withoutComments = JavaScriptLexicalMask.mask(
             expression,
             maskLiterals = false,
+            checkCancelled = checkCancelled,
         ).trim()
         val quoted = COMPUTED_STRING.matchEntire(withoutComments)
         if (quoted != null) return quoted.groupValues[2]
@@ -274,6 +292,7 @@ class JavaScriptTokenRewriter {
     private fun matchingBracket(source: String, opening: Int): Int? {
         var depth = 0
         for (index in opening until source.length) {
+            checkLoop(index, opening)
             when (source[index]) {
                 '[' -> depth++
                 ']' -> {
@@ -324,13 +343,19 @@ class JavaScriptTokenRewriter {
     private fun readIdentifier(source: String, start: Int): Pair<String, Int>? {
         if (source.getOrNull(start)?.isJavaIdentifierStart() != true) return null
         var end = start + 1
-        while (source.getOrNull(end)?.isJavaIdentifierPart() == true) end++
+        while (source.getOrNull(end)?.isJavaIdentifierPart() == true) {
+            checkLoop(end, start)
+            end++
+        }
         return source.substring(start, end) to end
     }
 
     private fun previousNonWhitespace(source: String, start: Int): Char? {
         var cursor = start - 1
-        while (cursor >= 0 && source[cursor].isWhitespace()) cursor--
+        while (cursor >= 0 && source[cursor].isWhitespace()) {
+            checkLoop(start - cursor, 0)
+            cursor--
+        }
         return source.getOrNull(cursor)
     }
 
@@ -339,18 +364,32 @@ class JavaScriptTokenRewriter {
 
     private fun skipWhitespace(source: String, start: Int): Int {
         var cursor = start
-        while (source.getOrNull(cursor)?.isWhitespace() == true) cursor++
+        while (source.getOrNull(cursor)?.isWhitespace() == true) {
+            checkLoop(cursor, start)
+            cursor++
+        }
         return cursor
     }
 
-    private fun lineAt(source: String, offset: Int): Int =
-        source.substring(0, offset.coerceIn(0, source.length))
-            .count { it == '\n' } + 1
+    private fun lineAt(source: String, offset: Int): Int {
+        var lines = 1
+        val end = offset.coerceIn(0, source.length)
+        for (index in 0 until end) {
+            checkLoop(index, 0)
+            if (source[index] == '\n') lines++
+        }
+        return lines
+    }
+
+    private fun checkLoop(position: Int, start: Int) {
+        if ((position - start) % CHECKPOINT_INTERVAL == 0) checkCancelled()
+    }
 
     private companion object {
         const val STORAGE = "storage"
         const val SYNC = "sync"
         const val LOCAL = "local"
+        const val CHECKPOINT_INTERVAL = 16_384
         val ROOT_NAMES = setOf("chrome", "browser")
         val ROOT_IDENTIFIER = Regex("""\b(?:chrome|browser)\b""")
         val EVAL_IDENTIFIER = Regex("""\beval\b""")
