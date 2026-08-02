@@ -89,6 +89,21 @@ sixbridge analyze \
   --output .local/test-output/desktop-mobile-before.json
 ```
 
+Bitwarden·Tampermonkey 같은 대형 실제 CRX는 데스크톱 CLI를 설치한 뒤
+입력별 300초 제한으로 선택 검증한다.
+
+```sh
+./gradlew :cli:installDist
+./scripts/desktop-large-extension-analysis.sh \
+  --profile profiles/sbrowser-30.0.2.61.json \
+  --input /absolute/path/to/tampermonkey.crx \
+  --input /absolute/path/to/bitwarden.crx
+```
+
+실제 CRX는 저장소 밖의 절대경로에 두고 사용한다. CRX를 이 저장소로
+복사하거나 Git에 추가·커밋하지 않는다. 각 출력 행은 상태, 경과
+밀리초, 확장 이름, 검증된 CRX ID, 사용 API 수를 JSON으로 보고한다.
+
 데스크톱과 Android 관리자 사이에 전달할 서명된 `SixDraft`를 만든다. 다음
 예시는 action popup을 모바일 탭 진입점으로 바꾸는 동작을 승인한다.
 
