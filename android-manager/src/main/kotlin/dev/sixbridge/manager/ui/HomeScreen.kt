@@ -31,8 +31,6 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.manager.R
-import java.text.BreakIterator
-import java.util.Locale
 import java.util.concurrent.CancellationException
 
 @Composable
@@ -260,9 +258,7 @@ internal inline fun <T> decodeIconOrNull(decode: () -> T?): T? = try {
 internal fun firstGraphemeOrQuestionMark(name: String): String {
     val trimmed = name.trim()
     if (trimmed.isEmpty()) return "?"
-    val boundaries = BreakIterator.getCharacterInstance(Locale.ROOT).apply {
-        setText(trimmed)
-    }
-    val end = boundaries.next()
-    return if (end == BreakIterator.DONE || end <= 0) "?" else trimmed.substring(0, end)
+    return FIRST_GRAPHEME.find(trimmed)?.value ?: "?"
 }
+
+private val FIRST_GRAPHEME = Regex("\\X")

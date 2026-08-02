@@ -4,6 +4,7 @@ import android.util.Log
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.core.input.ChromeWebStoreAddress
+import java.io.ByteArrayInputStream
 import java.io.Closeable
 import java.io.InputStream
 import java.io.OutputStream
@@ -485,7 +486,7 @@ internal class HttpsChromeDownloadTransport(
                 val body = if (statusCode in 200..399) {
                     opened.inputStream
                 } else {
-                    opened.errorStream ?: InputStream.nullInputStream()
+                    opened.errorStream ?: ByteArrayInputStream(ByteArray(0))
                 }
                 val response = ChromeDownloadResponse(
                     statusCode = statusCode,
