@@ -117,25 +117,27 @@ clear_active_process() {
 }
 
 terminate_active_process() {
-  local deadline pid pgid
+  local attempts max_attempts pid pgid
   pid=$active_pid
   pgid=$active_pgid
   [ -n "$pid" ] || return 0
+  attempts=0
+  max_attempts=$((term_grace_seconds * 10))
 
   if safe_owned_group; then
     /bin/kill -TERM -- "-$pgid" 2>/dev/null || true
-    deadline=$((SECONDS + term_grace_seconds))
-    while active_group_alive && [ "$SECONDS" -lt "$deadline" ]; do
+    while active_group_alive && [ "$attempts" -lt "$max_attempts" ]; do
       sleep 0.1
+      attempts=$((attempts + 1))
     done
     if active_group_alive; then
       /bin/kill -KILL -- "-$pgid" 2>/dev/null || true
     fi
   else
     /bin/kill -TERM "$pid" 2>/dev/null || true
-    deadline=$((SECONDS + term_grace_seconds))
-    while /bin/kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+    while /bin/kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt "$max_attempts" ]; do
       sleep 0.1
+      attempts=$((attempts + 1))
     done
     if /bin/kill -0 "$pid" 2>/dev/null; then
       /bin/kill -KILL "$pid" 2>/dev/null || true
@@ -166,7 +168,8 @@ trap 'handle_signal 143' TERM
 trap cleanup_runner EXIT
 
 run_with_deadline() {
-  local deadline go marker_pid marker_pgid marker_rest pid process_exit ready setup_deadline
+  local go marker_pid marker_pgid marker_rest pid process_exit ready
+  local setup_attempts timeout_attempts timeout_max_attempts
   group_sequence=$((group_sequence + 1))
   ready="$run_dir/group-$group_sequence.ready"
   go="$run_dir/group-$group_sequence.go"
@@ -188,7 +191,7 @@ run_with_deadline() {
   active_pid=$pid
   active_pgid=
   active_group_owned=0
-  setup_deadline=$((SECONDS + 5))
+  setup_attempts=0
 
   while [ ! -s "$ready" ]; do
     if ! /bin/kill -0 "$pid" 2>/dev/null; then
@@ -197,11 +200,12 @@ run_with_deadline() {
       clear_active_process
       return "$process_exit"
     fi
-    if [ "$SECONDS" -ge "$setup_deadline" ]; then
+    if [ "$setup_attempts" -ge 500 ]; then
       terminate_active_process
       return 125
     fi
     sleep 0.01
+    setup_attempts=$((setup_attempts + 1))
   done
 
   IFS=' ' read -r marker_pid marker_pgid marker_rest <"$ready"
@@ -216,14 +220,16 @@ run_with_deadline() {
   active_pgid=$marker_pgid
   active_group_owned=1
   : >"$go"
-  deadline=$((SECONDS + timeout_seconds))
+  timeout_attempts=0
+  timeout_max_attempts=$((timeout_seconds * 10))
 
   while /bin/kill -0 "$pid" 2>/dev/null; do
-    if [ "$SECONDS" -ge "$deadline" ]; then
+    if [ "$timeout_attempts" -ge "$timeout_max_attempts" ]; then
       terminate_active_process
       return 124
     fi
     sleep 0.1
+    timeout_attempts=$((timeout_attempts + 1))
   done
 
   wait "$pid"
@@ -279,7 +285,7 @@ for input in "${inputs[@]}"; do
       (.status | type) == "string" and
       (.status == "compatible" or .status == "partial" or
        .status == "unknown" or .status == "blocked") and
-      has("extensionName") and (.extensionName | type) == "string" and
+      ((has("extensionName") | not) or (.extensionName | type) == "string") and
       has("originalExtensionId") and
       (.originalExtensionId | type) == "string" and
       (.originalExtensionId | test("^[a-p]{32}$")) and
@@ -289,7 +295,7 @@ for input in "${inputs[@]}"; do
       input: $input,
       status: (.status | ascii_upcase),
       elapsedMs: $elapsed,
-      extensionName: .extensionName,
+      extensionName: (.extensionName // null),
       verifiedExtensionId: .originalExtensionId,
       usedApiCount: (.usedApis | length)
     }

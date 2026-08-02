@@ -72,7 +72,12 @@ JSON
 }
 
 run_with_child() {
-  trap '' HUP INT TERM
+  record_term() {
+    /usr/bin/perl -MTime::HiRes=time -e 'printf "%.6f\n", time' \
+      >"$SIXBRIDGE_TEST_TERM_MARKER"
+  }
+  trap '' HUP INT
+  trap record_term TERM
   printf '%s\n' "$$" >"$SIXBRIDGE_TEST_LEADER_PID_FILE"
   /bin/sh -c 'trap "" HUP INT TERM; while :; do sleep 1; done' &
   child=$!
@@ -94,6 +99,18 @@ case "$(basename -- "$input")" in
   unknown.crx)
     write_report unknown 'Unknown Fake' \
       cccccccccccccccccccccccccccccccc '[]'
+    exit 2
+    ;;
+  unknown-no-name.crx|blocked-no-name.crx)
+    status=${input##*/}
+    status=${status%%-*}
+    write_report "$status" Ignored dddddddddddddddddddddddddddddddd '[]'
+    jq 'del(.extensionName)' "$output" >"$output.tmp" && mv "$output.tmp" "$output"
+    exit 2
+    ;;
+  null-name.crx)
+    write_report unknown Ignored dddddddddddddddddddddddddddddddd '[]'
+    jq '.extensionName = null' "$output" >"$output.tmp" && mv "$output.tmp" "$output"
     exit 2
     ;;
   timeout.crx|signal.crx)
@@ -141,8 +158,9 @@ esac
 EOF
 chmod +x "$fixture/bin/sixbridge"
 
-for name in compatible partial unknown timeout signal missing-id invalid-api \
-  multiple-json malformed wrong-schema invalid-status invalid-name invalid-id; do
+for name in compatible partial unknown unknown-no-name blocked-no-name null-name \
+  timeout signal missing-id invalid-api multiple-json malformed wrong-schema \
+  invalid-status invalid-name invalid-id; do
   printf 'fixture\n' >"$fixture/inputs/$name.crx"
 done
 
@@ -151,6 +169,7 @@ run_runner() {
     SIXBRIDGE_TEST_CLI_LOG="$cli_log" \
     SIXBRIDGE_TEST_CHILD_PID_FILE="${SIXBRIDGE_TEST_CHILD_PID_FILE:-$fixture/default-child.pid}" \
     SIXBRIDGE_TEST_LEADER_PID_FILE="${SIXBRIDGE_TEST_LEADER_PID_FILE:-$fixture/default-leader.pid}" \
+    SIXBRIDGE_TEST_TERM_MARKER="${SIXBRIDGE_TEST_TERM_MARKER:-$fixture/default-term.marker}" \
     SIXBRIDGE_ANALYSIS_TIMEOUT_SECONDS=1 \
     SIXBRIDGE_ANALYSIS_TERM_GRACE_SECONDS=1 \
     "$runner" "$@"
@@ -177,6 +196,21 @@ assert_process_dead() {
     printf 'analysis descendant remained alive: %s\n' "$pid" >&2
     return 1
   fi
+}
+
+now_high_resolution() {
+  /usr/bin/perl -MTime::HiRes=time -e 'printf "%.6f\n", time'
+}
+
+assert_minimum_grace() {
+  started=$1
+  finished=$2
+  /usr/bin/perl -e '
+    my ($started, $finished) = @ARGV;
+    my $elapsed = $finished - $started;
+    die "TERM grace was ${elapsed}s, expected at least 1.0s\n"
+      if $elapsed < 1.0;
+  ' "$started" "$finished"
 }
 
 success_output=$(run_runner \
@@ -207,21 +241,43 @@ printf '%s\n' "$unknown_output" | jq -e '
 ' >/dev/null
 
 if [ "${SIXBRIDGE_TEST_CASE:-all}" = all ] ||
+  [ "${SIXBRIDGE_TEST_CASE:-all}" = nullable_name ]; then
+  for name in unknown-no-name blocked-no-name; do
+    set +e
+    no_name_output=$(run_runner --profile "$profile" \
+      --input "$fixture/inputs/$name.crx" 2>"$fixture/$name.err")
+    no_name_exit=$?
+    set -e
+    [ "$no_name_exit" -eq 2 ]
+    printf '%s\n' "$no_name_output" | jq -e '
+      (.status == "UNKNOWN" or .status == "BLOCKED") and
+      .extensionName == null and
+      .verifiedExtensionId == "dddddddddddddddddddddddddddddddd"
+    ' >/dev/null
+  done
+fi
+
+if [ "${SIXBRIDGE_TEST_CASE:-all}" = all ] ||
   [ "${SIXBRIDGE_TEST_CASE:-all}" = timeout_cleanup ]; then
   timeout_child="$fixture/timeout-child.pid"
   timeout_leader="$fixture/timeout-leader.pid"
+  timeout_term_marker="$fixture/timeout-term.marker"
   set +e
   timeout_output=$(SIXBRIDGE_TEST_CHILD_PID_FILE="$timeout_child" \
-    SIXBRIDGE_TEST_LEADER_PID_FILE="$timeout_leader" run_runner \
+    SIXBRIDGE_TEST_LEADER_PID_FILE="$timeout_leader" \
+    SIXBRIDGE_TEST_TERM_MARKER="$timeout_term_marker" run_runner \
     --profile "$profile" \
     --input "$fixture/inputs/timeout.crx" 2>"$fixture/timeout.err")
   timeout_exit=$?
+  timeout_finished=$(now_high_resolution)
   set -e
   [ "$timeout_exit" -eq 3 ]
   printf '%s\n' "$timeout_output" | jq -e '
     .result == "TIMEOUT" and (.elapsedMs | type) == "number"
   ' >/dev/null
   wait_for_file "$timeout_child"
+  wait_for_file "$timeout_term_marker"
+  assert_minimum_grace "$(cat "$timeout_term_marker")" "$timeout_finished"
   assert_process_dead "$(cat "$timeout_child")"
 fi
 
@@ -233,6 +289,7 @@ if [ "${SIXBRIDGE_TEST_CASE:-all}" = all ] ||
     SIXBRIDGE_TEST_CLI_LOG="$cli_log" \
     SIXBRIDGE_TEST_CHILD_PID_FILE="$signal_child" \
     SIXBRIDGE_TEST_LEADER_PID_FILE="$signal_leader" \
+    SIXBRIDGE_TEST_TERM_MARKER="$fixture/signal-term.marker" \
     SIXBRIDGE_ANALYSIS_TIMEOUT_SECONDS=30 \
     SIXBRIDGE_ANALYSIS_TERM_GRACE_SECONDS=1 \
     "$runner" --profile "$profile" --input "$fixture/inputs/signal.crx" \
@@ -244,9 +301,12 @@ if [ "${SIXBRIDGE_TEST_CASE:-all}" = all ] ||
   set +e
   wait "$signal_runner"
   signal_exit=$?
+  signal_finished=$(now_high_resolution)
   set -e
   rm -f "$fixture/signal-runner.pid"
   [ "$signal_exit" -eq 143 ]
+  wait_for_file "$fixture/signal-term.marker"
+  assert_minimum_grace "$(cat "$fixture/signal-term.marker")" "$signal_finished"
   assert_process_dead "$(cat "$signal_child")"
 fi
 
@@ -254,7 +314,7 @@ if [ "${SIXBRIDGE_TEST_CASE:-all}" = all ] ||
   [ "${SIXBRIDGE_TEST_CASE:-all}" = strict_json ]; then
   strict_failures=0
   for name in missing-id invalid-api multiple-json malformed wrong-schema \
-    invalid-status invalid-name invalid-id; do
+    invalid-status invalid-name invalid-id null-name; do
     set +e
     run_runner --profile "$profile" --input "$fixture/inputs/$name.crx" \
       >"$fixture/$name.out" 2>"$fixture/$name.err"
