@@ -55,6 +55,13 @@ data class AnalyzedConversion(
     val logicalSourceIdentity: LogicalSourceIdentityResult,
 )
 
+internal fun retainAnalyzedOriginalExtensionId(
+    report: CompatibilityReport,
+    proofExtensionId: String?,
+): CompatibilityReport = report.copy(
+    originalExtensionId = proofExtensionId ?: report.manifestKeyExtensionId,
+).also(CompatibilityReport::validate)
+
 class ConversionPreparationEngine private constructor(
     private val compatibilityAnalyzer: CompatibilityAnalyzer,
     private val tempTreeFactory: ConversionTempTreeFactory,
@@ -86,10 +93,10 @@ class ConversionPreparationEngine private constructor(
         )
             .analyzeArchiveWithIdentity(input.canonicalOriginalZip, profile)
         requireCrxManifestBinding(input, analyzed.report)
-        val report = analyzed.report.copy(
-            originalExtensionId = input.expectedExtensionId
-                ?: analyzed.report.manifestKeyExtensionId,
-        ).also(CompatibilityReport::validate)
+        val report = retainAnalyzedOriginalExtensionId(
+            analyzed.report,
+            input.expectedExtensionId,
+        )
         return AnalyzedConversion(
             report = report,
             logicalSourceIdentity = logicalSourceIdentity(
