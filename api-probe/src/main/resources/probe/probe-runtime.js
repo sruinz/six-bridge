@@ -32,10 +32,10 @@ export async function runCase(testCase) {
     if (member === undefined || member === null) {
       return normalize(testCase, 'ABSENT', null, startedAt);
     }
-    if (testCase.mode === 'PRESENCE_ONLY') {
+    if (testCase.mode === 'presence_only') {
       return normalize(testCase, 'EXPOSED', null, startedAt);
     }
-    if (testCase.mode !== 'SAFE_CALL' && testCase.mode !== 'SAFE_CALL_WITH_CLEANUP') {
+    if (testCase.mode !== 'safe_call' && testCase.mode !== 'safe_call_with_cleanup') {
       throw new TypeError('unsupported probe mode');
     }
     if (typeof testCase.run !== 'function') {

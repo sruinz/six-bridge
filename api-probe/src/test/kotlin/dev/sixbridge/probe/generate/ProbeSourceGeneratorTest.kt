@@ -192,26 +192,39 @@ class ProbeSourceGeneratorTest {
 
     @Test
     fun `runtime은 presence only member를 호출하지 않고 mode별 상태를 정규화한다`() = withWorkspace { workspace ->
-        val source = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).first().sourceRoot
+        val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
+        val source = generated.first().sourceRoot
         val runtimeModule = workspace.resolve("probe-runtime.mjs")
         Files.copy(source.resolve("probe-runtime.js"), runtimeModule)
+        val descriptorUris = generated.joinToString(",") {
+            "'${it.sourceRoot.resolve("probe-cases.json").toUri()}'"
+        }
 
         runNodeModule(
             workspace,
             """
+            import { readFileSync } from 'node:fs';
             import { runCase } from '${runtimeModule.toUri()}';
+            const cases = [$descriptorUris].flatMap((uri) => JSON.parse(readFileSync(new URL(uri), 'utf8')).cases);
+            const presenceCase = cases.find((testCase) => testCase.mode === 'presence_only');
+            const safeCase = cases.find((testCase) => testCase.mode === 'safe_call');
+            const cleanupCase = cases.find((testCase) => testCase.mode === 'safe_call_with_cleanup');
+            if (!presenceCase || !safeCase || !cleanupCase) throw new Error('canonical mode fixture missing');
             let calls = 0;
-            const base = { id: 'case', context: 'extension_page', member: 'member', namespace: 'namespace' };
-            const absent = await runCase({ ...base, mode: 'PRESENCE_ONLY', resolve: () => undefined, run: () => { calls += 100; } });
-            const exposed = await runCase({ ...base, mode: 'PRESENCE_ONLY', resolve: () => () => { calls += 10; }, run: () => { calls += 100; } });
-            const verified = await runCase({ ...base, mode: 'SAFE_CALL', resolve: () => (() => {}), run: async () => { calls += 1; return 'ok'; } });
-            const cleaned = await runCase({ ...base, mode: 'SAFE_CALL_WITH_CLEANUP', resolve: () => ({}), run: async () => { calls += 1; return 'clean'; } });
-            const restricted = await runCase({ ...base, mode: 'SAFE_CALL', resolve: () => ({}), run: async () => { throw new Error('permission denied'); } });
+            const absent = await runCase({ ...presenceCase, resolve: () => undefined, run: () => { calls += 100; } });
+            const exposed = await runCase({ ...presenceCase, resolve: () => () => { calls += 10; }, run: () => { calls += 100; } });
+            const verified = await runCase({ ...safeCase, resolve: () => (() => {}), run: async () => { calls += 1; return 'ok'; } });
+            const cleaned = await runCase({ ...cleanupCase, resolve: () => ({}), run: async () => { calls += 1; return 'clean'; } });
+            const restricted = await runCase({ ...safeCase, resolve: () => ({}), run: async () => { throw new Error('permission denied'); } });
+            const uppercase = await runCase({ ...presenceCase, mode: 'PRESENCE_ONLY', resolve: () => ({}), run: () => { calls += 100; } });
+            const unknown = await runCase({ ...presenceCase, mode: 'unknown', resolve: () => ({}), run: () => { calls += 100; } });
             if (absent.status !== 'ABSENT') throw new Error(`absent: ${'$'}{absent.status}`);
             if (exposed.status !== 'EXPOSED') throw new Error(`exposed: ${'$'}{exposed.status}`);
             if (verified.status !== 'VERIFIED') throw new Error(`verified: ${'$'}{verified.status}`);
             if (cleaned.status !== 'VERIFIED') throw new Error(`cleaned: ${'$'}{cleaned.status}`);
             if (restricted.status !== 'RESTRICTED') throw new Error(`restricted: ${'$'}{restricted.status}`);
+            if (uppercase.status !== 'FAILED') throw new Error(`uppercase: ${'$'}{uppercase.status}`);
+            if (unknown.status !== 'FAILED') throw new Error(`unknown: ${'$'}{unknown.status}`);
             if (calls !== 2) throw new Error(`unexpected calls: ${'$'}{calls}`);
             """.trimIndent(),
         )
