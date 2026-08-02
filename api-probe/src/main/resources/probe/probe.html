@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIX API Probe</title>
+  <link rel="stylesheet" href="probe.css">
+</head>
+<body>
+  <main>
+    <h1>SIX API Probe</h1>
+    <section aria-label="실행 진행">
+      <p>전체 <strong id="progress-total">0</strong> · 현재 <strong id="progress-current">0</strong></p>
+      <p id="current-context">실행 context: 미실행</p>
+    </section>
+    <section class="summary" aria-label="결과 요약">
+      <span>OK <strong id="count-ok">0</strong></span>
+      <span>제한 <strong id="count-restricted">0</strong></span>
+      <span>없음 <strong id="count-absent">0</strong></span>
+      <span>실패 <strong id="count-failed">0</strong></span>
+      <span>미실행 <strong id="count-not-run">0</strong></span>
+    </section>
+    <section>
+      <ol id="case-results" aria-live="polite"></ol>
+    </section>
+    <section id="gesture" hidden>
+      <p id="gesture-description">사용자 gesture가 필요합니다.</p>
+      <button id="gesture-run" type="button">사용자 gesture로 실행</button>
+    </section>
+    <section aria-live="polite">
+      <p id="evidence-status">증거 전송: 미실행</p>
+    </section>
+  </main>
+  <script type="module" src="probe-ui.js"></script>
+</body>
+</html>
