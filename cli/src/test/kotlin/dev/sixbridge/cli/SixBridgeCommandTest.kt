@@ -20,6 +20,7 @@ import dev.sixbridge.probe.catalog.CatalogDisposition
 import picocli.CommandLine
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPairGenerator
@@ -91,6 +92,17 @@ class SixBridgeCommandTest {
             assertEquals(2, result.exitCode, arguments.joinToString(" "))
             assertEquals("", result.output, arguments.joinToString(" "))
         }
+    }
+
+    @Test
+    fun `probe parent help는 주입된 writer로 출력한다`() {
+        val result = execute("probe")
+
+        assertEquals(0, result.exitCode, result.error)
+        assertTrue("Usage:" in result.output)
+        assertTrue("generate" in result.output)
+        assertTrue("verify-evidence" in result.output)
+        assertTrue("build-profile" in result.output)
     }
 
     @Test
@@ -212,6 +224,77 @@ class SixBridgeCommandTest {
         assertEquals(2, result.exitCode)
         assertFalse(realParent.resolve("probe-source").exists())
         assertEquals("", result.output)
+    }
+
+    @Test
+    fun `probe publication은 force move parent fsync 순서를 지킨다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-publication-order")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val profileOutput = workspace.resolve("candidate.json")
+        val profileOps = RecordingProbePublicationFileOps()
+
+        val profileExit = executeProbe(
+            ProbeBuildProfileCommand(profileOps),
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", profileOutput.toString(),
+        )
+
+        assertEquals(0, profileExit.exitCode, profileExit.error)
+        assertEquals(listOf("write-force", "move-new", "fsync-directory"), profileOps.events)
+
+        val sourceOutput = workspace.resolve("sources")
+        val generateOps = RecordingProbePublicationFileOps()
+        val generateExit = executeProbe(
+            ProbeGenerateCommand(generateOps),
+            "--output", sourceOutput.toString(),
+        )
+        assertEquals(0, generateExit.exitCode, generateExit.error)
+        assertTrue(generateOps.events.indexOf("move-new") > generateOps.events.lastIndexOf("force-file"))
+        assertEquals("fsync-directory", generateOps.events.last())
+    }
+
+    @Test
+    fun `probe move race는 기존 target을 보존하고 임시 경로를 정리한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-publication-race")
+        val target = workspace.resolve("sources")
+        val ops = RecordingProbePublicationFileOps(onMove = { _, destination ->
+            Files.createDirectory(destination)
+            destination.resolve("sentinel.txt").writeText("user-owned")
+        })
+
+        val result = executeProbe(
+            ProbeGenerateCommand(ops),
+            "--output", target.toString(),
+        )
+
+        assertNotEquals(0, result.exitCode)
+        assertEquals("user-owned", target.resolve("sentinel.txt").readText())
+        assertTrue(Files.list(workspace).use { entries ->
+            entries.noneMatch { it.fileName.toString().contains("staging") }
+        })
+    }
+
+    @Test
+    fun `probe fsync 실패는 임시 파일을 남기지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-fsync-failure")
+        val base = writeProfile(workspace)
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val target = workspace.resolve("candidate.json")
+        val ops = RecordingProbePublicationFileOps(failDirectoryFsync = true)
+
+        val result = executeProbe(
+            ProbeBuildProfileCommand(ops),
+            "--base", base.toString(),
+            "--evidence", evidence.toString(),
+            "--output", target.toString(),
+        )
+
+        assertNotEquals(0, result.exitCode)
+        assertTrue(Files.list(workspace).use { entries ->
+            entries.noneMatch { it.fileName.toString().contains(".tmp-") }
+        })
     }
 
     @Test
@@ -1038,6 +1121,44 @@ class SixBridgeCommandTest {
 
     private fun execute(vararg arguments: String): Execution {
         return executeWith(::SixBridgeService, *arguments)
+    }
+
+    private fun executeProbe(commandObject: Any, vararg arguments: String): Execution {
+        val output = StringWriter()
+        val error = StringWriter()
+        val command = CommandLine(commandObject)
+        command.out = PrintWriter(output)
+        command.err = PrintWriter(error)
+        return Execution(command.execute(*arguments), output.toString(), error.toString())
+    }
+
+    private class RecordingProbePublicationFileOps(
+        private val onMove: (Path, Path) -> Unit = { _, _ -> },
+        private val failDirectoryFsync: Boolean = false,
+    ) : ProbePublicationFileOps {
+        val events = mutableListOf<String>()
+
+        override fun writeAndForce(path: Path, bytes: ByteArray) {
+            events += "write-force"
+            NioProbePublicationFileOps.writeAndForce(path, bytes)
+        }
+
+        override fun forceFile(path: Path) {
+            events += "force-file"
+            NioProbePublicationFileOps.forceFile(path)
+        }
+
+        override fun moveNew(source: Path, target: Path) {
+            events += "move-new"
+            onMove(source, target)
+            NioProbePublicationFileOps.moveNew(source, target)
+        }
+
+        override fun forceDirectory(path: Path) {
+            events += "fsync-directory"
+            if (failDirectoryFsync) throw IOException("injected directory fsync failure")
+            NioProbePublicationFileOps.forceDirectory(path)
+        }
     }
 
     private fun executeWith(

@@ -7,6 +7,8 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.catalog.CatalogDisposition
 import dev.sixbridge.probe.catalog.ProbeCatalogCase
+import dev.sixbridge.probe.catalog.ProbeExpectedOutcome
+import dev.sixbridge.probe.catalog.ProbeMode
 import dev.sixbridge.probe.evidence.ProbeCaseResult
 import dev.sixbridge.probe.evidence.ProbeCaseStatus
 import dev.sixbridge.probe.evidence.ProbeEvidence
@@ -105,7 +107,10 @@ class CapabilityProfileBuilder(
         }
 
         val promoted = expectedEntries.filter { entry ->
-            entry.cases.all { case ->
+            val coreCases = entry.cases.filter {
+                it.expectedOutcome == ProbeExpectedOutcome.VERIFIED
+            }
+            coreCases.isNotEmpty() && coreCases.all { case ->
                 statusesByKey[
                     ApiCapabilityKey(entry.namespace, case.member, case.context)
                 ] == ApiCapabilityStatus.VERIFIED
@@ -228,6 +233,39 @@ class CapabilityProfileBuilder(
             ) {
                 "API probe evidence의 ${result.caseId} descriptor가 catalog와 일치하지 않습니다."
             }
+            validateOutcome(result, expected.case)
+        }
+    }
+
+    private fun validateOutcome(result: ProbeCaseResult, expected: ProbeCatalogCase) {
+        val allowed = when (expected.mode) {
+            ProbeMode.PRESENCE_ONLY -> setOf(
+                ProbeCaseStatus.ABSENT,
+                ProbeCaseStatus.EXPOSED,
+                ProbeCaseStatus.FAILED,
+                ProbeCaseStatus.RESTRICTED,
+            )
+            ProbeMode.SAFE_CALL, ProbeMode.SAFE_CALL_WITH_CLEANUP -> setOf(
+                ProbeCaseStatus.ABSENT,
+                ProbeCaseStatus.FAILED,
+                ProbeCaseStatus.RESTRICTED,
+                ProbeCaseStatus.VERIFIED,
+            )
+        }.let { statuses ->
+            if (expected.context == dev.sixbridge.core.profile.ApiExecutionContext.USER_GESTURE) {
+                statuses + ProbeCaseStatus.NOT_RUN
+            } else {
+                statuses
+            }
+        }
+        require(result.status in allowed) {
+            "API probe evidence의 ${result.caseId} status가 catalog mode/expectedOutcome과 모순됩니다."
+        }
+        require(
+            (expected.expectedOutcome == ProbeExpectedOutcome.EXPOSED) ==
+                (expected.mode == ProbeMode.PRESENCE_ONLY),
+        ) {
+            "API probe catalog mode와 expectedOutcome이 모순됩니다."
         }
     }
 

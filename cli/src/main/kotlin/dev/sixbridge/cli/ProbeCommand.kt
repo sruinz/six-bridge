@@ -9,16 +9,17 @@ import dev.sixbridge.probe.generate.ProbeSourceGenerator
 import dev.sixbridge.probe.profile.CapabilityEvidenceSummary
 import dev.sixbridge.probe.profile.CapabilityProfileBuilder
 import java.io.IOException
-import java.nio.channels.Channels
 import java.nio.channels.FileChannel
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.OpenOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.BasicFileAttributes
-import java.util.Comparator
 import java.util.concurrent.Callable
 import picocli.CommandLine
 import picocli.CommandLine.Command
@@ -39,8 +40,11 @@ class ProbeCommand : Runnable {
     @ParentCommand
     lateinit var root: SixBridgeCommand
 
+    @Spec
+    lateinit var spec: CommandLine.Model.CommandSpec
+
     override fun run() {
-        CommandLine(this).usage(System.out)
+        spec.commandLine().usage(spec.commandLine().out)
     }
 }
 
@@ -49,7 +53,9 @@ class ProbeCommand : Runnable {
     mixinStandardHelpOptions = true,
     description = ["6개 API probe MV3 source를 결정론적으로 생성합니다."],
 )
-class ProbeGenerateCommand : Callable<Int> {
+class ProbeGenerateCommand internal constructor(
+    private val publication: ProbePublicationFileOps = NioProbePublicationFileOps,
+) : Callable<Int> {
     @Option(names = ["--output"], required = true)
     lateinit var output: Path
 
@@ -64,27 +70,24 @@ class ProbeGenerateCommand : Callable<Int> {
             "API probe output은 존재하지 않아야 합니다."
         }
         val parentIdentity = directoryIdentity(parent)
-        val staging = Files.createTempDirectory(parent, ".${target.fileName}.cli-staging-")
-        try {
-            val generatedRoot = staging.resolve("generated")
-            val generated = ProbeSourceGenerator().generate(catalog, generatedRoot)
-            require(generated.map { it.groupId }.toSet() == ApiProbeCatalog.PROBE_GROUP_IDS) {
-                "API probe source group coverage가 올바르지 않습니다."
-            }
+        val generated = ProbeSourceGenerator(directoryMover = { source, destination ->
+            forceGeneratedFiles(source, publication)
             require(directoryIdentity(parent) == parentIdentity) {
                 "API probe output parent가 생성 중 변경되었습니다."
             }
-            Files.move(generatedRoot, target)
-            require(Files.isDirectory(target, NOFOLLOW_LINKS) && !Files.isSymbolicLink(target)) {
-                "API probe output publication을 검증할 수 없습니다."
-            }
-            spec.commandLine().out.println("catalog SHA-256=${catalog.sha256}")
-            spec.commandLine().out.println("생성 그룹=${generated.size}")
-            spec.commandLine().out.println("출력=${target}")
-            0
-        } finally {
-            deleteOwnedTree(staging)
+            publication.moveNew(source, destination)
+            publication.forceDirectory(parent)
+        }).generate(catalog, target)
+        require(generated.map { it.groupId }.toSet() == ApiProbeCatalog.PROBE_GROUP_IDS) {
+            "API probe source group coverage가 올바르지 않습니다."
         }
+        require(Files.isDirectory(target, NOFOLLOW_LINKS) && !Files.isSymbolicLink(target)) {
+            "API probe output publication을 검증할 수 없습니다."
+        }
+        spec.commandLine().out.println("catalog SHA-256=${catalog.sha256}")
+        spec.commandLine().out.println("생성 그룹=${generated.size}")
+        spec.commandLine().out.println("출력=${target}")
+        0
     }
 }
 
@@ -115,7 +118,9 @@ class ProbeVerifyEvidenceCommand : Callable<Int> {
     mixinStandardHelpOptions = true,
     description = ["base profile과 검증된 evidence로 schema v4 후보 profile을 생성합니다."],
 )
-class ProbeBuildProfileCommand : Callable<Int> {
+class ProbeBuildProfileCommand internal constructor(
+    private val publication: ProbePublicationFileOps = NioProbePublicationFileOps,
+) : Callable<Int> {
     @Option(names = ["--base"], required = true)
     lateinit var base: Path
 
@@ -140,7 +145,7 @@ class ProbeBuildProfileCommand : Callable<Int> {
         require(decoded == candidate && decoded.canonicalSha256() == candidate.canonicalSha256()) {
             "후보 browser profile self-verification에 실패했습니다."
         }
-        publishNewProfile(output, encoded, candidate.canonicalSha256())
+        publishNewProfile(output, encoded, candidate.canonicalSha256(), publication)
         printEvidenceSummary(spec.commandLine().out, summary)
         spec.commandLine().out.println("profile SHA-256=${candidate.canonicalSha256()}")
         spec.commandLine().out.println("후보 profile=${output.toAbsolutePath().normalize()}")
@@ -205,7 +210,12 @@ private fun readStrictFile(path: Path, maxBytes: Int): String {
     return bytes.toString(Charsets.UTF_8)
 }
 
-private fun publishNewProfile(output: Path, encoded: String, expectedDigest: String) {
+private fun publishNewProfile(
+    output: Path,
+    encoded: String,
+    expectedDigest: String,
+    publication: ProbePublicationFileOps,
+) {
     val target = output.toAbsolutePath().normalize()
     val parent = prepareOutputParent(target)
     require(!Files.exists(target, NOFOLLOW_LINKS)) {
@@ -213,12 +223,8 @@ private fun publishNewProfile(output: Path, encoded: String, expectedDigest: Str
     }
     val parentIdentity = directoryIdentity(parent)
     val temporary = Files.createTempFile(parent, ".${target.fileName}.tmp-", ".json")
-    var publishedByThisCall = false
     try {
-        FileChannel.open(temporary, WRITE, NOFOLLOW_LINKS).use { channel ->
-            Channels.newOutputStream(channel).write(encoded.toByteArray(Charsets.UTF_8))
-            channel.force(true)
-        }
+        publication.writeAndForce(temporary, encoded.toByteArray(Charsets.UTF_8))
         val decoded = BrowserProfileJson.decode(readStrictFile(temporary, MAX_PROFILE_BYTES))
         require(decoded.canonicalSha256() == expectedDigest) {
             "후보 browser profile 임시 파일 digest가 일치하지 않습니다."
@@ -226,8 +232,8 @@ private fun publishNewProfile(output: Path, encoded: String, expectedDigest: Str
         require(directoryIdentity(parent) == parentIdentity) {
             "후보 browser profile parent가 생성 중 변경되었습니다."
         }
-        Files.createLink(target, temporary)
-        publishedByThisCall = true
+        publication.moveNew(temporary, target)
+        publication.forceDirectory(parent)
         require(directoryIdentity(parent) == parentIdentity) {
             "후보 browser profile parent가 publication 중 변경되었습니다."
         }
@@ -235,12 +241,6 @@ private fun publishNewProfile(output: Path, encoded: String, expectedDigest: Str
         require(published.canonicalSha256() == expectedDigest) {
             "후보 browser profile publication digest가 일치하지 않습니다."
         }
-    } catch (error: Exception) {
-        if (publishedByThisCall && Files.exists(target, NOFOLLOW_LINKS)) {
-            val sameFile = runCatching { Files.isSameFile(temporary, target) }.getOrDefault(false)
-            if (sameFile) Files.deleteIfExists(target)
-        }
-        throw error
     } finally {
         Files.deleteIfExists(temporary)
     }
@@ -267,10 +267,51 @@ private fun fileIdentity(attributes: BasicFileAttributes): List<Any?> = listOf(
     attributes.size(),
 )
 
-private fun deleteOwnedTree(root: Path) {
-    if (!Files.exists(root, NOFOLLOW_LINKS)) return
+private fun forceGeneratedFiles(root: Path, publication: ProbePublicationFileOps) {
     Files.walk(root).use { stream ->
-        stream.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
+        stream.filter { Files.isRegularFile(it, NOFOLLOW_LINKS) }
+            .sorted()
+            .forEach(publication::forceFile)
+    }
+}
+
+internal interface ProbePublicationFileOps {
+    fun writeAndForce(path: Path, bytes: ByteArray)
+    fun forceFile(path: Path)
+    fun moveNew(source: Path, target: Path)
+    fun forceDirectory(path: Path)
+}
+
+internal object NioProbePublicationFileOps : ProbePublicationFileOps {
+    override fun writeAndForce(path: Path, bytes: ByteArray) {
+        FileChannel.open(path, WRITE, TRUNCATE_EXISTING, NOFOLLOW_LINKS).use { channel ->
+            val buffer = ByteBuffer.wrap(bytes)
+            while (buffer.hasRemaining()) channel.write(buffer)
+            channel.force(true)
+        }
+    }
+
+    override fun forceFile(path: Path) {
+        require(Files.isRegularFile(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) {
+            "force 대상은 symlink가 아닌 regular file이어야 합니다."
+        }
+        FileChannel.open(path, WRITE, NOFOLLOW_LINKS).use { it.force(true) }
+    }
+
+    override fun moveNew(source: Path, target: Path) {
+        require(source.parent == target.parent) {
+            "publication source와 target은 같은 parent에 있어야 합니다."
+        }
+        // ATOMIC_MOVE는 provider에 따라 기존 target을 교체할 수 있어 사용하지 않는다.
+        // 같은 directory 내 no-replace move로 target race를 FileAlreadyExistsException으로 차단한다.
+        Files.move(source, target)
+    }
+
+    override fun forceDirectory(path: Path) {
+        require(Files.isDirectory(path, NOFOLLOW_LINKS) && !Files.isSymbolicLink(path)) {
+            "fsync 대상은 symlink가 아닌 directory여야 합니다."
+        }
+        FileChannel.open(path, READ, NOFOLLOW_LINKS).use { it.force(true) }
     }
 }
 

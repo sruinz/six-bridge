@@ -113,10 +113,10 @@ class CapabilityProfileBuilderTest {
     }
 
     @Test
-    fun `EXPOSED FAILED RESTRICTED는 지원 승격 근거가 되지 않는다`() {
-        listOf("EXPOSED", "FAILED", "RESTRICTED").forEach { status ->
+    fun `ABSENT FAILED RESTRICTED는 지원 승격 근거가 되지 않는다`() {
+        listOf("ABSENT", "FAILED", "RESTRICTED").forEach { status ->
             val detail = when (status) {
-                "EXPOSED" -> "{\"kind\":\"exposed\"}"
+                "ABSENT" -> "{\"kind\":\"absent\"}"
                 else -> "{\"kind\":\"error\",\"message\":\"boom\",\"name\":\"Error\"}"
             }
             val changed = evidence().map { group ->
@@ -137,6 +137,42 @@ class CapabilityProfileBuilderTest {
             val candidate = CapabilityProfileBuilder(catalog).build(base, changed)
             assertFalse("runtime" in candidate.supportedApis, status)
         }
+    }
+
+    @Test
+    fun `PRESENCE_ONLY evidence를 VERIFIED로 위조하면 거부한다`() {
+        listOf("cookies", "history", "proxy").forEach { namespace ->
+            val tampered = evidenceWithStatus(namespace, "VERIFIED")
+
+            assertFailsWith<IllegalArgumentException>(namespace) {
+                CapabilityProfileBuilder(catalog).build(base, tampered)
+            }
+        }
+    }
+
+    @Test
+    fun `SAFE_CALL evidence를 EXPOSED로 위조하면 거부한다`() {
+        val tampered = evidenceWithStatus("runtime", "EXPOSED")
+
+        assertFailsWith<IllegalArgumentException> {
+            CapabilityProfileBuilder(catalog).build(base, tampered)
+        }
+    }
+
+    @Test
+    fun `core case와 presence case가 섞여도 core VERIFIED만 namespace 승격 근거로 사용한다`() {
+        val candidate = CapabilityProfileBuilder(catalog).build(
+            base.copy(supportedApis = emptySet()),
+            evidence(),
+        )
+
+        assertTrue("runtime" in candidate.supportedApis)
+        assertFalse("cookies" in candidate.supportedApis)
+        assertFalse("history" in candidate.supportedApis)
+        assertEquals(
+            ApiCapabilityStatus.EXPOSED,
+            candidate.apiCapabilities.single { it.key.namespace == "cookies" }.status,
+        )
     }
 
     @Test
@@ -210,6 +246,25 @@ class CapabilityProfileBuilderTest {
             )
         }
     }
+
+    private fun evidenceWithStatus(namespace: String, status: String): List<ProbeEvidence> =
+        evidence().map { group ->
+            if (group.results.none { it.namespace == namespace }) group else {
+                decodeEvidence(
+                    group,
+                    results = group.results.map { result ->
+                        if (result.namespace != namespace) result else result.copyForTest(
+                            status = status,
+                            detail = when (status) {
+                                "VERIFIED" -> "{\"kind\":\"success\",\"valueType\":\"object\"}"
+                                "EXPOSED" -> "{\"kind\":\"exposed\"}"
+                                else -> error("unsupported test status")
+                            },
+                        )
+                    },
+                )
+            }
+        }
 
     private fun decodeEvidence(
         original: ProbeEvidence? = null,
