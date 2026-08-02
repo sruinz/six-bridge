@@ -12,6 +12,7 @@ local.properties
 
 # SIX Bridge keeps extension sources and all signing material local.
 .local/
+.local/probe-build/
 
 # Generated proof-of-concept artifacts.
 dist/
