@@ -105,7 +105,7 @@ object ProbeEvidenceJson {
                     "browserVersionName 값이 올바르지 않습니다."
                 }
             },
-            browserVersionCode = root.integer("browserVersionCode", Long.MAX_VALUE),
+            browserVersionCode = root.integer("browserVersionCode", MAX_SAFE_INTEGER),
             browserApkSetSha256 = root.digest("browserApkSetSha256"),
             browserSignerSha256 = root.digest("browserSignerSha256"),
             results = results.sortedBy(ProbeCaseResult::caseId),
@@ -150,11 +150,12 @@ object ProbeEvidenceJson {
         val objectValue = value.jsonObject
         require(objectValue.keys == resultFields) { "API probe result 필드가 정확하지 않습니다." }
         val status = objectValue.enumExact<ProbeCaseStatus>("status")
+        val context = objectValue.enumLowercase<ApiExecutionContext>("context")
         val detailValue = objectValue.required("detail")
-        validateStatusDetail(status, detailValue)
+        validateStatusDetail(status, context, detailValue)
         return ProbeCaseResult(
             caseId = objectValue.string("caseId").validated("caseId", caseId),
-            context = objectValue.enumLowercase("context"),
+            context = context,
             detail = normalizeDetail(detailValue),
             durationMs = objectValue.integer("durationMs", 600_000),
             member = objectValue.string("member").validated("member", member),
@@ -164,7 +165,11 @@ object ProbeEvidenceJson {
         )
     }
 
-    private fun validateStatusDetail(status: ProbeCaseStatus, detail: JsonElement) {
+    private fun validateStatusDetail(
+        status: ProbeCaseStatus,
+        context: ApiExecutionContext,
+        detail: JsonElement,
+    ) {
         val objectValue = detail as? JsonObject
             ?: throw IllegalArgumentException("API probe result detail은 object여야 합니다.")
         val expectedKind = when (status) {
@@ -179,6 +184,9 @@ object ProbeEvidenceJson {
         }
         when (expectedKind) {
             "success" -> {
+                require(objectValue.keys == setOf("kind", "valueType")) {
+                    "VERIFIED detail 필드가 정확하지 않습니다."
+                }
                 require(
                     objectValue.string("valueType") in setOf(
                         "bigint",
@@ -194,6 +202,9 @@ object ProbeEvidenceJson {
                 ) { "VERIFIED detail valueType이 올바르지 않습니다." }
             }
             "error" -> {
+                require(objectValue.keys == setOf("kind", "message", "name")) {
+                    "오류 detail 필드가 정확하지 않습니다."
+                }
                 require(objectValue.string("message").length <= 512) {
                     "오류 detail message가 너무 깁니다."
                 }
@@ -201,7 +212,17 @@ object ProbeEvidenceJson {
                     "오류 detail name이 올바르지 않습니다."
                 }
             }
-            else -> Unit
+            "gesture-required" -> {
+                require(objectValue.keys == setOf("kind")) {
+                    "NOT_RUN detail 필드가 정확하지 않습니다."
+                }
+                require(context == ApiExecutionContext.USER_GESTURE) {
+                    "NOT_RUN은 user_gesture context에서만 허용됩니다."
+                }
+            }
+            "absent", "exposed" -> require(objectValue.keys == setOf("kind")) {
+                "$status detail 필드가 정확하지 않습니다."
+            }
         }
     }
 
@@ -346,4 +367,5 @@ object ProbeEvidenceJson {
     }
 
     private val MAX_DETAIL_NUMBER = BigDecimal("1e308")
+    private const val MAX_SAFE_INTEGER = 9_007_199_254_740_991L
 }

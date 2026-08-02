@@ -2,14 +2,19 @@
 
 import { randomBytes } from 'node:crypto';
 import {
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  rename,
-  rm,
-  unlink,
-} from 'node:fs/promises';
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -126,6 +131,11 @@ function validateDetail(detail) {
     if (current.depth > 6) throw new TypeError('detail too deep');
     const value = current.value;
     if (value && typeof value === 'object') {
+      if (!Array.isArray(value)) {
+        for (const key of Object.keys(value)) {
+          if (key.length > 128) throw new TypeError('detail key too large');
+        }
+      }
       const children = Array.isArray(value) ? value : Object.values(value);
       if (children.length > 64) throw new TypeError('too many detail values');
       values += children.length;
@@ -138,7 +148,7 @@ function validateDetail(detail) {
       && typeof value !== 'boolean'
     ) {
       throw new TypeError('invalid detail value');
-    } else if (typeof value === 'number' && !Number.isFinite(value)) {
+    } else if (typeof value === 'number' && (!Number.isFinite(value) || Math.abs(value) > 1e308)) {
       throw new TypeError('invalid detail number');
     } else if (typeof value === 'string' && value.length > 1_024) {
       throw new TypeError('detail string too large');
@@ -157,7 +167,7 @@ function validateStatusDetail(result) {
   }[result.status];
   if (result.detail.kind !== kind) throw new TypeError('status and detail mismatch');
   if (kind === 'success') {
-    if (!new Set([
+    if (!exactFields(result.detail, ['kind', 'valueType']) || !new Set([
         'bigint',
         'boolean',
         'function',
@@ -171,13 +181,19 @@ function validateStatusDetail(result) {
       throw new TypeError('invalid success detail');
     }
   } else if (kind === 'error') {
-    if (typeof result.detail.message !== 'string'
+    if (!exactFields(result.detail, ['kind', 'message', 'name'])
+      || typeof result.detail.message !== 'string'
       || result.detail.message.length > 512
       || typeof result.detail.name !== 'string'
       || result.detail.name.length < 1
       || result.detail.name.length > 80) {
       throw new TypeError('invalid error detail');
     }
+  } else if (!exactFields(result.detail, ['kind'])) {
+    throw new TypeError('invalid terminal detail');
+  }
+  if (result.status === 'NOT_RUN' && result.context !== 'user_gesture') {
+    throw new TypeError('NOT_RUN requires user_gesture context');
   }
 }
 
@@ -264,92 +280,170 @@ function respond(response, status, body = '', headers = {}) {
   response.end(bytes);
 }
 
-async function requireDirectory(directory, create = false) {
-  if (create) await mkdir(directory, { recursive: false, mode: 0o700 }).catch((error) => {
-    if (error.code !== 'EEXIST') throw error;
-  });
-  const stat = await lstat(directory);
-  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new UnsafePathError('unsafe evidence directory');
-}
-
 class UnsafePathError extends Error {}
 class EvidenceConflictError extends Error {}
 
-async function acquireLock(lockPath) {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try {
-      return await open(lockPath, 'wx', 0o600);
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      const stat = await lstat(lockPath).catch((cause) => {
-        if (cause.code === 'ENOENT') return null;
-        throw cause;
-      });
-      if (stat && (stat.isSymbolicLink() || !stat.isFile())) {
-        throw new UnsafePathError('unsafe evidence lock');
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-  }
-  throw new EvidenceConflictError('evidence group is busy');
+const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const TEMP_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
-async function saveEvidence(rootDir, evidence, bytes) {
-  await requireDirectory(rootDir, true);
-  const sessionDir = path.join(rootDir, evidence.sessionId);
-  await requireDirectory(sessionDir, true);
-  const target = path.join(sessionDir, `${evidence.groupId}.json`);
-  const lockPath = path.join(sessionDir, `${evidence.groupId}.lock`);
-  const lock = await acquireLock(lockPath);
-  let tempPath;
+function validateOwnedDirectory(stat, label) {
+  if (!stat.isDirectory()) throw new UnsafePathError(`unsafe ${label} directory`);
+  if ((stat.mode & 0o022) !== 0) throw new UnsafePathError(`writable ${label} directory`);
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new UnsafePathError(`foreign ${label} directory`);
+  }
+}
+
+function validateOwnedFile(stat, label) {
+  if (!stat.isFile() || stat.nlink !== 1) throw new UnsafePathError(`unsafe ${label} file`);
+  if ((stat.mode & 0o022) !== 0) throw new UnsafePathError(`writable ${label} file`);
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new UnsafePathError(`foreign ${label} file`);
+  }
+}
+
+function openDirectory(directory, label) {
+  let descriptor;
   try {
-    const stat = await lstat(target).catch((error) => {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    });
-    if (stat) {
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new UnsafePathError('unsafe evidence target');
-      const existing = await readFile(target);
-      if (existing.equals(bytes)) return false;
-      throw new EvidenceConflictError('different evidence already exists');
+    descriptor = openSync(directory, DIRECTORY_FLAGS);
+    const stat = fstatSync(descriptor);
+    validateOwnedDirectory(stat, label);
+    return { descriptor, stat };
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (error instanceof UnsafePathError) throw error;
+    throw new UnsafePathError(`cannot open ${label} directory`);
+  }
+}
+
+function existingTarget(targetName, bytes) {
+  let stat;
+  try {
+    stat = lstatSync(targetName);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new UnsafePathError('unsafe evidence target');
+  validateOwnedFile(stat, 'evidence target');
+  if (readFileSync(targetName).equals(bytes)) return false;
+  throw new EvidenceConflictError('different evidence already exists');
+}
+
+function assertDirectoryIdentity(rootDir, sessionId, root, session) {
+  try {
+    const currentRoot = lstatSync(rootDir);
+    const currentSession = lstatSync(path.join(rootDir, sessionId));
+    if (currentRoot.isSymbolicLink() || currentSession.isSymbolicLink()
+      || !sameIdentity(currentRoot, root.stat) || !sameIdentity(currentSession, session.stat)
+      || !sameIdentity(fstatSync(root.descriptor), root.stat)
+      || !sameIdentity(fstatSync(session.descriptor), session.stat)) {
+      throw new UnsafePathError('evidence directory identity changed');
     }
-    tempPath = path.join(sessionDir, `.${evidence.groupId}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
-    const temp = await open(tempPath, 'wx', 0o600);
+    validateOwnedDirectory(currentRoot, 'evidence root');
+    validateOwnedDirectory(currentSession, 'evidence session');
+  } catch (error) {
+    if (error instanceof UnsafePathError) throw error;
+    throw new UnsafePathError('cannot revalidate evidence directory');
+  }
+}
+
+function saveEvidence(rootDir, evidence, bytes, receiverState) {
+  if (receiverState.poisoned) throw new UnsafePathError('receiver storage is unavailable');
+  try {
+    mkdirSync(rootDir, { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+
+  const originalCwd = process.cwd();
+  const originalStat = statSync('.');
+  const root = openDirectory(rootDir, 'evidence root');
+  let session;
+  let tempName;
+  let cwdChanged = false;
+  try {
+    process.chdir(rootDir);
+    cwdChanged = true;
+    if (!sameIdentity(statSync('.'), root.stat)) throw new UnsafePathError('evidence root identity changed');
+
     try {
-      await temp.writeFile(bytes);
-      await temp.sync();
-    } finally {
-      await temp.close();
+      mkdirSync(evidence.sessionId, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
     }
-    const appeared = await lstat(target).catch((error) => {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    });
-    if (appeared) throw new EvidenceConflictError('evidence target appeared while writing');
-    await rename(tempPath, target);
-    tempPath = undefined;
-    const directory = await open(sessionDir, 'r');
+    session = openDirectory(evidence.sessionId, 'evidence session');
+    process.chdir(evidence.sessionId);
+    if (!sameIdentity(statSync('.'), session.stat)) {
+      throw new UnsafePathError('evidence session identity changed');
+    }
+
+    const targetName = `${evidence.groupId}.json`;
+    const existing = existingTarget(targetName, bytes);
+    if (existing !== null) return existing;
+
+    tempName = `.${evidence.groupId}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+    const tempDescriptor = openSync(tempName, TEMP_FLAGS, 0o600);
     try {
-      await directory.sync();
+      validateOwnedFile(fstatSync(tempDescriptor), 'evidence temp');
+      writeFileSync(tempDescriptor, bytes);
+      fsyncSync(tempDescriptor);
     } finally {
-      await directory.close();
+      closeSync(tempDescriptor);
     }
+
+    assertDirectoryIdentity(rootDir, evidence.sessionId, root, session);
+
+    try {
+      linkSync(tempName, targetName);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const raced = existingTarget(targetName, bytes);
+      if (raced === false) return false;
+      throw new EvidenceConflictError('evidence target appeared while writing');
+    }
+    try {
+      assertDirectoryIdentity(rootDir, evidence.sessionId, root, session);
+    } catch (error) {
+      unlinkSync(targetName);
+      throw error;
+    }
+    unlinkSync(tempName);
+    tempName = undefined;
+    validateOwnedFile(lstatSync(targetName), 'evidence target');
+    fsyncSync(session.descriptor);
     return true;
   } finally {
-    if (tempPath) await rm(tempPath, { force: true });
-    await lock.close();
-    await unlink(lockPath).catch((error) => {
-      if (error.code !== 'ENOENT') throw error;
-    });
+    if (tempName) {
+      try { unlinkSync(tempName); } catch (error) { if (error.code !== 'ENOENT') receiverState.poisoned = true; }
+    }
+    try {
+      if (cwdChanged) process.chdir(originalCwd);
+      if (!sameIdentity(statSync('.'), originalStat)) throw new UnsafePathError('original cwd identity changed');
+    } catch {
+      receiverState.poisoned = true;
+    }
+    if (session) closeSync(session.descriptor);
+    closeSync(root.descriptor);
+    if (receiverState.poisoned) throw new UnsafePathError('receiver cwd restoration failed');
   }
 }
 
 export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
+  if (!Number.isInteger(constants.O_DIRECTORY) || constants.O_DIRECTORY <= 0
+    || !Number.isInteger(constants.O_NOFOLLOW) || constants.O_NOFOLLOW <= 0) {
+    throw new UnsafePathError('safe directory handles are not supported on this platform');
+  }
   if (!ORIGIN.test(String(expectedOrigin))) {
     throw new TypeError('expectedOrigin must be an exact chrome-extension origin');
   }
   const expectedExtensionId = expectedOrigin.slice('chrome-extension://'.length);
   const resolvedRoot = path.resolve(String(rootDir));
+  const receiverState = { poisoned: false };
   const server = http.createServer((request, response) => {
     const origin = request.headers.origin;
     if (request.url !== '/evidence') {
@@ -409,12 +503,12 @@ export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
       rejected = true;
       respond(response, 400, 'request error', cors);
     });
-    request.on('end', async () => {
+    request.on('end', () => {
       if (rejected || response.writableEnded) return;
       const bytes = Buffer.concat(chunks);
       try {
         const evidence = parseEvidence(bytes, expectedExtensionId);
-        const created = await saveEvidence(resolvedRoot, evidence, bytes);
+        const created = saveEvidence(resolvedRoot, evidence, bytes, receiverState);
         respond(response, created ? 201 : 200, created ? 'stored' : 'already stored', cors);
       } catch (error) {
         if (error instanceof EvidenceConflictError || error instanceof UnsafePathError) {
@@ -424,6 +518,11 @@ export function createEvidenceReceiver({ expectedOrigin, rootDir }) {
         }
       }
     });
+  });
+  server.on('clientError', (_error, socket) => {
+    if (socket.writable) {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    }
   });
 
   return {

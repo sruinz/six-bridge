@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "detail-key-129",
+      "operation": "detail-key-129"
+    },
+    {
+      "id": "detail-huge-finite-number",
+      "operation": "detail-huge-finite-number"
+    },
+    {
+      "id": "unsafe-browser-version-code",
+      "operation": "unsafe-browser-version-code"
+    },
+    {
+      "id": "duplicate-case-key",
+      "operation": "duplicate-case-key"
+    },
+    {
+      "id": "unknown-root-field",
+      "operation": "unknown-root-field"
+    },
+    {
+      "id": "unknown-result-field",
+      "operation": "unknown-result-field"
+    },
+    {
+      "id": "unknown-detail-field",
+      "operation": "unknown-detail-field"
+    },
+    {
+      "id": "detail-depth-seven",
+      "operation": "detail-depth-seven"
+    },
+    {
+      "id": "status-detail-mismatch",
+      "operation": "status-detail-mismatch"
+    },
+    {
+      "id": "not-run-worker-context",
+      "operation": "not-run-worker-context"
+    }
+  ]
+}

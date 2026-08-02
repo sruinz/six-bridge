@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, symlink } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import {
+  access,
+  chmod,
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -85,6 +97,121 @@ function post(baseUrl, value, extra = {}) {
   });
 }
 
+async function loadRejectCorpus() {
+  const bytes = await readFile(new URL(
+    '../api-probe/src/test/resources/evidence/reject-corpus.json',
+    import.meta.url,
+  ));
+  return JSON.parse(bytes).cases;
+}
+
+function applyCorpusOperation(operation) {
+  const value = structuredClone(evidence());
+  const first = value.results[0];
+  if (operation === 'detail-key-129') first.detail['k'.repeat(129)] = true;
+  else if (operation === 'detail-huge-finite-number') first.detail.number = 1.5e308;
+  else if (operation === 'unsafe-browser-version-code') value.browserVersionCode = 9_007_199_254_740_992;
+  else if (operation === 'duplicate-case-key') value.results.push(structuredClone(first));
+  else if (operation === 'unknown-root-field') value.unknown = true;
+  else if (operation === 'unknown-result-field') first.unknown = true;
+  else if (operation === 'unknown-detail-field') first.detail.unknown = true;
+  else if (operation === 'detail-depth-seven') {
+    first.detail.nested = { a: { b: { c: { d: { e: { f: { g: true } } } } } } };
+  } else if (operation === 'status-detail-mismatch') first.status = 'ABSENT';
+  else if (operation === 'not-run-worker-context') {
+    first.status = 'NOT_RUN';
+    first.detail = { kind: 'gesture-required' };
+  } else throw new Error(`unknown corpus operation: ${operation}`);
+  return value;
+}
+
+function allTerminalEvidence() {
+  const descriptors = [
+    ['absent', 'service_worker', { kind: 'absent' }, 'ABSENT'],
+    ['exposed', 'extension_page', { kind: 'exposed' }, 'EXPOSED'],
+    ['failed', 'service_worker', { kind: 'error', message: 'boom', name: 'Error' }, 'FAILED'],
+    ['gesture', 'user_gesture', { kind: 'gesture-required' }, 'NOT_RUN'],
+    ['restricted', 'service_worker', { kind: 'error', message: 'denied', name: 'Error' }, 'RESTRICTED'],
+    ['verified', 'offscreen_document', { kind: 'success', valueType: 'object' }, 'VERIFIED'],
+  ];
+  return evidence({
+    results: descriptors.map(([suffix, context, detail, status], index) => ({
+      caseId: `case-${suffix}`,
+      context,
+      detail,
+      durationMs: 0,
+      member: `member${index}`,
+      namespace: `namespace${index}`,
+      runToken: `run-token-${String(index + 1).padStart(8, '0')}`,
+      status,
+    })),
+  });
+}
+
+function chunkedOversizePost(baseUrl) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(new URL('/evidence', baseUrl), {
+      headers: { 'content-type': 'application/json', origin: ORIGIN },
+      method: 'POST',
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    const chunk = Buffer.alloc(64 * 1024, 0x20);
+    for (let index = 0; index < 17; index += 1) req.write(chunk);
+    req.end();
+  });
+}
+
+function rawHttp(baseUrl, contentLength, body) {
+  const url = new URL(baseUrl);
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(Number(url.port), url.hostname);
+    const chunks = [];
+    socket.setTimeout(3_000, () => socket.destroy(new Error('raw HTTP timeout')));
+    socket.on('error', reject);
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('close', () => {
+      const response = Buffer.concat(chunks).toString('latin1');
+      const match = response.match(/^HTTP\/1\.1 (\d{3})/);
+      if (match) resolve(Number(match[1]));
+      else reject(new Error(`raw HTTP response missing: ${response}`));
+    });
+    socket.on('connect', () => {
+      socket.end(
+        `POST /evidence HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: ${ORIGIN}\r\n`
+        + `Content-Type: application/json\r\nContent-Length: ${contentLength}\r\nConnection: close\r\n\r\n${body}`,
+      );
+    });
+  });
+}
+
+function startRaceChild(script, argumentsList) {
+  const child = spawn(process.execPath, ['-e', script, ...argumentsList], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let error = '';
+  child.stderr.on('data', (chunk) => { error += chunk.toString(); });
+  const ready = new Promise((resolve, reject) => {
+    child.stdout.once('data', (chunk) => {
+      if (chunk.toString().includes('ready')) resolve();
+      else reject(new Error(`race child did not become ready: ${chunk}`));
+    });
+    child.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`race child exited before ready (${code}): ${error}`));
+    });
+  });
+  return {
+    child,
+    ready,
+    completed: new Promise((resolve, reject) => child.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`race child failed (${code}): ${error}`));
+    })),
+  };
+}
+
 test('127.0.0.1 외 주소 bind를 거부한다', async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'six-probe-bind-'));
   const receiver = createEvidenceReceiver({ expectedOrigin: ORIGIN, rootDir });
@@ -138,12 +265,24 @@ test('없거나 null 또는 웹 origin과 잘못된 content type을 거부한다
   assert.equal((await post(f.baseUrl, evidence({ extensionId: 'b'.repeat(32) }))).status, 400);
 });
 
-test('1 MiB를 streaming 중 즉시 413으로 거부한다', async (t) => {
+test('Content-Length와 chunked streaming의 1 MiB 초과를 모두 413으로 거부한다', async (t) => {
   const f = await fixture();
   t.after(() => f.receiver.close());
 
   const response = await post(f.baseUrl, Buffer.alloc(1_048_577, 0x20));
   assert.equal(response.status, 413);
+  assert.equal(await chunkedOversizePost(f.baseUrl), 413);
+  await assert.rejects(access(path.join(f.rootDir, 'session-20260802', 'base-runtime.json')));
+});
+
+test('raw Content-Length smaller와 larger spoof를 저장 없이 400으로 거부한다', async (t) => {
+  const f = await fixture();
+  t.after(() => f.receiver.close());
+  const body = JSON.stringify(evidence());
+
+  assert.equal(await rawHttp(f.baseUrl, body.length - 1, body), 400);
+  assert.equal(await rawHttp(f.baseUrl, body.length + 10, body), 400);
+  await assert.rejects(access(path.join(f.rootDir, 'session-20260802', 'base-runtime.json')));
 });
 
 test('JSON과 top-level metadata를 엄격히 검증한다', async (t) => {
@@ -162,6 +301,25 @@ test('JSON과 top-level metadata를 엄격히 검증한다', async (t) => {
   const mismatched = evidence();
   mismatched.results[0].status = 'ABSENT';
   assert.equal((await post(f.baseUrl, mismatched)).status, 400);
+});
+
+test('Task4에서 생성되는 모든 terminal result shape를 수락한다', async (t) => {
+  const f = await fixture();
+  t.after(() => f.receiver.close());
+
+  assert.equal((await post(f.baseUrl, allTerminalEvidence())).status, 201);
+});
+
+test('Kotlin과 Node 공통 reject corpus를 모두 거부한다', async (t) => {
+  const f = await fixture();
+  t.after(() => f.receiver.close());
+  const cases = await loadRejectCorpus();
+  assert.equal(cases.length, 10);
+
+  for (const entry of cases) {
+    const response = await post(f.baseUrl, applyCorpusOperation(entry.operation));
+    assert.equal(response.status, 400, entry.id);
+  }
 });
 
 test('잘못된 UTF-8 JSON bytes를 거부한다', async (t) => {
@@ -217,6 +375,73 @@ test('동시 저장도 exact bytes 한 개만 승리한다', async (t) => {
   assert.ok(stored.equals(one) || stored.equals(two));
 });
 
+test('temp publish 직전 외부 target 생성 race도 기존 bytes를 보존한다', async (t) => {
+  const f = await fixture();
+  t.after(() => f.receiver.close());
+  const session = path.join(f.rootDir, 'session-20260802');
+  await mkdir(session);
+  const target = path.join(session, 'base-runtime.json');
+  const sentinel = 'external-winner';
+  const race = startRaceChild(`
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const [session, target, sentinel] = process.argv.slice(1);
+    process.stdout.write('ready\\n');
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const temp = fs.readdirSync(session).find((name) => name.endsWith('.tmp'));
+      if (temp) {
+        try { fs.writeFileSync(target, sentinel, { flag: 'wx' }); process.exit(0); }
+        catch (error) { if (error.code !== 'EEXIST') throw error; }
+      }
+    }
+    process.exit(2);
+  `, [session, target, sentinel]);
+  await race.ready;
+  const body = Buffer.from(`${JSON.stringify(evidence())}${' '.repeat(1_040_000)}`);
+
+  const response = await post(f.baseUrl, body);
+  await race.completed;
+
+  assert.equal(response.status, 409);
+  assert.equal(await readFile(target, 'utf8'), sentinel);
+});
+
+test('session parent swap race에서 열린 directory 밖에 파일을 만들지 않는다', async (t) => {
+  const originalCwd = process.cwd();
+  const f = await fixture();
+  t.after(() => f.receiver.close());
+  const session = path.join(f.rootDir, 'session-20260802');
+  const moved = path.join(f.rootDir, 'moved-session');
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'six-probe-race-outside-'));
+  await mkdir(session);
+  const race = startRaceChild(`
+    const fs = require('node:fs');
+    const [session, moved, outside] = process.argv.slice(1);
+    process.stdout.write('ready\\n');
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const temp = fs.readdirSync(session).find((name) => name.endsWith('.tmp'));
+      if (temp) {
+        fs.renameSync(session, moved);
+        fs.symlinkSync(outside, session);
+        process.exit(0);
+      }
+    }
+    process.exit(2);
+  `, [session, moved, outside]);
+  await race.ready;
+  const body = Buffer.from(`${JSON.stringify(evidence())}${' '.repeat(1_040_000)}`);
+
+  const response = await post(f.baseUrl, body);
+  await race.completed;
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await readdir(outside), []);
+  assert.deepEqual(await readdir(moved), []);
+  assert.equal(process.cwd(), originalCwd);
+});
+
 test('symlink parent와 target을 거부하고 target을 보존한다', async (t) => {
   const f = await fixture();
   t.after(() => f.receiver.close());
@@ -232,4 +457,23 @@ test('symlink parent와 target을 거부하고 target을 보존한다', async (t
   await symlink(outsideFile, path.join(session, 'base-runtime.json'));
   assert.equal((await post(second.baseUrl, evidence())).status, 409);
   await assert.rejects(readFile(outsideFile), { code: 'ENOENT' });
+});
+
+test('group writable directory와 hardlink target을 거부한다', async (t) => {
+  const writable = await fixture();
+  t.after(() => writable.receiver.close());
+  await chmod(writable.rootDir, 0o770);
+  assert.equal((await post(writable.baseUrl, evidence())).status, 409);
+
+  const linked = await fixture();
+  t.after(() => linked.receiver.close());
+  const session = path.join(linked.rootDir, 'session-20260802');
+  await mkdir(session);
+  const source = path.join(linked.rootDir, 'source.json');
+  const sentinel = Buffer.from('hardlink-winner');
+  await writeFile(source, sentinel, { mode: 0o600 });
+  await link(source, path.join(session, 'base-runtime.json'));
+
+  assert.equal((await post(linked.baseUrl, evidence())).status, 409);
+  assert.deepEqual(await readFile(source), sentinel);
 });
