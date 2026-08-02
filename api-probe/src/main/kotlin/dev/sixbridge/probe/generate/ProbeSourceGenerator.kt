@@ -1,5 +1,6 @@
 package dev.sixbridge.probe.generate
 
+import dev.sixbridge.core.profile.ApiExecutionContext
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.catalog.CatalogDisposition
 import dev.sixbridge.probe.catalog.ProbeCatalogCase
@@ -85,22 +86,23 @@ class ProbeSourceGenerator(
             UTF_8,
         )
         COMMON_ASSETS.forEach { name ->
-            Files.write(root.resolve(name), assetLoader("probe/$name"))
+            val target = root.resolve(name)
+            target.parent?.let(Files::createDirectories)
+            Files.write(target, assetLoader("probe/$name"))
         }
-        Files.writeString(
-            root.resolve("service-worker.js"),
-            "import './probe-runtime.js';\n",
-            UTF_8,
-        )
         val iconDirectory = root.resolve("icons")
         Files.createDirectory(iconDirectory)
         ICON_NAMES.forEach { name -> Files.write(iconDirectory.resolve(name), PROBE_ICON) }
     }
 
     private fun manifest(groupId: String, entries: List<ProbeCatalogEntry>): String {
-        val permissions = entries.flatMap { entry ->
+        val contexts = entries.flatMap { entry -> entry.cases.map(ProbeCatalogCase::context) }.toSet()
+        val permissions = (entries.flatMap { entry ->
             entry.cases.flatMap(ProbeCatalogCase::permissions)
-        }.distinct().sorted()
+        } + buildList {
+            if (ApiExecutionContext.CONTENT_SCRIPT in contexts) add("scripting")
+            if (ApiExecutionContext.OFFSCREEN_DOCUMENT in contexts) add("offscreen")
+        }).distinct().sorted()
         val manifestKeys = entries.flatMap { entry ->
             entry.cases.flatMap(ProbeCatalogCase::manifestKeys)
         }.toSet()
@@ -125,6 +127,19 @@ class ProbeSourceGenerator(
                     "description" to JsonPrimitive("SIX API Probe 열기"),
                     "suggested_key" to jsonObject(
                         "default" to JsonPrimitive("Ctrl+Shift+U"),
+                    ),
+                ),
+            )
+        }
+        if (ApiExecutionContext.CONTENT_SCRIPT in contexts) {
+            fields["host_permissions"] = JsonArray(listOf(JsonPrimitive(FIXTURE_MATCH)))
+            fields["web_accessible_resources"] = JsonArray(
+                listOf(
+                    jsonObject(
+                        "matches" to JsonArray(listOf(JsonPrimitive(FIXTURE_MATCH))),
+                        "resources" to JsonArray(
+                            listOf(JsonPrimitive("cases/*.js"), JsonPrimitive("probe-runtime.js")),
+                        ),
                     ),
                 ),
             )
@@ -203,7 +218,23 @@ class ProbeSourceGenerator(
     }
 
     private companion object {
-        val COMMON_ASSETS = listOf("probe.html", "probe.css", "probe-ui.js", "probe-runtime.js")
+        const val FIXTURE_MATCH = "https://example.com/*"
+        val COMMON_ASSETS = listOf(
+            "probe.html",
+            "probe.css",
+            "probe-ui.js",
+            "probe-runtime.js",
+            "service-worker.js",
+            "content-probe.js",
+            "offscreen-probe.html",
+            "offscreen-probe.js",
+            "cases/advanced-runtime.js",
+            "cases/base-runtime.js",
+            "cases/identity-privacy.js",
+            "cases/network.js",
+            "cases/tab-page.js",
+            "cases/user-interface.js",
+        )
         val ICON_NAMES = listOf("probe-16.png", "probe-48.png", "probe-128.png")
         val PROBE_ICON: ByteArray = Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
