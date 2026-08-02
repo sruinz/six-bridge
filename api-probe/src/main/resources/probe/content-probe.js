@@ -1,6 +1,4 @@
 (() => {
-  const FIXTURE_ORIGIN = 'https://example.com/';
-  const MARKER = '#sixbridge-api-probe=';
   const GROUP_IDS = new Set([
     'advanced-runtime',
     'base-runtime',
@@ -9,36 +7,79 @@
     'tab-page',
     'user-interface',
   ]);
+  const FIXTURE_URL = 'https://example.com/';
+  const url = new URL(globalThis.location.href);
+  const marker = new URLSearchParams(url.hash.slice(1));
+  const markerCaseId = marker.get('sixbridge-api-probe');
+  const markerRunToken = marker.get('runToken');
 
-  if (!location.href.startsWith(FIXTURE_ORIGIN) || !location.hash.startsWith(MARKER)) return;
+  if (url.origin !== new URL(FIXTURE_URL).origin || !markerCaseId || !markerRunToken) return;
+
+  async function sendResult(runtime, descriptor, runToken, result) {
+    const ack = await runtime.callbackResult(
+      globalThis,
+      (done) => globalThis.chrome.runtime.sendMessage(
+        { result, type: 'six-probe-result' },
+        done,
+      ),
+      1_000,
+    );
+    if (
+      ack?.type !== 'six-probe-ack'
+      || ack.caseId !== descriptor.id
+      || ack.runToken !== runToken
+    ) {
+      throw new Error('content probe acknowledgement mismatch');
+    }
+  }
+
+  async function execute(message) {
+    let runtime;
+    const descriptor = message.descriptor;
+    try {
+      runtime = await import(globalThis.chrome.runtime.getURL('probe-runtime.js'));
+      const group = await import(
+        globalThis.chrome.runtime.getURL(`cases/${String(message.groupId)}.js`)
+      );
+      if (
+        descriptor?.id !== message.caseId
+        || descriptor?.context !== 'content_script'
+      ) {
+        throw new Error('content probe descriptor mismatch');
+      }
+      const result = await runtime.runCase(
+        group.createCase(descriptor, globalThis),
+        message.runToken,
+        8_000,
+      );
+      await sendResult(runtime, descriptor, message.runToken, result);
+    } catch (error) {
+      if (!runtime || !descriptor?.id) return;
+      const result = runtime.failedResult(descriptor, message.runToken, error);
+      try {
+        await sendResult(runtime, descriptor, message.runToken, result);
+      } catch {
+        // The service worker already expired or rejected this execution.
+      }
+    }
+  }
 
   globalThis.chrome?.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
     if (
       message?.type !== 'six-probe-run'
       || message.descriptor?.context !== 'content_script'
-      || !message.caseId
+      || message.caseId !== markerCaseId
+      || message.runToken !== markerRunToken
       || !GROUP_IDS.has(message.groupId)
     ) {
       return false;
     }
-    Promise.all([
-      import(globalThis.chrome.runtime.getURL('probe-runtime.js')),
-      import(globalThis.chrome.runtime.getURL(`cases/${String(message.groupId)}.js`)),
-    ]).then(([runtime, group]) => {
-      const descriptor = message.descriptor;
-      if (descriptor?.id !== message.caseId || descriptor?.context !== 'content_script') {
-        throw new Error('content probe descriptor mismatch');
-      }
-      return runtime.runCase(group.createCase(descriptor, globalThis));
-    }).then((result) => {
-      sendResponse({ result, type: 'six-probe-result' });
-    }, (error) => {
-      sendResponse({
-        result: { caseId: String(message.caseId), status: 'FAILED' },
-        type: 'six-probe-result',
-        error: String(error?.message ?? error),
-      });
+    sendResponse({
+      caseId: message.caseId,
+      runToken: message.runToken,
+      type: 'six-probe-dispatched',
     });
-    return true;
+    void execute(message);
+    return false;
   });
 })();

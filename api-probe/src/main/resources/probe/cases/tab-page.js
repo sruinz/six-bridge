@@ -1,6 +1,6 @@
 import { callbackResult, createRuntimeCase } from '../probe-runtime.js';
 
-const FIXTURE_URL = 'https://example.com/';
+const FIXTURE_URL = 'https://example.com/#sixbridge-api-probe=';
 
 export const CASE_IDS = Object.freeze([
   'search-query-page',
@@ -10,25 +10,45 @@ export const CASE_IDS = Object.freeze([
 ]);
 
 const SAFE_RUNNERS = Object.freeze({
-  'tabs-create-fixture-page': async (environment, cleanup) => {
+  'tabs-create-fixture-page': async (environment, cleanup, runToken, timeoutMs) => {
     if (cleanup?.member !== 'remove' || cleanup?.target !== 'created_resource_id') {
       throw new Error('tabs cleanup contract mismatch');
     }
+    const fixtureUrl = `${FIXTURE_URL}tabs-create-fixture-page&runToken=${encodeURIComponent(runToken)}`;
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(1, deadline - Date.now());
     let createdTabId;
     try {
       const tab = await callbackResult(
         environment,
-        (done) => environment.chrome.tabs.create({ active: false, url: FIXTURE_URL }, done),
+        (done) => environment.chrome.tabs.create({ active: false, url: fixtureUrl }, done),
+        remaining(),
       );
       createdTabId = tab?.id;
       if (!Number.isInteger(createdTabId)) throw new Error('created tab ID is missing');
       return { created: true };
     } finally {
-      if (Number.isInteger(createdTabId)) {
-        await callbackResult(
-          environment,
-          (done) => environment.chrome.tabs.remove(createdTabId, done),
-        );
+      try {
+        let cleanupIds = Number.isInteger(createdTabId) ? [createdTabId] : [];
+        if (cleanupIds.length === 0) {
+          const tabs = await callbackResult(
+            environment,
+            (done) => environment.chrome.tabs.query({ url: 'https://example.com/*' }, done),
+            remaining(),
+          );
+          cleanupIds = (Array.isArray(tabs) ? tabs : [])
+            .filter((tab) => tab?.url === fixtureUrl && Number.isInteger(tab?.id))
+            .map((tab) => tab.id);
+        }
+        for (const tabId of cleanupIds) {
+          await callbackResult(
+            environment,
+            (done) => environment.chrome.tabs.remove(tabId, done),
+            remaining(),
+          );
+        }
+      } catch (_cleanupError) {
+        // Cleanup was attempted for this run's exact marker only.
       }
     }
   },

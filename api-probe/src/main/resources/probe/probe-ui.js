@@ -7,6 +7,7 @@ const GROUP_IDS = new Set([
   'tab-page',
   'user-interface',
 ]);
+const CASE_TIMEOUT_MS = 8_000;
 
 export function setProgress(current, total, context) {
   byId('progress-current').textContent = String(current);
@@ -24,6 +25,12 @@ export function summaryBuckets(counts) {
   };
 }
 
+export function transitionCounts(counts, previousStatus, nextStatus) {
+  if (previousStatus && previousStatus in counts) counts[previousStatus] -= 1;
+  if (nextStatus in counts) counts[nextStatus] += 1;
+  return counts;
+}
+
 export function setSummary(counts) {
   const buckets = summaryBuckets(counts);
   byId('count-ok').textContent = String(buckets.ok);
@@ -33,70 +40,120 @@ export function setSummary(counts) {
   byId('count-not-run').textContent = String(buckets.notRun);
 }
 
-export function appendResult(result) {
-  const item = document.createElement('li');
+function renderResult(item, result) {
+  item.replaceChildren();
   const label = document.createElement('strong');
   label.textContent = `${String(result.namespace)}.${String(result.member)}`;
   const detail = document.createElement('span');
   detail.textContent = ` · ${String(result.status)} · ${String(result.context)}`;
   item.append(label, detail);
+}
+
+export function appendResult(result) {
+  const item = document.createElement('li');
+  renderResult(item, result);
   byId('case-results').append(item);
+  return item;
+}
+
+export function replaceResult(item, result) {
+  renderResult(item, result);
+}
+
+export function createGestureRunner({ button, execute, onResult }) {
+  let started = false;
+  return async () => {
+    if (started) return null;
+    started = true;
+    button.disabled = true;
+    const result = await execute();
+    onResult(result);
+    button.hidden = true;
+    return result;
+  };
 }
 
 export function setGesture(description, handler) {
   const region = byId('gesture');
   byId('gesture-description').textContent = String(description);
   const button = byId('gesture-run');
+  button.disabled = false;
+  button.hidden = false;
   button.onclick = handler;
   region.hidden = false;
+  return button;
 }
 
 export function setEvidenceStatus(status) {
   byId('evidence-status').textContent = `증거 전송: ${String(status)}`;
 }
 
-function timeoutResult(testCase) {
-  return {
-    caseId: String(testCase.id),
-    context: String(testCase.context),
-    detail: { kind: 'error', message: 'probe timeout after 10000ms', name: 'ProbeError' },
-    durationMs: 10_000,
-    member: String(testCase.member),
-    namespace: String(testCase.namespace),
-    status: 'FAILED',
-  };
+function uiFailureToken() {
+  return `ui-failure-${Date.now().toString(36).padStart(16, '0')}`.slice(0, 64);
 }
 
-function sendMessage(message) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (value) => {
-      if (settled) return;
-      settled = true;
-      const lastError = globalThis.chrome?.runtime?.lastError;
-      if (lastError) reject(new Error(String(lastError.message ?? lastError)));
-      else resolve(value);
-    };
-    try {
-      const returned = globalThis.chrome.runtime.sendMessage(message, done);
-      if (returned && typeof returned.then === 'function') returned.then(done, reject);
-    } catch (error) {
-      reject(error);
-    }
-  });
+async function sendMessage(runtime, message, timeoutMs = 10_000) {
+  return runtime.callbackResult(
+    globalThis,
+    (done) => globalThis.chrome.runtime.sendMessage(message, done),
+    timeoutMs,
+  );
 }
 
-async function timed(testCase, operation) {
-  let timer;
+function validateDispatch(response, testCase) {
+  if (
+    response?.type !== 'six-probe-dispatch'
+    || response.caseId !== testCase.id
+    || response.context !== testCase.context
+    || typeof response.runToken !== 'string'
+  ) {
+    throw new Error('probe dispatch response mismatch');
+  }
+  return response;
+}
+
+async function sendResult(runtime, testCase, runToken, result) {
+  const ack = await sendMessage(runtime, { result, type: 'six-probe-result' }, 1_000);
+  if (
+    ack?.type !== 'six-probe-ack'
+    || ack.caseId !== testCase.id
+    || ack.runToken !== runToken
+  ) {
+    throw new Error('probe result acknowledgement mismatch');
+  }
+}
+
+async function executeDispatchedPageCase(runtime, group, testCase, dispatch) {
+  const result = await runtime.runCase(
+    group.createCase(testCase, globalThis),
+    dispatch.runToken,
+    CASE_TIMEOUT_MS,
+  );
+  await sendResult(runtime, testCase, dispatch.runToken, result);
+  return result;
+}
+
+async function requestCase(runtime, group, testCase) {
   try {
-    return await Promise.race([
-      operation(),
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(timeoutResult(testCase)), 10_000);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+    const response = await sendMessage(
+      runtime,
+      { caseId: testCase.id, type: 'six-probe-run' },
+      10_000,
+    );
+    if (response?.type === 'six-probe-result') {
+      return runtime.validateResultEnvelope(
+        response,
+        testCase,
+        response.result?.runToken,
+      ).result;
+    }
+    const dispatch = validateDispatch(response, testCase);
+    if (dispatch.context !== 'extension_page') {
+      throw new Error(`unsupported probe context dispatch: ${dispatch.context}`);
+    }
+    return executeDispatchedPageCase(runtime, group, testCase, dispatch);
+  } catch (error) {
+    return runtime.failedResult(testCase, uiFailureToken(), error);
   }
 }
 
@@ -105,7 +162,7 @@ export async function startProbe() {
   if (!descriptorResponse.ok) throw new Error(`probe descriptor load failed: ${descriptorResponse.status}`);
   const bundle = await descriptorResponse.json();
   if (!GROUP_IDS.has(bundle.groupId)) throw new Error('unknown probe group');
-  const [{ runCase }, group] = await Promise.all([
+  const [runtime, group] = await Promise.all([
     import('./probe-runtime.js'),
     import(`./cases/${String(bundle.groupId)}.js`),
   ]);
@@ -115,28 +172,43 @@ export async function startProbe() {
 
   for (const [index, testCase] of bundle.cases.entries()) {
     setProgress(index + 1, bundle.cases.length, testCase.context);
-    let result;
     if (testCase.context === 'user_gesture') {
-      result = { ...timeoutResult(testCase), detail: { kind: 'gesture-required' }, durationMs: 0, status: 'NOT_RUN' };
-      setGesture(`${testCase.namespace}.${testCase.member}`, async () => {
-        const executed = await timed(testCase, () => runCase(group.createCase(testCase, globalThis)));
-        await sendMessage({ result: executed, type: 'six-probe-result' });
-        appendResult(executed);
+      const waiting = runtime.notRunResult(testCase, uiFailureToken());
+      const item = appendResult(waiting);
+      transitionCounts(counts, null, 'NOT_RUN');
+      const button = setGesture(`${testCase.namespace}.${testCase.member}`, null);
+      button.onclick = createGestureRunner({
+        button,
+        execute: async () => {
+          let dispatch;
+          try {
+            dispatch = validateDispatch(
+              await sendMessage(runtime, { caseId: testCase.id, type: 'six-probe-run' }),
+              testCase,
+            );
+            runtime.validateResultEnvelope(
+              { result: dispatch.initialResult, type: 'six-probe-result' },
+              testCase,
+              dispatch.runToken,
+            );
+            return await executeDispatchedPageCase(runtime, group, testCase, dispatch);
+          } catch (error) {
+            return runtime.failedResult(testCase, dispatch?.runToken ?? uiFailureToken(), error);
+          }
+        },
+        onResult: (result) => {
+          replaceResult(item, result);
+          transitionCounts(counts, 'NOT_RUN', result.status);
+          setSummary(counts);
+        },
       });
-    } else {
-      result = await timed(testCase, async () => {
-        const response = await sendMessage({ caseId: testCase.id, type: 'six-probe-run' });
-        if (response?.type !== 'six-probe-dispatch') return response;
-        if (response.context !== 'extension_page') {
-          throw new Error(`unsupported probe context dispatch: ${response.context}`);
-        }
-        const executed = await runCase(group.createCase(testCase, globalThis));
-        await sendMessage({ result: executed, type: 'six-probe-result' });
-        return executed;
-      });
+      setSummary(counts);
+      continue;
     }
-    counts[result?.status in counts ? result.status : 'FAILED'] += 1;
-    appendResult(result ?? timeoutResult(testCase));
+
+    const result = await requestCase(runtime, group, testCase);
+    transitionCounts(counts, null, result.status);
+    appendResult(result);
     setSummary(counts);
   }
   setEvidenceStatus('준비');

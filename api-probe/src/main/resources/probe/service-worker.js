@@ -1,4 +1,11 @@
-import { callbackResult, runCase } from './probe-runtime.js';
+import {
+  callbackResult,
+  failedResult,
+  notRunResult,
+  runCase,
+  validateResultEnvelope,
+  withDeadline,
+} from './probe-runtime.js';
 import { createCase as createAdvanced } from './cases/advanced-runtime.js';
 import { createCase as createBase } from './cases/base-runtime.js';
 import { createCase as createIdentity } from './cases/identity-privacy.js';
@@ -14,158 +21,300 @@ const CASE_FACTORIES = Object.freeze({
   'tab-page': createTabPage,
   'user-interface': createUserInterface,
 });
-
-const TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 10_000;
 const FIXTURE_URL = 'https://example.com/';
+const FIXTURE_ORIGIN = new URL(FIXTURE_URL).origin;
 
-function failedResult(testCase, message) {
-  return {
-    caseId: String(testCase?.id ?? 'unknown'),
-    context: String(testCase?.context ?? 'unknown'),
-    detail: { kind: 'error', message: String(message), name: 'ProbeError' },
-    durationMs: 0,
-    member: String(testCase?.member ?? 'unknown'),
-    namespace: String(testCase?.namespace ?? 'unknown'),
-    status: 'FAILED',
-  };
+function randomRunToken(environment) {
+  const bytes = new Uint8Array(16);
+  environment.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
-function notRunResult(testCase) {
-  return {
-    caseId: String(testCase.id),
-    context: String(testCase.context),
-    detail: { kind: 'gesture-required' },
-    durationMs: 0,
-    member: String(testCase.member),
-    namespace: String(testCase.namespace),
-    status: 'NOT_RUN',
-  };
-}
-
-async function withTimeout(testCase, operation, timeoutMs) {
-  let timer;
+function senderIdentity(sender) {
+  let origin = '';
   try {
-    return await Promise.race([
-      operation(),
-      new Promise((resolve) => {
-        timer = setTimeout(
-          () => resolve(failedResult(testCase, `probe timeout after ${timeoutMs}ms`)),
-          timeoutMs,
-        );
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+    origin = new URL(String(sender?.url ?? '')).origin;
+  } catch {
+    origin = '';
   }
-}
-
-export async function runSequentially(testCases, executor, timeoutMs = TIMEOUT_MS) {
-  const results = [];
-  for (const testCase of testCases) {
-    results.push(await withTimeout(testCase, () => executor(testCase), timeoutMs));
-  }
-  return results;
-}
-
-export function createProbeController({ descriptors, executeContextCase, executeWorkerCase }) {
-  const pending = new Map();
   return {
-    async handleMessage(message) {
+    id: String(sender?.id ?? ''),
+    origin,
+    tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
+    url: String(sender?.url ?? ''),
+  };
+}
+
+function sameSender(expected, sender) {
+  const actual = senderIdentity(sender);
+  return expected.id === actual.id
+    && (!expected.url || expected.url === actual.url)
+    && (!expected.origin || expected.origin === actual.origin)
+    && (expected.tabId === null || expected.tabId === actual.tabId);
+}
+
+function resultEnvelope(value) {
+  return { result: value, type: 'six-probe-result' };
+}
+
+function dispatchEnvelope(testCase, runToken, initialResult) {
+  return {
+    caseId: testCase.id,
+    context: testCase.context,
+    initialResult,
+    runToken,
+    type: 'six-probe-dispatch',
+  };
+}
+
+export function createProbeController({
+  descriptors,
+  executeContextCase,
+  executeWorkerCase,
+  extensionPageUrl,
+  runtimeId,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  tokenFactory,
+}) {
+  const activeCases = new Set();
+  const pending = new Map();
+  const makeToken = tokenFactory ?? (() => randomRunToken(globalThis));
+  const pendingKey = (caseId, runToken) => `${caseId}\u0000${runToken}`;
+
+  const deletePending = (record, releaseActive = true) => {
+    clearTimeout(record.timer);
+    pending.delete(pendingKey(record.testCase.id, record.runToken));
+    if (releaseActive) activeCases.delete(record.testCase.id);
+  };
+
+  const createPending = (testCase, runToken, expectedSender) => {
+    let resolveResult;
+    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+    const record = {
+      expectedSender,
+      resolveResult,
+      resultPromise,
+      runToken,
+      testCase,
+      timer: null,
+    };
+    record.timer = setTimeout(
+      () => deletePending(
+        record,
+        testCase.context === 'extension_page' || testCase.context === 'user_gesture',
+      ),
+      timeoutMs,
+    );
+    pending.set(pendingKey(testCase.id, runToken), record);
+    return record;
+  };
+
+  const validPageSender = (sender) => sameSender(
+    { id: runtimeId, origin: '', tabId: null, url: extensionPageUrl },
+    sender,
+  );
+
+  return {
+    async handleMessage(message, sender) {
       if (!message || (message.type !== 'six-probe-run' && message.type !== 'six-probe-result')) {
         return null;
       }
       if (message.type === 'six-probe-result') {
         const caseId = String(message.result?.caseId ?? '');
-        if (!pending.has(caseId)) return null;
-        pending.delete(caseId);
-        return { caseId, type: 'six-probe-ack' };
+        const runToken = String(message.result?.runToken ?? '');
+        const record = pending.get(pendingKey(caseId, runToken));
+        if (!record || !sameSender(record.expectedSender, sender)) return null;
+        let validated;
+        try {
+          validated = validateResultEnvelope(message, record.testCase, record.runToken);
+        } catch {
+          return null;
+        }
+        deletePending(
+          record,
+          record.testCase.context === 'extension_page'
+            || record.testCase.context === 'user_gesture',
+        );
+        record.resolveResult(validated);
+        return { caseId, runToken, type: 'six-probe-ack' };
       }
 
       const testCase = descriptors.get(String(message.caseId));
-      if (!testCase) return failedResult({ id: message.caseId }, 'unknown probe case');
-      if (testCase.context === 'user_gesture') {
-        pending.set(testCase.id, testCase.context);
-        return notRunResult(testCase);
+      const runToken = makeToken();
+      if (!testCase) return resultEnvelope(failedResult(
+        { context: 'unknown', id: String(message.caseId), member: 'unknown', namespace: 'unknown' },
+        runToken,
+        new Error('unknown probe case'),
+      ));
+      if (!validPageSender(sender)) {
+        return resultEnvelope(failedResult(testCase, runToken, new Error('untrusted probe sender')));
       }
-      if (testCase.context === 'service_worker') return executeWorkerCase(testCase);
-      if (testCase.context === 'content_script' || testCase.context === 'offscreen_document') {
-        const result = await executeContextCase(testCase);
-        return result?.caseId === testCase.id ? result : failedResult(testCase, 'context result mismatch');
+      if (activeCases.has(testCase.id)) {
+        return resultEnvelope(failedResult(testCase, runToken, new Error('probe case is already running')));
+      }
+      activeCases.add(testCase.id);
+
+      if (testCase.context === 'service_worker') {
+        try {
+          const value = await executeWorkerCase(testCase, runToken, timeoutMs);
+          return validateResultEnvelope(resultEnvelope(value), testCase, runToken);
+        } catch (error) {
+          return resultEnvelope(failedResult(testCase, runToken, error, timeoutMs));
+        } finally {
+          activeCases.delete(testCase.id);
+        }
       }
 
-      pending.set(testCase.id, testCase.context);
-      return {
-        caseId: testCase.id,
-        context: testCase.context,
-        type: 'six-probe-dispatch',
-      };
+      const pageSender = senderIdentity(sender);
+      const record = createPending(testCase, runToken, pageSender);
+      if (testCase.context === 'extension_page' || testCase.context === 'user_gesture') {
+        return dispatchEnvelope(
+          testCase,
+          runToken,
+          testCase.context === 'user_gesture' ? notRunResult(testCase, runToken) : null,
+        );
+      }
+      if (testCase.context !== 'content_script' && testCase.context !== 'offscreen_document') {
+        deletePending(record);
+        return resultEnvelope(failedResult(testCase, runToken, new Error('unsupported probe context')));
+      }
+
+      try {
+        return await executeContextCase(testCase, runToken, record, timeoutMs);
+      } catch (error) {
+        return resultEnvelope(failedResult(testCase, runToken, error, timeoutMs));
+      } finally {
+        deletePending(record);
+      }
+    },
+    pendingCount() {
+      return pending.size;
     },
   };
 }
 
-async function dispatchContentCase(testCase, groupId) {
+async function cleanupFixtureTabs(environment, markerUrl, knownTabId, timeoutMs) {
+  let ids = Number.isInteger(knownTabId) ? [knownTabId] : [];
+  if (ids.length === 0) {
+    try {
+      const tabs = await callbackResult(
+        environment,
+        (done) => environment.chrome.tabs.query({ url: `${FIXTURE_URL}*` }, done),
+        Math.min(timeoutMs, 1_000),
+      );
+      ids = (tabs ?? []).filter((tab) => tab.url === markerUrl && Number.isInteger(tab.id)).map((tab) => tab.id);
+    } catch {
+      ids = [];
+    }
+  }
+  for (const id of ids) {
+    try {
+      await callbackResult(
+        environment,
+        (done) => environment.chrome.tabs.remove(id, done),
+        Math.min(timeoutMs, 1_000),
+      );
+    } catch {
+      // The owned tab is already gone or the browser rejected cleanup.
+    }
+  }
+}
+
+async function dispatchContentCase(environment, testCase, groupId, runToken, record, timeoutMs) {
+  const marker = `sixbridge-api-probe=${encodeURIComponent(testCase.id)}&runToken=${encodeURIComponent(runToken)}`;
+  const markerUrl = `${FIXTURE_URL}#${marker}`;
   let tabId;
   try {
-    const tab = await callbackResult(
-      globalThis,
-      (done) => globalThis.chrome.tabs.create(
-        { active: false, url: `${FIXTURE_URL}#sixbridge-api-probe=${encodeURIComponent(testCase.id)}` },
-        done,
-      ),
-    );
-    tabId = tab?.id;
-    if (!Number.isInteger(tabId)) throw new Error('content fixture tab ID is missing');
-    await globalThis.chrome.scripting.executeScript({
-      files: ['content-probe.js'],
-      target: { tabId },
-    });
-    const response = await callbackResult(
-      globalThis,
-      (done) => globalThis.chrome.tabs.sendMessage(
-        tabId,
-        { caseId: testCase.id, descriptor: testCase, groupId, type: 'six-probe-run' },
-        done,
-      ),
-    );
-    return response?.result;
+    return await withDeadline(async () => {
+      const tab = await callbackResult(
+        environment,
+        (done) => environment.chrome.tabs.create({ active: false, url: markerUrl }, done),
+        timeoutMs,
+      );
+      tabId = tab?.id;
+      if (!Number.isInteger(tabId)) throw new Error('content fixture tab ID is missing');
+      record.expectedSender = { id: environment.chrome.runtime.id, origin: FIXTURE_ORIGIN, tabId, url: '' };
+      await environment.chrome.scripting.executeScript({ files: ['content-probe.js'], target: { tabId } });
+      const dispatched = await callbackResult(
+        environment,
+        (done) => environment.chrome.tabs.sendMessage(
+          tabId,
+          { caseId: testCase.id, descriptor: testCase, groupId, runToken, type: 'six-probe-run' },
+          done,
+        ),
+        timeoutMs,
+      );
+      if (
+        dispatched?.type !== 'six-probe-dispatched'
+        || dispatched.caseId !== testCase.id
+        || dispatched.runToken !== runToken
+      ) {
+        throw new Error('content probe dispatch response mismatch');
+      }
+      return record.resultPromise;
+    }, timeoutMs);
   } finally {
-    if (Number.isInteger(tabId)) {
-      await callbackResult(globalThis, (done) => globalThis.chrome.tabs.remove(tabId, done));
-    }
+    await cleanupFixtureTabs(environment, markerUrl, tabId, timeoutMs);
   }
 }
 
-async function dispatchOffscreenCase(testCase, groupId) {
-  const existed = await globalThis.chrome.offscreen.hasDocument();
+async function dispatchOffscreenCase(environment, testCase, groupId, runToken, record, timeoutMs) {
+  let created = false;
+  record.expectedSender = {
+    id: environment.chrome.runtime.id,
+    origin: new URL(environment.chrome.runtime.getURL('/')).origin,
+    tabId: null,
+    url: environment.chrome.runtime.getURL('offscreen-probe.html'),
+  };
   try {
-    if (!existed) {
-      await globalThis.chrome.offscreen.createDocument({
-        justification: 'SIX API capability probe context',
-        reasons: ['DOM_PARSER'],
-        url: 'offscreen-probe.html',
-      });
-    }
-    const response = await callbackResult(
-      globalThis,
-      (done) => globalThis.chrome.runtime.sendMessage(
-        {
-          bridgeTarget: 'offscreen',
-          caseId: testCase.id,
-          descriptor: testCase,
-          groupId,
-          type: 'six-probe-run',
-        },
-        done,
-      ),
-    );
-    return response?.result;
+    return await withDeadline(async () => {
+      const existed = await environment.chrome.offscreen.hasDocument();
+      if (!existed) {
+        await environment.chrome.offscreen.createDocument({
+          justification: 'SIX API capability probe context',
+          reasons: ['DOM_PARSER'],
+          url: 'offscreen-probe.html',
+        });
+        created = true;
+      }
+      const dispatched = await callbackResult(
+        environment,
+        (done) => environment.chrome.runtime.sendMessage(
+          {
+            bridgeTarget: 'offscreen',
+            caseId: testCase.id,
+            descriptor: testCase,
+            groupId,
+            runToken,
+            type: 'six-probe-run',
+          },
+          done,
+        ),
+        timeoutMs,
+      );
+      if (
+        dispatched?.type !== 'six-probe-dispatched'
+        || dispatched.caseId !== testCase.id
+        || dispatched.runToken !== runToken
+      ) {
+        throw new Error('offscreen probe dispatch response mismatch');
+      }
+      return record.resultPromise;
+    }, timeoutMs);
   } finally {
-    if (!existed) await globalThis.chrome.offscreen.closeDocument();
+    if (created) {
+      try {
+        await withDeadline(() => environment.chrome.offscreen.closeDocument(), Math.min(timeoutMs, 1_000));
+      } catch {
+        // The owned offscreen document is already gone or cleanup was rejected.
+      }
+    }
   }
 }
 
-async function loadController() {
-  const response = await fetch(globalThis.chrome.runtime.getURL('probe-cases.json'));
+async function loadController(environment, fetchImpl, options) {
+  const response = await fetchImpl(environment.chrome.runtime.getURL('probe-cases.json'));
   if (!response.ok) throw new Error(`probe descriptor load failed: ${response.status}`);
   const bundle = await response.json();
   const factory = CASE_FACTORIES[bundle.groupId];
@@ -173,23 +322,58 @@ async function loadController() {
   const descriptors = new Map(bundle.cases.map((testCase) => [testCase.id, testCase]));
   return createProbeController({
     descriptors,
-    executeContextCase: (testCase) => (
+    executeContextCase: (testCase, runToken, record, timeoutMs) => (
       testCase.context === 'content_script'
-        ? dispatchContentCase(testCase, bundle.groupId)
-        : dispatchOffscreenCase(testCase, bundle.groupId)
+        ? dispatchContentCase(environment, testCase, bundle.groupId, runToken, record, timeoutMs)
+        : dispatchOffscreenCase(environment, testCase, bundle.groupId, runToken, record, timeoutMs)
     ),
-    executeWorkerCase: (testCase) => runCase(factory(testCase, globalThis)),
+    executeWorkerCase: (testCase, runToken, timeoutMs) => runCase(
+      factory(testCase, environment),
+      runToken,
+      timeoutMs,
+    ),
+    extensionPageUrl: environment.chrome.runtime.getURL('probe.html'),
+    runtimeId: environment.chrome.runtime.id,
+    timeoutMs: options.timeoutMs,
+    tokenFactory: options.tokenFactory,
   });
 }
 
-let controllerPromise;
-if (globalThis.chrome?.runtime?.onMessage) {
-  globalThis.chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.bridgeTarget) return false;
-    controllerPromise ??= loadController();
-    controllerPromise
-      .then((controller) => controller.handleMessage(message))
-      .then(sendResponse, (error) => sendResponse(failedResult({ id: message?.caseId }, error?.message ?? error)));
+export function installServiceWorkerBridge(
+  environment = globalThis,
+  fetchImpl = globalThis.fetch,
+  options = {},
+) {
+  let controllerPromise;
+  const listener = (message, sender, sendResponse) => {
+    if (
+      message?.bridgeTarget
+      || (message?.type !== 'six-probe-run' && message?.type !== 'six-probe-result')
+    ) return false;
+    controllerPromise ??= loadController(environment, fetchImpl, options);
+    controllerPromise.then(
+      (controller) => controller.handleMessage(message, sender),
+    ).then(
+      (response) => sendResponse(response),
+      (error) => sendResponse(resultEnvelope(failedResult(
+        {
+          context: 'unknown',
+          id: String(message?.caseId ?? 'unknown'),
+          member: 'unknown',
+          namespace: 'unknown',
+        },
+        options.tokenFactory?.() ?? randomRunToken(environment),
+        error,
+      ))),
+    ).catch(() => {
+      // sendResponse itself failed because the caller disappeared.
+    });
     return true;
-  });
+  };
+  environment.chrome.runtime.onMessage.addListener(listener);
+  return listener;
+}
+
+if (globalThis.chrome?.runtime?.onMessage && globalThis.fetch) {
+  installServiceWorkerBridge(globalThis, globalThis.fetch);
 }

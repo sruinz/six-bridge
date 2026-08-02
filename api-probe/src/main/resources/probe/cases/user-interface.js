@@ -18,27 +18,34 @@ const SAFE_RUNNERS = Object.freeze({
     environment,
     (done) => environment.chrome.commands.getAll(done),
   ),
-  'context-menus-create-worker': async (environment, cleanup) => {
+  'context-menus-create-worker': async (environment, cleanup, _runToken, timeoutMs) => {
     if (cleanup?.member !== 'remove' || cleanup?.target !== 'fixture_id' || !cleanup.fixtureId) {
       throw new Error('context menu cleanup contract mismatch');
     }
     const fixtureId = cleanup.fixtureId;
-    let created = false;
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(1, deadline - Date.now());
+    let createdId;
     try {
       await callbackCompletion(environment, (done) => {
-        environment.chrome.contextMenus.create(
+        createdId = environment.chrome.contextMenus.create(
           { contexts: ['all'], id: fixtureId, title: 'SIX API Probe' },
           done,
         );
-      });
-      created = true;
+      }, remaining());
+      if (createdId !== fixtureId) throw new Error('created context menu ID mismatch');
       return { created: true };
     } finally {
-      if (created) {
-        await callbackResult(
-          environment,
-          (done) => environment.chrome.contextMenus.remove(fixtureId, done),
-        );
+      if (createdId === fixtureId) {
+        try {
+          await callbackResult(
+            environment,
+            (done) => environment.chrome.contextMenus.remove(fixtureId, done),
+            remaining(),
+          );
+        } catch (_cleanupError) {
+          // The probe result remains the original failure; cleanup was still attempted.
+        }
       }
     }
   },
