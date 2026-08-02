@@ -305,43 +305,15 @@ class CompatibilityAnalyzer(
                     checkCancelled = control::checkCancelled,
                 )
                 control.checkCancelled()
-                val aliases = mutableSetOf<String>()
                 val consumedRoots = mutableSetOf<Int>()
-                ROOT_ALIAS_DECLARATION.findAll(sourceWithoutComments)
-                    .filter { it.startsInCode(codeOnly) }
-                    .forEach { declaration ->
-                    val kind = declaration.groupValues[1]
-                    val alias = declaration.groupValues[2]
-                    val expression = declaration.groupValues[3].trim()
-                    val dynamicExpression = JavaScriptLexicalMask.mask(
-                        expression,
-                        maskLiterals = true,
-                        checkCancelled = control::checkCancelled,
-                    )
-                    val directAlias = aliases.singleOrNull { it == expression }
-                    val referencesAlias = aliases.any {
-                        Regex(
-                            """\b${Regex.escape(it)}\b""" +
-                                """(?!\s*(?:\?\.|\.|\[\s*["']))""",
-                        ).containsMatchIn(dynamicExpression)
-                    }
-                    if (kind == "const" &&
-                        (STATIC_ROOT_EXPRESSION.matches(expression) || directAlias != null)
-                    ) {
-                        aliases += alias
-                        if (STATIC_ROOT_EXPRESSION.matches(expression)) {
-                            ROOT_TOKEN.findAll(declaration.groups[3]!!.value).forEach { root ->
-                                consumedRoots += declaration.groups[3]!!.range.first +
-                                    root.range.first
-                            }
-                        }
-                    } else if (
-                        DYNAMIC_GLOBAL_ROOT_LOOKUP.containsMatchIn(dynamicExpression) ||
-                        referencesAlias
-                    ) {
-                        dynamicUsage = true
-                    }
-                }
+                val aliases = StaticExtensionApiAliasResolver().resolve(
+                    sourceWithoutComments,
+                    codeOnly,
+                    control::checkCancelled,
+                )
+                found += aliases.namespaces
+                consumedRoots += aliases.consumedRootOffsets
+                dynamicUsage = dynamicUsage || aliases.dynamicUsage
                 control.checkCancelled()
                 API_CALL_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
@@ -359,40 +331,6 @@ class CompatibilityAnalyzer(
                         match.range.first
                 }
                 control.checkCancelled()
-                DESTRUCTURING_REGEX.findAll(sourceWithoutComments)
-                    .filter { it.startsInCode(codeOnly) }
-                    .forEach { match ->
-                    consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
-                        match.range.first
-                    match.groupValues[1].split(',').forEach { binding ->
-                        val namespace = binding.trim()
-                            .substringBefore(':')
-                            .substringBefore('=')
-                            .trim()
-                        if (API_NAME.matches(namespace)) found += namespace
-                    }
-                }
-                control.checkCancelled()
-                aliases.forEach { alias ->
-                    control.checkCancelled()
-                    aliasMemberRegex(alias).findAll(sourceWithoutComments)
-                        .filter { it.startsInCode(codeOnly) }
-                        .forEach { match ->
-                        found += match.groupValues[1]
-                    }
-                    control.checkCancelled()
-                    aliasBracketRegex(alias).findAll(sourceWithoutComments)
-                        .filter { it.startsInCode(codeOnly) }
-                        .forEach { match ->
-                        found += match.groupValues[1]
-                    }
-                    control.checkCancelled()
-                    if (aliasDynamicBracketRegex(alias).findAll(sourceWithoutComments)
-                            .any { it.startsInCode(codeOnly) }
-                    ) {
-                        dynamicUsage = true
-                    }
-                }
                 control.checkCancelled()
                 if (DYNAMIC_BRACKET_REGEX.findAll(sourceWithoutComments)
                         .any { it.startsInCode(codeOnly) }
@@ -591,25 +529,11 @@ class CompatibilityAnalyzer(
                 """(?:chrome|browser)\s*(?:\?\.)?\s*""" +
                     """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
             )
-        private val DESTRUCTURING_REGEX =
-            Regex(
-                """(?:const|let|var)\s*\{([^}]*)\}\s*=\s*""" +
-                    """(?:(?:globalThis|window|self)\s*\.\s*)?(?:chrome|browser)\b""",
-            )
         private val DYNAMIC_BRACKET_REGEX =
             Regex("""(?:chrome|browser)\s*(?:\?\.)?\s*\[\s*(?!["'])""")
-        private val ROOT_ALIAS_DECLARATION = Regex(
-            """\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\r\n]+)""",
-        )
-        private val STATIC_ROOT_EXPRESSION = Regex(
-            """(?:(?:globalThis|window|self)\s*(?:\?\.|\.)\s*)?(?:chrome|browser)""",
-        )
-        private val DYNAMIC_GLOBAL_ROOT_LOOKUP =
-            Regex("""(?:globalThis|window|self)\s*\[""")
         private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
         private val ROOT_SCHEME_LITERAL_REGEX =
             Regex("""\b(?:chrome|browser)\b(?:-extension)?\s*:""")
-        private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")
         private val KNOWN_API_NAMESPACES = setOf(
@@ -651,17 +575,5 @@ class CompatibilityAnalyzer(
             "windows",
         )
 
-        private fun aliasMemberRegex(alias: String) = Regex(
-            """\b${Regex.escape(alias)}\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""",
-        )
-
-        private fun aliasBracketRegex(alias: String) = Regex(
-            """\b${Regex.escape(alias)}\s*(?:\?\.)?\s*""" +
-                """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
-        )
-
-        private fun aliasDynamicBracketRegex(alias: String) = Regex(
-            """\b${Regex.escape(alias)}\s*(?:\?\.)?\s*\[\s*(?!["'])""",
-        )
     }
 }

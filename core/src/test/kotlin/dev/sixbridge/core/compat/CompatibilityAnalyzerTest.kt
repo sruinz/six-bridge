@@ -352,6 +352,40 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `resolves immutable globalThis destructured API aliases`() {
+        val source = Files.createTempDirectory("six-globalthis-destructured-apis")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Immutable global aliases",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            const root = globalThis;
+            const { chrome: C, browser: B } = root;
+            C.userScripts.register([]);
+            B.scripting.executeScript({});
+            """.trimIndent(),
+        )
+
+        val report = CompatibilityAnalyzer().analyzeStable(
+            source,
+            profile,
+            sourceSha256 = null,
+        )
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(setOf("scripting", "userScripts"), report.usedApis)
+        assertEquals(setOf("scripting", "userScripts"), report.unsupportedApis)
+        assertTrue(report.issues.none { it.code == "api_usage_dynamic" })
+    }
+
+    @Test
     fun `marks an unprovable indirect root alias unknown`() {
         val source = Files.createTempDirectory("six-indirect-dynamic-alias")
         source.resolve("manifest.json").writeText(
