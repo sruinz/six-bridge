@@ -35,7 +35,10 @@ internal object BrowserProfileDigest {
         digest.list("profileDifferences", profile.profileDifferences)
         digest.set("supportedFeatures", profile.supportedFeatures)
         digest.set("unavailableFeatures", profile.unavailableFeatures)
-        digest.capabilities("apiCapabilities", profile.apiCapabilities)
+        if (profile.apiCapabilities.isNotEmpty()) {
+            digest.field("profile.extension", "api-capabilities-v1")
+            digest.capabilities("apiCapabilities", profile.apiCapabilities)
+        }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 

@@ -1,0 +1,47 @@
+package dev.sixbridge.core.profile
+
+object OldBrowserProfileClient {
+    @JvmStatic
+    fun run(): List<Any?> {
+        val defaulted = BrowserProfile(
+            browserPackage = "default-package",
+            versionName = "default-version",
+            versionCode = 1,
+            majorVersion = 31,
+            supportedApis = setOf("default-supported"),
+            wrapperContract = WrapperContract.complete(),
+            sourceApkSha256 = "default-source",
+        )
+        val direct = BrowserProfile(
+            "direct-package", "direct-version", 2, 32,
+            setOf("direct-supported"), setOf("direct-detected"),
+            WrapperContract(false, true, false, true),
+            "direct-source", "direct-installation", "direct-signer",
+            listOf("direct-difference"), setOf("direct-feature"),
+            setOf("direct-unavailable"),
+        )
+        val (
+            browserPackage, versionName, versionCode, majorVersion,
+            supportedApis, detectedApis, wrapperContract, sourceApkSha256,
+            installationApkSetSha256, sourceApkSignerSha256, profileDifferences,
+            supportedFeatures, unavailableFeatures,
+        ) = direct
+        val components = listOf(
+            browserPackage, versionName, versionCode, majorVersion,
+            supportedApis, detectedApis, wrapperContract, sourceApkSha256,
+            installationApkSetSha256, sourceApkSignerSha256, profileDifferences,
+            supportedFeatures, unavailableFeatures,
+        )
+        val directCopy = direct.copy(
+            "copy-package", "copy-version", 3, 33,
+            setOf("copy-supported"), setOf("copy-detected"),
+            WrapperContract(true, false, true, false),
+            "copy-source", "copy-installation", "copy-signer",
+            listOf("copy-difference"), setOf("copy-feature"),
+            setOf("copy-unavailable"),
+        )
+        val defaultCopy = direct.copy(versionName = "default-copy-version")
+
+        return listOf(defaulted, components, directCopy, defaultCopy)
+    }
+}

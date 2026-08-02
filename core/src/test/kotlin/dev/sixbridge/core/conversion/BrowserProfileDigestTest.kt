@@ -6,7 +6,10 @@ import dev.sixbridge.core.profile.ApiCapabilityStatus
 import dev.sixbridge.core.profile.ApiExecutionContext
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileDigest
+import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
+import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -26,6 +29,19 @@ class BrowserProfileDigestTest {
         supportedFeatures = linkedSetOf("storage.local", "feature.a"),
         unavailableFeatures = linkedSetOf("storage.sync", "feature.b"),
     )
+
+    @Test
+    fun `빈 capability profile은 legacy canonical digest를 byte for byte 유지한다`() {
+        val profile = BrowserProfileJson.decode(
+            Files.readString(Path.of("../profiles/sbrowser-30.0.2.61.json")),
+        )
+
+        assertEquals(emptyList(), profile.apiCapabilities)
+        assertEquals(
+            "d92d55032ac5520a0546f9d5bb0d72f1444de766ae381febc294a1ede46d7e75",
+            profile.canonicalSha256(),
+        )
+    }
 
     @Test
     fun `is deterministic for unordered profile sets`() {
