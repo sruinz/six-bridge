@@ -147,7 +147,21 @@ class ApiProbeCatalogTest {
             expectedSources,
             entries.filterValues { it.sourceUrls.isNotEmpty() }.mapValues { it.value.sourceUrls },
         )
-        assertTrue(expectedSources.keys.all { !entries.getValue(it).reason.isNullOrBlank() })
+        assertEquals(
+            mapOf(
+                "clipboard" to
+                    "clipboard는 ChromeOS 전용 플랫폼 앱 API이므로 삼성 인터넷 runtime probe 대상에서 제외한다.",
+                "declarativeWebRequest" to
+                    "declarativeWebRequest는 Beta 채널의 Manifest V2 이하 API이므로 runtime probe 대상에서 제외한다.",
+                "browserAction" to
+                    "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
+                "pageAction" to
+                    "pageAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
+                "protocolHandlers" to
+                    "protocol_handlers는 ExtensionManifest dictionary의 manifest schema이며 JavaScript namespace가 아니다.",
+            ),
+            entries.filterValues { it.reason != null }.mapValues { it.value.reason },
+        )
         assertEquals(
             CatalogDisposition.PLATFORM_RESTRICTED,
             entries.getValue("clipboard").disposition,
@@ -158,6 +172,42 @@ class ApiProbeCatalogTest {
             },
         )
         assertEquals(CatalogDisposition.INTERNAL, entries.getValue("protocolHandlers").disposition)
+    }
+
+    @Test
+    fun `public load는 비 PROBE의 exact provenance와 disposition 변조를 거부한다`() {
+        val invalid = listOf(
+            catalogWithEntries(
+                BROWSER_ACTION_ENTRY.replace(
+                    "https://developer.chrome.com/docs/extensions/mv2/reference/browserAction",
+                    "https://developer.chrome.com/docs/extensions/mv2/reference/pageAction",
+                ),
+            ),
+            catalogWithEntries(
+                BROWSER_ACTION_ENTRY.replace(
+                    "runtime probe 대상에서 제외한다.",
+                    "임의로 분류한다.",
+                ),
+            ),
+            catalogWithEntries(
+                BROWSER_ACTION_ENTRY.replace("\"sourceUrls\":", "\"removedSourceUrls\":"),
+            ),
+            catalogWithEntries(
+                BROWSER_ACTION_ENTRY.replace("\"reason\":", "\"removedReason\":"),
+            ),
+            catalogWithEntries(
+                BROWSER_ACTION_ENTRY.replace("\"legacy_mv2\"", "\"internal\""),
+            ),
+            catalogWithEntries(
+                VALID_NON_PROBE_ENTRY
+                    .replace("\"sourceUrls\": []", "\"sourceUrls\": [\"$OFFICIAL_SOURCE\"]")
+                    .replace("\"reason\": null", "\"reason\": \"임의 근거\""),
+            ),
+        )
+
+        invalid.forEach { json ->
+            assertFailsWith<IllegalArgumentException> { load(json) }
+        }
     }
 
     @Test
@@ -490,6 +540,24 @@ class ApiProbeCatalogTest {
               "groupId": null,
               "sourceUrls": [],
               "reason": null,
+              "cases": []
+            }
+            """.trimIndent()
+
+        private const val OFFICIAL_SOURCE =
+            "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
+
+        private val BROWSER_ACTION_ENTRY =
+            """
+            {
+              "namespace": "browserAction",
+              "disposition": "legacy_mv2",
+              "groupId": null,
+              "sourceUrls": [
+                "https://developer.chrome.com/docs/extensions/mv2/reference/browserAction",
+                "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
+              ],
+              "reason": "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
               "cases": []
             }
             """.trimIndent()

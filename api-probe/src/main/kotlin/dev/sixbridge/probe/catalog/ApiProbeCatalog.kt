@@ -65,6 +65,12 @@ data class ProbeCatalogEntry(
     val cases: List<ProbeCatalogCase>,
 )
 
+private data class NonProbeContract(
+    val disposition: CatalogDisposition,
+    val sourceUrls: Set<String>,
+    val reason: String?,
+)
+
 class ApiProbeCatalog private constructor(
     entries: List<ProbeCatalogEntry>,
 ) {
@@ -203,35 +209,122 @@ class ApiProbeCatalog private constructor(
             "https://developer.chrome.com/",
             "https://chromium.googlesource.com/",
         )
-        private val platformRestrictedNamespaces = setOf(
-            "automation",
-            "clipboard",
-            "fileHandlers",
-            "gcm",
-            "inputMethodPrivate",
-            "ttsEngine",
-        )
-        private val legacyAppNamespaces = setOf("app", "app.runtime")
-        private val legacyMv2Namespaces = setOf(
-            "browserAction",
-            "declarativeWebRequest",
-            "pageAction",
-        )
-        private val internalNamespaces = setOf(
-            "appstoreService",
-            "clientService",
-            "dom",
-            "events",
-            "extensionTypes",
-            "iconVariants",
-            "protocolHandlers",
-            "scriptsInternal",
-            "sixLogging",
-            "trans",
-            "types",
-            "webRequestInternal",
-            "webViewRequest",
-            "webstorePrivate",
+        private val exactNonProbeContracts = mapOf(
+            "app" to NonProbeContract(CatalogDisposition.LEGACY_APP, emptySet(), null),
+            "app.runtime" to NonProbeContract(
+                CatalogDisposition.LEGACY_APP,
+                emptySet(),
+                null,
+            ),
+            "appstoreService" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "automation" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                emptySet(),
+                null,
+            ),
+            "browserAction" to NonProbeContract(
+                CatalogDisposition.LEGACY_MV2,
+                setOf(
+                    "https://developer.chrome.com/docs/extensions/mv2/reference/browserAction",
+                    "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls",
+                ),
+                "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
+            ),
+            "clientService" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "clipboard" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                setOf("https://developer.chrome.com/docs/apps/reference/clipboard"),
+                "clipboard는 ChromeOS 전용 플랫폼 앱 API이므로 삼성 인터넷 runtime probe 대상에서 제외한다.",
+            ),
+            "declarativeWebRequest" to NonProbeContract(
+                CatalogDisposition.LEGACY_MV2,
+                setOf(
+                    "https://developer.chrome.com/docs/extensions/mv2/reference/declarativeWebRequest",
+                ),
+                "declarativeWebRequest는 Beta 채널의 Manifest V2 이하 API이므로 runtime probe 대상에서 제외한다.",
+            ),
+            "dom" to NonProbeContract(CatalogDisposition.INTERNAL, emptySet(), null),
+            "events" to NonProbeContract(CatalogDisposition.INTERNAL, emptySet(), null),
+            "extensionTypes" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "fileHandlers" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                emptySet(),
+                null,
+            ),
+            "gcm" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                emptySet(),
+                null,
+            ),
+            "iconVariants" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "inputMethodPrivate" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                emptySet(),
+                null,
+            ),
+            "pageAction" to NonProbeContract(
+                CatalogDisposition.LEGACY_MV2,
+                setOf(
+                    "https://developer.chrome.com/docs/extensions/mv2/reference/pageAction",
+                    "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls",
+                ),
+                "pageAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
+            ),
+            "protocolHandlers" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                setOf(
+                    "https://chromium.googlesource.com/chromium/src/+/HEAD/extensions/common/api/protocol_handlers.webidl",
+                ),
+                "protocol_handlers는 ExtensionManifest dictionary의 manifest schema이며 JavaScript namespace가 아니다.",
+            ),
+            "scriptsInternal" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "sixLogging" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "trans" to NonProbeContract(CatalogDisposition.INTERNAL, emptySet(), null),
+            "ttsEngine" to NonProbeContract(
+                CatalogDisposition.PLATFORM_RESTRICTED,
+                emptySet(),
+                null,
+            ),
+            "types" to NonProbeContract(CatalogDisposition.INTERNAL, emptySet(), null),
+            "webRequestInternal" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "webViewRequest" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
+            "webstorePrivate" to NonProbeContract(
+                CatalogDisposition.INTERNAL,
+                emptySet(),
+                null,
+            ),
         )
         private val exactProbeDescriptors = mapOf(
             "action" to "user-interface|getTitle|EXTENSION_PAGE|SAFE_CALL||action|VERIFIED|||",
@@ -604,17 +697,20 @@ class ApiProbeCatalog private constructor(
             require(entry.namespace in BrowserProfile.BASELINE_APIS) {
                 "API probe namespace는 삼성 30 baseline에 포함되어야 합니다."
             }
-            val expectedDisposition = when (entry.namespace) {
-                in platformRestrictedNamespaces -> CatalogDisposition.PLATFORM_RESTRICTED
-                in legacyAppNamespaces -> CatalogDisposition.LEGACY_APP
-                in legacyMv2Namespaces -> CatalogDisposition.LEGACY_MV2
-                in internalNamespaces -> CatalogDisposition.INTERNAL
-                else -> CatalogDisposition.PROBE
-            }
+            val nonProbeContract = exactNonProbeContracts[entry.namespace]
+            val expectedDisposition = nonProbeContract?.disposition ?: CatalogDisposition.PROBE
             require(entry.disposition == expectedDisposition) {
                 "API probe baseline disposition이 정확하지 않습니다."
             }
-            if (expectedDisposition != CatalogDisposition.PROBE) return
+            if (nonProbeContract != null) {
+                require(
+                    entry.sourceUrls == nonProbeContract.sourceUrls &&
+                        entry.reason == nonProbeContract.reason,
+                ) {
+                    "API probe 비 PROBE provenance가 정확하지 않습니다."
+                }
+                return
+            }
             val case = entry.cases.singleOrNull()
                 ?: throw IllegalArgumentException("baseline PROBE는 case를 정확히 하나 가져야 합니다.")
             require(exactProbeDescriptors[entry.namespace] == descriptor(entry.groupId, case)) {

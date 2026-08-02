@@ -59,7 +59,7 @@
                 "https://developer.chrome.com/docs/extensions/mv2/reference/browserAction",
                 "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
             ],
-            "reason": "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 노출 여부만 확인한다.",
+            "reason": "browserAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
             "cases": []
         },
         {"namespace": "clientService", "disposition": "internal", "groupId": null,
@@ -72,7 +72,7 @@
             "sourceUrls": [
                 "https://developer.chrome.com/docs/apps/reference/clipboard"
             ],
-            "reason": "ChromeOS 전용 플랫폼 앱 API이지만 삼성의 비표준 노출 가능성만 확인하며 setImageData는 호출하지 않는다.",
+            "reason": "clipboard는 ChromeOS 전용 플랫폼 앱 API이므로 삼성 인터넷 runtime probe 대상에서 제외한다.",
             "cases": []
         },
         {
@@ -219,7 +219,7 @@
             "sourceUrls": [
                 "https://developer.chrome.com/docs/extensions/mv2/reference/declarativeWebRequest"
             ],
-            "reason": "Beta 채널의 Manifest V2 이하 API이므로 삼성의 alias 노출 여부만 확인한다.",
+            "reason": "declarativeWebRequest는 Beta 채널의 Manifest V2 이하 API이므로 runtime probe 대상에서 제외한다.",
             "cases": []
         },
         {"namespace": "dom", "disposition": "internal", "groupId": null,
@@ -403,7 +403,7 @@
                 "https://developer.chrome.com/docs/extensions/mv2/reference/pageAction",
                 "https://developer.chrome.com/docs/extensions/develop/migrate/api-calls"
             ],
-            "reason": "pageAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 노출 여부만 확인한다.",
+            "reason": "pageAction은 Manifest V2 API이며 Manifest V3에서는 action으로 통합되므로 runtime probe 대상에서 제외한다.",
             "cases": []
         },
         {
