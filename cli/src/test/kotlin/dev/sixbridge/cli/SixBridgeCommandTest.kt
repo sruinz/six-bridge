@@ -490,6 +490,61 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `probe NIO file restore move 완료 후 예외는 competitor 복원 완료로 판정한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-file-restore-then-fail")
+        val target = workspace.resolve("candidate.json").also { it.writeText("published") }
+        val nio = NioProbePublicationFileOps { source, destination ->
+            if (source == target && destination.fileName.toString() == "entry") {
+                source.writeText("competitor-owned")
+                Files.move(source, destination)
+            } else {
+                Files.move(source, destination)
+                if (source.fileName.toString() == "entry" && destination == target) {
+                    throw IOException("injected failure after completed file restore")
+                }
+            }
+        }
+        val expected = nio.snapshot(target)
+
+        val result = nio.quarantineAfterFailure(target, expected)
+
+        assertEquals(ProbeRollbackState.COMPETITOR_RESTORED, result.state)
+        assertTrue(result.publicTargetChanged)
+        assertEquals("competitor-owned", target.readText())
+        assertFalse(result.quarantinePath.resolve("entry").exists())
+        assertTrue("completed file restore" in result.failure?.cause?.message.orEmpty())
+    }
+
+    @Test
+    fun `probe NIO directory restore move 완료 후 예외는 nested competitor tree 복원으로 판정한다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-nio-directory-restore-then-fail")
+        val target = workspace.resolve("sources").also(Files::createDirectory)
+        target.resolve("generated.txt").writeText("published")
+        val nio = NioProbePublicationFileOps { source, destination ->
+            if (source == target && destination.fileName.toString() == "entry") {
+                source.resolve("group").also(Files::createDirectory)
+                    .resolve("user-added.txt").writeText("competitor-owned")
+                Files.move(source, destination)
+            } else {
+                Files.move(source, destination)
+                if (source.fileName.toString() == "entry" && destination == target) {
+                    throw IOException("injected failure after completed directory restore")
+                }
+            }
+        }
+        val expected = nio.snapshot(target)
+
+        val result = nio.quarantineAfterFailure(target, expected)
+
+        assertEquals(ProbeRollbackState.COMPETITOR_RESTORED, result.state)
+        assertTrue(result.publicTargetChanged)
+        assertEquals("published", target.resolve("generated.txt").readText())
+        assertEquals("competitor-owned", target.resolve("group/user-added.txt").readText())
+        assertFalse(result.quarantinePath.resolve("entry").exists())
+        assertTrue("completed directory restore" in result.failure?.cause?.message.orEmpty())
+    }
+
+    @Test
     fun `probe NIO quarantine 2차 검사 직후 추가된 경쟁자 파일을 절대 삭제하지 않는다`() {
         val workspace = Files.createTempDirectory("six-cli-probe-nio-after-inspection-race")
         val target = workspace.resolve("sources").also(Files::createDirectory)

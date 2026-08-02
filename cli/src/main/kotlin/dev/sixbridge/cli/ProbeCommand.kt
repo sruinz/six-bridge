@@ -444,12 +444,13 @@ internal class NioProbePublicationFileOps(
         try {
             mover(path, entry)
         } catch (moveFailure: Exception) {
-            return classifyAfterFailedMove(
+            return classifyAfterMoveException(
                 path = path,
                 entry = entry,
                 quarantine = quarantine,
                 expected = expected,
                 moveFailure = moveFailure,
+                direction = ProbeRollbackMoveDirection.TO_QUARANTINE,
             )
         }
         val quarantinedSnapshot = runCatching { snapshot(entry) }
@@ -470,55 +471,91 @@ internal class NioProbePublicationFileOps(
                 publicTargetChanged = true,
             )
         }
+        val inspectionFailure = quarantinedSnapshot.exceptionOrNull()
+            ?: confirmedSnapshot.exceptionOrNull()
+        val restoreExpected = confirmedSnapshot.getOrNull()?.takeIf { it.stable }
+            ?: quarantinedSnapshot.getOrNull()?.takeIf { it.stable }
         return try {
             mover(entry, path)
             ProbeRollbackResult(
                 ProbeRollbackState.COMPETITOR_RESTORED,
                 quarantine,
                 publicTargetChanged = true,
-                failure = (quarantinedSnapshot.exceptionOrNull()
-                    ?: confirmedSnapshot.exceptionOrNull())?.let {
+                failure = inspectionFailure?.let {
                     IOException("quarantine target을 안정적으로 검사하지 못했습니다.", it)
                 },
             )
         } catch (restoreFailure: Exception) {
-            ProbeRollbackResult(
-                ProbeRollbackState.RESTORE_COLLISION,
-                quarantine,
-                publicTargetChanged = true,
-                failure = IOException(
-                    "rollback quarantine의 경쟁자 target을 복원하지 못했습니다: $entry",
-                    restoreFailure,
-                ),
+            classifyAfterMoveException(
+                path = path,
+                entry = entry,
+                quarantine = quarantine,
+                expected = restoreExpected,
+                moveFailure = restoreFailure,
+                direction = ProbeRollbackMoveDirection.TO_PUBLIC,
+                priorFailure = inspectionFailure,
             )
         }
     }
 
-    private fun classifyAfterFailedMove(
+    private fun classifyAfterMoveException(
         path: Path,
         entry: Path,
         quarantine: Path,
-        expected: ProbePublicationSnapshot,
+        expected: ProbePublicationSnapshot?,
         moveFailure: Exception,
+        direction: ProbeRollbackMoveDirection,
+        priorFailure: Throwable? = null,
     ): ProbeRollbackResult {
         val entryExists = Files.exists(entry, NOFOLLOW_LINKS)
         val publicExists = Files.exists(path, NOFOLLOW_LINKS)
-        val publicSnapshot = if (publicExists && !Files.isSymbolicLink(path)) {
+        val publicIsSymbolicLink = publicExists && Files.isSymbolicLink(path)
+        val publicSnapshot = if (publicExists && !publicIsSymbolicLink) {
             runCatching { snapshot(path) }
         } else {
             null
         }
+        val entrySnapshot = if (entryExists && !Files.isSymbolicLink(entry)) {
+            runCatching { snapshot(entry) }
+        } else if (entryExists) {
+            Result.failure(IOException("quarantine entry가 symlink로 변경되었습니다."))
+        } else {
+            null
+        }
         val inspectedPublic = publicSnapshot?.getOrNull()
-        val publicIsStableCompetitor = inspectedPublic?.let {
+        val publicMatchesExpected = expected != null && inspectedPublic?.let {
+            it.stable && it.entries == expected.entries
+        } == true
+        val publicIsStableCompetitor = expected != null && inspectedPublic?.let {
             it.stable && it.entries != expected.entries
         } == true
-        val publicChanged = !publicExists || publicIsStableCompetitor
+        val publicChanged = when (direction) {
+            ProbeRollbackMoveDirection.TO_PUBLIC -> true
+            ProbeRollbackMoveDirection.TO_QUARANTINE ->
+                !publicExists || publicIsSymbolicLink || publicIsStableCompetitor
+        }
         val moveDiagnostic = IOException(
             "rollback target move가 예외로 종료되어 파일 상태를 재검사했습니다.",
             moveFailure,
         )
+        priorFailure?.let(moveDiagnostic::addSuppressed)
+        publicSnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+        entrySnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
+
+        if (direction == ProbeRollbackMoveDirection.TO_PUBLIC) {
+            return ProbeRollbackResult(
+                state = if (publicMatchesExpected && !entryExists) {
+                    ProbeRollbackState.COMPETITOR_RESTORED
+                } else {
+                    ProbeRollbackState.RESTORE_COLLISION
+                },
+                quarantinePath = quarantine,
+                publicTargetChanged = publicChanged,
+                failure = moveDiagnostic,
+            )
+        }
+
         if (!entryExists) {
-            publicSnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
             return ProbeRollbackResult(
                 state = if (publicIsStableCompetitor) {
                     ProbeRollbackState.COMPETITOR_RESTORED
@@ -530,14 +567,7 @@ internal class NioProbePublicationFileOps(
                 failure = moveDiagnostic,
             )
         }
-        val entrySnapshot = if (!Files.isSymbolicLink(entry)) {
-            runCatching { snapshot(entry) }
-        } else {
-            Result.failure(IOException("quarantine entry가 symlink로 변경되었습니다."))
-        }
         if (publicExists) {
-            publicSnapshot?.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
-            entrySnapshot.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
             return ProbeRollbackResult(
                 ProbeRollbackState.RESTORE_COLLISION,
                 quarantine,
@@ -545,9 +575,8 @@ internal class NioProbePublicationFileOps(
                 failure = moveDiagnostic,
             )
         }
-        val inspectedEntry = entrySnapshot.getOrNull()
+        val inspectedEntry = entrySnapshot?.getOrNull()
         if (inspectedEntry == null || !inspectedEntry.stable) {
-            entrySnapshot.exceptionOrNull()?.let(moveDiagnostic::addSuppressed)
             return ProbeRollbackResult(
                 ProbeRollbackState.RESTORE_COLLISION,
                 quarantine,
@@ -555,7 +584,7 @@ internal class NioProbePublicationFileOps(
                 failure = moveDiagnostic,
             )
         }
-        if (inspectedEntry.entries == expected.entries) {
+        if (expected != null && inspectedEntry.entries == expected.entries) {
             return ProbeRollbackResult(
                 ProbeRollbackState.OWN_OUTPUT_ISOLATED,
                 quarantine,
@@ -572,16 +601,21 @@ internal class NioProbePublicationFileOps(
                 failure = moveDiagnostic,
             )
         } catch (restoreFailure: Exception) {
-            ProbeRollbackResult(
-                ProbeRollbackState.RESTORE_COLLISION,
-                quarantine,
-                publicTargetChanged = true,
-                failure = IOException(
-                    "move 예외 후 quarantine target을 복원하지 못했습니다: $entry",
-                    restoreFailure,
-                ).also { it.addSuppressed(moveDiagnostic) },
+            classifyAfterMoveException(
+                path = path,
+                entry = entry,
+                quarantine = quarantine,
+                expected = inspectedEntry,
+                moveFailure = restoreFailure,
+                direction = ProbeRollbackMoveDirection.TO_PUBLIC,
+                priorFailure = moveDiagnostic,
             )
         }
+    }
+
+    private enum class ProbeRollbackMoveDirection {
+        TO_QUARANTINE,
+        TO_PUBLIC,
     }
 
     private fun readTreeSnapshot(root: Path): Map<String, ProbePublicationIdentity> {
