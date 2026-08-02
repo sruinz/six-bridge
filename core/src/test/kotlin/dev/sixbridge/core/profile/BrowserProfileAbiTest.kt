@@ -5,6 +5,7 @@ import java.util.Base64
 import kotlin.jvm.internal.DefaultConstructorMarker
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class BrowserProfileAbiTest {
@@ -109,7 +110,9 @@ class BrowserProfileAbiTest {
             Set::class.java,
             Set::class.java,
         )
-        BrowserProfile::class.java.getDeclaredConstructor(*legacyParameters)
+        val legacyConstructor =
+            BrowserProfile::class.java.getDeclaredConstructor(*legacyParameters)
+        assertFalse(legacyConstructor.isSynthetic)
         val defaultConstructor = BrowserProfile::class.java.getDeclaredConstructor(
             *legacyParameters,
             Int::class.javaPrimitiveType,
@@ -120,7 +123,9 @@ class BrowserProfileAbiTest {
         (1..13).forEach { index ->
             BrowserProfile::class.java.getDeclaredMethod("component$index")
         }
-        BrowserProfile::class.java.getDeclaredMethod("copy", *legacyParameters)
+        val legacyCopy =
+            BrowserProfile::class.java.getDeclaredMethod("copy", *legacyParameters)
+        assertFalse(legacyCopy.isSynthetic)
         val copyDefault = BrowserProfile::class.java.getDeclaredMethod(
             "copy\$default",
             BrowserProfile::class.java,
@@ -129,6 +134,86 @@ class BrowserProfileAbiTest {
             Any::class.java,
         )
         assertTrue(Modifier.isStatic(copyDefault.modifiers))
+    }
+
+    @Test
+    fun `Java source는 legacy 13 parameter constructor와 copy를 호출한다`() {
+        val profile = BrowserProfileJavaAbiClient.run()
+
+        assertEquals("java-copy-package", profile.browserPackage)
+        assertEquals("java-copy-version", profile.versionName)
+        assertEquals(14L, profile.versionCode)
+        assertEquals(emptyList(), profile.apiCapabilities)
+    }
+
+    @Test
+    fun `Kotlin exact 13 arity callable reference는 constructor와 copy를 호출한다`() {
+        val constructor: (
+            String,
+            String,
+            Long,
+            Int,
+            Set<String>,
+            Set<String>,
+            WrapperContract,
+            String,
+            String,
+            String,
+            List<String>,
+            Set<String>,
+            Set<String>,
+        ) -> BrowserProfile = ::BrowserProfile
+        val copy: (
+            BrowserProfile,
+            String,
+            String,
+            Long,
+            Int,
+            Set<String>,
+            Set<String>,
+            WrapperContract,
+            String,
+            String,
+            String,
+            List<String>,
+            Set<String>,
+            Set<String>,
+        ) -> BrowserProfile = BrowserProfile::copy
+        val profile = constructor(
+            "kotlin-package",
+            "kotlin-version",
+            13,
+            30,
+            setOf("kotlin-supported"),
+            setOf("kotlin-detected"),
+            WrapperContract.complete(),
+            "kotlin-source",
+            "kotlin-installation",
+            "kotlin-signer",
+            listOf("kotlin-difference"),
+            setOf("kotlin-feature"),
+            setOf("kotlin-unavailable"),
+        )
+
+        val copied = copy(
+            profile,
+            "kotlin-copy-package",
+            profile.versionName,
+            profile.versionCode,
+            profile.majorVersion,
+            profile.supportedApis,
+            profile.detectedApis,
+            profile.wrapperContract,
+            profile.sourceApkSha256,
+            profile.installationApkSetSha256,
+            profile.sourceApkSignerSha256,
+            profile.profileDifferences,
+            profile.supportedFeatures,
+            profile.unavailableFeatures,
+        )
+
+        assertEquals("kotlin-copy-package", copied.browserPackage)
+        assertEquals(emptyList(), copied.apiCapabilities)
     }
 
     @Test

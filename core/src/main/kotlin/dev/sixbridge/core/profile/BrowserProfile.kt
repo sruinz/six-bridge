@@ -45,7 +45,6 @@ class BrowserProfile(
     val unavailableFeatures: Set<String> = emptySet(),
     apiCapabilities: List<ApiCapabilityEvidence> = emptyList(),
 ) {
-    @Deprecated("legacy binary ABI bridge", level = DeprecationLevel.HIDDEN)
     constructor(
         browserPackage: String,
         versionName: String,
@@ -176,7 +175,6 @@ class BrowserProfile(
         apiCapabilities,
     )
 
-    @Deprecated("legacy binary ABI bridge", level = DeprecationLevel.HIDDEN)
     fun copy(
         browserPackage: String,
         versionName: String,
