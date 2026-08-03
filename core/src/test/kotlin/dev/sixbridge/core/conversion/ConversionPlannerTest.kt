@@ -18,6 +18,39 @@ import kotlin.test.assertTrue
 
 class ConversionPlannerTest {
     @Test
+    fun `선택적 adapter는 승인한 경우에만 plan에 포함한다`() {
+        val report = reportWith(
+            decision("popup-native-autofill-guard", AdapterDisposition.OPTIONAL_APPROVAL),
+        )
+
+        val original = ConversionPlanner().plan(report, emptySet())
+        val protected = ConversionPlanner().plan(
+            report,
+            setOf("popup-native-autofill-guard"),
+        )
+
+        assertTrue(original.selectedAdapters.isEmpty())
+        assertEquals(
+            listOf("popup-native-autofill-guard"),
+            protected.selectedAdapters.map(SelectedAdapter::id),
+        )
+    }
+
+    @Test
+    fun `필수 승인은 선택적 승인 추가 후에도 누락할 수 없다`() {
+        val report = reportWith(
+            decision("action-popup-entry", AdapterDisposition.REQUIRES_APPROVAL),
+            decision("popup-native-autofill-guard", AdapterDisposition.OPTIONAL_APPROVAL),
+        )
+
+        val error = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(report, setOf("popup-native-autofill-guard"))
+        }
+
+        assertEquals(ConversionPlanningFailure.MISSING_REQUIRED_APPROVAL, error.failure)
+    }
+
+    @Test
     fun `selects automatic and explicitly approved adapters in registry order`() {
         val report = reportWith(
             decision("storage-fallback", AdapterDisposition.AUTOMATIC),

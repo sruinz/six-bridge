@@ -424,7 +424,9 @@ object BundleJson {
         "passthrough", "automatic", "requires-approval", "converted", "unavailable",
     )
     private val ADAPTER_RISKS = setOf("safe", "behavior-change")
-    private val ADAPTER_DISPOSITIONS = setOf("automatic", "requires-approval", "unavailable")
+    private val ADAPTER_DISPOSITIONS = setOf(
+        "automatic", "requires-approval", "optional-approval", "unavailable",
+    )
     private val EXTENSION_KEYS = setOf(
         "schemaVersion", "extensionId", "name", "version", "sourceKind", "crxSha256",
         "wrapperSha256", "wrapperPackage", "wrapperVersionCode", "signerSha256",

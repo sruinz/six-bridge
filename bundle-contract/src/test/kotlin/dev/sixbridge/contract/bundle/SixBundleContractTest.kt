@@ -17,6 +17,30 @@ import kotlin.test.assertFailsWith
 
 class SixBundleContractTest {
     @Test
+    fun `bundle contract는 optional approval disposition을 허용하고 보존한다`() {
+        val decision = ContractAdapterDecision(
+            id = "popup-native-autofill-guard",
+            version = 1,
+            risk = "behavior-change",
+            disposition = "optional-approval",
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 유지 시 팝업 포커스 충돌 위험이 남습니다."),
+        )
+        val compatibility = validContents().compatibility.copy(
+            adapterDecisions = listOf(decision),
+        )
+
+        assertEquals(
+            decision,
+            BundleJson.decodeCompatibility(
+                BundleJson.encodeCompatibility(compatibility),
+            ).adapterDecisions.single(),
+        )
+    }
+
+    @Test
     fun `v5 compatibility는 API 검증 상태를 보존하고 v4를 승격한다`() {
         val current = validContents().compatibility.copy(
             schemaVersion = 5,

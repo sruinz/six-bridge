@@ -64,10 +64,21 @@ class ConversionPlanner {
                     (
                         it.disposition == AdapterDisposition.REQUIRES_APPROVAL &&
                             it.id in approvals
+                        ) ||
+                    (
+                        it.disposition == AdapterDisposition.OPTIONAL_APPROVAL &&
+                            it.id in approvals
                         )
             }
             .sortedWith(compareBy(AdapterDecision::id, AdapterDecision::version))
-        if (immutableReport.adapterDecisions.isNotEmpty() && selected.isEmpty()) {
+        val optionalPresent = immutableReport.adapterDecisions.any {
+            it.disposition == AdapterDisposition.OPTIONAL_APPROVAL
+        }
+        if (
+            immutableReport.adapterDecisions.isNotEmpty() &&
+            selected.isEmpty() &&
+            !optionalPresent
+        ) {
             throw ConversionPlanningException(
                 ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
                 emptySet(),

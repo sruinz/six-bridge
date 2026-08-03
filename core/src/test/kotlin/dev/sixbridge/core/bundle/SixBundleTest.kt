@@ -52,7 +52,7 @@ class SixBundleTest {
                     id = "popup-fallback",
                     version = 2,
                     risk = AdapterRisk.BEHAVIOR_CHANGE,
-                    disposition = AdapterDisposition.REQUIRES_APPROVAL,
+                    disposition = AdapterDisposition.OPTIONAL_APPROVAL,
                     applied = false,
                     evidence = listOf(
                         SourceEvidence("popup.js", 4, "action popup"),
@@ -72,6 +72,10 @@ class SixBundleTest {
 
         assertEquals(descriptor, read.extension)
         assertEquals(compatibility, read.compatibility)
+        assertEquals(
+            AdapterDisposition.OPTIONAL_APPROVAL,
+            read.compatibility.adapterDecisions.single().disposition,
+        )
         assertContentEquals(wrapper.toFile().readBytes(), read.wrapperApk)
         ZipFile(output.toFile()).use { zip ->
             assertNotNull(zip.getEntry("wrapper.apk"))

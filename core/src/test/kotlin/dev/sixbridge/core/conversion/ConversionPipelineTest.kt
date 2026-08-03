@@ -32,6 +32,29 @@ import kotlin.test.assertTrue
 
 class ConversionPipelineTest {
     @Test
+    fun `reconciliation은 실행하지 않은 선택적 승인을 보존한다`() {
+        val optional = AdapterDecision(
+            id = "popup-native-autofill-guard",
+            version = 1,
+            risk = AdapterRisk.BEHAVIOR_CHANGE,
+            disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+            applied = false,
+            evidence = listOf(SourceEvidence("popup.js", 1, "popup guard")),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 유지"),
+        )
+
+        assertEquals(
+            listOf(optional),
+            reconcileAdapterDecisions(
+                beforeDecisions = listOf(optional),
+                appliedDecisions = emptyList(),
+                rawAfterDecisions = listOf(optional),
+            ),
+        )
+    }
+
+    @Test
     fun `pipeline use는 취소를 primary로 두고 실제 다중 정리 실패를 중첩 보존한다`() {
         val closeOrder = mutableListOf<String>()
         val materializationFailure = IllegalStateException("materialization cleanup")

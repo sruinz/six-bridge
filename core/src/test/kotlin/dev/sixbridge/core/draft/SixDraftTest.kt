@@ -39,6 +39,43 @@ import kotlin.io.path.writeText
 
 class SixDraftTest {
     @Test
+    fun `optional approval disposition을 canonical JSON으로 왕복한다`() {
+        val decision = AdapterDecision(
+            id = "popup-native-autofill-guard",
+            version = 1,
+            risk = AdapterRisk.BEHAVIOR_CHANGE,
+            disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 유지 시 팝업 포커스 충돌 위험이 남습니다."),
+        )
+        val report = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Popup",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+            adapterDecisions = listOf(decision),
+            sourceSha256 = "a".repeat(64),
+            browserProfileSha256 = "b".repeat(64),
+        )
+
+        val encoded = SixDraftJson.encodeCompatibility(report)
+
+        assertTrue("\"optional-approval\"" in encoded.decodeToString())
+        assertEquals(
+            AdapterDisposition.OPTIONAL_APPROVAL,
+            SixDraftJson.decodeCompatibility("compatibility.json", encoded)
+                .adapterDecisions.single().disposition,
+        )
+    }
+
+    @Test
     fun `compatibility schema 4는 API 검증 상태를 보존한다`() {
         val report = CompatibilityReport(
             status = CompatibilityStatus.PARTIAL,

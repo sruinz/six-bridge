@@ -447,7 +447,22 @@ class ConversionWorkspace private constructor(
         ) {
             "conversion plan automatic adapter selection이 완전하지 않습니다."
         }
-        check(report.adapterDecisions.isEmpty() || selected.isNotEmpty()) {
+        val requiresApproval = report.adapterDecisions
+            .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
+            .map { it.id to it.version }
+            .toSet()
+        check(
+            requiresApproval == selected
+                .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
+                .map { it.id to it.version }
+                .toSet(),
+        ) {
+            "conversion plan required approval adapter selection이 완전하지 않습니다."
+        }
+        val optionalPresent = report.adapterDecisions.any {
+            it.disposition == AdapterDisposition.OPTIONAL_APPROVAL
+        }
+        check(report.adapterDecisions.isEmpty() || selected.isNotEmpty() || optionalPresent) {
             "adapter 결정이 있는 conversion plan은 no-op일 수 없습니다."
         }
     }

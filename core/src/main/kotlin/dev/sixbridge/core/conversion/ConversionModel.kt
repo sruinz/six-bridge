@@ -16,6 +16,7 @@ enum class AdapterRisk {
 enum class AdapterDisposition {
     AUTOMATIC,
     REQUIRES_APPROVAL,
+    OPTIONAL_APPROVAL,
     UNAVAILABLE,
 }
 

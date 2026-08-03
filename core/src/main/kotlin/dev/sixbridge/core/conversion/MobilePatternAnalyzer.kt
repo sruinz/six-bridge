@@ -923,7 +923,8 @@ class MobilePatternAnalyzer private constructor(
                 it.disposition == AdapterDisposition.UNAVAILABLE
             } -> ConversionState.UNAVAILABLE
             decisions.any {
-                it.disposition == AdapterDisposition.REQUIRES_APPROVAL
+                it.disposition == AdapterDisposition.REQUIRES_APPROVAL ||
+                    it.disposition == AdapterDisposition.OPTIONAL_APPROVAL
             } -> ConversionState.REQUIRES_APPROVAL
             decisions.any {
                 it.disposition == AdapterDisposition.AUTOMATIC
@@ -965,11 +966,13 @@ class MobilePatternAnalyzer private constructor(
         const val DESKTOP_SELECTION_EVENT_BRIDGE =
             "desktop-selection-event-bridge"
         const val ACTION_POPUP_ENTRY = "action-popup-entry"
+        const val POPUP_NATIVE_AUTOFILL_GUARD = "popup-native-autofill-guard"
         const val STORAGE_FALLBACK = "storage-fallback"
 
         val ADAPTER_IDS: Set<String> = listOf(
             ACTION_POPUP_ENTRY,
             DESKTOP_SELECTION_EVENT_BRIDGE,
+            POPUP_NATIVE_AUTOFILL_GUARD,
             STORAGE_FALLBACK,
         ).sorted().toSet()
 
