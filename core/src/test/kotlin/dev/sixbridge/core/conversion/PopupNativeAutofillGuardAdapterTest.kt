@@ -89,6 +89,24 @@ class PopupNativeAutofillGuardAdapterTest {
     }
 
     @Test
+    fun `문자열 marker version은 applied로 재구성하지 않는다`() {
+        val prepared = prepare(fixtureInput(), setOf(ADAPTER_ID))
+        val transformed = extract(prepared.transformedSourceZip)
+        val canonical = MobilePatternAnalyzer().analyze(transformed, profile)
+            .adapterDecisions.single { it.id == ADAPTER_ID }
+        val marker = transformed.resolve(MARKER_PATH)
+        val markerText = marker.readText()
+
+        assertTrue(canonical.applied)
+        assertTrue("\"version\":1" in markerText)
+        marker.writeText(markerText.replace("\"version\":1", "\"version\":\"1\""))
+
+        val tampered = MobilePatternAnalyzer().analyze(transformed, profile)
+            .adapterDecisions.single { it.id == ADAPTER_ID }
+        assertFalse(tampered.applied)
+    }
+
+    @Test
     fun `원본 유지 선재은 source bytes를 변경하지 않는다`() {
         val input = fixtureInput()
 

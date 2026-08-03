@@ -222,9 +222,12 @@ internal class PopupAutofillRiskAnalyzer {
         if (!Files.isRegularFile(marker, NOFOLLOW_LINKS)) return null
         val json = Json.parseToJsonElement(Files.readString(marker, UTF_8)) as? JsonObject
             ?: return null
+        val markerVersion = json["version"] as? JsonPrimitive
         if (json.keys != MARKER_KEYS ||
             json.string("adapter") != MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD ||
-            (json["version"] as? JsonPrimitive)?.intOrNull != 1 ||
+            markerVersion == null ||
+            markerVersion.isString ||
+            markerVersion.intOrNull != 1 ||
             json.string("popupPath") != proof.popupPath ||
             json.string("scriptTagSha256") != proof.scriptTagSha256 ||
             json.string("assetSha256") != proof.assetSha256
