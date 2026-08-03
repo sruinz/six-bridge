@@ -88,19 +88,43 @@ Evidence 원본은 Git에 포함하지 않고 다음 로컬 경로에 보존한�
 나머지 6 case가 모두 성공했다. 따라서 해당 member를 manifest load
 차단 `FAILED`로 합성했다.
 
-## 기존 확장 host 회귀
+## 기존 변환 후보 회귀
 
-| 확장 | 후보 profile 분석 | unavailable | 비고 |
-|---|---|---|---|
-| 스마트 컨텍스트 메뉴 | `UNKNOWN` | 없음 | 계산된 API alias로 fail-closed |
-| AI 레시피 추출기 | `PARTIAL` | 없음 | `contextMenus.create`, `tabs.create` 검증 |
-| Video Download to NAS | `PARTIAL` | 없음 | `contextMenus.create` 검증 |
+| 확장 | 후보 profile 분석 | 변환 | unavailable | 래퍼 |
+|---|---|---|---|---|
+| 스마트 컨텍스트 메뉴 | `PARTIAL` | `converted` | 없음 | `dncif…` v20 |
+| AI 레시피 추출기 | `PARTIAL` | `passthrough` | 없음 | `fdac…` v4 |
+| Video Download to NAS | `PARTIAL` | `passthrough` | 없음 | `iefg…` v3 |
 
-세 확장 모두 분석은 완료됐고 없거나 실패한 API는 없었다. 기존
-Fold7 기능 시나리오는 이전 base profile 래퍼에서 사용자가 통과를
-확인했다. 후보 profile로 재빌드한 래퍼의 실기기 회귀와 자막
-확장 source 재분석은 아직 완료하지 않았으므로 baseline 승격 근거로
-사용하지 않는다.
+스마트 컨텍스트 메뉴의 함수 내부 API 호출 결과와 `window` 호출
+결과를 계산된 namespace alias로 잘못 판정하던 정적 분석 오탐을
+수정했다. 재분석 결과 차단 issue와 unavailable API는 없었으며,
+`action-popup-entry`와 `desktop-selection-event-bridge`가 각각
+승인·자동 어댑터로 적용됐다. 나머지 두 확장은 소스 의미를 바꾸지
+않는 `passthrough`다.
+
+세 후보의 CRX·래퍼 APK·SixBundle 결합 계약은 모두 독립 검증을
+통과했다. Fold7 설치와 smoke도 모두 다음 결과를 냈다.
+
+- `installed=true`
+- `discovery=true`
+- `provider=true`
+
+Smoke evidence는 Git에 포함하지 않고 다음 로컬 경로에 보존한다.
+
+- `.local/evidence/20260803-candidate-profile/`
+
+사용자가 Fold7에서 다음 기능 시나리오와 삼성 인터넷 완전 종료·재실행
+후 활성 유지를 확인했다.
+
+- 스마트 컨텍스트 메뉴: 텍스트 선택, 검색 메뉴 실행, 설정 저장
+- AI 레시피 추출기: 실제 YouTube 영상에서 서버 레시피 추출
+- Video Download to NAS: 영상 목록 표시, 항목 선택, NAS 전송
+- 삼성 인터넷 완전 종료·재실행 후 세 확장의 활성 상태와 기능 유지
+
+따라서 기존 변환 후보 3개의 기능·재시작 회귀 게이트는 통과했다.
+MediaNab은 `validation/extensions.json`의 `boundary-diagnostic`
+대상이며 변환 후보 회귀 수에 포함하지 않는다.
 
 ## Tampermonkey
 
@@ -135,7 +159,7 @@ Fold7 기능 시나리오는 이전 base profile 래퍼에서 사용자가 통�
 ## 남은 게이트
 
 - 삼성 인터넷 완전 종료·재실행 후 6개 probe 활성·결과 유지
-- 후보 profile로 기존 4개 확장 재분석·재빌드·실기기 회귀
+- MediaNab 비지원 native 의존성의 boundary 진단 유지
 - Tampermonkey의 스크립 등록·fixture 주입
 - Bitwarden의 로컬 fixture autofill trigger
 - 단순 namespace 노출이 아닌 실제 사용 member의 추가 probe evidence

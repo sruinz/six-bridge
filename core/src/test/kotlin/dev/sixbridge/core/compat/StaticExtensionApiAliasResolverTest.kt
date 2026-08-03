@@ -76,6 +76,24 @@ class StaticExtensionApiAliasResolverTest {
     }
 
     @Test
+    fun `함수 내부의 정적 API 호출 결과 변수는 dynamic alias가 아니다`() {
+        val result = resolve(
+            "async function load(){ const result=await chrome.storage.sync.get(['key']); return result.key; }",
+        )
+
+        assertFalse(result.dynamicUsage)
+    }
+
+    @Test
+    fun `함수 내부의 window API 호출 결과 변수는 dynamic alias가 아니다`() {
+        val result = resolve(
+            "function read(){ const selection=window.getSelection(); return selection.toString(); }",
+        )
+
+        assertFalse(result.dynamicUsage)
+    }
+
+    @Test
     fun `for initializer alias는 top level const로 해석하지 않는다`() {
         val result = resolve("for (const api=chrome; ready;) { api.tabs.query({}); break; }")
 

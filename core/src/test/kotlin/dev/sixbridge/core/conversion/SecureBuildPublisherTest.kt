@@ -1333,6 +1333,39 @@ class SecureBuildPublisherTest {
         assertNoTransactionDebris(localParent)
     }
 
+    @Test
+    fun `다른 filesystem의 local source를 권한 정규화 상태로 게시한다`() {
+        Jimfs.newFileSystem(jimfsConfiguration()).use { sourceFileSystem ->
+            Jimfs.newFileSystem(jimfsConfiguration()).use { targetFileSystem ->
+                val source = Files.createDirectory(sourceFileSystem.getPath("/source"))
+                val sourceFile = source.resolve("manifest.json")
+                sourceFile.writeText("new-source")
+                Files.setPosixFilePermissions(sourceFile, emptySet())
+                val outputParent = Files.createDirectory(targetFileSystem.getPath("/outputs"))
+                val localParent = Files.createDirectory(targetFileSystem.getPath("/extensions"))
+                val output = outputParent.resolve("extension.crx")
+                val destination = localParent.resolve("extension-id")
+
+                SecureBuildPublisher.publish(
+                    mapOf(output to byteArrayOf(1)),
+                    LocalSourcePublication(source, destination),
+                )
+
+                assertContentEquals(byteArrayOf(1), Files.readAllBytes(output))
+                assertEquals("new-source", destination.resolve("manifest.json").readText())
+                assertEquals(
+                    setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                    ),
+                    Files.getPosixFilePermissions(destination.resolve("manifest.json")),
+                )
+                assertNoTransactionDebris(outputParent)
+                assertNoTransactionDebris(localParent)
+            }
+        }
+    }
+
     private fun assertNoTransactionDebris(parent: Path) {
         val entries = parent.listDirectoryEntries()
         assertTrue(

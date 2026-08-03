@@ -1,5 +1,7 @@
 package dev.sixbridge.core.conversion
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import java.nio.file.Files
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.AclEntry
@@ -75,6 +77,42 @@ class NativeWorkspaceTreeTest {
             }
         } finally {
             OwnedTempTree.delete(destination)
+        }
+    }
+
+    @Test
+    fun `다른 filesystem provider로 복사할 때 대상 owner를 유지한다`() {
+        val configuration = Configuration.unix().toBuilder()
+            .setAttributeViews("basic", "owner", "posix", "unix")
+            .build()
+        Jimfs.newFileSystem(configuration).use { sourceFileSystem ->
+            Jimfs.newFileSystem(configuration).use { targetFileSystem ->
+                val source = Files.createDirectory(sourceFileSystem.getPath("/source"))
+                val sourceOwner = sourceFileSystem.userPrincipalLookupService
+                    .lookupPrincipalByName("source-owner")
+                Files.setOwner(source, sourceOwner)
+                source.resolve("entry.js").writeText("preserved")
+                Files.setOwner(source.resolve("entry.js"), sourceOwner)
+                Files.setPosixFilePermissions(source.resolve("entry.js"), emptySet())
+                val destination = OwnedTempTree.createAt(targetFileSystem.getPath("/copy"))
+                val targetOwner = Files.getOwner(destination.rootPath)
+                try {
+                    NativeWorkspaceTree.copyInto(source, destination.rootPath)
+
+                    assertEquals("preserved", destination.rootPath.resolve("entry.js").readText())
+                    assertEquals(targetOwner, Files.getOwner(destination.rootPath))
+                    assertEquals(targetOwner, Files.getOwner(destination.rootPath.resolve("entry.js")))
+                    assertEquals(
+                        setOf(
+                            PosixFilePermission.OWNER_READ,
+                            PosixFilePermission.OWNER_WRITE,
+                        ),
+                        Files.getPosixFilePermissions(destination.rootPath.resolve("entry.js")),
+                    )
+                } finally {
+                    OwnedTempTree.delete(destination)
+                }
+            }
         }
     }
 

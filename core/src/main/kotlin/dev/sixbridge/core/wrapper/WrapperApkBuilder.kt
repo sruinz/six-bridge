@@ -2,6 +2,7 @@ package dev.sixbridge.core.wrapper
 
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -126,6 +127,11 @@ class WrapperApkBuilder(
                     aligned.toString(),
                 ),
             )
+            val signedApk = if (request.outputApk.fileSystem == FileSystems.getDefault()) {
+                request.outputApk
+            } else {
+                work.resolve("signed.apk")
+            }
             ProcessRunner.run(
                 listOf(
                     toolchain.apkSigner.toString(),
@@ -139,7 +145,7 @@ class WrapperApkBuilder(
                     "--ks-pass",
                     "file:${signer.passwordFile}",
                     "--out",
-                    request.outputApk.toString(),
+                    signedApk.toString(),
                     aligned.toString(),
                 ),
             )
@@ -149,7 +155,7 @@ class WrapperApkBuilder(
                     "verify",
                     "--verbose",
                     "--print-certs",
-                    request.outputApk.toString(),
+                    signedApk.toString(),
                 ),
             )
             val signerSha = SIGNER_SHA_REGEX.find(verify.stdout)
@@ -158,6 +164,9 @@ class WrapperApkBuilder(
                 ?.replace(":", "")
                 ?.lowercase()
                 ?: sha256(signer.keyStore.readBytes())
+            if (signedApk != request.outputApk) {
+                publishSignedApk(signedApk, request.outputApk)
+            }
             versionReservation.commit()
             return WrapperBuildResult(
                 outputApk = request.outputApk,
@@ -188,16 +197,45 @@ class WrapperApkBuilder(
 
     private fun existingOutputVersion(outputApk: Path): Int {
         if (!outputApk.exists() || Files.size(outputApk) == 0L) return 0
-        val badging = ProcessRunner.run(
-            listOf(toolchain.aapt2.toString(), "dump", "badging", outputApk.toString()),
-        ).stdout
-        return PACKAGE_BADGING.find(badging)
-            ?.groupValues
-            ?.get(1)
-            ?.toIntOrNull()
-            ?: throw IllegalArgumentException(
-                "기존 output APK versionCode를 읽을 수 없습니다: $outputApk",
+        val inspectionApk = if (outputApk.fileSystem == FileSystems.getDefault()) {
+            outputApk
+        } else {
+            Files.createTempFile("sixbridge-wrapper-inspection-", ".apk").also {
+                Files.copy(outputApk, it, StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
+        return try {
+            val badging = ProcessRunner.run(
+                listOf(toolchain.aapt2.toString(), "dump", "badging", inspectionApk.toString()),
+            ).stdout
+            PACKAGE_BADGING.find(badging)
+                ?.groupValues
+                ?.get(1)
+                ?.toIntOrNull()
+                ?: throw IllegalArgumentException(
+                    "기존 output APK versionCode를 읽을 수 없습니다: $outputApk",
+                )
+        } finally {
+            if (inspectionApk != outputApk) Files.deleteIfExists(inspectionApk)
+        }
+    }
+
+    private fun publishSignedApk(signedApk: Path, outputApk: Path) {
+        val parent = requireNotNull(outputApk.toAbsolutePath().parent)
+        Files.createDirectories(parent)
+        val temporary = Files.createTempFile(parent, ".${outputApk.fileName}.", ".tmp")
+        try {
+            Files.copy(signedApk, temporary, StandardCopyOption.REPLACE_EXISTING)
+            FileChannel.open(temporary, StandardOpenOption.WRITE).use { it.force(true) }
+            Files.move(
+                temporary,
+                outputApk,
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
             )
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
     }
 
     private fun assembleApk(

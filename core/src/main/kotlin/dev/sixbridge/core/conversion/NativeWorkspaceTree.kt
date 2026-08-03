@@ -8,6 +8,7 @@ import java.nio.file.attribute.AclFileAttributeView
 import java.nio.file.attribute.BasicFileAttributeView
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermission
 import kotlin.jvm.JvmSynthetic
 
 internal object NativeWorkspaceTree {
@@ -25,20 +26,35 @@ internal object NativeWorkspaceTree {
             "native workspace copy 경계를 확인할 수 없습니다."
         }
         PendingTempCleanup.requireOwned(targetRoot)
+        val preservePrincipals = sourceRoot.fileSystem == targetRoot.fileSystem
         val before = WorkspaceTreeDigest.capture(sourceRoot)
-        copyTree(sourceRoot, targetRoot)
+        copyTree(sourceRoot, targetRoot, preservePrincipals)
         val sourceAfter = WorkspaceTreeDigest.capture(sourceRoot)
         val target = WorkspaceTreeDigest.capture(targetRoot)
         check(before == sourceAfter) {
             "native workspace source가 copy 중 변경되었습니다."
         }
-        check(before.provenanceSha256 == target.provenanceSha256) {
+        val sourceProvenance = if (preservePrincipals) {
+            before.provenanceSha256
+        } else {
+            before.portableProvenanceSha256
+        }
+        val targetProvenance = if (preservePrincipals) {
+            target.provenanceSha256
+        } else {
+            target.portableProvenanceSha256
+        }
+        check(sourceProvenance == targetProvenance) {
             "native workspace metadata 또는 content를 보존하지 못했습니다."
         }
         return targetRoot
     }
 
-    private fun copyTree(sourceRoot: Path, targetRoot: Path) {
+    private fun copyTree(
+        sourceRoot: Path,
+        targetRoot: Path,
+        preservePrincipals: Boolean,
+    ) {
         val entries = Files.walk(sourceRoot).use { paths ->
             paths.sorted().toList()
         }
@@ -58,13 +74,17 @@ internal object NativeWorkspaceTree {
             if (attributes.isDirectory) {
                 Files.createDirectory(target)
             } else {
-                Files.copy(
-                    source,
-                    target,
-                    COPY_ATTRIBUTES,
-                    NOFOLLOW_LINKS,
-                )
-                copyMetadata(source, target)
+                if (preservePrincipals) {
+                    Files.copy(
+                        source,
+                        target,
+                        COPY_ATTRIBUTES,
+                        NOFOLLOW_LINKS,
+                    )
+                } else {
+                    Files.copy(source, target, NOFOLLOW_LINKS)
+                }
+                copyMetadata(source, target, preservePrincipals)
             }
         }
         entries.asReversed()
@@ -75,11 +95,15 @@ internal object NativeWorkspaceTree {
                 } else {
                     targetRoot.resolve(sourceRoot.relativize(source).toString())
                 }
-                copyMetadata(source, target)
+                copyMetadata(source, target, preservePrincipals)
             }
     }
 
-    private fun copyMetadata(source: Path, target: Path) {
+    private fun copyMetadata(
+        source: Path,
+        target: Path,
+        preservePrincipals: Boolean,
+    ) {
         val basic = Files.readAttributes(
             source,
             BasicFileAttributes::class.java,
@@ -105,9 +129,15 @@ internal object NativeWorkspaceTree {
                 "POSIX metadata view를 동일하게 보존할 수 없습니다."
             }
             val attributes = sourcePosix.readAttributes()
-            targetPosix.setOwner(attributes.owner())
-            targetPosix.setGroup(attributes.group())
-            targetPosix.setPermissions(attributes.permissions())
+            if (preservePrincipals) {
+                targetPosix.setOwner(attributes.owner())
+                targetPosix.setGroup(attributes.group())
+                targetPosix.setPermissions(attributes.permissions())
+            } else {
+                targetPosix.setPermissions(
+                    if (basic.isDirectory) OWNER_DIRECTORY_PERMISSIONS else OWNER_FILE_PERMISSIONS,
+                )
+            }
         }
         val sourceAcl = Files.getFileAttributeView(
             source,
@@ -123,8 +153,10 @@ internal object NativeWorkspaceTree {
             check(sourceAcl != null && targetAcl != null) {
                 "ACL metadata view를 동일하게 보존할 수 없습니다."
             }
-            targetAcl.owner = sourceAcl.owner
-            targetAcl.acl = sourceAcl.acl
+            if (preservePrincipals) {
+                targetAcl.owner = sourceAcl.owner
+                targetAcl.acl = sourceAcl.acl
+            }
         }
         if (sourcePosix == null && sourceAcl == null) {
             WorkspacePermissionPolicy.requireMetadataSupport(source)
@@ -133,4 +165,12 @@ internal object NativeWorkspaceTree {
             WorkspacePermissionPolicy.requireMetadataSupport(target)
         }
     }
+
+    private val OWNER_FILE_PERMISSIONS = setOf(
+        PosixFilePermission.OWNER_READ,
+        PosixFilePermission.OWNER_WRITE,
+    )
+
+    private val OWNER_DIRECTORY_PERMISSIONS = OWNER_FILE_PERMISSIONS +
+        PosixFilePermission.OWNER_EXECUTE
 }

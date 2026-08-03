@@ -1,5 +1,7 @@
 package dev.sixbridge.core.wrapper
 
+import com.google.common.jimfs.Configuration
+import com.google.common.jimfs.Jimfs
 import dev.sixbridge.core.crx.Crx3
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
@@ -82,6 +84,32 @@ class WrapperApkBuilderTest {
             assertTrue(apk.getEntry("classes.dex") != null)
             val embedded = apk.getInputStream(apk.getEntry("assets/extension.crx")).readBytes()
             assertTrue(embedded.contentEquals(crx.bytes))
+        }
+    }
+
+    @Test
+    fun `외부 도구가 볼 수 없는 보안 filesystem output에도 래퍼를 게시한다`() {
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 wrapper 배포 검증을 실행할 수 없습니다.")
+        val source = Files.createTempDirectory("six-wrapper-secure-source")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Secure output","version":"1"}""",
+        )
+        val keyPair = KeyPairGenerator.getInstance("RSA")
+            .apply { initialize(2048) }
+            .generateKeyPair()
+        val crx = Crx3.pack(source, keyPair)
+        val localRoot = Files.createTempDirectory("six-wrapper-secure-local")
+        Jimfs.newFileSystem(Configuration.unix()).use { secureFileSystem ->
+            val outputRoot = Files.createDirectory(secureFileSystem.getPath("/output"))
+            val output = outputRoot.resolve("wrapper.apk")
+
+            val result = WrapperApkBuilder(sdk, localRoot).build(
+                WrapperBuildRequest(crx.extensionId, "Secure output", crx.bytes, output),
+            )
+
+            assertEquals(output, result.outputApk)
+            assertTrue(Files.size(output) > 0L)
         }
     }
 

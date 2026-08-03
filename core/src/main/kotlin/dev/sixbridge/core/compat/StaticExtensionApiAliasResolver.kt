@@ -34,7 +34,12 @@ internal class StaticExtensionApiAliasResolver {
                 rawExpression.indexOf(expression)
             declarationScope.advanceTo(declaration.range.first)
             if (!declarationScope.isTopLevel) {
-                if (referencesExtensionState(expression, aliases)) dynamicUsage = true
+                if (referencesExtensionState(expression, aliases) &&
+                    !STATIC_API_CALL_RESULT.matches(expression) &&
+                    !STATIC_GLOBAL_CALL_RESULT.matches(expression)
+                ) {
+                    dynamicUsage = true
+                }
                 return@forEach
             }
 
@@ -370,6 +375,16 @@ internal class StaticExtensionApiAliasResolver {
         )
         private val STATIC_ALIAS_ROOT = Regex(
             """([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\?\.|\.)\s*(?:chrome|browser)""",
+        )
+        private val STATIC_API_CALL_RESULT = Regex(
+            """(?:await\s+)?(?:chrome|browser)\s*(?:\?\.|\.)\s*""" +
+                """[A-Za-z][A-Za-z0-9_]*(?:\s*(?:\?\.|\.)\s*""" +
+                """[A-Za-z][A-Za-z0-9_]*)+\s*\([^;]*\)""",
+        )
+        private val STATIC_GLOBAL_CALL_RESULT = Regex(
+            """(?:await\s+)?(?:globalThis|window|self)\s*(?:\?\.|\.)\s*""" +
+                """[A-Za-z][A-Za-z0-9_]*(?:\s*(?:\?\.|\.)\s*""" +
+                """[A-Za-z][A-Za-z0-9_]*)*\s*\([^;]*\)""",
         )
         private val ROOT_TOKEN = Regex("""(?<![A-Za-z0-9_$])(?:chrome|browser)(?![A-Za-z0-9_$])""")
         private val GLOBAL_OBJECT_TOKEN =

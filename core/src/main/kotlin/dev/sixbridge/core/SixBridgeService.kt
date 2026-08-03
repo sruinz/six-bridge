@@ -523,7 +523,7 @@ class SixBridgeService(
                 version = compatibility.extensionVersion ?: "0",
                 sourceKind = resolved.kind.name,
                 crxSha256 = sha256(prepared.crxBytes),
-                wrapperSha256 = sha256(wrapperDraft.toFile().readBytes()),
+                wrapperSha256 = sha256(Files.readAllBytes(wrapperDraft)),
                 wrapperPackage = wrapper.packageName,
                 wrapperVersionCode = wrapper.versionCode,
                 signerSha256 = wrapper.signerSha256,

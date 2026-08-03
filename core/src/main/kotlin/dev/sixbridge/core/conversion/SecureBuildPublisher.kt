@@ -839,6 +839,7 @@ internal object SecureBuildPublisher {
         )
         private var owner: OwnedTempDirectory? = null
         private var sourceState: WorkspaceTreeDigest.State? = null
+        private var stagedState: WorkspaceTreeDigest.State? = null
         private var originalState: WorkspaceTreeDigest.State? = null
         private var originalRootIdentity: Any? = null
         private var backupExists = false
@@ -924,9 +925,15 @@ internal object SecureBuildPublisher {
                 LocalStageCrashPoint.AFTER_COPY,
             )
             val stageStateBeforeFsync = WorkspaceTreeDigest.capture(stageOriginal)
+            val sameFileSystem = source.fileSystem == stageOriginal.fileSystem
             check(
-                stageStateBeforeFsync.provenanceSha256 ==
-                    requireNotNull(sourceState).provenanceSha256,
+                if (sameFileSystem) {
+                    stageStateBeforeFsync.provenanceSha256 ==
+                        requireNotNull(sourceState).provenanceSha256
+                } else {
+                    stageStateBeforeFsync.portableProvenanceSha256 ==
+                        requireNotNull(sourceState).portableProvenanceSha256
+                },
             ) {
                 "local source stage가 fsync 전에 원본과 다릅니다."
             }
@@ -942,6 +949,7 @@ internal object SecureBuildPublisher {
             check(WorkspaceTreeDigest.capture(stageOriginal) == stageStateBeforeFsync) {
                 "local source stage가 fsync 검증 중 변경되었습니다."
             }
+            stagedState = stageStateBeforeFsync
             BuildPublicationFaultInjection.crashLocalStageAt(
                 LocalStageCrashPoint.AFTER_PROVENANCE_VERIFY,
             )
@@ -983,7 +991,7 @@ internal object SecureBuildPublisher {
             validateTreeNoLinks(destination)
             check(
                 WorkspaceTreeDigest.capture(destination).provenanceSha256 ==
-                    requireNotNull(sourceState).provenanceSha256,
+                    requireNotNull(stagedState).provenanceSha256,
             ) {
                 "published local source가 검증된 stage와 다릅니다."
             }
@@ -1068,7 +1076,9 @@ internal object SecureBuildPublisher {
             backupName = backupName.toString(),
             oldExists = originalState != null,
             oldIdentitySha256 = originalState?.identitySha256,
-            newProvenanceSha256 = requireNotNull(sourceState).provenanceSha256,
+            newProvenanceSha256 = (
+                stagedState ?: requireNotNull(sourceState)
+            ).provenanceSha256,
             stageRootKey = requireNotNull(stageRootKey),
             stageIdentity = requireNotNull(stageIdentity).encode(),
             oldRootKey = originalRootIdentity?.toString(),

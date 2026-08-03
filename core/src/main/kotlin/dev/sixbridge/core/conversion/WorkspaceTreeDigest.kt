@@ -20,6 +20,9 @@ internal object WorkspaceTreeDigest {
     fun provenanceSha256(root: Path): String =
         capture(root).provenanceSha256
 
+    fun portableProvenanceSha256(root: Path): String =
+        capture(root).portableProvenanceSha256
+
     fun capture(root: Path): State {
         val normalizedRoot = root.toAbsolutePath().normalize()
         val first = entries(normalizedRoot)
@@ -28,16 +31,29 @@ internal object WorkspaceTreeDigest {
             "workspace tree가 digest 계산 중 변경되었습니다."
         }
         return State(
-            identitySha256 = digest(first, includeIdentity = true, includeMetadata = true),
+            identitySha256 = digest(
+                first,
+                includeIdentity = true,
+                includeMetadata = true,
+                includePrincipals = true,
+            ),
             provenanceSha256 = digest(
                 first,
                 includeIdentity = false,
                 includeMetadata = true,
+                includePrincipals = true,
+            ),
+            portableProvenanceSha256 = digest(
+                first,
+                includeIdentity = false,
+                includeMetadata = true,
+                includePrincipals = false,
             ),
             contentSha256 = digest(
                 first,
                 includeIdentity = false,
                 includeMetadata = false,
+                includePrincipals = false,
             ),
         )
     }
@@ -46,6 +62,7 @@ internal object WorkspaceTreeDigest {
         entries: List<TreeEntry>,
         includeIdentity: Boolean,
         includeMetadata: Boolean,
+        includePrincipals: Boolean,
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         entries.forEach { entry ->
@@ -55,11 +72,13 @@ internal object WorkspaceTreeDigest {
             digest.field(entry.contentSha256)
             if (includeMetadata) {
                 digest.field(entry.lastModified)
-                digest.field(entry.owner)
-                digest.field(entry.aclOwner)
-                digest.field(entry.group)
-                digest.field(entry.permissions)
-                digest.field(entry.acl)
+                if (includePrincipals) {
+                    digest.field(entry.permissions)
+                    digest.field(entry.owner)
+                    digest.field(entry.aclOwner)
+                    digest.field(entry.group)
+                    digest.field(entry.acl)
+                }
             }
             if (includeIdentity) digest.field(entry.fileKey)
         }
@@ -177,6 +196,7 @@ internal object WorkspaceTreeDigest {
     data class State(
         val identitySha256: String,
         val provenanceSha256: String,
+        val portableProvenanceSha256: String,
         val contentSha256: String,
     )
 
