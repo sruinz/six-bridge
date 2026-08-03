@@ -118,7 +118,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
     private fun calculateOutputSize(entries: List<PreparedEntry>): Long {
         var offset = 0L
         entries.forEach { entry ->
-            val extraSize = if (entry.name == "resources.arsc") alignmentExtraSize(offset, entry.name.encodeToByteArray().size) else 0
+            val extraSize = alignmentExtraSize(offset, entry.name.encodeToByteArray().size)
             offset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + entry.name.encodeToByteArray().size + extraSize + entry.size)
         }
         val centralSize = entries.sumOf { CENTRAL_HEADER_SIZE.toLong() + it.name.encodeToByteArray().size }
@@ -146,7 +146,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
     private fun writeLocalEntry(stream: OutputStream, template: File, offset: Long, entry: PreparedEntry): WrittenEntry {
         val name = entry.name.encodeToByteArray()
-        val extra = if (entry.name == "resources.arsc") alignmentExtra(offset, name.size) else ByteArray(0)
+        val extra = alignmentExtra(offset, name.size)
         stream.writeLeInt(LOCAL_MAGIC)
         stream.writeLeShort(VERSION_NEEDED)
         stream.writeLeShort(0)
@@ -161,7 +161,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         stream.write(name)
         stream.write(extra)
         val dataOffset = checkedAdd(offset, LOCAL_HEADER_SIZE.toLong() + name.size + extra.size)
-        require(entry.name != "resources.arsc" || dataOffset % 4L == 0L) { "resources.arsc 정렬 계산이 올바르지 않습니다." }
+        require(dataOffset % 4L == 0L) { "래퍼 APK entry 정렬 계산이 올바르지 않습니다: ${entry.name}" }
         when (val source = entry.source) {
             is EntrySource.Bytes -> writeBytesAndVerify(stream, source.bytes, entry.crc32)
             is EntrySource.Template -> ApkZipStructureVerifier.copyEntryData(template, source.entry, stream)
@@ -274,7 +274,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
     private fun verifyAssembly(apk: File, expectedCrxSize: Long) {
         val facts = ApkZipStructureVerifier.inspect(apk)
         require(facts.map { it.name } == REQUIRED_ENTRY_NAMES && facts.all { it.method == STORED }) { "래퍼 APK entry 계약이 올바르지 않습니다." }
-        require(facts.single { it.name == "resources.arsc" }.dataOffset % 4L == 0L) { "resources.arsc가 4-byte 정렬되지 않았습니다." }
+        require(facts.all { it.dataOffset % 4L == 0L }) { "래퍼 APK entry가 4-byte 정렬되지 않았습니다." }
         require(facts.single { it.name == "assets/extension.crx" }.size == expectedCrxSize) { "래퍼 APK CRX3 크기가 올바르지 않습니다." }
     }
 

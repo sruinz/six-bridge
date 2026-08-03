@@ -33,7 +33,7 @@ class AlignedApkAssemblerTest {
     private val crxBytes by lazy { validCrx() }
 
     @Test
-    fun `래퍼 APK는 네 entry를 결정적으로 조립하고 resources를 정렬한다`() {
+    fun `래퍼 APK는 네 entry를 결정적으로 조립하고 모두 4 byte 정렬한다`() {
         val first = File(work, "first.apk")
         val second = File(work, "second.apk")
 
@@ -46,9 +46,10 @@ class AlignedApkAssemblerTest {
             listOf("AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/extension.crx"),
             facts.map { it.name },
         )
-        val resources = facts.single { it.name == "resources.arsc" }
-        assertEquals(ZipEntry.STORED, resources.method)
-        assertEquals(0L, resources.dataOffset % 4L)
+        assertTrue(facts.all { it.method == ZipEntry.STORED })
+        facts.forEach { entry ->
+            assertEquals(0L, entry.dataOffset % 4L, entry.name)
+        }
     }
 
     @Test

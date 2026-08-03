@@ -76,6 +76,54 @@ class RuntimeResourceIndexTest {
     }
 
     @Test
+    fun `고정 dynamic import는 runtime dependency graph에 포함한다`() {
+        val fixtures = listOf(
+            """import("./helper.js");""",
+            """import(chrome.runtime.getURL("./helper.js"));""",
+            """import(globalThis.chrome.runtime.getURL("./helper.js"));""",
+        )
+
+        fixtures.forEach { source ->
+            val root = workerExtension(source)
+            root.resolve("helper.js").writeText("console.log('helper');")
+
+            val index = RuntimeResourceIndex.create(
+                root,
+                manifest("""{"service_worker":"background.js"}"""),
+            )
+
+            assertFalse(index.unresolvedDependency, source)
+            assertEquals(
+                setOf(RuntimeResourceIndex.RuntimeDependencyEdge("background.js", "helper.js")),
+                index.dependencyEdges,
+                source,
+            )
+        }
+    }
+
+    @Test
+    fun `계산된 dynamic import는 계속 unresolved로 차단한다`() {
+        val fixtures = listOf(
+            """const path = "./helper.js"; import(path);""",
+            """const path = "./helper.js"; import(chrome.runtime.getURL(path));""",
+            """import(chrome.runtime.getURL("./helper.js") + "?v=1");""",
+        )
+
+        fixtures.forEach { source ->
+            val root = workerExtension(source)
+            root.resolve("helper.js").writeText("console.log('helper');")
+
+            val index = RuntimeResourceIndex.create(
+                root,
+                manifest("""{"service_worker":"background.js"}"""),
+            )
+
+            assertTrue(index.unresolvedDependency, source)
+            assertTrue(index.dependencyEdges.isEmpty(), source)
+        }
+    }
+
+    @Test
     fun `marks runtime closure unresolved when a declared resource read fails`() {
         val root = workerExtension(
             """importScripts("./helper.js");""",

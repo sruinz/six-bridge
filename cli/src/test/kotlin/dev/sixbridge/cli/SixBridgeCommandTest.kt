@@ -17,6 +17,10 @@ import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.catalog.CatalogDisposition
+import dev.sixbridge.probe.evidence.ProbeEvidenceJson
+import dev.sixbridge.probe.evidence.ProbeManifestLoadIsolation
+import dev.sixbridge.probe.evidence.ProbeManifestLoadIsolationJson
+import dev.sixbridge.probe.evidence.ProbeManifestLoadOutcome
 import picocli.CommandLine
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -44,6 +48,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class SixBridgeCommandTest {
     private val projectIdentity = "0123456789abcdef0123456789abcdef"
@@ -186,6 +193,42 @@ class SixBridgeCommandTest {
         assertEquals(2, repeated.exitCode)
         assertContentEquals(bytes, output.readBytes())
         assertEquals("", repeated.output)
+    }
+
+    @Test
+    fun `probe CLI는 manifest 로드 차단 A B 증거로 33개 후보 capability를 만든다`() {
+        val workspace = Files.createTempDirectory("six-cli-probe-load-isolation")
+        val base = writeProfile(workspace)
+        val inputs = writeProbeIsolatedEvidence(workspace)
+        val output = workspace.resolve("candidate.json")
+
+        val verified = execute(
+            "probe", "verify-evidence",
+            "--input", inputs.evidence.toString(),
+            "--manifest-load-isolation", inputs.isolation.toString(),
+            "--variant-evidence", inputs.variantEvidence.toString(),
+        )
+        val built = execute(
+            "probe", "build-profile",
+            "--base", base.toString(),
+            "--evidence", inputs.evidence.toString(),
+            "--manifest-load-isolation", inputs.isolation.toString(),
+            "--variant-evidence", inputs.variantEvidence.toString(),
+            "--output", output.toString(),
+        )
+
+        assertEquals(0, verified.exitCode, verified.error)
+        assertTrue("실행 case=32/33" in verified.output)
+        assertTrue("manifest 로드 차단 분리=1" in verified.output)
+        assertEquals(0, built.exitCode, built.error)
+        val candidate = BrowserProfileJson.decode(output.readText())
+        assertEquals(33, candidate.apiCapabilities.size)
+        assertEquals(
+            dev.sixbridge.core.profile.ApiCapabilityStatus.FAILED,
+            candidate.apiCapabilities.single {
+                it.probeId == "web-auth-proxy-session-event-worker"
+            }.status,
+        )
     }
 
     @Test
@@ -846,6 +889,35 @@ class SixBridgeCommandTest {
 
         assertEquals(0, exit)
         assertTrue("\"status\": \"compatible\"" in report.readText())
+    }
+
+    @Test
+    fun `production analyze accepts a verified CRX on macOS`() {
+        val workspace = Files.createTempDirectory("six-cli-analyze-crx")
+        val source = workspace.resolve("source").also(Files::createDirectory)
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"CRX Analyze","version":"1"}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                .generateKeyPair(),
+        )
+        val crx = workspace.resolve("input.crx").also { it.writeBytes(packed.bytes) }
+        val profile = writeProfile(workspace)
+        val report = workspace.resolve("compatibility.json")
+
+        val exit = CommandLine(SixBridgeCommand()).execute(
+            "--workspace", workspace.toString(),
+            "analyze",
+            "--input", crx.toString(),
+            "--profile", profile.toString(),
+            "--output", report.toString(),
+        )
+
+        assertEquals(0, exit)
+        assertTrue("\"extensionName\": \"CRX Analyze\"" in report.readText())
+        assertTrue("\"originalExtensionId\": \"${packed.extensionId}\"" in report.readText())
     }
 
     @Test
@@ -1528,6 +1600,57 @@ class SixBridgeCommandTest {
         return root
     }
 
+    private fun writeProbeIsolatedEvidence(workspace: Path): ProbeIsolatedEvidenceFiles {
+        val evidence = writeProbeEvidence(workspace.resolve("evidence"), mismatchProvenance = false)
+        val identityPath = evidence.resolve("identity-privacy.json")
+        val control = ProbeEvidenceJson.decodeStrict(identityPath.readText())
+        val root = Json.parseToJsonElement(identityPath.readText()).jsonObject
+        val variantRoot = JsonObject(
+            root.toMutableMap().also { fields ->
+                fields["sessionId"] = JsonPrimitive("session-identity-variant")
+                fields["extensionId"] = JsonPrimitive(probeExtensionId("identity-privacy-variant"))
+                fields["results"] = JsonArray(
+                    root.getValue("results").jsonArray.filterNot { result ->
+                        result.jsonObject.getValue("caseId").jsonPrimitive.content ==
+                            "web-auth-proxy-session-event-worker"
+                    },
+                )
+            }.toSortedMap(),
+        )
+        val variantPath = workspace.resolve("identity-privacy.variant.json")
+        variantPath.writeText(Json.encodeToString(JsonObject.serializer(), variantRoot))
+        val variant = ProbeEvidenceJson.decodeStrict(variantPath.readText())
+        Files.delete(identityPath)
+        val isolation = workspace.resolve("identity-privacy.load-isolation.json")
+        isolation.writeText(
+            ProbeManifestLoadIsolationJson.encodeCanonical(
+                ProbeManifestLoadIsolation(
+                    schemaVersion = 1,
+                    groupId = "identity-privacy",
+                    catalogSha256 = control.catalogSha256,
+                    excludedCaseId = "web-auth-proxy-session-event-worker",
+                    excludedPermission = "webAuthenticationProxy",
+                    controlSessionId = control.sessionId,
+                    controlExtensionId = control.extensionId,
+                    controlManifestSha256 = "a".repeat(64),
+                    controlOutcome = ProbeManifestLoadOutcome.LOAD_BLOCKED,
+                    variantSessionId = variant.sessionId,
+                    variantExtensionId = variant.extensionId,
+                    variantManifestSha256 = "b".repeat(64),
+                    variantEvidenceSha256 = ProbeEvidenceJson.canonicalSha256(variant),
+                    variantOutcome = ProbeManifestLoadOutcome.LOADED,
+                    wrapperSignerSha256 = variant.wrapperSignerSha256,
+                    browserPackage = variant.browserPackage,
+                    browserVersionName = variant.browserVersionName,
+                    browserVersionCode = variant.browserVersionCode,
+                    browserApkSetSha256 = variant.browserApkSetSha256,
+                    browserSignerSha256 = variant.browserSignerSha256,
+                ),
+            ),
+        )
+        return ProbeIsolatedEvidenceFiles(evidence, isolation, variantPath)
+    }
+
     private fun probeExtensionId(groupId: String): String = MessageDigest.getInstance("SHA-256")
         .digest(groupId.toByteArray())
         .take(16)
@@ -1537,7 +1660,7 @@ class SixBridgeCommandTest {
         }
 
     private fun execute(vararg arguments: String): Execution {
-        return executeWith(::SixBridgeService, *arguments)
+        return executeWith(::createDesktopService, *arguments)
     }
 
     private fun executeProbe(commandObject: Any, vararg arguments: String): Execution {
@@ -1737,5 +1860,11 @@ class SixBridgeCommandTest {
         val exitCode: Int,
         val output: String,
         val error: String,
+    )
+
+    private data class ProbeIsolatedEvidenceFiles(
+        val evidence: Path,
+        val isolation: Path,
+        val variantEvidence: Path,
     )
 }

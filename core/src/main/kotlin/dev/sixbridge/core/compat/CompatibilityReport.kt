@@ -33,8 +33,23 @@ data class CompatibilityReport(
     val convertedExtensionId: String? = null,
     val sourceSha256: String? = null,
     val browserProfileSha256: String? = null,
+    val verifiedApis: Set<String> = usedApis - unsupportedApis,
+    val unverifiedApis: Set<String> = emptySet(),
+    val unavailableApis: Set<String> = unsupportedApis,
 ) {
     fun validate() {
+        require(unsupportedApis == unavailableApis) {
+            "unsupportedApis는 unavailableApis 호환 alias와 일치해야 합니다."
+        }
+        require((verifiedApis intersect unverifiedApis).isEmpty()) {
+            "검증된 API와 미검증 API는 겹칠 수 없습니다."
+        }
+        require((verifiedApis intersect unavailableApis).isEmpty()) {
+            "검증된 API와 사용 불가 API는 겹칠 수 없습니다."
+        }
+        require((unverifiedApis intersect unavailableApis).isEmpty()) {
+            "미검증 API와 사용 불가 API는 겹칠 수 없습니다."
+        }
         require(adapterDecisions.map { it.id to it.version }.toSet().size == adapterDecisions.size) {
             "어댑터 결정 ID와 version 조합은 중복될 수 없습니다."
         }

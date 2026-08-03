@@ -57,6 +57,9 @@ class VerifiedPreparedSixDraft internal constructor(
             declaredPermissions = declaredPermissions.toSet(),
             usedApis = usedApis.toSet(),
             unsupportedApis = unsupportedApis.toSet(),
+            verifiedApis = verifiedApis.toSet(),
+            unverifiedApis = unverifiedApis.toSet(),
+            unavailableApis = unavailableApis.toSet(),
             issues = issues.map { it.copy() },
             adapterDecisions = adapterDecisions.map { decision ->
                 decision.copy(

@@ -1,0 +1,631 @@
+{
+    "schemaVersion": 4,
+    "browserPackage": "com.sec.android.app.sbrowser",
+    "versionName": "30.0.0.67",
+    "versionCode": 1300067502,
+    "majorVersion": 30,
+    "detectedApis": [
+        "action",
+        "alarms",
+        "app",
+        "app.runtime",
+        "appstoreService",
+        "automation",
+        "browserAction",
+        "clientService",
+        "clipboard",
+        "commands",
+        "contentSettings",
+        "contextMenus",
+        "cookies",
+        "debugger",
+        "declarativeContent",
+        "declarativeNetRequest",
+        "declarativeWebRequest",
+        "dom",
+        "events",
+        "extension",
+        "extensionTypes",
+        "fileHandlers",
+        "gcm",
+        "history",
+        "i18n",
+        "iconVariants",
+        "identity",
+        "idle",
+        "inputMethodPrivate",
+        "management",
+        "notifications",
+        "offscreen",
+        "pageAction",
+        "permissions",
+        "privacy",
+        "protocolHandlers",
+        "proxy",
+        "runtime",
+        "scripting",
+        "scriptsInternal",
+        "search",
+        "sidePanel",
+        "sixLogging",
+        "storage",
+        "tabGroups",
+        "tabs",
+        "trans",
+        "tts",
+        "ttsEngine",
+        "types",
+        "userScripts",
+        "webAuthenticationProxy",
+        "webNavigation",
+        "webRequest",
+        "webRequestInternal",
+        "webViewRequest",
+        "webstorePrivate",
+        "windows"
+    ],
+    "supportedApis": [
+        "action",
+        "alarms",
+        "commands",
+        "contextMenus",
+        "declarativeNetRequest",
+        "extension",
+        "i18n",
+        "identity",
+        "idle",
+        "management",
+        "notifications",
+        "offscreen",
+        "permissions",
+        "runtime",
+        "scripting",
+        "sidePanel",
+        "storage",
+        "tabs",
+        "webRequest",
+        "windows"
+    ],
+    "apiCapabilities": [
+        {
+            "key": {
+                "namespace": "action",
+                "member": "getTitle",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [
+                "action"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"string\"}",
+            "probeId": "action-get-title-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "alarms",
+                "member": "get",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "alarms"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"undefined\"}",
+            "probeId": "alarms-get-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "commands",
+                "member": "getAll",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [
+                "commands"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "commands-get-all-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "contentSettings",
+                "member": "cookies",
+                "context": "extension_page"
+            },
+            "status": "exposed",
+            "permissions": [
+                "contentSettings"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "content-settings-cookies-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "contextMenus",
+                "member": "create",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "contextMenus"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "context-menus-create-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "cookies",
+                "member": "get",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "cookies"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "cookies-get-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "debugger",
+                "member": "attach",
+                "context": "service_worker"
+            },
+            "status": "failed",
+            "permissions": [
+                "debugger"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"error\",\"message\":\"Cannot read properties of undefined (reading 'attach')\",\"name\":\"TypeError\"}",
+            "probeId": "debugger-attach-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "declarativeContent",
+                "member": "onPageChanged",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "declarativeContent"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "declarative-content-on-page-changed-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "declarativeNetRequest",
+                "member": "getAvailableStaticRuleCount",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "declarativeNetRequest"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"number\"}",
+            "probeId": "declarative-net-request-static-count-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "extension",
+                "member": "isAllowedIncognitoAccess",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"boolean\"}",
+            "probeId": "extension-incognito-access-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "history",
+                "member": "search",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "history"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "history-search-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "i18n",
+                "member": "getUILanguage",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"string\"}",
+            "probeId": "i18n-ui-language-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "identity",
+                "member": "getRedirectURL",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [
+                "identity"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"string\"}",
+            "probeId": "identity-redirect-url-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "idle",
+                "member": "queryState",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "idle"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"string\"}",
+            "probeId": "idle-query-state-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "management",
+                "member": "getSelf",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "management-get-self-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "notifications",
+                "member": "getPermissionLevel",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "notifications"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"string\"}",
+            "probeId": "notifications-permission-level-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "offscreen",
+                "member": "hasDocument",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "offscreen"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"boolean\"}",
+            "probeId": "offscreen-has-document-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "permissions",
+                "member": "contains",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"boolean\"}",
+            "probeId": "permissions-contains-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "privacy",
+                "member": "network",
+                "context": "extension_page"
+            },
+            "status": "exposed",
+            "permissions": [
+                "privacy"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "privacy-network-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "proxy",
+                "member": "settings",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "proxy"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "proxy-settings-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "runtime",
+                "member": "getPlatformInfo",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "runtime-platform-info-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "scripting",
+                "member": "getRegisteredContentScripts",
+                "context": "service_worker"
+            },
+            "status": "verified",
+            "permissions": [
+                "scripting"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "scripting-get-registered-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "search",
+                "member": "query",
+                "context": "extension_page"
+            },
+            "status": "failed",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"error\",\"message\":\"Cannot read properties of undefined (reading 'query')\",\"name\":\"TypeError\"}",
+            "probeId": "search-query-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "sidePanel",
+                "member": "getOptions",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [
+                "sidePanel"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "side-panel-get-options-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "storage",
+                "member": "local",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "storage"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "storage-local-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "tabGroups",
+                "member": "query",
+                "context": "extension_page"
+            },
+            "status": "exposed",
+            "permissions": [
+                "tabGroups"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "tab-groups-query-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "tabs",
+                "member": "create",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "tabs-create-fixture-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "tts",
+                "member": "getVoices",
+                "context": "extension_page"
+            },
+            "status": "restricted",
+            "permissions": [
+                "tts"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"error\",\"message\":\"Access to extension API denied.\",\"name\":\"Error\"}",
+            "probeId": "tts-get-voices-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "userScripts",
+                "member": "getScripts",
+                "context": "service_worker"
+            },
+            "status": "failed",
+            "permissions": [
+                "userScripts"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"error\",\"message\":\"Cannot read properties of undefined (reading 'getScripts')\",\"name\":\"TypeError\"}",
+            "probeId": "user-scripts-get-scripts-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "webAuthenticationProxy",
+                "member": "onRemoteSessionStateChange",
+                "context": "service_worker"
+            },
+            "status": "failed",
+            "permissions": [
+                "webAuthenticationProxy"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"controlExtensionId\":\"ehkhkjjffngbhhajclkfmjeeidciboha\",\"kind\":\"manifest-load-blocked\",\"permission\":\"webAuthenticationProxy\",\"variantExtensionId\":\"agngeiipmaclokbhppfopifpeblniaki\"}",
+            "probeId": "web-auth-proxy-session-event-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "webNavigation",
+                "member": "getAllFrames",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "webNavigation"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "web-navigation-get-all-frames-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "webRequest",
+                "member": "onBeforeRequest",
+                "context": "service_worker"
+            },
+            "status": "exposed",
+            "permissions": [
+                "webRequest"
+            ],
+            "manifestKeys": [
+                "permissions"
+            ],
+            "detail": "{\"kind\":\"exposed\"}",
+            "probeId": "web-request-before-request-worker",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        },
+        {
+            "key": {
+                "namespace": "windows",
+                "member": "getCurrent",
+                "context": "extension_page"
+            },
+            "status": "verified",
+            "permissions": [],
+            "manifestKeys": [],
+            "detail": "{\"kind\":\"success\",\"valueType\":\"object\"}",
+            "probeId": "windows-get-current-page",
+            "probeCatalogSha256": "88acdaad29e031d2ea7db63fdd137f07d196de98bb230af5b64c40859e7af746"
+        }
+    ],
+    "wrapperContract": {
+        "discoveryUri": true,
+        "extensionMetadata": true,
+        "contentProvider": true,
+        "devExtensionPath": true
+    },
+    "sourceApkSha256": "9e2270ddbd0f41e4ed85944362c66f55e96090c86e19d098eb483a4a0850d32f",
+    "installationApkSetSha256": "9e2270ddbd0f41e4ed85944362c66f55e96090c86e19d098eb483a4a0850d32f",
+    "sourceApkSignerSha256": "34df0e7a9f1cf1892e45c056b4973cd81ccf148a4050d11aea4ac5a65f900a42",
+    "profileDifferences": [],
+    "supportedFeatures": [
+        "extension.options-page.user-accessible"
+    ],
+    "unavailableFeatures": [],
+    "support": "supported"
+}

@@ -60,17 +60,14 @@ fun AnalysisStep(
         AnalysisSection("선언 권한") {
             TaggedText("analysis:permissions", reportList(report.declaredPermissions))
         }
-        AnalysisSection("사용 API") {
-            TaggedText(
-                "analysis:apis",
-                buildString {
-                    append(reportList(report.usedApis))
-                    if (report.unsupportedApis.isNotEmpty()) {
-                        append("\n지원하지 않는 API\n")
-                        append(reportList(report.unsupportedApis))
-                    }
-                },
-            )
+        AnalysisSection("검증된 API") {
+            TaggedText("analysis:apis:verified", reportList(report.verifiedApis))
+        }
+        AnalysisSection("발견됐지만 미검증 또는 제한된 API") {
+            TaggedText("analysis:apis:unverified", reportList(report.unverifiedApis))
+        }
+        AnalysisSection("없거나 실패한 API") {
+            TaggedText("analysis:apis:unavailable", reportList(report.unavailableApis))
         }
         AnalysisSection("분석 issue") {
             TaggedText(

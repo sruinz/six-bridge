@@ -3,6 +3,7 @@ package dev.sixbridge.probe.evidence
 import dev.sixbridge.core.profile.ApiExecutionContext
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import java.math.BigDecimal
+import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -145,6 +146,10 @@ object ProbeEvidenceJson {
             ),
         ),
     )
+
+    fun canonicalSha256(evidence: ProbeEvidence): String = MessageDigest.getInstance("SHA-256")
+        .digest(encodeCanonical(evidence).toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
 
     private fun parseResult(value: JsonElement): ProbeCaseResult {
         val objectValue = value.jsonObject

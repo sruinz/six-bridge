@@ -1,6 +1,10 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.ApiCapabilityEvidence
+import dev.sixbridge.core.profile.ApiCapabilityKey
+import dev.sixbridge.core.profile.ApiCapabilityStatus
+import dev.sixbridge.core.profile.ApiExecutionContext
 import dev.sixbridge.core.profile.WrapperContract
 import java.nio.file.Files
 import java.security.KeyPairGenerator
@@ -30,6 +34,121 @@ class CompatibilityAnalyzerTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
+
+    @Test
+    fun `사용 member를 capability 상태별로 분리한다`() {
+        val source = Files.createTempDirectory("six-member-capability")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Member capability",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            chrome.tabs.query({});
+            chrome["userScripts"]["register"]([]);
+            chrome.downloads["download"]({});
+            """.trimIndent(),
+        )
+        val catalogSha256 = "a".repeat(64)
+        fun capability(
+            namespace: String,
+            member: String,
+            status: ApiCapabilityStatus,
+        ) = ApiCapabilityEvidence(
+            key = ApiCapabilityKey(
+                namespace,
+                member,
+                ApiExecutionContext.SERVICE_WORKER,
+            ),
+            status = status,
+            permissions = emptySet(),
+            manifestKeys = emptySet(),
+            detail = "test",
+            probeId = "$namespace.$member",
+            probeCatalogSha256 = catalogSha256,
+        )
+        val capabilityProfile = profile.copy(
+            supportedApis = setOf("tabs"),
+            detectedApis = setOf("tabs", "userScripts", "downloads"),
+            apiCapabilities = listOf(
+                capability("tabs", "query", ApiCapabilityStatus.VERIFIED),
+                capability("userScripts", "register", ApiCapabilityStatus.EXPOSED),
+                capability("downloads", "download", ApiCapabilityStatus.FAILED),
+            ),
+        )
+
+        val report = CompatibilityAnalyzer().analyzeStable(
+            source,
+            capabilityProfile,
+            sourceSha256 = null,
+        )
+
+        assertEquals(setOf("tabs.query"), report.verifiedApis)
+        assertEquals(setOf("userScripts.register"), report.unverifiedApis)
+        assertEquals(setOf("downloads.download"), report.unavailableApis)
+        assertEquals(report.unavailableApis, report.unsupportedApis)
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+    }
+
+    @Test
+    fun `capability가 없는 member는 namespace 증거 수준에 따라 미검증 또는 사용 불가다`() {
+        val source = Files.createTempDirectory("six-member-fallback")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Member fallback",
+              "version": "1",
+              "background": {"service_worker": "background.js"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("background.js").writeText(
+            """
+            chrome.tabs.unknownMember();
+            chrome.history.search({});
+            chrome.bookmarks.get("1");
+            """.trimIndent(),
+        )
+        val capabilityProfile = profile.copy(
+            supportedApis = setOf("tabs"),
+            detectedApis = setOf("tabs", "history"),
+            apiCapabilities = listOf(
+                ApiCapabilityEvidence(
+                    key = ApiCapabilityKey(
+                        "tabs",
+                        "query",
+                        ApiExecutionContext.SERVICE_WORKER,
+                    ),
+                    status = ApiCapabilityStatus.VERIFIED,
+                    permissions = emptySet(),
+                    manifestKeys = emptySet(),
+                    detail = "test",
+                    probeId = "tabs.query",
+                    probeCatalogSha256 = "a".repeat(64),
+                ),
+            ),
+        )
+
+        val report = CompatibilityAnalyzer().analyzeStable(
+            source,
+            capabilityProfile,
+            sourceSha256 = null,
+        )
+
+        assertEquals(
+            setOf("history.search", "tabs.unknownMember"),
+            report.unverifiedApis,
+        )
+        assertEquals(setOf("bookmarks.get"), report.unavailableApis)
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+    }
 
     @Test
     fun `분석 보고서는 지역화된 manifest 이름과 locale issue를 포함한다`() {

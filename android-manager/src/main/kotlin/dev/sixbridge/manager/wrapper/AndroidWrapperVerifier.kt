@@ -226,7 +226,7 @@ class AndroidWrapperVerifier(
     )
 
     private companion object {
-        val SUPPORTED_REPORT_SCHEMAS = setOf(3, 4)
+        val SUPPORTED_REPORT_SCHEMAS = setOf(3, 4, 5)
         const val EXTENSION_ID_METADATA = "extension-id"
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"

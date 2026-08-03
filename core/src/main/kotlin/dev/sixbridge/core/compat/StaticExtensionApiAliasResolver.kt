@@ -363,7 +363,7 @@ internal class StaticExtensionApiAliasResolver {
         private val IDENTIFIER = Regex("[A-Za-z_$][A-Za-z0-9_$]*")
         private val API_NAME = Regex("[A-Za-z][A-Za-z0-9_]*")
         private val DECLARATION = Regex(
-            """\b(const|let|var)\s+(?:(\{[^}\r\n]*})|([A-Za-z_$][\w$]*))\s*=\s*([^;\r\n]+)""",
+            """\b(const|let|var)\s+(?:([{][^}\r\n]*[}])|([A-Za-z_$][\w$]*))\s*=\s*([^;\r\n]+)""",
         )
         private val STATIC_GLOBAL_ROOT = Regex(
             """(?:globalThis|window|self)\s*(?:\?\.|\.)\s*(?:chrome|browser)""",

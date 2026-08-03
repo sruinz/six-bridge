@@ -85,6 +85,7 @@ const NAMESPACE = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/;
 const MEMBER = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
 const RUN_TOKEN = /^[A-Za-z0-9_-]{16,64}$/;
 const ORIGIN = /^chrome-extension:\/\/[a-p]{32}$/;
+const SESSION_ORIGIN_SCHEMES = ['chrome-extension', 'internet-extension'];
 const CONTENT_TYPE = /^application\/json(?:\s*;\s*charset=utf-8)?$/i;
 const MODE_OUTCOME = new Map([
   ['presence_only', 'exposed'],
@@ -1017,10 +1018,9 @@ function createEvidenceReceiverInternal(options, dependencies) {
     ? null : validateSessionConfig(options.sessionConfig);
   let originBindings;
   if (sessionConfig) {
-    originBindings = new Map(sessionConfig.bindings.map((binding) => [
-      `chrome-extension://${binding.extensionId}`,
-      binding,
-    ]));
+    originBindings = new Map(sessionConfig.bindings.flatMap((binding) => (
+      SESSION_ORIGIN_SCHEMES.map((scheme) => [`${scheme}://${binding.extensionId}`, binding])
+    )));
     if (expectedOrigin !== undefined) throw new TypeError('session receiver cannot use expectedOrigin');
   } else {
     if (!ORIGIN.test(String(expectedOrigin))) {

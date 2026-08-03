@@ -42,6 +42,9 @@ data class ContractCompatibilityReport(
     val browserProfileSha256: String?,
     val originalSourceSha256: String? = null,
     val planSha256: String? = null,
+    val verifiedApis: List<String> = usedApis.filterNot(unsupportedApis::contains),
+    val unverifiedApis: List<String> = emptyList(),
+    val unavailableApis: List<String> = unsupportedApis,
 )
 
 data class ContractIssue(

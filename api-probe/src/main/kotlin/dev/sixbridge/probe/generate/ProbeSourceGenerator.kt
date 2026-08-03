@@ -88,7 +88,17 @@ class ProbeSourceGenerator(
         COMMON_ASSETS.forEach { name ->
             val target = root.resolve(name)
             target.parent?.let(Files::createDirectories)
-            Files.write(target, assetLoader("probe/$name"))
+            val asset = assetLoader("probe/$name")
+            Files.write(
+                target,
+                if (name in GROUP_TEMPLATED_ASSETS) {
+                    asset.toString(UTF_8)
+                        .replace(GROUP_PLACEHOLDER, groupId)
+                        .encodeToByteArray()
+                } else {
+                    asset
+                },
+            )
         }
         val iconDirectory = root.resolve("icons")
         Files.createDirectory(iconDirectory)
@@ -231,6 +241,8 @@ class ProbeSourceGenerator(
     private companion object {
         const val FIXTURE_MATCH = "https://example.com/*"
         const val LOOPBACK_MATCH = "http://127.0.0.1:47171/*"
+        const val GROUP_PLACEHOLDER = "__SIXBRIDGE_PROBE_GROUP__"
+        val GROUP_TEMPLATED_ASSETS = setOf("probe-ui.js", "content-probe.js")
         val COMMON_ASSETS = listOf(
             "probe.html",
             "probe.css",

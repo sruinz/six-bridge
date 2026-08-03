@@ -17,6 +17,30 @@ import kotlin.test.assertFailsWith
 
 class SixBundleContractTest {
     @Test
+    fun `v5 compatibility는 API 검증 상태를 보존하고 v4를 승격한다`() {
+        val current = validContents().compatibility.copy(
+            schemaVersion = 5,
+            verifiedApis = listOf("tabs.query"),
+            unverifiedApis = listOf("userScripts.register"),
+            unavailableApis = listOf("downloads.download"),
+            unsupportedApis = listOf("downloads.download"),
+        )
+
+        val decoded = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(current))
+        val legacy = validContents().compatibility.copy(
+            schemaVersion = 4,
+            originalSourceSha256 = "e".repeat(64),
+            planSha256 = "f".repeat(64),
+        )
+        val promoted = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(legacy))
+
+        assertEquals(current, decoded)
+        assertEquals(legacy.usedApis - legacy.unsupportedApis.toSet(), promoted.verifiedApis)
+        assertEquals(emptyList(), promoted.unverifiedApis)
+        assertEquals(legacy.unsupportedApis, promoted.unavailableApis)
+    }
+
+    @Test
     fun `round trips the fixed three-entry bundle contract`() {
         val contents = validContents()
         val output = ByteArrayOutputStream()

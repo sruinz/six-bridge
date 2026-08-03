@@ -97,10 +97,17 @@ private fun AnalysisReadyContent(
         ready.report.declaredPermissions.ifEmpty { setOf(stringResource(R.string.review_none)) }
             .forEach { Text(it) }
     }
-    SectionCard(stringResource(R.string.conversion_apis)) {
-        ready.report.usedApis.ifEmpty { setOf(stringResource(R.string.review_none)) }
+    SectionCard("검증된 API") {
+        ready.report.verifiedApis.ifEmpty { setOf(stringResource(R.string.review_none)) }
             .forEach { Text(it) }
-        ready.report.unsupportedApis.forEach { Text("지원되지 않음: $it") }
+    }
+    SectionCard("발견됐지만 미검증 또는 제한된 API") {
+        ready.report.unverifiedApis.ifEmpty { setOf(stringResource(R.string.review_none)) }
+            .forEach { Text(it) }
+    }
+    SectionCard("없거나 실패한 API") {
+        ready.report.unavailableApis.ifEmpty { setOf(stringResource(R.string.review_none)) }
+            .forEach { Text(it) }
     }
     ready.draftSignerFingerprint?.let { fingerprint ->
         SectionCard(stringResource(R.string.conversion_draft_signer_title)) {

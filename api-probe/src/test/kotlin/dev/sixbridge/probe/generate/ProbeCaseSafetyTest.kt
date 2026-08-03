@@ -70,6 +70,7 @@ class ProbeCaseSafetyTest {
         FORBIDDEN_DYNAMIC_CALLS.forEach { pattern ->
             assertFalse(pattern.containsMatchIn(sources), "runtime에 동적 API 호출 우회가 포함됨: $pattern")
         }
+        assertFalse("chrome?.[" in sources, "runtime에 계산된 chrome namespace 접근이 포함됨")
         Regex("https://[^'\"`\\s)]+")
             .findAll(sources)
             .map { it.value }
@@ -725,7 +726,7 @@ class ProbeCaseSafetyTest {
     @Test
     fun `실제 content listener는 hash token을 검증하고 dispatch와 result를 분리한다`() = withWorkspace { workspace ->
         val generated = ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output"))
-        val root = generated.first().sourceRoot
+        val root = generated.single { it.groupId == "user-interface" }.sourceRoot
         Files.writeString(root.resolve("package.json"), "{\"type\":\"module\"}\n", UTF_8)
         val output = runNodeModule(
             workspace,

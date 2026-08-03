@@ -84,7 +84,7 @@ object SixBundle {
         originalSourceSha256: String,
         planSha256: String,
     ): ContractCompatibilityReport = compatibility.toContract().copy(
-        schemaVersion = 4,
+        schemaVersion = 5,
         originalSourceSha256 = originalSourceSha256,
         planSha256 = planSha256,
     )
@@ -105,7 +105,7 @@ object SixBundle {
     private fun CompatibilityReport.toContract(): ContractCompatibilityReport {
         validate()
         return ContractCompatibilityReport(
-        schemaVersion = 3,
+        schemaVersion = 5,
         status = ContractCompatibilityStatus.valueOf(status.name),
         manifestVersion = manifestVersion,
         extensionName = extensionName,
@@ -115,6 +115,9 @@ object SixBundle {
         declaredPermissions = declaredPermissions.sorted(),
         usedApis = usedApis.sorted(),
         unsupportedApis = unsupportedApis.sorted(),
+        verifiedApis = verifiedApis.sorted(),
+        unverifiedApis = unverifiedApis.sorted(),
+        unavailableApis = unavailableApis.sorted(),
         issues = issues.map { ContractIssue(it.code, it.message, it.blocking) },
         conversionState = conversionState.jsonValue(),
         adapterDecisions = adapterDecisions.map { decision ->
@@ -164,6 +167,9 @@ object SixBundle {
         declaredPermissions = declaredPermissions.toSet(),
         usedApis = usedApis.toSet(),
         unsupportedApis = unsupportedApis.toSet(),
+        verifiedApis = verifiedApis.toSet(),
+        unverifiedApis = unverifiedApis.toSet(),
+        unavailableApis = unavailableApis.toSet(),
         issues = issues.map { CompatibilityIssue(it.code, it.message, it.blocking) },
         conversionState = conversionState.toConversionState(),
         adapterDecisions = adapterDecisions.map { decision ->

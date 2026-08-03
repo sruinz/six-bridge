@@ -8,6 +8,8 @@ import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.evidence.ProbeEvidence
 import dev.sixbridge.probe.evidence.ProbeEvidenceJson
+import dev.sixbridge.probe.evidence.ProbeManifestLoadIsolation
+import dev.sixbridge.probe.evidence.ProbeManifestLoadIsolationJson
 import dev.sixbridge.probe.generate.ProbeSourceGenerator
 import dev.sixbridge.probe.profile.CapabilityEvidenceSummary
 import dev.sixbridge.probe.profile.CapabilityProfileBuilder
@@ -295,13 +297,20 @@ class ProbeVerifyEvidenceCommand : Callable<Int> {
     @Option(names = ["--input"], required = true)
     lateinit var input: Path
 
+    @Option(names = ["--manifest-load-isolation"])
+    var manifestLoadIsolation: Path? = null
+
+    @Option(names = ["--variant-evidence"])
+    var variantEvidence: Path? = null
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int = probeUserInput {
         val catalog = loadProbeCatalog()
-        val evidence = readEvidenceDirectory(input)
-        val summary = CapabilityProfileBuilder(catalog).verify(evidence)
+        val isolation = readManifestLoadIsolation(manifestLoadIsolation)
+        val evidence = readEvidenceSet(input, isolation, variantEvidence)
+        val summary = CapabilityProfileBuilder(catalog).verify(evidence, isolation)
         printEvidenceSummary(spec.commandLine().out, summary)
         spec.commandLine().out.println("증거 검증 완료")
         0
@@ -325,16 +334,23 @@ class ProbeBuildProfileCommand internal constructor(
     @Option(names = ["--output"], required = true)
     lateinit var output: Path
 
+    @Option(names = ["--manifest-load-isolation"])
+    var manifestLoadIsolation: Path? = null
+
+    @Option(names = ["--variant-evidence"])
+    var variantEvidence: Path? = null
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int = probeUserInput {
         val catalog = loadProbeCatalog()
         val baseProfile = BrowserProfileJson.decode(readStrictFile(base, MAX_PROFILE_BYTES))
-        val decodedEvidence = readEvidenceDirectory(evidence)
+        val isolation = readManifestLoadIsolation(manifestLoadIsolation)
+        val decodedEvidence = readEvidenceSet(evidence, isolation, variantEvidence)
         val builder = CapabilityProfileBuilder(catalog)
-        val summary = builder.verify(decodedEvidence)
-        val candidate = builder.build(baseProfile, decodedEvidence)
+        val summary = builder.verify(decodedEvidence, isolation)
+        val candidate = builder.build(baseProfile, decodedEvidence, isolation)
         val encoded = BrowserProfileJson.encode(candidate)
         val decoded = BrowserProfileJson.decode(encoded)
         require(decoded == candidate && decoded.canonicalSha256() == candidate.canonicalSha256()) {
@@ -354,13 +370,40 @@ private fun loadProbeCatalog(): ApiProbeCatalog = ApiProbeCatalog.load(
     )) { "bundled API probe catalog를 찾을 수 없습니다." },
 )
 
-private fun readEvidenceDirectory(path: Path): List<ProbeEvidence> {
+private fun readEvidenceSet(
+    path: Path,
+    isolation: ProbeManifestLoadIsolation?,
+    variantEvidence: Path?,
+): List<ProbeEvidence> {
+    if (isolation == null) {
+        require(variantEvidence == null) {
+            "--variant-evidence는 --manifest-load-isolation과 함께 사용해야 합니다."
+        }
+        return readEvidenceDirectory(
+            path,
+            ApiProbeCatalog.PROBE_GROUP_IDS.mapTo(linkedSetOf()) { "$it.json" },
+        )
+    }
+    val variantPath = requireNotNull(variantEvidence) {
+        "--manifest-load-isolation에는 --variant-evidence가 필요합니다."
+    }
+    val expectedControlNames = ApiProbeCatalog.PROBE_GROUP_IDS
+        .filterNot { it == isolation.groupId }
+        .mapTo(linkedSetOf()) { "$it.json" }
+    return readEvidenceDirectory(path, expectedControlNames) + ProbeEvidenceJson.decodeStrict(
+        readStrictFile(variantPath, MAX_EVIDENCE_BYTES),
+    )
+}
+
+private fun readEvidenceDirectory(
+    path: Path,
+    expectedNames: Set<String>,
+): List<ProbeEvidence> {
     val root = path.toAbsolutePath().normalize()
     require(Files.isDirectory(root, NOFOLLOW_LINKS) && !Files.isSymbolicLink(root)) {
         "API probe evidence input은 symlink가 아닌 directory여야 합니다."
     }
     val identity = directoryIdentity(root)
-    val expectedNames = ApiProbeCatalog.PROBE_GROUP_IDS.mapTo(linkedSetOf()) { "$it.json" }
     val entries = Files.list(root).use { stream -> stream.toList() }
     require(entries.map { it.fileName.toString() }.toSet() == expectedNames) {
         "API probe evidence directory는 정확한 6개 group JSON만 포함해야 합니다."
@@ -384,6 +427,10 @@ private fun readEvidenceDirectory(path: Path): List<ProbeEvidence> {
         "API probe evidence directory가 검증 중 변경되었습니다."
     }
     return decoded
+}
+
+private fun readManifestLoadIsolation(path: Path?): ProbeManifestLoadIsolation? = path?.let {
+    ProbeManifestLoadIsolationJson.decodeStrict(readStrictFile(it, MAX_EVIDENCE_BYTES))
 }
 
 private fun readStrictFile(path: Path, maxBytes: Int): String {
@@ -854,6 +901,10 @@ private fun printEvidenceSummary(
     output.println("catalog SHA-256=${summary.catalogSha256}")
     output.println("그룹=${summary.groupCaseCounts.size}/${ApiProbeCatalog.PROBE_GROUP_IDS.size}")
     output.println("case=${summary.totalCaseCount}/${summary.expectedTotalCaseCount}")
+    if (summary.manifestLoadBlockedCaseCount > 0) {
+        output.println("실행 case=${summary.executedCaseCount}/${summary.expectedTotalCaseCount}")
+        output.println("manifest 로드 차단 분리=${summary.manifestLoadBlockedCaseCount}")
+    }
     output.println(
         "브라우저=${summary.browserPackage} ${summary.browserVersionName}" +
             "(${summary.browserVersionCode})",

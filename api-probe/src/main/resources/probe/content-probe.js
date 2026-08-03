@@ -8,7 +8,11 @@
     'user-interface',
   ]);
   const FIXTURE_URL = 'https://example.com/';
-  const url = new URL(globalThis.location.href);
+  function currentUrl() {
+    return new URL(globalThis.location.href);
+  }
+
+  const url = currentUrl();
   const marker = new URLSearchParams(url.hash.slice(1));
   const markerCaseId = marker.get('sixbridge-api-probe');
   const markerRunToken = marker.get('runToken');
@@ -39,7 +43,7 @@
     try {
       runtime = await import(globalThis.chrome.runtime.getURL('probe-runtime.js'));
       const group = await import(
-        globalThis.chrome.runtime.getURL(`cases/${String(message.groupId)}.js`)
+        globalThis.chrome.runtime.getURL('cases/__SIXBRIDGE_PROBE_GROUP__.js')
       );
       if (
         descriptor?.id !== message.caseId

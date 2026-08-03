@@ -59,6 +59,13 @@ assert_no_log() {
   fi
 }
 
+assert_no_wrapper_install() {
+  if grep -E 'ADB -s serial-1 install -r .*/\.local/probe-build/20990102-030405/.*-wrapper\.apk' \
+      "$command_log" >/dev/null 2>&1; then
+    fail '검증 전에 wrapper APK 설치가 실행되었습니다'
+  fi
+}
+
 assert_event_count() {
   expected=$1
   pattern=$2
@@ -78,7 +85,34 @@ new_fixture() {
   cp "$runner_source" "$fixture_project/scripts/fold7-api-probe.sh"
   chmod +x "$fixture_project/scripts/fold7-api-probe.sh"
   : >"$fixture_project/scripts/api-probe-receiver.mjs"
+  : >"$fixture_project/scripts/api-probe-artifact-verify.mjs"
   printf '%s\n' '{"fixture":"profile"}' >"$profile"
+
+  cat >"$fixture_project/gradlew" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf 'GRADLE' >>"$SIX_TEST_COMMAND_LOG"
+printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
+printf '\n' >>"$SIX_TEST_COMMAND_LOG"
+[ "${SIX_TEST_GRADLE_FAIL:-0}" -eq 0 ] || exit 61
+draft_root=
+for argument in "$@"; do
+  case "$argument" in
+    -Psixbridge.probe.drafts=*) draft_root=${argument#*=} ;;
+  esac
+done
+[ -n "$draft_root" ] || exit 62
+/bin/mkdir -p "$draft_root"
+for group in advanced-runtime base-runtime identity-privacy network tab-page user-interface; do
+  printf '%s\n' "draft-$group" >"$draft_root/$group.sixdraft"
+done
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+/bin/mkdir -p "$project_root/android-manager/build/outputs/apk/debug"
+/bin/mkdir -p "$project_root/android-manager/build/outputs/apk/androidTest/debug"
+printf '%s\n' manager >"$project_root/android-manager/build/outputs/apk/debug/android-manager-debug.apk"
+printf '%s\n' manager-test >"$project_root/android-manager/build/outputs/apk/androidTest/debug/android-manager-debug-androidTest.apk"
+EOF
+  chmod +x "$fixture_project/gradlew"
 
   cat >"$fake_bin/date" <<'EOF'
 #!/bin/bash
@@ -195,10 +229,119 @@ case "$1" in
     printf '%s\n' 'Success'
     ;;
   shell)
+    shift
+    if [ "${1:-}" = -T ]; then shift; fi
+    if [ "${1:-}" = run-as ]; then
+      [ "$2" = dev.sixbridge.manager ] || exit 78
+      shift 2
+      case "$1" in
+        mkdir)
+          shift
+          if [ "${1:-}" = -p ]; then shift; fi
+          /bin/mkdir -p "$SIX_TEST_REMOTE_ROOT/$1"
+          if [ "$1" = 'files/api-probe-gate/sessions/20990102-030405' ]; then
+            case "${SIX_TEST_ADB_MODE:-device}" in
+              signal_after_remote_mkdir_term)
+                printf 'remote-signal-target=%s\n' "$PPID" >>"$SIX_TEST_EVENTS"
+                kill -TERM "$PPID"
+                ;;
+              signal_after_remote_mkdir_int)
+                printf 'remote-signal-target=%s\n' "$PPID" >>"$SIX_TEST_EVENTS"
+                kill -INT "$PPID"
+                ;;
+            esac
+          fi
+          ;;
+        dd)
+          remote=${2#of=}
+          /bin/mkdir -p "$(dirname -- "$SIX_TEST_REMOTE_ROOT/$remote")"
+          /bin/cat >"$SIX_TEST_REMOTE_ROOT/$remote"
+          if [ "${SIX_TEST_INSTRUMENT_LOG_PRECLAIM:-0}" -eq 1 ] &&
+              [ "$remote" = 'files/api-probe-gate/sessions/20990102-030405/input/user-interface.sixdraft' ]; then
+            /bin/mkdir -p "$SIX_TEST_HOST_BUILD_DIR"
+            printf '%s\n' 'competitor-instrumentation-log' >"$SIX_TEST_HOST_BUILD_DIR/android-instrumentation.log"
+          fi
+          ;;
+        rm)
+          [ "$2" = -r ] || exit 79
+          /bin/rm -rf "$SIX_TEST_REMOTE_ROOT/$3"
+          ;;
+        *) exit 80 ;;
+      esac
+    elif [ "${1:-}" = am ] && [ "${2:-}" = instrument ]; then
+      [ -z "${SIX_TEST_BUILD_FAIL_GROUP:-}" ] || exit 81
+      case "${SIX_TEST_INSTRUMENT_MODE:-success}" in
+        status_failure)
+          printf '%s\n' \
+            'INSTRUMENTATION_STATUS: class=dev.sixbridge.manager.conversion.ApiProbeGateInstrumentedTest' \
+            'INSTRUMENTATION_STATUS: test=convertPortableDraftsThroughProductionCoordinator' \
+            'INSTRUMENTATION_STATUS_CODE: 1' \
+            'INSTRUMENTATION_STATUS: stack=fixture failure' \
+            'INSTRUMENTATION_STATUS_CODE: -2' \
+            'INSTRUMENTATION_RESULT: stream=' \
+            'INSTRUMENTATION_CODE: -1'
+          exit 0
+          ;;
+        failure_bundle)
+          printf '%s\n' \
+            'INSTRUMENTATION_RESULT: shortMsg=Process crashed.' \
+            'INSTRUMENTATION_CODE: 0'
+          exit 0
+          ;;
+      esac
+      session=20990102-030405
+      output="$SIX_TEST_REMOTE_ROOT/files/api-probe-gate/sessions/$session/output"
+      /bin/mkdir -p "$output"
+      for group in advanced-runtime base-runtime identity-privacy network tab-page user-interface; do
+        printf '%s\n' "bundle-$group" >"$output/$group.six"
+        printf '%s\n' "wrapper-$group" >"$output/$group-wrapper.apk"
+        printf '%s\n' '{}' >"$output/$group-result.json"
+      done
+      printf '%s\n' \
+        'INSTRUMENTATION_STATUS: class=dev.sixbridge.manager.conversion.ApiProbeGateInstrumentedTest' \
+        'INSTRUMENTATION_STATUS: test=convertPortableDraftsThroughProductionCoordinator' \
+        'INSTRUMENTATION_STATUS_CODE: 1' \
+        'INSTRUMENTATION_STATUS_CODE: 0' \
+        'INSTRUMENTATION_RESULT: stream=' \
+        'INSTRUMENTATION_CODE: -1'
+    fi
+    ;;
+  exec-out)
+    [ "$1" = exec-out ]
+    [ "$2" = run-as ] && [ "$3" = dev.sixbridge.manager ] && [ "$4" = cat ] || exit 82
+    remote=$5
+    /bin/cat "$SIX_TEST_REMOTE_ROOT/$remote"
     ;;
   *)
     exit 74
     ;;
+esac
+EOF
+
+  cat >"$fake_bin/unzip" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf 'UNZIP' >>"$SIX_TEST_COMMAND_LOG"
+printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
+printf '\n' >>"$SIX_TEST_COMMAND_LOG"
+[ "$1" = -p ] || exit 95
+case "$3" in
+  wrapper.apk)
+    group=$(basename -- "$2" .six)
+    printf '%s\n' "wrapper-$group"
+    ;;
+  assets/extension.crx)
+    group=$(basename -- "$2" -wrapper.apk)
+    if [ -n "${SIX_TEST_CRX_PRECLAIM_GROUP:-}" ]; then
+      target="$(dirname -- "$2")/$SIX_TEST_CRX_PRECLAIM_GROUP.crx"
+      if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        printf '%s\n' 'competitor-crx' >"$target"
+      fi
+    fi
+    [ "${SIX_TEST_CRX_EXTRACT_FAIL_GROUP:-}" != "$group" ] || exit 97
+    printf '%s\n' "crx-$group"
+    ;;
+  *) exit 95 ;;
 esac
 EOF
 
@@ -238,11 +381,13 @@ fi
 output=
 input=
 session_id=
+artifact_bundles=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
     --input) input=$2; shift 2 ;;
     --session-id) session_id=$2; shift 2 ;;
+    --artifact-set) artifact_bundles+=("${2#*=}"); shift 2 ;;
     *) shift ;;
   esac
 done
@@ -265,6 +410,11 @@ case "$command_name" in
     ;;
   probe-prepare-session)
     [ "${SIX_TEST_PREPARE_FAIL:-0}" -eq 0 ] || exit 82
+    [ "${#artifact_bundles[@]}" -eq 6 ] || exit 87
+    for bundle in "${artifact_bundles[@]}"; do
+      crx="${bundle%.six}.crx"
+      [ -f "$crx" ] && [ ! -L "$crx" ] && [ -s "$crx" ] || exit 88
+    done
     printf '{"schemaVersion":1,"sessionId":"%s"}\n' "$session_id" >"$output"
     chmod 600 "$output"
     ;;
@@ -292,6 +442,15 @@ printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
 printf '\n' >>"$SIX_TEST_COMMAND_LOG"
 printf 'node-pid=%s\n' "$$" >>"$SIX_TEST_EVENTS"
 mode=${SIX_TEST_NODE_MODE:-success}
+if [ "$(basename -- "$1")" = api-probe-artifact-verify.mjs ]; then
+  group=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --group ]; then group=$2; break; fi
+    shift
+  done
+  [ "${SIX_TEST_VERIFY_ARTIFACT_FAIL_GROUP:-}" != "$group" ] || exit 96
+  exit 0
+fi
 if [ "$mode" = early_exit ]; then
   printf '%s\n' 'receiver early exit' >&2
   exit 91
@@ -331,16 +490,21 @@ if [ "$mode" = success ] || [ "$mode" = partial ]; then
     [ "$mode" != partial ] || break
   done
 fi
-while :; do /bin/sleep 1; done
+while :; do /bin/sleep 0.1; done
 EOF
 
-  chmod +x "$fake_bin/date" "$fake_bin/sleep" "$fake_bin/mkdir" "$fake_bin/adb" "$fake_bin/sixbridge" "$fake_bin/node"
+  chmod +x "$fake_bin/date" "$fake_bin/sleep" "$fake_bin/mkdir" "$fake_bin/adb" "$fake_bin/sixbridge" "$fake_bin/node" "$fake_bin/unzip"
   events="$case_root/events.log"
   install_count="$case_root/install-count"
+  remote_root="$case_root/remote"
+  /bin/mkdir -p "$remote_root"
   : >"$events"
   export SIX_TEST_COMMAND_LOG="$command_log"
   export SIX_TEST_EVENTS="$events"
   export SIX_TEST_INSTALL_COUNT="$install_count"
+  export SIX_TEST_REMOTE_ROOT="$remote_root"
+  fixture_project_real=$(CDPATH= cd -- "$fixture_project" && pwd -P)
+  export SIX_TEST_HOST_BUILD_DIR="$fixture_project_real/.local/probe-build/20990102-030405"
   export HOME="$case_root/home"
   export PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin"
   unset SIX_TEST_ADB_MODE SIX_TEST_BUILD_FAIL_GROUP SIX_TEST_INSTALL_FAIL_AT
@@ -348,6 +512,10 @@ EOF
   unset SIX_TEST_SLEEP_MODE SIX_TEST_MKDIR_MODE SIX_TEST_DATE_REPLACE_PROFILE
   unset SIX_TEST_SNAPSHOT_PRECLAIM SIX_TEST_SNAPSHOT_VICTIM
   unset SIX_TEST_CLI_CONTRACT
+  unset SIX_TEST_GRADLE_FAIL
+  unset SIX_TEST_VERIFY_ARTIFACT_FAIL_GROUP
+  unset SIX_TEST_INSTRUMENT_MODE SIX_TEST_CRX_PRECLAIM_GROUP SIX_TEST_CRX_EXTRACT_FAIL_GROUP
+  unset SIX_TEST_INSTRUMENT_LOG_PRECLAIM
   runner="$fixture_project/scripts/fold7-api-probe.sh"
 }
 
@@ -411,6 +579,14 @@ cleanup_fixture
 pass 'compatible local CLI의 read-only 계약 확인 후 정상 실행'
 
 new_fixture
+export SIX_TEST_GRADLE_FAIL=1
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+assert_log_count 1 'GRADLE :desktop-app:apiProbeDraftBatch :android-manager:assembleDebug :android-manager:assembleDebugAndroidTest'
+assert_no_log 'ADB '
+cleanup_fixture
+pass 'desktop draft·manager APK Gradle 실패 시 device 접근 금지'
+
+new_fixture
 export SIX_TEST_ADB_MODE=offline
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'ADB -s serial-1 get-state'
@@ -419,10 +595,42 @@ cleanup_fixture
 pass 'offline device 거부'
 
 new_fixture
+export SIX_TEST_ADB_MODE=signal_after_remote_mkdir_term
+expect_status 143 "$runner" --serial serial-1 --profile "$profile"
+assert_exact_log_count 1 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager mkdir files/api-probe-gate/sessions/20990102-030405'
+assert_exact_log_count 1 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager rm -r files/api-probe-gate/sessions/20990102-030405'
+assert_no_log 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager dd of='
+assert_no_log 'ADB -s serial-1 shell am instrument '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
+signal_target=$(sed -n 's/^remote-signal-target=//p' "$events")
+[ -n "$runner_pid" ] && [ "$runner_pid" = "$signal_target" ] || fail "remote mkdir SIGTERM target이 실제 runner PID가 아닙니다"
+cleanup_fixture
+pass 'remote session mkdir 성공 직후 SIGTERM에서도 소유권 확정 뒤 exact session 1회 cleanup'
+
+new_fixture
+export SIX_TEST_ADB_MODE=signal_after_remote_mkdir_int
+expect_status 130 "$runner" --serial serial-1 --profile "$profile"
+assert_exact_log_count 1 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager mkdir files/api-probe-gate/sessions/20990102-030405'
+assert_exact_log_count 1 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager rm -r files/api-probe-gate/sessions/20990102-030405'
+assert_no_log 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager dd of='
+assert_no_log 'ADB -s serial-1 shell am instrument '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
+signal_target=$(sed -n 's/^remote-signal-target=//p' "$events")
+[ -n "$runner_pid" ] && [ "$runner_pid" = "$signal_target" ] || fail "remote mkdir SIGINT target이 실제 runner PID가 아닙니다"
+cleanup_fixture
+pass 'remote session mkdir 성공 직후 SIGINT에서도 소유권 확정 뒤 exact session 1회 cleanup'
+
+new_fixture
 export SIX_TEST_ADB_MODE=preexisting_reverse
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
-assert_no_log 'ADB -s serial-1 install -r '
+assert_log_count 1 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager rm -r files/api-probe-gate/sessions/20990102-030405'
+assert_log_count 2 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 assert_no_log 'ADB -s serial-1 reverse --remove tcp:47171'
 grep -Fx 'pre-existing-mapping-preserved' "$events" >/dev/null || fail '기존 reverse mapping 보존 증거가 없습니다'
 cleanup_fixture
@@ -433,7 +641,8 @@ export SIX_TEST_ADB_MODE=signal_after_reverse_term
 expect_status 143 "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
-assert_no_log 'ADB -s serial-1 install -r '
+assert_log_count 2 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 assert_event_count 1 'reverse-set'
 assert_event_count 1 'reverse-removed'
 runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
@@ -447,7 +656,8 @@ export SIX_TEST_ADB_MODE=signal_after_reverse_int
 expect_status 130 "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
-assert_no_log 'ADB -s serial-1 install -r '
+assert_log_count 2 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 assert_event_count 1 'reverse-set'
 assert_event_count 1 'reverse-removed'
 runner_pid=$(sed -n 's/^runner-pid=//p' "$events")
@@ -459,31 +669,48 @@ pass 'reverse 성공 직후 SIGINT에서도 ownership 확정 뒤 정확히 한 �
 new_fixture
 expect_status 0 "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 1 'SIX probe generate --output '
-assert_log_count 6 'SIX build --input '
+assert_no_log 'SIX build --input '
 assert_log_count 1 'SIX probe prepare-session '
-assert_log_count 1 'NODE '
-assert_log_count 6 'ADB -s serial-1 install -r '
+assert_log_count 7 'NODE '
+assert_log_count 6 ' --crx '
+assert_log_count 8 'ADB -s serial-1 install -r '
+assert_log_count 7 'ADB -s serial-1 shell -T run-as dev.sixbridge.manager dd of='
+assert_log_count 18 'ADB -s serial-1 exec-out run-as dev.sixbridge.manager cat '
+assert_log_count 1 'ADB -s serial-1 shell am instrument -w -r -e sixbridgeSession 20990102-030405'
+assert_log_count 12 'UNZIP -p '
 assert_log_count 1 'ADB -s serial-1 shell am start -a android.intent.action.VIEW -d internet://extension -p com.sec.android.app.sbrowser'
 assert_log_count 1 'SIX probe verify-evidence --input '
 assert_log_count 1 'SIX probe build-profile --base '
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
 assert_log_count 1 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
 generate_line=$(grep -n -F 'SIX probe generate --output ' "$command_log" | cut -d: -f1)
-last_build_line=$(grep -n -F 'SIX build --input ' "$command_log" | tail -1 | cut -d: -f1)
+gradle_line=$(grep -n -F 'GRADLE :desktop-app:apiProbeDraftBatch ' "$command_log" | cut -d: -f1)
+instrument_line=$(grep -n -F 'ADB -s serial-1 shell am instrument ' "$command_log" | cut -d: -f1)
+last_pull_line=$(grep -n -F 'ADB -s serial-1 exec-out run-as dev.sixbridge.manager cat ' "$command_log" | tail -1 | cut -d: -f1)
 prepare_number=$(grep -n -F 'SIX probe prepare-session ' "$command_log" | cut -d: -f1)
-node_line=$(grep -n -F 'NODE ' "$command_log" | cut -d: -f1)
-first_install_line=$(grep -n -F 'ADB -s serial-1 install -r ' "$command_log" | head -1 | cut -d: -f1)
-[ "$generate_line" -lt "$last_build_line" ] && [ "$last_build_line" -lt "$prepare_number" ] && \
-  [ "$prepare_number" -lt "$node_line" ] && [ "$node_line" -lt "$first_install_line" ] || \
-  fail "generate→build×6→prepare-session→receiver→install 순서가 아닙니다"
+receiver_line=$(grep -n -F 'NODE ' "$command_log" | tail -1 | cut -d: -f1)
+last_install_line=$(grep -n -F 'ADB -s serial-1 install -r ' "$command_log" | tail -1 | cut -d: -f1)
+[ "$generate_line" -lt "$gradle_line" ] && [ "$gradle_line" -lt "$instrument_line" ] && \
+  [ "$instrument_line" -lt "$last_pull_line" ] && [ "$last_pull_line" -lt "$prepare_number" ] && \
+  [ "$prepare_number" -lt "$receiver_line" ] && [ "$receiver_line" -lt "$last_install_line" ] || \
+  fail "generate→draft→Android 변환→pull 검증→prepare-session→receiver→wrapper install 순서가 아닙니다"
 prepare_line=$(grep -F 'SIX probe prepare-session ' "$command_log")
 expected_artifacts='--artifact-set advanced-runtime='
 case "$prepare_line" in *"$expected_artifacts"*' --artifact-set base-runtime='*' --artifact-set identity-privacy='*' --artifact-set network='*' --artifact-set tab-page='*' --artifact-set user-interface='*) ;;
   *) fail "prepare-session artifact-set canonical 순서가 아닙니다: $prepare_line" ;;
 esac
-build_dir="$fixture_project/.local/probe-build/20990102-030405"
-evidence_dir="$fixture_project/.local/evidence/api-probe/20990102-030405"
+fixture_project_real=$(CDPATH= cd -- "$fixture_project" && pwd -P)
+build_dir="$fixture_project_real/.local/probe-build/20990102-030405"
+evidence_dir="$fixture_project_real/.local/evidence/api-probe/20990102-030405"
 [ -f "$build_dir/candidate-profile.json" ] || fail "후보 profile이 없습니다"
+[ -f "$build_dir/android-instrumentation.log" ] && [ ! -L "$build_dir/android-instrumentation.log" ] || fail 'instrumentation raw output이 regular evidence로 보존되지 않았습니다'
+grep -Fx 'INSTRUMENTATION_CODE: -1' "$build_dir/android-instrumentation.log" >/dev/null || fail 'instrumentation final success token이 보존되지 않았습니다'
+for group in advanced-runtime base-runtime identity-privacy network tab-page user-interface; do
+  crx="$build_dir/$group.crx"
+  [ -f "$crx" ] && [ ! -L "$crx" ] || fail "host extracted CRX가 regular file이 아닙니다: $group"
+  grep -Fx "crx-$group" "$crx" >/dev/null || fail "host extracted CRX bytes가 wrapper entry와 다릅니다: $group"
+  assert_exact_log_count 1 "UNZIP -p $build_dir/$group-wrapper.apk assets/extension.crx"
+done
 [ -f "$build_dir/base-profile.json" ] && [ ! -L "$build_dir/base-profile.json" ] || fail 'profile snapshot이 owner session의 regular file이 아닙니다'
 cmp -s "$profile" "$build_dir/base-profile.json" || fail 'profile snapshot bytes가 source와 다릅니다'
 snapshot_permissions=$(LC_ALL=C ls -ld "$build_dir/base-profile.json")
@@ -495,11 +722,50 @@ if grep -F 'fd9-leaked-' "$events" >/dev/null 2>&1; then
   fail "profile FD9가 의도한 snapshot writer 이외의 child에 노출됨: $(grep -F 'fd9-leaked-' "$events" | tr '\n' ' ')"
 fi
 [ "$(find "$evidence_dir" -type f -name '*.json' | wc -l | tr -d ' ')" -eq 6 ] || fail "evidence 6개가 보존되지 않았습니다"
-node_pid=$(sed -n 's/^node-pid=//p' "$events")
+node_pid=$(sed -n 's/^node-pid=//p' "$events" | tail -1)
 node_term=$(sed -n 's/^node-term=//p' "$events")
 [ -n "$node_pid" ] && [ "$node_pid" = "$node_term" ] || fail "exact receiver PID를 종료하지 않았습니다"
 cleanup_fixture
 pass '정상 흐름의 6-group 순서·session·evidence·cleanup'
+
+new_fixture
+export SIX_TEST_INSTRUMENT_MODE=status_failure
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+build_dir="$fixture_project/.local/probe-build/20990102-030405"
+[ -f "$build_dir/android-instrumentation.log" ] || fail '실패 instrumentation raw output이 보존되지 않았습니다'
+grep -Fx 'INSTRUMENTATION_STATUS_CODE: -2' "$build_dir/android-instrumentation.log" >/dev/null || fail '실패 status code 증거가 없습니다'
+assert_no_log 'ADB -s serial-1 exec-out run-as dev.sixbridge.manager cat '
+assert_no_log 'SIX probe prepare-session '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+cleanup_fixture
+pass 'am exit 0이어도 per-test failure status를 거부하고 후속 artifact·prepare·reverse·install 금지'
+
+new_fixture
+export SIX_TEST_INSTRUMENT_MODE=failure_bundle
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+build_dir="$fixture_project/.local/probe-build/20990102-030405"
+[ -f "$build_dir/android-instrumentation.log" ] || fail 'failure bundle raw output이 보존되지 않았습니다'
+grep -Fx 'INSTRUMENTATION_RESULT: shortMsg=Process crashed.' "$build_dir/android-instrumentation.log" >/dev/null || fail 'failure bundle 증거가 없습니다'
+assert_no_log 'ADB -s serial-1 exec-out run-as dev.sixbridge.manager cat '
+assert_no_log 'SIX probe prepare-session '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+cleanup_fixture
+pass 'am exit 0이어도 failure result bundle을 거부하고 후속 artifact·prepare·reverse·install 금지'
+
+new_fixture
+export SIX_TEST_INSTRUMENT_LOG_PRECLAIM=1
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+build_dir="$fixture_project_real/.local/probe-build/20990102-030405"
+grep -Fx 'competitor-instrumentation-log' "$build_dir/android-instrumentation.log" >/dev/null || fail '선점된 instrumentation log bytes를 변경했습니다'
+assert_no_log 'ADB -s serial-1 shell am instrument '
+assert_no_log 'ADB -s serial-1 exec-out run-as dev.sixbridge.manager cat '
+assert_no_log 'SIX probe prepare-session '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+cleanup_fixture
+pass 'instrumentation log 경로 선점 시 no-replace하고 후속 instrument·artifact·prepare·reverse·install 금지'
 
 new_fixture
 export SIX_TEST_DATE_REPLACE_PROFILE="$profile"
@@ -508,7 +774,8 @@ fixture_project_real=$(CDPATH= cd -- "$fixture_project" && pwd -P)
 profile_snapshot="$fixture_project_real/.local/probe-build/20990102-030405/base-profile.json"
 grep -F '"fixture":"replaced"' "$profile" >/dev/null || fail 'source profile 교체 fixture가 실행되지 않았습니다'
 cmp -s "$profile" "$profile_snapshot" || fail '사전 child 완료 뒤 재검증한 source bytes가 snapshot과 다릅니다'
-assert_log_count 7 "--profile $profile_snapshot"
+assert_log_count 1 "-Psixbridge.probe.profile=$profile_snapshot"
+assert_log_count 1 "--profile $profile_snapshot"
 assert_log_count 1 "--base $profile_snapshot"
 assert_no_log "$profile"
 cleanup_fixture
@@ -517,7 +784,7 @@ pass '사전 child 완료 뒤 profile을 재검증하고 private snapshot으로 
 new_fixture
 export SIX_TEST_NODE_MODE=never_ready
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
-assert_no_log 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
 cleanup_fixture
 pass 'receiver 준비 전 APK 설치 금지'
@@ -525,7 +792,7 @@ pass 'receiver 준비 전 APK 설치 금지'
 new_fixture
 export SIX_TEST_NODE_MODE=port_collision
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
-assert_no_log 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 grep -F 'EADDRINUSE' "$case_root/stderr" >/dev/null || grep -F 'EADDRINUSE' "$case_root/stdout" >/dev/null || fail "port 충돌 원인이 출력되지 않았습니다"
 cleanup_fixture
 pass 'receiver port 충돌 실패'
@@ -533,7 +800,7 @@ pass 'receiver port 충돌 실패'
 new_fixture
 export SIX_TEST_NODE_MODE=early_exit
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
-assert_no_log 'ADB -s serial-1 install -r '
+assert_no_wrapper_install
 grep -F 'receiver early exit' "$case_root/stderr" "$case_root/stdout" >/dev/null || fail "receiver 조기 종료 원인이 없습니다"
 cleanup_fixture
 pass 'receiver 조기 종료 실패'
@@ -542,18 +809,39 @@ new_fixture
 export SIX_TEST_BUILD_FAIL_GROUP=network
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
 assert_no_log 'NODE '
-assert_no_log 'ADB -s serial-1 install -r '
-assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
+assert_no_wrapper_install
+assert_no_log 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
 [ -d "$fixture_project/.local/probe-build/20990102-030405" ] || fail "실패 build 증거가 보존되지 않았습니다"
 cleanup_fixture
-pass '일부 build 실패와 산출물 보존'
+pass 'Android 변환 실패 시 reverse·receiver·wrapper 설치 금지와 host 증거 보존'
+
+new_fixture
+export SIX_TEST_VERIFY_ARTIFACT_FAIL_GROUP=network
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+assert_log_count 4 'NODE '
+assert_no_log 'SIX probe prepare-session '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind tcp:47171 tcp:47171'
+assert_no_wrapper_install
+cleanup_fixture
+pass 'Android artifact hash 검증 실패 시 prepare·reverse·wrapper 설치 금지'
+
+new_fixture
+export SIX_TEST_CRX_PRECLAIM_GROUP=network
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+build_dir="$fixture_project/.local/probe-build/20990102-030405"
+grep -Fx 'competitor-crx' "$build_dir/network.crx" >/dev/null || fail '경쟁자가 선점한 CRX bytes를 변경했습니다'
+assert_no_log 'SIX probe prepare-session '
+assert_no_log 'ADB -s serial-1 reverse --no-rebind '
+assert_no_wrapper_install
+cleanup_fixture
+pass 'host CRX 경로 선점 시 no-replace하고 prepare·reverse·wrapper 설치 금지'
 
 new_fixture
 export SIX_TEST_INSTALL_FAIL_AT=3
 expect_nonzero "$runner" --serial serial-1 --profile "$profile"
 assert_log_count 3 'ADB -s serial-1 install -r '
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
-node_pid=$(sed -n 's/^node-pid=//p' "$events")
+node_pid=$(sed -n 's/^node-pid=//p' "$events" | tail -1)
 node_term=$(sed -n 's/^node-term=//p' "$events")
 [ "$node_pid" = "$node_term" ] || fail "install 실패에서 receiver exact PID cleanup 실패"
 cleanup_fixture
@@ -642,7 +930,7 @@ signal_status=$?
 set -e
 [ "$signal_status" -eq 143 ] || fail "SIGTERM exit 143 예상, 실제 $signal_status"
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
-node_pid=$(sed -n 's/^node-pid=//p' "$events")
+node_pid=$(sed -n 's/^node-pid=//p' "$events" | tail -1)
 node_term=$(sed -n 's/^node-term=//p' "$events")
 [ "$node_pid" = "$node_term" ] || fail "SIGTERM exact receiver PID cleanup 실패"
 cleanup_fixture
@@ -697,7 +985,7 @@ signal_status=$?
 set -e
 [ "$signal_status" -eq 130 ] || fail "SIGINT exit 130 예상, 실제 $signal_status"
 assert_log_count 1 'ADB -s serial-1 reverse --remove tcp:47171'
-node_pid=$(sed -n 's/^node-pid=//p' "$events")
+node_pid=$(sed -n 's/^node-pid=//p' "$events" | tail -1)
 node_term=$(sed -n 's/^node-term=//p' "$events")
 [ "$node_pid" = "$node_term" ] || fail "SIGINT exact receiver PID cleanup 실패"
 cleanup_fixture

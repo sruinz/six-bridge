@@ -39,6 +39,32 @@ import kotlin.io.path.writeText
 
 class SixDraftTest {
     @Test
+    fun `compatibility schema 4는 API 검증 상태를 보존한다`() {
+        val report = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Capability",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = setOf("tabs", "userScripts", "downloads"),
+            unsupportedApis = setOf("downloads.download"),
+            issues = emptyList(),
+            sourceSha256 = "a".repeat(64),
+            browserProfileSha256 = "b".repeat(64),
+            verifiedApis = setOf("tabs.query"),
+            unverifiedApis = setOf("userScripts.register"),
+            unavailableApis = setOf("downloads.download"),
+        )
+
+        val decoded = SixDraftJson.decodeCompatibility(
+            "compatibility.json",
+            SixDraftJson.encodeCompatibility(report),
+        )
+
+        assertEquals(report, decoded)
+    }
+
+    @Test
     fun `same key payload and plan produce identical draft bytes`() {
         val keyPair = keyPair()
         val payload = payload(DraftSourceKind.ZIP)
@@ -698,6 +724,8 @@ class SixDraftTest {
             status = CompatibilityStatus.COMPATIBLE,
             usedApis = setOf("storage.local"),
             unsupportedApis = emptySet(),
+            verifiedApis = setOf("storage.local"),
+            unavailableApis = emptySet(),
             conversionState = ConversionState.CONVERTED,
             adapterDecisions = listOf(decision.copy(applied = true)),
             convertedExtensionId = "a".repeat(32),

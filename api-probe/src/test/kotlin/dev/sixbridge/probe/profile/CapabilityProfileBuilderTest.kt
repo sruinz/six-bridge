@@ -7,6 +7,8 @@ import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.catalog.CatalogDisposition
 import dev.sixbridge.probe.evidence.ProbeEvidence
 import dev.sixbridge.probe.evidence.ProbeEvidenceJson
+import dev.sixbridge.probe.evidence.ProbeManifestLoadIsolation
+import dev.sixbridge.probe.evidence.ProbeManifestLoadOutcome
 import java.security.MessageDigest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -219,6 +221,64 @@ class CapabilityProfileBuilderTest {
         assertEquals(first.apiCapabilities.map { it.key.namespace }, first.apiCapabilities.map { it.key.namespace }.sorted())
     }
 
+    @Test
+    fun `manifest 로드 차단 A B 증거는 누락 case를 FAILED capability로 합친다`() {
+        val complete = evidence()
+        val control = complete.single { it.groupId == "identity-privacy" }
+        val variant = decodeEvidence(
+            control,
+            sessionId = "session-identity-variant",
+            extensionId = extensionId("identity-privacy-variant"),
+            results = control.results.filterNot {
+                it.caseId == "web-auth-proxy-session-event-worker"
+            },
+        )
+        val split = complete.map { if (it.groupId == variant.groupId) variant else it }
+        val isolation = manifestLoadIsolation(control, variant)
+
+        val builder = CapabilityProfileBuilder(catalog)
+        val summary = builder.verify(split, isolation)
+        val candidate = builder.build(base, split, isolation)
+
+        assertEquals(32, summary.executedCaseCount)
+        assertEquals(1, summary.manifestLoadBlockedCaseCount)
+        assertEquals(33, summary.totalCaseCount)
+        val blocked = candidate.apiCapabilities.single {
+            it.probeId == "web-auth-proxy-session-event-worker"
+        }
+        assertEquals(ApiCapabilityStatus.FAILED, blocked.status)
+        assertTrue("manifest-load-blocked" in blocked.detail)
+        assertTrue("webAuthenticationProxy" in blocked.detail)
+        assertFalse("webAuthenticationProxy" in candidate.supportedApis)
+    }
+
+    @Test
+    fun `manifest 로드 차단 A B 증거의 case permission session digest 불일치는 거부한다`() {
+        val complete = evidence()
+        val control = complete.single { it.groupId == "identity-privacy" }
+        val variant = decodeEvidence(
+            control,
+            sessionId = "session-identity-variant",
+            extensionId = extensionId("identity-privacy-variant"),
+            results = control.results.filterNot {
+                it.caseId == "web-auth-proxy-session-event-worker"
+            },
+        )
+        val split = complete.map { if (it.groupId == variant.groupId) variant else it }
+        val valid = manifestLoadIsolation(control, variant)
+
+        listOf(
+            valid.copy(excludedPermission = "identity"),
+            valid.copy(variantSessionId = "wrong-variant-session"),
+            valid.copy(variantEvidenceSha256 = SHA_A),
+            valid.copy(controlExtensionId = split.first().extensionId),
+        ).forEach { tampered ->
+            assertFailsWith<IllegalArgumentException>(tampered.toString()) {
+                CapabilityProfileBuilder(catalog).build(base, split, tampered)
+            }
+        }
+    }
+
     private fun evidence(): List<ProbeEvidence> {
         val entries = catalog.entries.filter { it.disposition == CatalogDisposition.PROBE }
         return entries.groupBy { requireNotNull(it.groupId) }.toSortedMap().map { (groupId, group) ->
@@ -336,6 +396,32 @@ class CapabilityProfileBuilderTest {
             val value = byte.toInt() and 0xff
             "${('a'.code + (value ushr 4)).toChar()}${('a'.code + (value and 0xf)).toChar()}"
         }
+
+    private fun manifestLoadIsolation(
+        control: ProbeEvidence,
+        variant: ProbeEvidence,
+    ): ProbeManifestLoadIsolation = ProbeManifestLoadIsolation(
+        schemaVersion = 1,
+        groupId = "identity-privacy",
+        catalogSha256 = catalog.sha256,
+        excludedCaseId = "web-auth-proxy-session-event-worker",
+        excludedPermission = "webAuthenticationProxy",
+        controlSessionId = control.sessionId,
+        controlExtensionId = control.extensionId,
+        controlManifestSha256 = SHA_A,
+        controlOutcome = ProbeManifestLoadOutcome.LOAD_BLOCKED,
+        variantSessionId = variant.sessionId,
+        variantExtensionId = variant.extensionId,
+        variantManifestSha256 = SHA_B,
+        variantEvidenceSha256 = ProbeEvidenceJson.canonicalSha256(variant),
+        variantOutcome = ProbeManifestLoadOutcome.LOADED,
+        wrapperSignerSha256 = variant.wrapperSignerSha256,
+        browserPackage = variant.browserPackage,
+        browserVersionName = variant.browserVersionName,
+        browserVersionCode = variant.browserVersionCode,
+        browserApkSetSha256 = variant.browserApkSetSha256,
+        browserSignerSha256 = variant.browserSignerSha256,
+    )
 
     private fun loadCatalog(): ApiProbeCatalog = ApiProbeCatalog.load(
         checkNotNull(javaClass.getResourceAsStream("/catalog/sbrowser-30-public-apis.json")),

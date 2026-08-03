@@ -85,12 +85,19 @@ node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/minimal-mv3/content.test.mjs \
   fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
   fixtures/desktop-mobile-golden/storage-fallback.test.mjs \
+  scripts/api-probe-artifact-verify.test.mjs \
+  scripts/api-probe-receiver.test.mjs \
   scripts/lan-receiver-evidence.test.mjs \
   scripts/ai-recipe-lan-receiver.test.mjs \
   scripts/video-nas-lan-receiver.test.mjs
 
 bash -n scripts/fold7-gate.sh
 for shell_file in \
+  scripts/api-probe-generation.test.sh \
+  scripts/desktop-large-extension-analysis.sh \
+  scripts/desktop-large-extension-analysis.test.sh \
+  scripts/fold7-api-probe.sh \
+  scripts/fold7-api-probe.test.sh \
   scripts/fold7-extension-validation.sh \
   scripts/fold7-ai-recipe.sh \
   scripts/fold7-video-nas.sh \
@@ -102,6 +109,9 @@ for shell_file in \
   scripts/fold7-ondevice-conversion-flow.test.sh; do
   bash -n "$shell_file"
 done
+bash scripts/api-probe-generation.test.sh
+bash scripts/desktop-large-extension-analysis.test.sh
+bash scripts/fold7-api-probe.test.sh
 bash scripts/fold7-extension-validation.test.sh
 bash scripts/fold7-converted-extension.test.sh
 bash scripts/fold7-ondevice-conversion-flow.test.sh

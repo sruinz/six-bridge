@@ -13,7 +13,10 @@ groups=(
 receiver_pid=
 reverse_set=false
 reverse_critical=false
+remote_session_critical=false
 pending_signal=0
+remote_session_owned=false
+remote_session=
 serial=
 profile_input=
 
@@ -29,7 +32,7 @@ die() {
 }
 
 on_signal() {
-  if [ "$reverse_critical" = true ]; then
+  if [ "$reverse_critical" = true ] || [ "$remote_session_critical" = true ]; then
     if [ "$pending_signal" -eq 0 ]; then
       pending_signal=$1
     fi
@@ -58,6 +61,11 @@ cleanup() {
   if [ "$reverse_set" = true ]; then
     if ! "$adb_bin" -s "$serial" reverse --remove tcp:47171 >/dev/null 2>&1; then
       echo "경고: 이 실행이 설정한 adb reverse mapping을 제거하지 못했습니다." >&2
+    fi
+  fi
+  if [ "$remote_session_owned" = true ]; then
+    if ! "$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager rm -r "$remote_session" >/dev/null 2>&1; then
+      echo "경고: 이 실행이 만든 app-private probe session을 정리하지 못했습니다." >&2
     fi
   fi
   exit "$status"
@@ -136,6 +144,54 @@ else
 fi
 receiver_script="$project_dir/scripts/api-probe-receiver.mjs"
 [ -f "$receiver_script" ] && [ ! -L "$receiver_script" ] || die "API probe receiver script를 검증할 수 없습니다."
+artifact_verifier="$project_dir/scripts/api-probe-artifact-verify.mjs"
+[ -f "$artifact_verifier" ] && [ ! -L "$artifact_verifier" ] || die "API probe artifact verifier를 검증할 수 없습니다."
+unzip_bin=$(command -v unzip) || die "unzip을 찾을 수 없습니다."
+cmp_bin=$(command -v cmp) || die "cmp를 찾을 수 없습니다."
+awk_bin=$(command -v awk) || die "awk를 찾을 수 없습니다."
+
+verify_instrumentation_output() {
+  instrumentation_output=$1
+  "$awk_bin" '
+    BEGIN {
+      start_count = 0
+      success_count = 0
+      final_count = 0
+      result_stream_count = 0
+      invalid = 0
+      status_prefix = "INSTRUMENTATION_STATUS_CODE: "
+      final_prefix = "INSTRUMENTATION_CODE: "
+      result_prefix = "INSTRUMENTATION_RESULT: "
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (index(line, status_prefix) == 1) {
+        code = substr(line, length(status_prefix) + 1)
+        if (code == "1") start_count++
+        else if (code == "0") success_count++
+        else invalid = 1
+        next
+      }
+      if (index(line, final_prefix) == 1) {
+        final_count++
+        if (substr(line, length(final_prefix) + 1) != "-1") invalid = 1
+        next
+      }
+      if (index(line, result_prefix) == 1) {
+        if (line == "INSTRUMENTATION_RESULT: stream=") result_stream_count++
+        else invalid = 1
+        next
+      }
+      if (index(line, "INSTRUMENTATION_FAILED:") == 1 ||
+          index(line, "INSTRUMENTATION_ABORTED:") == 1) invalid = 1
+    }
+    END {
+      if (invalid || start_count != 1 || success_count != 1 ||
+          final_count != 1 || result_stream_count != 1) exit 1
+    }
+  ' "$instrumentation_output"
+}
 
 help_lists_command() {
   expected_command=$1
@@ -162,7 +218,6 @@ cli_contract_error() {
 if ! root_help=$("$sixbridge_bin" --help 2>/dev/null); then
   cli_contract_error
 fi
-help_lists_command build "$root_help" || cli_contract_error
 help_lists_command probe "$root_help" || cli_contract_error
 if ! probe_help=$("$sixbridge_bin" probe 2>/dev/null); then
   cli_contract_error
@@ -222,8 +277,111 @@ exec 9<&-
 chmod 600 "$profile_snapshot"
 [ -f "$profile_snapshot" ] && [ ! -L "$profile_snapshot" ] || die "profile session snapshot을 검증할 수 없습니다."
 
+source_dir="$build_dir/source"
+"$sixbridge_bin" probe generate --output "$source_dir"
+draft_dir="$build_dir/drafts"
+gradle_wrapper="$project_dir/gradlew"
+[ -f "$gradle_wrapper" ] && [ ! -L "$gradle_wrapper" ] && [ -x "$gradle_wrapper" ] || \
+  die "검증된 Gradle wrapper를 찾을 수 없습니다."
+sdk_root=${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}
+ANDROID_HOME="$sdk_root" ANDROID_SDK_ROOT="$sdk_root" "$gradle_wrapper" \
+  :desktop-app:apiProbeDraftBatch \
+  :android-manager:assembleDebug \
+  :android-manager:assembleDebugAndroidTest \
+  "-Psixbridge.probe.source=$source_dir" \
+  "-Psixbridge.probe.profile=$profile_snapshot" \
+  "-Psixbridge.probe.drafts=$draft_dir"
+for group in "${groups[@]}"; do
+  draft="$draft_dir/$group.sixdraft"
+  [ -f "$draft" ] && [ ! -L "$draft" ] || die "portable probe draft를 검증할 수 없습니다: $draft"
+done
+manager_apk="$project_dir/android-manager/build/outputs/apk/debug/android-manager-debug.apk"
+manager_test_apk="$project_dir/android-manager/build/outputs/apk/androidTest/debug/android-manager-debug-androidTest.apk"
+for manager_artifact in "$manager_apk" "$manager_test_apk"; do
+  [ -f "$manager_artifact" ] && [ ! -L "$manager_artifact" ] || \
+    die "manager test APK를 검증할 수 없습니다: $manager_artifact"
+done
+
 device_state=$("$adb_bin" -s "$serial" get-state) || die "ADB device 상태를 확인하지 못했습니다."
 [ "$device_state" = device ] || die "ADB device가 online device 상태가 아닙니다: $device_state"
+
+"$adb_bin" -s "$serial" install -r "$manager_apk"
+"$adb_bin" -s "$serial" install -r "$manager_test_apk"
+remote_sessions="files/api-probe-gate/sessions"
+remote_session="$remote_sessions/$session_id"
+remote_input="$remote_session/input"
+"$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager mkdir -p "$remote_sessions"
+remote_session_critical=true
+if "$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager mkdir "$remote_session"; then
+  remote_session_status=0
+  remote_session_owned=true
+else
+  remote_session_status=$?
+fi
+remote_session_critical=false
+if [ "$pending_signal" -ne 0 ]; then
+  exit "$pending_signal"
+fi
+[ "$remote_session_status" -eq 0 ] || die "app-private probe session을 만들지 못했습니다."
+"$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager mkdir "$remote_input"
+"$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager dd of="$remote_input/base-profile.json" <"$profile_snapshot"
+for group in "${groups[@]}"; do
+  "$adb_bin" -s "$serial" shell -T run-as dev.sixbridge.manager \
+    dd of="$remote_input/$group.sixdraft" <"$draft_dir/$group.sixdraft"
+done
+instrumentation_log="$build_dir/android-instrumentation.log"
+[ ! -e "$instrumentation_log" ] && [ ! -L "$instrumentation_log" ] || \
+  die "instrumentation log를 덮어쓸 수 없습니다."
+if (set -C; "$adb_bin" -s "$serial" shell am instrument -w -r \
+    -e sixbridgeSession "$session_id" \
+    -e class dev.sixbridge.manager.conversion.ApiProbeGateInstrumentedTest \
+    dev.sixbridge.manager.test/androidx.test.runner.AndroidJUnitRunner \
+    >"$instrumentation_log" 2>&1); then
+  instrumentation_status=0
+else
+  instrumentation_status=$?
+fi
+[ -f "$instrumentation_log" ] && [ ! -L "$instrumentation_log" ] || \
+  die "instrumentation output이 regular file이 아닙니다."
+[ "$instrumentation_status" -eq 0 ] || die "Android probe instrumentation 실행에 실패했습니다."
+verify_instrumentation_output "$instrumentation_log" || \
+  die "Android probe instrumentation 결과가 성공 계약을 충족하지 않습니다."
+
+artifact_args=()
+for group in "${groups[@]}"; do
+  bundle="$build_dir/$group.six"
+  wrapper="$build_dir/$group-wrapper.apk"
+  result="$build_dir/$group-result.json"
+  crx="$build_dir/$group.crx"
+  for remote_artifact in "$group.six:$bundle" "$group-wrapper.apk:$wrapper" "$group-result.json:$result"; do
+    remote_name=${remote_artifact%%:*}
+    local_file=${remote_artifact#*:}
+    [ ! -e "$local_file" ] && [ ! -L "$local_file" ] || die "회수 artifact를 덮어쓸 수 없습니다: $local_file"
+    (set -C; "$adb_bin" -s "$serial" exec-out run-as dev.sixbridge.manager \
+      cat "$remote_session/output/$remote_name" >"$local_file") || \
+      die "Android probe artifact를 회수하지 못했습니다: $remote_name"
+    [ -f "$local_file" ] && [ ! -L "$local_file" ] || die "회수 artifact가 regular file이 아닙니다: $local_file"
+  done
+  "$unzip_bin" -p "$bundle" wrapper.apk | "$cmp_bin" - "$wrapper" || \
+    die "SixBundle 내장 wrapper와 회수 APK가 일치하지 않습니다: $group"
+  [ ! -e "$crx" ] && [ ! -L "$crx" ] || die "추출 CRX를 덮어쓸 수 없습니다: $crx"
+  (set -C; "$unzip_bin" -p "$wrapper" assets/extension.crx >"$crx") || \
+    die "wrapper APK에서 CRX를 추출하지 못했습니다: $group"
+  [ -f "$crx" ] && [ ! -L "$crx" ] && [ -s "$crx" ] || \
+    die "추출 CRX가 비어 있지 않은 regular file이 아닙니다: $crx"
+  "$node_bin" "$artifact_verifier" \
+    --group "$group" --six "$bundle" --wrapper "$wrapper" --crx "$crx" --result "$result"
+  artifact_args+=(--artifact-set "$group=$bundle")
+done
+
+session_config="$build_dir/session-config.json"
+"$sixbridge_bin" probe prepare-session \
+  --session-id "$session_id" \
+  --profile "$profile_snapshot" \
+  "${artifact_args[@]}" \
+  --output "$session_config"
+[ -f "$session_config" ] && [ ! -L "$session_config" ] || die "session config를 검증할 수 없습니다."
+
 reverse_critical=true
 if "$adb_bin" -s "$serial" reverse --no-rebind tcp:47171 tcp:47171; then
   reverse_status=0
@@ -236,30 +394,6 @@ if [ "$pending_signal" -ne 0 ]; then
   exit "$pending_signal"
 fi
 [ "$reverse_status" -eq 0 ] || die "ADB reverse mapping을 설정하지 못했습니다."
-
-source_dir="$build_dir/source"
-"$sixbridge_bin" probe generate --output "$source_dir"
-
-artifact_args=()
-for group in "${groups[@]}"; do
-  group_source="$source_dir/$group"
-  bundle="$build_dir/$group.six"
-  "$sixbridge_bin" build --input "$group_source" --profile "$profile_snapshot" --output "$bundle"
-  crx="$build_dir/$group.crx"
-  wrapper="$build_dir/$group-wrapper.apk"
-  for artifact in "$bundle" "$crx" "$wrapper"; do
-    [ -f "$artifact" ] && [ ! -L "$artifact" ] || die "build artifact가 symlink가 아닌 regular file이 아닙니다: $artifact"
-  done
-  artifact_args+=(--artifact-set "$group=$bundle")
-done
-
-session_config="$build_dir/session-config.json"
-"$sixbridge_bin" probe prepare-session \
-  --session-id "$session_id" \
-  --profile "$profile_snapshot" \
-  "${artifact_args[@]}" \
-  --output "$session_config"
-[ -f "$session_config" ] && [ ! -L "$session_config" ] || die "session config를 검증할 수 없습니다."
 
 receiver_log="$build_dir/receiver.log"
 "$node_bin" "$receiver_script" \

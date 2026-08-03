@@ -90,7 +90,11 @@ class SixBridgeCommand(
 internal fun createDesktopService(workspace: Path): SixBridgeService =
     SixBridgeService(
         workspaceRoot = workspace,
-        inputResolver = ExtensionInputResolver(DesktopChromeCrxDownloader()),
+        inputResolver = ExtensionInputResolver(
+            DesktopChromeCrxDownloader(),
+            CliSecureWorkspace::createExtractionRoot,
+        ),
+        secureConversionRoot = CliSecureWorkspace.root,
     )
 
 @Command(

@@ -1,6 +1,7 @@
 package dev.sixbridge.core.compat
 
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.ApiCapabilityStatus
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -128,9 +129,16 @@ class CompatibilityAnalyzer(
             ).withAdditionalIssues(manifestIssues)
         }
         val usedApis = (
-            apiScan.namespaces + permissions.filter { it in KNOWN_API_NAMESPACES }
+            apiScan.references.map(ApiReference::namespace) +
+                permissions.filter { it in KNOWN_API_NAMESPACES }
             ).toSortedSet()
-        val unsupported = (usedApis - profile.supportedApis).toSortedSet()
+        val apiReferences = apiScan.references.toMutableSet().apply {
+            permissions.filter { it in KNOWN_API_NAMESPACES }.forEach { permission ->
+                if (none { it.namespace == permission }) add(ApiReference(permission, null))
+            }
+        }
+        val classification = classifyApiReferences(apiReferences, profile)
+        val unsupported = classification.unavailable
         val issues = manifestIssues.toMutableList()
 
         if (manifestVersion != 3) {
@@ -149,6 +157,7 @@ class CompatibilityAnalyzer(
                 permissions,
                 usedApis,
                 unsupported,
+                classification,
                 issues,
             )
         }
@@ -168,6 +177,7 @@ class CompatibilityAnalyzer(
                 permissions,
                 usedApis,
                 unsupported,
+                classification,
                 issues,
             )
         }
@@ -184,6 +194,7 @@ class CompatibilityAnalyzer(
                 permissions,
                 usedApis,
                 unsupported,
+                classification,
                 issues,
             )
         }
@@ -203,6 +214,7 @@ class CompatibilityAnalyzer(
                 permissions,
                 usedApis,
                 unsupported,
+                classification,
                 issues,
             )
         }
@@ -222,14 +234,22 @@ class CompatibilityAnalyzer(
                 permissions,
                 usedApis,
                 unsupported,
+                classification,
                 issues,
             )
         }
 
-        unsupported.forEach { api ->
+        classification.unavailable.forEach { api ->
             issues += CompatibilityIssue(
                 code = "unsupported_api",
-                message = "chrome.$api API는 이 삼성 브라우저 프로필에서 확인되지 않았습니다.",
+                message = "chrome.$api API는 이 삼성 브라우저 프로필에서 없거나 실패했습니다.",
+                blocking = false,
+            )
+        }
+        classification.unverified.forEach { api ->
+            issues += CompatibilityIssue(
+                code = "unverified_api",
+                message = "chrome.$api API는 발견됐지만 동작이 검증되지 않았거나 제한됩니다.",
                 blocking = false,
             )
         }
@@ -241,7 +261,7 @@ class CompatibilityAnalyzer(
             )
         }
 
-        val status = if (unsupported.isEmpty()) {
+        val status = if (unsupported.isEmpty() && classification.unverified.isEmpty()) {
             CompatibilityStatus.COMPATIBLE
         } else {
             CompatibilityStatus.PARTIAL
@@ -256,6 +276,7 @@ class CompatibilityAnalyzer(
             permissions,
             usedApis,
             unsupported,
+            classification,
             issues,
         )
     }
@@ -265,7 +286,7 @@ class CompatibilityAnalyzer(
         manifest: JsonObject,
         ledger: AnalysisBudgetLedger,
     ): ApiScan {
-        val found = mutableSetOf<String>()
+        val found = mutableSetOf<ApiReference>()
         val runtimeClosure = RuntimeResourceIndex.create(
             root,
             manifest,
@@ -318,14 +339,17 @@ class CompatibilityAnalyzer(
                     codeOnly,
                     control::checkCancelled,
                 )
-                found += aliases.namespaces
+                found += aliases.namespaces.map { ApiReference(it, null) }
                 consumedRoots += aliases.consumedRootOffsets
                 dynamicUsage = dynamicUsage || aliases.dynamicUsage
                 control.checkCancelled()
                 API_CALL_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
                     .forEach { match ->
-                    found += match.groupValues[1]
+                    found += ApiReference(
+                        namespace = match.groupValues[1],
+                        member = match.groupValues.drop(2).firstOrNull(String::isNotBlank),
+                    )
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
@@ -333,7 +357,10 @@ class CompatibilityAnalyzer(
                 BRACKET_API_REGEX.findAll(sourceWithoutComments)
                     .filter { it.startsInCode(codeOnly) }
                     .forEach { match ->
-                    found += match.groupValues[1]
+                    found += ApiReference(
+                        namespace = match.groupValues[1],
+                        member = match.groupValues.drop(2).firstOrNull(String::isNotBlank),
+                    )
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
@@ -360,7 +387,7 @@ class CompatibilityAnalyzer(
                 if (NATIVE_MESSAGING_REGEX.findAll(sourceWithoutComments)
                         .any { it.startsInCode(codeOnly) }
                 ) {
-                    found += "nativeMessaging"
+                    found += ApiReference("nativeMessaging", null)
                 }
             }
         }
@@ -491,6 +518,7 @@ class CompatibilityAnalyzer(
         permissions: Set<String>,
         usedApis: Set<String>,
         unsupported: Set<String>,
+        classification: ApiClassification,
         issues: List<CompatibilityIssue>,
     ) = CompatibilityReport(
         status = status,
@@ -502,8 +530,58 @@ class CompatibilityAnalyzer(
         declaredPermissions = permissions.toSortedSet(),
         usedApis = usedApis,
         unsupportedApis = unsupported,
+        verifiedApis = classification.verified,
+        unverifiedApis = classification.unverified,
+        unavailableApis = classification.unavailable,
         issues = issues,
     )
+
+    private fun classifyApiReferences(
+        references: Set<ApiReference>,
+        profile: BrowserProfile,
+    ): ApiClassification {
+        val verified = sortedSetOf<String>()
+        val unverified = sortedSetOf<String>()
+        val unavailable = sortedSetOf<String>()
+        val legacyProfile = profile.apiCapabilities.isEmpty()
+
+        references.sortedBy(ApiReference::displayName).forEach { reference ->
+            val displayName = if (legacyProfile) reference.namespace else reference.displayName
+            if (legacyProfile) {
+                when (reference.namespace) {
+                    in profile.supportedApis -> verified += displayName
+                    in profile.detectedApis -> unverified += displayName
+                    else -> unavailable += displayName
+                }
+                return@forEach
+            }
+
+            val evidence = profile.apiCapabilities.filter {
+                it.key.namespace == reference.namespace &&
+                    (reference.member == null || it.key.member == reference.member)
+            }
+            if (reference.member == null || evidence.isEmpty()) {
+                when {
+                    evidence.isNotEmpty() || reference.namespace in profile.supportedApis ||
+                        reference.namespace in profile.detectedApis -> unverified += displayName
+                    else -> unavailable += displayName
+                }
+                return@forEach
+            }
+
+            val statuses = evidence.map { it.status }.toSet()
+            when {
+                statuses.all { it == ApiCapabilityStatus.VERIFIED } -> verified += displayName
+                statuses.all {
+                    it == ApiCapabilityStatus.ABSENT ||
+                        it == ApiCapabilityStatus.FAILED ||
+                        it == ApiCapabilityStatus.INTERNAL
+                } -> unavailable += displayName
+                else -> unverified += displayName
+            }
+        }
+        return ApiClassification(verified, unverified, unavailable)
+    }
 
     private fun extensionIdFromManifestKey(value: String): String? = runCatching {
         val publicKey = Base64.getDecoder().decode(value)
@@ -527,18 +605,30 @@ class CompatibilityAnalyzer(
     }.getOrNull()
 
     private data class ApiScan(
-        val namespaces: Set<String>,
+        val references: Set<ApiReference>,
         val dynamicUsage: Boolean,
+    )
+
+    private data class ApiClassification(
+        val verified: Set<String>,
+        val unverified: Set<String>,
+        val unavailable: Set<String>,
     )
 
     companion object {
         private val SCRIPT_EXTENSIONS = setOf("js", "mjs", "cjs", "html")
         private val API_CALL_REGEX =
-            Regex("""(?:chrome|browser)\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""")
+            Regex(
+                """(?:chrome|browser)\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""" +
+                    """(?:\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)|""" +
+                    """\s*(?:\?\.)?\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*])?""",
+            )
         private val BRACKET_API_REGEX =
             Regex(
                 """(?:chrome|browser)\s*(?:\?\.)?\s*""" +
-                    """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""",
+                    """\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*]""" +
+                    """(?:\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)|""" +
+                    """\s*(?:\?\.)?\[\s*["']([A-Za-z][A-Za-z0-9_]*)["']\s*])?""",
             )
         private val DYNAMIC_BRACKET_REGEX =
             Regex("""(?:chrome|browser)\s*(?:\?\.)?\s*\[\s*(?!["'])""")

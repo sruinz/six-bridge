@@ -9,26 +9,58 @@ export const CASE_IDS = Object.freeze([
   'storage-local-worker',
 ]);
 
-const SAFE_RUNNERS = Object.freeze({
-  'alarms-get-worker': (environment) => callbackResult(
+function runAlarmsGet(environment) {
+  return callbackResult(
     environment,
     (done) => environment.chrome.alarms.get('sixbridge-probe-missing-alarm', done),
-  ),
-  'extension-incognito-access-worker': (environment) => callbackResult(
+  );
+}
+
+function runExtensionIncognitoAccess(environment) {
+  return callbackResult(
     environment,
     (done) => environment.chrome.extension.isAllowedIncognitoAccess(done),
-  ),
-  'i18n-ui-language-page': (environment) => environment.chrome.i18n.getUILanguage(),
-  'permissions-contains-worker': (environment) => callbackResult(
+  );
+}
+
+function runI18nUiLanguage(environment) {
+  return environment.chrome.i18n.getUILanguage();
+}
+
+function runPermissionsContains(environment) {
+  return callbackResult(
     environment,
     (done) => environment.chrome.permissions.contains({ permissions: [] }, done),
-  ),
-  'runtime-platform-info-worker': (environment) => callbackResult(
+  );
+}
+
+function runRuntimePlatformInfo(environment) {
+  return callbackResult(
     environment,
     (done) => environment.chrome.runtime.getPlatformInfo(done),
-  ),
+  );
+}
+
+const SAFE_RUNNERS = Object.freeze({
+  'alarms-get-worker': runAlarmsGet,
+  'extension-incognito-access-worker': runExtensionIncognitoAccess,
+  'i18n-ui-language-page': runI18nUiLanguage,
+  'permissions-contains-worker': runPermissionsContains,
+  'runtime-platform-info-worker': runRuntimePlatformInfo,
 });
 
+function resolveCase(environment, caseId) {
+  switch (caseId) {
+    case 'alarms-get-worker': return environment.chrome.alarms.get;
+    case 'extension-incognito-access-worker': return environment.chrome.extension.isAllowedIncognitoAccess;
+    case 'i18n-ui-language-page': return environment.chrome.i18n.getUILanguage;
+    case 'permissions-contains-worker': return environment.chrome.permissions.contains;
+    case 'runtime-platform-info-worker': return environment.chrome.runtime.getPlatformInfo;
+    case 'storage-local-worker': return environment.chrome.storage.local;
+    default: return undefined;
+  }
+}
+
 export function createCase(descriptor, environment = globalThis) {
-  return createRuntimeCase(descriptor, environment, CASE_IDS, SAFE_RUNNERS);
+  return createRuntimeCase(descriptor, environment, CASE_IDS, SAFE_RUNNERS, resolveCase);
 }

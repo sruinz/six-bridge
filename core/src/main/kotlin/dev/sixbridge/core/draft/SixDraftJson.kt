@@ -138,10 +138,10 @@ internal object SixDraftJson {
         validateCompatibilitySchema(value)
         requireCanonicalAdapterDecisions(value.adapterDecisions)
         requireNotNull(value.sourceSha256) {
-            "compatibility schema 3에는 sourceSha256이 필요합니다."
+            "compatibility schema 4에는 sourceSha256이 필요합니다."
         }
         requireNotNull(value.browserProfileSha256) {
-            "compatibility schema 3에는 browserProfileSha256이 필요합니다."
+            "compatibility schema 4에는 browserProfileSha256이 필요합니다."
         }
         return encodeCanonicalObject(
             "compatibility.json",
@@ -162,19 +162,26 @@ internal object SixDraftJson {
                     value.manifestVersion?.let(::JsonPrimitive) ?: JsonNull
                     ),
                 "originalExtensionId" to nullableString(value.originalExtensionId),
-                "schemaVersion" to JsonPrimitive(3),
+                "schemaVersion" to JsonPrimitive(4),
                 "sourceSha256" to JsonPrimitive(value.sourceSha256),
                 "status" to JsonPrimitive(value.status.jsonValue()),
                 "unsupportedApis" to stringSet(value.unsupportedApis),
+                "unavailableApis" to stringSet(value.unavailableApis),
+                "unverifiedApis" to stringSet(value.unverifiedApis),
                 "usedApis" to stringSet(value.usedApis),
+                "verifiedApis" to stringSet(value.verifiedApis),
             ),
         )
     }
 
     fun decodeCompatibility(name: String, bytes: ByteArray): CompatibilityReport {
         val value = parseCanonicalObject(name, bytes)
-        value.requireKeys(COMPATIBILITY_KEYS, name)
-        value.requireSchema(name, 3)
+        val schemaVersion = value.getValue("schemaVersion").strictInt("schemaVersion")
+        require(schemaVersion in 3..4) { "지원하지 않는 $name schemaVersion입니다." }
+        value.requireKeys(
+            if (schemaVersion == 3) COMPATIBILITY_V3_KEYS else COMPATIBILITY_V4_KEYS,
+            name,
+        )
         val decisions = value.getValue("adapterDecisions").jsonArray.map {
             decodeAdapterDecision(it)
         }
@@ -189,6 +196,21 @@ internal object SixDraftJson {
             declaredPermissions = value.strictStringSet("declaredPermissions"),
             usedApis = value.strictStringSet("usedApis"),
             unsupportedApis = value.strictStringSet("unsupportedApis"),
+            verifiedApis = if (schemaVersion == 3) {
+                value.strictStringSet("usedApis") - value.strictStringSet("unsupportedApis")
+            } else {
+                value.strictStringSet("verifiedApis")
+            },
+            unverifiedApis = if (schemaVersion == 3) {
+                emptySet()
+            } else {
+                value.strictStringSet("unverifiedApis")
+            },
+            unavailableApis = if (schemaVersion == 3) {
+                value.strictStringSet("unsupportedApis")
+            } else {
+                value.strictStringSet("unavailableApis")
+            },
             issues = value.getValue("issues").jsonArray.map { element ->
                 val issue = element.jsonObject
                 issue.requireKeys(ISSUE_KEYS, "compatibility issue")
@@ -415,7 +437,10 @@ internal object SixDraftJson {
             require(EXTENSION_ID.matches(it)) { "extension ID 형식이 올바르지 않습니다." }
         }
         require(
-            (value.declaredPermissions + value.usedApis + value.unsupportedApis)
+            (
+                value.declaredPermissions + value.usedApis + value.unsupportedApis +
+                    value.verifiedApis + value.unverifiedApis + value.unavailableApis
+                )
                 .all(String::isNotBlank),
         ) {
             "compatibility 문자열 집합 항목은 비어 있을 수 없습니다."
@@ -788,12 +813,15 @@ internal object SixDraftJson {
     private val SIGNATURE_KEYS = setOf(
         "schemaVersion", "algorithm", "keyId", "publicKey", "signature",
     )
-    private val COMPATIBILITY_KEYS = setOf(
+    private val COMPATIBILITY_V3_KEYS = setOf(
         "schemaVersion", "status", "manifestVersion", "extensionName",
         "extensionVersion", "manifestKeyPresent", "manifestKeyExtensionId",
         "declaredPermissions", "usedApis", "unsupportedApis", "issues",
         "conversionState", "adapterDecisions", "originalExtensionId",
         "convertedExtensionId", "sourceSha256", "browserProfileSha256",
+    )
+    private val COMPATIBILITY_V4_KEYS = COMPATIBILITY_V3_KEYS + setOf(
+        "verifiedApis", "unverifiedApis", "unavailableApis",
     )
     private val ISSUE_KEYS = setOf("code", "message", "blocking")
     private val ADAPTER_KEYS = setOf(

@@ -185,7 +185,7 @@ export async function startProbe() {
   if (!GROUP_IDS.has(bundle.groupId)) throw new Error('unknown probe group');
   const [runtime, group] = await Promise.all([
     import('./probe-runtime.js'),
-    import(`./cases/${String(bundle.groupId)}.js`),
+    import('./cases/__SIXBRIDGE_PROBE_GROUP__.js'),
   ]);
   const counts = { ABSENT: 0, EXPOSED: 0, FAILED: 0, NOT_RUN: 0, RESTRICTED: 0, VERIFIED: 0 };
   const submission = createEvidenceSubmission({

@@ -153,6 +153,9 @@ internal object ConversionPlanProof {
         )
         digest.stringSet("report.usedApis", report.usedApis)
         digest.stringSet("report.unsupportedApis", report.unsupportedApis)
+        digest.stringSet("report.verifiedApis", report.verifiedApis)
+        digest.stringSet("report.unverifiedApis", report.unverifiedApis)
+        digest.stringSet("report.unavailableApis", report.unavailableApis)
         digest.count("report.issues", report.issues.size)
         report.issues.forEachIndexed { index, issue ->
             digest.field("report.issues[$index].code", issue.code)
@@ -254,6 +257,9 @@ internal fun CompatibilityReport.deepImmutableCopy(): CompatibilityReport = copy
     declaredPermissions = Collections.unmodifiableSet(declaredPermissions.toSortedSet()),
     usedApis = Collections.unmodifiableSet(usedApis.toSortedSet()),
     unsupportedApis = Collections.unmodifiableSet(unsupportedApis.toSortedSet()),
+    verifiedApis = Collections.unmodifiableSet(verifiedApis.toSortedSet()),
+    unverifiedApis = Collections.unmodifiableSet(unverifiedApis.toSortedSet()),
+    unavailableApis = Collections.unmodifiableSet(unavailableApis.toSortedSet()),
     issues = Collections.unmodifiableList(issues.map { it.copy() }),
     adapterDecisions = Collections.unmodifiableList(
         adapterDecisions.map { decision ->

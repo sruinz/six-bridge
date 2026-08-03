@@ -967,15 +967,19 @@ test('cleanup worker는 session path swap 후도 pinned inode temp만 삭제한�
   assert.deepEqual(await readFile(path.join(outside, tempName)), sentinel);
 });
 
-test('session receiver는 exact 6 origins을 group과 binding해 full evidence로 저장한다', async (t) => {
+test('session receiver는 Chrome·삼성 exact origins을 group과 binding해 full evidence로 저장한다', async (t) => {
   const current = await sessionFixture();
   t.after(() => current.receiver.close());
   const config = sessionConfig();
   for (const binding of config.bindings) {
-    const origin = `chrome-extension://${binding.extensionId}`;
-    const response = await sessionPost(current.baseUrl, origin, submission(binding.groupId));
-    assert.equal(response.status, 201);
-    assert.equal(response.headers['access-control-allow-origin'], origin);
+    const chromeOrigin = `chrome-extension://${binding.extensionId}`;
+    const samsungOrigin = `internet-extension://${binding.extensionId}`;
+    const first = await sessionPost(current.baseUrl, chromeOrigin, submission(binding.groupId));
+    assert.equal(first.status, 201);
+    assert.equal(first.headers['access-control-allow-origin'], chromeOrigin);
+    const second = await sessionPost(current.baseUrl, samsungOrigin, submission(binding.groupId));
+    assert.equal(second.status, 200);
+    assert.equal(second.headers['access-control-allow-origin'], samsungOrigin);
     const stored = JSON.parse(await readFile(
       path.join(current.rootDir, config.sessionId, `${binding.groupId}.json`),
       'utf8',

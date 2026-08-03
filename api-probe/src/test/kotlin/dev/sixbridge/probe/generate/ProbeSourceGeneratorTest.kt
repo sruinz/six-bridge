@@ -1,7 +1,12 @@
 package dev.sixbridge.probe.generate
 
+import dev.sixbridge.core.compat.CompatibilityAnalyzer
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.probe.catalog.ApiProbeCatalog
 import dev.sixbridge.probe.catalog.CatalogDisposition
+import java.lang.reflect.InvocationTargetException
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -28,6 +33,76 @@ import kotlinx.serialization.json.jsonPrimitive
 
 class ProbeSourceGeneratorTest {
     @Test
+    fun `생성한 여섯 probe source는 정적 API 분석에서 동적 호출로 차단되지 않는다`() =
+        withWorkspace { workspace ->
+            val profile = BrowserProfile(
+                browserPackage = "com.sec.android.app.sbrowser",
+                versionName = BrowserProfile.BASELINE_VERSION,
+                versionCode = 1_300_261_502,
+                majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION,
+                supportedApis = BrowserProfile.BASELINE_APIS,
+                wrapperContract = WrapperContract.complete(),
+                sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+                sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+            )
+
+            ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).forEach { probe ->
+                val report = analyzeGeneratedSource(probe.sourceRoot, profile)
+                val dynamicFiles = if (report.issues.any { it.code == "api_usage_dynamic" }) {
+                    Files.walk(probe.sourceRoot).use { paths ->
+                        paths.filter { Files.isRegularFile(it) && it.name.endsWith(".js") }
+                            .filter { source ->
+                                val isolated = Files.createDirectory(
+                                    workspace.resolve("isolated-${probe.groupId}-${source.fileName}"),
+                                )
+                                Files.writeString(
+                                    isolated.resolve("manifest.json"),
+                                    """{"manifest_version":3,"name":"Isolated","version":"1"}""",
+                                )
+                                Files.copy(source, isolated.resolve("source.js"))
+                                analyzeGeneratedSource(isolated, profile).issues.any {
+                                    it.code == "api_usage_dynamic"
+                                }
+                            }
+                            .map { probe.sourceRoot.relativize(it).toString() }
+                            .toList()
+                    }
+                } else {
+                    emptyList()
+                }
+                assertTrue(
+                    report.issues.none { it.code == "api_usage_dynamic" },
+                    "${probe.groupId}: ${report.issues.joinToString { it.code }}; files=$dynamicFiles",
+                )
+            }
+        }
+
+    private fun analyzeGeneratedSource(sourceRoot: Path, profile: BrowserProfile): CompatibilityReport {
+        val analyzer = CompatibilityAnalyzer()
+        val methods = CompatibilityAnalyzer::class.java.declaredMethods.filter {
+            it.name.startsWith("analyzeStable$") && it.name.endsWith("\$default")
+        }
+        assertEquals(1, methods.size, "CompatibilityAnalyzer stable 기본 메서드 경계가 변경되었습니다.")
+        val method = methods.single()
+        @Suppress("UNCHECKED_CAST")
+        return try {
+            method.invoke(
+                null,
+                analyzer,
+                sourceRoot,
+                profile,
+                null,
+                null,
+                false,
+                24,
+                null,
+            ) as CompatibilityReport
+        } catch (error: InvocationTargetException) {
+            throw error.targetException
+        }
+    }
+
+    @Test
     fun `같은 catalog는 같은 여섯 probe source를 생성한다`() = withWorkspace { workspace ->
         val catalog = loadCatalog()
 
@@ -43,6 +118,21 @@ class ProbeSourceGeneratorTest {
             entries.noneMatch { it.name.contains(".staging-") }
         })
     }
+
+    @Test
+    fun `각 group source는 계산된 module import 없이 자기 runtime module만 참조한다`() =
+        withWorkspace { workspace ->
+            ProbeSourceGenerator().generate(loadCatalog(), workspace.resolve("output")).forEach { probe ->
+                val ui = probe.sourceRoot.resolve("probe-ui.js").readText()
+                val content = probe.sourceRoot.resolve("content-probe.js").readText()
+                assertTrue("./cases/${probe.groupId}.js" in ui)
+                assertTrue("cases/${probe.groupId}.js" in content)
+                assertFalse("__SIXBRIDGE_PROBE_GROUP__" in ui)
+                assertFalse("__SIXBRIDGE_PROBE_GROUP__" in content)
+                assertFalse("import(`" in ui)
+                assertFalse("import(`" in content)
+            }
+        }
 
     @Test
     fun `manifest는 그룹에 필요한 최소 권한만 canonical 순서로 선언한다`() = withWorkspace { workspace ->

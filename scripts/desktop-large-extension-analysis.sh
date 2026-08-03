@@ -281,7 +281,7 @@ for input in "${inputs[@]}"; do
     else error("호환성 보고서는 하나의 JSON object여야 합니다.")
     end |
     if
-      .schemaVersion == 3 and
+      (.schemaVersion == 3 or .schemaVersion == 4 or .schemaVersion == 5) and
       (.status | type) == "string" and
       (.status == "compatible" or .status == "partial" or
        .status == "unknown" or .status == "blocked") and
@@ -290,7 +290,18 @@ for input in "${inputs[@]}"; do
       (.originalExtensionId | type) == "string" and
       (.originalExtensionId | test("^[a-p]{32}$")) and
       (.usedApis | type) == "array" and
-      all(.usedApis[]; type == "string")
+      all(.usedApis[]; type == "string") and
+      (.unsupportedApis | type) == "array" and
+      all(.unsupportedApis[]; type == "string") and
+      (if .schemaVersion == 5 then
+        (.verifiedApis | type) == "array" and
+        all(.verifiedApis[]; type == "string") and
+        (.unverifiedApis | type) == "array" and
+        all(.unverifiedApis[]; type == "string") and
+        (.unavailableApis | type) == "array" and
+        all(.unavailableApis[]; type == "string") and
+        .unavailableApis == .unsupportedApis
+      else true end)
     then {
       input: $input,
       status: (.status | ascii_upcase),

@@ -33,6 +33,10 @@ function randomRunToken(environment) {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
+function defaultTokenFactory() {
+  return () => randomRunToken(globalThis);
+}
+
 function senderIdentity(sender) {
   let origin = '';
   try {
@@ -81,7 +85,7 @@ export function createProbeController({
 }) {
   const activeCases = new Set();
   const pending = new Map();
-  const makeToken = tokenFactory ?? (() => randomRunToken(globalThis));
+  const makeToken = tokenFactory ?? defaultTokenFactory();
   const pendingKey = (caseId, runToken) => `${caseId}\u0000${runToken}`;
 
   const deletePending = (record, releaseActive = true) => {
@@ -448,8 +452,12 @@ async function dispatchOffscreenCase(
   }
 }
 
+function fetchProbeCases(environment, fetchImpl) {
+  return fetchImpl(environment.chrome.runtime.getURL('probe-cases.json'));
+}
+
 async function loadController(environment, fetchImpl, options) {
-  const response = await fetchImpl(environment.chrome.runtime.getURL('probe-cases.json'));
+  const response = await fetchProbeCases(environment, fetchImpl);
   if (!response.ok) throw new Error(`probe descriptor load failed: ${response.status}`);
   const bundle = await response.json();
   const factory = CASE_FACTORIES[bundle.groupId];

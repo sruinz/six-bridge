@@ -55,12 +55,17 @@ object BundleJson {
             2 -> COMPATIBILITY_V2_KEYS
             3 -> COMPATIBILITY_V3_KEYS
             4 -> COMPATIBILITY_V4_KEYS
+            5 -> COMPATIBILITY_V5_KEYS
             else -> throw IllegalArgumentException("지원하지 않는 compatibility.json schemaVersion입니다.")
         }
         requireExactKeys(
             objectValue,
             keys,
-            if (schemaVersion == 4) COMPATIBILITY_V4_REQUIRED_KEYS else COMPATIBILITY_BASE_REQUIRED_KEYS,
+            when (schemaVersion) {
+                4 -> COMPATIBILITY_V4_REQUIRED_KEYS
+                5 -> COMPATIBILITY_V5_REQUIRED_KEYS
+                else -> COMPATIBILITY_BASE_REQUIRED_KEYS
+            },
             "compatibility.json",
         )
         val report = ContractCompatibilityReport(
@@ -89,8 +94,27 @@ object BundleJson {
             convertedExtensionId = if (schemaVersion == 1) null else objectValue.nullableString("convertedExtensionId"),
             sourceSha256 = if (schemaVersion < 3) null else objectValue.requiredSha256("sourceSha256"),
             browserProfileSha256 = if (schemaVersion < 3) null else objectValue.requiredSha256("browserProfileSha256"),
-            originalSourceSha256 = if (schemaVersion < 4) null else objectValue.requiredSha256("originalSourceSha256"),
-            planSha256 = if (schemaVersion < 4) null else objectValue.requiredSha256("planSha256"),
+            originalSourceSha256 = when (schemaVersion) {
+                4 -> objectValue.requiredSha256("originalSourceSha256")
+                5 -> objectValue.optionalSha256("originalSourceSha256")
+                else -> null
+            },
+            planSha256 = when (schemaVersion) {
+                4 -> objectValue.requiredSha256("planSha256")
+                5 -> objectValue.optionalSha256("planSha256")
+                else -> null
+            },
+            verifiedApis = if (schemaVersion < 5) {
+                objectValue.stringList("usedApis") - objectValue.stringList("unsupportedApis").toSet()
+            } else {
+                objectValue.stringList("verifiedApis")
+            },
+            unverifiedApis = if (schemaVersion < 5) emptyList() else objectValue.stringList("unverifiedApis"),
+            unavailableApis = if (schemaVersion < 5) {
+                objectValue.stringList("unsupportedApis")
+            } else {
+                objectValue.stringList("unavailableApis")
+            },
         )
         validateCompatibility(report)
         return report
@@ -113,7 +137,19 @@ object BundleJson {
     }
 
     fun validateCompatibility(value: ContractCompatibilityReport) {
-        require(value.schemaVersion in 1..4) { "지원하지 않는 compatibility.json schemaVersion입니다." }
+        require(value.schemaVersion in 1..5) { "지원하지 않는 compatibility.json schemaVersion입니다." }
+        require(value.unsupportedApis == value.unavailableApis) {
+            "unsupportedApis는 unavailableApis 호환 alias와 일치해야 합니다."
+        }
+        require((value.verifiedApis intersect value.unverifiedApis.toSet()).isEmpty()) {
+            "검증된 API와 미검증 API는 겹칠 수 없습니다."
+        }
+        require((value.verifiedApis intersect value.unavailableApis.toSet()).isEmpty()) {
+            "검증된 API와 사용 불가 API는 겹칠 수 없습니다."
+        }
+        require((value.unverifiedApis intersect value.unavailableApis.toSet()).isEmpty()) {
+            "미검증 API와 사용 불가 API는 겹칠 수 없습니다."
+        }
         require(value.conversionState in CONVERSION_STATES) { "지원하지 않는 conversionState입니다." }
         require(value.adapterDecisions.map { it.id to it.version }.toSet().size == value.adapterDecisions.size) {
             "어댑터 결정 ID와 version 조합은 중복될 수 없습니다."
@@ -149,7 +185,7 @@ object BundleJson {
             require(value.originalSourceSha256 == null && value.planSha256 == null) {
                 "schema v3 compatibility에는 on-device provenance proof가 있을 수 없습니다."
             }
-        } else {
+        } else if (value.schemaVersion == 4) {
             require(value.sourceSha256 != null && SHA256.matches(value.sourceSha256)) {
                 "schema v4 compatibility에는 올바른 sourceSha256이 필요합니다."
             }
@@ -161,6 +197,21 @@ object BundleJson {
             }
             require(value.planSha256 != null && SHA256.matches(value.planSha256)) {
                 "schema v4 compatibility에는 올바른 planSha256이 필요합니다."
+            }
+        } else {
+            require(value.sourceSha256 != null && SHA256.matches(value.sourceSha256)) {
+                "schema v5 compatibility에는 올바른 sourceSha256이 필요합니다."
+            }
+            require(value.browserProfileSha256 != null && SHA256.matches(value.browserProfileSha256)) {
+                "schema v5 compatibility에는 올바른 browserProfileSha256이 필요합니다."
+            }
+            require((value.originalSourceSha256 == null) == (value.planSha256 == null)) {
+                "schema v5 compatibility의 on-device provenance proof는 함께 있어야 합니다."
+            }
+            value.originalSourceSha256?.let {
+                require(SHA256.matches(it) && SHA256.matches(requireNotNull(value.planSha256))) {
+                    "schema v5 compatibility의 on-device provenance proof가 올바르지 않습니다."
+                }
             }
         }
     }
@@ -208,9 +259,14 @@ object BundleJson {
             fields["sourceSha256"] = JsonPrimitive(requireNotNull(value.sourceSha256))
             fields["browserProfileSha256"] = JsonPrimitive(requireNotNull(value.browserProfileSha256))
         }
-        if (value.schemaVersion == 4) {
+        if (value.schemaVersion == 4 || value.schemaVersion == 5 && value.originalSourceSha256 != null) {
             fields["originalSourceSha256"] = JsonPrimitive(requireNotNull(value.originalSourceSha256))
             fields["planSha256"] = JsonPrimitive(requireNotNull(value.planSha256))
+        }
+        if (value.schemaVersion == 5) {
+            fields["verifiedApis"] = stringArray(value.verifiedApis)
+            fields["unverifiedApis"] = stringArray(value.unverifiedApis)
+            fields["unavailableApis"] = stringArray(value.unavailableApis)
         }
         return JsonObject(fields)
     }
@@ -304,6 +360,10 @@ object BundleJson {
         require(SHA256.matches(it)) { "$name 필드는 소문자 SHA-256이어야 합니다." }
     }
 
+    private fun JsonObject.optionalSha256(name: String): String? = nullableString(name)?.also {
+        require(SHA256.matches(it)) { "$name 필드는 소문자 SHA-256이어야 합니다." }
+    }
+
     private fun JsonObject.requiredInt(name: String): Int = getValue(name).jsonPrimitive.let { primitive ->
         require(!primitive.isString) { "$name 필드는 정수여야 합니다." }
         primitive.int
@@ -386,8 +446,15 @@ object BundleJson {
     private val COMPATIBILITY_V4_KEYS = COMPATIBILITY_V3_KEYS + setOf(
         "originalSourceSha256", "planSha256",
     )
+    private val COMPATIBILITY_V5_KEYS = COMPATIBILITY_V4_KEYS + setOf(
+        "verifiedApis", "unverifiedApis", "unavailableApis",
+    )
     private val COMPATIBILITY_V4_REQUIRED_KEYS = COMPATIBILITY_BASE_REQUIRED_KEYS + setOf(
         "sourceSha256", "browserProfileSha256", "originalSourceSha256", "planSha256",
+    )
+    private val COMPATIBILITY_V5_REQUIRED_KEYS = COMPATIBILITY_BASE_REQUIRED_KEYS + setOf(
+        "sourceSha256", "browserProfileSha256", "verifiedApis", "unverifiedApis",
+        "unavailableApis",
     )
     private val ISSUE_KEYS = setOf("code", "message", "blocking")
     private val ADAPTER_KEYS = setOf(

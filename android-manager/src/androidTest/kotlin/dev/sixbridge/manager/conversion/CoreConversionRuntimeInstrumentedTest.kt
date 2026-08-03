@@ -833,6 +833,37 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
+    fun staticExtensionApiAliasResolverInitializesAndResolvesAliasOnAndroid() {
+        val root = Files.createTempDirectory(targetContext.cacheDir.toPath(), "alias-android-")
+        try {
+            Files.write(
+                root.resolve("manifest.json"),
+                """{"manifest_version":3,"name":"alias","version":"1.0","background":{"service_worker":"worker.js"},"permissions":["tabs"]}""".encodeToByteArray(),
+            )
+            Files.write(
+                root.resolve("worker.js"),
+                "const api=chrome; api.tabs.query({});".encodeToByteArray(),
+            )
+            val input = PortableExtensionInput.fromZip(
+                ExtensionInputKind.ZIP,
+                ExtensionZip.createBytes(root, includeProjectMarker = true),
+            )
+
+            val analyzed = ConversionPreparationEngine().use {
+                it.analyzeWithIdentity(
+                    input,
+                    profile(),
+                    AnalysisControl(AnalysisSafetyPolicy.mobile),
+                )
+            }
+
+            assertTrue("tabs" in analyzed.report.usedApis)
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
     fun schemaV2Ed25519DraftReadAndReplayOnAndroid() {
         val sourceIdentity = "project:${"1".repeat(32)}"
         val source = canonicalAssetZip("ondevice-conversion")

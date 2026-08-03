@@ -14,6 +14,7 @@ kotlin {
 dependencies {
     implementation(project(":core"))
     implementation(project(":api-probe"))
+    implementation("com.google.jimfs:jimfs:1.3.1")
     implementation("info.picocli:picocli:4.7.7")
 
     testImplementation(kotlin("test"))

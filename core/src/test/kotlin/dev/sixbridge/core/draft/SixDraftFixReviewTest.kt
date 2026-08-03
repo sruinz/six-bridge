@@ -226,6 +226,8 @@ class SixDraftFixReviewTest {
             status = CompatibilityStatus.COMPATIBLE,
             usedApis = setOf("storage.local"),
             unsupportedApis = emptySet(),
+            verifiedApis = setOf("storage.local"),
+            unavailableApis = emptySet(),
             conversionState = ConversionState.CONVERTED,
             adapterDecisions = listOf(decision.copy(applied = true)),
             convertedExtensionId = convertedId,

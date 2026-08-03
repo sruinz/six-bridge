@@ -42,7 +42,11 @@ class DesktopAnalysisStepTest {
         )
         onNodeWithTag("analysis:status").assertTextContains("BLOCKED", substring = true)
         onNodeWithTag("analysis:permissions").assertExists()
-        onNodeWithTag("analysis:apis").assertExists()
+        onNodeWithTag("analysis:apis:verified").assertTextContains("tabs.query", substring = true)
+        onNodeWithTag("analysis:apis:unverified")
+            .assertTextContains("userScripts.register", substring = true)
+        onNodeWithTag("analysis:apis:unavailable")
+            .assertTextContains("nativeMessaging", substring = true)
         onNodeWithTag("analysis:issues").assertTextContains("nativeMessaging", substring = true)
         onNodeWithTag("analysis:adapters").assertTextContains("context-menu-mobile", substring = true)
         onNodeWithTag("analysis:continue").assertIsNotEnabled()
@@ -99,6 +103,9 @@ class DesktopAnalysisStepTest {
             declaredPermissions = setOf("storage", "contextMenus"),
             usedApis = setOf("chrome.storage", "chrome.contextMenus"),
             unsupportedApis = setOf("nativeMessaging"),
+            verifiedApis = setOf("tabs.query"),
+            unverifiedApis = setOf("userScripts.register"),
+            unavailableApis = setOf("nativeMessaging"),
             issues = listOf(
                 CompatibilityIssue(
                     code = "unsupported-api",

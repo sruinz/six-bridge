@@ -264,8 +264,11 @@ internal object RuntimeSourceScanner {
     ): Int {
         var cursor = skipMaskedWhitespace(source, start)
         if (isImport && source.getOrNull(cursor) == '(') {
-            dependencies.unresolvedDependency = true
-            return cursor + 1
+            return scanDynamicImportDependency(
+                source,
+                cursor,
+                dependencies,
+            )
         }
         if (isImport && source.getOrNull(cursor) == '.') return cursor + 1
         if (isImport) {
@@ -297,6 +300,50 @@ internal object RuntimeSourceScanner {
             }
         }
         return cursor
+    }
+
+    private fun scanDynamicImportDependency(
+        source: String,
+        openingParenthesis: Int,
+        dependencies: JavaScriptDependencyCollector,
+    ): Int {
+        var cursor = skipMaskedWhitespace(source, openingParenthesis + 1)
+        readJavaScriptString(source, cursor)?.let { literal ->
+            val closing = skipMaskedWhitespace(source, literal.end)
+            if (source.getOrNull(closing) == ')') {
+                dependencies.add(literal)
+                return closing + 1
+            }
+            dependencies.unresolvedDependency = true
+            return closing
+        }
+
+        val prefix = DYNAMIC_IMPORT_GET_URL_PREFIXES.firstOrNull {
+            source.startsWith(it, cursor)
+        }
+        if (prefix == null) {
+            dependencies.unresolvedDependency = true
+            return cursor + 1
+        }
+        cursor = skipMaskedWhitespace(source, cursor + prefix.length)
+        if (source.getOrNull(cursor) != '(') {
+            dependencies.unresolvedDependency = true
+            return cursor
+        }
+        cursor = skipMaskedWhitespace(source, cursor + 1)
+        val literal = readJavaScriptString(source, cursor)
+        if (literal == null) {
+            dependencies.unresolvedDependency = true
+            return cursor + 1
+        }
+        val getUrlClosing = skipMaskedWhitespace(source, literal.end)
+        val importClosing = skipMaskedWhitespace(source, getUrlClosing + 1)
+        if (source.getOrNull(getUrlClosing) != ')' || source.getOrNull(importClosing) != ')') {
+            dependencies.unresolvedDependency = true
+            return importClosing
+        }
+        dependencies.add(literal)
+        return importClosing + 1
     }
 
     private fun scanImportScriptsDependencies(
@@ -491,6 +538,17 @@ internal object RuntimeSourceScanner {
         }
         return JavaScriptString(null, source.length)
     }
+
+    private val DYNAMIC_IMPORT_GET_URL_PREFIXES = listOf(
+        "chrome.runtime.getURL",
+        "browser.runtime.getURL",
+        "globalThis.chrome.runtime.getURL",
+        "globalThis.browser.runtime.getURL",
+        "window.chrome.runtime.getURL",
+        "window.browser.runtime.getURL",
+        "self.chrome.runtime.getURL",
+        "self.browser.runtime.getURL",
+    )
 
     private fun decodeUnicodeEscape(
         source: String,

@@ -88,3 +88,20 @@ tasks.processResources {
         into("profiles/builtin")
     }
 }
+
+tasks.register<JavaExec>("apiProbeDraftBatch") {
+    group = "verification"
+    description = "API probe source 여섯 그룹을 portable .sixdraft로 생성합니다."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("dev.sixbridge.desktop.probe.DesktopProbeDraftBatch")
+    val sourceRoot = providers.gradleProperty("sixbridge.probe.source")
+    val profile = providers.gradleProperty("sixbridge.probe.profile")
+    val outputRoot = providers.gradleProperty("sixbridge.probe.drafts")
+    doFirst {
+        args(
+            "--source-root", sourceRoot.get(),
+            "--profile", profile.get(),
+            "--output-root", outputRoot.get(),
+        )
+    }
+}

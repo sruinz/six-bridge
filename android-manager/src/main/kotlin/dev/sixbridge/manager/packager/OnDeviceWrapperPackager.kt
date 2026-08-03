@@ -612,8 +612,8 @@ class OnDeviceWrapperPackager(context: Context) {
             "extension name과 version은 비어 있지 않아야 합니다."
         }
         require(request.sourceKind in ON_DEVICE_SOURCE_KINDS) { "sourceKind가 올바르지 않습니다." }
-        require(request.compatibility.schemaVersion == 4) {
-            "온디바이스 package에는 compatibility schema v4가 필요합니다."
+        require(request.compatibility.schemaVersion in 4..5) {
+            "온디바이스 package에는 compatibility schema v4 또는 v5가 필요합니다."
         }
         BundleJson.validateCompatibility(request.compatibility)
     }
@@ -1213,8 +1213,8 @@ private fun requireBasicRequest(request: ValidatedOnDeviceWrapperRequest) {
     require(request.sourceKind in ON_DEVICE_SOURCE_KINDS) {
         "sourceKind가 올바르지 않습니다."
     }
-    require(request.compatibility.schemaVersion == 4) {
-        "온디바이스 package에는 compatibility schema v4가 필요합니다."
+    require(request.compatibility.schemaVersion in 4..5) {
+        "온디바이스 package에는 compatibility schema v4 또는 v5가 필요합니다."
     }
     BundleJson.validateCompatibility(request.compatibility)
 }

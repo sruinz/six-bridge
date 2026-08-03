@@ -51,6 +51,10 @@ function successDetail(value) {
   };
 }
 
+function runtimeLastError(environment) {
+  return environment?.chrome?.runtime?.lastError;
+}
+
 function result(testCase, runToken, status, detail, startedAt, durationMs) {
   return {
     caseId: String(testCase.id),
@@ -203,17 +207,13 @@ export async function runCase(testCase, runToken = LOCAL_RUN_TOKEN, timeoutMs = 
   }
 }
 
-export function resolveMember(environment, namespace, member) {
-  return environment?.chrome?.[namespace]?.[member];
-}
-
 export function callbackResult(environment, invoke, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return withDeadline(() => new Promise((resolve, reject) => {
     let settled = false;
     const complete = (value) => {
       if (settled) return;
       settled = true;
-      const lastError = environment?.chrome?.runtime?.lastError;
+      const lastError = runtimeLastError(environment);
       if (lastError) reject(new Error(String(lastError.message ?? lastError)));
       else resolve(value);
     };
@@ -231,7 +231,7 @@ export function callbackCompletion(environment, invoke, timeoutMs = DEFAULT_TIME
   return withDeadline(() => new Promise((resolve, reject) => {
     try {
       invoke((value) => {
-        const lastError = environment?.chrome?.runtime?.lastError;
+        const lastError = runtimeLastError(environment);
         if (lastError) reject(new Error(String(lastError.message ?? lastError)));
         else resolve(value);
       });
@@ -241,12 +241,13 @@ export function callbackCompletion(environment, invoke, timeoutMs = DEFAULT_TIME
   }), timeoutMs);
 }
 
-export function createRuntimeCase(descriptor, environment, caseIds, safeRunners) {
+export function createRuntimeCase(descriptor, environment, caseIds, safeRunners, resolveCase) {
   if (!caseIds.includes(descriptor?.id)) throw new TypeError('unknown runtime probe case');
   const runner = safeRunners[descriptor.id];
+  if (typeof resolveCase !== 'function') throw new TypeError('runtime probe resolver is required');
   return {
     ...descriptor,
-    resolve: () => resolveMember(environment, descriptor.namespace, descriptor.member),
+    resolve: () => resolveCase(environment, descriptor.id),
     run: runner ? (runToken, timeoutMs) => runner(
       environment,
       descriptor.cleanup,

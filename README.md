@@ -104,6 +104,23 @@ Bitwarden·Tampermonkey 같은 대형 실제 CRX는 데스크톱 CLI를 설치�
 복사하거나 Git에 추가·커밋하지 않는다. 각 출력 행은 상태, 경과
 밀리초, 확장 이름, 검증된 CRX ID, 사용 API 수를 JSON으로 보고한다.
 
+### 실기기 API capability 프로필
+
+호환성 분석은 namespace 이름만으로 지원을 단정하지 않는다.
+Fold7 API probe가 수집한 `namespace.member`별 evidence를 사용해
+다음 세 구역으로 보고한다.
+
+- `검증된 API`: 안전한 실제 호출이 성공한 member
+- `발견됐지만 미검증 또는 제한된 API`: 노출만 확인했거나 정책·권한
+  제한이 있는 member
+- `없거나 실패한 API`: 실기기에서 없거나 호출·manifest load가
+  실패한 member
+
+Host 생성 gate와 Fold7 수집·격리·후보 profile 검토 절차는
+[Fold7 API capability probe 검증](docs/api-probe-fold7-validation.md)을 참고한다.
+후보 profile은 `profiles/candidates/`에 저장하고 evidence와 기존 확장
+회귀를 검토한 별도 승인 전에는 baseline을 덮어쓰지 않는다.
+
 데스크톱과 Android 관리자 사이에 전달할 서명된 `SixDraft`를 만든다. 다음
 예시는 action popup을 모바일 탭 진입점으로 바꾸는 동작을 승인한다.
 

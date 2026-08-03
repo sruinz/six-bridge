@@ -51,7 +51,7 @@ write_report() {
   used_apis=$4
   cat >"$output" <<JSON
 {
-  "schemaVersion": 3,
+  "schemaVersion": 5,
   "status": "$status",
   "manifestVersion": 3,
   "extensionName": "$name",
@@ -60,6 +60,9 @@ write_report() {
   "declaredPermissions": [],
   "usedApis": $used_apis,
   "unsupportedApis": [],
+  "verifiedApis": $used_apis,
+  "unverifiedApis": [],
+  "unavailableApis": [],
   "issues": [],
   "conversionState": "passthrough",
   "adapterDecisions": [],

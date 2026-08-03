@@ -1178,7 +1178,7 @@ internal class RetainedImportStore(
         } catch (error: Exception) {
             throw RetainedImportTransientException(error)
         }
-        if (report.schemaVersion !in 3..4 ||
+        if (report.schemaVersion !in 3..5 ||
             report.convertedExtensionId != descriptor.extensionId ||
             report.extensionName != descriptor.name ||
             report.extensionVersion != descriptor.version ||
