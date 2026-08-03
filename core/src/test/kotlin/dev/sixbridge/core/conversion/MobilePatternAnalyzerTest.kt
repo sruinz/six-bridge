@@ -40,6 +40,52 @@ class MobilePatternAnalyzerTest {
     )
 
     @Test
+    fun `안전한 popup 입력 위험은 partial과 선택적 보호 adapter를 만든다`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('content');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText(
+            "<html><head></head><body><input type='email'></body></html>",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(
+            AdapterDisposition.OPTIONAL_APPROVAL,
+            report.decision("popup-native-autofill-guard")?.disposition,
+        )
+        assertTrue(report.issues.any {
+            it.code == "popup_native_autofill_risk" && !it.blocking
+        })
+    }
+
+    @Test
+    fun `popup 삽입 경계가 불안전하면 unknown으로 중단한다`() {
+        val source = extension(
+            contentFile = "content.js",
+            contentSource = "console.log('content');",
+            popup = "popup.html",
+        )
+        source.resolve("popup.html").writeText(
+            "<html><head><body><input type='email'></body></html>",
+        )
+
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+        assertEquals(
+            AdapterDisposition.UNAVAILABLE,
+            report.decision("popup-native-autofill-guard")?.disposition,
+        )
+        assertTrue(report.issues.any {
+            it.code == "popup_native_autofill_unavailable" && it.blocking
+        })
+    }
+
+    @Test
     fun `모바일 패턴 분석은 취소를 전달한다`() {
         val control = AnalysisControl(AnalysisSafetyPolicy.mobile) {
             throw CancellationException("cancel")
@@ -416,7 +462,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         val unsupported = profile.copy(supportedFeatures = emptySet())
         val supported = profile.copy(
             supportedFeatures = setOf("extension.options-page.user-accessible"),
@@ -465,7 +511,7 @@ class MobilePatternAnalyzerTest {
                 contentSource = "console.log('content');",
                 popup = "popup.html",
             )
-            source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
             source.resolve("settings.html").writeText("<p>settings</p>")
             val manifestPath = source.resolve("manifest.json")
             val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
@@ -551,7 +597,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('unused');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         val manifestPath = source.resolve("manifest.json")
         val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
         manifestPath.writeText(JsonObject(manifest - "content_scripts").toString())
@@ -573,7 +619,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         writeOptionsUi(source, "popup.html")
         Files.createDirectories(source.resolve("sixbridge"))
         source.resolve("sixbridge/action-popup-entry.v2.json").writeText(
@@ -596,7 +642,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         writeOptionsUi(source, "popup.html")
         Files.createDirectories(source.resolve("sixbridge"))
         source.resolve("sixbridge/action-popup-entry.v2.json").writeText(
@@ -635,7 +681,7 @@ class MobilePatternAnalyzerTest {
                 contentSource = "console.log('content');",
                 popup = "popup.html",
             )
-            source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
             source.resolve("other.html").writeText("<p>other</p>")
             writeOptionsUi(source, optionsPage)
             if (provenance != null) {
@@ -658,7 +704,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
 
         val report = MobilePatternAnalyzer().analyze(
             source,
@@ -705,7 +751,7 @@ class MobilePatternAnalyzerTest {
             """.trimIndent(),
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         val fallbackProfile = profile.copy(
             supportedFeatures = setOf(
                 "extension.options-page.user-accessible",
@@ -741,7 +787,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "chrome.storage.sync.get('value');",
             popup = "popup.html",
         )
-        approvalAndAutomatic.resolve("popup.html").writeText("<p>popup</p>")
+        approvalAndAutomatic.resolve("popup.html").writeText(safePopupHtml)
         val fallbackProfile = profile.copy(
             supportedFeatures = setOf(
                 "extension.options-page.user-accessible",
@@ -1026,7 +1072,7 @@ class MobilePatternAnalyzerTest {
             contentSource = "console.log('content');",
             popup = "popup.html",
         )
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(safePopupHtml)
         val manifestPath = source.resolve("manifest.json")
         val manifest = Json.parseToJsonElement(manifestPath.readText()).jsonObject
         manifestPath.writeText(JsonObject(manifest + (name to value)).toString())
@@ -1087,4 +1133,7 @@ class MobilePatternAnalyzerTest {
     private val optionsPageProfile = profile.copy(
         supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
+
+    private val safePopupHtml =
+        "<html><head></head><body><p>popup</p></body></html>"
 }

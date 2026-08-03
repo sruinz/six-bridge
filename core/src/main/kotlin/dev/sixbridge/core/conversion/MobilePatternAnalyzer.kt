@@ -10,6 +10,7 @@ import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
+import dev.sixbridge.core.compat.ManifestPopupResolver
 import dev.sixbridge.core.compat.RuntimeResourceIndex
 import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.input.SourceProjectIdentityStore
@@ -203,6 +204,15 @@ class MobilePatternAnalyzer private constructor(
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
         control.checkCancelled()
+        val popupRisk = PopupAutofillRiskAnalyzer().analyze(
+            extensionRoot,
+            manifest,
+            index,
+            control,
+        )
+        popupRisk?.decision?.let(decisions::add)
+        popupRisk?.issue?.let(issues::add)
+        control.checkCancelled()
         popupDecision(manifestPath, manifest, profile)?.let(decisions::add)
         control.checkCancelled()
         val storage = storageDecision(extensionRoot, manifest, index, profile)
@@ -221,6 +231,14 @@ class MobilePatternAnalyzer private constructor(
         )
         return finalizeReport(
             compatibility.copy(
+                status = when {
+                    popupRisk?.decision?.disposition == AdapterDisposition.UNAVAILABLE ->
+                        CompatibilityStatus.UNKNOWN
+                    popupRisk != null &&
+                        compatibility.status == CompatibilityStatus.COMPATIBLE ->
+                        CompatibilityStatus.PARTIAL
+                    else -> compatibility.status
+                },
                 issues = issues,
                 conversionState = conversionState(sortedDecisions),
                 adapterDecisions = sortedDecisions,
@@ -299,10 +317,7 @@ class MobilePatternAnalyzer private constructor(
         profile: BrowserProfile,
     ): AdapterDecision? {
         if (ACTION_POPUP_USER_ACCESSIBLE in profile.supportedFeatures) return null
-        val popup = (manifest["action"] as? JsonObject)
-            ?.stringOrNull("default_popup")
-            ?.takeIf(String::isNotBlank)
-            ?: return null
+        val popup = ManifestPopupResolver.resolve(manifest) ?: return null
         val applied = ActionPopupEntryAdapter().isExactlyApplied(
             manifestPath.parent,
             manifest,
@@ -370,10 +385,7 @@ class MobilePatternAnalyzer private constructor(
         profile: BrowserProfile,
     ): AdapterDecision? {
         if (ACTION_POPUP_USER_ACCESSIBLE in profile.supportedFeatures) return null
-        val popup = (manifest["action"] as? JsonObject)
-            ?.stringOrNull("default_popup")
-            ?.takeIf(String::isNotBlank)
-            ?: return null
+        val popup = ManifestPopupResolver.resolve(manifest) ?: return null
         val invalid = existingOptionPageState(
             manifest,
             manifestPath.parent,

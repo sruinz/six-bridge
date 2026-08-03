@@ -14,6 +14,65 @@ import kotlin.test.assertTrue
 
 class RuntimeResourceIndexTest {
     @Test
+    fun `MV3는 action popup만 popup 역할로 색인한다`() {
+        val root = Files.createTempDirectory("sixbridge-index-mv3-popup-")
+        root.resolve("mv3.html").writeText("<head><script src='mv3.js'></script></head>")
+        root.resolve("mv3.js").writeText("console.log('mv3');")
+        root.resolve("mv2.html").writeText("<head></head>")
+        val manifest = Json.parseToJsonElement(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Popup",
+              "version": "1",
+              "action": {"default_popup": "mv3.html"},
+              "browser_action": {"default_popup": "mv2.html"}
+            }
+            """.trimIndent(),
+        ) as JsonObject
+
+        val index = RuntimeResourceIndex.create(root, manifest)
+
+        assertEquals("mv3.html", ManifestPopupResolver.resolve(manifest))
+        assertEquals(
+            setOf(RuntimeResourceIndex.ResourceRole.ACTION_POPUP),
+            index.rolesByRelativePath.getValue("mv3.html"),
+        )
+        assertEquals(
+            setOf(RuntimeResourceIndex.ResourceRole.ACTION_POPUP),
+            index.rolesByRelativePath.getValue("mv3.js"),
+        )
+        assertFalse("mv2.html" in index.rolesByRelativePath)
+    }
+
+    @Test
+    fun `MV2는 browser action popup만 popup 역할로 색인한다`() {
+        val root = Files.createTempDirectory("sixbridge-index-mv2-popup-")
+        root.resolve("mv2.html").writeText("<head></head>")
+        root.resolve("mv3.html").writeText("<head></head>")
+        val manifest = Json.parseToJsonElement(
+            """
+            {
+              "manifest_version": 2,
+              "name": "Popup",
+              "version": "1",
+              "action": {"default_popup": "mv3.html"},
+              "browser_action": {"default_popup": "mv2.html"}
+            }
+            """.trimIndent(),
+        ) as JsonObject
+
+        val index = RuntimeResourceIndex.create(root, manifest)
+
+        assertEquals("mv2.html", ManifestPopupResolver.resolve(manifest))
+        assertEquals(
+            setOf(RuntimeResourceIndex.ResourceRole.ACTION_POPUP),
+            index.rolesByRelativePath.getValue("mv2.html"),
+        )
+        assertFalse("mv3.html" in index.rolesByRelativePath)
+    }
+
+    @Test
     fun `marks declared and imported resources unresolved when resolution fails`() {
         val missingRoot = Files.createTempDirectory("sixbridge-index-missing-root-")
         val missingRootIndex = RuntimeResourceIndex.create(

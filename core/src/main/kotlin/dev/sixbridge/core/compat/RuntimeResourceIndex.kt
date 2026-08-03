@@ -158,8 +158,7 @@ class RuntimeResourceIndex private constructor(
                     )
                 }
             }
-            (manifest["action"] as? JsonObject)
-                ?.stringOrNull("default_popup")
+            ManifestPopupResolver.resolve(manifest)
                 ?.let {
                     enqueue(
                         normalizedRoot,
