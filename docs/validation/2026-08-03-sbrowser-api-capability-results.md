@@ -156,18 +156,69 @@ Tampermonkey를 현재 자동 변환 대상으로 승인하지 않는다. 정적
 - 상태: `UNKNOWN`
 - 검증 member: 10
 - unavailable: `contentScripts`, `nativeMessaging`, `sidebarAction`
-- 차단 근거: 계산된 namespace/browser alias
+- 차단 근거: 계산된 Chrome API alias와 재귀 `Proxy`
 
-`nativeMessaging`과 특정 사이드바 경로가 선택 기능일 가능성은 있지만,
-현재 evidence만으로 핵심 popup·잠금 해제·login field 감지·autofill을
-증명할 수 없다. 실제 계정 대신 로컬 fixture로 설치·활성화·popup·
-잠금·해제·field 감지·autofill trigger를 순서대로 검증해야 한다.
+### 정적 분석 경계
+
+`contentScripts.register`는 Manifest V2·Firefox fallback, `nativeMessaging`은
+선택 권한, `sidebarAction`은 Firefox·Opera 분기에 있었다. 따라서 이 세 항목은
+Chrome Manifest V3의 popup·정적 content script 실행을 곧바로 차단한다고
+볼 수 없다.
+
+다만 bundle에는 `globalThis.chrome`를 재귀 `Proxy`로 감싸는 Promise API
+호환 계층도 있다. 현재 정적 분석기는 Manifest V3에서 도달하지 않는 fallback과
+실행되는 계산 member 접근을 안전하게 분리할 수 없으므로 `api_usage_dynamic`을
+차단 근거로 유지한다. 제품 CLI·데스크탑·Android 관리자의 `UNKNOWN` 차단은
+완화하지 않았다.
+
+### 로컬 진단용 원본 CRX 래퍼
+
+사용자가 선택한 로컬 실험에서만 저수준 `WrapperApkBuilder`로 원본 CRX를
+그대로 래핑했다. 자동 변환 결과나 배포 가능한 `.six`로 승인한 것이 아니다.
+
+- 원본 CRX SHA-256:
+  `3f05cb920192f588ef051507830884b6a8979179969e0bf7c40e01a2a8fd7fbe`
+- 래퍼 내부 `assets/extension.crx` SHA-256: 원본과 동일
+- 래퍼 package:
+  `dev.sixbridge.ext.nngceckbapebfimnlniiiahkandclblb`
+- 래퍼 `versionCode`: `1`
+- 래퍼 SHA-256:
+  `2712988d4d0276978cb31221f5751a003f20cdfcbf9fbee189fc4345c866f7e6`
+- 래퍼 signer SHA-256:
+  `436e837f7fae287a23dcead0d944bc9fb7dfdbee82fabf962fdb8846accd927a`
+- APK 검증: v3 서명, 4-byte alignment, `extension-id`, discovery Activity,
+  exported ContentProvider 계약 통과
+- Fold7 smoke: 설치 성공, `six://ex` resolution 성공, Provider `Cr24`
+
+삼성 인터넷 `30.0.0.67`에서 사용자가 Add-ons 활성화를 완료한 뒤 다음을
+확인했다.
+
+- DevTools에 원본 ID의 service worker가 실행됨
+- 로컬 HTTP fixture의 격리 execution context에 `Bitwarden 비밀번호 관리자`
+  content script와 원본 runtime ID가 존재함
+- 삼성 인터넷 더보기 메뉴에 `Bitwarden 비밀번호 관리자` action이 표시됨
+- action 실행 로그가 원본 ID를 가리킴
+- popup에서 WebAssembly 지원·SDK 로드·state version 초기화가 성공함
+- 초기 안내 화면과 `bitwarden.com` 로그인 화면이 모바일에서 정상 표시됨
+- popup·background 로그에 `TypeError`, `ReferenceError`, uncaught 오류가 없음
+
+화면 evidence와 실험 APK는 Git에 포함하지 않고 `.local/evidence/`에
+보존한다. 로컬 fixture도 네트워크 제출을 막고 다음 더미 값만 사용했다.
+
+- 사용자 이름: `six-test@example.invalid`
+- 비밀번호: `not-a-real-password`
+
+이 결과는 service worker·content script·popup의 기본 런타임 호환성이
+예상보다 높다는 증거다. 그러나 content script execution context 존재만으로
+login field 의미 인식이나 autofill 성공을 증명하지는 않는다. 로그인한 vault가
+없어 잠금·해제, 저장 항목 매칭, autofill trigger는 실행하지 않았으며 계속
+미검증으로 둔다. 실제 계정·비밀번호·운영 vault는 사용하지 않았다.
 
 ## 남은 게이트
 
 - 삼성 인터넷 완전 종료·재실행 후 6개 probe 활성·결과 유지
 - MediaNab 비지원 native 의존성의 boundary 진단 유지
-- Bitwarden의 로컬 fixture autofill trigger
+- Bitwarden의 비운영 test vault 잠금·해제와 로컬 fixture autofill trigger
 - 단순 namespace 노출이 아닌 실제 사용 member의 추가 probe evidence
 
 이 게이트가 끝나기 전에는 후보 profile을 baseline으로 승격하지 않는다.
