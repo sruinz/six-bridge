@@ -39,6 +39,71 @@ import kotlin.io.path.writeText
 
 class SixDraftTest {
     @Test
+    fun `선택적 승인만 있는 빈 plan은 원본 유지 draft로 검증된다`() {
+        val source = "optional-original-source".encodeToByteArray()
+        val sourceSha256 = sha256(source)
+        val profileSha256 = "b".repeat(64)
+        val decision = AdapterDecision(
+            id = "popup-native-autofill-guard",
+            version = 1,
+            risk = AdapterRisk.BEHAVIOR_CHANGE,
+            disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = listOf("원본 유지"),
+        )
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Optional",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+            adapterDecisions = listOf(decision),
+            sourceSha256 = sourceSha256,
+            browserProfileSha256 = profileSha256,
+        )
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                coreVersion = "test",
+                adapterVersions = emptyMap(),
+                sourceIdentity = "optional-original-draft",
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.SOURCE_DIRECTORY,
+                originalSourceSha256 = sourceSha256,
+                browserProfileSha256 = profileSha256,
+                originalExtensionId = null,
+                originalExtensionVersion = "1",
+                sourceIdentity = "optional-original-draft",
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(before, emptyList()),
+            compatibilityBefore = before,
+            compatibilityAfter = before.copy(
+                conversionState = ConversionState.PASSTHROUGH,
+            ),
+        )
+
+        val verified = SixDraft.read(SixDraft.createBytes(payload, keyPair()))
+
+        assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
+        assertEquals(
+            AdapterDisposition.OPTIONAL_APPROVAL,
+            verified.payload.compatibilityBefore.adapterDecisions.single().disposition,
+        )
+        assertEquals(
+            ConversionState.PASSTHROUGH,
+            verified.payload.compatibilityAfter.conversionState,
+        )
+    }
+
+    @Test
     fun `optional approval disposition을 canonical JSON으로 왕복한다`() {
         val decision = AdapterDecision(
             id = "popup-native-autofill-guard",

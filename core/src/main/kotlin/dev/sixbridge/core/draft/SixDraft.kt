@@ -408,11 +408,7 @@ class SixDraftPayload private constructor(
                 ) {
                     "passthrough 전후 보고서는 동일한 실제 source를 가리켜야 합니다."
                 }
-                require(
-                    before.conversionState ==
-                        dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH &&
-                        before.convertedExtensionId == null,
-                ) {
+                require(isOriginalPreservingBefore(before)) {
                     "passthrough 변환 전 보고서는 미변환 상태여야 합니다."
                 }
                 require(after.extensionVersion == input.originalExtensionVersion) {
@@ -422,6 +418,7 @@ class SixDraftPayload private constructor(
                     "passthrough 결과 extension ID가 원본과 일치하지 않습니다."
                 }
                 val expectedAfter = before.copy(
+                    conversionState = dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH,
                     convertedExtensionId = input.originalExtensionId,
                 )
                 require(expectedAfter == after) {
@@ -535,11 +532,7 @@ class SixDraftPayload private constructor(
                 require(after.sourceSha256 == actualOriginalSha256) {
                     "schema v2 passthrough 결과가 원본 source와 다릅니다."
                 }
-                require(
-                    before.conversionState ==
-                        dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH &&
-                        before.convertedExtensionId == null,
-                ) {
+                require(isOriginalPreservingBefore(before)) {
                     "passthrough 변환 전 보고서는 미변환 상태여야 합니다."
                 }
                 require(after.extensionVersion == input.originalExtensionVersion) {
@@ -549,6 +542,7 @@ class SixDraftPayload private constructor(
                     .takeIf { sourceKind == DraftSourceKind.CRX }
                 require(
                     before.copy(
+                        conversionState = dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH,
                         originalExtensionId = input.originalExtensionId,
                         convertedExtensionId = passthroughExtensionId,
                     ) ==
@@ -587,6 +581,24 @@ class SixDraftPayload private constructor(
                 }
             }
         }
+
+        private fun isOriginalPreservingBefore(
+            report: dev.sixbridge.core.compat.CompatibilityReport,
+        ): Boolean =
+            report.convertedExtensionId == null &&
+                (
+                    report.conversionState ==
+                        dev.sixbridge.core.conversion.ConversionState.PASSTHROUGH ||
+                        (
+                            report.conversionState ==
+                                dev.sixbridge.core.conversion.ConversionState.REQUIRES_APPROVAL &&
+                                report.adapterDecisions.isNotEmpty() &&
+                                report.adapterDecisions.all {
+                                    it.disposition ==
+                                        dev.sixbridge.core.conversion.AdapterDisposition.OPTIONAL_APPROVAL
+                                }
+                            )
+                    )
 
         private fun validateV3Semantics(
             draft: DraftMetadata,

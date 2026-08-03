@@ -52,13 +52,23 @@ class SixBundleTest {
                     id = "popup-fallback",
                     version = 2,
                     risk = AdapterRisk.BEHAVIOR_CHANGE,
-                    disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+                    disposition = AdapterDisposition.REQUIRES_APPROVAL,
                     applied = false,
                     evidence = listOf(
                         SourceEvidence("popup.js", 4, "action popup"),
                     ),
                     changes = listOf("manifest.json"),
                     remainingLimitations = listOf("popup rendering differs"),
+                ),
+                AdapterDecision(
+                    id = "popup-native-autofill-guard",
+                    version = 1,
+                    risk = AdapterRisk.BEHAVIOR_CHANGE,
+                    disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+                    applied = false,
+                    evidence = emptyList(),
+                    changes = emptyList(),
+                    remainingLimitations = listOf("popup focus conflict remains"),
                 ),
             ),
             originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
@@ -73,8 +83,14 @@ class SixBundleTest {
         assertEquals(descriptor, read.extension)
         assertEquals(compatibility, read.compatibility)
         assertEquals(
+            AdapterDisposition.REQUIRES_APPROVAL,
+            read.compatibility.adapterDecisions
+                .single { it.id == "popup-fallback" }.disposition,
+        )
+        assertEquals(
             AdapterDisposition.OPTIONAL_APPROVAL,
-            read.compatibility.adapterDecisions.single().disposition,
+            read.compatibility.adapterDecisions
+                .single { it.id == "popup-native-autofill-guard" }.disposition,
         )
         assertContentEquals(wrapper.toFile().readBytes(), read.wrapperApk)
         ZipFile(output.toFile()).use { zip ->
