@@ -12,6 +12,22 @@ internal object SafeHtmlDocument {
         val safeToInject: Boolean,
     )
 
+    fun insertExternalScript(
+        source: String,
+        absolutePath: String,
+    ): String {
+        require(
+            absolutePath.startsWith('/') &&
+                ActionPopupEntrySafety.isSafeUrlPath(absolutePath),
+        ) {
+            "script asset은 extension 절대 경로만 허용합니다."
+        }
+        val offset = parse(source) {}.headContentOffset
+            ?: throw IllegalStateException("popup head 삽입 경계를 확인할 수 없습니다.")
+        val scriptTag = "<script src=\"$absolutePath\"></script>"
+        return source.substring(0, offset) + scriptTag + source.substring(offset)
+    }
+
     fun parse(
         source: String,
         checkCancelled: () -> Unit,

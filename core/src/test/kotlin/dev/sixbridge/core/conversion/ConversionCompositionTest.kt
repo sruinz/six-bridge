@@ -46,6 +46,7 @@ class ConversionCompositionTest {
                 listOf(
                     MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
                     MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
+                    MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
                     MobilePatternAnalyzer.STORAGE_FALLBACK,
                 ),
                 plan.selectedAdapters.map(SelectedAdapter::id),
@@ -84,6 +85,14 @@ class ConversionCompositionTest {
             )
             assertTrue(
                 "chrome.storage.local" in
+                    snapshot.workingRoot.resolve("content.js").readText(),
+            )
+            assertTrue(
+                "<script src=\"/sixbridge/popup-native-autofill-guard.v1.js\"></script>" in
+                    snapshot.workingRoot.resolve("popup.html").readText(),
+            )
+            assertFalse(
+                "popup-native-autofill-guard.v1.js" in
                     snapshot.workingRoot.resolve("content.js").readText(),
             )
         }
@@ -205,7 +214,10 @@ class ConversionCompositionTest {
         val report = MobilePatternAnalyzer().analyze(root, profile)
         return ConversionPlanner().plan(
             report,
-            setOf(MobilePatternAnalyzer.ACTION_POPUP_ENTRY),
+            setOf(
+                MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
+                MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
+            ),
         )
     }
 
@@ -226,7 +238,9 @@ class ConversionCompositionTest {
                 }
                 """.trimIndent(),
             )
-            root.resolve("popup.html").writeText("<p>popup</p>")
+            root.resolve("popup.html").writeText(
+                "<html><head></head><body><input type='email'></body></html>",
+            )
             root.resolve("content.js").writeText(
                 """
                 document.addEventListener("mouseup", (event) => {

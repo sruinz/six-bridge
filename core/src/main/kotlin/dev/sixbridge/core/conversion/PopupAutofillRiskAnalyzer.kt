@@ -5,9 +5,15 @@ import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import dev.sixbridge.core.compat.ManifestPopupResolver
 import dev.sixbridge.core.compat.RuntimeResourceIndex
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.security.MessageDigest
 
 internal enum class PopupAutofillEvidenceKind {
     CONFIRMED,
@@ -20,6 +26,54 @@ internal data class PopupAutofillRisk(
     val decision: AdapterDecision,
     val issue: CompatibilityIssue,
 )
+
+internal data class PopupAutofillProof(
+    val popupPath: String,
+    val scriptTagSha256: String,
+    val assetSha256: String,
+) {
+    fun evidence(): SourceEvidence = SourceEvidence(
+        relativePath = PopupNativeAutofillGuardContract.MARKER_PATH,
+        line = 1,
+        detail = "popup_guard_sha256=$scriptTagSha256,$assetSha256",
+    )
+
+    companion object {
+        fun parse(evidence: List<SourceEvidence>): PopupAutofillProof {
+            val popup = evidence.singleOrNull {
+                it.detail.startsWith(POPUP_PREFIX)
+            } ?: throw IllegalStateException("popup 경로 근거를 확인할 수 없습니다.")
+            val popupPath = popup.detail.removePrefix(POPUP_PREFIX)
+            check(
+                popup.relativePath == popupPath &&
+                    ActionPopupEntrySafety.canonicalResourcePath(popupPath) == popupPath,
+            ) {
+                "popup 경로 근거가 canonical path와 다릅니다."
+            }
+            val hashes = evidence.singleOrNull {
+                it.detail.startsWith(HASH_PREFIX)
+            }?.detail?.removePrefix(HASH_PREFIX)?.split(',')
+            return PopupAutofillProof(
+                popupPath = popupPath,
+                scriptTagSha256 = hashes?.getOrNull(0).orEmpty(),
+                assetSha256 = hashes?.getOrNull(1).orEmpty(),
+            )
+        }
+
+        fun fromApplied(
+            popupPath: String,
+            scriptTag: String,
+            assetBytes: ByteArray,
+        ): PopupAutofillProof = PopupAutofillProof(
+            popupPath = popupPath,
+            scriptTagSha256 = popupGuardSha256(scriptTag.toByteArray(UTF_8)),
+            assetSha256 = popupGuardSha256(assetBytes),
+        )
+
+        private const val POPUP_PREFIX = "popup_path="
+        private const val HASH_PREFIX = "popup_guard_sha256="
+    }
+}
 
 internal class PopupAutofillRiskAnalyzer {
     fun analyze(
@@ -49,6 +103,7 @@ internal class PopupAutofillRiskAnalyzer {
         control.checkCancelled()
         val document = SafeHtmlDocument.parse(source, control::checkCancelled)
         if (!document.safeToInject) return unavailableRisk(popupPath)
+        val appliedProof = exactAppliedProof(root, popupPath, source, document)
 
         val staticEvidence = document.inputs.map { input ->
             control.checkCancelled()
@@ -82,7 +137,7 @@ internal class PopupAutofillRiskAnalyzer {
             PopupAutofillEvidenceKind.CONFIRMED -> staticEvidence
             PopupAutofillEvidenceKind.POTENTIAL -> dynamicEvidence
             PopupAutofillEvidenceKind.MANUAL -> emptyList()
-        }
+        } + listOfNotNull(appliedProof?.evidence())
         return PopupAutofillRisk(
             kind = kind,
             decision = AdapterDecision(
@@ -90,11 +145,21 @@ internal class PopupAutofillRiskAnalyzer {
                 version = 1,
                 risk = AdapterRisk.BEHAVIOR_CHANGE,
                 disposition = AdapterDisposition.OPTIONAL_APPROVAL,
-                applied = false,
+                applied = appliedProof != null,
                 evidence = evidence,
-                changes = listOf(
-                    "승인 시 popup 대상 input의 native autocomplete를 비활성화합니다.",
-                ),
+                changes = if (appliedProof != null) {
+                    listOf(
+                        spanHashChange(
+                            popupPath,
+                            "",
+                            PopupNativeAutofillGuardContract.SCRIPT_TAG,
+                        ),
+                    )
+                } else {
+                    listOf(
+                        "승인 시 popup 대상 input의 native autocomplete를 비활성화합니다.",
+                    )
+                },
                 remainingLimitations = listOf(
                     "보호를 적용하면 popup의 native autocomplete 동작이 달라집니다.",
                 ),
@@ -133,6 +198,55 @@ internal class PopupAutofillRiskAnalyzer {
         line = 1,
         detail = "popup_path=$popupPath",
     )
+
+    private fun exactAppliedProof(
+        root: Path,
+        popupPath: String,
+        source: String,
+        document: SafeHtmlDocument.Result,
+    ): PopupAutofillProof? = runCatching {
+        val assetBytes = PopupNativeAutofillGuardContract.assetBytes()
+        val proof = PopupAutofillProof.fromApplied(
+            popupPath,
+            PopupNativeAutofillGuardContract.SCRIPT_TAG,
+            assetBytes,
+        )
+        val asset = root.resolve(PopupNativeAutofillGuardContract.ASSET_PATH)
+        if (!Files.isRegularFile(asset, NOFOLLOW_LINKS) ||
+            !Files.readAllBytes(asset).contentEquals(assetBytes) ||
+            !hasSingleTagAtHead(source, document)
+        ) {
+            return null
+        }
+        val marker = root.resolve(PopupNativeAutofillGuardContract.MARKER_PATH)
+        if (!Files.isRegularFile(marker, NOFOLLOW_LINKS)) return null
+        val json = Json.parseToJsonElement(Files.readString(marker, UTF_8)) as? JsonObject
+            ?: return null
+        if (json.keys != MARKER_KEYS ||
+            json.string("adapter") != MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD ||
+            (json["version"] as? JsonPrimitive)?.intOrNull != 1 ||
+            json.string("popupPath") != proof.popupPath ||
+            json.string("scriptTagSha256") != proof.scriptTagSha256 ||
+            json.string("assetSha256") != proof.assetSha256
+        ) {
+            return null
+        }
+        proof
+    }.getOrNull()
+
+    private fun hasSingleTagAtHead(
+        source: String,
+        document: SafeHtmlDocument.Result,
+    ): Boolean {
+        val offset = document.headContentOffset ?: return false
+        val tag = PopupNativeAutofillGuardContract.SCRIPT_TAG
+        return source.startsWith(tag, offset) && source.indexOf(tag) == source.lastIndexOf(tag)
+    }
+
+    private fun JsonObject.string(name: String): String? =
+        (get(name) as? JsonPrimitive)
+            ?.takeIf(JsonPrimitive::isString)
+            ?.content
 
     private fun dynamicInputEvidence(
         script: RuntimeResourceIndex.RuntimeScript,
@@ -173,9 +287,29 @@ internal class PopupAutofillRiskAnalyzer {
     }
 
     private companion object {
+        val MARKER_KEYS = setOf(
+            "adapter",
+            "version",
+            "popupPath",
+            "scriptTagSha256",
+            "assetSha256",
+        )
         val CREATE_INPUT = Regex(
             """\bcreateElement\s*\(\s*(['"])input\1\s*\)""",
         )
         const val CHECKPOINT_INTERVAL = 16_384
     }
 }
+
+internal fun spanHashChange(
+    path: String,
+    before: String,
+    after: String,
+): String =
+    "path=$path; span-before-sha256=${popupGuardSha256(before.toByteArray(UTF_8))}; " +
+        "span-after-sha256=${popupGuardSha256(after.toByteArray(UTF_8))}"
+
+private fun popupGuardSha256(bytes: ByteArray): String = MessageDigest
+    .getInstance("SHA-256")
+    .digest(bytes)
+    .joinToString("") { "%02x".format(it) }

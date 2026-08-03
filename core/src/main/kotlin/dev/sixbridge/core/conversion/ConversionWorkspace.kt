@@ -779,6 +779,7 @@ class ConversionWorkspace private constructor(
         private val adapters = listOf(
             ActionPopupEntryAdapter(),
             DesktopSelectionEventBridge(),
+            PopupNativeAutofillGuardAdapter(),
             StorageFallbackAdapter(),
         ).associateBy(MobileAdapter::id)
 
