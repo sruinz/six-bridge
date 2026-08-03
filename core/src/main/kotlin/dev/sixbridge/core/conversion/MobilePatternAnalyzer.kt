@@ -155,14 +155,33 @@ class MobilePatternAnalyzer private constructor(
             compatibility.status == CompatibilityStatus.UNKNOWN
         ) {
             control.stage(AnalysisStage.MOBILE_PATTERNS)
+            val decisions = mutableListOf<AdapterDecision>()
+            val issues = compatibility.issues.toMutableList()
+            val popupRisk = manifest?.let {
+                analyzeEarlyPopupRisk(extensionRoot, it, ledger)
+            }
+            popupRisk?.decision?.let(decisions::add)
+            popupRisk?.issue?.let(issues::add)
             val invalidOptionPage = manifest?.let {
                 invalidExistingOptionPageDecision(manifestPath, it, profile)
             }
-            if (invalidOptionPage != null) {
+            invalidOptionPage?.let(decisions::add)
+            if (decisions.isNotEmpty()) {
+                val sortedDecisions = decisions.sortedWith(
+                    compareBy(AdapterDecision::id, AdapterDecision::version),
+                )
                 return finalizeReport(
                     compatibility.copy(
-                        conversionState = ConversionState.UNAVAILABLE,
-                        adapterDecisions = listOf(invalidOptionPage),
+                        status = if (
+                            popupRisk?.decision?.disposition == AdapterDisposition.UNAVAILABLE
+                        ) {
+                            CompatibilityStatus.UNKNOWN
+                        } else {
+                            compatibility.status
+                        },
+                        issues = issues,
+                        conversionState = conversionState(sortedDecisions),
+                        adapterDecisions = sortedDecisions,
                     ),
                     emitFinalizingStage,
                 )
@@ -195,7 +214,13 @@ class MobilePatternAnalyzer private constructor(
             )
         }
         control.checkCancelled()
-        if (index.unresolvedDependency) {
+        val popupRisk = PopupAutofillRiskAnalyzer().analyze(
+            extensionRoot,
+            manifest,
+            index,
+            control,
+        )
+        if (index.unresolvedDependency && popupRisk == null) {
             return finalizeReport(compatibility, emitFinalizingStage)
         }
 
@@ -204,12 +229,6 @@ class MobilePatternAnalyzer private constructor(
         val issues = compatibility.issues.toMutableList()
         selectionDecision(index)?.let(decisions::add)
         control.checkCancelled()
-        val popupRisk = PopupAutofillRiskAnalyzer().analyze(
-            extensionRoot,
-            manifest,
-            index,
-            control,
-        )
         popupRisk?.decision?.let(decisions::add)
         popupRisk?.issue?.let(issues::add)
         control.checkCancelled()
@@ -244,6 +263,32 @@ class MobilePatternAnalyzer private constructor(
                 adapterDecisions = sortedDecisions,
             ),
             emitFinalizingStage,
+        )
+    }
+
+    private fun analyzeEarlyPopupRisk(
+        extensionRoot: Path,
+        manifest: JsonObject,
+        ledger: AnalysisBudgetLedger,
+    ): PopupAutofillRisk? {
+        if (ManifestPopupResolver.declaration(manifest) == null) return null
+        val index = try {
+            RuntimeResourceIndex.create(
+                extensionRoot,
+                manifest,
+                control,
+                ledger,
+                emitStage = false,
+            )
+        } catch (_: AnalysisBudgetExceededException) {
+            return null
+        }
+        control.checkCancelled()
+        return PopupAutofillRiskAnalyzer().analyze(
+            extensionRoot,
+            manifest,
+            index,
+            control,
         )
     }
 

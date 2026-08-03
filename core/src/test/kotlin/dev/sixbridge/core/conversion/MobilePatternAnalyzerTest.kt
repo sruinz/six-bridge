@@ -40,6 +40,65 @@ class MobilePatternAnalyzerTest {
     )
 
     @Test
+    fun `MV2의 선택된 browser action popup만 end to end로 분석한다`() {
+        val source = Files.createTempDirectory("six-mobile-mv2-popup-")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 2,
+              "name": "MV2 popup",
+              "version": "1",
+              "action": {"default_popup": "missing-ignored-mv3.html"},
+              "browser_action": {"default_popup": "popup.html"}
+            }
+            """.trimIndent(),
+        )
+        source.resolve("popup.html").writeText(safePopupHtml)
+
+        val report = MobilePatternAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.BLOCKED, report.status)
+        assertEquals(
+            AdapterDisposition.OPTIONAL_APPROVAL,
+            report.decision("popup-native-autofill-guard")?.disposition,
+        )
+        assertTrue(report.issues.none { it.code == "manifest_resource_invalid" })
+        assertTrue(report.issues.any { it.code == "manifest_version_unsupported" })
+    }
+
+    @Test
+    fun `선택된 popup이 없거나 해석 불가면 fail closed unknown이다`() {
+        listOf("missing.html", "../outside.html").forEach { popup ->
+            val source = Files.createTempDirectory("six-mobile-missing-popup-")
+            source.resolve("manifest.json").writeText(
+                """
+                {
+                  "manifest_version": 3,
+                  "name": "Missing popup",
+                  "version": "1",
+                  "action": {"default_popup": "$popup"}
+                }
+                """.trimIndent(),
+            )
+
+            val report = MobilePatternAnalyzer().analyze(source, profile)
+
+            assertEquals(CompatibilityStatus.UNKNOWN, report.status, popup)
+            assertEquals(
+                AdapterDisposition.UNAVAILABLE,
+                report.decision("popup-native-autofill-guard")?.disposition,
+                popup,
+            )
+            assertTrue(
+                report.issues.any {
+                    it.code == "popup_native_autofill_unavailable" && it.blocking
+                },
+                popup,
+            )
+        }
+    }
+
+    @Test
     fun `안전한 popup 입력 위험은 partial과 선택적 보호 adapter를 만든다`() {
         val source = extension(
             contentFile = "content.js",

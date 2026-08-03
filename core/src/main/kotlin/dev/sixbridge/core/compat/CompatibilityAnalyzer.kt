@@ -426,13 +426,13 @@ class CompatibilityAnalyzer(
                 }
             }
         }
-        if ("action" in manifest && manifest["action"] !is JsonObject) {
-            declared += "action" to null
-        }
-        (manifest["action"] as? JsonObject)?.let { action ->
-            if ("default_popup" in action) {
-                declared += "action.default_popup" to action["default_popup"]
+        ManifestPopupResolver.selectedContainerName(manifest)?.let { containerName ->
+            if (containerName in manifest && manifest[containerName] !is JsonObject) {
+                declared += containerName to null
             }
+        }
+        ManifestPopupResolver.declaration(manifest)?.let { popup ->
+            declared += popup.field to popup.value
         }
         if ("options_page" in manifest) {
             declared += "options_page" to manifest["options_page"]

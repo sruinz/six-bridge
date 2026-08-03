@@ -28,7 +28,9 @@ internal class PopupAutofillRiskAnalyzer {
         index: RuntimeResourceIndex,
         control: AnalysisControl,
     ): PopupAutofillRisk? {
-        val declaredPopup = ManifestPopupResolver.resolve(manifest) ?: return null
+        val declaration = ManifestPopupResolver.declaration(manifest) ?: return null
+        val declaredPopup = ManifestPopupResolver.resolve(manifest)
+            ?: return unavailableRisk(declaration.field)
         control.checkCancelled()
         val popupPath = ActionPopupEntrySafety.canonicalResourcePath(declaredPopup)
         if (popupPath == null ||

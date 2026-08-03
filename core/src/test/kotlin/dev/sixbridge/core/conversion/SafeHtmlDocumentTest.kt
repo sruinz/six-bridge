@@ -72,6 +72,16 @@ class SafeHtmlDocumentTest {
     }
 
     @Test
+    fun `self closing script와 style raw text tag는 복구하지 않는다`() {
+        listOf("script", "style").forEach { tag ->
+            assertFalse(
+                SafeHtmlDocument.parse("<head><$tag/></head>") {}.safeToInject,
+                tag,
+            )
+        }
+    }
+
+    @Test
     fun `scanner는 16384 UTF-16 code unit 간격으로 취소를 전달한다`() {
         var checkpoints = 0
         val source = "<head></head>" + " ".repeat(16_384)
@@ -83,5 +93,28 @@ class SafeHtmlDocumentTest {
             }
         }
         assertEquals(2, checkpoints)
+    }
+
+    @Test
+    fun `긴 ASCII tag name을 copy하기 전 scanner 진행 중 취소를 전달한다`() {
+        val source = "<" + "a".repeat(16_384 * 2)
+        var checkpoints = 0
+        var secondCheckpointInsideTagScan = false
+
+        assertFailsWith<CancellationException> {
+            SafeHtmlDocument.parse(source) {
+                checkpoints += 1
+                if (checkpoints == 2) {
+                    secondCheckpointInsideTagScan = Throwable().stackTrace.any {
+                        it.className.endsWith("SafeHtmlDocument") &&
+                            it.methodName == "parseTag"
+                    }
+                    throw CancellationException("tag-name-cancel")
+                }
+            }
+        }
+
+        assertEquals(2, checkpoints)
+        assertTrue(secondCheckpointInsideTagScan)
     }
 }

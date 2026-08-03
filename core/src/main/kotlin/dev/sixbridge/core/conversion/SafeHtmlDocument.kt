@@ -112,10 +112,12 @@ internal object SafeHtmlDocument {
                     }
                 }
             }
-            if (!tag.closing && !tag.selfClosing &&
-                (tag.name == "script" || tag.name == "style")
-            ) {
-                rawTextTag = tag.name
+            if (!tag.closing && (tag.name == "script" || tag.name == "style")) {
+                if (tag.selfClosing) {
+                    malformed = true
+                } else {
+                    rawTextTag = tag.name
+                }
             } else if (tag.closing && tag.name == rawTextTag) {
                 rawTextTag = null
             }
@@ -193,8 +195,11 @@ internal object SafeHtmlDocument {
             return null
         }
         val nameStart = index
-        while (source.getOrNull(index).isTagNameCharacter()) index += 1
-        val name = source.substring(nameStart, index).lowercaseAscii()
+        while (source.getOrNull(index).isTagNameCharacter()) {
+            checkThrough(index + 1)
+            index += 1
+        }
+        val name = knownTagName(source, nameStart, index)
         if (!source.getOrNull(index).isTagNameBoundary()) return null
 
         var quote: Char? = null
@@ -307,6 +312,17 @@ internal object SafeHtmlDocument {
             next == '?'
     }
 
+    private fun knownTagName(source: String, start: Int, end: Int): String =
+        KNOWN_TAG_NAMES.firstOrNull { name ->
+            end - start == name.length && source.regionMatches(
+                start,
+                name,
+                0,
+                name.length,
+                ignoreCase = true,
+            )
+        }.orEmpty()
+
     private fun String.lastNonWhitespace(start: Int, endExclusive: Int): Int {
         var index = endExclusive - 1
         while (index >= start && this[index].isHtmlWhitespace()) index -= 1
@@ -348,5 +364,6 @@ internal object SafeHtmlDocument {
         "tel",
         "search",
     )
+    private val KNOWN_TAG_NAMES = listOf("head", "body", "input", "script", "style")
     private const val CHECKPOINT_INTERVAL = 16_384
 }
