@@ -45,6 +45,13 @@ assert_log_count() {
   [ "$actual" -eq "$expected" ] || fail "log '$pattern' count $expected 예상, 실제 $actual"
 }
 
+assert_exact_log_count() {
+  expected=$1
+  line=$2
+  actual=$(grep -F -x -c -- "$line" "$command_log" || true)
+  [ "$actual" -eq "$expected" ] || fail "exact log '$line' count $expected 예상, 실제 $actual"
+}
+
 assert_no_log() {
   pattern=$1
   if grep -F -- "$pattern" "$command_log" >/dev/null 2>&1; then
@@ -204,9 +211,27 @@ fi
 printf 'SIX' >>"$SIX_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$SIX_TEST_COMMAND_LOG"
 printf '\n' >>"$SIX_TEST_COMMAND_LOG"
+printf 'cli-path=%s\n' "$0" >>"$SIX_TEST_EVENTS"
 command_name=$1
 shift
+if [ "$command_name" = --help ]; then
+  printf '%s\n' 'Commands:'
+  printf '%s\n' '  build  build command'
+  if [ "${SIX_TEST_CLI_CONTRACT:-compatible}" != stale ]; then
+    printf '%s\n' '  probe  probe command'
+  fi
+  exit 0
+fi
 if [ "$command_name" = probe ]; then
+  [ "${SIX_TEST_CLI_CONTRACT:-compatible}" != stale ] || exit 86
+  if [ "$#" -eq 0 ]; then
+    printf '%s\n' 'Commands:'
+    printf '%s\n' '  generate         generate command'
+    printf '%s\n' '  prepare-session  prepare command'
+    printf '%s\n' '  verify-evidence  verify command'
+    printf '%s\n' '  build-profile    profile command'
+    exit 0
+  fi
   command_name="probe-$1"
   shift
 fi
@@ -322,7 +347,15 @@ EOF
   unset SIX_TEST_NODE_MODE SIX_TEST_PREPARE_FAIL SIX_TEST_VERIFY_FAIL SIX_TEST_PROFILE_FAIL
   unset SIX_TEST_SLEEP_MODE SIX_TEST_MKDIR_MODE SIX_TEST_DATE_REPLACE_PROFILE
   unset SIX_TEST_SNAPSHOT_PRECLAIM SIX_TEST_SNAPSHOT_VICTIM
+  unset SIX_TEST_CLI_CONTRACT
   runner="$fixture_project/scripts/fold7-api-probe.sh"
+}
+
+install_fixture_local_cli() {
+  local_cli="$fixture_project/cli/build/install/sixbridge/bin/sixbridge"
+  /bin/mkdir -p "$(dirname -- "$local_cli")"
+  cp "$fake_bin/sixbridge" "$local_cli"
+  chmod +x "$local_cli"
 }
 
 cleanup_fixture() {
@@ -348,6 +381,34 @@ expect_status 2 "$runner" --serial serial-1 --profile "$case_root/profile-link.j
 assert_no_log 'ADB '
 cleanup_fixture
 pass '단독 help만 허용하고 혼합 help·인자·serial·profile symlink를 device 접근 전 거부'
+
+new_fixture
+install_fixture_local_cli
+export SIX_TEST_CLI_CONTRACT=stale
+expect_nonzero "$runner" --serial serial-1 --profile "$profile"
+assert_no_log 'ADB '
+assert_no_log 'SIX probe generate --output '
+[ ! -e "$fixture_project/.local/probe-build" ] || fail 'stale local CLI 실패 전에 build session 경로를 만들었습니다'
+[ ! -e "$fixture_project/.local/evidence/api-probe" ] || fail 'stale local CLI 실패 전에 evidence session 경로를 만들었습니다'
+grep -F './gradlew :cli:installDist' "$case_root/stderr" >/dev/null || fail 'stale local CLI 재생성 안내가 없습니다'
+grep -F 'source와 일치하지 않습니다' "$case_root/stderr" >/dev/null || fail 'source/build 불일치 오류가 명확하지 않습니다'
+if grep -F "cli-path=$fake_bin/sixbridge" "$events" >/dev/null 2>&1; then
+  fail 'stale local CLI에서 PATH CLI로 fallback했습니다'
+fi
+cleanup_fixture
+pass 'stale local CLI를 PATH fallback 없이 device·session 접근 전에 거부'
+
+new_fixture
+install_fixture_local_cli
+expect_status 0 "$runner" --serial serial-1 --profile "$profile"
+assert_exact_log_count 1 'SIX --help'
+assert_exact_log_count 1 'SIX probe'
+assert_log_count 1 'SIX probe generate --output '
+if grep -F "cli-path=$fake_bin/sixbridge" "$events" >/dev/null 2>&1; then
+  fail 'compatible local CLI 대신 PATH CLI를 사용했습니다'
+fi
+cleanup_fixture
+pass 'compatible local CLI의 read-only 계약 확인 후 정상 실행'
 
 new_fixture
 export SIX_TEST_ADB_MODE=offline

@@ -127,13 +127,49 @@ profile="$profile_parent/$(basename -- "$profile_input")"
 adb_bin=$(command -v adb) || die "adb를 찾을 수 없습니다."
 node_bin=$(command -v node) || die "node를 찾을 수 없습니다."
 local_sixbridge="$project_dir/cli/build/install/sixbridge/bin/sixbridge"
+using_local_sixbridge=false
 if [ -x "$local_sixbridge" ]; then
   sixbridge_bin=$local_sixbridge
+  using_local_sixbridge=true
 else
   sixbridge_bin=$(command -v sixbridge) || die "sixbridge CLI를 찾을 수 없습니다."
 fi
 receiver_script="$project_dir/scripts/api-probe-receiver.mjs"
 [ -f "$receiver_script" ] && [ ! -L "$receiver_script" ] || die "API probe receiver script를 검증할 수 없습니다."
+
+help_lists_command() {
+  expected_command=$1
+  help_output=$2
+  while IFS= read -r help_line; do
+    trimmed_line=${help_line#"${help_line%%[![:space:]]*}"}
+    command_token=${trimmed_line%%[[:space:]]*}
+    if [ "$command_token" = "$expected_command" ]; then
+      return 0
+    fi
+  done <<EOF
+$help_output
+EOF
+  return 1
+}
+
+cli_contract_error() {
+  if [ "$using_local_sixbridge" = true ]; then
+    die "프로젝트 local sixbridge CLI가 현재 source와 일치하지 않습니다. ./gradlew :cli:installDist 로 재생성해 주세요."
+  fi
+  die "선택한 sixbridge CLI가 필요한 API probe 명령 계약을 지원하지 않습니다."
+}
+
+if ! root_help=$("$sixbridge_bin" --help 2>/dev/null); then
+  cli_contract_error
+fi
+help_lists_command build "$root_help" || cli_contract_error
+help_lists_command probe "$root_help" || cli_contract_error
+if ! probe_help=$("$sixbridge_bin" probe 2>/dev/null); then
+  cli_contract_error
+fi
+for required_probe_command in generate prepare-session verify-evidence build-profile; do
+  help_lists_command "$required_probe_command" "$probe_help" || cli_contract_error
+done
 
 ensure_directory() {
   directory=$1
