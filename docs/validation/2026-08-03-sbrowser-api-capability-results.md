@@ -136,10 +136,17 @@ MediaNab은 `validation/extensions.json`의 `boundary-diagnostic`
 - 차단 근거: 계산된 namespace/browser alias
 - 중요 evidence: `userScripts.getScripts`는 Fold7에서 `FAILED`
 
-현재 결과는 사용자 스크립 등록·주입의 핵심 경로가 동작한다는
-근거가 아니다. `userScripts` 대신 검증된 content script 주입 경로로
-변환하려면 의미 보존 어댑터와 별도 승인이 필요하다. 설치·스크립
-등록·fixture 주입·재시작 유지는 미검증이다.
+추가 소스 검토에서 Tampermonkey 5.5.0은 기본 경로에서도 사용자 지정
+`csp`와 `messaging: true`를 `configureWorld`에 전달하며,
+`userscripts-dynamic` 경로는 런타임 `code` 문자열을 등록하는 것을 확인했다.
+삼성 인터넷에서 검증된 `scripting` 경로는 이 동작과 `USER_SCRIPT` 실행
+세계를 같은 의미로 보존하지 못한다.
+
+따라서 `userScripts → scripting` 범용 어댑터는 구현하지 않으며
+Tampermonkey를 현재 자동 변환 대상으로 승인하지 않는다. 정적 alias 분석
+개선으로 현재의 `UNKNOWN` 원인을 제거하더라도 핵심 `userScripts` 의존성은
+별도의 차단 근거다. Tampermonkey 역할의 삼성 인터넷 전용 UserScript 기능은
+현재 범용 변환 엔진과 분리한 후속 프로젝트로 둔다.
 
 ## Bitwarden
 
@@ -160,7 +167,6 @@ MediaNab은 `validation/extensions.json`의 `boundary-diagnostic`
 
 - 삼성 인터넷 완전 종료·재실행 후 6개 probe 활성·결과 유지
 - MediaNab 비지원 native 의존성의 boundary 진단 유지
-- Tampermonkey의 스크립 등록·fixture 주입
 - Bitwarden의 로컬 fixture autofill trigger
 - 단순 namespace 노출이 아닌 실제 사용 member의 추가 probe evidence
 
