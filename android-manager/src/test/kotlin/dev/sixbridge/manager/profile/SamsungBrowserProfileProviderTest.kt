@@ -115,7 +115,8 @@ class SamsungBrowserProfileProviderTest {
 
     @Test
     fun `정상 Samsung 30 x 설치 profile은 Supported이다`(): Unit = runBlocking {
-        val result = provider(found()).load()
+        val cache = MemoryCache()
+        val result = provider(found(), cache).load()
 
         val supported = assertIs<SamsungBrowserProfileResult.Supported>(result)
 
@@ -123,6 +124,7 @@ class SamsungBrowserProfileProviderTest {
         assertEquals(30, supported.profile.majorVersion)
         assertEquals(ProfileSupport.SUPPORTED, supported.profile.support)
         assertTrue(supported.profile.installationApkSetSha256.matches(SHA256))
+        assertEquals(3, cache.value?.schemaVersion)
     }
 
     @Test
@@ -239,10 +241,11 @@ class SamsungBrowserProfileProviderTest {
         }
 
     @Test
-    fun `legacy domain 또는 profile digest가 다른 cache는 재검사한다`(): Unit =
+    fun `legacy domain schema 또는 profile digest가 다른 cache는 재검사한다`(): Unit =
         runBlocking {
             listOf<(CachedSamsungBrowserProfile) -> CachedSamsungBrowserProfile>(
                 { it.copy(domain = "legacy") },
+                { it.copy(schemaVersion = 2) },
                 { it.copy(profileDigest = "0".repeat(64)) },
             ).forEach { corrupt ->
                 val cache = MemoryCache()

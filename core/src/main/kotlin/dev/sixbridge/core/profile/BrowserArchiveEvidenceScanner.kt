@@ -178,6 +178,8 @@ class BrowserArchiveEvidenceScanner private constructor(
             emptyList()
         }
 
+        val baseApkSha256 = verifiedArchives.single(VerifiedArchive::isBase)
+            .actualSha256
         return BrowserProfile(
             browserPackage = evidence.packageName,
             versionName = versionName,
@@ -193,8 +195,7 @@ class BrowserArchiveEvidenceScanner private constructor(
                 contentProvider = ".contentprovider" in scan.markers,
                 devExtensionPath = "dev_ext" in scan.markers,
             ),
-            sourceApkSha256 = verifiedArchives.single(VerifiedArchive::isBase)
-                .actualSha256,
+            sourceApkSha256 = baseApkSha256,
             installationApkSetSha256 = installationDigest(
                 verifiedArchives.map {
                     ArchiveIdentity(it.canonicalName, it.actualSha256)
@@ -202,7 +203,12 @@ class BrowserArchiveEvidenceScanner private constructor(
             ),
             sourceApkSignerSha256 = evidence.signerSha256,
             profileDifferences = differences,
-            supportedFeatures = scan.supportedFeatures(),
+            supportedFeatures = scan.supportedFeatures() + verifiedProfileFeatures(
+                packageName = evidence.packageName,
+                versionName = versionName,
+                baseApkSha256 = baseApkSha256,
+                signerSha256 = evidence.signerSha256,
+            ),
         )
     }
 
@@ -560,6 +566,22 @@ class BrowserArchiveEvidenceScanner private constructor(
     }
 
     companion object {
+        internal fun verifiedProfileFeatures(
+            packageName: String,
+            versionName: String,
+            baseApkSha256: String,
+            signerSha256: String,
+        ): Set<String> = if (
+            packageName == SAMSUNG_BROWSER_PACKAGE &&
+            versionName == BrowserProfile.BASELINE_VERSION &&
+            baseApkSha256 == BrowserProfile.BASELINE_APK_SHA256 &&
+            signerSha256 == BrowserProfile.SAMSUNG_SIGNER_SHA256
+        ) {
+            setOf(INTERNAL_URL_EXTENSIONS_ROOT_FEATURE)
+        } else {
+            emptySet()
+        }
+
         fun installationApkSetSha256(
             baseApk: BrowserArchiveInput,
             splitApks: List<BrowserArchiveInput>,
@@ -676,6 +698,10 @@ class BrowserArchiveEvidenceScanner private constructor(
         )
         private const val OPTIONS_PAGE_ACCESSIBLE_FEATURE =
             "extension.options-page.user-accessible"
+        private const val INTERNAL_URL_EXTENSIONS_ROOT_FEATURE =
+            "browser.internal-url.extensions-root"
+        private const val SAMSUNG_BROWSER_PACKAGE =
+            "com.sec.android.app.sbrowser"
         private val OPTION_PAGE_DEX_MARKERS = setOf(
             "getExtensionOptionPage",
             "six_add_on_settings",

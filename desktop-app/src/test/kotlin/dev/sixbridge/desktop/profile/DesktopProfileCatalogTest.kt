@@ -84,6 +84,18 @@ class DesktopProfileCatalogTest {
         val catalog = catalog()
 
         assertEquals("30.0.2.61", catalog.default().profile?.versionName)
+        assertTrue(
+            catalog.default().profile?.supportedFeatures?.contains(
+                "browser.internal-url.extensions-root",
+            ) == true,
+        )
+        assertTrue(
+            catalog.builtIns()
+                .single { it.profile?.versionName == "30.0.0.67" }
+                .profile
+                ?.supportedFeatures
+                ?.contains("browser.internal-url.extensions-root") == false,
+        )
         assertEquals(DesktopProfileTrust.BUILT_IN, catalog.default().trust)
         assertTrue(catalog.default().selectable)
     }

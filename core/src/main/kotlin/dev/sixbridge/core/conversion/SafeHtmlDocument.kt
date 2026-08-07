@@ -1,5 +1,14 @@
 package dev.sixbridge.core.conversion
 
+internal data class StaticHtmlUrlAttribute(
+    val name: String,
+    val value: String,
+    val quote: Char,
+    val openingQuoteOffset: Int,
+    val contentRange: IntRange,
+    val closingQuoteOffset: Int,
+)
+
 internal object SafeHtmlDocument {
     data class Input(
         val normalizedType: String,
@@ -9,6 +18,7 @@ internal object SafeHtmlDocument {
     data class Result(
         val headContentOffset: Int?,
         val inputs: List<Input>,
+        val urlAttributes: List<StaticHtmlUrlAttribute>,
         val safeToInject: Boolean,
     )
 
@@ -51,6 +61,7 @@ internal object SafeHtmlDocument {
         }
 
         val inputs = mutableListOf<Input>()
+        val urlAttributes = mutableListOf<StaticHtmlUrlAttribute>()
         var headContentOffset: Int? = null
         var headOpen = false
         var headClosed = false
@@ -100,6 +111,9 @@ internal object SafeHtmlDocument {
                 advance(position + 1)
                 continue
             }
+            if (!tag.closing) {
+                urlAttributes += staticUrlAttributes(source, tag, checkCancelled)
+            }
             advance(tag.endExclusive)
             when (tag.name) {
                 "head" -> if (tag.closing) {
@@ -147,8 +161,93 @@ internal object SafeHtmlDocument {
         return Result(
             headContentOffset = headContentOffset.takeIf { safeToInject },
             inputs = inputs,
+            urlAttributes = urlAttributes,
             safeToInject = safeToInject,
         )
+    }
+
+    private fun staticUrlAttributes(
+        source: String,
+        tag: Tag,
+        checkCancelled: () -> Unit,
+    ): List<StaticHtmlUrlAttribute> = buildList {
+        var index = tag.attributesStart
+        var nextCheckpoint = index
+        fun checkCancellationCheckpoint() {
+            while (index >= nextCheckpoint) {
+                checkCancelled()
+                nextCheckpoint += CHECKPOINT_INTERVAL
+            }
+        }
+        while (index < tag.attributesEnd) {
+            checkCancellationCheckpoint()
+            while (index < tag.attributesEnd && source[index].isHtmlWhitespace()) {
+                index += 1
+                checkCancellationCheckpoint()
+            }
+            if (index >= tag.attributesEnd) break
+            if (source[index] == '/') {
+                index += 1
+                continue
+            }
+
+            val nameStart = index
+            while (
+                index < tag.attributesEnd &&
+                !source[index].isHtmlWhitespace() &&
+                source[index] != '=' &&
+                source[index] != '/'
+            ) {
+                index += 1
+                checkCancellationCheckpoint()
+            }
+            if (index == nameStart) {
+                index += 1
+                continue
+            }
+            val name = source.substring(nameStart, index).lowercaseAscii()
+            while (index < tag.attributesEnd && source[index].isHtmlWhitespace()) {
+                index += 1
+                checkCancellationCheckpoint()
+            }
+            if (index >= tag.attributesEnd || source[index] != '=') continue
+            index += 1
+            while (index < tag.attributesEnd && source[index].isHtmlWhitespace()) {
+                index += 1
+                checkCancellationCheckpoint()
+            }
+            if (index >= tag.attributesEnd) break
+
+            val quote = source[index]
+            if (quote != '\'' && quote != '"') {
+                while (index < tag.attributesEnd && !source[index].isHtmlWhitespace()) {
+                    index += 1
+                    checkCancellationCheckpoint()
+                }
+                continue
+            }
+            val openingQuoteOffset = index
+            val contentStart = openingQuoteOffset + 1
+            index = contentStart
+            while (index < tag.attributesEnd && source[index] != quote) {
+                index += 1
+                checkCancellationCheckpoint()
+            }
+            if (index >= tag.attributesEnd) break
+            if (name in URL_ATTRIBUTE_NAMES) {
+                add(
+                    StaticHtmlUrlAttribute(
+                        name = name,
+                        value = source.substring(contentStart, index),
+                        quote = quote,
+                        openingQuoteOffset = openingQuoteOffset,
+                        contentRange = contentStart until index,
+                        closingQuoteOffset = index,
+                    ),
+                )
+            }
+            index += 1
+        }
     }
 
     private fun findCommentEnd(
@@ -381,5 +480,6 @@ internal object SafeHtmlDocument {
         "search",
     )
     private val KNOWN_TAG_NAMES = listOf("head", "body", "input", "script", "style")
+    private val URL_ATTRIBUTE_NAMES = setOf("href", "src", "action", "formaction")
     private const val CHECKPOINT_INTERVAL = 16_384
 }

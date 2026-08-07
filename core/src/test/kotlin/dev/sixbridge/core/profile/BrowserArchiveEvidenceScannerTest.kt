@@ -17,6 +17,44 @@ class BrowserArchiveEvidenceScannerTest {
     private val scanner = BrowserArchiveEvidenceScanner()
 
     @Test
+    fun `내부 주소 feature는 package version base hash signer exact tuple에만 생성한다`() {
+        val exact = BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
+            packageName = "com.sec.android.app.sbrowser",
+            versionName = BrowserProfile.BASELINE_VERSION,
+            baseApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+            signerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        )
+
+        assertEquals(setOf("browser.internal-url.extensions-root"), exact)
+        listOf(
+            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
+                "not.sbrowser",
+                BrowserProfile.BASELINE_VERSION,
+                BrowserProfile.BASELINE_APK_SHA256,
+                BrowserProfile.SAMSUNG_SIGNER_SHA256,
+            ),
+            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
+                "com.sec.android.app.sbrowser",
+                "30.0.0.67",
+                BrowserProfile.BASELINE_APK_SHA256,
+                BrowserProfile.SAMSUNG_SIGNER_SHA256,
+            ),
+            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
+                "com.sec.android.app.sbrowser",
+                BrowserProfile.BASELINE_VERSION,
+                "0".repeat(64),
+                BrowserProfile.SAMSUNG_SIGNER_SHA256,
+            ),
+            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
+                "com.sec.android.app.sbrowser",
+                BrowserProfile.BASELINE_VERSION,
+                BrowserProfile.BASELINE_APK_SHA256,
+                "0".repeat(64),
+            ),
+        ).forEach { assertTrue(it.isEmpty()) }
+    }
+
+    @Test
     fun `설치 APK 집합 내용이 바뀌면 profile digest가 바뀐다`() {
         val first = scanner.scan(
             evidence(splitApks = listOf(archive("split_feature.apk", padding = "a"))),

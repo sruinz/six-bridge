@@ -1,5 +1,5 @@
 {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "browserPackage": "com.sec.android.app.sbrowser",
     "versionName": "30.0.2.61",
     "versionCode": 1300261502,
@@ -83,5 +83,9 @@
     "sourceApkSha256": "6fad5501a3f9823c7dd9fafdfe1204f7246e487c8dea9c192426c07c8c48c981",
     "sourceApkSignerSha256": "34df0e7a9f1cf1892e45c056b4973cd81ccf148a4050d11aea4ac5a65f900a42",
     "profileDifferences": [],
+    "supportedFeatures": [
+        "browser.internal-url.extensions-root"
+    ],
+    "unavailableFeatures": [],
     "support": "supported"
 }

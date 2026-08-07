@@ -254,9 +254,9 @@ class AndroidSamsungBrowserProfileProvider internal constructor(
         const val SAMSUNG_BROWSER_PACKAGE = "com.sec.android.app.sbrowser"
         const val CACHE_PREFERENCES = "samsung-browser-profile"
         const val CACHE_DOMAIN = "sixbridge-samsung-browser-profile"
-        const val CACHE_SCHEMA_VERSION = 2
+        const val CACHE_SCHEMA_VERSION = 3
         private const val CACHE_KEY_DOMAIN =
-            "sixbridge-samsung-browser-profile-cache-key-v2"
+            "sixbridge-samsung-browser-profile-cache-key-v3"
         private const val PACKAGE_CHANGED = "package_changed"
         private val SHA256 = Regex("[0-9a-f]{64}")
     }

@@ -1,5 +1,13 @@
 package dev.sixbridge.core.compat
 
+internal data class StaticStringLiteral(
+    val value: String,
+    val quote: Char,
+    val openingQuoteOffset: Int,
+    val contentRange: IntRange,
+    val closingQuoteOffset: Int,
+)
+
 internal object RuntimeSourceScanner {
     fun scanHtmlScripts(source: String): HtmlScriptScan {
         val records = mutableListOf<HtmlScriptRecord>()
@@ -208,6 +216,70 @@ internal object RuntimeSourceScanner {
             normalizedType.isEmpty() ||
             normalizedType == "module" ||
             normalizedType.substringBefore(';').trim() in JAVA_SCRIPT_MIME_TYPES
+
+    fun scanStaticStringLiterals(
+        source: String,
+        checkCancelled: () -> Unit,
+    ): List<StaticStringLiteral> {
+        val lexicalSource = JavaScriptLexicalMask.mask(
+            source,
+            maskLiterals = false,
+            checkCancelled = checkCancelled,
+        )
+        return buildList {
+            var index = 0
+            var nextCheckpoint = 0
+            while (index < lexicalSource.length) {
+                while (index >= nextCheckpoint) {
+                    checkCancelled()
+                    nextCheckpoint += STATIC_LITERAL_CHECKPOINT_INTERVAL
+                }
+                val quote = lexicalSource[index]
+                if (quote != '\'' && quote != '"') {
+                    index += 1
+                    continue
+                }
+
+                val openingQuoteOffset = index
+                val contentStart = openingQuoteOffset + 1
+                index = contentStart
+                var hasEscape = false
+                var hasLineBreak = false
+                while (index < lexicalSource.length) {
+                    while (index >= nextCheckpoint) {
+                        checkCancelled()
+                        nextCheckpoint += STATIC_LITERAL_CHECKPOINT_INTERVAL
+                    }
+                    when {
+                        source[index] == '\\' -> {
+                            hasEscape = true
+                            index = (index + 2).coerceAtMost(source.length)
+                        }
+                        source[index] == '\r' || source[index] == '\n' -> {
+                            hasLineBreak = true
+                            index += 1
+                        }
+                        lexicalSource[index] == quote -> {
+                            if (!hasEscape && !hasLineBreak) {
+                                add(
+                                    StaticStringLiteral(
+                                        value = source.substring(contentStart, index),
+                                        quote = quote,
+                                        openingQuoteOffset = openingQuoteOffset,
+                                        contentRange = contentStart until index,
+                                        closingQuoteOffset = index,
+                                    ),
+                                )
+                            }
+                            index += 1
+                            break
+                        }
+                        else -> index += 1
+                    }
+                }
+            }
+        }
+    }
 
     fun javaScriptDependencies(
         source: String,
@@ -688,6 +760,8 @@ internal object RuntimeSourceScanner {
         "lpar" to '('.code,
         "rpar" to ')'.code,
     )
+
+    private const val STATIC_LITERAL_CHECKPOINT_INTERVAL = 16_384
 }
 
 internal object JavaScriptLexicalMask {
