@@ -142,10 +142,11 @@ internal object SafeHtmlDocument {
                     }
                 }
             }
-            if (!tag.closing && (tag.name == "script" || tag.name == "style")) {
+            if (!tag.closing && tag.name in RAW_TEXT_TAG_NAMES) {
                 if (tag.selfClosing) {
                     malformed = true
-                } else {
+                }
+                if (!tag.selfClosing || tag.name in RCDATA_TAG_NAMES) {
                     rawTextTag = tag.name
                 }
             } else if (tag.closing && tag.name == rawTextTag) {
@@ -479,7 +480,17 @@ internal object SafeHtmlDocument {
         "tel",
         "search",
     )
-    private val KNOWN_TAG_NAMES = listOf("head", "body", "input", "script", "style")
+    private val KNOWN_TAG_NAMES = listOf(
+        "head",
+        "body",
+        "input",
+        "script",
+        "style",
+        "title",
+        "textarea",
+    )
+    private val RAW_TEXT_TAG_NAMES = setOf("script", "style", "title", "textarea")
+    private val RCDATA_TAG_NAMES = setOf("title", "textarea")
     private val URL_ATTRIBUTE_NAMES = setOf("href", "src", "action", "formaction")
     private const val CHECKPOINT_INTERVAL = 16_384
 }

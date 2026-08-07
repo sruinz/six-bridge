@@ -51,6 +51,40 @@ class SafeHtmlDocumentTest {
     }
 
     @Test
+    fun `title과 textarea 본문의 URL attribute 문자열을 markup으로 보지 않는다`() {
+        val source = """
+            <html><head><title><a href="chrome://flags"><img src="chrome://inspect"></title></head>
+            <body><textarea><form action="chrome://flags"><button formaction="chrome://inspect"></textarea>
+            <a href="chrome://extensions">extensions</a></body></html>
+        """.trimIndent()
+
+        val result = SafeHtmlDocument.parse(source) {}
+
+        assertTrue(result.safeToInject)
+        assertEquals(
+            listOf("chrome://extensions"),
+            result.urlAttributes.map { it.value },
+        )
+    }
+
+    @Test
+    fun `self closing title과 textarea도 matching end tag까지 본문으로 처리한다`() {
+        val source = """
+            <html><head><title/><a href="chrome://flags"></title></head>
+            <body><textarea/><form action="chrome://inspect"></textarea>
+            <a href="chrome://extensions">extensions</a></body></html>
+        """.trimIndent()
+
+        val result = SafeHtmlDocument.parse(source) {}
+
+        assertFalse(result.safeToInject)
+        assertEquals(
+            listOf("chrome://extensions"),
+            result.urlAttributes.map { it.value },
+        )
+    }
+
+    @Test
     fun `entity escape 또는 제외 type은 대상 input으로 추측하지 않는다`() {
         val source = """
             <head></head><body>

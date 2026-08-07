@@ -260,10 +260,21 @@ internal object RuntimeSourceScanner {
                             index += 1
                         }
                         lexicalSource[index] == quote -> {
-                            if (!hasEscape && !hasLineBreak) {
+                            val value = source.substring(contentStart, index)
+                            if (
+                                !hasEscape &&
+                                !hasLineBreak &&
+                                !isConcatenatedInternalUrl(
+                                    value,
+                                    lexicalSource,
+                                    openingQuoteOffset,
+                                    index,
+                                    checkCancelled,
+                                )
+                            ) {
                                 add(
                                     StaticStringLiteral(
-                                        value = source.substring(contentStart, index),
+                                        value = value,
                                         quote = quote,
                                         openingQuoteOffset = openingQuoteOffset,
                                         contentRange = contentStart until index,
@@ -280,6 +291,52 @@ internal object RuntimeSourceScanner {
             }
         }
     }
+
+    private fun isConcatenatedInternalUrl(
+        value: String,
+        lexicalSource: String,
+        openingQuoteOffset: Int,
+        closingQuoteOffset: Int,
+        checkCancelled: () -> Unit,
+    ): Boolean {
+        if (INTERNAL_URL_SCHEMES.none { value.startsWith(it) && value.length > it.length }) {
+            return false
+        }
+        var inspectedCodeUnits = 0
+        fun checkContextCancellation() {
+            if (inspectedCodeUnits % STATIC_LITERAL_CHECKPOINT_INTERVAL == 0) {
+                checkCancelled()
+            }
+            inspectedCodeUnits += 1
+        }
+        fun previousNonWhitespace(start: Int): Int {
+            var index = start
+            while (lexicalSource.getOrNull(index)?.isJavaScriptWhitespace() == true) {
+                checkContextCancellation()
+                index -= 1
+            }
+            return index
+        }
+        fun nextNonWhitespace(start: Int): Int {
+            var index = start
+            while (lexicalSource.getOrNull(index)?.isJavaScriptWhitespace() == true) {
+                checkContextCancellation()
+                index += 1
+            }
+            return index
+        }
+
+        val previous = previousNonWhitespace(openingQuoteOffset - 1)
+        val previousOperator = when (lexicalSource.getOrNull(previous)) {
+            '+' -> true
+            '=' -> lexicalSource.getOrNull(previousNonWhitespace(previous - 1)) == '+'
+            else -> false
+        }
+        val next = nextNonWhitespace(closingQuoteOffset + 1)
+        return previousOperator || lexicalSource.getOrNull(next) == '+'
+    }
+
+    private fun Char.isJavaScriptWhitespace(): Boolean = isWhitespace() || this == '\uFEFF'
 
     fun javaScriptDependencies(
         source: String,
@@ -762,6 +819,7 @@ internal object RuntimeSourceScanner {
     )
 
     private const val STATIC_LITERAL_CHECKPOINT_INTERVAL = 16_384
+    private val INTERNAL_URL_SCHEMES = listOf("chrome://", "edge://")
 }
 
 internal object JavaScriptLexicalMask {

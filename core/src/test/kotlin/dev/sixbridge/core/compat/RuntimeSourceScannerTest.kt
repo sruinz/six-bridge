@@ -55,6 +55,35 @@ class RuntimeSourceScannerTest {
     }
 
     @Test
+    fun `exact 내부 주소의 plus 조합은 제외하고 진단 조각은 유지한다`() {
+        val source = """
+            const left = prefix +   'chrome://extensions';
+            const right = "edge://extensions/"   + suffix;
+            const diagnostic = 'chrome://' + page;
+            const independent = 'chrome://extensions';
+        """.trimIndent()
+
+        assertEquals(
+            listOf("chrome://", "chrome://extensions"),
+            RuntimeSourceScanner.scanStaticStringLiterals(source) {}.map { it.value },
+        )
+    }
+
+    @Test
+    fun `BOM whitespace로 구분된 plus와 plus equals 조합도 제외한다`() {
+        val source = """
+            const left = prefix +﻿'chrome://extensions';
+            const right = "edge://extensions/"﻿ + suffix;
+            value +=﻿'chrome://extensions';
+        """.trimIndent()
+
+        assertEquals(
+            emptyList(),
+            RuntimeSourceScanner.scanStaticStringLiterals(source) {},
+        )
+    }
+
+    @Test
     fun `comment regex template과 미종결 literal은 반환하지 않는다`() {
         val source = """
             /* 'chrome://extensions' */
@@ -105,6 +134,31 @@ class RuntimeSourceScannerTest {
             }
         }
         assertEquals(2, spanCheckpoints)
+    }
+
+    @Test
+    fun `plus 문맥 lookaround 중 취소도 bounded 간격으로 전달한다`() {
+        val source = "prefix +" + " ".repeat(16_384 * 2) + "'chrome://extensions';"
+        var contextCheckpoints = 0
+
+        assertFailsWith<CancellationException> {
+            RuntimeSourceScanner.scanStaticStringLiterals(source) {
+                val directScannerFrame = Throwable().stackTrace.firstOrNull {
+                    it.className.endsWith("RuntimeSourceScanner") ||
+                        it.className.endsWith("JavaScriptLexicalMask")
+                }
+                if (directScannerFrame?.methodName?.startsWith(
+                        "isConcatenatedInternalUrl",
+                    ) == true
+                ) {
+                    contextCheckpoints += 1
+                    if (contextCheckpoints == 2) {
+                        throw CancellationException("context-cancel")
+                    }
+                }
+            }
+        }
+        assertEquals(2, contextCheckpoints)
     }
 
     @Test
