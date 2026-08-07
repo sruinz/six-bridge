@@ -20,6 +20,17 @@ internal object BrowserInternalUrlMapper {
         }
     }
 
+    fun evidenceDetail(rule: BrowserInternalUrlRule): String =
+        "browser-internal-url:v1;rule=${rule.id};" +
+            "status=${rule.status.name.lowercase()};" +
+            "from=${rule.original};to=${rule.replacement}"
+
+    fun parseEvidenceDetail(detail: String): BrowserInternalUrlRule? =
+        RULES.singleOrNull { evidenceDetail(it) == detail }
+
+    fun ruleById(id: String): BrowserInternalUrlRule? =
+        RULES.singleOrNull { it.id == id }
+
     private val RULES = listOf(
         BrowserInternalUrlRule(
             id = "extensions.chrome.root",

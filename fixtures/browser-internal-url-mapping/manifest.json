@@ -1,0 +1,7 @@
+{
+  "manifest_version": 3,
+  "name": "Browser internal URL mapping fixture",
+  "version": "1",
+  "action": {"default_popup": "popup.html"},
+  "options_page": "options.html"
+}

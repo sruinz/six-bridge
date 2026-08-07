@@ -778,6 +778,7 @@ class ConversionWorkspace private constructor(
     private object AdapterRegistry {
         private val adapters = listOf(
             ActionPopupEntryAdapter(),
+            BrowserInternalUrlAdapter(),
             DesktopSelectionEventBridge(),
             PopupNativeAutofillGuardAdapter(),
             StorageFallbackAdapter(),

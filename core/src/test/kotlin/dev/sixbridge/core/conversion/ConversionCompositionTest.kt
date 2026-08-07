@@ -28,6 +28,7 @@ class ConversionCompositionTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         supportedFeatures = setOf(
+            "browser.internal-url.extensions-root",
             "storage.local",
             "extension.options-page.user-accessible",
         ),
@@ -45,6 +46,7 @@ class ConversionCompositionTest {
             assertEquals(
                 listOf(
                     MobilePatternAnalyzer.ACTION_POPUP_ENTRY,
+                    MobilePatternAnalyzer.BROWSER_INTERNAL_URL_MAPPER,
                     MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE,
                     MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
                     MobilePatternAnalyzer.STORAGE_FALLBACK,
@@ -91,6 +93,26 @@ class ConversionCompositionTest {
                 "<script src=\"/sixbridge/popup-native-autofill-guard.v1.js\"></script>" in
                     snapshot.workingRoot.resolve("popup.html").readText(),
             )
+            assertTrue(
+                "href=\"internet://extension\"" in
+                    snapshot.workingRoot.resolve("popup.html").readText(),
+            )
+            assertTrue(
+                Files.isRegularFile(
+                    snapshot.workingRoot.resolve(
+                        "sixbridge/browser-internal-url-mapper.v1.json",
+                    ),
+                ),
+            )
+            val reapplied = MobilePatternAnalyzer().analyze(
+                snapshot.workingRoot,
+                profile,
+            ).adapterDecisions.filter {
+                it.id == MobilePatternAnalyzer.BROWSER_INTERNAL_URL_MAPPER ||
+                    it.id == MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD
+            }
+            assertEquals(2, reapplied.size)
+            assertTrue(reapplied.all(AdapterDecision::applied))
             assertFalse(
                 "popup-native-autofill-guard.v1.js" in
                     snapshot.workingRoot.resolve("content.js").readText(),
@@ -239,7 +261,8 @@ class ConversionCompositionTest {
                 """.trimIndent(),
             )
             root.resolve("popup.html").writeText(
-                "<html><head></head><body><input type='email'></body></html>",
+                "<html><head></head><body><a href=\"chrome://extensions\">확장</a>" +
+                    "<input type='email'></body></html>",
             )
             root.resolve("content.js").writeText(
                 """

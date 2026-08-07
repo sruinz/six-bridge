@@ -12,6 +12,7 @@ import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.JavaScriptLexicalMask
 import dev.sixbridge.core.compat.ManifestPopupResolver
 import dev.sixbridge.core.compat.RuntimeResourceIndex
+import dev.sixbridge.core.compat.RuntimeSourceScanner
 import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.input.SourceProjectIdentityStore
 import dev.sixbridge.core.profile.BrowserProfile
@@ -24,6 +25,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import kotlin.io.path.readText
+import kotlin.io.path.extension
 import kotlin.jvm.JvmSynthetic
 
 internal data class MobileArchiveAnalysis(
@@ -220,7 +222,15 @@ class MobilePatternAnalyzer private constructor(
             index,
             control,
         )
-        if (index.unresolvedDependency && popupRisk == null) {
+        val internalUrls = browserInternalUrlDecision(
+            extensionRoot,
+            index,
+            profile,
+        )
+        if (index.unresolvedDependency &&
+            popupRisk == null &&
+            internalUrls.decision == null
+        ) {
             return finalizeReport(compatibility, emitFinalizingStage)
         }
 
@@ -231,6 +241,9 @@ class MobilePatternAnalyzer private constructor(
         control.checkCancelled()
         popupRisk?.decision?.let(decisions::add)
         popupRisk?.issue?.let(issues::add)
+        control.checkCancelled()
+        internalUrls.decision?.let(decisions::add)
+        issues += internalUrls.issues
         control.checkCancelled()
         popupDecision(manifestPath, manifest, profile)?.let(decisions::add)
         control.checkCancelled()
@@ -256,6 +269,9 @@ class MobilePatternAnalyzer private constructor(
                     popupRisk != null &&
                         compatibility.status == CompatibilityStatus.COMPATIBLE ->
                         CompatibilityStatus.PARTIAL
+                    internalUrls.decision != null &&
+                        compatibility.status == CompatibilityStatus.COMPATIBLE ->
+                        CompatibilityStatus.PARTIAL
                     else -> compatibility.status
                 },
                 issues = issues,
@@ -265,6 +281,85 @@ class MobilePatternAnalyzer private constructor(
             emitFinalizingStage,
         )
     }
+
+    private fun browserInternalUrlDecision(
+        extensionRoot: Path,
+        index: RuntimeResourceIndex,
+        profile: BrowserProfile,
+    ): BrowserInternalUrlAnalysis {
+        val evidence = mutableListOf<SourceEvidence>()
+        val issues = mutableListOf<CompatibilityIssue>()
+        val root = extensionRoot.toAbsolutePath().normalize()
+        index.resources.sortedBy { root.relativize(it).toString() }.forEach { resource ->
+            control.checkCancelled()
+            val extension = resource.extension.lowercase()
+            if (extension !in INTERNAL_URL_TEXT_EXTENSIONS) return@forEach
+            val relativePath = root.relativize(resource.toAbsolutePath().normalize())
+                .joinToString("/") { it.toString() }
+            val source = Files.readString(resource)
+            val candidates = when (extension) {
+                "html" -> SafeHtmlDocument.parse(source, control::checkCancelled)
+                    .urlAttributes
+                    .map { it.value to it.contentRange.first }
+                else -> RuntimeSourceScanner.scanStaticStringLiterals(
+                    source,
+                    control::checkCancelled,
+                ).map { it.value to it.contentRange.first }
+            }
+            candidates.forEach { (value, offset) ->
+                control.checkCancelled()
+                if (!value.isBrowserInternalUrl()) return@forEach
+                val line = lineAt(source, offset)
+                val rule = BrowserInternalUrlMapper.classify(value, profile)
+                if (rule == null) {
+                    issues += CompatibilityIssue(
+                        code = BROWSER_INTERNAL_URL_UNMAPPED,
+                        message = "브라우저 내부 주소를 자동 변환할 수 없습니다: $relativePath:$line",
+                        blocking = false,
+                    )
+                } else {
+                    evidence += SourceEvidence(
+                        relativePath = relativePath,
+                        line = line,
+                        detail = BrowserInternalUrlMapper.evidenceDetail(rule),
+                    )
+                }
+            }
+        }
+        val appliedSpans = BrowserInternalUrlProof.detect(
+            extensionRoot,
+            index,
+            profile,
+        )
+        if (evidence.isEmpty() && appliedSpans == null) {
+            return BrowserInternalUrlAnalysis(issues = issues)
+        }
+        val sortedEvidence = (appliedSpans?.let {
+            BrowserInternalUrlProof.evidence(it, index, extensionRoot)
+        } ?: evidence).sortedWith(
+            compareBy(
+                SourceEvidence::relativePath,
+                SourceEvidence::line,
+                SourceEvidence::detail,
+            ),
+        )
+        return BrowserInternalUrlAnalysis(
+            decision = AdapterDecision(
+                id = BROWSER_INTERNAL_URL_MAPPER,
+                version = 1,
+                risk = AdapterRisk.BEHAVIOR_CHANGE,
+                disposition = AdapterDisposition.AUTOMATIC,
+                applied = appliedSpans != null,
+                evidence = sortedEvidence,
+                changes = listOf("검증된 브라우저 내부 주소를 안전한 삼성 인터넷 또는 로컬 안내 페이지로 변경합니다."),
+                remainingLimitations = emptyList(),
+            ),
+            issues = issues,
+        )
+    }
+
+    private fun String.isBrowserInternalUrl(): Boolean =
+        startsWith("chrome://") || startsWith("edge://")
 
     private fun analyzeEarlyPopupRisk(
         extensionRoot: Path,
@@ -1007,6 +1102,11 @@ class MobilePatternAnalyzer private constructor(
         val unknown: Boolean = false,
     )
 
+    private data class BrowserInternalUrlAnalysis(
+        val decision: AdapterDecision? = null,
+        val issues: List<CompatibilityIssue> = emptyList(),
+    )
+
     private sealed interface ExistingOptionPage {
         data object Absent : ExistingOptionPage
         data object Valid : ExistingOptionPage
@@ -1024,10 +1124,12 @@ class MobilePatternAnalyzer private constructor(
             "desktop-selection-event-bridge"
         const val ACTION_POPUP_ENTRY = "action-popup-entry"
         const val POPUP_NATIVE_AUTOFILL_GUARD = "popup-native-autofill-guard"
+        const val BROWSER_INTERNAL_URL_MAPPER = "browser-internal-url-mapper"
         const val STORAGE_FALLBACK = "storage-fallback"
 
         val ADAPTER_IDS: Set<String> = listOf(
             ACTION_POPUP_ENTRY,
+            BROWSER_INTERNAL_URL_MAPPER,
             DESKTOP_SELECTION_EVENT_BRIDGE,
             POPUP_NATIVE_AUTOFILL_GUARD,
             STORAGE_FALLBACK,
@@ -1040,6 +1142,10 @@ class MobilePatternAnalyzer private constructor(
         private const val STORAGE_LOCAL_FEATURE = "storage.local"
         private const val STORAGE_SYNC_FEATURE = "storage.sync"
         private const val CHECKPOINT_INTERVAL = 16_384
+        private const val BROWSER_INTERNAL_URL_UNMAPPED =
+            "browser_internal_url_unmapped"
+        private val INTERNAL_URL_TEXT_EXTENSIONS =
+            setOf("html", "js", "mjs", "cjs")
 
         private val MOUSEUP_LISTENER = eventListenerRegex("mouseup")
         private val POINTERUP_LISTENER = eventListenerRegex("pointerup")
