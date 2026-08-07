@@ -1,7 +1,10 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.RuntimeResourceIndex
+import dev.sixbridge.core.draft.SixDraftJson
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.nio.file.Files
@@ -15,6 +18,40 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PopupAutofillRiskAnalyzerTest {
+    @Test
+    fun `같은 popup path와 line의 evidence는 detail canonical 순서로 draft 직렬화된다`() {
+        val risk = assertNotNull(
+            fixture(
+                "<html><head></head><body><input type='email'></body></html>",
+            ).analyze(),
+        )
+        val report = CompatibilityReport(
+            status = CompatibilityStatus.PARTIAL,
+            manifestVersion = 3,
+            extensionName = "Popup",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = listOf(risk.issue),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+            adapterDecisions = listOf(risk.decision),
+            sourceSha256 = "1".repeat(64),
+            browserProfileSha256 = "2".repeat(64),
+        )
+
+        val encoded = SixDraftJson.encodeCompatibility(report)
+
+        assertTrue(encoded.isNotEmpty())
+        assertEquals(
+            listOf("popup input type=email", "popup_path=popup.html"),
+            risk.decision.evidence.map(SourceEvidence::detail),
+        )
+        assertTrue(risk.decision.evidence.all {
+            it.relativePath == "popup.html" && it.line == 1
+        })
+    }
+
     @Test
     fun `정적 대상 input은 confirmed 선택적 adapter와 partial issue를 만든다`() {
         val fixture = fixture(

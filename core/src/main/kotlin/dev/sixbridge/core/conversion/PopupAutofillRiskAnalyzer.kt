@@ -133,11 +133,16 @@ internal class PopupAutofillRiskAnalyzer {
             dynamicEvidence.isNotEmpty() -> PopupAutofillEvidenceKind.POTENTIAL
             else -> PopupAutofillEvidenceKind.MANUAL
         }
-        val evidence = listOf(popupEvidence(popupPath)) + when (kind) {
-            PopupAutofillEvidenceKind.CONFIRMED -> staticEvidence
-            PopupAutofillEvidenceKind.POTENTIAL -> dynamicEvidence
-            PopupAutofillEvidenceKind.MANUAL -> emptyList()
-        } + listOfNotNull(appliedProof?.evidence())
+        val evidence = (
+            listOf(popupEvidence(popupPath)) + when (kind) {
+                PopupAutofillEvidenceKind.CONFIRMED -> staticEvidence
+                PopupAutofillEvidenceKind.POTENTIAL -> dynamicEvidence
+                PopupAutofillEvidenceKind.MANUAL -> emptyList()
+            } + listOfNotNull(appliedProof?.evidence())
+            ).sortedWith(
+            compareBy(SourceEvidence::relativePath, SourceEvidence::line)
+                .thenBy(SourceEvidence::detail),
+        )
         return PopupAutofillRisk(
             kind = kind,
             decision = AdapterDecision(
