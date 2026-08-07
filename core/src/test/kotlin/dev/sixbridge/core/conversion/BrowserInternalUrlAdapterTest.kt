@@ -60,6 +60,59 @@ class BrowserInternalUrlAdapterTest {
     }
 
     @Test
+    fun `exact 내부 주소 concat은 진단하되 lexical 비코드는 오탐하지 않는다`() {
+        val report = analyzeFixture(
+            js = """
+                const right = 'chrome://extensions' + suffix;
+                const left = prefix + 'edge://extensions/';
+                value += 'chrome://flags';
+                // const comment = 'chrome://inspect' + suffix;
+                const regex = /chrome:\/\/extensions/;
+                const template = `chrome://extensions`;
+                const escaped = 'chrome:\/\/extensions' + suffix;
+            """.trimIndent(),
+        )
+        val unmapped = report.issues.filter { it.code == UNMAPPED_ISSUE }
+
+        assertEquals(3, unmapped.size, report.toString())
+        assertEquals(
+            listOf(
+                "브라우저 내부 주소를 자동 변환할 수 없습니다: popup.js:1",
+                "브라우저 내부 주소를 자동 변환할 수 없습니다: popup.js:2",
+                "브라우저 내부 주소를 자동 변환할 수 없습니다: popup.js:3",
+            ),
+            unmapped.map { it.message },
+        )
+        assertFalse(report.adapterDecisions.any { it.id == ADAPTER_ID })
+    }
+
+    @Test
+    fun `invalid UTF-8 binary runtime dependency는 읽지 않고 bytes를 보존한다`() {
+        val binary = byteArrayOf(0xc3.toByte(), 0x28, 0xff.toByte(), 0x00)
+        val source = fixtureRootFromFiles().also { root ->
+            root.resolve("popup.js").writeText(
+                "const root = 'chrome://extensions';\n",
+            )
+            root.resolve("popup.html").writeText(
+                root.resolve("popup.html").readText().replace(
+                    "<script src=\"popup.js\"></script>",
+                    "<script src=\"module.wasm\"></script>" +
+                        "<script src=\"popup.js\"></script>",
+                ),
+            )
+            Files.write(root.resolve("module.wasm"), binary)
+        }
+
+        val occurrences = BrowserInternalUrlProof.scan(
+            BrowserInternalUrlProof.runtimeIndex(source),
+            source,
+        )
+
+        assertTrue(occurrences.any { it.value == "chrome://extensions" })
+        assertContentEquals(binary, Files.readAllBytes(source.resolve("module.wasm")))
+    }
+
+    @Test
     fun `HTML과 JavaScript exact span을 상태별 목적지로 뒤 offset부터 변환한다`() {
         val prepared = prepareFixture()
         val transformed = extract(prepared.transformedSourceZip)

@@ -300,18 +300,41 @@ class MobilePatternAnalyzer private constructor(
             val candidates = when (extension) {
                 "html" -> SafeHtmlDocument.parse(source, control::checkCancelled)
                     .urlAttributes
-                    .map { it.value to it.contentRange.first }
-                else -> RuntimeSourceScanner.scanStaticStringLiterals(
-                    source,
-                    control::checkCancelled,
-                ).map { it.value to it.contentRange.first }
+                    .map {
+                        BrowserInternalUrlCandidate(
+                            it.value,
+                            it.contentRange.first,
+                            rewriteEligible = true,
+                        )
+                    }
+                else -> (
+                    RuntimeSourceScanner.scanStaticStringLiterals(
+                        source,
+                        control::checkCancelled,
+                    ).map {
+                        BrowserInternalUrlCandidate(
+                            it.value,
+                            it.contentRange.first,
+                            rewriteEligible = true,
+                        )
+                    } + RuntimeSourceScanner.scanConcatenatedInternalUrlLiterals(
+                        source,
+                        control::checkCancelled,
+                    ).map {
+                        BrowserInternalUrlCandidate(
+                            it.value,
+                            it.contentRange.first,
+                            rewriteEligible = false,
+                        )
+                    }
+                    ).sortedBy(BrowserInternalUrlCandidate::offset)
             }
-            candidates.forEach { (value, offset) ->
+            candidates.forEach { candidate ->
                 control.checkCancelled()
-                if (!value.isBrowserInternalUrl()) return@forEach
-                val line = lineAt(source, offset)
-                val rule = BrowserInternalUrlMapper.classify(value, profile)
-                if (rule == null) {
+                if (!candidate.value.isBrowserInternalUrl()) return@forEach
+                val line = lineAt(source, candidate.offset)
+                val rule = BrowserInternalUrlMapper.classify(candidate.value, profile)
+                if (rule == null || !candidate.rewriteEligible) {
                     issues += CompatibilityIssue(
                         code = BROWSER_INTERNAL_URL_UNMAPPED,
                         message = "브라우저 내부 주소를 자동 변환할 수 없습니다: $relativePath:$line",
@@ -1105,6 +1128,12 @@ class MobilePatternAnalyzer private constructor(
     private data class BrowserInternalUrlAnalysis(
         val decision: AdapterDecision? = null,
         val issues: List<CompatibilityIssue> = emptyList(),
+    )
+
+    private data class BrowserInternalUrlCandidate(
+        val value: String,
+        val offset: Int,
+        val rewriteEligible: Boolean,
     )
 
     private sealed interface ExistingOptionPage {

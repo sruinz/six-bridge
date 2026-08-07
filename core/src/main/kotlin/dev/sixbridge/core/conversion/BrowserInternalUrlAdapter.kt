@@ -234,9 +234,11 @@ internal object BrowserInternalUrlProof {
 
     fun scan(index: RuntimeResourceIndex, root: Path): List<BrowserInternalUrlOccurrence> =
         index.resources.sortedBy { relativePath(root, it) }.flatMap { resource ->
+            val extension = resource.extension.lowercase()
+            if (extension !in SCANNED_EXTENSIONS) return@flatMap emptyList()
             val relativePath = relativePath(root, resource)
             val source = Files.readString(resource, UTF_8)
-            when (resource.extension.lowercase()) {
+            when (extension) {
                 "html" -> SafeHtmlDocument.parse(source) {}.urlAttributes.map {
                     BrowserInternalUrlOccurrence(
                         relativePath,
@@ -454,6 +456,7 @@ internal object BrowserInternalUrlProof {
         "originalSpanSha256",
         "replacementSpanSha256",
     )
+    private val SCANNED_EXTENSIONS = setOf("html", "js", "mjs", "cjs")
     private val ASSET_PATHS = setOf(
         "sixbridge/internal-url-manual-password-manager.v1.html",
         "sixbridge/internal-url-unsupported-flags.v1.html",

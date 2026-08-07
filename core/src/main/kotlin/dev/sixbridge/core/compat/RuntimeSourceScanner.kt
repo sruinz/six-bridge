@@ -220,6 +220,25 @@ internal object RuntimeSourceScanner {
     fun scanStaticStringLiterals(
         source: String,
         checkCancelled: () -> Unit,
+    ): List<StaticStringLiteral> = scanStaticStringLiterals(
+        source,
+        checkCancelled,
+        concatenatedInternalUrlsOnly = false,
+    )
+
+    fun scanConcatenatedInternalUrlLiterals(
+        source: String,
+        checkCancelled: () -> Unit,
+    ): List<StaticStringLiteral> = scanStaticStringLiterals(
+        source,
+        checkCancelled,
+        concatenatedInternalUrlsOnly = true,
+    )
+
+    private fun scanStaticStringLiterals(
+        source: String,
+        checkCancelled: () -> Unit,
+        concatenatedInternalUrlsOnly: Boolean,
     ): List<StaticStringLiteral> {
         val lexicalSource = JavaScriptLexicalMask.mask(
             source,
@@ -261,16 +280,19 @@ internal object RuntimeSourceScanner {
                         }
                         lexicalSource[index] == quote -> {
                             val value = source.substring(contentStart, index)
-                            if (
-                                !hasEscape &&
+                            val concatenatedInternalUrl = !hasEscape &&
                                 !hasLineBreak &&
-                                !isConcatenatedInternalUrl(
+                                isConcatenatedInternalUrl(
                                     value,
                                     lexicalSource,
                                     openingQuoteOffset,
                                     index,
                                     checkCancelled,
                                 )
+                            if (
+                                !hasEscape &&
+                                !hasLineBreak &&
+                                concatenatedInternalUrl == concatenatedInternalUrlsOnly
                             ) {
                                 add(
                                     StaticStringLiteral(
