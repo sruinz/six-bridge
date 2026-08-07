@@ -23,6 +23,11 @@
     <string name="conversion_apis">사용 API</string>
     <string name="conversion_adapter_requires_approval">동작 변경 · 직접 승인 필요</string>
     <string name="conversion_adapter_automatic">안전 어댑터 · 자동 적용</string>
+    <string name="conversion_adapter_optional">선택 어댑터 · 명시적 결정 필요</string>
+    <string name="conversion_optional_apply">보호 적용</string>
+    <string name="conversion_optional_apply_description">popup 대상 input의 native autocomplete 동작이 달라집니다.</string>
+    <string name="conversion_optional_original">원본 유지</string>
+    <string name="conversion_optional_original_description">자동 입력으로 인한 브라우저 종료 위험이 남으며 최종 결과는 PARTIAL로 유지됩니다.</string>
     <string name="conversion_confirm_partial">부분 호환의 남은 제한을 확인했습니다.</string>
     <string name="conversion_identity">설치 신원</string>
     <string name="conversion_identity_stable">안정적인 원본 신원 %1$s</string>

@@ -31,6 +31,30 @@ import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
     @Test
+    fun `선택적 adapter는 적용과 원본 유지 모두 유효한 결정이다`() {
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.popupSource), profile)
+            val ready = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            val optional = ready.session.optionalApprovals.single()
+
+            controller.chooseOptionalAdapter(optional, apply = false)
+
+            val original = assertIs<DesktopConversionState.AnalysisReady>(controller.state.value)
+            assertEquals(setOf(optional), original.resolvedOptionalAdapters)
+            assertFalse(optional in original.selectedAdapters)
+
+            controller.chooseOptionalAdapter(optional, apply = true)
+
+            val applied = assertIs<DesktopConversionState.AnalysisReady>(controller.state.value)
+            assertEquals(setOf(optional), applied.resolvedOptionalAdapters)
+            assertTrue(optional in applied.selectedAdapters)
+            controller.close()
+        }
+    }
+
+    @Test
     fun `API scan 단계는 현재 분석 상태에 반영되고 취소하면 입력으로 돌아간다`() {
         val apiScanEntered = CountDownLatch(1)
         val releaseApiScan = CountDownLatch(1)
@@ -227,6 +251,8 @@ class DesktopConversionControllerTest {
             assertEquals(DesktopFailureStage.APPROVAL, (awaitState(controller) { it is DesktopConversionState.Failed } as DesktopConversionState.Failed).stage)
 
             controller.toggleAdapter(ready.session.requiredApprovals.single())
+            controller.chooseOptionalAdapter(ready.session.optionalApprovals.single(), apply = false)
+            controller.setPartialConfirmed(true)
             controller.buildDraft()
             assertIs<DesktopConversionState.DraftReady>(awaitState(controller) { it is DesktopConversionState.DraftReady })
             controller.close()
@@ -481,7 +507,9 @@ class DesktopConversionControllerTest {
             Files.write(it, ExtensionZip.createBytes(firstSource, includeProjectMarker = false))
         }
         val popupSource = Files.createDirectory(root.resolve("popup")).also {
-            it.resolve("popup.html").writeText("<p>popup</p>")
+            it.resolve("popup.html").writeText(
+                "<html><head></head><body><input type='email'></body></html>",
+            )
             it.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
         }
 

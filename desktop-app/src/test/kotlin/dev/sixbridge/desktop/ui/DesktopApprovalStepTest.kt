@@ -7,6 +7,7 @@ import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -27,10 +28,63 @@ import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalTestApi::class)
 class DesktopApprovalStepTest {
+    @Test
+    fun `선택적 adapter를 결정하기 전에는 draft를 만들 수 없다`() {
+        val state = approvalState(
+            status = CompatibilityStatus.PARTIAL,
+            requiredApprovals = emptySet(),
+            optionalApprovals = setOf("popup-native-autofill-guard"),
+            resolvedOptionalAdapters = emptySet(),
+            partialConfirmed = true,
+        )
+
+        assertFalse(canBuildDraft(state))
+    }
+
+    @Test
+    fun `선택적 adapter는 보호 적용과 원본 유지를 배타적으로 선택한다`() = runComposeUiTest {
+        var state by mutableStateOf(
+            approvalState(
+                status = CompatibilityStatus.PARTIAL,
+                requiredApprovals = emptySet(),
+                optionalApprovals = setOf("popup-native-autofill-guard"),
+                resolvedOptionalAdapters = emptySet(),
+                partialConfirmed = true,
+            ),
+        )
+        val actions = mutableListOf<DesktopAction>()
+        setContent {
+            ApprovalStep(state) { action ->
+                actions += action
+                state = reduceApprovalForTest(state, action)
+            }
+        }
+
+        onNodeWithTag("approval:build").performScrollTo().assertIsNotEnabled()
+        onNodeWithTag("approval:optional:popup-native-autofill-guard:original")
+            .performScrollTo()
+            .performClick()
+            .assertIsSelected()
+        onNodeWithTag("approval:optional:popup-native-autofill-guard:risk")
+            .assertTextContains("브라우저 종료 위험", substring = true)
+            .assertTextContains("PARTIAL", substring = true)
+        onNodeWithTag("approval:build").assertIsEnabled()
+
+        runOnIdle {
+            assertEquals(
+                listOf<DesktopAction>(
+                    DesktopAction.OptionalAdapterChosen("popup-native-autofill-guard", false),
+                ),
+                actions,
+            )
+        }
+    }
+
     @Test
     fun `동작 변경 adapter와 partial 확인 전에는 생성할 수 없다`() = runComposeUiTest {
         var state by mutableStateOf(approvalState(CompatibilityStatus.PARTIAL))
@@ -112,6 +166,12 @@ class DesktopApprovalStepTest {
                 if (!it.add(action.id)) it.remove(action.id)
             },
         )
+        is DesktopAction.OptionalAdapterChosen -> state.copy(
+            selectedAdapters = state.selectedAdapters.toMutableSet().also {
+                if (action.apply) it.add(action.id) else it.remove(action.id)
+            },
+            resolvedOptionalAdapters = state.resolvedOptionalAdapters + action.id,
+        )
         is DesktopAction.PartialConfirmationChanged -> state.copy(partialConfirmed = action.confirmed)
         else -> state
     }
@@ -123,6 +183,9 @@ class DesktopApprovalStepTest {
             LogicalIdentityEvidence.MANIFEST_KEY,
         ),
         requiredApprovals: Set<String> = setOf("action-popup-entry"),
+        optionalApprovals: Set<String> = emptySet(),
+        resolvedOptionalAdapters: Set<String> = emptySet(),
+        partialConfirmed: Boolean = false,
     ): DesktopConversionState.AnalysisReady {
         val adapters = listOf(
             AdapterDecision(
@@ -144,6 +207,16 @@ class DesktopApprovalStepTest {
                 evidence = emptyList(),
                 changes = listOf("팝업을 모바일 메뉴로 변경"),
                 remainingLimitations = listOf("데스크톱 팝업 크기는 유지되지 않음"),
+            ),
+            AdapterDecision(
+                id = "popup-native-autofill-guard",
+                version = 1,
+                risk = AdapterRisk.BEHAVIOR_CHANGE,
+                disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+                applied = false,
+                evidence = emptyList(),
+                changes = listOf("자동 입력 URL 이동 차단"),
+                remainingLimitations = listOf("원본 유지 시 브라우저 종료 위험"),
             ),
         )
         return DesktopConversionState.AnalysisReady(
@@ -172,10 +245,12 @@ class DesktopApprovalStepTest {
                 logicalSourceIdentity = identity,
                 selectedAutomaticAdapters = setOf("safe-entry"),
                 requiredApprovals = requiredApprovals,
+                optionalApprovals = optionalApprovals,
             ),
             reviewStep = DesktopReviewStep.APPROVAL,
             selectedAdapters = emptySet(),
-            partialConfirmed = false,
+            resolvedOptionalAdapters = resolvedOptionalAdapters,
+            partialConfirmed = partialConfirmed,
             projectIdentity = null,
         )
     }

@@ -58,6 +58,7 @@ class DesktopConversionEngine private constructor(
         val extensionName: String?,
         val selectedAutomaticAdapters: Set<String>,
         val requiredApprovals: Set<String>,
+        val optionalApprovals: Set<String>,
         val lock: ReentrantLock = ReentrantLock(),
     )
 
@@ -101,11 +102,15 @@ class DesktopConversionEngine private constructor(
                 requiredApprovals = analysis.report.adapterDecisions
                     .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
                     .mapTo(sortedSetOf()) { it.id }.immutableSet(),
+                optionalApprovals = analysis.report.adapterDecisions
+                    .filter { it.disposition == AdapterDisposition.OPTIONAL_APPROVAL }
+                    .mapTo(sortedSetOf()) { it.id }.immutableSet(),
             )
             val context = DesktopSessionContext(
                 lease, resolvedInput, service, profileSnapshot, analysis.report.status,
                 analysis.report.sourceSha256, analysis.report.extensionName,
                 session.selectedAutomaticAdapters, session.requiredApprovals,
+                session.optionalApprovals,
             )
             testHooks?.beforeContextRegistration?.invoke()
             lifecycleLock.withLock {
@@ -254,7 +259,8 @@ class DesktopConversionEngine private constructor(
         if (!approvedAdapterIds.containsAll(context.requiredApprovals)) {
             throw DesktopConversionException("필수 승인 adapter가 누락되었습니다.")
         }
-        if (!context.requiredApprovals.containsAll(approvedAdapterIds)) {
+        val allowedApprovals = context.requiredApprovals + context.optionalApprovals
+        if (!allowedApprovals.containsAll(approvedAdapterIds)) {
             throw DesktopConversionException("분석 결과에 없는 adapter 승인이 포함되었습니다.")
         }
     }

@@ -223,7 +223,10 @@ internal class OnDeviceConversionCoordinator(
         analysis.report.toBlockingFailure()?.let {
             return@withLock ConversionBuildResult.Failure(it)
         }
-        if (approvedAdapterIds != analysis.requiredApprovals) {
+        val allowedApprovals = analysis.requiredApprovals + analysis.optionalApprovals
+        if (!approvedAdapterIds.containsAll(analysis.requiredApprovals) ||
+            !allowedApprovals.containsAll(approvedAdapterIds)
+        ) {
             return@withLock ConversionBuildResult.Failure(
                 ConversionFailureCode.APPROVAL_REQUIRED,
             )
@@ -535,6 +538,7 @@ internal class OnDeviceConversionCoordinator(
             report = analysis.report,
             selectedAutomaticAdapters = analysis.selectedAutomaticAdapters,
             requiredApprovals = analysis.requiredApprovals,
+            optionalApprovals = analysis.optionalApprovals,
             identityRequirement = identityRequirement,
             profileChanged = analysis.profileChanged,
             draftSignerFingerprint = analysis.draftSignerFingerprint,

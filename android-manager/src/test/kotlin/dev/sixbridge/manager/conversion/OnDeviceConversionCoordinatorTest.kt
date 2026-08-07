@@ -354,6 +354,27 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `분석의 선택적 승인은 coordinator build에서 허용한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            optionalApprovals = setOf("popup-native-autofill-guard")
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        assertEquals(fixture.optionalApprovals, analysis.optionalApprovals)
+        assertIs<ConversionBuildResult.BundleReady>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals + analysis.optionalApprovals,
+                partialConfirmed = true,
+                identitySelection = null,
+            ),
+        )
+    }
+
+    @Test
     fun `profile 변경은 새 분석을 저장하고 재승인을 요구한다`() = runTest {
         val fixture = Fixture(temporaryFolder, mutableListOf())
         val coordinator = fixture.coordinator()
@@ -1186,6 +1207,7 @@ class OnDeviceConversionCoordinatorTest {
         var identityAbortFailure: Throwable? = null
         var importFailuresRemaining = 0
         var packageFailuresRemaining = 0
+        var optionalApprovals: Set<String> = emptySet()
         var packageFailure: Throwable? = null
         var preparedSourceSha256 = "4".repeat(64)
         var verifiedInputFailureCall: Int? = null
@@ -1532,6 +1554,7 @@ class OnDeviceConversionCoordinatorTest {
             report = coreReport(profile, compatibilityStatus),
             selectedAutomaticAdapters = emptySet(),
             requiredApprovals = setOf("adapter"),
+            optionalApprovals = optionalApprovals,
             logicalSourceIdentity = logicalIdentity,
             identityMode = analysisIdentityMode,
         )

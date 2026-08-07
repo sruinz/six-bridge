@@ -14,6 +14,27 @@ import org.junit.Test
 
 class ConversionScreenTest {
     @Test
+    fun `Android build는 선택적 결정을 모두 요구하되 원본 유지도 허용한다`() {
+        val ready = analysis(
+            optionalApprovals = setOf("popup-native-autofill-guard"),
+        )
+
+        assertFalse(ready.canBuild)
+
+        val original = ready.chooseOptionalAdapter(
+            "popup-native-autofill-guard",
+            apply = false,
+        )
+
+        assertTrue(original.canBuild)
+        assertTrue(original.selectedAdapters.isEmpty())
+        assertEquals(
+            setOf("popup-native-autofill-guard"),
+            original.resolvedOptionalAdapters,
+        )
+    }
+
+    @Test
     fun `동작 변경 어댑터는 모두 승인하기 전 build할 수 없다`() {
         val ready = analysis(requiredApprovals = setOf("action-popup-entry", "tabs"))
 
@@ -103,6 +124,7 @@ class ConversionScreenTest {
     private fun analysis(
         status: CompatibilityStatus = CompatibilityStatus.COMPATIBLE,
         requiredApprovals: Set<String> = emptySet(),
+        optionalApprovals: Set<String> = emptySet(),
         identityRequirement: IdentityRequirement =
             IdentityRequirement.Stable("0123456789ab"),
     ) = ConversionUiState.AnalysisReady(
@@ -120,6 +142,7 @@ class ConversionScreenTest {
         ),
         selectedAutomaticAdapters = emptySet(),
         requiredApprovals = requiredApprovals,
+        optionalApprovals = optionalApprovals,
         identityRequirement = identityRequirement,
     )
 

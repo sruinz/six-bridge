@@ -71,8 +71,10 @@ sealed interface ConversionUiState {
         val report: CompatibilityReport,
         val selectedAutomaticAdapters: Set<String>,
         val requiredApprovals: Set<String>,
+        val optionalApprovals: Set<String> = emptySet(),
         val identityRequirement: IdentityRequirement,
         val selectedAdapters: Set<String> = emptySet(),
+        val resolvedOptionalAdapters: Set<String> = emptySet(),
         val partialConfirmed: Boolean = false,
         val identitySelection: InstallationIdentitySelection? = null,
         val existingIdentityConfirmed: Boolean = false,
@@ -84,7 +86,9 @@ sealed interface ConversionUiState {
                 CompatibilityStatus.COMPATIBLE,
                 CompatibilityStatus.PARTIAL,
             ) &&
-                selectedAdapters == requiredApprovals &&
+                selectedAdapters.containsAll(requiredApprovals) &&
+                (requiredApprovals + optionalApprovals).containsAll(selectedAdapters) &&
+                resolvedOptionalAdapters.containsAll(optionalApprovals) &&
                 (report.status != CompatibilityStatus.PARTIAL || partialConfirmed) &&
                 identitySelectionSatisfied()
 
@@ -96,6 +100,18 @@ sealed interface ConversionUiState {
                 } else {
                     selectedAdapters + id
                 },
+            )
+        }
+
+        fun chooseOptionalAdapter(id: String, apply: Boolean): AnalysisReady {
+            if (id !in optionalApprovals) return this
+            return copy(
+                selectedAdapters = if (apply) {
+                    selectedAdapters + id
+                } else {
+                    selectedAdapters - id
+                },
+                resolvedOptionalAdapters = resolvedOptionalAdapters + id,
             )
         }
 
@@ -231,6 +247,10 @@ sealed interface ManagerAction {
     ) : ManagerAction
     data object AnalyzeConversionUrl : ManagerAction
     data class ToggleConversionAdapter(val id: String) : ManagerAction
+    data class ChooseOptionalConversionAdapter(
+        val id: String,
+        val apply: Boolean,
+    ) : ManagerAction
     data object ConfirmConversionPartial : ManagerAction
     data object SelectNewConversionIdentity : ManagerAction
     data class SelectExistingConversionIdentity(val identitySha256: String) : ManagerAction

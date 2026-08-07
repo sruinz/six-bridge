@@ -66,6 +66,7 @@ sealed interface DesktopConversionState {
         val session: DesktopAnalysisSession,
         val reviewStep: DesktopReviewStep,
         val selectedAdapters: Set<String>,
+        val resolvedOptionalAdapters: Set<String> = emptySet(),
         val partialConfirmed: Boolean,
         val projectIdentity: String?,
     ) : DesktopConversionState
@@ -176,6 +177,7 @@ class DesktopConversionController private constructor(
                                 session = session,
                                 reviewStep = DesktopReviewStep.ANALYSIS,
                                 selectedAdapters = emptySet(),
+                                resolvedOptionalAdapters = emptySet(),
                                 partialConfirmed = false,
                                 projectIdentity = null,
                             )
@@ -222,6 +224,19 @@ class DesktopConversionController private constructor(
         }
     }
 
+    fun chooseOptionalAdapter(id: String, apply: Boolean) {
+        synchronized(lock) {
+            val ready = approvalReady(_state.value) ?: return
+            if (id !in ready.session.optionalApprovals) return
+            _state.value = ready.copy(
+                selectedAdapters = ready.selectedAdapters.toMutableSet().also {
+                    if (apply) it.add(id) else it.remove(id)
+                },
+                resolvedOptionalAdapters = ready.resolvedOptionalAdapters + id,
+            )
+        }
+    }
+
     fun setPartialConfirmed(confirmed: Boolean) {
         synchronized(lock) {
             val ready = approvalReady(_state.value) ?: return
@@ -258,8 +273,16 @@ class DesktopConversionController private constructor(
         synchronized(lock) {
             ready = approvalReady(_state.value) ?: return
             if (ready.reviewStep != DesktopReviewStep.APPROVAL) return
-            if (!ready.selectedAdapters.containsAll(ready.session.requiredApprovals)) {
-                _state.value = DesktopConversionState.Failed(DesktopFailureStage.APPROVAL, "필수 adapter 승인이 필요합니다.", ready)
+            val allowedApprovals = ready.session.requiredApprovals + ready.session.optionalApprovals
+            val approvalsReady = ready.selectedAdapters.containsAll(ready.session.requiredApprovals) &&
+                allowedApprovals.containsAll(ready.selectedAdapters) &&
+                ready.resolvedOptionalAdapters.containsAll(ready.session.optionalApprovals)
+            if (!approvalsReady) {
+                _state.value = DesktopConversionState.Failed(
+                    DesktopFailureStage.APPROVAL,
+                    "필수 adapter 승인과 선택 adapter 결정을 모두 완료하세요.",
+                    ready,
+                )
                 return
             }
             if (ready.session.report.status == CompatibilityStatus.PARTIAL && !ready.partialConfirmed) {

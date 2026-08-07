@@ -230,6 +230,9 @@ class ManagerViewModel(
             is ManagerAction.ToggleConversionAdapter -> updateConversionAnalysis {
                 it.toggleAdapter(action.id)
             }
+            is ManagerAction.ChooseOptionalConversionAdapter -> updateConversionAnalysis {
+                it.chooseOptionalAdapter(action.id, action.apply)
+            }
             ManagerAction.ConfirmConversionPartial -> updateConversionAnalysis {
                 it.copy(partialConfirmed = true)
             }
@@ -4743,6 +4746,7 @@ private fun ConversionBeginResult.AnalysisReady.toUiState() =
         report = report,
         selectedAutomaticAdapters = selectedAutomaticAdapters,
         requiredApprovals = requiredApprovals,
+        optionalApprovals = optionalApprovals,
         identityRequirement = identityRequirement,
         profileChanged = profileChanged,
         draftSignerFingerprint = draftSignerFingerprint,

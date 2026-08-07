@@ -35,7 +35,36 @@ class DesktopConversionEngineTest {
             val session = fixture.engine.analyze(DesktopExtensionInput.Local(fixture.popupSource), profile, AnalysisControl())
             assertEquals(session.report.adapterDecisions.filter { it.disposition.name == "AUTOMATIC" }.mapTo(sortedSetOf()) { it.id }, session.selectedAutomaticAdapters)
             assertEquals(session.report.adapterDecisions.filter { it.disposition.name == "REQUIRES_APPROVAL" }.mapTo(sortedSetOf()) { it.id }, session.requiredApprovals)
+            assertEquals(session.report.adapterDecisions.filter { it.disposition.name == "OPTIONAL_APPROVAL" }.mapTo(sortedSetOf()) { it.id }, session.optionalApprovals)
             assertTrue(fixture.engine.release(session.token))
+            assertFalse(fixture.engine.release(session.token))
+        }
+    }
+
+    @Test
+    fun `선택적 adapter 승인은 build validation을 통과한다`() {
+        Fixture(
+            hooks = DesktopConversionEngineTestHooks(
+                beforeDraft = { throw IllegalStateException("validation passed") },
+            ),
+        ).use { fixture ->
+            val session = fixture.engine.analyze(
+                DesktopExtensionInput.Local(fixture.popupSource),
+                profile,
+                AnalysisControl(),
+            )
+            val optional = session.optionalApprovals.single()
+
+            val result = assertFailsWith<IllegalStateException> {
+                fixture.engine.buildDraft(
+                    session,
+                    session.requiredApprovals + optional,
+                    null,
+                    AnalysisControl(),
+                )
+            }
+
+            assertEquals("validation passed", result.message)
             assertFalse(fixture.engine.release(session.token))
         }
     }
@@ -420,7 +449,9 @@ class DesktopConversionEngineTest {
         val hostAppData = Files.createTempDirectory("desktop-engine-app-data")
         val source = Files.createDirectory(hostAppData.resolve("source")).also { root -> root.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"sealed source","version":"1"}""") }
         val popupSource = Files.createDirectory(hostAppData.resolve("popup")).also { root ->
-            root.resolve("popup.html").writeText("<p>popup</p>")
+            root.resolve("popup.html").writeText(
+                "<html><head></head><body><input type='email'></body></html>",
+            )
             root.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
         }
         val blockedSource = Files.createDirectory(hostAppData.resolve("blocked")).also { root ->

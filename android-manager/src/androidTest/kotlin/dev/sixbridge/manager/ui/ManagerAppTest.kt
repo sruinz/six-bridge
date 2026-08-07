@@ -271,6 +271,71 @@ class ManagerAppTest {
     }
 
     @Test
+    fun conversion_optional_adapter_requires_apply_or_original_choice() {
+        var state by mutableStateOf(conversionOptionalAnalysisState())
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = state,
+                onAction = { action ->
+                    actions += action
+                    val ready = state.conversionState as ConversionUiState.AnalysisReady
+                    state = when (action) {
+                        is ManagerAction.ChooseOptionalConversionAdapter -> state.copy(
+                            conversionState = ready.chooseOptionalAdapter(
+                                action.id,
+                                action.apply,
+                            ),
+                        )
+                        ManagerAction.ConfirmConversionPartial -> state.copy(
+                            conversionState = ready.copy(partialConfirmed = true),
+                        )
+                        else -> state
+                    }
+                },
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithText("보호 적용").assertExists()
+        composeRule.onNodeWithText("원본 유지").assertExists()
+        composeRule.onNodeWithTag("conversion:build").assertIsNotEnabled()
+        composeRule.onNodeWithTag("conversion:analysis-screen").performScrollToNode(
+            hasTestTag("conversion:optional:popup-native-autofill-guard:original"),
+        )
+        composeRule.onNodeWithTag(
+            "conversion:optional:popup-native-autofill-guard:original",
+        ).performClick().assertIsSelected()
+        composeRule.onNodeWithTag("conversion:optional:popup-native-autofill-guard:risk")
+            .assertTextContains("브라우저 종료 위험", substring = true)
+            .assertTextContains("PARTIAL", substring = true)
+        composeRule.onNodeWithTag("conversion:analysis-screen").performScrollToNode(
+            hasTestTag("conversion:confirm-partial"),
+        )
+        composeRule.onNodeWithTag("conversion:confirm-partial").performClick()
+        composeRule.runOnIdle {
+            val ready = state.conversionState as ConversionUiState.AnalysisReady
+            assertTrue(
+                "partial=${ready.partialConfirmed}, resolved=${ready.resolvedOptionalAdapters}, " +
+                    "selected=${ready.selectedAdapters}",
+                ready.canBuild,
+            )
+        }
+        composeRule.onNodeWithTag("conversion:build").assertIsEnabled()
+
+        assertEquals(
+            listOf(
+                ManagerAction.ChooseOptionalConversionAdapter(
+                    "popup-native-autofill-guard",
+                    false,
+                ),
+                ManagerAction.ConfirmConversionPartial,
+            ),
+            actions,
+        )
+    }
+
+    @Test
     fun draft_analysis_exposes_verified_signer_and_unpaired_notice() {
         val fingerprint = "a".repeat(64)
         val initial = conversionAnalysisState()
@@ -1312,6 +1377,28 @@ class ManagerAppTest {
             identityRequirement = IdentityRequirement.Stable("0123456789ab"),
         ),
     )
+
+    private fun conversionOptionalAnalysisState(): ManagerUiState {
+        val initial = conversionAnalysisState()
+        val ready = initial.conversionState as ConversionUiState.AnalysisReady
+        val optional = AdapterDecision(
+            id = "popup-native-autofill-guard",
+            version = 1,
+            risk = AdapterRisk.BEHAVIOR_CHANGE,
+            disposition = AdapterDisposition.OPTIONAL_APPROVAL,
+            applied = false,
+            evidence = emptyList(),
+            changes = listOf("자동 입력 URL 이동 차단"),
+            remainingLimitations = listOf("원본 유지 시 브라우저 종료 위험"),
+        )
+        return initial.copy(
+            conversionState = ready.copy(
+                report = ready.report.copy(adapterDecisions = listOf(optional)),
+                requiredApprovals = emptySet(),
+                optionalApprovals = setOf(optional.id),
+            ),
+        )
+    }
 
     private fun assertGeneratedActiveInstallControls(
         installState: dev.sixbridge.manager.install.InstallState,

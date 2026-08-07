@@ -23,6 +23,7 @@ data class DesktopAnalysisSession(
     val logicalSourceIdentity: LogicalSourceIdentityResult,
     val selectedAutomaticAdapters: Set<String>,
     val requiredApprovals: Set<String>,
+    val optionalApprovals: Set<String> = emptySet(),
 )
 
 data class DesktopDraftArtifact(

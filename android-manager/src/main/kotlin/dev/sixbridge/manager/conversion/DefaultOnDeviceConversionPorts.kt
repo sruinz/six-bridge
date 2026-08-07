@@ -426,6 +426,9 @@ internal class DefaultConversionRuntime(
         requiredApprovals = report.adapterDecisions
             .filter { it.disposition == AdapterDisposition.REQUIRES_APPROVAL }
             .mapTo(sortedSetOf()) { it.id },
+        optionalApprovals = report.adapterDecisions
+            .filter { it.disposition == AdapterDisposition.OPTIONAL_APPROVAL }
+            .mapTo(sortedSetOf()) { it.id },
         logicalSourceIdentity = logicalIdentity,
         identityMode = identityMode
             ?: installationIdentityMode(inputKind, report.conversionState),

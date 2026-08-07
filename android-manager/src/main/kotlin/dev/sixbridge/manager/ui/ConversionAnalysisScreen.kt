@@ -124,6 +124,7 @@ private fun AnalysisReadyContent(
         SectionCard(stringResource(R.string.review_adapters)) {
             ready.report.adapterDecisions.forEach { decision ->
                 val approvalRequired = decision.id in ready.requiredApprovals
+                val optionalApproval = decision.id in ready.optionalApprovals
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (approvalRequired) {
                         Checkbox(
@@ -141,10 +142,14 @@ private fun AnalysisReadyContent(
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text("${decision.id} v${decision.version}")
                         Text(
-                            if (approvalRequired) {
-                                stringResource(R.string.conversion_adapter_requires_approval)
-                            } else {
-                                stringResource(R.string.conversion_adapter_automatic)
+                            when {
+                                approvalRequired -> stringResource(
+                                    R.string.conversion_adapter_requires_approval,
+                                )
+                                optionalApproval -> stringResource(
+                                    R.string.conversion_adapter_optional,
+                                )
+                                else -> stringResource(R.string.conversion_adapter_automatic)
                             },
                         )
                         decision.evidence.forEach {
@@ -153,6 +158,9 @@ private fun AnalysisReadyContent(
                         decision.changes.forEach { Text("변경: $it") }
                         decision.remainingLimitations.forEach { Text("제한: $it") }
                     }
+                }
+                if (optionalApproval) {
+                    OptionalAdapterChoice(decision.id, ready, onAction)
                 }
             }
         }
@@ -189,6 +197,35 @@ private fun AnalysisReadyContent(
             Text(stringResource(R.string.conversion_build))
         }
     }
+}
+
+@Composable
+private fun OptionalAdapterChoice(
+    id: String,
+    ready: ConversionUiState.AnalysisReady,
+    onAction: (ManagerAction) -> Unit,
+) {
+    IdentityRadioRow(
+        selected = id in ready.resolvedOptionalAdapters && id in ready.selectedAdapters,
+        tag = "conversion:optional:$id:apply",
+        label = stringResource(R.string.conversion_optional_apply),
+        details = listOf(stringResource(R.string.conversion_optional_apply_description)),
+        onClick = {
+            onAction(ManagerAction.ChooseOptionalConversionAdapter(id, apply = true))
+        },
+    )
+    IdentityRadioRow(
+        selected = id in ready.resolvedOptionalAdapters && id !in ready.selectedAdapters,
+        tag = "conversion:optional:$id:original",
+        label = stringResource(R.string.conversion_optional_original),
+        onClick = {
+            onAction(ManagerAction.ChooseOptionalConversionAdapter(id, apply = false))
+        },
+    )
+    Text(
+        text = stringResource(R.string.conversion_optional_original_description),
+        modifier = Modifier.testTag("conversion:optional:$id:risk"),
+    )
 }
 
 @Composable

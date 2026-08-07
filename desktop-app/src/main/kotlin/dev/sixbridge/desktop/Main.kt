@@ -161,6 +161,8 @@ private fun launchDesktopApplication() = application {
                         controller.cancel()
                     }
                     is DesktopAction.AdapterToggled -> controller.toggleAdapter(action.id)
+                    is DesktopAction.OptionalAdapterChosen ->
+                        controller.chooseOptionalAdapter(action.id, action.apply)
                     is DesktopAction.PartialConfirmationChanged ->
                         controller.setPartialConfirmed(action.confirmed)
                     is DesktopAction.ProjectIdentitySelected ->
