@@ -84,6 +84,22 @@ class StorageFallbackAdapterTest {
     }
 
     @Test
+    fun `함수와 class 표현식 뒤 division 우변의 storage token을 변환한다`() {
+        val sources = listOf(
+            "const ratio = function value() {} / chrome.storage.sync.value;",
+            "const Constructor = class {} / chrome.storage.sync.value;",
+        )
+
+        sources.forEach { source ->
+            val result = JavaScriptTokenRewriter().rewrite(source)
+
+            assertEquals(1, result.replacements.size, source)
+            assertTrue("storage.local" in result.source, source)
+            assertTrue(result.unsafeAccesses.isEmpty(), "$source: ${'$'}{result.unsafeAccesses}")
+        }
+    }
+
+    @Test
     fun `reports computed alias destructuring and eval access as unsafe`() {
         val samples = mapOf(
             """chrome.storage["sync"].get("a");""" to "계산된",

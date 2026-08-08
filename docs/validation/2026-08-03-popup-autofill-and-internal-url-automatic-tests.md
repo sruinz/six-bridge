@@ -136,33 +136,36 @@ bash scripts/android-manager-distribution.test.sh
 Node runtime 테스트는 초기 DOM, `MutationObserver`, capture `focusin` 경로에서
 input value와 extension API getter가 호출되지 않는 것도 검증한다.
 
-## 기존 기준선과 분리한 미완료 검증
+## 2026-08-09 전역 검증 보강
 
-2026-08-09 JDK 26 `./scripts/verify.sh` 전역 실행은 이번 변경 전부터 존재하는
-기준선 실패를 재현해 전체 PASS가 아니었다.
+기준선에 남아 있던 테스트 fixture, portable draft 공개 경계,
+정적 namespace alias, 분석 예산 수렴과 호스트 JDK 차이를 교정한 뒤
+`./scripts/verify.sh`를 fresh 실행했다.
 
-- CLI: 55 tests 중 7 failures
-- core: 696 tests 중 31 failures
-- desktop: 이번 변경의 내장 profile 회귀를 포함해 PASS
-- Android 전역 suite: 앞선 CLI·core 실패로 전역 실행이 완료되지 않음
-- Android production runtime focused suite: 7 tests 모두 PASS
+- `bundle-contract`: 60 tests, PASS
+- `core`: 700 tests, PASS
+- `cli`: 55 tests, PASS
+- `desktop-app`: 172 tests, PASS
+- `api-probe`: 83 tests, PASS
+- Android JDK 17 일반 suite: 806 tests, PASS
+- Android JDK 26 보안 ZIP 경계: 41 tests, PASS
+- Node fixture/evidence receiver: 138 tests, PASS
+- Android `lintDebug`, `assembleDebug`, instrumentation source compile: PASS
+- shell fail-closed gate, mobile conversion 결정론·서명, Android 배포 계약: PASS
 
-CLI·core 실패 목록에는 이번 변경의 내부 주소 mapper, adapter, profile scanner와
-Android runtime focused test가 포함되지 않는다. 따라서 전역 결과를 성공으로
-표현하지 않고, 위 focused PASS와 Fold7 실기기 gate를 변경 범위 증거로 사용한다.
+Robolectric은 JDK 17에서 실행하고, macOS JDK 17의 file provider가
+`SecureDirectoryStream`을 지원하지 않아 실행할 수 없는 두 보안 class는
+JDK 26에서 별도 실행했다. 이로써 기존 ASM 호환 문제와
+파일 시스템 기능 차이를 동시에 회피하면서 보안 테스트를 누락하지
+않았다.
 
-이전 Android JDK 26 전체 실행에서 Robolectric ASM `ClassReader` 호환 문제로
-844 tests 중 124 failures가 발생한 기준선도 별도로 확인돼 있다.
+`scripts/verify-mobile-conversion.sh`는 고정 project identity와 일회성
+workspace를 사용하도록 보강했다. 따라서 사용자의 기존 `.local`
+draft key 저장소나 이전 실패 상태에 영향을 주지 않으며, 원본
+fixture 불변·동일 draft hash·`verify-draft`를 모두 통과했다.
 
-`bash scripts/verify-mobile-conversion.sh`는 기존
-`fixtures/desktop-mobile-golden`에 source project identity 표식이 없어 기존
-fail-closed 계약에서 중단된다.
-
-```text
-표식 없는 확장 소스에는 source project identity가 필요합니다.
-```
-
-해당 script와 fixture는 시작 commit과 비교해 변경하지 않았다.
+상세 전역 결과는
+`docs/validation/full-suite-stabilization-2026-08-09.md`에 기록했다.
 
 ## 개인정보 경계
 

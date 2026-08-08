@@ -609,7 +609,7 @@ class CompatibilityAnalyzerTest {
 
         val report = CompatibilityAnalyzer().analyze(source, profile)
 
-        assertEquals(CompatibilityStatus.COMPATIBLE, report.status)
+        assertEquals(CompatibilityStatus.COMPATIBLE, report.status, report.toString())
         assertEquals(setOf("storage"), report.usedApis)
     }
 
@@ -839,7 +839,7 @@ class CompatibilityAnalyzerTest {
 
         val report = CompatibilityAnalyzer().analyze(source, profile)
 
-        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(CompatibilityStatus.PARTIAL, report.status, report.toString())
         assertTrue("webstorePrivate" in report.usedApis)
         assertTrue("downloads" in report.usedApis)
     }
@@ -973,7 +973,7 @@ class CompatibilityAnalyzerTest {
 
         val report = CompatibilityAnalyzer().analyze(source, profile)
 
-        assertEquals(CompatibilityStatus.PARTIAL, report.status)
+        assertEquals(CompatibilityStatus.PARTIAL, report.status, report.toString())
         assertEquals(setOf("downloads", "webstorePrivate"), report.unsupportedApis)
         assertTrue("downloads" in report.usedApis)
         assertTrue("webstorePrivate" in report.usedApis)

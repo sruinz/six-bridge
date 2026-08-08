@@ -47,4 +47,18 @@ class JavaScriptLexicalMaskTest {
 
         assertFalse("chrome.runtime" in masked)
     }
+
+    @Test
+    fun `함수와 class 표현식 뒤 division 우변은 실행 코드로 보존한다`() {
+        val sources = listOf(
+            "const ratio = function value() {} / chrome.storage.sync.value;",
+            "const Constructor = class {} / chrome.storage.sync.value;",
+        )
+
+        sources.forEach { source ->
+            val masked = JavaScriptLexicalMask.mask(source, maskLiterals = true)
+
+            assertTrue("chrome.storage.sync" in masked, source)
+        }
+    }
 }

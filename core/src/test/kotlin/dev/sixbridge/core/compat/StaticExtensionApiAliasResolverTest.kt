@@ -150,6 +150,27 @@ class StaticExtensionApiAliasResolverTest {
         assertFalse(result.dynamicUsage)
     }
 
+    @Test
+    fun `정적으로 export한 namespace 참조는 dynamic alias가 아니다`() {
+        val result = resolve(
+            "export const imported=chrome.webstorePrivate; " +
+                "export const downloaded=browser.downloads;",
+        )
+
+        assertEquals(setOf("downloads", "webstorePrivate"), result.namespaces)
+        assertFalse(result.dynamicUsage)
+    }
+
+    @Test
+    fun `객체 property 이름과 함수 값의 정적 API 호출은 dynamic alias가 아니다`() {
+        val result = resolve(
+            "const environments={chrome:true,browser:false}; " +
+                "const load=()=>chrome.storage.local.get('value');",
+        )
+
+        assertFalse(result.dynamicUsage)
+    }
+
     private fun resolve(source: String): StaticExtensionApiAliases = resolver.resolve(
         source = JavaScriptLexicalMask.mask(source, maskLiterals = false),
         codeOnly = JavaScriptLexicalMask.mask(source, maskLiterals = true),

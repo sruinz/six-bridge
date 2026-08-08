@@ -46,6 +46,7 @@ for jdk_tool in java javac keytool; do
   [ -x "$java_bin_dir/$jdk_tool" ] ||
     fail "JDK bin/${jdk_tool}을(를) 찾을 수 없습니다. JAVA_HOME에 완전한 JDK 17 이상 경로를 지정하세요."
 done
+primary_java_home=$(CDPATH= cd -- "$java_bin_dir/.." && pwd)
 
 java_version_output=$("$java_command" -version 2>&1) ||
   fail "JDK를 실행할 수 없습니다. JAVA_HOME에 JDK 17 이상 경로를 지정하세요."
@@ -58,6 +59,46 @@ case "$java_major" in
 esac
 [ "$java_major" -ge 17 ] ||
   fail "JDK 17 이상이 필요합니다. 현재 major version: $java_major"
+
+default_android_test_java_home="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+if [ -n "${SIXBRIDGE_ANDROID_TEST_JAVA_HOME:-}" ]; then
+  android_test_java_home="$SIXBRIDGE_ANDROID_TEST_JAVA_HOME"
+elif [ -x "$default_android_test_java_home/bin/java" ]; then
+  android_test_java_home="$default_android_test_java_home"
+else
+  android_test_java_home="$primary_java_home"
+fi
+if [ -n "${SIXBRIDGE_SECURE_ZIP_JAVA_HOME:-}" ]; then
+  secure_zip_java_home="$SIXBRIDGE_SECURE_ZIP_JAVA_HOME"
+elif [ -x "$default_java_home/bin/java" ]; then
+  secure_zip_java_home="$default_java_home"
+else
+  secure_zip_java_home="$primary_java_home"
+fi
+
+for java_home_case in \
+  "Android 단위 테스트:$android_test_java_home" \
+  "보안 ZIP 경계 테스트:$secure_zip_java_home"; do
+  java_home_label=${java_home_case%%:*}
+  java_home_path=${java_home_case#*:}
+  [ -x "$java_home_path/bin/java" ] ||
+    fail "$java_home_label JDK를 찾을 수 없습니다: $java_home_path"
+  for jdk_tool in java javac keytool; do
+    [ -x "$java_home_path/bin/$jdk_tool" ] ||
+      fail "$java_home_label JDK bin/${jdk_tool}을(를) 찾을 수 없습니다: $java_home_path"
+  done
+  split_java_version_output=$("$java_home_path/bin/java" -version 2>&1) ||
+    fail "$java_home_label JDK를 실행할 수 없습니다: $java_home_path"
+  split_java_major=$(printf '%s\n' "$split_java_version_output" |
+    awk -F '"' 'NR == 1 { split($2, parts, "."); if (parts[1] == "1") print parts[2]; else print parts[1] }')
+  case "$split_java_major" in
+    ''|*[!0-9]*)
+      fail "$java_home_label JDK 버전을 확인할 수 없습니다: $java_home_path"
+      ;;
+  esac
+  [ "$split_java_major" -ge 17 ] ||
+    fail "$java_home_label에 JDK 17 이상이 필요합니다. 현재 major version: $split_java_major"
+done
 
 if [ -n "${ANDROID_HOME:-}" ]; then
   android_sdk_root="$ANDROID_HOME"
@@ -109,12 +150,34 @@ else
 fi
 
 GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
+JAVA_HOME="$secure_zip_java_home" \
   "$gradle_command" -Pkotlin.jvm.target.validation.mode=IGNORE \
-  clean test installDist \
+  clean \
   :bundle-contract:test \
+  :core:test \
+  :cli:test \
+  :desktop-app:test \
+  :api-probe:test \
+  :android-wrapper-template:test \
+  :cli:installDist \
+  --max-workers=1
+
+GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
+JAVA_HOME="$android_test_java_home" \
+  "$gradle_command" -Pkotlin.jvm.target.validation.mode=IGNORE \
+  -Psixbridge.skipSecureZipHostTests=true \
   :android-manager:testDebugUnitTest \
   :android-manager:lintDebug \
-  :android-manager:assembleDebug
+  :android-manager:assembleDebug \
+  --max-workers=1
+
+GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
+JAVA_HOME="$secure_zip_java_home" \
+  "$gradle_command" -Pkotlin.jvm.target.validation.mode=IGNORE \
+  :android-manager:testDebugUnitTest \
+  --tests dev.sixbridge.manager.conversion.OnDeviceInputServiceTest \
+  --tests dev.sixbridge.manager.conversion.DefaultConversionRuntimeTest \
+  --max-workers=1
 
 node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/minimal-mv3/content.test.mjs \

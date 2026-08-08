@@ -215,8 +215,18 @@ test_verify_runs_android_contract() {
 
     assert_contains "${command_log}" ":bundle-contract:test" \
         "verify.sh가 bundle-contract test를 실행하지 않았습니다."
+    assert_contains "${command_log}" ":core:test" \
+        "verify.sh가 core 전체 테스트를 명시적으로 실행하지 않았습니다."
+    assert_contains "${command_log}" "--max-workers=1" \
+        "verify.sh가 소유 임시 경로 테스트를 단일 worker로 고정하지 않았습니다."
     assert_contains "${command_log}" ":android-manager:testDebugUnitTest" \
         "verify.sh가 Android unit test를 실행하지 않았습니다."
+    assert_contains "${command_log}" "-Psixbridge.skipSecureZipHostTests=true" \
+        "verify.sh가 JDK 17 Android 테스트에서 host 보안 ZIP 경계를 분리하지 않았습니다."
+    assert_contains "${command_log}" "--tests dev.sixbridge.manager.conversion.OnDeviceInputServiceTest" \
+        "verify.sh가 보안 ZIP 경계 테스트를 별도로 실행하지 않았습니다."
+    assert_contains "${command_log}" "--tests dev.sixbridge.manager.conversion.DefaultConversionRuntimeTest" \
+        "verify.sh가 Android 변환 runtime 보안 경계를 별도로 실행하지 않았습니다."
     assert_contains "${command_log}" ":android-manager:lintDebug" \
         "verify.sh가 Android lint를 실행하지 않았습니다."
     assert_contains "${command_log}" ":android-manager:assembleDebug" \

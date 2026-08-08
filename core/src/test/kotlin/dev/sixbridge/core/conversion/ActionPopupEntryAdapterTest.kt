@@ -366,7 +366,7 @@ class ActionPopupEntryAdapterTest {
         root.resolve("second.js").writeText("console.log('second');")
         val popupOutput = root.resolve(popup.removePrefix("/")).normalize()
         Files.createDirectories(popupOutput.parent)
-        popupOutput.writeText("<p>popup</p>")
+        popupOutput.writeText("<html><head></head><body><p>popup</p></body></html>")
         worker?.let {
             val output = root.resolve(it.removePrefix("/")).normalize()
             Files.createDirectories(output.parent)

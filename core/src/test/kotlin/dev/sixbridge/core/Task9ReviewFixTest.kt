@@ -183,7 +183,9 @@ class Task9ReviewFixTest {
         Files.createDirectories(root)
         if (popup) {
             root.resolve("content.js").writeText("console.log('content');")
-            root.resolve("popup.html").writeText("<p>popup</p>")
+            root.resolve("popup.html").writeText(
+                "<html><head></head><body><p>popup</p></body></html>",
+            )
         }
         val key = manifestKey?.let { ""","key":"$it"""" }.orEmpty()
         val action = if (popup) {

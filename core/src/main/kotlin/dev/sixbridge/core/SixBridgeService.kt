@@ -178,7 +178,7 @@ class SixBridgeService(
         val resolved = runControlledDraftStage(control) {
             inputResolver.resolve(input)
         }.copy(projectIdentity = projectIdentity)
-        return draftResolved(
+        return draftPortableResolved(
             resolved = resolved,
             profile = profile,
             outputDraft = outputDraft,

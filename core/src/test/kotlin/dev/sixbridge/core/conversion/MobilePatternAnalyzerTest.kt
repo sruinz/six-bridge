@@ -246,7 +246,7 @@ class MobilePatternAnalyzerTest {
     }
 
     @Test
-    fun `Video NAS pattern은 webNavigation만 부분 호환이다`() {
+    fun `Video NAS pattern은 webNavigation만 미검증 부분 호환이다`() {
         val report = MobilePatternAnalyzer().analyze(
             fixture("video-nas-pattern"),
             exactFold7Profile(),
@@ -267,9 +267,10 @@ class MobilePatternAnalyzerTest {
             ),
             report.usedApis,
         )
-        assertEquals(setOf("webNavigation"), report.unsupportedApis)
+        assertTrue(report.unsupportedApis.isEmpty())
+        assertEquals(setOf("webNavigation"), report.unverifiedApis)
         assertTrue(report.issues.any {
-            it.code == "unsupported_api" && !it.blocking
+            it.code == "unverified_api" && !it.blocking
         })
         assertTrue(report.issues.any {
             it.code == "storage_area_unknown" && !it.blocking

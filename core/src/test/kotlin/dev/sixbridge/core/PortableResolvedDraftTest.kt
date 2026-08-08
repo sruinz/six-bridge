@@ -348,7 +348,9 @@ class PortableResolvedDraftTest {
         private val popupSource = Files.createTempDirectory(
             "six-portable-popup-source",
         ).also {
-            it.resolve("popup.html").writeText("<p>Portable popup</p>")
+            it.resolve("popup.html").writeText(
+                "<html><head></head><body><p>Portable popup</p></body></html>",
+            )
             it.resolve("manifest.json").writeText(
                 """
                 {

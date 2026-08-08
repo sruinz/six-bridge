@@ -48,6 +48,13 @@ kotlin {
     }
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    if (providers.gradleProperty("sixbridge.skipSecureZipHostTests").orNull == "true") {
+        exclude("dev/sixbridge/manager/conversion/OnDeviceInputServiceTest.class")
+        exclude("dev/sixbridge/manager/conversion/DefaultConversionRuntimeTest.class")
+    }
+}
+
 room {
     schemaDirectory("$projectDir/schemas")
 }

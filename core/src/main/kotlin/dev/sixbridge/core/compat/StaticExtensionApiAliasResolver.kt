@@ -46,6 +46,7 @@ internal class StaticExtensionApiAliasResolver {
             if (name != null) {
                 val nameOffset = declaration.groups[3]!!.range.first
                 val alias = resolveExpression(expression, aliases)
+                val namespace = resolveNamespaceExpression(expression)
                 if (kind == "const" && alias != null) {
                     if (alias.depth >= MAX_ALIAS_DEPTH || aliases.size >= MAX_ALIASES) {
                         dynamicUsage = true
@@ -59,7 +60,18 @@ internal class StaticExtensionApiAliasResolver {
                         consumeStaticRoot(expression, expressionOffset, consumedRootOffsets)
                         if (expression in aliases) safeReferenceOffsets += expressionOffset
                     }
-                } else if (referencesExtensionState(expression, aliases)) {
+                } else if (kind == "const" && namespace != null) {
+                    aliases[name] = Alias(
+                        kind = AliasKind.EXTENSION_NAMESPACE,
+                        depth = 0,
+                        declarationOffset = nameOffset,
+                        namespace = namespace,
+                    )
+                    namespaces += namespace
+                    consumeStaticRoot(expression, expressionOffset, consumedRootOffsets)
+                } else if (!isFunctionValue(expression) &&
+                    referencesExtensionState(expression, aliases)
+                ) {
                     dynamicUsage = true
                 }
             } else {
@@ -118,6 +130,7 @@ internal class StaticExtensionApiAliasResolver {
                             }
 
                             AliasKind.EXTENSION_ROOT -> namespaces += property
+                            AliasKind.EXTENSION_NAMESPACE -> dynamicUsage = true
                         }
                     }
                 } else if (referencesExtensionState(expression, aliases)) {
@@ -171,6 +184,8 @@ internal class StaticExtensionApiAliasResolver {
                         else -> dynamicUsage = true
                     }
                 }
+
+                AliasKind.EXTENSION_NAMESPACE -> dynamicUsage = true
             }
         }
 
@@ -196,6 +211,16 @@ internal class StaticExtensionApiAliasResolver {
         } ?: aliases[expression]
     }
 
+    private fun resolveNamespaceExpression(expression: String): String? =
+        STATIC_ROOT_NAMESPACE.matchEntire(expression)?.groupValues?.get(1)
+
+    private fun isFunctionValue(expression: String): Boolean {
+        val trimmed = expression.trimStart()
+        return trimmed.startsWith("function") ||
+            trimmed.startsWith("class") ||
+            "=>" in expression
+    }
+
     private fun consumeStaticRoot(
         expression: String,
         expressionOffset: Int,
@@ -210,9 +235,23 @@ internal class StaticExtensionApiAliasResolver {
         expression: String,
         aliases: Map<String, Alias>,
     ): Boolean =
-        ROOT_TOKEN.containsMatchIn(expression) ||
+        ROOT_TOKEN.findAll(expression).any { root ->
+            !isStaticObjectProperty(expression, root)
+        } ||
             GLOBAL_OBJECT_TOKEN.containsMatchIn(expression) ||
             aliases.keys.any { alias -> identifierRegex(alias).containsMatchIn(expression) }
+
+    private fun isStaticObjectProperty(
+        expression: String,
+        root: MatchResult,
+    ): Boolean {
+        var before = root.range.first - 1
+        while (expression.getOrNull(before)?.isWhitespace() == true) before--
+        var after = root.range.last + 1
+        while (expression.getOrNull(after)?.isWhitespace() == true) after++
+        return expression.getOrNull(before) in setOf('{', ',') &&
+            expression.getOrNull(after) == ':'
+    }
 
     private fun bindingStartOffset(bindings: String, bindingIndex: Int): Int {
         var offset = 0
@@ -303,12 +342,14 @@ internal class StaticExtensionApiAliasResolver {
     private enum class AliasKind {
         GLOBAL_OBJECT,
         EXTENSION_ROOT,
+        EXTENSION_NAMESPACE,
     }
 
     private data class Alias(
         val kind: AliasKind,
         val depth: Int,
         val declarationOffset: Int,
+        val namespace: String? = null,
     )
 
     private data class Usage(
@@ -375,6 +416,9 @@ internal class StaticExtensionApiAliasResolver {
         )
         private val STATIC_ALIAS_ROOT = Regex(
             """([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\?\.|\.)\s*(?:chrome|browser)""",
+        )
+        private val STATIC_ROOT_NAMESPACE = Regex(
+            """(?:chrome|browser)\s*(?:\?\.|\.)\s*([A-Za-z][A-Za-z0-9_]*)""",
         )
         private val STATIC_API_CALL_RESULT = Regex(
             """(?:await\s+)?(?:chrome|browser)\s*(?:\?\.|\.)\s*""" +

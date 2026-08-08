@@ -288,7 +288,9 @@ class SixBridgeServiceTest {
         val outputParent = workspace.resolve("dist").also(Files::createDirectory)
         val source = source("six-build-no-output-source", "Missing approval")
         source.resolve("content.js").writeText("console.log('content');")
-        source.resolve("popup.html").writeText("<p>popup</p>")
+        source.resolve("popup.html").writeText(
+            "<html><head></head><body><p>popup</p></body></html>",
+        )
         source.resolve("manifest.json").writeText(
             """
             {

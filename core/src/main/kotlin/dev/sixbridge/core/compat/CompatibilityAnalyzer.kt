@@ -29,15 +29,50 @@ class CompatibilityAnalyzer(
 
     fun analyze(extensionRoot: Path, profile: BrowserProfile): CompatibilityReport {
         control.beginOperation()
-        return StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
-            val report = analyzeStable(
-                stable.root,
-                profile,
-                stable.sourceSha256,
-            )
-            stable.verifyLiveSource()
-            report
+        return try {
+            StableExtensionAnalysis.captureLive(extensionRoot, control).use { stable ->
+                val report = analyzeStable(
+                    stable.root,
+                    profile,
+                    stable.sourceSha256,
+                )
+                stable.verifyLiveSource()
+                report
+            }
+        } catch (error: AnalysisBudgetExceededException) {
+            budgetExceededLiveReport(extensionRoot, profile, error.exceeded)
         }
+    }
+
+    private fun budgetExceededLiveReport(
+        extensionRoot: Path,
+        profile: BrowserProfile,
+        exceeded: AnalysisInventoryResult.Exceeded,
+    ): CompatibilityReport {
+        profile.validate()
+        val manifestPath = extensionRoot.resolve("manifest.json")
+        val manifest = manifestPath.takeIf(Path::isRegularFile)
+            ?.takeIf { Files.size(it) <= control.policy.maxManifestBytes }
+            ?.let { path ->
+                runCatching {
+                    json.parseToJsonElement(path.readText()) as? JsonObject
+                }.getOrNull()
+            }
+        val localizedName = manifest?.let {
+            ManifestLocalization.resolveName(extensionRoot, it)
+        }
+        val permissions = manifest?.let {
+            readStringSet(it["permissions"]) + readStringSet(it["optional_permissions"])
+        }.orEmpty()
+        return analysisBudgetExceededReport(
+            exceeded = exceeded,
+            manifestVersion = (manifest?.get("manifest_version") as? JsonPrimitive)?.intOrNull,
+            name = localizedName?.value,
+            version = manifest?.stringOrNull("version"),
+            permissions = permissions,
+        ).withAdditionalIssues(listOfNotNull(localizedName?.issue)).copy(
+            browserProfileSha256 = profile.canonicalSha256(),
+        ).also(CompatibilityReport::validate)
     }
 
     @JvmSynthetic
@@ -376,6 +411,9 @@ class CompatibilityAnalyzer(
                     consumedRoots += ROOT_TOKEN.find(match.value)!!.range.first +
                         match.range.first
                 }
+                OBJECT_PROPERTY_ROOT_REGEX.findAll(codeOnly).forEach { match ->
+                    consumedRoots += match.groups[1]!!.range.first
+                }
                 control.checkCancelled()
                 if (ROOT_TOKEN.findAll(codeOnly).any {
                         it.range.first !in consumedRoots
@@ -635,6 +673,8 @@ class CompatibilityAnalyzer(
         private val ROOT_TOKEN = Regex("""\b(?:chrome|browser)\b""")
         private val ROOT_SCHEME_LITERAL_REGEX =
             Regex("""\b(?:chrome|browser)\b(?:-extension)?\s*:""")
+        private val OBJECT_PROPERTY_ROOT_REGEX =
+            Regex("""[{,]\s*\b(chrome|browser)\b\s*:""")
         private val NATIVE_MESSAGING_REGEX =
             Regex("""(?:sendNativeMessage|connectNative)\s*\(""")
         private val KNOWN_API_NAMESPACES = setOf(

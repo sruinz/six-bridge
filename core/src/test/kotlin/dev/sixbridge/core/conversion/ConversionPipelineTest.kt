@@ -154,7 +154,18 @@ class ConversionPipelineTest {
         )
         assertEquals(null, first.logicalIdentity)
         assertEquals(ConversionState.CONVERTED, first.compatibilityAfter.conversionState)
-        assertTrue(first.compatibilityAfter.adapterDecisions.all(AdapterDecision::applied))
+        val decisions = first.compatibilityAfter.adapterDecisions.associateBy(AdapterDecision::id)
+        assertTrue(requireNotNull(decisions[MobilePatternAnalyzer.ACTION_POPUP_ENTRY]).applied)
+        assertTrue(
+            requireNotNull(
+                decisions[MobilePatternAnalyzer.DESKTOP_SELECTION_EVENT_BRIDGE],
+            ).applied,
+        )
+        assertFalse(
+            requireNotNull(
+                decisions[MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD],
+            ).applied,
+        )
     }
 
     @Test
@@ -824,7 +835,11 @@ class ConversionPipelineTest {
                 });
                 """.trimIndent(),
             )
-            if (includePopup) root.resolve("popup.html").writeText("<p>popup</p>")
+            if (includePopup) {
+                root.resolve("popup.html").writeText(
+                    "<html><head></head><body><p>popup</p></body></html>",
+                )
+            }
             root.resolve("manifest.json").writeText(
                 """
                 {

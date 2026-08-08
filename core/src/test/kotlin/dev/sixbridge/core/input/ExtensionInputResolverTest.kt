@@ -164,7 +164,10 @@ class ExtensionInputResolverTest {
         resolved.zip(roots).forEach { (result, root) ->
             assertTrue(Files.isDirectory(root, NOFOLLOW_LINKS))
             assertFalse(Files.isSymbolicLink(root))
-            assertTrue(requireNotNull(result.sourceRoot).startsWith(root))
+            assertTrue(
+                requireNotNull(result.sourceRoot).startsWith(root.toRealPath()),
+                "${result.kind}: ${result.sourceRoot} !startsWith ${root.toRealPath()}",
+            )
         }
         assertEquals(3, roots.map(::fileKey).toSet().size)
     }
