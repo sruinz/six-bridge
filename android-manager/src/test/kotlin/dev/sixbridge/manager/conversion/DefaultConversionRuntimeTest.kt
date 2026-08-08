@@ -99,6 +99,44 @@ class DefaultConversionRuntimeTest {
     }
 
     @Test
+    fun `Android production runtime은 popup 원본 유지 draft를 no-op으로 재생한다`() {
+        val draftFile = File(
+            "src/androidTest/assets/popup-autofill-original.sixdraft",
+        )
+        val verified = SixDraft.read(draftFile.toPath())
+        val sourceZip = temporaryFolder.newFile("popup-original-source.zip").apply {
+            writeBytes(verified.payload.source)
+        }
+        val runtime = DefaultConversionRuntime()
+
+        val direct = runtime.prepare(
+            sourceZip,
+            OnDeviceInputKind.ZIP,
+            popupProfile(),
+            emptySet(),
+        )
+        val replayed = runtime.prepare(
+            draftFile,
+            OnDeviceInputKind.SIX_DRAFT,
+            popupProfile(),
+            emptySet(),
+        )
+        val directPrepared = direct.opaque as PreparedConversion
+        val replayedPrepared = replayed.opaque as PreparedConversion
+
+        assertContentEquals(verified.payload.source, direct.transformedSourceZip)
+        assertContentEquals(direct.transformedSourceZip, replayed.transformedSourceZip)
+        assertEquals(direct.reportBefore, replayed.reportBefore)
+        assertEquals(directPrepared.compatibilityAfter, replayedPrepared.compatibilityAfter)
+        assertEquals(
+            ConversionState.PASSTHROUGH,
+            replayedPrepared.compatibilityAfter.conversionState,
+        )
+        assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
+        assertTrue(replayedPrepared.appliedAdapterIds.isEmpty())
+    }
+
+    @Test
     fun `Android runtime은 모바일 예산 초과를 UNKNOWN snapshot으로 보존한다`() {
         val input = crxFileWithScriptBytes(2 * 1024 * 1024 + 1)
 
@@ -316,6 +354,10 @@ class DefaultConversionRuntimeTest {
             "extension.options-page.user-accessible",
             "browser.internal-url.extensions-root",
         ),
+    )
+
+    private fun popupProfile() = profile().copy(
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
     private companion object {

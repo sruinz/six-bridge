@@ -38,18 +38,23 @@ class PortableResolvedDraftTest {
     @Test
     fun `public portable draft는 Android production runtime용 canonical fixture와 같다`() {
         SecureFixture().use { fixture ->
-            fixture.draftPortableResolved(
+            fixture.service.draftPortableResolved(
                 resolved = fixture.platformResolved,
-                projectIdentity = fixture.projectIdentity,
                 profile = platformProfile,
+                outputDraft = fixture.output,
+                projectIdentity = fixture.projectIdentity,
                 approvedAdapterIds = setOf(
                     MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
                 ),
+                protectedInputs = emptyList(),
+                control = fixture.control,
             )
             val desktop = SixDraft.read(fixture.output)
             val androidAsset = SixDraft.read(platformDraftAsset)
 
             assertContentEquals(androidAsset.payload.source, desktop.payload.source)
+            assertContentEquals(androidAsset.payload.draftJson, desktop.payload.draftJson)
+            assertContentEquals(androidAsset.payload.inputJson, desktop.payload.inputJson)
             assertContentEquals(
                 androidAsset.payload.conversionPlanJson,
                 desktop.payload.conversionPlanJson,
@@ -126,13 +131,17 @@ class PortableResolvedDraftTest {
     @Test
     fun `popup 원본 유지 portable draft는 passthrough와 빈 signed plan을 보존한다`() {
         SecureFixture().use { fixture ->
-            fixture.draftPortableResolved(
+            fixture.service.draftPortableResolved(
                 resolved = fixture.popupGuardResolved,
-                projectIdentity = fixture.projectIdentity,
                 profile = profile,
+                outputDraft = fixture.output,
+                projectIdentity = fixture.projectIdentity,
                 approvedAdapterIds = emptySet(),
+                protectedInputs = emptyList(),
+                control = fixture.control,
             )
             val verified = SixDraft.read(fixture.output)
+            val androidAsset = SixDraft.read(popupOriginalDraftAsset)
 
             assertEquals(ConversionState.PASSTHROUGH, verified.payload.compatibilityAfter.conversionState)
             assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
@@ -147,6 +156,25 @@ class PortableResolvedDraftTest {
             assertEquals(
                 verified.payload.compatibilityBefore.adapterDecisions,
                 verified.payload.compatibilityAfter.adapterDecisions,
+            )
+            assertContentEquals(androidAsset.payload.source, verified.payload.source)
+            assertContentEquals(androidAsset.payload.draftJson, verified.payload.draftJson)
+            assertContentEquals(androidAsset.payload.inputJson, verified.payload.inputJson)
+            assertContentEquals(
+                androidAsset.payload.conversionPlanJson,
+                verified.payload.conversionPlanJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.compatibilityBeforeJson,
+                verified.payload.compatibilityBeforeJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.compatibilityAfterJson,
+                verified.payload.compatibilityAfterJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.expectedJson,
+                verified.payload.expectedJson,
             )
         }
     }
@@ -402,6 +430,10 @@ class PortableResolvedDraftTest {
         private val platformDraftAsset = Path.of(
             "../android-manager/src/androidTest/assets/" +
                 "popup-autofill-internal-url-platform.sixdraft",
+        )
+        private val popupOriginalDraftAsset = Path.of(
+            "../android-manager/src/androidTest/assets/" +
+                "popup-autofill-original.sixdraft",
         )
         val profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",

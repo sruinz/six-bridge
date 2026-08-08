@@ -25,8 +25,17 @@ JVM 검증은 PASS이고, 실제 기기 검증은 보류다.
 - 검증 환경: JDK 26, Kotlin/JVM, Android debug test source
 - Samsung Internet profile:
   `profiles/sbrowser-30.0.2.61.json`
-- profile SHA-256:
+- 기준 profile 파일 SHA-256:
   `296971df57ed43fb5448d296badd0fa453a54efbd32814f5e47046d576214f8b`
+- 합성 변환 profile feature:
+  `extension.options-page.user-accessible`,
+  `browser.internal-url.extensions-root`
+- 합성 변환 canonical profile SHA-256:
+  `0633598b9afe50d72b4691cbfb480591cb336ae349563fd8f03d57a4d7474723`
+- popup 원본 유지 profile feature:
+  `extension.options-page.user-accessible`
+- popup 원본 유지 canonical profile SHA-256:
+  `e5f2486009d7eabf31a66222f2ed08dcf55b55961dbe594748449fa5f17e4955`
 - 공용 합성 fixture:
   `fixtures/popup-autofill-internal-url-platform`
 - 공용 합성 fixture tree SHA-256:
@@ -35,10 +44,17 @@ JVM 검증은 PASS이고, 실제 기기 검증은 보류다.
   `android-manager/src/androidTest/assets/popup-autofill-internal-url-platform.sixdraft`
 - 계측 asset SHA-256:
   `fde71f337cc7b415dd4ebadcf19ffb4f0a7feca114fb6888c052ae889b5e1b62`
+- popup 원본 유지 Android 계측 asset:
+  `android-manager/src/androidTest/assets/popup-autofill-original.sixdraft`
+- popup 원본 유지 계측 asset SHA-256:
+  `4bf5f7baaa3090622cbe0d9106a30f60169cb6153ec4549aebcc23c3b9de85ce`
 
 fixture tree hash는 상대 경로 순으로 각 파일의 SHA-256을 계산한 목록 전체에
-다시 SHA-256을 적용한 값이다. 저장된 `.sixdraft`는 공용 합성 fixture만 담고
-있으며 실제 계정, server URL, cookie, storage 또는 방문 기록을 포함하지 않는다.
+다시 SHA-256을 적용한 값이다. 저장된 두 `.sixdraft`는 공용 합성 fixture만
+담고 있으며 실제 계정, server URL, cookie, storage 또는 방문 기록을 포함하지
+않는다. 기준 profile 파일 SHA-256은 입력 파일의 무결성 표식이고, 각 canonical
+profile SHA-256은 테스트에 실제로 사용한 feature 집합까지 canonical 직렬화한
+생산 경로 provenance 값이다.
 
 ## 자동 검증 결과
 
@@ -73,13 +89,15 @@ GRADLE_USER_HOME=.local/gradle-home \
 ./gradlew -Pkotlin.jvm.target.validation.mode=IGNORE \
   :android-manager:testDebugUnitTest \
   --tests 'dev.sixbridge.manager.conversion.DefaultConversionRuntimeTest.Android production runtime은 desktop portable draft와 direct ZIP을 동일하게 준비한다' \
+  --tests 'dev.sixbridge.manager.conversion.DefaultConversionRuntimeTest.Android production runtime은 popup 원본 유지 draft를 no-op으로 재생한다' \
   :android-manager:compileDebugAndroidTestKotlin
 ```
 
-- Android production consumer unit: PASS, 1 test
+- Android production consumer unit: PASS, 2 tests
 - Android 계측 source compile: PASS, `BUILD SUCCESSFUL`
 - Fold7 계측 실행: 보류. `adb devices -l`에 연결 기기가 없었다.
-- 계측 테스트는 연결 복구 뒤 같은 asset으로 direct ZIP과 portable draft replay를
+- 계측 테스트는 연결 복구 뒤 변환 asset과 popup 원본 유지 asset 각각에 대해
+  `DefaultConversionRuntime.prepare`의 direct ZIP과 portable draft replay를
   비교하도록 구현돼 있다.
 
 ### popup guard runtime과 정적 경계

@@ -28,6 +28,7 @@ import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.PreparedConversion
 import dev.sixbridge.core.draft.DraftConversionPlan
 import dev.sixbridge.core.draft.DraftInputMetadata
@@ -957,25 +958,44 @@ class CoreConversionRuntimeInstrumentedTest {
 
     @Test
     fun originalPopupChoiceIsNoOpOnAndroid() {
-        val source = platformFixtureZip(includeInternalUrls = false)
-        val prepared = ConversionPreparationEngine().use {
-            it.prepare(
-                PortableExtensionInput.fromZip(ExtensionInputKind.ZIP, source),
-                profile(),
-                emptySet(),
-            )
+        val draftFile = File(targetContext.cacheDir, "popup-autofill-original.sixdraft")
+        testContext.assets.open("popup-autofill-original.sixdraft").use { input ->
+            draftFile.outputStream().use(input::copyTo)
         }
+        val verified = SixDraft.read(draftFile.toPath())
+        val sourceZip = File(targetContext.cacheDir, "popup-original-source.zip").apply {
+            writeBytes(verified.payload.source)
+        }
+        val runtime = DefaultConversionRuntime()
 
-        assertArrayEquals(source, prepared.transformedSourceZip)
-        assertTrue(prepared.appliedAdapterIds.isEmpty())
+        val direct = runtime.prepare(
+            sourceZip,
+            OnDeviceInputKind.ZIP,
+            profile(),
+            emptySet(),
+        )
+        val replayed = runtime.prepare(
+            draftFile,
+            OnDeviceInputKind.SIX_DRAFT,
+            profile(),
+            emptySet(),
+        )
+        val directPrepared = direct.opaque as PreparedConversion
+        val replayedPrepared = replayed.opaque as PreparedConversion
+
+        assertArrayEquals(verified.payload.source, direct.transformedSourceZip)
+        assertArrayEquals(direct.transformedSourceZip, replayed.transformedSourceZip)
+        assertEquals(direct.reportBefore, replayed.reportBefore)
         assertEquals(
-            prepared.compatibilityBefore.status,
-            prepared.compatibilityAfter.status,
+            directPrepared.compatibilityAfter,
+            replayedPrepared.compatibilityAfter,
         )
         assertEquals(
-            prepared.compatibilityBefore.adapterDecisions,
-            prepared.compatibilityAfter.adapterDecisions,
+            ConversionState.PASSTHROUGH,
+            replayedPrepared.compatibilityAfter.conversionState,
         )
+        assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
+        assertTrue(replayedPrepared.appliedAdapterIds.isEmpty())
     }
 
     @Test

@@ -93,7 +93,7 @@ reject_rg_matches \
 
 reject_rg_matches \
   "팝업 보호 asset이 금지된 데이터 또는 네트워크 API를 사용합니다." \
-  -nP \
+  -n \
   -e '\bfetch\s*\(' \
   -e '\bXMLHttpRequest\b' \
   -e '\b(?:chrome|browser)\s*(?:\?\.|\.)\s*storage\b' \
