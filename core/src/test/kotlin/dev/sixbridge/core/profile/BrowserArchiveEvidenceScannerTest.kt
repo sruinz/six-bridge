@@ -9,6 +9,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
@@ -17,41 +18,10 @@ class BrowserArchiveEvidenceScannerTest {
     private val scanner = BrowserArchiveEvidenceScanner()
 
     @Test
-    fun `내부 주소 feature는 package version base hash signer exact tuple에만 생성한다`() {
-        val exact = BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
-            packageName = "com.sec.android.app.sbrowser",
-            versionName = BrowserProfile.BASELINE_VERSION,
-            baseApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
-            signerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
-        )
+    fun `APK 증거 스캔은 내부 주소 직접 이동 feature를 생성하지 않는다`() {
+        val profile = scanner.scan(evidence())
 
-        assertEquals(setOf("browser.internal-url.extensions-root"), exact)
-        listOf(
-            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
-                "not.sbrowser",
-                BrowserProfile.BASELINE_VERSION,
-                BrowserProfile.BASELINE_APK_SHA256,
-                BrowserProfile.SAMSUNG_SIGNER_SHA256,
-            ),
-            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
-                "com.sec.android.app.sbrowser",
-                "30.0.0.67",
-                BrowserProfile.BASELINE_APK_SHA256,
-                BrowserProfile.SAMSUNG_SIGNER_SHA256,
-            ),
-            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
-                "com.sec.android.app.sbrowser",
-                BrowserProfile.BASELINE_VERSION,
-                "0".repeat(64),
-                BrowserProfile.SAMSUNG_SIGNER_SHA256,
-            ),
-            BrowserArchiveEvidenceScanner.verifiedProfileFeatures(
-                "com.sec.android.app.sbrowser",
-                BrowserProfile.BASELINE_VERSION,
-                BrowserProfile.BASELINE_APK_SHA256,
-                "0".repeat(64),
-            ),
-        ).forEach { assertTrue(it.isEmpty()) }
+        assertFalse("browser.internal-url.extensions-root" in profile.supportedFeatures)
     }
 
     @Test

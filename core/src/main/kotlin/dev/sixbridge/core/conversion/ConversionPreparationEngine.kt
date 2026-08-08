@@ -103,12 +103,20 @@ class ConversionPreparationEngine private constructor(
         profile: BrowserProfile,
         control: AnalysisControl = AnalysisControl(),
     ): AnalyzedConversion {
+        val analysisArchive = when (input.kind) {
+            ExtensionInputKind.ZIP,
+            ExtensionInputKind.SOURCE_DIRECTORY,
+            -> workspace.snapshot(input.canonicalOriginalZip).sourceZip
+            ExtensionInputKind.CRX3,
+            ExtensionInputKind.CHROME_WEB_STORE,
+            -> input.canonicalOriginalZip
+        }
         val analyzed = MobilePatternAnalyzer(
             control = control,
             compatibilityAnalyzer = compatibilityAnalyzer.withControl(control),
             tempTreeFactory = tempTreeFactory,
         )
-            .analyzeArchiveWithIdentity(input.canonicalOriginalZip, profile)
+            .analyzeArchiveWithIdentity(analysisArchive, profile)
         requireCrxManifestBinding(input, analyzed.report)
         val report = retainAnalyzedOriginalExtensionId(
             analyzed.report,

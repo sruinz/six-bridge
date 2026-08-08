@@ -643,8 +643,5 @@ class ConversionPreparationEngineTest {
         supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
-    private fun internalUrlProfile() = profile().copy(
-        supportedFeatures = profile().supportedFeatures +
-            "browser.internal-url.extensions-root",
-    )
+    private fun internalUrlProfile() = profile()
 }

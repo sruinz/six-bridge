@@ -1,19 +1,20 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.core.profile.WrapperContract
+import java.nio.file.Path
+import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 class BrowserInternalUrlMapperTest {
-    private val verifiedProfile = profile(
-        supportedFeatures = setOf("browser.internal-url.extensions-root"),
-    )
+    private val verifiedProfile = profile()
     private val unverified30Profile = profile()
 
     @Test
-    fun `검증 profile은 extensions root 네 개만 verified로 매핑한다`() {
+    fun `extensions root 네 개는 안전한 local 안내로 manual 매핑한다`() {
         val values = listOf(
             "chrome://extensions",
             "chrome://extensions/",
@@ -24,13 +25,36 @@ class BrowserInternalUrlMapperTest {
         values.forEach { value ->
             val rule = BrowserInternalUrlMapper.classify(value, verifiedProfile)
 
-            assertEquals(BrowserInternalUrlStatus.VERIFIED, rule?.status, value)
-            assertEquals("internet://extension", rule?.replacement, value)
+            assertEquals(BrowserInternalUrlStatus.MANUAL, rule?.status, value)
+            assertEquals(
+                "/sixbridge/internal-url-manual-extensions.v1.html",
+                rule?.replacement,
+                value,
+            )
         }
     }
 
     @Test
-    fun `query fragment와 미검증 profile은 자동 매핑하지 않는다`() {
+    fun `Fold7 30 0 0 67 profile은 extensions direct 지원을 선언하지 않고 manual 매핑한다`() {
+        val fold7Profile = BrowserProfileJson.decode(
+            Path.of("../profiles/sbrowser-30.0.0.67.json").readText(),
+        )
+
+        val rule = BrowserInternalUrlMapper.classify(
+            "chrome://extensions",
+            fold7Profile,
+        )
+
+        assertEquals(false, "browser.internal-url.extensions-root" in fold7Profile.supportedFeatures)
+        assertEquals(BrowserInternalUrlStatus.MANUAL, rule?.status)
+        assertEquals(
+            "/sixbridge/internal-url-manual-extensions.v1.html",
+            rule?.replacement,
+        )
+    }
+
+    @Test
+    fun `query와 fragment는 자동 매핑하지 않는다`() {
         assertNull(
             BrowserInternalUrlMapper.classify(
                 "chrome://extensions/?id=x",
@@ -41,12 +65,6 @@ class BrowserInternalUrlMapperTest {
             BrowserInternalUrlMapper.classify(
                 "chrome://extensions#x",
                 verifiedProfile,
-            ),
-        )
-        assertNull(
-            BrowserInternalUrlMapper.classify(
-                "chrome://extensions",
-                unverified30Profile,
             ),
         )
     }

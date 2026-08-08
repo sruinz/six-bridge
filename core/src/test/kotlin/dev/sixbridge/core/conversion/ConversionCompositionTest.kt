@@ -28,7 +28,6 @@ class ConversionCompositionTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         supportedFeatures = setOf(
-            "browser.internal-url.extensions-root",
             "storage.local",
             "extension.options-page.user-accessible",
         ),
@@ -94,7 +93,7 @@ class ConversionCompositionTest {
                     snapshot.workingRoot.resolve("popup.html").readText(),
             )
             assertTrue(
-                "href=\"internet://extension\"" in
+                "href=\"/sixbridge/internal-url-manual-extensions.v1.html\"" in
                     snapshot.workingRoot.resolve("popup.html").readText(),
             )
             assertTrue(

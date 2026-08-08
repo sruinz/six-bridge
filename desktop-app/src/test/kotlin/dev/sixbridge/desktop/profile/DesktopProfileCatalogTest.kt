@@ -87,7 +87,7 @@ class DesktopProfileCatalogTest {
         assertTrue(
             catalog.default().profile?.supportedFeatures?.contains(
                 "browser.internal-url.extensions-root",
-            ) == true,
+            ) == false,
         )
         assertTrue(
             catalog.builtIns()

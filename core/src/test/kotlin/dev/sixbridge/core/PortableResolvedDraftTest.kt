@@ -446,9 +446,6 @@ class PortableResolvedDraftTest {
             sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
             supportedFeatures = setOf("extension.options-page.user-accessible"),
         )
-        val platformProfile = profile.copy(
-            supportedFeatures = profile.supportedFeatures +
-                "browser.internal-url.extensions-root",
-        )
+        val platformProfile = profile
     }
 }

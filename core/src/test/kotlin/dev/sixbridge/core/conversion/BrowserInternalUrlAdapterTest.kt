@@ -23,7 +23,7 @@ import kotlin.test.assertTrue
 
 class BrowserInternalUrlAdapterTest {
     @Test
-    fun `정적 내부 주소는 rule status와 path를 보고한다`() {
+    fun `정적 내부 주소는 manual과 unsupported status와 path를 보고한다`() {
         val report = analyzeFixture(
             html = """
                 <html><head></head><body>
@@ -37,11 +37,9 @@ class BrowserInternalUrlAdapterTest {
             .single { it.id == ADAPTER_ID }
 
         assertTrue(decision.evidence.any {
-            it.relativePath == "popup.html" && "status=verified" in it.detail
-        })
-        assertTrue(decision.evidence.any {
             it.relativePath == "popup.html" && "status=manual" in it.detail
         })
+        assertFalse(decision.evidence.any { "status=verified" in it.detail })
         assertTrue(decision.evidence.any {
             it.relativePath == "popup.html" && "status=unsupported" in it.detail
         })
@@ -120,14 +118,19 @@ class BrowserInternalUrlAdapterTest {
         val script = transformed.resolve("popup.js").readText()
         val options = transformed.resolve("options.html").readText()
 
-        assertTrue("href=\"internet://extension\"" in html)
-        assertTrue("'internet://extension'" in script)
-        assertTrue("\"internet://extension\"" in script)
-        assertTrue("href=\"internet://extension\"" in options)
+        val extensionsGuide = "/sixbridge/internal-url-manual-extensions.v1.html"
+        assertTrue("href=\"$extensionsGuide\"" in html)
+        assertTrue("'$extensionsGuide'" in script)
+        assertTrue("\"$extensionsGuide\"" in script)
+        assertTrue("href=\"$extensionsGuide\"" in options)
+        assertFalse("internet://extension" in html)
+        assertFalse("internet://extension" in script)
+        assertFalse("internet://extension" in options)
         assertTrue("/sixbridge/internal-url-manual-password-manager.v1.html" in html)
         assertTrue("/sixbridge/internal-url-unsupported-flags.v1.html" in html)
         assertTrue("/sixbridge/internal-url-unsupported-inspect.v1.html" in html)
         assertTrue("chrome://extensions/?id=unchanged" in html)
+        assertTrue("chrome://extensions/#details" in html)
         assertTrue("'chrome://' + page" in script)
         assertTrue("chrome://extensions/?id=unchanged" in script)
         assertFalse("chrome://extensions\"" in html)
@@ -165,19 +168,23 @@ class BrowserInternalUrlAdapterTest {
     fun `로컬 안내 asset은 외부 자원과 사용자 데이터 전달 경로가 없다`() {
         val transformed = extract(prepareFixture().transformedSourceZip)
         val assets = listOf(
+            "sixbridge/internal-url-manual-extensions.v1.html",
             "sixbridge/internal-url-manual-password-manager.v1.html",
             "sixbridge/internal-url-unsupported-flags.v1.html",
             "sixbridge/internal-url-unsupported-inspect.v1.html",
         ).map { transformed.resolve(it).readText() }
 
+        assertTrue("<h1>추가 기능 관리 화면을 직접 열 수 없습니다.</h1>" in assets[0])
+        assertTrue("더보기 메뉴에서 추가 기능을 선택해 주세요." in assets[0])
         assertTrue(
-            "<h1>이 브라우저에서는 같은 설정 화면을 자동으로 열 수 없습니다.</h1>" in assets.first(),
+            "<h1>이 브라우저에서는 같은 설정 화면을 자동으로 열 수 없습니다.</h1>" in assets[1],
         )
         assertTrue(
-            "<p>삼성 인터넷 설정에서 해당 항목을 직접 찾아주세요.</p>" in assets.first(),
+            "<p>삼성 인터넷 설정에서 해당 항목을 직접 찾아주세요.</p>" in assets[1],
         )
-        assets.drop(1).forEach { source ->
-            assertTrue("삼성 인터넷 30.0.2.61에서 제공하지 않습니다." in source)
+        assets.drop(2).forEach { source ->
+            assertTrue("현재 삼성 인터넷에서 제공하지 않습니다." in source)
+            assertFalse("30.0.2.61" in source)
             assertTrue("실행을 차단했습니다." in source)
         }
         assets.forEach { source ->
@@ -252,7 +259,7 @@ class BrowserInternalUrlAdapterTest {
                 val popup = root.resolve("popup.html")
                 popup.writeText(
                     popup.readText().replaceFirst(
-                        "internet://extension",
+                        "/sixbridge/internal-url-manual-extensions.v1.html",
                         "chrome://extensions",
                     ),
                 )
@@ -341,7 +348,7 @@ class BrowserInternalUrlAdapterTest {
         wrapperContract = WrapperContract.complete(),
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
-        supportedFeatures = setOf("browser.internal-url.extensions-root"),
+        supportedFeatures = emptySet(),
     )
 
     private companion object {

@@ -757,10 +757,7 @@ class SixDraftReplayTest {
         supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
-    private fun internalUrlProfile() = profile().copy(
-        supportedFeatures = profile().supportedFeatures +
-            "browser.internal-url.extensions-root",
-    )
+    private fun internalUrlProfile() = profile()
 
     private fun readEntries(bytes: ByteArray): LinkedHashMap<String, ByteArray> {
         val entries = linkedMapOf<String, ByteArray>()

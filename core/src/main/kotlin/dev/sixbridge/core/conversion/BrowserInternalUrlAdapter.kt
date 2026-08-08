@@ -458,6 +458,7 @@ internal object BrowserInternalUrlProof {
     )
     private val SCANNED_EXTENSIONS = setOf("html", "js", "mjs", "cjs")
     private val ASSET_PATHS = setOf(
+        "sixbridge/internal-url-manual-extensions.v1.html",
         "sixbridge/internal-url-manual-password-manager.v1.html",
         "sixbridge/internal-url-unsupported-flags.v1.html",
         "sixbridge/internal-url-unsupported-inspect.v1.html",

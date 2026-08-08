@@ -38,6 +38,45 @@ class DefaultConversionRuntimeTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `Android runtime은 일반 ZIP의 analyze와 prepare에 같은 canonical proof를 사용한다`() {
+        val input = temporaryFolder.newFile("noncanonical.zip").apply {
+            outputStream().use { bytes ->
+                ZipOutputStream(bytes).use { output ->
+                    output.putNextEntry(ZipEntry("manifest.json"))
+                    output.write(
+                        """{"manifest_version":3,"name":"ZIP","version":"1"}"""
+                            .encodeToByteArray(),
+                    )
+                    output.closeEntry()
+                    output.putNextEntry(ZipEntry("popup.js"))
+                    output.write("chrome.runtime.getPlatformInfo();".encodeToByteArray())
+                    output.closeEntry()
+                }
+            }
+        }
+        val runtime = DefaultConversionRuntime()
+
+        val analysis = runtime.analyze(
+            input,
+            OnDeviceInputKind.ZIP,
+            profile(),
+            AnalysisControl(),
+        )
+        val prepared = runtime.prepare(
+            input,
+            OnDeviceInputKind.ZIP,
+            profile(),
+            emptySet(),
+        )
+
+        assertEquals(analysis.report.sourceSha256, prepared.reportBefore.sourceSha256)
+        assertEquals(
+            analysis.report.browserProfileSha256,
+            prepared.reportBefore.browserProfileSha256,
+        )
+    }
+
+    @Test
     fun `Android production runtime은 desktop portable draft와 direct ZIP을 동일하게 준비한다`() {
         val draftFile = File(
             "src/androidTest/assets/" +
@@ -350,10 +389,7 @@ class DefaultConversionRuntimeTest {
     )
 
     private fun platformProfile() = profile().copy(
-        supportedFeatures = setOf(
-            "extension.options-page.user-accessible",
-            "browser.internal-url.extensions-root",
-        ),
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
     private fun popupProfile() = profile().copy(

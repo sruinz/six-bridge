@@ -12,12 +12,11 @@ internal data class BrowserInternalUrlRule(
 )
 
 internal object BrowserInternalUrlMapper {
-    fun classify(value: String, profile: BrowserProfile): BrowserInternalUrlRule? {
-        val rule = RULES.firstOrNull { it.original == value } ?: return null
-        return rule.takeIf {
-            it.status != BrowserInternalUrlStatus.VERIFIED ||
-                EXTENSIONS_ROOT_FEATURE in profile.supportedFeatures
-        }
+    fun classify(
+        value: String,
+        @Suppress("UNUSED_PARAMETER") profile: BrowserProfile,
+    ): BrowserInternalUrlRule? {
+        return RULES.firstOrNull { it.original == value }
     }
 
     fun evidenceDetail(rule: BrowserInternalUrlRule): String =
@@ -35,26 +34,26 @@ internal object BrowserInternalUrlMapper {
         BrowserInternalUrlRule(
             id = "extensions.chrome.root",
             original = "chrome://extensions",
-            replacement = "internet://extension",
-            status = BrowserInternalUrlStatus.VERIFIED,
+            replacement = "/sixbridge/internal-url-manual-extensions.v1.html",
+            status = BrowserInternalUrlStatus.MANUAL,
         ),
         BrowserInternalUrlRule(
             id = "extensions.chrome.root-slash",
             original = "chrome://extensions/",
-            replacement = "internet://extension",
-            status = BrowserInternalUrlStatus.VERIFIED,
+            replacement = "/sixbridge/internal-url-manual-extensions.v1.html",
+            status = BrowserInternalUrlStatus.MANUAL,
         ),
         BrowserInternalUrlRule(
             id = "extensions.edge.root",
             original = "edge://extensions",
-            replacement = "internet://extension",
-            status = BrowserInternalUrlStatus.VERIFIED,
+            replacement = "/sixbridge/internal-url-manual-extensions.v1.html",
+            status = BrowserInternalUrlStatus.MANUAL,
         ),
         BrowserInternalUrlRule(
             id = "extensions.edge.root-slash",
             original = "edge://extensions/",
-            replacement = "internet://extension",
-            status = BrowserInternalUrlStatus.VERIFIED,
+            replacement = "/sixbridge/internal-url-manual-extensions.v1.html",
+            status = BrowserInternalUrlStatus.MANUAL,
         ),
         BrowserInternalUrlRule(
             id = "password-manager.chrome.settings",
@@ -75,7 +74,4 @@ internal object BrowserInternalUrlMapper {
             status = BrowserInternalUrlStatus.UNSUPPORTED,
         ),
     )
-
-    private const val EXTENSIONS_ROOT_FEATURE =
-        "browser.internal-url.extensions-root"
 }
