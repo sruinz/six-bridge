@@ -67,6 +67,18 @@ ANDROID_HOME="$android_sdk_root"
 ANDROID_SDK_ROOT="$android_sdk_root"
 export ANDROID_HOME ANDROID_SDK_ROOT
 
+if rg -ni \
+  'nngceckbapebfimnlniiiahkandclblb|dhdgffkkebhmkfjojejmpbldmpobfkfo|bitwarden|tampermonkey' \
+  core/src/main desktop-app/src/main android-manager/src/main; then
+  fail "제품 코드에 특정 확장 분기가 포함되어 있습니다."
+fi
+
+if rg -n \
+  'fetch\(|XMLHttpRequest|chrome\.storage|browser\.storage|\.value\b' \
+  core/src/main/resources/dev/sixbridge/adapters/popup-native-autofill-guard.v1.js; then
+  fail "팝업 보호 asset이 금지된 데이터 또는 네트워크 API를 사용합니다."
+fi
+
 if [ -x "$project_dir/gradlew" ]; then
   gradle_command="$project_dir/gradlew"
 else
@@ -85,6 +97,7 @@ node --test fixtures/minimal-mv3/background.test.mjs \
   fixtures/minimal-mv3/content.test.mjs \
   fixtures/desktop-mobile-golden/selection-bridge.test.mjs \
   fixtures/desktop-mobile-golden/storage-fallback.test.mjs \
+  fixtures/popup-native-autofill-guard/guard-runtime.test.mjs \
   scripts/api-probe-artifact-verify.test.mjs \
   scripts/api-probe-receiver.test.mjs \
   scripts/lan-receiver-evidence.test.mjs \

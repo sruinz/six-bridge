@@ -10,6 +10,9 @@ import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
+import dev.sixbridge.core.wrapper.AndroidToolchain
+import dev.sixbridge.core.wrapper.WrapperApkBuilder
+import dev.sixbridge.core.wrapper.WrapperBuildRequest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -28,6 +31,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.test.fail
 
 class ConversionPreparationEngineTest {
     @Test
@@ -77,6 +81,100 @@ class ConversionPreparationEngineTest {
         assertEquals(first.planSha256, second.planSha256)
         assertEquals(first.transformedSourceSha256, second.transformedSourceSha256)
         assertEquals(first.originalSourceSha256, second.originalSourceSha256)
+    }
+
+    @Test
+    fun `두 선택 adapter 조합은 동일 report와 provenance로 재변환된다`() {
+        val input = PortableExtensionInput.fromZip(
+            kind = ExtensionInputKind.ZIP,
+            zipBytes = popupAndInternalUrlFixtureZip(),
+        )
+        val approvals = setOf("popup-native-autofill-guard")
+
+        val first = ConversionPreparationEngine().use {
+            it.prepare(input, internalUrlProfile(), approvals)
+        }
+        val second = ConversionPreparationEngine().use {
+            it.prepare(input, internalUrlProfile(), approvals)
+        }
+
+        assertEquals(first.compatibilityAfter, second.compatibilityAfter)
+        assertEquals(
+            setOf("browser-internal-url-mapper", "popup-native-autofill-guard"),
+            first.appliedAdapterIds,
+        )
+        assertEquals(first.appliedAdapterIds, second.appliedAdapterIds)
+        assertEquals(first.transformedSourceSha256, second.transformedSourceSha256)
+        assertTrue(first.originalSourceSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(first.browserProfileSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(first.transformedSourceSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(first.compatibilityAfter.adapterDecisions.all { decision ->
+            decision.evidence.none { evidence ->
+                val detail = evidence.detail.lowercase()
+                "value=" in detail || "cookie=" in detail || "visitedurl=" in detail
+            }
+        })
+
+        val signingKey = keyPair()
+        val boundFirst = ConversionPreparationEngine().use {
+            it.bindIdentity(first, internalUrlProfile(), signingKey.public.encoded)
+        }
+        val boundSecond = ConversionPreparationEngine().use {
+            it.bindIdentity(second, internalUrlProfile(), signingKey.public.encoded)
+        }
+        val crxFirst = Crx3.packCanonicalZip(boundFirst.sourceZip, signingKey)
+        val crxSecond = Crx3.packCanonicalZip(boundSecond.sourceZip, signingKey)
+        assertEquals(boundFirst.extensionId, boundSecond.extensionId)
+        assertEquals(crxFirst.extensionId, crxSecond.extensionId)
+
+        val sdk = AndroidToolchain.locateOrNull()
+            ?: fail("Android SDK 도구가 없어 wrapper 결정성 검증을 실행할 수 없습니다.")
+        val wrapperRoot = Files.createTempDirectory("six-platform-wrapper-local")
+        val wrapperOutputs = Files.createTempDirectory("six-platform-wrapper-output")
+        val wrapperBuilder = WrapperApkBuilder(sdk, wrapperRoot)
+        val wrapperFirst = wrapperBuilder.build(
+            WrapperBuildRequest(
+                crxFirst.extensionId,
+                "Platform Fixture",
+                crxFirst.bytes,
+                wrapperOutputs.resolve("first.apk"),
+            ),
+        )
+        val wrapperSecond = wrapperBuilder.build(
+            WrapperBuildRequest(
+                crxSecond.extensionId,
+                "Platform Fixture",
+                crxSecond.bytes,
+                wrapperOutputs.resolve("second.apk"),
+            ),
+        )
+        assertEquals(wrapperFirst.packageName, wrapperSecond.packageName)
+        assertEquals(wrapperFirst.signerSha256, wrapperSecond.signerSha256)
+    }
+
+    @Test
+    fun `popup 원본 유지는 source를 변경하지 않고 partial report를 보존한다`() {
+        val source = popupOnlyFixtureZip()
+        val input = PortableExtensionInput.fromZip(ExtensionInputKind.ZIP, source)
+
+        val prepared = ConversionPreparationEngine().use {
+            it.prepare(input, profile(), emptySet())
+        }
+
+        assertContentEquals(source, prepared.transformedSourceZip)
+        assertTrue(prepared.appliedAdapterIds.isEmpty())
+        assertEquals(
+            dev.sixbridge.core.compat.CompatibilityStatus.PARTIAL,
+            prepared.compatibilityBefore.status,
+        )
+        assertEquals(
+            dev.sixbridge.core.compat.CompatibilityStatus.PARTIAL,
+            prepared.compatibilityAfter.status,
+        )
+        assertEquals(
+            prepared.compatibilityBefore.adapterDecisions,
+            prepared.compatibilityAfter.adapterDecisions,
+        )
     }
 
     @Test
@@ -448,6 +546,54 @@ class ConversionPreparationEngineTest {
         return ExtensionZip.createBytes(root, includeProjectMarker = true)
     }
 
+    private fun popupAndInternalUrlFixtureZip(): ByteArray {
+        val root = Files.createTempDirectory("six-platform-popup-url")
+        root.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Platform Fixture",
+              "version": "1",
+              "action": { "default_popup": "popup.html" },
+              "options_ui": { "page": "options.html", "open_in_tab": true }
+            }
+            """.trimIndent(),
+        )
+        root.resolve("popup.html").writeText(
+            """
+            <!doctype html><html><head><script src="popup.js"></script></head>
+            <body><input type="email"><a href="chrome://extensions">add-ons</a></body></html>
+            """.trimIndent(),
+        )
+        root.resolve("popup.js").writeText("const addOns = 'edge://extensions/';")
+        root.resolve("options.html").writeText(
+            "<!doctype html><html><head></head><body>options</body></html>",
+        )
+        return ExtensionZip.createBytes(root, includeProjectMarker = true)
+    }
+
+    private fun popupOnlyFixtureZip(): ByteArray {
+        val root = Files.createTempDirectory("six-platform-popup-only")
+        root.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Popup Only Fixture",
+              "version": "1",
+              "action": { "default_popup": "popup.html" },
+              "options_ui": { "page": "options.html", "open_in_tab": true }
+            }
+            """.trimIndent(),
+        )
+        root.resolve("popup.html").writeText(
+            "<!doctype html><html><head></head><body><input type=\"email\"></body></html>",
+        )
+        root.resolve("options.html").writeText(
+            "<!doctype html><html><head></head><body>options</body></html>",
+        )
+        return ExtensionZip.createBytes(root, includeProjectMarker = true)
+    }
+
     private fun plainFixtureZip(
         name: String = "Plain",
         projectMarker: String? = null,
@@ -490,5 +636,10 @@ class ConversionPreparationEngineTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         supportedFeatures = setOf("extension.options-page.user-accessible"),
+    )
+
+    private fun internalUrlProfile() = profile().copy(
+        supportedFeatures = profile().supportedFeatures +
+            "browser.internal-url.extensions-root",
     )
 }

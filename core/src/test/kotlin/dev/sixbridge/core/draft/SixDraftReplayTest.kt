@@ -34,6 +34,45 @@ import kotlin.test.assertTrue
 
 class SixDraftReplayTest {
     @Test
+    fun `portable draft replay는 두 adapter의 직접 변환과 같은 canonical 결과를 만든다`() {
+        val profile = internalUrlProfile()
+        val source = popupAndInternalUrlFixtureZip()
+        val approvals = setOf("popup-native-autofill-guard")
+        val portable = portableV2Draft(source, profile, approvals)
+
+        val replayed = assertIs<DraftReplayResult.Ready>(
+            SixDraftReplay().replay(portable.draft, profile, approvals),
+        ).prepared
+
+        assertEquals(portable.direct.compatibilityAfter, replayed.compatibilityAfter)
+        assertEquals(portable.direct.appliedAdapterIds, replayed.appliedAdapterIds)
+        assertEquals(
+            setOf("browser-internal-url-mapper", "popup-native-autofill-guard"),
+            replayed.appliedAdapterIds,
+        )
+        assertEquals(
+            portable.direct.transformedSourceSha256,
+            replayed.transformedSourceSha256,
+        )
+    }
+
+    @Test
+    fun `portable draft의 popup 원본 유지는 빈 승인과 동일 report를 재생한다`() {
+        val profile = profile()
+        val source = popupOnlyFixtureZip()
+        val portable = portableV2Draft(source, profile, emptySet())
+
+        val replayed = assertIs<DraftReplayResult.Ready>(
+            SixDraftReplay().replay(portable.draft, profile, emptySet()),
+        ).prepared
+
+        assertTrue(portable.direct.appliedAdapterIds.isEmpty())
+        assertTrue(replayed.appliedAdapterIds.isEmpty())
+        assertEquals(portable.direct.compatibilityAfter, replayed.compatibilityAfter)
+        assertContentEquals(source, replayed.transformedSourceZip)
+    }
+
+    @Test
     fun `schema v2 converted draft reruns the signed original in the current core`() {
         val fixture = convertedV2Fixture(
             sourceIdentity = "project:signed-identity",
@@ -421,6 +460,105 @@ class SixDraftReplayTest {
         )
     }
 
+    private fun portableV2Draft(
+        source: ByteArray,
+        profile: BrowserProfile,
+        approvals: Set<String>,
+    ): PortablePlatformFixture {
+        val sourceIdentity = "project:${"d".repeat(32)}"
+        val direct = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    kind = ExtensionInputKind.ZIP,
+                    zipBytes = source,
+                    signedDraftSourceIdentity = sourceIdentity,
+                ),
+                profile,
+                approvals,
+            )
+        }
+        val selected = direct.compatibilityAfter.adapterDecisions
+            .filter { it.applied }
+            .map { DraftSelectedAdapter(it.id, it.version) }
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                coreVersion = "platform-parity-test",
+                adapterVersions = selected.associate { it.id to it.version },
+                sourceIdentity = sourceIdentity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = direct.originalSourceSha256,
+                browserProfileSha256 = direct.browserProfileSha256,
+                originalExtensionId = direct.originalExtensionId,
+                originalExtensionVersion = requireNotNull(
+                    direct.compatibilityBefore.extensionVersion,
+                ),
+                sourceIdentity = sourceIdentity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(
+                direct.compatibilityBefore,
+                selected,
+            ),
+            compatibilityBefore = direct.compatibilityBefore,
+            compatibilityAfter = direct.compatibilityAfter,
+        )
+        return PortablePlatformFixture(
+            draft = SixDraft.read(SixDraft.createBytes(payload, ed25519())),
+            direct = direct,
+        )
+    }
+
+    private fun popupAndInternalUrlFixtureZip(): ByteArray {
+        val root = Files.createTempDirectory("six-draft-platform-popup-url")
+        root.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Portable Platform Fixture",
+              "version": "1",
+              "action": { "default_popup": "popup.html" },
+              "options_ui": { "page": "options.html", "open_in_tab": true }
+            }
+            """.trimIndent(),
+        )
+        root.resolve("popup.html").writeText(
+            """
+            <!doctype html><html><head><script src="popup.js"></script></head>
+            <body><input type="email"><a href="chrome://extensions">add-ons</a></body></html>
+            """.trimIndent(),
+        )
+        root.resolve("popup.js").writeText("const addOns = 'edge://extensions/';")
+        root.resolve("options.html").writeText(
+            "<!doctype html><html><head></head><body>options</body></html>",
+        )
+        return ExtensionZip.createBytes(root, includeProjectMarker = true)
+    }
+
+    private fun popupOnlyFixtureZip(): ByteArray {
+        val root = Files.createTempDirectory("six-draft-platform-popup-only")
+        root.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Portable Popup Only Fixture",
+              "version": "1",
+              "action": { "default_popup": "popup.html" },
+              "options_ui": { "page": "options.html", "open_in_tab": true }
+            }
+            """.trimIndent(),
+        )
+        root.resolve("popup.html").writeText(
+            "<!doctype html><html><head></head><body><input type=\"email\"></body></html>",
+        )
+        root.resolve("options.html").writeText(
+            "<!doctype html><html><head></head><body>options</body></html>",
+        )
+        return ExtensionZip.createBytes(root, includeProjectMarker = true)
+    }
+
     private fun portablePassthroughV2Fixture(): Fixture {
         val profile = profile()
         val sourceIdentity = "project:portable-passthrough"
@@ -619,6 +757,11 @@ class SixDraftReplayTest {
         supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
+    private fun internalUrlProfile() = profile().copy(
+        supportedFeatures = profile().supportedFeatures +
+            "browser.internal-url.extensions-root",
+    )
+
     private fun readEntries(bytes: ByteArray): LinkedHashMap<String, ByteArray> {
         val entries = linkedMapOf<String, ByteArray>()
         ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
@@ -700,6 +843,11 @@ class SixDraftReplayTest {
         val profile: BrowserProfile,
         val signingKey: KeyPair,
         val embeddedMarker: String,
+    )
+
+    private data class PortablePlatformFixture(
+        val draft: VerifiedSixDraft,
+        val direct: dev.sixbridge.core.conversion.PreparedConversion,
     )
 
     private data class LegacyCrxFixture(

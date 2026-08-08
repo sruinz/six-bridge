@@ -833,6 +833,101 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
+    fun portableDraftReplayMatchesDirectAndroidPreparationForBothAdapters() {
+        val sourceIdentity = "project:${"e".repeat(32)}"
+        val source = platformFixtureZip(includeInternalUrls = true)
+        val profile = internalUrlProfile()
+        val approvals = setOf("popup-native-autofill-guard")
+        val direct = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    kind = ExtensionInputKind.ZIP,
+                    zipBytes = source,
+                    signedDraftSourceIdentity = sourceIdentity,
+                ),
+                profile,
+                approvals,
+            )
+        }
+        val selected = direct.compatibilityAfter.adapterDecisions
+            .filter { it.applied }
+            .map { DraftSelectedAdapter(it.id, it.version) }
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                coreVersion = "android-platform-parity",
+                adapterVersions = selected.associate { it.id to it.version },
+                sourceIdentity = sourceIdentity,
+            ),
+            input = DraftInputMetadata(
+                inputKind = ExtensionInputKind.ZIP,
+                originalSourceSha256 = direct.originalSourceSha256,
+                browserProfileSha256 = direct.browserProfileSha256,
+                originalExtensionId = direct.originalExtensionId,
+                originalExtensionVersion = requireNotNull(
+                    direct.compatibilityBefore.extensionVersion,
+                ),
+                sourceIdentity = sourceIdentity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(direct.compatibilityBefore, selected),
+            compatibilityBefore = direct.compatibilityBefore,
+            compatibilityAfter = direct.compatibilityAfter,
+        )
+        val draft = SixDraft.read(
+            SixDraft.createBytes(
+                payload,
+                KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
+            ),
+        )
+        val replayed = (SixDraftReplay().replay(
+            draft = draft,
+            profile = profile,
+            approvedAdapterIds = approvals,
+        ) as DraftReplayResult.Ready).prepared
+
+        assertEquals(direct.compatibilityAfter, replayed.compatibilityAfter)
+        assertEquals(direct.appliedAdapterIds, replayed.appliedAdapterIds)
+        assertEquals(
+            setOf("browser-internal-url-mapper", "popup-native-autofill-guard"),
+            replayed.appliedAdapterIds,
+        )
+        assertEquals(direct.transformedSourceSha256, replayed.transformedSourceSha256)
+        assertTrue(direct.originalSourceSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(direct.browserProfileSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(direct.transformedSourceSha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(direct.compatibilityAfter.adapterDecisions.all { decision ->
+            decision.evidence.none { evidence ->
+                val detail = evidence.detail.lowercase()
+                "value=" in detail || "cookie=" in detail || "visitedurl=" in detail
+            }
+        })
+    }
+
+    @Test
+    fun originalPopupChoiceIsNoOpOnAndroid() {
+        val source = platformFixtureZip(includeInternalUrls = false)
+        val prepared = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(ExtensionInputKind.ZIP, source),
+                profile(),
+                emptySet(),
+            )
+        }
+
+        assertArrayEquals(source, prepared.transformedSourceZip)
+        assertTrue(prepared.appliedAdapterIds.isEmpty())
+        assertEquals(
+            prepared.compatibilityBefore.status,
+            prepared.compatibilityAfter.status,
+        )
+        assertEquals(
+            prepared.compatibilityBefore.adapterDecisions,
+            prepared.compatibilityAfter.adapterDecisions,
+        )
+    }
+
+    @Test
     fun staticExtensionApiAliasResolverInitializesAndResolvesAliasOnAndroid() {
         val root = Files.createTempDirectory(targetContext.cacheDir.toPath(), "alias-android-")
         try {
@@ -1015,6 +1110,54 @@ class CoreConversionRuntimeInstrumentedTest {
             }
             output.toByteArray()
         }
+
+    private fun platformFixtureZip(includeInternalUrls: Boolean): ByteArray {
+        val cacheRoot = targetContext.cacheDir.toPath()
+        Files.createDirectories(cacheRoot)
+        val root = Files.createTempDirectory(cacheRoot, "sixbridge-platform-parity-")
+        return try {
+            Files.write(
+                root.resolve("manifest.json"),
+                """
+                {
+                  "manifest_version": 3,
+                  "name": "Android Platform Fixture",
+                  "version": "1",
+                  "action": { "default_popup": "popup.html" },
+                  "options_ui": { "page": "options.html", "open_in_tab": true }
+                }
+                """.trimIndent().encodeToByteArray(),
+            )
+            val link = if (includeInternalUrls) {
+                "<a href=\"chrome://extensions\">add-ons</a>"
+            } else {
+                ""
+            }
+            Files.write(
+                root.resolve("popup.html"),
+                (
+                    "<!doctype html><html><head><script src=\"popup.js\"></script></head>" +
+                        "<body><input type=\"email\">$link</body></html>"
+                    ).encodeToByteArray(),
+            )
+            Files.write(
+                root.resolve("popup.js"),
+                (if (includeInternalUrls) {
+                    "const addOns = 'edge://extensions/';"
+                } else {
+                    "const ready = true;"
+                }).encodeToByteArray(),
+            )
+            Files.write(
+                root.resolve("options.html"),
+                "<!doctype html><html><head></head><body>options</body></html>"
+                    .encodeToByteArray(),
+            )
+            ExtensionZip.createBytes(root, includeProjectMarker = true)
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
 
     private fun canonicalAssetZip(directory: String): ByteArray {
         val cacheRoot = targetContext.cacheDir.toPath()
@@ -1292,6 +1435,11 @@ class CoreConversionRuntimeInstrumentedTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
         supportedFeatures = setOf("extension.options-page.user-accessible"),
+    )
+
+    private fun internalUrlProfile() = profile().copy(
+        supportedFeatures = profile().supportedFeatures +
+            "browser.internal-url.extensions-root",
     )
 
     private fun sha256(bytes: ByteArray): String =
