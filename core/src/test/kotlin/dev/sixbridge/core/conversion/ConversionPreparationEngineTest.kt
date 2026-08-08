@@ -131,25 +131,30 @@ class ConversionPreparationEngineTest {
             ?: fail("Android SDK 도구가 없어 wrapper 결정성 검증을 실행할 수 없습니다.")
         val wrapperRoot = Files.createTempDirectory("six-platform-wrapper-local")
         val wrapperOutputs = Files.createTempDirectory("six-platform-wrapper-output")
-        val wrapperBuilder = WrapperApkBuilder(sdk, wrapperRoot)
-        val wrapperFirst = wrapperBuilder.build(
-            WrapperBuildRequest(
-                crxFirst.extensionId,
-                "Platform Fixture",
-                crxFirst.bytes,
-                wrapperOutputs.resolve("first.apk"),
-            ),
-        )
-        val wrapperSecond = wrapperBuilder.build(
-            WrapperBuildRequest(
-                crxSecond.extensionId,
-                "Platform Fixture",
-                crxSecond.bytes,
-                wrapperOutputs.resolve("second.apk"),
-            ),
-        )
-        assertEquals(wrapperFirst.packageName, wrapperSecond.packageName)
-        assertEquals(wrapperFirst.signerSha256, wrapperSecond.signerSha256)
+        try {
+            val wrapperBuilder = WrapperApkBuilder(sdk, wrapperRoot)
+            val wrapperFirst = wrapperBuilder.build(
+                WrapperBuildRequest(
+                    crxFirst.extensionId,
+                    "Platform Fixture",
+                    crxFirst.bytes,
+                    wrapperOutputs.resolve("first.apk"),
+                ),
+            )
+            val wrapperSecond = wrapperBuilder.build(
+                WrapperBuildRequest(
+                    crxSecond.extensionId,
+                    "Platform Fixture",
+                    crxSecond.bytes,
+                    wrapperOutputs.resolve("second.apk"),
+                ),
+            )
+            assertEquals(wrapperFirst.packageName, wrapperSecond.packageName)
+            assertEquals(wrapperFirst.signerSha256, wrapperSecond.signerSha256)
+        } finally {
+            wrapperOutputs.toFile().deleteRecursively()
+            wrapperRoot.toFile().deleteRecursively()
+        }
     }
 
     @Test

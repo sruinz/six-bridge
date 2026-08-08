@@ -26,18 +26,30 @@ new_fixture() {
     mkdir -p \
         "${fixture_dir}/scripts" \
         "${fixture_dir}/fake-bin" \
+        "${fixture_dir}/core/src/main/resources/dev/sixbridge/adapters" \
+        "${fixture_dir}/desktop-app/src/main" \
+        "${fixture_dir}/android-manager/src/main" \
         "${fixture_dir}/jdk/bin" \
         "${fixture_dir}/sdk/platforms/android-36" \
         "${fixture_dir}/sdk/build-tools/36.0.0" \
         "${fixture_dir}/sdk/cmdline-tools/latest/bin"
     cp "${VERIFY_SCRIPT}" "${fixture_dir}/scripts/verify.sh"
     chmod +x "${fixture_dir}/scripts/verify.sh"
+    cp \
+        "${ROOT_DIR}/core/src/main/resources/dev/sixbridge/adapters/popup-native-autofill-guard.v1.js" \
+        "${fixture_dir}/core/src/main/resources/dev/sixbridge/adapters/"
     printf '#!/bin/sh\nexit 0\n' \
         >"${fixture_dir}/scripts/android-wrapper-template.test.sh"
     chmod +x "${fixture_dir}/scripts/android-wrapper-template.test.sh"
     printf '#!/bin/sh\nexit 0\n' \
         >"${fixture_dir}/scripts/fold7-ondevice-packager-gate.test.sh"
     chmod +x "${fixture_dir}/scripts/fold7-ondevice-packager-gate.test.sh"
+    printf '#!/bin/sh\nexit 0\n' \
+        >"${fixture_dir}/scripts/fold7-core-conversion-gate.test.sh"
+    chmod +x "${fixture_dir}/scripts/fold7-core-conversion-gate.test.sh"
+    printf '#!/bin/sh\nexit 0\n' \
+        >"${fixture_dir}/scripts/fold7-ondevice-conversion-flow.test.sh"
+    chmod +x "${fixture_dir}/scripts/fold7-ondevice-conversion-flow.test.sh"
 
     for script_name in \
         fold7-gate.sh \
@@ -99,13 +111,83 @@ apply_fixture_tools() {
         '#!/bin/sh' \
         'printf "bash %s\n" "$*" >>"$COMMAND_LOG"' \
         >"${fixture_dir}/fake-bin/bash"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'case "${SIXBRIDGE_TEST_RG_RESULT:-nomatch}" in' \
+        '  match) printf "fixture forbidden match\n"; exit 0;;' \
+        '  error) printf "fixture rg error\n" >&2; exit 2;;' \
+        '  delegate) exec "$SIXBRIDGE_REAL_RG" "$@";;' \
+        '  *) exit 1;;' \
+        'esac' \
+        >"${fixture_dir}/fake-bin/rg"
     chmod +x \
         "${fixture_dir}/jdk/bin/"* \
         "${fixture_dir}/fake-bin/gradle" \
         "${fixture_dir}/fake-bin/node" \
         "${fixture_dir}/fake-bin/bash" \
+        "${fixture_dir}/fake-bin/rg" \
         "${fixture_dir}/sdk/build-tools/36.0.0/"* \
         "${fixture_dir}/sdk/cmdline-tools/latest/bin/apkanalyzer"
+}
+
+test_verify_rejects_missing_rg() {
+    local fixture_dir
+    local output_file
+
+    fixture_dir="$(new_fixture)"
+    output_file="${fixture_dir}/missing-rg.txt"
+    rm -f -- "${fixture_dir}/fake-bin/rg"
+
+    if run_fixture_verify "${fixture_dir}" "${output_file}"; then
+        fail "rg가 없는데 verify.sh가 성공했습니다."
+    fi
+    assert_contains "${output_file}" "rg" \
+        "rg 누락 오류가 필요한 명령을 설명하지 않았습니다."
+    rm -rf -- "${fixture_dir}"
+}
+
+test_verify_rejects_rg_scan_error() {
+    local fixture_dir
+    local output_file
+
+    fixture_dir="$(new_fixture)"
+    output_file="${fixture_dir}/rg-error.txt"
+
+    if SIXBRIDGE_TEST_RG_RESULT=error \
+        run_fixture_verify "${fixture_dir}" "${output_file}"; then
+        fail "rg scan 오류인데 verify.sh가 성공했습니다."
+    fi
+    assert_contains "${output_file}" "검사" \
+        "rg scan 실패 원인이 한글 오류에 없습니다."
+    rm -rf -- "${fixture_dir}"
+}
+
+test_verify_rejects_guard_forbidden_syntax_variants() {
+    local fixture_dir
+    local output_file
+    local real_rg
+    local source
+
+    real_rg="$(command -v rg)"
+    for source in \
+        "fetch ('/upload')" \
+        "chrome?.storage" \
+        "browser['storage']" \
+        "input?.value" \
+        "input['value']"; do
+        fixture_dir="$(new_fixture)"
+        output_file="${fixture_dir}/guard-static.txt"
+        printf '%s\n' "${source}" \
+            >"${fixture_dir}/core/src/main/resources/dev/sixbridge/adapters/popup-native-autofill-guard.v1.js"
+
+        if SIXBRIDGE_TEST_RG_RESULT=delegate SIXBRIDGE_REAL_RG="${real_rg}" \
+            run_fixture_verify "${fixture_dir}" "${output_file}"; then
+            fail "금지 구문을 포함한 popup guard가 검증을 통과했습니다: ${source}"
+        fi
+        assert_contains "${output_file}" "팝업 보호 asset" \
+            "popup guard 금지 구문 오류가 정적 경계를 설명하지 않았습니다."
+        rm -rf -- "${fixture_dir}"
+    done
 }
 
 run_fixture_verify() {
@@ -444,6 +526,9 @@ test_gitignore_excludes_local_release_outputs() {
 }
 
 test_verify_runs_android_contract
+test_verify_rejects_missing_rg
+test_verify_rejects_rg_scan_error
+test_verify_rejects_guard_forbidden_syntax_variants
 test_verify_rejects_missing_sdk
 test_verify_rejects_platform_without_android_jar
 test_verify_rejects_missing_sdk_tools

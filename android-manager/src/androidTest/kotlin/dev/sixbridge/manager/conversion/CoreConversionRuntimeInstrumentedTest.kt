@@ -28,6 +28,7 @@ import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
 import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.PreparedConversion
 import dev.sixbridge.core.draft.DraftConversionPlan
 import dev.sixbridge.core.draft.DraftInputMetadata
 import dev.sixbridge.core.draft.DraftMetadata
@@ -902,6 +903,56 @@ class CoreConversionRuntimeInstrumentedTest {
                 "value=" in detail || "cookie=" in detail || "visitedurl=" in detail
             }
         })
+    }
+
+    @Test
+    fun desktopPortableDraftMatchesAndroidProductionRuntime() {
+        val draftFile = File(
+            targetContext.cacheDir,
+            "popup-autofill-internal-url-platform.sixdraft",
+        )
+        testContext.assets.open(
+            "popup-autofill-internal-url-platform.sixdraft",
+        ).use { input ->
+            draftFile.outputStream().use(input::copyTo)
+        }
+        val verified = SixDraft.read(draftFile.toPath())
+        val sourceZip = File(targetContext.cacheDir, "platform-source.zip").apply {
+            writeBytes(verified.payload.source)
+        }
+        val approvals = setOf("popup-native-autofill-guard")
+        val runtime = DefaultConversionRuntime()
+
+        val direct = runtime.prepare(
+            sourceZip,
+            OnDeviceInputKind.ZIP,
+            internalUrlProfile(),
+            approvals,
+        )
+        val replayed = runtime.prepare(
+            draftFile,
+            OnDeviceInputKind.SIX_DRAFT,
+            internalUrlProfile(),
+            approvals,
+        )
+        val directPrepared = direct.opaque as PreparedConversion
+        val replayedPrepared = replayed.opaque as PreparedConversion
+
+        assertEquals(direct.reportBefore, replayed.reportBefore)
+        assertEquals(direct.originalSourceSha256, replayed.originalSourceSha256)
+        assertEquals(direct.planSha256, replayed.planSha256)
+        assertArrayEquals(direct.transformedSourceZip, replayed.transformedSourceZip)
+        assertEquals(
+            directPrepared.compatibilityAfter,
+            replayedPrepared.compatibilityAfter,
+        )
+        assertEquals(
+            setOf("browser-internal-url-mapper", "popup-native-autofill-guard"),
+            replayedPrepared.appliedAdapterIds,
+        )
+        val reports = verified.payload.compatibilityBeforeJson.decodeToString() +
+            verified.payload.compatibilityAfterJson.decodeToString()
+        assertFalse(reports.contains("SIX_PRIVATE_SENTINEL_DO_NOT_LOG"))
     }
 
     @Test

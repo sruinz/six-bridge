@@ -4,6 +4,7 @@ import com.google.common.jimfs.Configuration
 import com.google.common.jimfs.Jimfs
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.BuildPublicationFaultInjection
+import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.MobilePatternAnalyzer
 import dev.sixbridge.core.conversion.SecureBuildPublisher
@@ -21,6 +22,7 @@ import dev.sixbridge.core.input.ResolvedExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.nio.file.Files
+import java.nio.file.Path
 import java.security.KeyPairGenerator
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -33,6 +35,122 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class PortableResolvedDraftTest {
+    @Test
+    fun `public portable draft는 Android production runtime용 canonical fixture와 같다`() {
+        SecureFixture().use { fixture ->
+            fixture.draftPortableResolved(
+                resolved = fixture.platformResolved,
+                projectIdentity = fixture.projectIdentity,
+                profile = platformProfile,
+                approvedAdapterIds = setOf(
+                    MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
+                ),
+            )
+            val desktop = SixDraft.read(fixture.output)
+            val androidAsset = SixDraft.read(platformDraftAsset)
+
+            assertContentEquals(androidAsset.payload.source, desktop.payload.source)
+            assertContentEquals(
+                androidAsset.payload.conversionPlanJson,
+                desktop.payload.conversionPlanJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.compatibilityBeforeJson,
+                desktop.payload.compatibilityBeforeJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.compatibilityAfterJson,
+                desktop.payload.compatibilityAfterJson,
+            )
+            assertContentEquals(
+                androidAsset.payload.expectedJson,
+                desktop.payload.expectedJson,
+            )
+            assertEquals(
+                listOf(
+                    DraftSelectedAdapter(
+                        MobilePatternAnalyzer.BROWSER_INTERNAL_URL_MAPPER,
+                        1,
+                    ),
+                    DraftSelectedAdapter(
+                        MobilePatternAnalyzer.POPUP_NATIVE_AUTOFILL_GUARD,
+                        1,
+                    ),
+                ),
+                desktop.payload.plan.selectedAdapters,
+            )
+            assertEquals(
+                desktop.payload.input.originalSourceSha256,
+                desktop.payload.compatibilityBefore.sourceSha256,
+            )
+            assertEquals(
+                desktop.payload.expected.transformedSourceSha256,
+                desktop.payload.compatibilityAfter.sourceSha256,
+            )
+            assertEquals(
+                desktop.payload.input.browserProfileSha256,
+                desktop.payload.compatibilityBefore.browserProfileSha256,
+            )
+            assertEquals(
+                desktop.payload.input.browserProfileSha256,
+                desktop.payload.compatibilityAfter.browserProfileSha256,
+            )
+            assertEquals(
+                desktop.payload.compatibilityBefore.sourceSha256,
+                desktop.payload.plan.reportSourceSha256,
+            )
+            assertEquals(
+                desktop.payload.compatibilityBefore.browserProfileSha256,
+                desktop.payload.plan.browserProfileSha256,
+            )
+            assertEquals(
+                desktop.payload.plan.planSha256,
+                desktop.payload.expected.planSha256,
+            )
+            assertEquals(
+                desktop.payload.input.originalSourceSha256,
+                desktop.payload.expected.originalSourceSha256,
+            )
+            assertFalse(
+                listOf(
+                    desktop.payload.conversionPlanJson,
+                    desktop.payload.compatibilityBeforeJson,
+                    desktop.payload.compatibilityAfterJson,
+                    desktop.payload.expectedJson,
+                ).joinToString(separator = "") { it.decodeToString() }
+                    .contains(PRIVATE_SENTINEL),
+            )
+        }
+    }
+
+    @Test
+    fun `popup 원본 유지 portable draft는 passthrough와 빈 signed plan을 보존한다`() {
+        SecureFixture().use { fixture ->
+            fixture.draftPortableResolved(
+                resolved = fixture.popupGuardResolved,
+                projectIdentity = fixture.projectIdentity,
+                profile = profile,
+                approvedAdapterIds = emptySet(),
+            )
+            val verified = SixDraft.read(fixture.output)
+
+            assertEquals(ConversionState.PASSTHROUGH, verified.payload.compatibilityAfter.conversionState)
+            assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
+            assertEquals(
+                verified.payload.input.originalSourceSha256,
+                verified.payload.expected.transformedSourceSha256,
+            )
+            assertEquals(
+                verified.payload.compatibilityBefore.status,
+                verified.payload.compatibilityAfter.status,
+            )
+            assertEquals(
+                verified.payload.compatibilityBefore.adapterDecisions,
+                verified.payload.compatibilityAfter.adapterDecisions,
+            )
+        }
+    }
+
     @Test
     fun `public portable draft는 secure root와 output이 같은 provider여도 guarded publisher를 사용한다`() {
         SecureFixture().use { fixture ->
@@ -189,6 +307,16 @@ class PortableResolvedDraftTest {
             originalInput = source.toString(),
             sourceRoot = source,
         )
+        val platformResolved = ResolvedExtensionInput(
+            kind = ExtensionInputKind.SOURCE_DIRECTORY,
+            originalInput = platformSource.toString(),
+            sourceRoot = platformSource,
+        )
+        val popupGuardResolved = ResolvedExtensionInput(
+            kind = ExtensionInputKind.SOURCE_DIRECTORY,
+            originalInput = popupGuardSource.toString(),
+            sourceRoot = popupGuardSource,
+        )
         private val popupSource = Files.createTempDirectory(
             "six-portable-popup-source",
         ).also {
@@ -266,6 +394,15 @@ class PortableResolvedDraftTest {
     }
 
     private companion object {
+        private const val PRIVATE_SENTINEL = "SIX_PRIVATE_SENTINEL_DO_NOT_LOG"
+        private val platformSource =
+            Path.of("../fixtures/popup-autofill-internal-url-platform")
+        private val popupGuardSource =
+            Path.of("../fixtures/popup-native-autofill-guard")
+        private val platformDraftAsset = Path.of(
+            "../android-manager/src/androidTest/assets/" +
+                "popup-autofill-internal-url-platform.sixdraft",
+        )
         val profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",
             versionName = BrowserProfile.BASELINE_VERSION,
@@ -276,6 +413,10 @@ class PortableResolvedDraftTest {
             sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
             sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
             supportedFeatures = setOf("extension.options-page.user-accessible"),
+        )
+        val platformProfile = profile.copy(
+            supportedFeatures = profile.supportedFeatures +
+                "browser.internal-url.extensions-root",
         )
     }
 }

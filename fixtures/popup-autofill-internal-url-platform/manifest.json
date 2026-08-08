@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "SIX Platform Parity Fixture",
+  "version": "1",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html"
+}

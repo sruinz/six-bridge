@@ -9,6 +9,21 @@ fail() {
   exit 1
 }
 
+reject_rg_matches() {
+  label=$1
+  shift
+  if matches=$(rg "$@" 2>&1); then
+    printf '%s\n' "$matches" >&2
+    fail "$label"
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      printf '%s\n' "$matches" >&2
+      fail "정적 검사를 실행하지 못했습니다: $label"
+    fi
+  fi
+}
+
 default_java_home="${SIXBRIDGE_DEFAULT_JAVA_HOME:-/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home}"
 default_android_home="/opt/homebrew/share/android-commandlinetools"
 
@@ -67,17 +82,25 @@ ANDROID_HOME="$android_sdk_root"
 ANDROID_SDK_ROOT="$android_sdk_root"
 export ANDROID_HOME ANDROID_SDK_ROOT
 
-if rg -ni \
-  'nngceckbapebfimnlniiiahkandclblb|dhdgffkkebhmkfjojejmpbldmpobfkfo|bitwarden|tampermonkey' \
-  core/src/main desktop-app/src/main android-manager/src/main; then
-  fail "제품 코드에 특정 확장 분기가 포함되어 있습니다."
-fi
+command -v rg >/dev/null 2>&1 ||
+  fail "필수 정적 검사 도구 rg를 찾을 수 없습니다. ripgrep을 설치하세요."
 
-if rg -n \
-  'fetch\(|XMLHttpRequest|chrome\.storage|browser\.storage|\.value\b' \
-  core/src/main/resources/dev/sixbridge/adapters/popup-native-autofill-guard.v1.js; then
-  fail "팝업 보호 asset이 금지된 데이터 또는 네트워크 API를 사용합니다."
-fi
+reject_rg_matches \
+  "제품 코드에 특정 확장 분기가 포함되어 있습니다." \
+  -ni \
+  'nngceckbapebfimnlniiiahkandclblb|dhdgffkkebhmkfjojejmpbldmpobfkfo|bitwarden|tampermonkey' \
+  core/src/main desktop-app/src/main android-manager/src/main
+
+reject_rg_matches \
+  "팝업 보호 asset이 금지된 데이터 또는 네트워크 API를 사용합니다." \
+  -nP \
+  -e '\bfetch\s*\(' \
+  -e '\bXMLHttpRequest\b' \
+  -e '\b(?:chrome|browser)\s*(?:\?\.|\.)\s*storage\b' \
+  -e "\\b(?:chrome|browser)\\s*\\[\\s*['\"]storage['\"]\\s*\\]" \
+  -e '(?:\?\.|\.)\s*value\b' \
+  -e "\\[\\s*['\"]value['\"]\\s*\\]" \
+  core/src/main/resources/dev/sixbridge/adapters/popup-native-autofill-guard.v1.js
 
 if [ -x "$project_dir/gradlew" ]; then
   gradle_command="$project_dir/gradlew"

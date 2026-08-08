@@ -6,6 +6,7 @@ import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.PreparedConversion
 import dev.sixbridge.core.crx.KeyPairCrx3SigningKey
 import dev.sixbridge.core.draft.DraftConversionPlan
 import dev.sixbridge.core.draft.DraftInputMetadata
@@ -24,7 +25,10 @@ import java.util.Random
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.assertEquals
+import kotlin.test.assertContentEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -32,6 +36,67 @@ import org.junit.rules.TemporaryFolder
 class DefaultConversionRuntimeTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `Android production runtime은 desktop portable draft와 direct ZIP을 동일하게 준비한다`() {
+        val draftFile = File(
+            "src/androidTest/assets/" +
+                "popup-autofill-internal-url-platform.sixdraft",
+        )
+        val verified = SixDraft.read(draftFile.toPath())
+        val sourceZip = temporaryFolder.newFile("platform-source.zip").apply {
+            writeBytes(verified.payload.source)
+        }
+        val approvals = setOf("popup-native-autofill-guard")
+        val runtime = DefaultConversionRuntime()
+
+        val direct = runtime.prepare(
+            sourceZip,
+            OnDeviceInputKind.ZIP,
+            platformProfile(),
+            approvals,
+        )
+        val replayed = runtime.prepare(
+            draftFile,
+            OnDeviceInputKind.SIX_DRAFT,
+            platformProfile(),
+            approvals,
+        )
+        val directPrepared = direct.opaque as PreparedConversion
+        val replayedPrepared = replayed.opaque as PreparedConversion
+
+        assertEquals(direct.reportBefore, replayed.reportBefore)
+        assertEquals(direct.originalSourceSha256, replayed.originalSourceSha256)
+        assertEquals(direct.planSha256, replayed.planSha256)
+        assertContentEquals(direct.transformedSourceZip, replayed.transformedSourceZip)
+        assertEquals(
+            directPrepared.compatibilityAfter,
+            replayedPrepared.compatibilityAfter,
+        )
+        assertEquals(
+            setOf(
+                "browser-internal-url-mapper",
+                "popup-native-autofill-guard",
+            ),
+            replayedPrepared.appliedAdapterIds,
+        )
+        assertEquals(
+            verified.payload.input.originalSourceSha256,
+            replayed.reportBefore.sourceSha256,
+        )
+        assertEquals(
+            verified.payload.input.browserProfileSha256,
+            replayed.reportBefore.browserProfileSha256,
+        )
+        assertEquals(
+            verified.payload.expected.transformedSourceSha256,
+            replayedPrepared.compatibilityAfter.sourceSha256,
+        )
+        val reports = verified.payload.compatibilityBeforeJson.decodeToString() +
+            verified.payload.compatibilityAfterJson.decodeToString()
+        assertFalse(reports.contains(PRIVATE_SENTINEL))
+        assertTrue(verified.payload.plan.selectedAdapters.isNotEmpty())
+    }
 
     @Test
     fun `Android runtime은 모바일 예산 초과를 UNKNOWN snapshot으로 보존한다`() {
@@ -245,4 +310,15 @@ class DefaultConversionRuntimeTest {
         sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
         sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
     )
+
+    private fun platformProfile() = profile().copy(
+        supportedFeatures = setOf(
+            "extension.options-page.user-accessible",
+            "browser.internal-url.extensions-root",
+        ),
+    )
+
+    private companion object {
+        const val PRIVATE_SENTINEL = "SIX_PRIVATE_SENTINEL_DO_NOT_LOG"
+    }
 }
