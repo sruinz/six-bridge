@@ -58,6 +58,19 @@ release_tool() {
 }
 release_run_apksigner() { "${SIXBRIDGE_PUBLISH_FIXTURE_BIN}/apksigner" "$@"; }
 release_run_apkanalyzer() { "${SIXBRIDGE_PUBLISH_FIXTURE_BIN}/apkanalyzer" "$@"; }
+release_before_tag_creation() {
+    [[ "${SIXBRIDGE_PUBLISH_FIXTURE_RACE:-}" = head ]] || return 0
+    printf '%s\n' "$1" >"${SIXBRIDGE_PUBLISH_FIXTURE_RACE_MARKER}"
+    /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" commit --quiet --allow-empty -m fixture-head-race
+}
+release_before_tag_push() {
+    local tag_oid=$1 other_commit
+    [[ "${SIXBRIDGE_PUBLISH_FIXTURE_RACE:-}" = tag-ref ]] || return 0
+    printf '%s\n' "${tag_oid}" >"${SIXBRIDGE_PUBLISH_FIXTURE_RACE_MARKER}"
+    /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" commit --quiet --allow-empty -m fixture-tag-ref-race
+    other_commit=$(/usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" rev-parse HEAD)
+    /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" update-ref refs/tags/v0.1.0 "${other_commit}"
+}
 EOF
 }
 
@@ -157,6 +170,8 @@ run_publish() {
         SIXBRIDGE_PUBLISH_FIXTURE_BIN="${CASE_ROOT}/bin" \
         SIXBRIDGE_PUBLISH_FIXTURE_SIGNER="${SIGNER}" \
         SIXBRIDGE_PUBLISH_PATH_GIT_MARKER="${CASE_ROOT}/path-git-ran" \
+        SIXBRIDGE_PUBLISH_FIXTURE_RACE="${PUBLISH_FIXTURE_RACE:-}" \
+        SIXBRIDGE_PUBLISH_FIXTURE_RACE_MARKER="${PUBLISH_FIXTURE_RACE_MARKER:-}" \
         "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.0
 }
 
@@ -223,6 +238,12 @@ setup_case eof
 expect_failure eof '백업 확인 입력을 읽지 못했습니다.' EOF
 assert_no_remote_tag eof
 
+setup_case no-local-identity
+/usr/bin/git -C "${CASE_ROOT}" config --unset user.name
+/usr/bin/git -C "${CASE_ROOT}" config --unset user.email
+expect_failure no-local-identity 'local Git tagger identity' 'v0.1.0 KEY BACKUP COMPLETE'
+assert_no_remote_tag no-local-identity
+
 setup_case push-failure
 /bin/cat >"${CASE_ORIGIN}/hooks/pre-receive" <<'EOF'
 #!/usr/bin/env bash
@@ -249,10 +270,32 @@ assert_contains "${success_log}" '수동' '정상 출력에 수동 Releases 안�
 assert_not_contains "${success_log}" 'fixture-secret' '정상 출력에 비밀정보가 노출되었습니다.'
 [[ ! -e "${CASE_ROOT}/path-git-ran" ]] || fail 'PATH의 git shim이 실행되었습니다.'
 
+setup_case head-race
+head_race_expected=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
+PUBLISH_FIXTURE_RACE=head
+PUBLISH_FIXTURE_RACE_MARKER="${FIXTURE_ROOT}/head-race.tag-target"
+printf '%s\n' 'v0.1.0 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/head-race.log" 2>&1
+[[ "$(/bin/cat "${PUBLISH_FIXTURE_RACE_MARKER}")" = "${head_race_expected}" ]] || fail 'HEAD race callback이 검증한 commit을 받지 못했습니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_ORIGIN}" cat-file -t refs/tags/v0.1.0)" = tag ]] || fail 'HEAD race remote tag가 annotated tag가 아닙니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_ORIGIN}" rev-parse refs/tags/v0.1.0^{})" = "${head_race_expected}" ]] || fail 'HEAD 변경 뒤 remote tag가 verified commit을 가리키지 않습니다.'
+
+setup_case tag-ref-race
+tag_race_expected=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
+PUBLISH_FIXTURE_RACE=tag-ref
+PUBLISH_FIXTURE_RACE_MARKER="${FIXTURE_ROOT}/tag-ref-race.tag-oid"
+printf '%s\n' 'v0.1.0 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/tag-ref-race.log" 2>&1
+tag_race_expected_oid=$(/bin/cat "${PUBLISH_FIXTURE_RACE_MARKER}")
+tag_race_remote_oid=$(/usr/bin/git --git-dir="${CASE_ORIGIN}" rev-parse refs/tags/v0.1.0)
+[[ "${tag_race_remote_oid}" = "${tag_race_expected_oid}" ]] || fail 'local tag ref 교체 뒤 remote가 검증한 annotated tag OID를 받지 않았습니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_ORIGIN}" cat-file -t "${tag_race_remote_oid}")" = tag ]] || fail 'tag ref race remote tag가 annotated tag가 아닙니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_ORIGIN}" rev-parse refs/tags/v0.1.0^{})" = "${tag_race_expected}" ]] || fail 'tag ref race remote tag peeled commit이 verified commit과 다릅니다.'
+unset PUBLISH_FIXTURE_RACE PUBLISH_FIXTURE_RACE_MARKER
+
 # These publisher capabilities are intentionally absent: the fixture permits
 # only a normal non-force tag ref update to its local bare origin.
-if /usr/bin/grep -Eq -- '(curl|gh[[:space:]].*(release|api)|--force|[[:space:]]-f[[:space:]]|tag[[:space:]]+-d|push[[:space:]].*:refs/tags/)' "${PUBLISH_SCRIPT}"; then
+if /usr/bin/grep -Eq -- '(curl|gh[[:space:]].*(release|api)|--force|[[:space:]]-f[[:space:]]|tag[[:space:]]+-d)' "${PUBLISH_SCRIPT}"; then
     fail 'publisher에 Release API/force/delete tag 동작이 포함되어 있습니다.'
 fi
+assert_contains "${PUBLISH_SCRIPT}" '"${tag_oid}:refs/tags/${RELEASE_TAG}"' 'publisher가 exact tag object OID refspec을 사용하지 않습니다.'
 
 printf 'publish release tag 검증 통과\n'

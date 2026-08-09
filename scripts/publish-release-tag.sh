@@ -166,6 +166,30 @@ release_require_absent_tag() {
     }
 }
 
+release_require_local_tagger_identity() {
+    local name email identity
+    name=$(release_git config --local --get user.name 2>&1) || {
+        release_fail 'local Git tagger identity user.name이 필요합니다.'
+        return 1
+    }
+    email=$(release_git config --local --get user.email 2>&1) || {
+        release_fail 'local Git tagger identity user.email이 필요합니다.'
+        return 1
+    }
+    [[ -n "${name}" && -n "${email}" ]] || {
+        release_fail 'local Git tagger identity가 비어 있습니다.'
+        return 1
+    }
+    identity=$(release_git var GIT_COMMITTER_IDENT 2>&1) || {
+        release_fail 'local Git tagger identity가 유효하지 않습니다.'
+        return 1
+    }
+    [[ -n "${identity}" ]] || {
+        release_fail 'local Git tagger identity가 유효하지 않습니다.'
+        return 1
+    }
+}
+
 release_metadata_value() {
     local filter=$1 jq raw_output
     jq=$(release_tool jq) || return 1
@@ -197,8 +221,32 @@ release_preflight() {
     local head_commit signer
     head_commit=$(release_clean_main_at_origin) || return 1
     release_require_absent_tag || return 1
+    release_require_local_tagger_identity || return 1
     signer=$(release_verify_artifacts "${head_commit}") || return 1
     printf '%s:%s\n' "${head_commit}" "${signer}"
+}
+
+release_verify_created_tag() {
+    local expected_commit=$1 tag_oid tag_type peeled_commit
+    tag_oid=$(release_git rev-parse "refs/tags/${RELEASE_TAG}" 2>&1) || {
+        release_fail '생성한 tag object를 읽지 못했습니다.'
+        return 1
+    }
+    [[ "${tag_oid}" =~ ^[0-9a-f]{40}$ ]] || {
+        release_fail '생성한 tag object OID 형식이 올바르지 않습니다.'
+        return 1
+    }
+    tag_type=$(release_git cat-file -t "${tag_oid}" 2>&1) || return 1
+    [[ "${tag_type}" = tag ]] || {
+        release_fail '생성한 tag는 annotated tag여야 합니다.'
+        return 1
+    }
+    peeled_commit=$(release_git rev-parse "${tag_oid}^{}" 2>&1) || return 1
+    [[ "${peeled_commit}" = "${expected_commit}" ]] || {
+        release_fail '생성한 tag가 검증한 commit을 가리키지 않습니다.'
+        return 1
+    }
+    printf '%s\n' "${tag_oid}"
 }
 
 [[ "$#" = 1 ]] || { release_fail '사용법: publish-release-tag.sh 0.1.0'; exit 1; }
@@ -221,8 +269,17 @@ IFS=: read -r verified_commit verified_signer <<<"${preflight}"
     exit 1
 }
 
-release_git tag -a "${RELEASE_TAG}" -m 'SIX Bridge v0.1.0' || exit 1
-release_git push origin "refs/tags/${RELEASE_TAG}" || {
+# These hooks are intentionally absent from the production release library.
+# The fixture-only library supplies them to exercise the two publish races.
+if declare -F release_before_tag_creation >/dev/null; then
+    release_before_tag_creation "${verified_commit}" || exit 1
+fi
+release_git tag -a "${RELEASE_TAG}" "${verified_commit}" -m 'SIX Bridge v0.1.0' || exit 1
+tag_oid=$(release_verify_created_tag "${verified_commit}") || exit 1
+if declare -F release_before_tag_push >/dev/null; then
+    release_before_tag_push "${tag_oid}" "${verified_commit}" || exit 1
+fi
+release_git push origin "${tag_oid}:refs/tags/${RELEASE_TAG}" || {
     release_fail 'tag push에 실패했습니다. local tag 상태를 확인하세요.'
     exit 1
 }
