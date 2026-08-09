@@ -318,3 +318,9 @@ Windows x86-64 MSI 구성과 owner-only ACL 코드는 포함되어 있으나,
 상세 내용은 [아키텍처](docs/architecture.md),
 [Fold7 검증 절차](docs/fold7-validation.md),
 [PoC 검증 결과](docs/poc-results.md)를 참고한다.
+
+## 공개 배포
+
+SIX Bridge 소스는 [Apache-2.0](LICENSE)으로 제공됩니다. v0.1.0 공개
+산출물은 Android 관리자 APK와 macOS 미서명·미공증 preview DMG입니다.
+설치 경고와 검증 절차는 [한글 배포 안내](docs/RELEASE_KO.md)를 확인하세요.
