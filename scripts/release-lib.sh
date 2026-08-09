@@ -48,6 +48,19 @@ release_stage_identity() {
     printf '%s:%s:%s:%s:%s\n' "${device}" "${inode}" "${owner}" "${mode}" "${ctime}"
 }
 
+# Container contents can be changed only by verifier-owned private work and
+# snapshot directories. Its identity therefore omits ctime while retaining the
+# properties that prevent container replacement, ownership, and mode changes.
+release_container_identity() {
+    local path=$1 device inode owner mode
+    release_directory "${path}" || return 1
+    device=$(release_stat_value '%d' "${path}") || return 1
+    inode=$(release_stat_value '%i' "${path}") || return 1
+    owner=$(release_stat_value '%u' "${path}") || return 1
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${owner}" "${mode}"
+}
+
 release_private_directory() {
     local path=${1:-} owner mode current_owner
     release_directory "${path}" || return 1
@@ -116,7 +129,7 @@ release_validate_stage_root() {
         return 1
     }
     release_stage_identity "${physical_stage}" >/dev/null
-    release_stage_identity "${physical_container}" >/dev/null
+    release_container_identity "${physical_container}" >/dev/null
 }
 
 release_assert_stage_identity() {
@@ -127,7 +140,7 @@ release_assert_stage_identity() {
         release_fail 'private stage root changed during verification.'
         return 1
     }
-    actual=$(release_stage_identity "${container}") || return 1
+    actual=$(release_container_identity "${container}") || return 1
     [[ "${actual}" = "${expected_container}" ]] || {
         release_fail 'trusted container changed during verification.'
         return 1
@@ -195,6 +208,52 @@ release_assert_file_identity() {
     local path=$1 expected=$2 actual
     actual=$(release_file_identity "${path}") || return 1
     [[ "${actual}" = "${expected}" ]] || release_fail 'artifact changed during verification.'
+}
+
+release_snapshot_identity() {
+    local path=$1 device inode size digest
+    release_regular_file "${path}" || return 1
+    device=$(release_stat_value '%d' "${path}") || return 1
+    inode=$(release_stat_value '%i' "${path}") || return 1
+    size=$(release_stat_value '%z' "${path}") || return 1
+    digest=$(release_sha256_unchecked "${path}") || return 1
+    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${size}" "${digest}"
+}
+
+release_assert_snapshot_identity() {
+    local path=$1 expected=$2 actual
+    actual=$(release_snapshot_identity "${path}") || return 1
+    [[ "${actual}" = "${expected}" ]] || release_fail 'artifact changed during verification.'
+}
+
+release_create_verification_snapshot() {
+    local artifact=$1 container=$2 snapshot_dir snapshot snapshot_identity artifact_identity
+    release_validate_release_container "${container}" || return 1
+    artifact_identity=$(release_snapshot_identity "${artifact}") || return 1
+    snapshot_dir=$(/usr/bin/mktemp -d "${container}/.sixbridge-release-snapshot.XXXXXX") || {
+        release_fail 'verification snapshot directory를 만들지 못했습니다.'
+        return 1
+    }
+    release_private_directory "${snapshot_dir}" || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    snapshot="${snapshot_dir}/artifact"
+    if ! /bin/ln "${artifact}" "${snapshot}"; then
+        /bin/rm -rf "${snapshot_dir}"
+        release_fail 'verification snapshot을 만들지 못했습니다.'
+        return 1
+    fi
+    snapshot_identity=$(release_snapshot_identity "${snapshot}") || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    [[ "${snapshot_identity}" = "${artifact_identity}" ]] || {
+        /bin/rm -rf "${snapshot_dir}"
+        release_fail 'verification snapshot identity가 원본과 다릅니다.'
+        return 1
+    }
+    printf '%s\n' "${snapshot_dir}"
+}
+
+release_remove_verification_snapshot() {
+    local snapshot_dir=${1:-}
+    [[ -n "${snapshot_dir}" && -d "${snapshot_dir}" && ! -L "${snapshot_dir}" ]] || return 0
+    /bin/rm -rf "${snapshot_dir}"
 }
 
 release_sha256_unchecked() {
@@ -285,6 +344,9 @@ release_system_executable() {
     }
     links=$(release_link_count "${path}") || return 1
     [[ "${links}" = 1 ]] || {
+        if [[ "${path}" = '/usr/bin/shasum' && "$(/usr/bin/uname -s)" = Darwin && "${links}" = 2 ]]; then
+            return 0
+        fi
         release_fail 'system release 도구에 hardlink가 포함되어 있습니다.'
         return 1
     }
@@ -357,7 +419,7 @@ release_tool() {
 release_verify_apk() {
     local apk=${1:-} expected_signer=${2:-} stage_root=${3:-} container=${4:-}
     local raw_output signer_lines actual_signer application_id version_name version_code
-    local apksigner apkanalyzer artifact_identity stage_identity container_identity
+    local apksigner apkanalyzer artifact_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity
 
     release_require_artifact_stage "${apk}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${apk}" || return 1
@@ -368,57 +430,75 @@ release_verify_apk() {
     apksigner=$(release_tool apksigner) || return 1
     apkanalyzer=$(release_tool apkanalyzer) || return 1
     artifact_identity=$(release_file_identity "${apk}") || return 1
-    stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    snapshot_identity=$(release_snapshot_identity "${apk}") || return 1
+    snapshot_dir=$(release_create_verification_snapshot "${apk}" "${container}") || return 1
+    snapshot="${snapshot_dir}/artifact"
+    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
-    if ! raw_output=$("${apksigner}" verify --verbose --print-certs "${apk}" 2>&1); then
+    if ! raw_output=$("${apksigner}" verify --verbose --print-certs "${snapshot}" 2>&1); then
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK signature verification에 실패했습니다.'
         return 1
     fi
-    release_assert_file_identity "${apk}" "${artifact_identity}" || return 1
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || return 1
+    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     signer_lines=$(printf '%s\n' "${raw_output}" | /usr/bin/awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print $2}')
     [[ "$(printf '%s\n' "${signer_lines}" | /usr/bin/awk 'NF {count += 1} END {print count + 0}')" = 1 ]] || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK signer는 정확히 하나여야 합니다.'
         return 1
     }
     actual_signer=${signer_lines}
     actual_signer=$(printf '%s' "${actual_signer}" | /usr/bin/tr '[:upper:]' '[:lower:]')
     [[ "${actual_signer}" = "${expected_signer}" ]] || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK signer SHA-256가 예상 값과 다릅니다.'
         return 1
     }
 
-    if ! application_id=$("${apkanalyzer}" manifest application-id "${apk}" 2>&1); then
+    if ! application_id=$("${apkanalyzer}" manifest application-id "${snapshot}" 2>&1); then
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK application ID를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${apk}" "${artifact_identity}" || return 1
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || return 1
+    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${application_id}" = 'dev.sixbridge.manager' ]] || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK application ID가 계약과 다릅니다.'
         return 1
     }
-    if ! version_name=$("${apkanalyzer}" manifest version-name "${apk}" 2>&1); then
+    if ! version_name=$("${apkanalyzer}" manifest version-name "${snapshot}" 2>&1); then
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionName을 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${apk}" "${artifact_identity}" || return 1
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || return 1
+    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${version_name}" = "${SIXBRIDGE_RELEASE_VERSION}" ]] || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionName이 계약과 다릅니다.'
         return 1
     }
-    if ! version_code=$("${apkanalyzer}" manifest version-code "${apk}" 2>&1); then
+    if ! version_code=$("${apkanalyzer}" manifest version-code "${snapshot}" 2>&1); then
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionCode를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${apk}" "${artifact_identity}" || return 1
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || return 1
+    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${version_code}" = '1' ]] || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionCode가 계약과 다릅니다.'
         return 1
     }
+    release_remove_verification_snapshot "${snapshot_dir}" || return 1
+    release_assert_file_identity "${apk}" "${artifact_identity}"
 }
 
 release_dmg_detach() {
@@ -448,16 +528,13 @@ release_verify_dmg() {
 
     release_require_artifact_stage "${dmg}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${dmg}" || return 1
-    if [[ -n "${work_dir}" && ! -e "${work_dir}" && ! -L "${work_dir}" ]]; then
-        /bin/mkdir -p "${work_dir}" || return 1
-    fi
-    release_directory "${work_dir}" || return 1
+    release_validate_private_work_directory "${work_dir}" "${container}" || return 1
     hdiutil=$(release_tool hdiutil) || return 1
     release_tool plistbuddy >/dev/null || return 1
     codesign=$(release_tool codesign) || return 1
     dmg_identity=$(release_file_identity "${dmg}") || return 1
     stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
 
     mountpoint=$(/usr/bin/mktemp -d "${work_dir}/sixbridge-dmg.XXXXXX") || {
         release_fail 'DMG mount directory를 만들지 못했습니다.'
@@ -558,26 +635,45 @@ release_file_contains_secret() {
     return 1
 }
 
+release_validate_private_work_directory() {
+    local work_dir=${1:-} container=${2:-} physical_work physical_container
+    release_validate_release_container "${container}" || return 1
+    release_private_directory "${work_dir}" || return 1
+    physical_work="$(CDPATH= builtin cd -P -- "${work_dir}" && builtin pwd -P)"
+    physical_container="$(CDPATH= builtin cd -P -- "${container}" && builtin pwd -P)"
+    case "${physical_work}/" in
+        "${physical_container}/"*) ;;
+        *) release_fail 'DMG work directory가 trusted container 밖에 있습니다.'; return 1 ;;
+    esac
+}
+
 release_scan_tree() {
     local root=${1:-} stage_root=${2:-} container=${3:-} secret_probe=${4:-}
-    local physical_root entries entry basename lower secret_probe file_identity stage_identity container_identity
+    local physical_root entries entry basename lower file_identity stage_identity container_identity
     release_validate_stage_root "${stage_root}" "${container}" || return 1
     release_directory "${root}" || return 1
     physical_root="$(CDPATH= builtin cd -P -- "${root}" && builtin pwd -P)"
     case "${physical_root}" in "$(CDPATH= builtin cd -P -- "${stage_root}" && builtin pwd -P)"/*|"$(CDPATH= builtin cd -P -- "${stage_root}" && builtin pwd -P)") ;; *) release_fail 'release tree가 private stage root 밖에 있습니다.'; return 1;; esac
     stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     if ! entries=$(/usr/bin/find "${physical_root}" -xdev -print 2>&1); then
         release_fail 'release tree를 순회하지 못했습니다.'
         return 1
     fi
     while IFS= read -r entry; do
         [[ -n "${entry}" ]] || continue
+        basename=$(/usr/bin/basename -- "${entry}")
+        lower=$(printf '%s' "${basename}" | /usr/bin/tr '[:upper:]' '[:lower:]')
+        case "${lower}" in
+            *.p12|*.jks|*.pem|*.pk8|*.six|*.sixdraft|*.crx|*.zip)
+                release_fail 'forbidden release input이 포함되어 있습니다.'
+                return 1
+                ;;
+        esac
         [[ ! -L "${entry}" ]] || {
             release_fail 'release tree에 symbolic link가 포함되어 있습니다.'
             return 1
         }
-        basename=$(/usr/bin/basename -- "${entry}")
         if [[ "${basename}" = '.local' ]]; then
             release_fail 'forbidden release input이 포함되어 있습니다.'
             return 1
@@ -587,13 +683,6 @@ release_scan_tree() {
         fi
         release_require_single_link_file "${entry}" || return 1
         file_identity=$(release_file_identity "${entry}") || return 1
-        lower=$(printf '%s' "${basename}" | /usr/bin/tr '[:upper:]' '[:lower:]')
-        case "${lower}" in
-            *.p12|*.jks|*.pem|*.pk8|*.six|*.sixdraft|*.crx|*.zip)
-                release_fail 'forbidden release input이 포함되어 있습니다.'
-                return 1
-                ;;
-        esac
         if [[ -n "${secret_probe}" ]] && release_file_contains_secret "${entry}" "${secret_probe}"; then
             release_fail '비밀정보가 release tree에 포함되어 있습니다.'
             return 1
@@ -625,7 +714,7 @@ release_write_metadata() {
     release_directory "${directory}" || return 1
     release_validate_stage_root "${directory}" "${container}" || return 1
     stage_identity=$(release_stage_identity "${directory}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     [[ "${git_commit}" =~ ^[0-9a-f]{40}$ ]] || {
         release_fail 'git commit 형식이 올바르지 않습니다.'
         return 1
@@ -659,7 +748,7 @@ release_write_metadata() {
         return 1
     }
     stage_identity=$(release_stage_identity "${directory}") || { /bin/rm -f "${temp_file}"; return 1; }
-    container_identity=$(release_stage_identity "${container}") || { /bin/rm -f "${temp_file}"; return 1; }
+    container_identity=$(release_container_identity "${container}") || { /bin/rm -f "${temp_file}"; return 1; }
     if ! "${jq}" -S -n \
         --arg git_commit "${git_commit}" \
         --arg signer "${signer}" \
@@ -691,7 +780,7 @@ release_write_checksums() {
     release_directory "${directory}" || return 1
     release_validate_stage_root "${directory}" "${container}" || return 1
     stage_identity=$(release_stage_identity "${directory}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     target="${directory}/SHA256SUMS"
     [[ ! -e "${target}" && ! -L "${target}" ]] || {
         release_fail 'SHA256SUMS가 이미 존재합니다.'
@@ -708,7 +797,7 @@ release_write_checksums() {
         return 1
     }
     stage_identity=$(release_stage_identity "${directory}") || { /bin/rm -f "${temp_file}"; return 1; }
-    container_identity=$(release_stage_identity "${container}") || { /bin/rm -f "${temp_file}"; return 1; }
+    container_identity=$(release_container_identity "${container}") || { /bin/rm -f "${temp_file}"; return 1; }
     while IFS='|' read -r file identity; do
         [[ -n "${file}" ]] || continue
         release_assert_file_identity "${directory}/${file}" "${identity}" || { /bin/rm -f "${temp_file}"; return 1; }
@@ -731,7 +820,7 @@ release_verify_metadata() {
     apk_identity=$(release_file_identity "${directory}/${SIXBRIDGE_ANDROID_FILE}") || return 1
     dmg_identity=$(release_file_identity "${directory}/${SIXBRIDGE_MACOS_FILE}") || return 1
     stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     jq=$(release_tool jq) || return 1
     if ! raw_output=$("${jq}" -er --arg signer "${expected_signer}" '
       type == "object" and
@@ -739,11 +828,13 @@ release_verify_metadata() {
       .schemaVersion == 1 and .productVersion == "0.1.0" and
       (.gitCommit | test("^[0-9a-f]{40}$")) and
       (.android | type == "object" and
+        (keys | sort) == ["applicationId", "file", "sha256", "signerSha256", "versionCode", "versionName"] and
         .file == "SIX-Bridge-Manager-0.1.0-android.apk" and
         .applicationId == "dev.sixbridge.manager" and .versionName == "0.1.0" and
         .versionCode == 1 and .signerSha256 == $signer and
         (.sha256 | test("^[0-9a-f]{64}$"))) and
       (.macos | type == "object" and
+        (keys | sort) == ["bundleId", "file", "minimumSystemVersion", "nativePackageVersion", "notarized", "productVersion", "sha256", "signed"] and
         .file == "SIX-Bridge-0.1.0-macos-unsigned.dmg" and
         .bundleId == "dev.sixbridge.desktop" and .productVersion == "0.1.0" and
         .nativePackageVersion == "1.0.0" and .minimumSystemVersion == "13.0" and
@@ -805,7 +896,7 @@ release_verify_checksums() {
     release_require_single_link_file "${checksum_file}" || return 1
     checksum_identity=$(release_file_identity "${checksum_file}") || return 1
     stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     for file in "${checksum_files[@]}"; do
         identity=$(release_file_identity "${directory}/${file}") || return 1
         input_identities="${input_identities}${file}|${identity}"$'\n'
@@ -847,7 +938,7 @@ release_verify_directory() {
     }
     physical_directory="$(CDPATH= builtin cd -P -- "${directory}" && builtin pwd -P)"
     stage_identity=$(release_stage_identity "${directory}") || return 1
-    container_identity=$(release_stage_identity "${container}") || return 1
+    container_identity=$(release_container_identity "${container}") || return 1
     if ! entries=$(/usr/bin/find "${physical_directory}" -maxdepth 1 -mindepth 1 -print 2>&1); then
         release_fail 'release directory를 읽지 못했습니다.'
         return 1
@@ -874,10 +965,13 @@ release_verify_directory() {
     release_verify_checksums "${physical_directory}" "${directory}" "${container}" || return 1
     release_verify_metadata "${physical_directory}" "${expected_signer}" "${directory}" "${container}" || return 1
     release_verify_apk "${physical_directory}/${SIXBRIDGE_ANDROID_FILE}" "${expected_signer}" "${directory}" "${container}" || return 1
-    work_dir=$(/usr/bin/mktemp -d '/tmp/sixbridge-release-verify.XXXXXX') || {
+    work_dir=$(/usr/bin/mktemp -d "${container}/.sixbridge-release-verify.XXXXXX") || {
         release_fail 'DMG verification work directory를 만들지 못했습니다.'
         return 1
     }
+    release_private_directory "${work_dir}" || { /bin/rm -rf "${work_dir}"; return 1; }
+    stage_identity=$(release_stage_identity "${directory}") || { /bin/rm -rf "${work_dir}"; return 1; }
+    container_identity=$(release_container_identity "${container}") || { /bin/rm -rf "${work_dir}"; return 1; }
     if ! release_verify_dmg "${physical_directory}/${SIXBRIDGE_MACOS_FILE}" "${work_dir}" "${directory}" "${container}"; then
         /bin/rm -rf "${work_dir}"
         return 1

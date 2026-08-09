@@ -3,7 +3,6 @@ set -euo pipefail
 
 readonly ROOT_DIR="$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)"
 readonly LIBRARY="${ROOT_DIR}/scripts/release-lib.sh"
-readonly TEST_HOOK="${ROOT_DIR}/scripts/release-lib-test-hook.sh"
 readonly FIXTURE_ROOT="$(/usr/bin/mktemp -d "${ROOT_DIR}/.local/release-lib-test.XXXXXX")"
 readonly SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 readonly GIT_COMMIT='abcdef0123456789abcdef0123456789abcdef01'
@@ -37,8 +36,10 @@ if [[ -n "${FAKE_APKSIGNER_SWAP_RESTORE_PATH:-}" ]]; then
   saved="${FAKE_APKSIGNER_SWAP_RESTORE_PATH}.saved"
   /bin/mv "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}" "${saved}"
   printf 'replaced' >"${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
-  /bin/sleep 1
   /bin/mv "${saved}" "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
+fi
+if [[ "${FAKE_APKSIGNER_REQUIRE_SNAPSHOT:-0}" = 1 ]]; then
+  case "${!#}" in */.sixbridge-release-snapshot.*/artifact) ;; *) exit 29;; esac
 fi
 printf 'Signer #1 certificate SHA-256 digest: %s\n' "${FAKE_SIGNER}"
 [[ "${FAKE_EXTRA_SIGNER:-0}" != 1 ]] || printf 'Signer #2 certificate SHA-256 digest: %s\n' "${FAKE_SIGNER}"
@@ -99,9 +100,30 @@ if [[ ${production_status} -ne 0 ]]; then
     assert_contains "${production_log}" 'release 검증 실패' 'production tool 실패 status의 진단이 없습니다.'
 fi
 expect_failure production-unknown-tool '알 수 없는 release 도구' bash -c 'source "$1"; release_tool invalid' _ "${LIBRARY}"
+production_shasum_log="${FIXTURE_ROOT}/production-shasum.log"
+set +e
+bash -c 'source "$1"; tool=$(release_tool shasum) || exit 1; [[ "${tool}" = /usr/bin/shasum ]] || exit 1; release_sha256 "$2"' _ "${LIBRARY}" "${LIBRARY}" >"${production_shasum_log}" 2>&1
+production_shasum_status=$?
+set -e
+[[ "${production_shasum_status}" = 0 ]] || { /bin/cat "${production_shasum_log}" >&2; fail 'production macOS shasum 검증이 실패했습니다.'; }
+/usr/bin/grep -Eq '^[0-9a-f]{64}$' "${production_shasum_log}" || fail 'production shasum digest 형식이 올바르지 않습니다.'
 
 source "${LIBRARY}"
-source "${TEST_HOOK}"
+
+# Test-only resolver: production library has no sourceable hook and ignores
+# environment overrides. This override exists only in this fixture process.
+release_tool() {
+    case "$1" in
+        apksigner) printf '%s\n' "${SIXBRIDGE_APKSIGNER}" ;;
+        apkanalyzer) printf '%s\n' "${SIXBRIDGE_APKANALYZER}" ;;
+        hdiutil) printf '%s\n' "${SIXBRIDGE_HDIUTIL}" ;;
+        plistbuddy) printf '%s\n' "${SIXBRIDGE_PLISTBUDDY}" ;;
+        codesign) printf '%s\n' "${SIXBRIDGE_CODESIGN}" ;;
+        jq) printf '%s\n' /usr/bin/jq ;;
+        shasum) printf '%s\n' "${SIXBRIDGE_SHASUM}" ;;
+        *) release_fail '알 수 없는 release 도구입니다.'; return 1 ;;
+    esac
+}
 
 container="${FIXTURE_ROOT}"
 stage="${container}/stage"
@@ -127,17 +149,23 @@ export FAKE_EXTRA_SIGNER=1; expect_failure apk-extra-signer '정확히 하나' r
 export FAKE_VERSION_CODE=2; expect_failure apk-version-code 'versionCode' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_CODE=1
 export FAKE_APKSIGNER_REPLACE_PATH="${apk}"; expect_failure apk-race 'artifact changed during verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_REPLACE_PATH
 make_file "${apk}" apk
-export FAKE_APKSIGNER_SWAP_RESTORE_PATH="${apk}"; expect_failure apk-swap-restore 'stage root changed' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_SWAP_RESTORE_PATH
+export FAKE_APKSIGNER_SWAP_RESTORE_PATH="${apk}" FAKE_APKSIGNER_REQUIRE_SNAPSHOT=1
+expect_failure apk-swap-restore 'stage root changed' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
+unset FAKE_APKSIGNER_SWAP_RESTORE_PATH FAKE_APKSIGNER_REQUIRE_SNAPSHOT
 outside="${FIXTURE_ROOT}/outside.apk"; make_file "${outside}" apk
 expect_failure apk-outside-stage 'stage root 밖' release_verify_apk "${outside}" "${SIGNER}" "${stage}" "${container}"
 
-release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"
-export FAKE_BUNDLE_ID='invalid.bundle'; expect_failure dmg-bundle-id 'bundle ID' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
-export FAKE_EXTRA_APP=1; expect_failure dmg-extra-app '정확히 하나' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; unset FAKE_EXTRA_APP
-export FAKE_PRODUCT_VERSION=9.9.9; expect_failure dmg-product-version 'product version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='0.1.0'
-export FAKE_NATIVE_VERSION=2.0.0; expect_failure dmg-native-version 'native package version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_NATIVE_VERSION='1.0.0'
-export FAKE_MINIMUM_VERSION=12.0; expect_failure dmg-minimum-version 'minimum macOS version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_MINIMUM_VERSION='13.0'
-export FAKE_CODESIGN_SIGNED=1; expect_failure dmg-signed '미서명' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; unset FAKE_CODESIGN_SIGNED
+dmg_work="${container}/mounts"; /bin/mkdir "${dmg_work}"; /bin/chmod 700 "${dmg_work}"
+release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+export FAKE_BUNDLE_ID='invalid.bundle'; expect_failure dmg-bundle-id 'bundle ID' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
+export FAKE_EXTRA_APP=1; expect_failure dmg-extra-app '정확히 하나' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_EXTRA_APP
+export FAKE_PRODUCT_VERSION=9.9.9; expect_failure dmg-product-version 'product version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='0.1.0'
+export FAKE_NATIVE_VERSION=2.0.0; expect_failure dmg-native-version 'native package version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_NATIVE_VERSION='1.0.0'
+export FAKE_MINIMUM_VERSION=12.0; expect_failure dmg-minimum-version 'minimum macOS version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_MINIMUM_VERSION='13.0'
+export FAKE_CODESIGN_SIGNED=1; expect_failure dmg-signed '미서명' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_CODESIGN_SIGNED
+public_dmg_work="${container}/public-mounts"; /bin/mkdir "${public_dmg_work}"; /bin/chmod 777 "${public_dmg_work}"
+expect_failure dmg-public-work-dir 'trusted directory' release_verify_dmg "${dmg}" "${public_dmg_work}" "${stage}" "${container}"
+/bin/rmdir "${public_dmg_work}"
 
 scan_root="${stage}/scan"; /bin/mkdir -p "${scan_root}"; make_file "${scan_root}/safe.txt" safe
 release_scan_tree "${scan_root}" "${stage}" "${container}"
@@ -155,6 +183,9 @@ done
 /bin/mkdir "${scan_root}/.local"
 expect_failure scan-local-directory 'forbidden release input' release_scan_tree "${scan_root}" "${stage}" "${container}"
 /bin/rmdir "${scan_root}/.local"
+/bin/mkdir "${scan_root}/private.p12"
+expect_failure scan-forbidden-directory 'forbidden release input' release_scan_tree "${scan_root}" "${stage}" "${container}"
+/bin/rmdir "${scan_root}/private.p12"
 make_file "${scan_root}/secret.txt" 'release-secret-probe'
 /bin/mkdir -p "${FIXTURE_ROOT}/path"; /bin/cat >"${FIXTURE_ROOT}/path/grep" <<'EOF'
 #!/usr/bin/env bash
@@ -197,6 +228,12 @@ first_byte=$(/bin/dd if="${release_one_byte}/SHA256SUMS" bs=1 count=1 2>/dev/nul
 replacement_byte=0; [[ "${first_byte}" = 0 ]] && replacement_byte=1
 printf '%s' "${replacement_byte}" | /bin/dd of="${release_one_byte}/SHA256SUMS" bs=1 count=1 conv=notrunc >/dev/null 2>&1
 expect_failure checksum-one-byte 'SHA256SUMS' release_verify_directory "${release_one_byte}" "${SIGNER}" "${container}"
+
+release_nested_metadata=$(make_release_directory nested-metadata)
+nested_metadata_tmp=$(/usr/bin/mktemp "${release_nested_metadata}/.nested-metadata.XXXXXX")
+/usr/bin/jq '.android.extra = true' "${release_nested_metadata}/RELEASE-METADATA.json" >"${nested_metadata_tmp}"
+/bin/mv "${nested_metadata_tmp}" "${release_nested_metadata}/RELEASE-METADATA.json"
+expect_failure metadata-extra-nested 'release metadata 계약' release_verify_metadata "${release_nested_metadata}" "${SIGNER}" "${release_nested_metadata}" "${container}"
 
 release_cmp=$(make_release_directory cmp)
 printf x >>"${release_cmp}/${SIXBRIDGE_ANDROID_FILE}"
