@@ -197,6 +197,10 @@ node --test fixtures/minimal-mv3/background.test.mjs \
 
 bash -n scripts/fold7-gate.sh
 for shell_file in \
+  scripts/release-lib.sh \
+  scripts/init-android-release-key.sh \
+  scripts/prepare-release.sh \
+  scripts/publish-release-tag.sh \
   scripts/api-probe-generation.test.sh \
   scripts/desktop-large-extension-analysis.sh \
   scripts/desktop-large-extension-analysis.test.sh \
@@ -226,4 +230,9 @@ bash scripts/fold7-popup-autofill-url-gate.test.sh
 bash scripts/verify-jdk-routing.test.sh
 bash scripts/verify-mobile-conversion.sh
 bash scripts/android-manager-manifest.test.sh
+bash scripts/release-contract.test.sh
+bash scripts/init-android-release-key.test.sh
+bash scripts/release-lib.test.sh
+bash scripts/prepare-release.test.sh
+bash scripts/publish-release-tag.test.sh
 bash scripts/android-manager-distribution.test.sh

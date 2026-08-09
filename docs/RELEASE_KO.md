@@ -56,6 +56,42 @@ shasum -a 256 SIX-Bridge-0.1.0-macos-unsigned.dmg
 실행하지 마세요. `RELEASE-NOTES-KO.md`에는 해당 release의 기능과 제한이
 기록됩니다.
 
+## 배포 전 자동 검증
+
+공개 배포를 준비하는 작업자는 동일한 checkout에서 다음 회귀 검증을
+fresh 실행합니다.
+
+```sh
+bash scripts/release-contract.test.sh
+bash scripts/init-android-release-key.test.sh
+bash scripts/release-lib.test.sh
+bash scripts/prepare-release.test.sh
+bash scripts/publish-release-tag.test.sh
+bash scripts/android-manager-distribution.test.sh
+./scripts/verify.sh
+```
+
+`./scripts/verify.sh`는 기존 Android·desktop·core 검증과 위 release 회귀를
+함께 실행합니다. 이 자동 검증은 실제 release key를 생성하거나,
+`.local/releases/v0.1.0/`을 게시하거나, 원격 branch·tag·Release를
+변경하지 않습니다.
+
+## 자동 검증 이후 수동 gate
+
+자동 회귀가 모두 통과해도 공개 게시가 완료된 것은 아닙니다. 작업자가
+별도 매체에 Android release key와 비밀번호를 백업했는지 확인한 뒤,
+실제 산출물을 생성하고 다음 수동 gate를 모두 확인해야 합니다.
+
+- Fold7에서 관리자 APK 설치, `.six` 가져오기·변환, wrapper APK
+  내보내기, 삼성 인터넷 Add-ons 활성화·실행을 확인합니다.
+- macOS에서 DMG mount·복사와 미서명·미공증 Gatekeeper 경고가 이
+  문서의 안내와 일치하는지 확인합니다.
+- 원격 `main` push, annotated `v0.1.0` tag, Git 서버 Release 첨부는
+  별도의 명시적 승인 후에만 진행합니다.
+
+자동 검증 통과를 key 백업, 실기기 작동, Gatekeeper 확인 또는 원격
+게시 승인의 대체로 간주하지 마세요.
+
 ## 네트워크와 개인정보 경계
 
 분석·변환 내용과 생성 결과를 원격 분석 서버에 업로드하지 않습니다. 스토어 URL을 입력하면 extension ID와 다운로드 요청이 Google 및 허용된 redirect host에 전송됩니다.

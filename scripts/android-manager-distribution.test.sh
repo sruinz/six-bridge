@@ -19,6 +19,27 @@ assert_contains() {
     grep -Fq -- "${expected}" "${file}" || fail "${message}"
 }
 
+assert_exact_commands_in_order() {
+    local file="$1"
+    local previous_line=0
+    local expected
+    local count
+    local line
+
+    shift
+    for expected in "$@"; do
+        count="$(awk -v expected="${expected}" '$0 == expected { count += 1 } END { print count + 0 }' "${file}")" ||
+            fail "command log를 읽지 못했습니다: ${expected}"
+        [[ "${count}" == "1" ]] ||
+            fail "command log에 exact 호출이 한 번 없습니다: ${expected} (count=${count})"
+        line="$(awk -v expected="${expected}" '$0 == expected { print NR }' "${file}")" ||
+            fail "command log 순서를 읽지 못했습니다: ${expected}"
+        [[ "${line}" -gt "${previous_line}" ]] ||
+            fail "command log의 release 검증 순서가 잘못됐습니다: ${expected}"
+        previous_line="${line}"
+    done
+}
+
 new_fixture() {
     local fixture_dir
 
@@ -233,6 +254,30 @@ test_verify_runs_android_contract() {
         "verify.sh가 Android debug APK를 조립하지 않았습니다."
     assert_contains "${command_log}" "bash scripts/android-manager-manifest.test.sh" \
         "verify.sh가 Android manifest 계약 검사를 실행하지 않았습니다."
+    rm -rf -- "${fixture_dir}"
+}
+
+test_verify_runs_release_verification_contract() {
+    local fixture_dir
+    local output_file
+    local command_log
+
+    fixture_dir="$(new_fixture)"
+    output_file="${fixture_dir}/release-verify-output.txt"
+    command_log="${fixture_dir}/commands.log"
+    run_fixture_verify "${fixture_dir}" "${output_file}" ||
+        fail "release 검증 fixture에서 verify.sh가 실패했습니다: $(cat "${output_file}")"
+
+    assert_exact_commands_in_order "${command_log}" \
+        "bash -n scripts/release-lib.sh" \
+        "bash -n scripts/init-android-release-key.sh" \
+        "bash -n scripts/prepare-release.sh" \
+        "bash -n scripts/publish-release-tag.sh" \
+        "bash scripts/release-contract.test.sh" \
+        "bash scripts/init-android-release-key.test.sh" \
+        "bash scripts/release-lib.test.sh" \
+        "bash scripts/prepare-release.test.sh" \
+        "bash scripts/publish-release-tag.test.sh"
     rm -rf -- "${fixture_dir}"
 }
 
@@ -536,6 +581,7 @@ test_gitignore_excludes_local_release_outputs() {
 }
 
 test_verify_runs_android_contract
+test_verify_runs_release_verification_contract
 test_verify_rejects_missing_rg
 test_verify_rejects_rg_scan_error
 test_verify_rejects_guard_forbidden_syntax_variants
