@@ -28,6 +28,14 @@ if /usr/bin/grep -q 'SIXBRIDGE_PREPARE_SANITIZER_\(READY\|CONTINUE\)' "${PREPARE
     fail 'sanitizer 이전에 caller가 지정한 READY/CONTINUE 파일을 사용하는 경계가 남아 있습니다.'
 fi
 
+if /usr/bin/grep -Eq -- '--sixbridge-internal-worker|sixbridge-sanitized-worker-v1|SIXBRIDGE_PREPARE_BOUND|SIXBRIDGE_RELEASE_BOUND_PROJECT_ROOT' "${PREPARE_SCRIPT}"; then
+    fail 'public internal worker selector, 고정 token 또는 과거 bound 환경 분기가 production entrypoint에 남아 있습니다.'
+fi
+if /usr/bin/grep -Eq -- 'SIXBRIDGE_RELEASE_BOUND_PROJECT_ROOT|BASH_SOURCE\[0\].*/dev/fd' \
+    "${ROOT_DIR}/scripts/release-lib.sh"; then
+    fail 'release-lib에 caller-selected root 또는 public FD source 분기가 남아 있습니다.'
+fi
+
 assert_contains() {
     local file=$1 expected=$2 message=$3
     grep -Fq -- "${expected}" "${file}" || {
@@ -93,6 +101,15 @@ descendant_commands() {
         done < <(/usr/bin/pgrep -P "${pid}" 2>/dev/null || true)
     done
     printf '%s' "${commands}"
+}
+
+source_file_identity() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        /usr/bin/perl -e '
+            my @s = stat($ARGV[0]);
+            @s or exit 1;
+            printf "%s:%s:%s:%s:%s:%o:%s\n", @s[0,1,7,3,4], $s[2] & 07777, $s[10];
+        ' "$1"
 }
 
 run_homebrew_resolver() {
@@ -396,6 +413,7 @@ expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRI
 for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
   [[ -z "${!poisoned+x}" ]]
 done
+! /usr/bin/env | /usr/bin/grep -Fq 'BAD-NAME=poison'
 "${JAVA_HOME}/bin/java" verify
 node verify
 rg verify
@@ -413,6 +431,7 @@ expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRI
 for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
   [[ -z "${!poisoned+x}" ]]
 done
+! /usr/bin/env | /usr/bin/grep -Fq 'BAD-NAME=poison'
 printf '%s\n' "$*" >>"${SIXBRIDGE_PREPARE_LOG}"
 case " $* " in
   *' :android-manager:assembleRelease '*)
@@ -448,12 +467,15 @@ EOF
 setup_case() {
     local name=$1
     CASE_ROOT="${FIXTURE_ROOT}/${name}"
+    CASE_PREPARE_SCRIPT="${CASE_ROOT}/scripts/prepare-release.sh"
     CASE_LOG="${CASE_ROOT}/.local/calls.log"
     rm -rf "${CASE_ROOT}"
     mkdir -p "${CASE_ROOT}/scripts" "${CASE_ROOT}/docs/releases" "${CASE_ROOT}/.local/keystore"
     chmod 700 "${CASE_ROOT}/.local" "${CASE_ROOT}/.local/keystore"
     : >"${CASE_LOG}"
     copy_fixture_library "${CASE_ROOT}"
+    cp "${PREPARE_SCRIPT}" "${CASE_PREPARE_SCRIPT}"
+    chmod 755 "${CASE_PREPARE_SCRIPT}"
     create_fixture_tools "${CASE_ROOT}"
     [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.pl" ]] || \
         cp "${ROOT_DIR}/scripts/release-atomic-publish.pl" "${CASE_ROOT}/scripts/release-atomic-publish.pl"
@@ -474,14 +496,13 @@ run_prepare() {
         cd "${CASE_ROOT}"
         exec /usr/bin/env \
             PATH="${CASE_ROOT}/bin:${PATH}" \
-            SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
             SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
             SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
             SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
             SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
             SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
             "$@" \
-            "${PREPARE_SCRIPT}" 0.1.0
+            "${CASE_PREPARE_SCRIPT}" 0.1.0
     )
 }
 
@@ -502,6 +523,140 @@ expect_failure() {
 printf '%s\n' key-material >"${TEMPLATE_KEYSTORE}"
 chmod 600 "${TEMPLATE_KEYSTORE}"
 readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+
+setup_case forged-public-internal-worker
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 700 "${CASE_ROOT}/.local/gradle-home"
+forged_runtime_path="/usr/bin:/bin:${CASE_ROOT}/runtime/node/bin:${CASE_ROOT}/runtime/rg/bin"
+expect_failure forged-public-internal-worker '지원하지 않는 release version' \
+    /bin/bash -c '
+        exec 8< <(printf "%s\0" sixbridge-sanitized-worker-v1)
+        exec /usr/bin/env -i \
+            PATH="$1" JAVA_HOME="$2" GRADLE_USER_HOME="$3" \
+            HOME=/var/empty LANG=C LC_ALL=C \
+            SIXBRIDGE_RELEASE_ROOT="$4" SIXBRIDGE_PREPARE_FIXTURE_BIN="$5" \
+            SIXBRIDGE_PREPARE_LOG="$6" SIXBRIDGE_PREPARE_SIGNER="$7" \
+            SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="$8" \
+            SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="$8" \
+            "$9" --sixbridge-internal-worker 0.1.0
+    ' forged-worker "${forged_runtime_path}" "${CASE_ROOT}/runtime/jdk" \
+        "${CASE_ROOT}/.local/gradle-home" "${CASE_ROOT}" "${CASE_ROOT}/bin" \
+        "${CASE_LOG}" "${FIXTURE_SIGNER}" "${RELEASE_PASSWORD}" "${CASE_PREPARE_SCRIPT}"
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case public-source-mode
+set +e
+/bin/bash --noprofile --norc -p -c '
+    source "$1"
+    declare -F prepare_release_worker
+' public-source "${CASE_PREPARE_SCRIPT}" >"${FIXTURE_ROOT}/public-source-mode.log" 2>&1
+public_source_status=$?
+set -e
+[[ "${public_source_status}" -ne 0 ]] || fail 'public prepare source mode가 worker 함수를 노출했습니다.'
+assert_contains "${FIXTURE_ROOT}/public-source-mode.log" 'source할 수 없는 direct-exec entrypoint' \
+    'public prepare source mode의 명시적 거부 사유가 없습니다.'
+assert_not_contains "${FIXTURE_ROOT}/public-source-mode.log" 'prepare_release_worker' \
+    'public prepare source mode에서 worker 함수가 보입니다.'
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case public-source-debug-trap
+set +e
+/bin/bash --noprofile --norc -p -c '
+    set -T
+    trap '\''if [[ "$BASH_COMMAND" == "run_preparation_worker \"\$@\"" ]]; then
+        trap - DEBUG
+        return 0
+    fi'\'' DEBUG
+    source "$0" 9.9.9
+    declare -F prepare_release_worker
+' "${CASE_PREPARE_SCRIPT}" >"${FIXTURE_ROOT}/public-source-debug-trap.log" 2>&1
+public_source_debug_status=$?
+set -e
+[[ "${public_source_debug_status}" -ne 0 ]] || \
+    fail '위조한 argv0와 DEBUG trap이 public prepare source mode를 우회했습니다.'
+assert_contains "${FIXTURE_ROOT}/public-source-debug-trap.log" 'source할 수 없는 direct-exec entrypoint' \
+    'DEBUG trap source 공격의 명시적 거부 사유가 없습니다.'
+assert_not_contains "${FIXTURE_ROOT}/public-source-debug-trap.log" 'prepare_release_worker' \
+    'DEBUG trap source 공격 뒤 worker 함수가 보입니다.'
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case worker-program-missing-function
+/usr/bin/perl -0pi -e '
+    s/publish_verified_snapshot prepare_release_worker;/publish_verified_snapshot;/
+        or die "worker function list substitution failed\n";
+' "${CASE_PREPARE_SCRIPT}"
+expect_failure worker-program-missing-function 'worker program 필수 함수가 없습니다: prepare_release_worker' \
+    run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+assert_no_release_work_entries "${CASE_ROOT}"
+
+setup_case forged-source-fds
+forged_source_marker="${CASE_ROOT}/.local/forged-source-lib-sourced"
+forged_source_lib="${CASE_ROOT}/.local/forged-release-lib.sh"
+printf ': >%q\n' "${forged_source_marker}" >"${forged_source_lib}"
+/bin/chmod 600 "${forged_source_lib}"
+forged_source_identity=$(source_file_identity "${CASE_PREPARE_SCRIPT}")
+forged_lib_identity=$(source_file_identity "${forged_source_lib}")
+set +e
+/bin/bash --noprofile --norc -p -c '
+    exec 6<"$1"
+    exec 7<"$2"
+    SIXBRIDGE_PREPARE_BOUND_ROOT=$3
+    SIXBRIDGE_PREPARE_BOUND_SOURCE_IDENTITY=$4
+    SIXBRIDGE_PREPARE_BOUND_LIB_IDENTITY=$5
+    source /dev/fd/6
+' forged-source "${CASE_PREPARE_SCRIPT}" "${forged_source_lib}" "${CASE_ROOT}" \
+    "${forged_source_identity}" "${forged_lib_identity}" \
+    >"${FIXTURE_ROOT}/forged-source-fds.log" 2>&1
+forged_source_status=$?
+set -e
+[[ "${forged_source_status}" -ne 0 ]] || fail 'forged source fd fixture가 성공했습니다.'
+[[ ! -e "${forged_source_marker}" ]] || fail '외부 forged FD의 release-lib.sh가 source 되었습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+
+poison_root="${FIXTURE_ROOT}/root-override-source-injection"
+poison_marker="${poison_root}/source-marker"
+mkdir -p "${poison_root}/scripts"
+cat >"${poison_root}/scripts/release-lib.sh" <<EOF
+: >"${poison_marker}"
+release_require_version() { return 1; }
+EOF
+set +e
+SIXBRIDGE_RELEASE_ROOT="${poison_root}" \
+    SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+    SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+    "${PREPARE_SCRIPT}" 9.9.9 >"${FIXTURE_ROOT}/root-override-source-injection.log" 2>&1
+poison_root_status=$?
+set -e
+[[ "${poison_root_status}" -ne 0 ]] || fail 'caller-selected release root fixture가 성공했습니다.'
+[[ ! -e "${poison_marker}" ]] || fail 'caller-selected release root의 release-lib.sh가 source 되었습니다.'
+assert_contains "${FIXTURE_ROOT}/root-override-source-injection.log" '지원하지 않는 release version' \
+    'caller-selected release root를 무시한 실제 entrypoint version 거부가 없습니다.'
+
+setup_case symlink-entrypoint
+symlink_entrypoint="${CASE_ROOT}/scripts/prepare-release-link.sh"
+ln -s prepare-release.sh "${symlink_entrypoint}"
+expect_failure symlink-entrypoint 'symbolic link entrypoint' \
+    /usr/bin/env SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${symlink_entrypoint}" 9.9.9
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case writable-release-library
+writable_lib_marker="${CASE_ROOT}/.local/writable-release-lib-sourced"
+writable_lib_temp="${CASE_ROOT}/scripts/release-lib.writable"
+{
+    printf ': >%q\n' "${writable_lib_marker}"
+    /bin/cat "${CASE_ROOT}/scripts/release-lib.sh"
+} >"${writable_lib_temp}"
+/bin/mv "${writable_lib_temp}" "${CASE_ROOT}/scripts/release-lib.sh"
+/bin/chmod 666 "${CASE_ROOT}/scripts/release-lib.sh"
+expect_failure writable-release-library 'group/other write' \
+    /usr/bin/env SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${CASE_PREPARE_SCRIPT}" 9.9.9
+[[ ! -e "${writable_lib_marker}" ]] || fail 'writable release-lib.sh가 trust 검증 전에 source 되었습니다.'
+assert_no_final_directory "${CASE_ROOT}"
 
 set +e
 (
@@ -699,11 +854,11 @@ assert_contains "${FIXTURE_ROOT}/entrypoint-shebang-bypass.log" 'privileged Bash
 
 setup_case invalid-version
 expect_failure invalid-version '지원하지 않는 release version' \
-    /usr/bin/env PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+    /usr/bin/env PATH="${CASE_ROOT}/bin:${PATH}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        "${PREPARE_SCRIPT}" 9.9.9
+        "${CASE_PREPARE_SCRIPT}" 9.9.9
 [[ ! -s "${CASE_LOG}" ]] || fail 'invalid version preflight 전에 runtime/build 도구가 실행되었습니다.'
 [[ ! -e "${CASE_ROOT}/.local/gradle-home" ]] || fail 'invalid version preflight 전에 GRADLE_USER_HOME이 생성되었습니다.'
 assert_no_final_directory "${CASE_ROOT}"
@@ -775,7 +930,6 @@ sanitizer_log="${FIXTURE_ROOT}/sanitized-worker-argv.log"
 (
     cd "${CASE_ROOT}"
     export PATH="${CASE_ROOT}/bin:${PATH}"
-    export SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}"
     export SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin"
     export SIXBRIDGE_PREPARE_LOG="${CASE_LOG}"
     export SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}"
@@ -786,7 +940,7 @@ sanitizer_log="${FIXTURE_ROOT}/sanitized-worker-argv.log"
     export SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=argv
     export SIXBRIDGE_PREPARE_READY="${sanitizer_ready}"
     export SIXBRIDGE_PREPARE_CONTINUE="${sanitizer_continue}"
-    exec "${PREPARE_SCRIPT}" 0.1.0
+    exec /usr/bin/env 'BAD-NAME=poison' "${CASE_PREPARE_SCRIPT}" 0.1.0
 ) >"${sanitizer_log}" 2>&1 &
 sanitizer_parent_pid=$!
 for _ in $(seq 1 100); do [[ -e "${sanitizer_ready}" ]] && break; /bin/sleep 0.05; done
@@ -813,36 +967,6 @@ fi
 assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
 assert_log_has_no_secret "${sanitizer_log}"
 
-setup_case internal-worker-no-bootstrap
-mkdir -p "${CASE_ROOT}/.local/gradle-home"
-chmod 700 "${CASE_ROOT}/.local/gradle-home"
-internal_runtime_path="/usr/bin:/bin:${CASE_ROOT}/runtime/node/bin:${CASE_ROOT}/runtime/rg/bin"
-expect_failure internal-worker-no-bootstrap 'sanitized worker bootstrap' \
-    /usr/bin/env -i PATH="${internal_runtime_path}" \
-        JAVA_HOME="${CASE_ROOT}/runtime/jdk" \
-        GRADLE_USER_HOME="${CASE_ROOT}/.local/gradle-home" \
-        HOME=/var/empty LANG=C LC_ALL=C \
-        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
-        SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
-        SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
-        SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
-        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
-        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        "${PREPARE_SCRIPT}" --sixbridge-internal-worker 0.1.0
-assert_no_final_directory "${CASE_ROOT}"
-
-setup_case internal-worker-poison
-mkdir -p "${CASE_ROOT}/.local/gradle-home"
-chmod 700 "${CASE_ROOT}/.local/gradle-home"
-expect_failure internal-worker-poison 'sanitized worker' \
-    /usr/bin/env -i PATH=/caller/poison HOME=/var/empty LANG=C LC_ALL=C \
-        JAVA_HOME=/caller/poison-jdk GRADLE_USER_HOME="${CASE_ROOT}/.local/gradle-home" \
-        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
-        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
-        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        "${PREPARE_SCRIPT}" --sixbridge-internal-worker 0.1.0
-assert_no_final_directory "${CASE_ROOT}"
-
 setup_case runtime-node-resolution-mismatch
 expect_failure runtime-node-resolution-mismatch 'sanitized PATH의 node가 검증된 canonical 도구와 다릅니다.' \
     run_prepare /usr/bin/env SIXBRIDGE_PREPARE_RUNTIME_MISMATCH=node
@@ -856,10 +980,10 @@ assert_no_final_directory "${CASE_ROOT}"
 setup_case missing-credential
 expect_failure missing-credential 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
     /usr/bin/env -u SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD \
-        PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        PATH="${CASE_ROOT}/bin:${PATH}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        "${PREPARE_SCRIPT}" 0.1.0
+        "${CASE_PREPARE_SCRIPT}" 0.1.0
 [[ ! -s "${CASE_LOG}" ]] || fail 'missing credential preflight 전에 runtime/build 도구가 실행되었습니다.'
 [[ ! -e "${CASE_ROOT}/.local/gradle-home" ]] || fail 'missing credential preflight 전에 GRADLE_USER_HOME이 생성되었습니다.'
 assert_no_final_directory "${CASE_ROOT}"
@@ -1045,7 +1169,6 @@ for signal in HUP INT TERM; do
     /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "exec failed\n";' \
         /usr/bin/env \
         PATH="${CASE_ROOT}/bin:${PATH}" \
-        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
         SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
@@ -1056,7 +1179,7 @@ for signal in HUP INT TERM; do
         SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
         SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
         SIXBRIDGE_PREPARE_TMPDIR_RECORD="${CASE_ROOT}/child-tmpdir" \
-        "${PREPARE_SCRIPT}" 0.1.0 >"${signal_log}" 2>&1 &
+        "${CASE_PREPARE_SCRIPT}" 0.1.0 >"${signal_log}" 2>&1 &
     signal_pid=$!
     for _ in $(seq 1 100); do [[ -e "${signal_ready}" ]] && break; /bin/sleep 0.05; done
     [[ -e "${signal_ready}" ]] || fail "${signal} cleanup fixture가 verifier 대기 상태에 도달하지 못했습니다."

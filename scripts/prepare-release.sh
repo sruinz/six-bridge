@@ -1,5 +1,11 @@
 #!/bin/bash -p
 
+builtin trap - DEBUG RETURN ERR
+if (builtin return 0 2>/dev/null); then
+    printf 'release 검증 실패: prepare-release.sh는 source할 수 없는 direct-exec entrypoint입니다.\n' >&2
+    builtin return 64
+fi
+
 case $- in
     *p*) ;;
     *) printf 'release 검증 실패: prepare-release.sh는 privileged Bash direct-exec로 실행해야 합니다.\n' >&2; exit 1 ;;
@@ -15,16 +21,119 @@ unset BASH_ENV ENV CDPATH GLOBIGNORE
 export -n BASHOPTS SHELLOPTS
 set -euo pipefail
 
-ROOT_INPUT="${SIXBRIDGE_RELEASE_ROOT:-$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)}"
-[[ -d "${ROOT_INPUT}" && ! -L "${ROOT_INPUT}" ]] || {
-    printf 'release 검증 실패: release root는 symbolic link가 아닌 directory여야 합니다.\n' >&2
+bootstrap_stat_value() {
+    local format=$1 path=$2 linux_format
+    if [[ "$(/usr/bin/uname -s)" = Darwin ]]; then
+        /usr/bin/stat -f "${format}" "${path}" 2>/dev/null
+        return
+    fi
+    case "${format}" in
+        '%d') linux_format='%d' ;; '%i') linux_format='%i' ;; '%z') linux_format='%s' ;;
+        '%l') linux_format='%h' ;; '%u') linux_format='%u' ;; '%Lp') linux_format='%a' ;;
+        '%c') linux_format='%Z' ;;
+        *) return 1 ;;
+    esac
+    /usr/bin/stat -c "${linux_format}" "${path}" 2>/dev/null
+}
+
+bootstrap_file_identity() {
+    local path=$1 device inode size links owner mode ctime
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    device=$(bootstrap_stat_value '%d' "${path}") || return 1
+    inode=$(bootstrap_stat_value '%i' "${path}") || return 1
+    size=$(bootstrap_stat_value '%z' "${path}") || return 1
+    links=$(bootstrap_stat_value '%l' "${path}") || return 1
+    owner=$(bootstrap_stat_value '%u' "${path}") || return 1
+    mode=$(bootstrap_stat_value '%Lp' "${path}") || return 1
+    ctime=$(bootstrap_stat_value '%c' "${path}") || return 1
+    printf '%s:%s:%s:%s:%s:%s:%s\n' "${device}" "${inode}" "${size}" "${links}" "${owner}" "${mode}" "${ctime}"
+}
+
+bootstrap_require_directory() {
+    local path=$1 current_uid=$2 owner mode
+    [[ -d "${path}" && ! -L "${path}" ]] || {
+        printf 'release 검증 실패: entrypoint ancestor는 symbolic link가 아닌 directory여야 합니다.\n' >&2
+        return 1
+    }
+    owner=$(bootstrap_stat_value '%u' "${path}") || return 1
+    [[ "${owner}" = 0 || "${owner}" = "${current_uid}" ]] || {
+        printf 'release 검증 실패: entrypoint ancestor owner가 신뢰 범위 밖입니다.\n' >&2
+        return 1
+    }
+    mode=$(bootstrap_stat_value '%Lp' "${path}") || return 1
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
+        printf 'release 검증 실패: entrypoint ancestor가 group/other write를 허용합니다.\n' >&2
+        return 1
+    }
+}
+
+bootstrap_require_source_file() {
+    local path=$1 current_uid=$2 identity owner mode links
+    identity=$(bootstrap_file_identity "${path}") || {
+        printf 'release 검증 실패: entrypoint source는 symbolic link가 아닌 regular file이어야 합니다.\n' >&2
+        return 1
+    }
+    IFS=: read -r _ _ _ links owner mode _ <<<"${identity}"
+    [[ "${links}" = 1 && "${owner}" = "${current_uid}" ]] || {
+        printf 'release 검증 실패: entrypoint source owner 또는 link count가 올바르지 않습니다.\n' >&2
+        return 1
+    }
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
+        printf 'release 검증 실패: entrypoint source가 group/other write를 허용합니다.\n' >&2
+        return 1
+    }
+    printf '%s\n' "${identity}"
+}
+
+bootstrap_fd_identity() {
+    local fd=$1
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        /usr/bin/perl -e '
+            open(my $fh, q{<&=} . $ARGV[0]) or exit 1;
+            my @s = stat($fh);
+            @s or exit 1;
+            printf "%s:%s:%s:%s:%s:%o:%s\n", @s[0,1,7,3,4], $s[2] & 07777, $s[10];
+        ' "${fd}"
+}
+
+current_uid=$(/usr/bin/id -u) || exit 1
+source_input=${BASH_SOURCE[0]}
+[[ ! -L "${source_input}" ]] || {
+    printf 'release 검증 실패: prepare-release.sh symbolic link entrypoint는 허용되지 않습니다.\n' >&2
     exit 1
 }
-ROOT_DIR="$(CDPATH= cd -P -- "${ROOT_INPUT}" && pwd -P)"
-readonly ROOT_DIR
+source_parent=$(/usr/bin/dirname -- "${source_input}") || exit 1
+source_leaf=${source_input##*/}
+SCRIPT_DIR=$(CDPATH= cd -P -- "${source_parent}" && pwd -P) || exit 1
+PREPARE_SOURCE_PATH="${SCRIPT_DIR}/${source_leaf}"
+ROOT_DIR=$(CDPATH= cd -P -- "${SCRIPT_DIR}/.." && pwd -P) || exit 1
+[[ "${SCRIPT_DIR}" = "${ROOT_DIR}/scripts" ]] || {
+    printf 'release 검증 실패: prepare-release.sh canonical containment가 올바르지 않습니다.\n' >&2
+    exit 1
+}
+ancestor=${ROOT_DIR}
+while :; do
+    bootstrap_require_directory "${ancestor}" "${current_uid}" || exit 1
+    [[ "${ancestor}" = / ]] && break
+    ancestor=$(/usr/bin/dirname -- "${ancestor}") || exit 1
+done
+bootstrap_require_directory "${SCRIPT_DIR}" "${current_uid}" || exit 1
+PREPARE_SOURCE_IDENTITY=$(bootstrap_require_source_file "${PREPARE_SOURCE_PATH}" "${current_uid}") || exit 1
+RELEASE_LIB_PATH="${SCRIPT_DIR}/release-lib.sh"
+RELEASE_LIB_IDENTITY=$(bootstrap_require_source_file "${RELEASE_LIB_PATH}" "${current_uid}") || exit 1
+readonly ROOT_DIR PREPARE_SOURCE_PATH RELEASE_LIB_PATH PREPARE_SOURCE_IDENTITY RELEASE_LIB_IDENTITY
+readonly SIXBRIDGE_RELEASE_ROOT=${ROOT_DIR}
+export SIXBRIDGE_RELEASE_ROOT
 
 # shellcheck source=release-lib.sh
-source "${ROOT_DIR}/scripts/release-lib.sh"
+exec 7<"${RELEASE_LIB_PATH}" || exit 1
+[[ "$(bootstrap_fd_identity 7)" = "${RELEASE_LIB_IDENTITY}" ]] || {
+    printf 'release 검증 실패: release-lib.sh fd identity가 변경되었습니다.\n' >&2
+    exit 1
+}
+source /dev/fd/7
+exec 7<&-
+release_bind_project_root "${ROOT_DIR}" || exit 1
 
 readonly KEYSTORE="${ROOT_DIR}/.local/keystore/six-bridge-manager-release.p12"
 readonly RELEASE_NOTES="${ROOT_DIR}/docs/releases/v0.1.0-ko.md"
@@ -93,10 +202,11 @@ cleanup_stage() {
 terminate_preparation_worker() {
     local pid=${ACTIVE_CHILD_PID:-} pgroup=${ACTIVE_CHILD_PGID:-}
     [[ -n "${pid}" ]] || return 0
-    if [[ -n "${pgroup}" ]]; then
-        /bin/kill -TERM -- "-${pgroup}" 2>/dev/null || true
+    if [[ -n "${pgroup}" ]] && /bin/kill -TERM -- "-${pgroup}" 2>/dev/null; then
+        :
+    else
+        /bin/kill -TERM "${pid}" 2>/dev/null || true
     fi
-    /bin/kill -TERM "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     ACTIVE_CHILD_PID=''
     ACTIVE_CHILD_PGID=''
@@ -116,9 +226,31 @@ release_worker_signal_exit() {
     exit "${status}"
 }
 
+emit_preparation_worker_program() {
+    local name
+    declare -p ROOT_DIR KEYSTORE RELEASE_NOTES RELEASE_CONTAINER FINAL_DIR LOCK_DIR \
+        PUBLISH_HELPER_SOURCE ANDROID_OUTPUT DMG_OUTPUT STAGE_DIR STAGE_IDENTITY \
+        PUBLISH_DIR PUBLISH_IDENTITY PUBLISH_HELPER PUBLISH_HELPER_IDENTITY \
+        PUBLISH_HELPER_SOURCE_IDENTITY PUBLISH_PERL_PRIVLIB PUBLISH_PERL_ARCHLIB \
+        RELEASE_TMPDIR CONTAINER_IDENTITY LOCK_IDENTITY OWNED_WORK_DIRECTORIES \
+        ACTIVE_CHILD_PID ACTIVE_CHILD_PGID
+    for name in \
+        stable_directory_identity remove_owned_directory release_register_owned_work_directory \
+        cleanup_owned_work_directories cleanup_stage release_worker_signal_exit \
+        require_android_credentials validate_sanitized_worker_environment validate_keystore \
+        release_keytool release_git release_clean_commit read_signer_sha256 \
+        create_release_container acquire_release_lock create_release_temp_directory \
+        copy_to_stage capture_release_file_identities assert_release_file_identities \
+        assert_exact_release_entries create_publish_snapshot compile_atomic_publish_helper \
+        publish_manifest_identity publish_verified_snapshot prepare_release_worker; do
+        declare -f "${name}" || return 1
+    done
+    printf 'readonly SIXBRIDGE_PREPARE_WORKER_PROGRAM_COMPLETE=1\n'
+}
+
 run_preparation_worker() {
     local status java_path java_home node_path rg_path gradle_home gradle_mode local_root physical_local
-    local runtime_path resolved_node resolved_rg sanitizer_script perl_sanitizer
+    local runtime_path resolved_node resolved_rg sanitizer_script perl_sanitizer worker_bootstrap
     release_require_version "${1:-}" || return 1
     require_android_credentials || return 1
     java_path=$(release_java_executable) || return 1
@@ -171,11 +303,13 @@ run_preparation_worker() {
     sanitizer_script='
 set -euo pipefail
 perl_sanitizer=$1
-target=$2
-runtime_path=$3
-java_home=$4
-gradle_home=$5
-shift 5
+worker_bootstrap=$2
+root=$3
+lib_identity=$4
+runtime_path=$5
+java_home=$6
+gradle_home=$7
+shift 7
 values=(
     "${runtime_path}"
     "${java_home}"
@@ -205,13 +339,13 @@ values=(
     "${SIXBRIDGE_PREPARE_CHILD_PID:-}"
     "${SIXBRIDGE_PREPARE_TMPDIR_RECORD:-}"
 )
-exec 8< <(printf "%s\0" sixbridge-sanitized-worker-v1)
 exec 9< <(
     for ((index = 0; index < ${#values[@]}; index++)); do
         printf "%s\0" "${values[index]}"
     done
 )
-exec -c /usr/bin/perl -e "${perl_sanitizer}" "${target}" --sixbridge-internal-worker "$@"
+exec -c /usr/bin/perl -e "${perl_sanitizer}" "${worker_bootstrap}" "${root}" \
+    "${lib_identity}" "$@"
 '
     perl_sanitizer='
 use strict;
@@ -243,14 +377,73 @@ pop(@values) if @values && $values[-1] eq q{};
 $SIG{HUP} = q{DEFAULT};
 $SIG{INT} = q{DEFAULT};
 $SIG{TERM} = q{DEFAULT};
-my ($target, @args) = @ARGV;
-exec {$target} $target, @args or die q{worker exec failed\n};
+my ($worker_bootstrap, $root, $lib_identity, @args) = @ARGV;
+exec {q{/bin/bash}} q{/bin/bash}, q{--noprofile}, q{--norc}, q{-p}, q{-c},
+    $worker_bootstrap, q{sixbridge-worker}, $root, $lib_identity, @args
+    or die q{worker exec failed\n};
 '
+    worker_bootstrap='
+set -euo pipefail
+case $- in *p*) ;; *) printf "release 검증 실패: worker privileged Bash가 아닙니다.\n" >&2; exit 1 ;; esac
+ENTRY_INHERITED_PATH=${PATH:-}
+PATH=/usr/bin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE
+export -n BASHOPTS SHELLOPTS
+worker_root=$1
+expected_lib_identity=$2
+shift 2
+actual_lib_identity=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+    /usr/bin/perl -e '\''open(my $fh, q{<&=} . 7) or exit 1; my @s = stat($fh); @s or exit 1; print join(q{:}, @s[0,1,7,3,4], sprintf(q{%o}, $s[2] & 07777), $s[10]), chr(10);'\'')
+[[ "${actual_lib_identity}" = "${expected_lib_identity}" ]] || {
+    printf "release 검증 실패: worker release-lib fd identity가 올바르지 않습니다.\n" >&2
+    exit 1
+}
+source /dev/fd/7
+release_bind_project_root "${worker_root}"
+source /dev/fd/6
+exec 6<&- 7<&-
+[[ "${SIXBRIDGE_PREPARE_WORKER_PROGRAM_COMPLETE:-}" = 1 ]] || {
+    release_fail "worker program이 완전하지 않습니다."
+    exit 1
+}
+for worker_function in prepare_release_worker cleanup_stage release_worker_signal_exit \
+    validate_sanitized_worker_environment require_android_credentials; do
+    declare -F "${worker_function}" >/dev/null || {
+        release_fail "worker program 필수 함수가 없습니다: ${worker_function}"
+        exit 1
+    }
+done
+release_require_version "${1:-}"
+require_android_credentials
+validate_sanitized_worker_environment
+set +m
+trap cleanup_stage EXIT
+trap "release_worker_signal_exit 129" HUP
+trap "release_worker_signal_exit 130" INT
+trap "release_worker_signal_exit 143" TERM
+prepare_release_worker "$@"
+'
+    [[ "$(bootstrap_file_identity "${PREPARE_SOURCE_PATH}")" = "${PREPARE_SOURCE_IDENTITY}" &&
+       "$(bootstrap_file_identity "${ROOT_DIR}/scripts/release-lib.sh")" = "${RELEASE_LIB_IDENTITY}" ]] || {
+        release_fail 'worker source path identity가 변경되었습니다.'
+        return 1
+    }
+    exec 6< <(emit_preparation_worker_program)
+    exec 7<"${ROOT_DIR}/scripts/release-lib.sh" || { exec 6<&-; return 1; }
+    [[ "$(bootstrap_fd_identity 7)" = "${RELEASE_LIB_IDENTITY}" ]] || {
+        exec 6<&- 7<&-
+        release_fail 'worker release-lib fd identity가 변경되었습니다.'
+        return 1
+    }
     set -m
     /bin/bash --noprofile --norc -p -c "${sanitizer_script}" sixbridge-sanitizer \
-        "${perl_sanitizer}" "$0" "${runtime_path}" "${java_home}" "${gradle_home}" "$@" &
+        "${perl_sanitizer}" "${worker_bootstrap}" "${ROOT_DIR}" \
+        "${RELEASE_LIB_IDENTITY}" \
+        "${runtime_path}" "${java_home}" "${gradle_home}" "$@" &
     ACTIVE_CHILD_PID=$!
     ACTIVE_CHILD_PGID=$!
+    exec 6<&- 7<&-
     if wait "${ACTIVE_CHILD_PID}"; then
         status=0
     else
@@ -284,24 +477,6 @@ require_android_credentials() {
     }
     [[ "${store_password}" = "${key_password}" ]] || {
         release_fail 'store 및 key 비밀번호는 동일해야 합니다.'
-        return 1
-    }
-}
-
-validate_internal_worker_bootstrap() {
-    local bootstrap extra
-    if ! IFS= read -r -d '' bootstrap 2>/dev/null <&8; then
-        release_fail 'sanitized worker bootstrap fd가 없거나 손상됐습니다.'
-        return 1
-    fi
-    if IFS= read -r -n 1 extra 2>/dev/null <&8; then
-        exec 8<&-
-        release_fail 'sanitized worker bootstrap payload가 올바르지 않습니다.'
-        return 1
-    fi
-    exec 8<&-
-    [[ "${bootstrap}" = sixbridge-sanitized-worker-v1 ]] || {
-        release_fail 'sanitized worker bootstrap payload가 올바르지 않습니다.'
         return 1
     }
 }
@@ -738,21 +913,6 @@ PUBLISH_IDENTITY=''
 
 printf 'v%s release directory를 준비했습니다: %s\n' "${SIXBRIDGE_RELEASE_VERSION}" "${FINAL_DIR}"
 }
-
-if [[ "${1:-}" = --sixbridge-internal-worker ]]; then
-    shift
-    release_require_version "${1:-}"
-    require_android_credentials
-    validate_internal_worker_bootstrap
-    validate_sanitized_worker_environment
-    set +m
-    trap cleanup_stage EXIT
-    trap 'release_worker_signal_exit 129' HUP
-    trap 'release_worker_signal_exit 130' INT
-    trap 'release_worker_signal_exit 143' TERM
-    prepare_release_worker "$@"
-    exit $?
-fi
 
 unset SIXBRIDGE_PREPARE_WORKER
 run_preparation_worker "$@"

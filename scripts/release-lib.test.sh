@@ -153,6 +153,7 @@ set -e
 /usr/bin/grep -Eq '^[0-9a-f]{64}$' "${production_shasum_log}" || fail 'production shasum digest 형식이 올바르지 않습니다.'
 
 source "${LIBRARY}"
+release_bind_project_root "${ROOT_DIR}"
 
 [[ "$(release_linux_stat_format '%g')" = '%g' ]] || \
     fail 'Linux stat group format mapping이 올바르지 않습니다.'
@@ -225,15 +226,15 @@ expect_failure production-apk-launcher-boundary 'APK signature verification' \
   env PATH="${fake_java_home}/bin:/usr/bin:/bin" JAVA_HOME="${fake_java_home}" \
   JAVA_OPTS='-Dfake=true' APKANALYZER_OPTS='-Dfake=true' JAVA_TOOL_OPTIONS='-Dfake=true' \
   JDK_JAVA_OPTIONS='-Dfake=true' BASH_ENV=/dev/null ENV=/dev/null CLASSPATH=/tmp/fake-classpath \
-  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_verify_apk "$2" "$3" "$4" "$5"' _ \
-  "${LIBRARY}" "${apk}" "${SIGNER}" "${stage}" "${container}"
+  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_bind_project_root "$2"; release_verify_apk "$3" "$4" "$5" "$6"' _ \
+  "${LIBRARY}" "${ROOT_DIR}" "${apk}" "${SIGNER}" "${stage}" "${container}"
 production_apkanalyzer_log="${FIXTURE_ROOT}/production-apkanalyzer-boundary.log"
 set +e
 env PATH="${fake_java_home}/bin:/usr/bin:/bin" JAVA_HOME="${fake_java_home}" \
   JAVA_OPTS='-Dfake=true' APKANALYZER_OPTS='-Dfake=true' JAVA_TOOL_OPTIONS='-Dfake=true' \
   JDK_JAVA_OPTIONS='-Dfake=true' BASH_ENV=/dev/null ENV=/dev/null CLASSPATH=/tmp/fake-classpath \
-  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_run_apkanalyzer manifest application-id "$2"' _ \
-  "${LIBRARY}" "${apk}" >"${production_apkanalyzer_log}" 2>&1
+  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_bind_project_root "$2"; release_run_apkanalyzer manifest application-id "$3"' _ \
+  "${LIBRARY}" "${ROOT_DIR}" "${apk}" >"${production_apkanalyzer_log}" 2>&1
 production_apkanalyzer_status=$?
 set -e
 [[ "${production_apkanalyzer_status}" -ne 0 ]] || fail 'production apkanalyzer가 비-APK 입력을 허용했습니다.'
@@ -320,6 +321,74 @@ GREP_CAPTURE="${FIXTURE_ROOT}/grep-argv.log" PATH="${FIXTURE_ROOT}/path:${PATH}"
   expect_failure scan-secret '비밀정보' release_scan_tree "${scan_root}" "${stage}" "${container}" 'release-secret-probe'
 assert_not_contains "${FIXTURE_ROOT}/grep-argv.log" 'release-secret-probe' 'secret probe가 grep argv에 노출되었습니다.'
 /bin/rm "${scan_root}/secret.txt"
+
+fifo_scan_path="${scan_root}/rebound-fifo"
+make_file "${fifo_scan_path}" safe
+fifo_expected_identity=$(release_file_identity "${fifo_scan_path}")
+/bin/rm "${fifo_scan_path}"
+/usr/bin/mkfifo "${fifo_scan_path}"
+fifo_status_file="${FIXTURE_ROOT}/fifo-scan.status"
+(
+  set +e
+  release_file_contains_secret "${fifo_scan_path}" probe "${fifo_expected_identity}"
+  printf '%s\n' "$?" >"${fifo_status_file}"
+) &
+fifo_scan_pid=$!
+/bin/sleep 0.2
+if /bin/kill -0 "${fifo_scan_pid}" 2>/dev/null; then
+  /bin/kill -TERM "${fifo_scan_pid}" 2>/dev/null || true
+  wait "${fifo_scan_pid}" 2>/dev/null || true
+  fail 'path가 FIFO로 바뀐 binary secret scanner가 block되었습니다.'
+fi
+wait "${fifo_scan_pid}" 2>/dev/null || true
+[[ "$(/bin/cat "${fifo_status_file}")" = 2 ]] || fail 'FIFO scanner 오류가 clean으로 처리되었습니다.'
+/bin/rm "${fifo_scan_path}"
+
+safe_identity=$(release_file_identity "${scan_root}/safe.txt")
+set +e
+release_file_contains_secret "${scan_root}/safe.txt" '' "${safe_identity}"
+empty_secret_status=$?
+release_file_contains_secret "${scan_root}/safe.txt" probe ''
+empty_identity_status=$?
+set -e
+[[ "${empty_secret_status}" = 2 && "${empty_identity_status}" = 2 ]] || \
+  fail '비어 있는 scanner secret/identity가 clean 상태로 처리되었습니다.'
+
+binary_secret='binary-secret-probe'
+printf 'prefix\0%s\0suffix' "${binary_secret}" >"${scan_root}/binary-secret.bin"
+expect_failure scan-binary-secret '비밀정보' release_scan_tree \
+  "${scan_root}" "${stage}" "${container}" "${binary_secret}"
+/bin/rm "${scan_root}/binary-secret.bin"
+
+printf 'prefix\0\0%s\0\0suffix' "${binary_secret}" >"${scan_root}/multiple-nul-secret.bin"
+expect_failure scan-multiple-nul-secret '비밀정보' release_scan_tree \
+  "${scan_root}" "${stage}" "${container}" "${binary_secret}"
+/bin/rm "${scan_root}/multiple-nul-secret.bin"
+
+newline_secret=$'line-one\nline-two'
+printf 'prefix\0%s\0suffix' "${newline_secret}" >"${scan_root}/newline-secret.bin"
+expect_failure scan-newline-secret '비밀정보' release_scan_tree \
+  "${scan_root}" "${stage}" "${container}" "${newline_secret}"
+/bin/rm "${scan_root}/newline-secret.bin"
+
+printf '%65535s' '' | /usr/bin/tr ' ' a >"${scan_root}/chunk-boundary-secret.bin"
+printf '%s' "${binary_secret}" >>"${scan_root}/chunk-boundary-secret.bin"
+expect_failure scan-chunk-boundary-secret '비밀정보' release_scan_tree \
+  "${scan_root}" "${stage}" "${container}" "${binary_secret}"
+/bin/rm "${scan_root}/chunk-boundary-secret.bin"
+
+printf '%131072s' '' | /usr/bin/tr ' ' a >"${scan_root}/single-byte-clean.bin"
+release_scan_tree "${scan_root}" "${stage}" "${container}" Z
+/bin/rm "${scan_root}/single-byte-clean.bin"
+
+ancestor_fixture="${FIXTURE_ROOT}/trusted-system-ancestor"
+/bin/mkdir "${ancestor_fixture}"
+/bin/chmod 755 "${ancestor_fixture}"
+release_trusted_ancestor_directory "${ancestor_fixture}" "$(/usr/bin/id -u)"
+/bin/chmod 775 "${ancestor_fixture}"
+expect_failure writable-system-ancestor 'group/other write' \
+  release_trusted_ancestor_directory "${ancestor_fixture}" "$(/usr/bin/id -u)"
+/bin/chmod 755 "${ancestor_fixture}"
 
 make_release_directory() {
     local name=$1 parent directory

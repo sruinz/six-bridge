@@ -13,11 +13,35 @@ readonly SIXBRIDGE_RELEASE_FILES=(
     'RELEASE-METADATA.json'
     'RELEASE-NOTES-KO.md'
 )
-readonly SIXBRIDGE_RELEASE_PROJECT_ROOT="$(CDPATH= builtin cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")/.." && builtin pwd -P)"
+SIXBRIDGE_RELEASE_PROJECT_ROOT=''
 
 release_fail() {
     printf 'release 검증 실패: %s\n' "$1" >&2
     return 1
+}
+
+release_bind_project_root() {
+    local requested=${1:-} physical
+    [[ -n "${requested}" && "${requested}" = /* && -d "${requested}" && ! -L "${requested}" ]] || {
+        release_fail 'release project root는 canonical absolute directory여야 합니다.'
+        return 1
+    }
+    physical="$(CDPATH= builtin cd -P -- "${requested}" && builtin pwd -P)" || return 1
+    [[ "${physical}" = "${requested}" ]] || {
+        release_fail 'release project root canonical path가 입력과 다릅니다.'
+        return 1
+    }
+    release_trusted_directory "${physical}" || return 1
+    release_trusted_directory "${physical}/scripts" || return 1
+    if [[ -n "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" ]]; then
+        [[ "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" = "${physical}" ]] || {
+            release_fail 'release project root는 다시 bind할 수 없습니다.'
+            return 1
+        }
+        return 0
+    fi
+    SIXBRIDGE_RELEASE_PROJECT_ROOT=${physical}
+    readonly SIXBRIDGE_RELEASE_PROJECT_ROOT
 }
 
 release_before_atomic_publish() {
@@ -379,6 +403,8 @@ release_java_executable() {
     # This project already standardizes its local Android builds on Homebrew
     # JDK homes. Do not accept JAVA_HOME/PATH here: caller-controlled runtime
     # selection would let an SDK launcher execute an unverified JVM.
+    release_system_directory / || return 1
+    release_system_directory /opt || return 1
     release_trusted_directory /opt/homebrew || return 1
     release_trusted_directory /opt/homebrew/opt || return 1
     release_trusted_directory /opt/homebrew/Cellar || return 1
@@ -449,6 +475,8 @@ release_resolve_homebrew_tool_at() {
 }
 
 release_homebrew_tool() {
+    release_system_directory / || return 1
+    release_system_directory /opt || return 1
     release_resolve_homebrew_tool_at /opt/homebrew "$1" "$2"
 }
 
@@ -503,14 +531,25 @@ release_system_executable() {
     }
 }
 
-release_system_directory() {
-    local path=${1:-} owner mode
+release_trusted_ancestor_directory() {
+    local path=${1:-} expected_owner=${2:-} owner mode
     release_directory "${path}" || return 1
     owner=$(release_stat_value '%u' "${path}") || return 1
-    [[ "${owner}" = 0 ]] || { release_fail 'system directory owner가 root가 아닙니다.'; return 1; }
+    [[ "${expected_owner}" =~ ^[0-9]+$ && "${owner}" = "${expected_owner}" ]] || {
+        release_fail 'trusted ancestor directory owner가 올바르지 않습니다.'
+        return 1
+    }
     mode=$(release_stat_value '%Lp' "${path}") || return 1
     [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
-        release_fail 'system directory가 group/other write를 허용합니다.'
+        release_fail 'trusted ancestor directory가 group/other write를 허용합니다.'
+        return 1
+    }
+    release_link_count "${path}" >/dev/null
+}
+
+release_system_directory() {
+    release_trusted_ancestor_directory "${1:-}" 0 || {
+        release_fail 'system directory trust 검증에 실패했습니다.'
         return 1
     }
 }
@@ -959,11 +998,86 @@ release_verify_dmg() {
 }
 
 release_file_contains_secret() {
-    local path=${1:-} secret=${2:-} line
-    while IFS= read -r line || [[ -n "${line}" ]]; do
-        [[ "${line}" = *"${secret}"* ]] && return 0
-    done <"${path}"
-    return 1
+    local path=${1:-} secret=${2:-} expected_identity=${3:-}
+    local perl_contract perl privlib archlib scanner_status
+    [[ -n "${secret}" && -n "${expected_identity}" ]] || {
+        release_fail 'binary secret scanner 입력이 비어 있습니다.'
+        return 2
+    }
+    perl_contract=$(release_system_perl) || return 2
+    IFS='|' read -r perl privlib archlib <<<"${perl_contract}"
+    exec 7< <(printf '%s' "${secret}")
+    if /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        SIXBRIDGE_PERL_INC="${privlib}:${archlib}" \
+        "${perl}" -e '
+            BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); }
+            use strict;
+            use warnings;
+            use Digest::SHA;
+            use Fcntl qw(O_RDONLY O_NONBLOCK O_NOFOLLOW S_ISREG);
+            my ($path, $expected) = @ARGV;
+            defined($path) && length($path) or exit 2;
+            defined($expected) && length($expected) or exit 2;
+            open(my $secret_fh, q{<&=7}) or exit 2;
+            binmode($secret_fh);
+            local $/;
+            my $secret = <$secret_fh>;
+            defined($secret) && length($secret) or exit 2;
+            close($secret_fh) or exit 2;
+            sysopen(my $artifact_fh, $path,
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or exit 2;
+            binmode($artifact_fh);
+            my @before = stat($artifact_fh);
+            @before && S_ISREG($before[2]) or exit 2;
+            my ($expected_device, $expected_inode, $expected_size,
+                $expected_links, $expected_digest) = split(/:/, $expected, 5);
+            defined($expected_digest) &&
+                $expected_digest =~ /\A[0-9a-f]{64}\z/ or exit 2;
+            join(q{:}, @before[0,1,7,3]) eq
+                join(q{:}, $expected_device, $expected_inode,
+                    $expected_size, $expected_links) or exit 2;
+            my $sha = Digest::SHA->new(256);
+            my $tail = q{};
+            my $found = 0;
+            my $total = 0;
+            while (1) {
+                my $read = read($artifact_fh, my $chunk, 65536);
+                defined($read) or exit 2;
+                last if $read == 0;
+                $total += $read;
+                $sha->add($chunk);
+                my $window = $tail . $chunk;
+                $found = 1 if index($window, $secret) >= 0;
+                my $overlap = length($secret) - 1;
+                if ($overlap == 0) {
+                    $tail = q{};
+                } elsif (length($window) > $overlap) {
+                    $tail = substr($window, -$overlap);
+                } else {
+                    $tail = $window;
+                }
+            }
+            my @after = stat($artifact_fh);
+            @after or exit 2;
+            close($artifact_fh) or exit 2;
+            my $identity = join(q{:}, $before[0], $before[1], $before[7],
+                $before[3], $sha->hexdigest);
+            $identity eq $expected or exit 2;
+            $total == $before[7] or exit 2;
+            join(q{:}, @before[0,1,7,3,4,2,10]) eq
+                join(q{:}, @after[0,1,7,3,4,2,10]) or exit 2;
+            exit($found ? 0 : 1);
+        ' "${path}" "${expected_identity}"; then
+        scanner_status=0
+    else
+        scanner_status=$?
+    fi
+    exec 7<&-
+    case "${scanner_status}" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) release_fail 'binary secret scanner가 artifact identity를 검증하지 못했습니다.'; return 2 ;;
+    esac
 }
 
 release_validate_private_work_directory() {
@@ -980,7 +1094,7 @@ release_validate_private_work_directory() {
 
 release_scan_tree() {
     local root=${1:-} stage_root=${2:-} container=${3:-} secret_probe=${4:-}
-    local physical_root entries entry basename lower file_identity stage_identity container_identity
+    local physical_root entries entry basename lower file_identity stage_identity container_identity scanner_status
     release_validate_stage_root "${stage_root}" "${container}" || return 1
     release_directory "${root}" || return 1
     physical_root="$(CDPATH= builtin cd -P -- "${root}" && builtin pwd -P)"
@@ -1014,9 +1128,14 @@ release_scan_tree() {
         fi
         release_require_single_link_file "${entry}" || return 1
         file_identity=$(release_file_identity "${entry}") || return 1
-        if [[ -n "${secret_probe}" ]] && release_file_contains_secret "${entry}" "${secret_probe}"; then
-            release_fail '비밀정보가 release tree에 포함되어 있습니다.'
-            return 1
+        if [[ -n "${secret_probe}" ]]; then
+            if release_file_contains_secret "${entry}" "${secret_probe}" "${file_identity}"; then
+                release_fail '비밀정보가 release tree에 포함되어 있습니다.'
+                return 1
+            else
+                scanner_status=$?
+                [[ "${scanner_status}" = 1 ]] || return 1
+            fi
         fi
         release_assert_file_identity "${entry}" "${file_identity}" || return 1
     done <<<"${entries}"
