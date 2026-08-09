@@ -177,6 +177,18 @@ release_run_apkanalyzer() {
     "${SIXBRIDGE_APKANALYZER}" "$@"
 }
 
+make_fake_android_sdk() {
+    local sdk_root=$1
+    /bin/mkdir -p "${sdk_root}/build-tools/36.0.0/lib" "${sdk_root}/cmdline-tools/latest/lib"
+    /bin/chmod 700 "${sdk_root}" "${sdk_root}/build-tools" "${sdk_root}/build-tools/36.0.0" \
+        "${sdk_root}/build-tools/36.0.0/lib" "${sdk_root}/cmdline-tools" \
+        "${sdk_root}/cmdline-tools/latest" "${sdk_root}/cmdline-tools/latest/lib"
+    make_file "${sdk_root}/build-tools/36.0.0/source.properties" 'Pkg.Revision=36.0.0'
+    make_file "${sdk_root}/build-tools/36.0.0/lib/apksigner.jar" jar
+    make_file "${sdk_root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar" jar
+    make_file "${sdk_root}/cmdline-tools/latest/lib/dependency.jar" jar
+}
+
 container="${FIXTURE_ROOT}"
 stage="${container}/stage"
 /bin/mkdir -p "${stage}"; /bin/chmod 700 "${container}" "${stage}"
@@ -189,6 +201,20 @@ external_stage="${external_container}/stage"
 /bin/mkdir -p "${external_stage}"; /bin/chmod 700 "${external_container}" "${external_stage}"
 expect_failure external-container '프로젝트 .local' release_validate_stage_root "${external_stage}" "${external_container}"
 /bin/rm -rf "${external_container}"
+
+fake_sdk="${FIXTURE_ROOT}/fake-sdk"
+make_fake_android_sdk "${fake_sdk}"
+release_validate_android_sdk "${fake_sdk}"
+fake_external_lib="${FIXTURE_ROOT}/fake-external-build-tools-lib"
+/bin/mv "${fake_sdk}/build-tools/36.0.0/lib" "${fake_external_lib}"
+/bin/ln -s "${fake_external_lib}" "${fake_sdk}/build-tools/36.0.0/lib"
+expect_failure sdk-build-tools-lib-symlink 'symbolic link가 아닌 directory' release_validate_android_sdk "${fake_sdk}"
+/bin/rm "${fake_sdk}/build-tools/36.0.0/lib"
+/bin/mv "${fake_external_lib}" "${fake_sdk}/build-tools/36.0.0/lib"
+/bin/chmod 100 "${fake_sdk}/cmdline-tools/latest/lib"
+expect_failure sdk-classpath-find 'Android SDK classpath 열거' release_validate_android_sdk "${fake_sdk}"
+/bin/chmod 700 "${fake_sdk}/cmdline-tools/latest/lib"
+release_validate_android_sdk "${fake_sdk}"
 
 apk="${stage}/fixture.apk"; dmg="${stage}/fixture.dmg"
 make_file "${apk}" apk; make_file "${dmg}" dmg

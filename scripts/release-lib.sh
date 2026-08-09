@@ -420,13 +420,64 @@ release_private_file() {
     }
 }
 
+release_validate_private_descendant_file() {
+    local parent=$1 path=$2 physical_parent physical_path ancestor
+    release_trusted_directory "${parent}" || return 1
+    release_private_file "${path}" || return 1
+    physical_parent="$(CDPATH= builtin cd -P -- "${parent}" && builtin pwd -P)"
+    physical_path="$(CDPATH= builtin cd -P -- "$(/usr/bin/dirname -- "${path}")" && builtin pwd -P)/$(/usr/bin/basename -- "${path}")"
+    case "${physical_path}" in
+        "${physical_parent}"/*) ;;
+        *) release_fail 'Android SDK file이 canonical parent 밖에 있습니다.'; return 1 ;;
+    esac
+    ancestor="$(/usr/bin/dirname -- "${physical_path}")"
+    while [[ "${ancestor}" != "${physical_parent}" ]]; do
+        release_trusted_directory "${ancestor}" || return 1
+        ancestor="$(/usr/bin/dirname -- "${ancestor}")"
+    done
+}
+
+release_validate_android_classpath() {
+    local lib=$1 scan_parent scan_dir jars_file links_file jar status=0
+    release_trusted_directory "${lib}" || return 1
+    scan_parent="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/.local"
+    release_trusted_directory "${scan_parent}" || return 1
+    scan_dir=$(/usr/bin/mktemp -d "${scan_parent}/.sixbridge-sdk-classpath.XXXXXX") || {
+        release_fail 'Android SDK classpath 임시 directory를 만들지 못했습니다.'
+        return 1
+    }
+    release_private_directory "${scan_dir}" || { /bin/rm -rf "${scan_dir}"; return 1; }
+    jars_file="${scan_dir}/jars.nul"
+    links_file="${scan_dir}/links.nul"
+    if ! /usr/bin/find "${lib}" -xdev -type l -print0 >"${links_file}"; then
+        /bin/rm -rf "${scan_dir}"
+        release_fail 'Android SDK classpath 열거에 실패했습니다.'
+        return 1
+    fi
+    if [[ -s "${links_file}" ]]; then
+        /bin/rm -rf "${scan_dir}"
+        release_fail 'Android SDK classpath에 symbolic link가 포함되어 있습니다.'
+        return 1
+    fi
+    if ! /usr/bin/find "${lib}" -xdev -type f -name '*.jar' -print0 >"${jars_file}"; then
+        /bin/rm -rf "${scan_dir}"
+        release_fail 'Android SDK classpath 열거에 실패했습니다.'
+        return 1
+    fi
+    while IFS= read -r -d '' jar; do
+        release_validate_private_descendant_file "${lib}" "${jar}" || { status=1; break; }
+    done <"${jars_file}"
+    /bin/rm -rf "${scan_dir}"
+    return "${status}"
+}
+
 release_validate_android_sdk() {
-    local root=$1 revision_file revision='' apksigner_jar apkanalyzer_jar jar
+    local root=$1 revision_file revision='' apksigner_lib apksigner_jar apkanalyzer_lib apkanalyzer_jar
     release_trusted_directory "${root}" || return 1
     release_trusted_directory "${root}/build-tools" || return 1
     release_trusted_directory "${root}/build-tools/36.0.0" || return 1
     revision_file="${root}/build-tools/36.0.0/source.properties"
-    release_private_file "${revision_file}" || return 1
+    release_validate_private_descendant_file "${root}/build-tools/36.0.0" "${revision_file}" || return 1
     while IFS= read -r revision || [[ -n "${revision}" ]]; do
         [[ "${revision}" = 'Pkg.Revision=36.0.0' ]] && break
     done <"${revision_file}"
@@ -434,20 +485,17 @@ release_validate_android_sdk() {
         release_fail 'Android SDK build-tools 36.0.0 revision 계약이 올바르지 않습니다.'
         return 1
     }
-    apksigner_jar="${root}/build-tools/36.0.0/lib/apksigner.jar"
-    release_private_file "${apksigner_jar}" || return 1
+    apksigner_lib="${root}/build-tools/36.0.0/lib"
+    release_trusted_directory "${apksigner_lib}" || return 1
+    apksigner_jar="${apksigner_lib}/apksigner.jar"
+    release_validate_private_descendant_file "${apksigner_lib}" "${apksigner_jar}" || return 1
     release_trusted_directory "${root}/cmdline-tools" || return 1
     release_trusted_directory "${root}/cmdline-tools/latest" || return 1
-    release_trusted_directory "${root}/cmdline-tools/latest/lib" || return 1
-    apkanalyzer_jar="${root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar"
-    release_private_file "${apkanalyzer_jar}" || return 1
-    while IFS= read -r -d '' jar; do
-        release_private_file "${jar}" || return 1
-    done < <(/usr/bin/find "${root}/cmdline-tools/latest/lib" -type f -name '*.jar' -print0)
-    [[ -z "$(/usr/bin/find "${root}/cmdline-tools/latest/lib" -type l -print -quit)" ]] || {
-        release_fail 'Android SDK classpath에 symbolic link가 포함되어 있습니다.'
-        return 1
-    }
+    apkanalyzer_lib="${root}/cmdline-tools/latest/lib"
+    release_trusted_directory "${apkanalyzer_lib}" || return 1
+    apkanalyzer_jar="${apkanalyzer_lib}/apkanalyzer-classpath.jar"
+    release_validate_private_descendant_file "${apkanalyzer_lib}" "${apkanalyzer_jar}" || return 1
+    release_validate_android_classpath "${apkanalyzer_lib}"
 }
 
 release_run_apksigner() {
