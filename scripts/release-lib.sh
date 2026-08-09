@@ -20,6 +20,10 @@ release_fail() {
     return 1
 }
 
+release_before_atomic_publish() {
+    :
+}
+
 release_require_version() {
     [[ "${1:-}" = "${SIXBRIDGE_RELEASE_VERSION}" ]] ||
         release_fail "지원하지 않는 release version입니다: ${1:-없음}"
@@ -393,10 +397,56 @@ release_system_executable() {
         # discovery/digest work; arbitrary system hardlinks remain rejected.
         if [[ "$(/usr/bin/uname -s)" = Darwin ]]; then
             case "${path}" in
-                /usr/bin/shasum|/usr/bin/git|/usr/bin/keytool|/usr/bin/clang) return 0 ;;
+                /usr/bin/shasum|/usr/bin/git|/usr/bin/keytool) return 0 ;;
             esac
         fi
         release_fail 'system release 도구에 hardlink가 포함되어 있습니다.'
+        return 1
+    }
+}
+
+release_system_directory() {
+    local path=${1:-} owner mode
+    release_directory "${path}" || return 1
+    owner=$(release_stat_value '%u' "${path}") || return 1
+    [[ "${owner}" = 0 ]] || { release_fail 'system directory owner가 root가 아닙니다.'; return 1; }
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
+        release_fail 'system directory가 group/other write를 허용합니다.'
+        return 1
+    }
+}
+
+release_system_perl() {
+    local output
+    release_system_executable /usr/bin/perl || return 1
+    release_system_directory /System || return 1
+    release_system_directory /System/Library || return 1
+    release_system_directory /System/Library/Perl || return 1
+    release_system_directory /System/Library/Perl/5.34 || return 1
+    release_system_directory /System/Library/Perl/5.34/darwin-thread-multi-2level || return 1
+    output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        /usr/bin/perl -e 'BEGIN { @INC = (q{/System/Library/Perl/5.34/darwin-thread-multi-2level}, q{/System/Library/Perl/5.34}); } use Digest::SHA; use File::Spec; print "$INC{\"Digest/SHA.pm\"}\n$INC{\"File/Spec.pm\"}\n";') || {
+        release_fail 'system Perl module을 load하지 못했습니다.'
+        return 1
+    }
+    [[ "${output}" = $'/System/Library/Perl/5.34/darwin-thread-multi-2level/Digest/SHA.pm\n/System/Library/Perl/5.34/darwin-thread-multi-2level/File/Spec.pm' ]] || {
+        release_fail 'system Perl module canonical containment가 올바르지 않습니다.'
+        return 1
+    }
+    printf '%s\n' /usr/bin/perl
+}
+
+release_darwin_atomic_publish_preflight() {
+    local kernel_major
+    release_system_executable /usr/bin/uname || return 1
+    [[ "$(/usr/bin/uname -s)" = Darwin ]] || {
+        release_fail 'atomic no-replace publish는 Darwin renameatx_np가 필요합니다.'
+        return 1
+    }
+    kernel_major=$(/usr/bin/uname -r | /usr/bin/cut -d. -f1) || return 1
+    [[ "${kernel_major}" =~ ^[0-9]+$ && "${kernel_major}" -ge 22 ]] || {
+        release_fail 'atomic no-replace publish는 macOS 13 이상이 필요합니다.'
         return 1
     }
 }
@@ -559,7 +609,7 @@ release_verify_apk() {
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
-    apksigner_output=$(/usr/bin/mktemp '/tmp/sixbridge-release-apksigner.XXXXXX') || {
+    apksigner_output=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/sixbridge-release-apksigner.XXXXXX") || {
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK verifier output 임시 파일을 만들지 못했습니다.'
         return 1
@@ -1070,7 +1120,7 @@ release_verify_checksums() {
     done
     # Do not create verifier-owned temporary files in the release tree: doing
     # so would modify the stage directory identity that this function checks.
-    expected_file=$(/usr/bin/mktemp '/tmp/sixbridge-release-checksums.XXXXXX') || {
+    expected_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/sixbridge-release-checksums.XXXXXX") || {
         release_fail 'checksum 비교 임시 파일을 만들지 못했습니다.'
         return 1
     }

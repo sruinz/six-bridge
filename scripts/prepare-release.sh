@@ -17,7 +17,7 @@ readonly RELEASE_NOTES="${ROOT_DIR}/docs/releases/v0.1.0-ko.md"
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
 readonly FINAL_DIR="${RELEASE_CONTAINER}/v0.1.0"
 readonly LOCK_DIR="${RELEASE_CONTAINER}/.sixbridge-v0.1.0.lock"
-readonly PUBLISH_HELPER_SOURCE="${ROOT_DIR}/scripts/release-atomic-publish.c"
+readonly PUBLISH_HELPER_SOURCE="${ROOT_DIR}/scripts/release-atomic-publish.pl"
 readonly ANDROID_OUTPUT="${ROOT_DIR}/android-manager/build/outputs/apk/release/android-manager-release.apk"
 readonly DMG_OUTPUT="${ROOT_DIR}/desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.0.dmg"
 
@@ -25,8 +25,10 @@ STAGE_DIR=''
 STAGE_IDENTITY=''
 PUBLISH_DIR=''
 PUBLISH_IDENTITY=''
-PUBLISH_HELPER_DIR=''
 PUBLISH_HELPER=''
+PUBLISH_HELPER_IDENTITY=''
+PUBLISH_HELPER_SOURCE_IDENTITY=''
+RELEASE_TMPDIR=''
 CONTAINER_IDENTITY=''
 LOCK_IDENTITY=''
 OWNED_WORK_DIRECTORIES=()
@@ -72,21 +74,13 @@ cleanup_stage() {
     remove_owned_directory "${LOCK_DIR}" "${LOCK_IDENTITY}" || true
 }
 
-terminate_active_release_child() {
-    local pid=${ACTIVE_CHILD_PID:-} pgroup=${ACTIVE_CHILD_PGID:-} index
+terminate_preparation_worker() {
+    local pid=${ACTIVE_CHILD_PID:-} pgroup=${ACTIVE_CHILD_PGID:-}
     [[ -n "${pid}" ]] || return 0
     if [[ -n "${pgroup}" ]]; then
         /bin/kill -TERM -- "-${pgroup}" 2>/dev/null || true
     fi
     /bin/kill -TERM "${pid}" 2>/dev/null || true
-    for index in $(/usr/bin/seq 1 20); do
-        /bin/kill -0 "${pid}" 2>/dev/null || break
-        /bin/sleep 0.05
-    done
-    if /bin/kill -0 "${pid}" 2>/dev/null; then
-        [[ -z "${pgroup}" ]] || /bin/kill -KILL -- "-${pgroup}" 2>/dev/null || true
-        /bin/kill -KILL "${pid}" 2>/dev/null || true
-    fi
     wait "${pid}" 2>/dev/null || true
     ACTIVE_CHILD_PID=''
     ACTIVE_CHILD_PGID=''
@@ -95,14 +89,22 @@ terminate_active_release_child() {
 release_signal_exit() {
     local status=$1
     trap - HUP INT TERM
-    terminate_active_release_child
+    terminate_preparation_worker
     exit "${status}"
 }
 
-run_release_step() {
+release_worker_signal_exit() {
+    local status=$1
+    trap - HUP INT TERM
+    cleanup_stage
+    exit "${status}"
+}
+
+run_preparation_worker() {
     local status
     set -m
-    "$@" &
+    /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "worker exec failed\n";' \
+        /usr/bin/env SIXBRIDGE_PREPARE_WORKER=1 "$0" "$@" &
     ACTIVE_CHILD_PID=$!
     ACTIVE_CHILD_PGID=$!
     if wait "${ACTIVE_CHILD_PID}"; then
@@ -166,7 +168,7 @@ release_keytool() {
     java_path=$(release_java_executable) || return 1
     keytool_path="${java_path%/java}/keytool"
     release_trusted_executable "${keytool_path}" || return 1
-    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR=/tmp LANG=C LC_ALL=C \
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR="${RELEASE_TMPDIR:-/tmp}" LANG=C LC_ALL=C \
         SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD}" \
         "${keytool_path}" "$@"
@@ -242,6 +244,16 @@ acquire_release_lock() {
     LOCK_IDENTITY=$(stable_directory_identity "${LOCK_DIR}") || return 1
 }
 
+create_release_temp_directory() {
+    RELEASE_TMPDIR=$(/usr/bin/mktemp -d "${RELEASE_CONTAINER}/.sixbridge-release-tmp.XXXXXX") || {
+        release_fail 'release private TMPDIR을 만들지 못했습니다.'
+        return 1
+    }
+    release_validate_stage_root "${RELEASE_TMPDIR}" "${RELEASE_CONTAINER}" || return 1
+    release_register_owned_work_directory "${RELEASE_TMPDIR}" || return 1
+    export TMPDIR="${RELEASE_TMPDIR}"
+}
+
 copy_to_stage() {
     local source=$1 destination=$2
     release_regular_file "${source}" || return 1
@@ -313,35 +325,48 @@ create_publish_snapshot() {
 }
 
 compile_atomic_publish_helper() {
+    local source_identity perl
     release_system_executable /usr/bin/env || return 1
-    release_system_executable /usr/bin/clang || return 1
+    release_darwin_atomic_publish_preflight || return 1
+    perl=$(release_system_perl) || return 1
     release_private_file "${PUBLISH_HELPER_SOURCE}" || return 1
-    PUBLISH_HELPER_DIR=$(/usr/bin/mktemp -d "${RELEASE_CONTAINER}/.sixbridge-release-publish-helper.XXXXXX") || {
-        release_fail 'atomic publish helper directory를 만들지 못했습니다.'
-        return 1
-    }
-    release_validate_stage_root "${PUBLISH_HELPER_DIR}" "${RELEASE_CONTAINER}" || return 1
-    release_register_owned_work_directory "${PUBLISH_HELPER_DIR}" || return 1
-    PUBLISH_HELPER="${PUBLISH_HELPER_DIR}/release-atomic-publish"
-    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR=/tmp LANG=C LC_ALL=C \
-        /usr/bin/clang -Wall -Wextra -Werror -O2 "${PUBLISH_HELPER_SOURCE}" -o "${PUBLISH_HELPER}" || {
-        release_fail 'atomic no-replace publish helper를 만들지 못했습니다.'
-        return 1
-    }
-    release_trusted_executable "${PUBLISH_HELPER}"
+    source_identity=$(release_file_identity "${PUBLISH_HELPER_SOURCE}") || return 1
+    release_assert_file_identity "${PUBLISH_HELPER_SOURCE}" "${source_identity}" || return 1
+    PUBLISH_HELPER="${perl}"
+    PUBLISH_HELPER_IDENTITY=$(release_file_identity "${PUBLISH_HELPER}")
+    PUBLISH_HELPER_SOURCE_IDENTITY="${source_identity}"
+}
+
+publish_manifest_identity() {
+    local name=$1 manifest=$2 file identity
+    while IFS='|' read -r file identity; do
+        [[ "${file}" = "${name}" ]] && { printf '%s\n' "${identity}"; return 0; }
+    done <<<"${manifest}"
+    release_fail 'native publish identity manifest가 불완전합니다.'
 }
 
 publish_verified_snapshot() {
-    local source_leaf final_leaf
+    local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity
     source_leaf=${PUBLISH_DIR##*/}
     final_leaf=${FINAL_DIR##*/}
     [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.0 ]] || {
         release_fail 'atomic publish helper path가 올바르지 않습니다.'
         return 1
     }
-    "${PUBLISH_HELPER}" "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" "${source_leaf}" "${final_leaf}"
+    apk_identity=$(publish_manifest_identity "${SIXBRIDGE_ANDROID_FILE}" "${PUBLISH_FILE_IDENTITIES}") || return 1
+    dmg_identity=$(publish_manifest_identity "${SIXBRIDGE_MACOS_FILE}" "${PUBLISH_FILE_IDENTITIES}") || return 1
+    sums_identity=$(publish_manifest_identity SHA256SUMS "${PUBLISH_FILE_IDENTITIES}") || return 1
+    metadata_identity=$(publish_manifest_identity RELEASE-METADATA.json "${PUBLISH_FILE_IDENTITIES}") || return 1
+    notes_identity=$(publish_manifest_identity RELEASE-NOTES-KO.md "${PUBLISH_FILE_IDENTITIES}") || return 1
+    release_assert_file_identity "${PUBLISH_HELPER}" "${PUBLISH_HELPER_IDENTITY}" || return 1
+    release_assert_file_identity "${PUBLISH_HELPER_SOURCE}" "${PUBLISH_HELPER_SOURCE_IDENTITY}" || return 1
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR="${RELEASE_TMPDIR}" LANG=C LC_ALL=C \
+        "${PUBLISH_HELPER}" "${PUBLISH_HELPER_SOURCE}" "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" \
+        "${source_leaf}" "${final_leaf}" "${PUBLISH_IDENTITY}" "${apk_identity}" "${dmg_identity}" \
+        "${sums_identity}" "${metadata_identity}" "${notes_identity}"
 }
 
+prepare_release_worker() {
 release_require_version "${1:-}"
 release_system_executable /usr/bin/env
 require_android_credentials
@@ -354,21 +379,22 @@ START_COMMIT=$(release_clean_commit)
 }
 create_release_container
 acquire_release_lock
+create_release_temp_directory
 [[ ! -e "${FINAL_DIR}" && ! -L "${FINAL_DIR}" ]] || {
     release_fail 'release directory가 이미 존재합니다.'
     exit 1
 }
 
 cd "${ROOT_DIR}"
-if ! run_release_step "${ROOT_DIR}/scripts/verify.sh"; then
+if ! "${ROOT_DIR}/scripts/verify.sh"; then
     release_fail '전체 검증에 실패했습니다.'
     exit 1
 fi
-if ! run_release_step ./gradlew :android-manager:assembleRelease; then
+if ! ./gradlew :android-manager:assembleRelease; then
     release_fail 'Android release build에 실패했습니다.'
     exit 1
 fi
-if ! run_release_step /usr/bin/env -u SIXBRIDGE_MAC_SIGNING_IDENTITY \
+if ! /usr/bin/env -u SIXBRIDGE_MAC_SIGNING_IDENTITY \
     -u SIXBRIDGE_MAC_NOTARIZATION_APPLE_ID \
     -u SIXBRIDGE_MAC_NOTARIZATION_PASSWORD \
     -u SIXBRIDGE_MAC_NOTARIZATION_TEAM_ID \
@@ -457,6 +483,7 @@ CONTAINER_IDENTITY=$(release_container_identity "${RELEASE_CONTAINER}")
     exit 1
 }
 release_assert_stage_identity "${PUBLISH_DIR}" "${RELEASE_CONTAINER}" "${PUBLISH_IDENTITY}" "${CONTAINER_IDENTITY}"
+release_before_atomic_publish
 if ! publish_verified_snapshot; then
     release_fail 'release directory를 atomic no-replace 방식으로 publish하지 못했습니다.'
     exit 1
@@ -477,3 +504,16 @@ PUBLISH_DIR=''
 PUBLISH_IDENTITY=''
 
 printf 'v%s release directory를 준비했습니다: %s\n' "${SIXBRIDGE_RELEASE_VERSION}" "${FINAL_DIR}"
+}
+
+if [[ "${SIXBRIDGE_PREPARE_WORKER:-}" = 1 ]]; then
+    set +m
+    trap cleanup_stage EXIT
+    trap 'release_worker_signal_exit 129' HUP
+    trap 'release_worker_signal_exit 130' INT
+    trap 'release_worker_signal_exit 143' TERM
+    prepare_release_worker "$@"
+    exit $?
+fi
+
+run_preparation_worker "$@"

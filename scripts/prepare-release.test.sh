@@ -7,6 +7,7 @@ readonly FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sixbridge-prepare-release-te
 readonly RELEASE_PASSWORD='fixture-release-password'
 readonly SECRET_PROBE='fixture-secret-probe'
 readonly TEMPLATE_KEYSTORE="${FIXTURE_ROOT}/fixture-release.p12"
+readonly PRIVATE_TMP_RELEASE_ENTRIES_BEFORE="$(find /private/tmp -maxdepth 1 -name 'sixbridge-release-*' -print 2>/dev/null | LC_ALL=C sort)"
 
 cleanup() { rm -rf "${FIXTURE_ROOT}"; }
 trap cleanup EXIT
@@ -119,6 +120,33 @@ release_verify_directory() {
         *) return 96 ;;
     esac
 }
+
+release_before_atomic_publish() {
+    local rebound entry
+    case "${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}" in
+        '') ;;
+        content)
+            : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired"
+            printf '%s\n' native-publish-tamper >>"${PUBLISH_DIR}/${SIXBRIDGE_ANDROID_FILE}"
+            ;;
+        directory)
+            : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired"
+            /bin/mkdir "${PUBLISH_DIR}/native-publish-directory"
+            ;;
+        rebind)
+            : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired"
+            rebound="${PUBLISH_DIR}.fixture-rebound"
+            /bin/mv "${PUBLISH_DIR}" "${rebound}"
+            /bin/mkdir "${PUBLISH_DIR}"
+            for entry in "${SIXBRIDGE_ANDROID_FILE}" "${SIXBRIDGE_MACOS_FILE}" SHA256SUMS RELEASE-METADATA.json RELEASE-NOTES-KO.md; do
+                /bin/mv "${rebound}/${entry}" "${PUBLISH_DIR}/${entry}"
+            done
+            /bin/rmdir "${rebound}"
+            : >"${PUBLISH_DIR}/external-rebind-sentinel"
+            ;;
+        *) return 95 ;;
+    esac
+}
 EOF
 }
 
@@ -144,9 +172,9 @@ EOF
 printf '%s\n' "PATH-ENV $*" >>"${SIXBRIDGE_PREPARE_LOG}"
 exec /usr/bin/env "$@"
 EOF
-    cat >"${bin}/clang" <<'EOF'
+    cat >"${bin}/perl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "PATH-CLANG $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+printf '%s\n' "PATH-PERL $*" >>"${SIXBRIDGE_PREPARE_LOG}"
 exit 99
 EOF
     cat >"${bin}/jdk/bin/java" <<'EOF'
@@ -169,6 +197,8 @@ EOF
 #!/usr/bin/env bash
 [[ "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-0}" != 1 ]] || exit 62
 if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = 1 ]]; then
+  printf '%s\n' "${TMPDIR}" >"${SIXBRIDGE_PREPARE_TMPDIR_RECORD}"
+  : >"${TMPDIR}/sixbridge-release-fixture-child-temp"
   /bin/sleep 600 &
   printf '%s\n' "$$ $!" >"${SIXBRIDGE_PREPARE_CHILD_PID}"
   : >"${SIXBRIDGE_PREPARE_READY}"
@@ -264,8 +294,8 @@ setup_case() {
     : >"${CASE_LOG}"
     copy_fixture_library "${CASE_ROOT}"
     create_fixture_tools "${CASE_ROOT}"
-    [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.c" ]] || \
-        cp "${ROOT_DIR}/scripts/release-atomic-publish.c" "${CASE_ROOT}/scripts/release-atomic-publish.c"
+    [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.pl" ]] || \
+        cp "${ROOT_DIR}/scripts/release-atomic-publish.pl" "${CASE_ROOT}/scripts/release-atomic-publish.pl"
     cp "${ROOT_DIR}/docs/releases/v0.1.0-ko.md" "${CASE_ROOT}/docs/releases/v0.1.0-ko.md"
     cp "${TEMPLATE_KEYSTORE}" "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
     chmod 600 "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
@@ -368,19 +398,19 @@ expect_failure dangling-symlink '이미 존재' run_prepare
 [[ -L "${CASE_ROOT}/.local/releases/v0.1.0" ]] || fail '기존 dangling symlink가 보존되지 않았습니다.'
 
 setup_case verify-failure
-expect_failure verify-failure '전체 검증' run_prepare env SIXBRIDGE_PREPARE_VERIFY_FAIL=1
+expect_failure verify-failure '전체 검증' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_VERIFY_FAIL=1
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case android-failure
-expect_failure android-failure 'Android release build' run_prepare env SIXBRIDGE_PREPARE_ANDROID_FAIL=1
+expect_failure android-failure 'Android release build' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_ANDROID_FAIL=1
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case dmg-build-failure
-expect_failure dmg-build-failure 'macOS DMG build' run_prepare env SIXBRIDGE_PREPARE_DMG_BUILD_FAIL=1
+expect_failure dmg-build-failure 'macOS DMG build' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_DMG_BUILD_FAIL=1
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case artifact-verification-failure
-expect_failure artifact-verification-failure 'APK' run_prepare env SIXBRIDGE_PREPARE_APK_VERIFY_FAIL=1
+expect_failure artifact-verification-failure 'APK' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_APK_VERIFY_FAIL=1
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
@@ -391,7 +421,7 @@ assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case jq-failure
-expect_failure jq-failure 'release metadata' run_prepare env SIXBRIDGE_PREPARE_JQ_FAIL=1
+expect_failure jq-failure 'release metadata' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_JQ_FAIL=1
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
@@ -403,54 +433,76 @@ assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case source-change-before-publish
 expect_failure source-change-before-publish 'git worktree 또는 commit이 변경' \
-    run_prepare env SIXBRIDGE_PREPARE_MUTATE_SOURCE=1
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_MUTATE_SOURCE=1
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case head-change-before-publish
 expect_failure head-change-before-publish 'git worktree 또는 commit이 변경' \
-    run_prepare env SIXBRIDGE_PREPARE_MUTATE_HEAD=1
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_MUTATE_HEAD=1
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case post-verify-content-tamper
 expect_failure post-verify-content-tamper 'artifact changed during verification' \
-    run_prepare env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=content
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=content
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case post-verify-extra-directory
 expect_failure post-verify-extra-directory '정확히 다섯 개' \
-    run_prepare env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=directory
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=directory
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case post-verify-extra-symlink
 expect_failure post-verify-extra-symlink '정확히 다섯 개' \
-    run_prepare env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=symlink
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=symlink
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case snapshot-barrier-content
-run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=content
+run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=content
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
 snapshot_content_final="${CASE_ROOT}/.local/releases/v0.1.0"
 assert_exact_release_files "${snapshot_content_final}"
 assert_not_contains "${snapshot_content_final}/SIX-Bridge-Manager-0.1.0-android.apk" 'snapshot-barrier-tamper' '검증 뒤 stage 변조가 final에 반영되었습니다.'
 
 setup_case snapshot-barrier-directory
-run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=directory
+run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=directory
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
 snapshot_directory_final="${CASE_ROOT}/.local/releases/v0.1.0"
 assert_exact_release_files "${snapshot_directory_final}"
 
 setup_case publish-final-insertion
 expect_failure publish-final-insertion 'atomic no-replace' \
-    run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=final
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=final
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'external final insertion barrier가 실행되지 않았습니다.'
 [[ "$(cat "${CASE_ROOT}/.local/releases/v0.1.0/sentinel")" = sentinel ]] || fail '외부 final sentinel이 보존되지 않았습니다.'
 [[ -z "$(find "${CASE_ROOT}/.local/releases/v0.1.0" -name '.sixbridge-*' -print)" ]] || fail '기존 final 아래에 stage가 중첩되었습니다.'
 assert_no_release_work_entries "${CASE_ROOT}"
+
+setup_case native-publish-content-tamper
+expect_failure native-publish-content-tamper 'atomic no-replace' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=content
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired" ]] || fail 'native publish content barrier가 실행되지 않았습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+assert_no_release_work_entries "${CASE_ROOT}"
+
+setup_case native-publish-extra-directory
+expect_failure native-publish-extra-directory 'atomic no-replace' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=directory
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired" ]] || fail 'native publish directory barrier가 실행되지 않았습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+assert_no_release_work_entries "${CASE_ROOT}"
+
+setup_case native-publish-name-rebind
+expect_failure native-publish-name-rebind 'atomic no-replace' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=rebind
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired" ]] || fail 'native publish name-rebind barrier가 실행되지 않았습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+[[ -n "$(find "${CASE_ROOT}/.local/releases" -name external-rebind-sentinel -print)" ]] || \
+    fail '외부 name-rebind directory를 cleanup이 삭제했습니다.'
 
 setup_case success-one
 run_prepare
@@ -484,6 +536,7 @@ for signal in HUP INT TERM; do
         SIXBRIDGE_PREPARE_READY="${signal_ready}" \
         SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
         SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
+        SIXBRIDGE_PREPARE_TMPDIR_RECORD="${CASE_ROOT}/child-tmpdir" \
         "${PREPARE_SCRIPT}" 0.1.0 >"${signal_log}" 2>&1 &
     signal_pid=$!
     for _ in $(seq 1 100); do [[ -e "${signal_ready}" ]] && break; /bin/sleep 0.05; done
@@ -508,6 +561,11 @@ for signal in HUP INT TERM; do
     kill -0 "${signal_grandchild_pid}" 2>/dev/null && fail "${signal} signal 뒤 verifier process group child가 남았습니다."
     assert_no_final_directory "${CASE_ROOT}"
     assert_no_release_work_entries "${CASE_ROOT}"
+    signal_tmpdir=$(cat "${CASE_ROOT}/child-tmpdir")
+    signal_root=$(CDPATH= cd -P -- "${CASE_ROOT}" && pwd -P)
+    case "${signal_tmpdir}" in "${signal_root}"/.local/releases/.sixbridge-release-tmp.*) ;; *) fail "${signal} child TMPDIR이 이번 release private work root가 아닙니다: ${signal_tmpdir}" ;; esac
+    [[ ! -e "${signal_tmpdir}" && ! -L "${signal_tmpdir}" ]] || fail "${signal} signal 뒤 child TMPDIR이 남았습니다."
+    [[ "$(find /private/tmp -maxdepth 1 -name 'sixbridge-release-*' -print 2>/dev/null | LC_ALL=C sort)" = "${PRIVATE_TMP_RELEASE_ENTRIES_BEFORE}" ]] || fail "${signal} signal 뒤 새 /private/tmp release temp가 남았습니다."
     assert_log_has_no_secret "${signal_log}"
 done
 
@@ -542,9 +600,9 @@ cmp "${final_one}/SHA256SUMS" "${final_two}/SHA256SUMS" || fail '두 root의 che
 assert_contains "${final_one}/RELEASE-METADATA.json" "${commit_one}" 'metadata에 현재 git commit이 없습니다.'
 
 setup_case path-shim
-run_prepare
+run_prepare /usr/bin/env PERL5LIB="${CASE_ROOT}/bin" PERL5OPT='-Mstrict'
 assert_not_contains "${CASE_LOG}" 'PATH-ENV' 'PATH env shim이 실행되었습니다.'
-assert_not_contains "${CASE_LOG}" 'PATH-CLANG' 'PATH clang shim이 실행되었습니다.'
+assert_not_contains "${CASE_LOG}" 'PATH-PERL' 'PATH perl shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-KEYTOOL' 'PATH keytool shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-GIT' 'PATH git shim이 실행되었습니다.'
 
