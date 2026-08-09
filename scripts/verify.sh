@@ -156,10 +156,15 @@ JAVA_HOME="$secure_zip_java_home" \
   :bundle-contract:test \
   :core:test \
   :cli:test \
-  :desktop-app:test \
   :api-probe:test \
   :android-wrapper-template:test \
   :cli:installDist \
+  --max-workers=1
+
+GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
+JAVA_HOME="$android_test_java_home" \
+  "$gradle_command" -Pkotlin.jvm.target.validation.mode=IGNORE \
+  :desktop-app:test \
   --max-workers=1
 
 GRADLE_USER_HOME="$project_dir/.local/gradle-home" \
@@ -207,7 +212,8 @@ for shell_file in \
   scripts/fold7-extension-validation.test.sh \
   scripts/fold7-converted-extension.test.sh \
   scripts/fold7-ondevice-conversion-flow.test.sh \
-  scripts/fold7-popup-autofill-url-gate.test.sh; do
+  scripts/fold7-popup-autofill-url-gate.test.sh \
+  scripts/verify-jdk-routing.test.sh; do
   bash -n "$shell_file"
 done
 bash scripts/api-probe-generation.test.sh
@@ -217,6 +223,7 @@ bash scripts/fold7-extension-validation.test.sh
 bash scripts/fold7-converted-extension.test.sh
 bash scripts/fold7-ondevice-conversion-flow.test.sh
 bash scripts/fold7-popup-autofill-url-gate.test.sh
+bash scripts/verify-jdk-routing.test.sh
 bash scripts/verify-mobile-conversion.sh
 bash scripts/android-manager-manifest.test.sh
 bash scripts/android-manager-distribution.test.sh
