@@ -103,9 +103,52 @@ release_worker_signal_exit() {
 }
 
 run_preparation_worker() {
-    local status
+    local status java_path java_home node_path rg_path gradle_home local_root physical_local
+    local runtime_path resolved_node resolved_rg
+    java_path=$(release_java_executable) || return 1
+    java_home=${java_path%/bin/java}
+    node_path=$(release_node_executable) || return 1
+    rg_path=$(release_ripgrep_executable) || return 1
+    [[ -d "${java_home}" && ! -L "${java_home}" ]] || return 1
+    local_root="${ROOT_DIR}/.local"
+    release_trusted_directory "${local_root}" || return 1
+    physical_local="$(CDPATH= cd -P -- "${local_root}" && pwd -P)" || return 1
+    [[ "${physical_local}" = "${ROOT_DIR}/.local" ]] || {
+        release_fail '.local canonical containment가 올바르지 않습니다.'
+        return 1
+    }
+    gradle_home="${ROOT_DIR}/.local/gradle-home"
+    [[ ! -L "${gradle_home}" ]] || { release_fail 'GRADLE_USER_HOME symbolic link는 허용되지 않습니다.'; return 1; }
+    if [[ ! -e "${gradle_home}" ]]; then
+        (umask 077; /bin/mkdir -- "${gradle_home}") || return 1
+    fi
+    release_private_directory "${gradle_home}" || return 1
+    [[ "$(CDPATH= cd -P -- "${gradle_home}" && pwd -P)" = "${ROOT_DIR}/.local/gradle-home" ]] || { release_fail 'GRADLE_USER_HOME containment가 올바르지 않습니다.'; return 1; }
+    [[ -w "${gradle_home}" && -x "${gradle_home}" ]] || {
+        release_fail 'GRADLE_USER_HOME은 write 가능한 private directory여야 합니다.'
+        return 1
+    }
+    runtime_path="/usr/bin:/bin:$(/usr/bin/dirname -- "${node_path}"):$(/usr/bin/dirname -- "${rg_path}")"
+    resolved_node=$(/usr/bin/env -i PATH="${runtime_path}" HOME=/var/empty LC_ALL=C \
+        /bin/bash --noprofile --norc -c 'command -v node') || {
+        release_fail 'sanitized PATH에서 node를 찾지 못했습니다.'
+        return 1
+    }
+    [[ "${resolved_node}" = "${node_path}" ]] || {
+        release_fail 'sanitized PATH의 node가 검증된 canonical 도구와 다릅니다.'
+        return 1
+    }
+    resolved_rg=$(/usr/bin/env -i PATH="${runtime_path}" HOME=/var/empty LC_ALL=C \
+        /bin/bash --noprofile --norc -c 'command -v rg') || {
+        release_fail 'sanitized PATH에서 rg를 찾지 못했습니다.'
+        return 1
+    }
+    [[ "${resolved_rg}" = "${rg_path}" ]] || {
+        release_fail 'sanitized PATH의 rg가 검증된 canonical 도구와 다릅니다.'
+        return 1
+    }
     set -m
-    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LANG=C LC_ALL=C \
+    /usr/bin/env -i PATH="${runtime_path}" JAVA_HOME="${java_home}" GRADLE_USER_HOME="${gradle_home}" HOME=/var/empty LANG=C LC_ALL=C \
         SIXBRIDGE_PREPARE_WORKER=1 \
         SIXBRIDGE_RELEASE_ROOT="${SIXBRIDGE_RELEASE_ROOT:-}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${SIXBRIDGE_PREPARE_FIXTURE_BIN:-}" \
@@ -372,7 +415,7 @@ publish_manifest_identity() {
 }
 
 publish_verified_snapshot() {
-    local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity status source_device source_inode source_size source_fd_identity
+    local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity status source_device source_inode source_size source_links source_digest source_fd_identity
     source_leaf=${PUBLISH_DIR##*/}
     final_leaf=${FINAL_DIR##*/}
     [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.0 ]] || {
@@ -387,13 +430,14 @@ publish_verified_snapshot() {
     release_assert_file_identity "${PUBLISH_HELPER}" "${PUBLISH_HELPER_IDENTITY}" || return 1
     release_assert_file_identity "${PUBLISH_HELPER_SOURCE}" "${PUBLISH_HELPER_SOURCE_IDENTITY}" || return 1
     exec 9<"${PUBLISH_HELPER_SOURCE}" || return 1
-    IFS=: read -r source_device source_inode source_size _ <<<"${PUBLISH_HELPER_SOURCE_IDENTITY}"
+    IFS=: read -r source_device source_inode source_size source_links source_digest <<<"${PUBLISH_HELPER_SOURCE_IDENTITY}"
     source_fd_identity=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
         /usr/bin/perl -e 'open(my $fh, q{<&=9}) or exit 1; my @s = stat($fh); print "$s[0]:$s[1]:$s[7]\n";') || { exec 9<&-; return 1; }
     [[ "${source_fd_identity}" = "${source_device}:${source_inode}:${source_size}" ]] || { printf 'publisher source fd identity mismatch\n' >&2; exec 9<&-; return 1; }
     /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR="${RELEASE_TMPDIR}" LANG=C LC_ALL=C \
         SIXBRIDGE_PERL_INC="${PUBLISH_PERL_PRIVLIB}:${PUBLISH_PERL_ARCHLIB}" \
-        "${PUBLISH_HELPER}" -e 'BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); } my $script = shift @ARGV; do $script or die "publisher bootstrap failed\n";' /dev/fd/9 "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" \
+        SIXBRIDGE_PUBLISHER_SOURCE_IDENTITY="${PUBLISH_HELPER_SOURCE_IDENTITY}" \
+        "${PUBLISH_HELPER}" -e 'BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); } use Digest::SHA qw(sha256_hex); my $script = shift @ARGV; open(my $fh, q{<&=9}) or die "publisher fd open failed\n"; binmode($fh); my @s = stat($fh); my ($d,$i,$z,$n,$h) = split(/:/, $ENV{SIXBRIDGE_PUBLISHER_SOURCE_IDENTITY}, 5); @s && $s[0] == $d && $s[1] == $i && $s[7] == $z && $s[3] == $n or die "publisher fd identity failed\n"; local $/; my $bytes = <$fh>; defined($bytes) && sha256_hex($bytes) eq $h or die "publisher fd digest failed\n"; eval $bytes; die $@ if $@;' /dev/fd/9 "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" \
         "${source_leaf}" "${final_leaf}" "${PUBLISH_IDENTITY}" "${CONTAINER_IDENTITY}" "${apk_identity}" "${dmg_identity}" \
         "${sums_identity}" "${metadata_identity}" "${notes_identity}"
     status=$?

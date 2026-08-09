@@ -154,6 +154,9 @@ set -e
 
 source "${LIBRARY}"
 
+[[ "$(release_linux_stat_format '%g')" = '%g' ]] || \
+    fail 'Linux stat group format mapping이 올바르지 않습니다.'
+
 # Test-only resolver: production library has no sourceable hook and ignores
 # environment overrides. This override exists only in this fixture process.
 release_tool() {

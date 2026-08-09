@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 readonly PREPARE_SCRIPT="${ROOT_DIR}/scripts/prepare-release.sh"
-readonly FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sixbridge-prepare-release-test.XXXXXX")"
+readonly FIXTURE_ROOT="$(CDPATH= cd -P -- "$(mktemp -d "${TMPDIR:-/tmp}/sixbridge-prepare-release-test.XXXXXX")" && pwd -P)"
 readonly RELEASE_PASSWORD='fixture-release-password'
 readonly SECRET_PROBE='fixture-secret-probe'
 readonly TEMPLATE_KEYSTORE="${FIXTURE_ROOT}/fixture-release.p12"
@@ -65,6 +65,15 @@ assert_call_count() {
     [[ "${count}" = 1 ]] || fail "호출 횟수가 기대와 다릅니다 (${expected}): ${count}"
 }
 
+run_homebrew_resolver() {
+    local prefix=$1 formula=$2 binary=$3
+    /bin/bash -c '
+        set -euo pipefail
+        source "$1"
+        release_resolve_homebrew_tool_at "$2" "$3" "$4"
+    ' resolver "${ROOT_DIR}/scripts/release-lib.sh" "${prefix}" "${formula}" "${binary}"
+}
+
 copy_fixture_library() {
     local root=$1
     cp "${ROOT_DIR}/scripts/release-lib.sh" "${root}/scripts/release-lib.sh"
@@ -87,7 +96,46 @@ release_tool() {
 
 release_run_apksigner() { "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apksigner" "$@"; }
 release_run_apkanalyzer() { "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apkanalyzer" "$@"; }
-release_java_executable() { printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/jdk/bin/java"; }
+release_java_executable() { printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk/bin/java"; }
+release_node_executable() {
+    case "${SIXBRIDGE_PREPARE_RUNTIME_MISMATCH:-}" in
+        node) printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin/node-verified" ;;
+        *) printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin/node" ;;
+    esac
+}
+release_ripgrep_executable() {
+    case "${SIXBRIDGE_PREPARE_RUNTIME_MISMATCH:-}" in
+        rg) printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin/rg-verified" ;;
+        *) printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin/rg" ;;
+    esac
+}
+
+eval "$(declare -f release_assert_file_identity | /usr/bin/sed '1s/release_assert_file_identity/release_assert_file_identity_real/')"
+release_assert_file_identity() {
+    local path=$1 expected=$2 size payload
+    release_assert_file_identity_real "$@" || return 1
+    if [[ "${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}" = helper-in-place &&
+          "${path}" = "${PUBLISH_HELPER_SOURCE:-}" &&
+          "${expected}" = "${PUBLISH_HELPER_SOURCE_IDENTITY:-}" &&
+          ! -e "${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-helper-source-mutated" ]]; then
+        : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired"
+        : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-helper-source-mutated"
+        size=$(release_stat_value '%z' "${path}") || return 1
+        payload='open(my $marker, q{>}, q{.local/releases/.fixture-helper-source-executed}) or die; print {$marker} qq{executed\n}; close($marker) or die; exit 0;'
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+            /usr/bin/perl -e '
+                my ($path, $size, $payload) = @ARGV;
+                $payload .= "\n";
+                length($payload) <= $size or die "payload too large\n";
+                $payload .= "#" x ($size - length($payload));
+                open(my $out, q{>}, $path) or die $!;
+                binmode($out);
+                print {$out} $payload or die $!;
+                close($out) or die $!;
+            ' "${path}" "${size}" "${payload}" || return 1
+        [[ "$(release_stat_value '%z' "${path}")" = "${size}" ]] || return 1
+    fi
+}
 
 eval "$(declare -f release_verify_directory | /usr/bin/sed '1s/release_verify_directory/release_verify_directory_real/')"
 release_verify_directory() {
@@ -153,6 +201,7 @@ release_before_atomic_publish() {
             /bin/mv "${rebound}/${source_leaf}" "${RELEASE_CONTAINER}/${source_leaf}"
             : >"${RELEASE_CONTAINER}/external-container-sentinel"
             ;;
+        helper-in-place) : ;;
         *) return 95 ;;
     esac
 }
@@ -163,7 +212,7 @@ create_fixture_tools() {
     local root=$1
     local bin="${root}/bin"
     mkdir -p "${bin}"
-    mkdir -p "${bin}/jdk/bin"
+    mkdir -p "${root}/runtime/jdk/bin" "${root}/runtime/node/bin" "${root}/runtime/rg/bin"
 
     cat >"${bin}/git" <<'EOF'
 #!/usr/bin/env bash
@@ -186,6 +235,16 @@ EOF
 printf '%s\n' "PATH-PERL $*" >>"${SIXBRIDGE_PREPARE_LOG}"
 exit 99
 EOF
+    cat >"${bin}/node" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "PATH-NODE $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 99
+EOF
+    cat >"${bin}/rg" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "PATH-RG $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 99
+EOF
     cat >"${bin}/FixtureLeak.pm" <<'EOF'
 BEGIN {
     open(my $marker, '>', $ENV{SIXBRIDGE_PERL_STARTUP_MARKER}) or die $!;
@@ -194,11 +253,12 @@ BEGIN {
 }
 1;
 EOF
-    cat >"${bin}/jdk/bin/java" <<'EOF'
+    cat >"${root}/runtime/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
-exit 98
+printf '%s\n' "RUNTIME-JAVA $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 0
 EOF
-cat >"${bin}/jdk/bin/keytool" <<'EOF'
+cat >"${root}/runtime/jdk/bin/keytool" <<'EOF'
 #!/usr/bin/env bash
 while [[ "$#" -gt 0 ]]; do
   if [[ "$1" = -keystore ]]; then
@@ -210,6 +270,18 @@ done
 [[ "$(cat "${keystore}")" != keytool-fail ]] || exit 61
 printf '%s\n' 'SHA256: 01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF'
 EOF
+    cat >"${root}/runtime/node/bin/node" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "RUNTIME-NODE $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 0
+EOF
+    cat >"${root}/runtime/rg/bin/rg" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "RUNTIME-RG $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 0
+EOF
+    cp "${root}/runtime/node/bin/node" "${root}/runtime/node/bin/node-verified"
+    cp "${root}/runtime/rg/bin/rg" "${root}/runtime/rg/bin/rg-verified"
     cat >"${bin}/apksigner" <<'EOF'
 #!/usr/bin/env bash
 [[ "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-0}" != 1 ]] || exit 62
@@ -270,15 +342,40 @@ exec /usr/bin/jq "$@"
 EOF
     cat >"${root}/scripts/verify.sh" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin"
+[[ "${PATH}" = "${expected_path}" ]]
+[[ "${JAVA_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk" ]]
+[[ "${GRADLE_USER_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/.local/gradle-home" ]]
+[[ "${HOME}" = /var/empty ]]
+[[ "$(/usr/bin/stat -f '%Lp' "${GRADLE_USER_HOME}")" = 700 ]]
+[[ -w "${GRADLE_USER_HOME}" && -x "${GRADLE_USER_HOME}" ]]
+for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
+  [[ -z "${!poisoned+x}" ]]
+done
+"${JAVA_HOME}/bin/java" verify
+node verify
+rg verify
 printf '%s\n' verify >>"${SIXBRIDGE_PREPARE_LOG}"
 [[ "${SIXBRIDGE_PREPARE_VERIFY_FAIL:-0}" != 1 ]]
 EOF
     cat >"${root}/gradlew" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin"
+[[ "${PATH}" = "${expected_path}" ]]
+[[ "${JAVA_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk" ]]
+[[ "${GRADLE_USER_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/.local/gradle-home" ]]
+[[ "${HOME}" = /var/empty ]]
+for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
+  [[ -z "${!poisoned+x}" ]]
+done
 printf '%s\n' "$*" >>"${SIXBRIDGE_PREPARE_LOG}"
 case " $* " in
   *' :android-manager:assembleRelease '*)
+    "${JAVA_HOME}/bin/java" android
+    node android
+    rg android
     [[ "${SIXBRIDGE_PREPARE_ANDROID_FAIL:-0}" != 1 ]] || exit 71
     mkdir -p android-manager/build/outputs/apk/release
     printf '%s\n' android-artifact >android-manager/build/outputs/apk/release/android-manager-release.apk
@@ -290,6 +387,9 @@ case " $* " in
     fi
     ;;
   *' :desktop-app:packageDmg '*)
+    "${JAVA_HOME}/bin/java" dmg
+    node dmg
+    rg dmg
     [[ -z "${SIXBRIDGE_MAC_SIGNING_IDENTITY:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_APPLE_ID:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_PASSWORD:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_TEAM_ID:-}" ]] || exit 72
     [[ "${SIXBRIDGE_PREPARE_DMG_BUILD_FAIL:-0}" != 1 ]] || exit 73
     mkdir -p 'desktop-app/build/compose/binaries/main/dmg'
@@ -298,7 +398,8 @@ case " $* " in
   *) exit 74 ;;
 esac
 EOF
-    chmod +x "${bin}"/* "${bin}/jdk/bin/"* "${root}/scripts/verify.sh" "${root}/gradlew"
+    chmod +x "${bin}"/* "${root}/runtime/jdk/bin/"* "${root}/runtime/node/bin/"* \
+        "${root}/runtime/rg/bin/"* "${root}/scripts/verify.sh" "${root}/gradlew"
 }
 
 setup_case() {
@@ -359,6 +460,70 @@ printf '%s\n' key-material >"${TEMPLATE_KEYSTORE}"
 chmod 600 "${TEMPLATE_KEYSTORE}"
 readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
+resolver_root="${FIXTURE_ROOT}/resolver-canonical"
+mkdir -p "${resolver_root}/opt" "${resolver_root}/Cellar/node/25.1.0/bin"
+chmod 775 "${resolver_root}/opt" "${resolver_root}/Cellar"
+cat >"${resolver_root}/Cellar/node/25.1.0/bin/node" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 700 "${resolver_root}/Cellar/node/25.1.0/bin/node"
+ln -s ../Cellar/node/25.1.0 "${resolver_root}/opt/node"
+set +e
+resolver_output=$(run_homebrew_resolver "${resolver_root}" node node 2>"${FIXTURE_ROOT}/resolver-canonical.log")
+resolver_status=$?
+set -e
+[[ "${resolver_status}" = 0 ]] || {
+    cat "${FIXTURE_ROOT}/resolver-canonical.log" >&2
+    fail 'canonical Homebrew resolver fixture가 성공하지 못했습니다.'
+}
+[[ "${resolver_output}" = "${resolver_root}/Cellar/node/25.1.0/bin/node" ]] || \
+    fail "canonical Homebrew resolver 결과가 다릅니다: ${resolver_output}"
+
+chmod 777 "${resolver_root}/opt"
+set +e
+run_homebrew_resolver "${resolver_root}" node node >"${FIXTURE_ROOT}/resolver-other-writable.out" 2>&1
+resolver_status=$?
+set -e
+[[ "${resolver_status}" -ne 0 ]] || fail 'other-writable Homebrew resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/resolver-other-writable.out" 'other write' \
+    'other-writable Homebrew resolver의 거부 사유가 없습니다.'
+chmod 775 "${resolver_root}/opt"
+
+resolver_external="${FIXTURE_ROOT}/resolver-external"
+resolver_external_target="${FIXTURE_ROOT}/resolver-external-target"
+mkdir -p "${resolver_external}/opt" "${resolver_external}/Cellar/node" "${resolver_external_target}/bin"
+cp "${resolver_root}/Cellar/node/25.1.0/bin/node" "${resolver_external_target}/bin/node"
+chmod 700 "${resolver_external_target}/bin/node"
+ln -s "${resolver_external_target}" "${resolver_external}/opt/node"
+set +e
+run_homebrew_resolver "${resolver_external}" node node >"${FIXTURE_ROOT}/resolver-external.out" 2>&1
+resolver_status=$?
+set -e
+[[ "${resolver_status}" -ne 0 ]] || fail 'Cellar 밖 Homebrew resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/resolver-external.out" 'canonical' 'Cellar 밖 resolver의 한글 거부 사유가 없습니다.'
+
+resolver_symlink="${FIXTURE_ROOT}/resolver-binary-symlink"
+mkdir -p "${resolver_symlink}/opt" "${resolver_symlink}/Cellar/node/25.1.0/bin"
+ln -s /bin/true "${resolver_symlink}/Cellar/node/25.1.0/bin/node"
+ln -s ../Cellar/node/25.1.0 "${resolver_symlink}/opt/node"
+set +e
+run_homebrew_resolver "${resolver_symlink}" node node >"${FIXTURE_ROOT}/resolver-symlink.out" 2>&1
+resolver_status=$?
+set -e
+[[ "${resolver_status}" -ne 0 ]] || fail 'binary symbolic link Homebrew resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/resolver-symlink.out" 'regular file' 'binary symlink resolver의 한글 거부 사유가 없습니다.'
+
+resolver_missing="${FIXTURE_ROOT}/resolver-missing"
+mkdir -p "${resolver_missing}/opt" "${resolver_missing}/Cellar/ripgrep"
+set +e
+run_homebrew_resolver "${resolver_missing}" ripgrep rg >"${FIXTURE_ROOT}/resolver-missing.out" 2>&1
+resolver_status=$?
+set -e
+[[ "${resolver_status}" -ne 0 ]] || fail '누락된 Homebrew rg resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/resolver-missing.out" '고정된 rg 도구를 찾을 수 없습니다.' \
+    '누락된 Homebrew rg prerequisite의 한글 거부 사유가 없습니다.'
+
 setup_case invalid-version
 expect_failure invalid-version '지원하지 않는 release version' \
     /usr/bin/env PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
@@ -391,6 +556,44 @@ chmod 600 "${outside_key_dir}/six-bridge-manager-release.p12"
 rm -rf "${CASE_ROOT}/.local/keystore"
 ln -s "${outside_key_dir}" "${CASE_ROOT}/.local/keystore"
 expect_failure keystore-parent-symlink 'symbolic link' run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case gradle-local-symlink
+outside_local="${FIXTURE_ROOT}/outside-local"
+mv "${CASE_ROOT}/.local" "${outside_local}"
+ln -s "${outside_local}" "${CASE_ROOT}/.local"
+expect_failure gradle-local-symlink 'symbolic link' run_prepare
+[[ ! -e "${outside_local}/gradle-home" && ! -L "${outside_local}/gradle-home" ]] || \
+    fail 'canonical 검사 전에 외부 .local에 GRADLE_USER_HOME을 만들었습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case gradle-home-symlink
+mkdir -p "${CASE_ROOT}/.local/gradle-home-target"
+chmod 700 "${CASE_ROOT}/.local/gradle-home-target"
+ln -s gradle-home-target "${CASE_ROOT}/.local/gradle-home"
+expect_failure gradle-home-symlink 'GRADLE_USER_HOME symbolic link' run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case gradle-home-nonprivate
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 755 "${CASE_ROOT}/.local/gradle-home"
+expect_failure gradle-home-nonprivate 'group/other 접근' run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case gradle-home-nonwritable
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 500 "${CASE_ROOT}/.local/gradle-home"
+expect_failure gradle-home-nonwritable 'write 가능한 private directory' run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case runtime-node-resolution-mismatch
+expect_failure runtime-node-resolution-mismatch 'sanitized PATH의 node가 검증된 canonical 도구와 다릅니다.' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_RUNTIME_MISMATCH=node
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case runtime-rg-resolution-mismatch
+expect_failure runtime-rg-resolution-mismatch 'sanitized PATH의 rg가 검증된 canonical 도구와 다릅니다.' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_RUNTIME_MISMATCH=rg
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case missing-credential
@@ -526,6 +729,22 @@ expect_failure native-publish-container-rebind 'atomic no-replace' \
     run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=container-rebind
 [[ -e "${CASE_ROOT}/.local/releases/external-container-sentinel" ]] || fail '외부 container sentinel이 보존되지 않았습니다.'
 
+setup_case native-publish-helper-in-place
+helper_mutation_log="${FIXTURE_ROOT}/native-publish-helper-in-place.log"
+set +e
+run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=helper-in-place \
+    >"${helper_mutation_log}" 2>&1
+helper_mutation_status=$?
+set -e
+[[ "${helper_mutation_status}" -ne 0 ]] || fail 'publisher helper in-place mutation을 거부해야 합니다.'
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired" ]] || \
+    fail 'publisher helper in-place mutation barrier가 실행되지 않았습니다.'
+[[ ! -e "${CASE_ROOT}/.local/releases/.fixture-helper-source-executed" ]] || \
+    fail '검증된 fd bytes가 아닌 in-place 변조 publisher helper가 실행됐습니다.'
+assert_contains "${helper_mutation_log}" 'atomic no-replace' 'publisher helper digest 거부 사유가 없습니다.'
+assert_log_has_no_secret "${helper_mutation_log}"
+assert_no_final_directory "${CASE_ROOT}"
+
 setup_case perl-startup-injection
 perl_startup_marker="${CASE_ROOT}/perl-startup-marker"
 run_prepare /usr/bin/env PERL5LIB="${CASE_ROOT}/bin" PERL5OPT='-MFixtureLeak' \
@@ -533,13 +752,26 @@ run_prepare /usr/bin/env PERL5LIB="${CASE_ROOT}/bin" PERL5OPT='-MFixtureLeak' \
 [[ ! -e "${perl_startup_marker}" ]] || fail 'worker launcher Perl이 inherited startup module을 실행했습니다.'
 
 setup_case success-one
-run_prepare
+run_prepare /usr/bin/env \
+    JAVA_HOME=/caller/poison-jdk GRADLE_USER_HOME=/caller/poison-gradle \
+    JAVA_TOOL_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" _JAVA_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" \
+    JDK_JAVA_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" GRADLE_OPTS="-Dfixture.secret=${SECRET_PROBE}" \
+    NODE_OPTIONS="--require=${CASE_ROOT}/bin/poison.js"
 final_one="${CASE_ROOT}/.local/releases/v0.1.0"
 commit_one=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
 assert_exact_release_files "${final_one}"
 assert_call_count "${CASE_LOG}" verify
 assert_call_count "${CASE_LOG}" ':android-manager:assembleRelease'
 assert_call_count "${CASE_LOG}" '-Pcompose.desktop.packaging.checkJdkVendor=false :desktop-app:packageDmg'
+assert_call_count "${CASE_LOG}" 'RUNTIME-JAVA verify'
+assert_call_count "${CASE_LOG}" 'RUNTIME-NODE verify'
+assert_call_count "${CASE_LOG}" 'RUNTIME-RG verify'
+assert_call_count "${CASE_LOG}" 'RUNTIME-JAVA android'
+assert_call_count "${CASE_LOG}" 'RUNTIME-NODE android'
+assert_call_count "${CASE_LOG}" 'RUNTIME-RG android'
+assert_call_count "${CASE_LOG}" 'RUNTIME-JAVA dmg'
+assert_call_count "${CASE_LOG}" 'RUNTIME-NODE dmg'
+assert_call_count "${CASE_LOG}" 'RUNTIME-RG dmg'
 assert_not_contains "${CASE_LOG}" "${RELEASE_PASSWORD}" '호출 log에 실제 비밀번호가 기록되었습니다.'
 if rg -n --hidden --glob '!*' "${SECRET_PROBE}|${RELEASE_PASSWORD}" "${final_one}" >/dev/null; then
     fail '정상 release directory에 secret probe 또는 비밀번호가 포함되었습니다.'
@@ -633,5 +865,7 @@ assert_not_contains "${CASE_LOG}" 'PATH-ENV' 'PATH env shim이 실행되었습�
 assert_not_contains "${CASE_LOG}" 'PATH-PERL' 'PATH perl shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-KEYTOOL' 'PATH keytool shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-GIT' 'PATH git shim이 실행되었습니다.'
+assert_not_contains "${CASE_LOG}" 'PATH-NODE' 'PATH node shim이 실행되었습니다.'
+assert_not_contains "${CASE_LOG}" 'PATH-RG' 'PATH rg shim이 실행되었습니다.'
 
 printf 'prepare release 검증 통과\n'

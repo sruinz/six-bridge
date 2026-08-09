@@ -99,6 +99,31 @@ release_trusted_directory() {
     release_link_count "${path}" >/dev/null
 }
 
+release_homebrew_shared_directory() {
+    local path=${1:-} owner group mode current_owner current_groups
+    release_directory "${path}" || return 1
+    owner=$(release_stat_value '%u' "${path}") || return 1
+    current_owner=$(/usr/bin/id -u) || return 1
+    [[ "${owner}" = "${current_owner}" ]] || {
+        release_fail 'Homebrew shared directory owner가 현재 사용자와 다릅니다.'
+        return 1
+    }
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#002)) = 0 ]] || {
+        release_fail 'Homebrew shared directory는 other write를 허용하면 안 됩니다.'
+        return 1
+    }
+    if (( (8#${mode} & 8#020) != 0 )); then
+        group=$(release_stat_value '%g' "${path}") || return 1
+        current_groups=" $(/usr/bin/id -G) " || return 1
+        [[ "${current_groups}" = *" ${group} "* ]] || {
+            release_fail 'Homebrew shared directory group이 현재 사용자의 group이 아닙니다.'
+            return 1
+        }
+    fi
+    release_link_count "${path}" >/dev/null
+}
+
 release_validate_release_container() {
     local container=${1:-} local_root="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/.local"
     local physical_container physical_local relative
@@ -164,12 +189,8 @@ release_require_artifact_stage() {
     esac
 }
 
-release_stat_value() {
-    local format=$1 path=$2 value
-    if [[ "$(/usr/bin/uname -s)" = Darwin ]] && value=$(/usr/bin/stat -f "${format}" "${path}" 2>/dev/null); then
-        printf '%s\n' "${value}"
-        return 0
-    fi
+release_linux_stat_format() {
+    local format=$1
     case "${format}" in
         '%d') format='%d' ;;
         '%i') format='%i' ;;
@@ -177,9 +198,20 @@ release_stat_value() {
         '%l') format='%h' ;;
         '%c') format='%Z' ;;
         '%u') format='%u' ;;
+        '%g') format='%g' ;;
         '%Lp') format='%a' ;;
         *) release_fail 'stat format을 변환할 수 없습니다.'; return 1 ;;
     esac
+    printf '%s\n' "${format}"
+}
+
+release_stat_value() {
+    local format=$1 path=$2 value
+    if [[ "$(/usr/bin/uname -s)" = Darwin ]] && value=$(/usr/bin/stat -f "${format}" "${path}" 2>/dev/null); then
+        printf '%s\n' "${value}"
+        return 0
+    fi
+    format=$(release_linux_stat_format "${format}") || return 1
     if ! value=$(/usr/bin/stat -c "${format}" "${path}" 2>/dev/null); then
         release_fail 'file identity를 확인할 수 없습니다.'
         return 1
@@ -356,6 +388,60 @@ release_java_executable() {
     }
     printf '%s\n' "${java_path}"
 }
+
+release_resolve_homebrew_tool_at() {
+    local prefix=$1 formula=$2 binary=$3 physical_prefix formula_link bin_directory
+    local physical relative version formula_directory version_directory
+    [[ "${prefix}" = /* && "${formula}" =~ ^[A-Za-z0-9@._+-]+$ && "${binary}" =~ ^[A-Za-z0-9._+-]+$ ]] || {
+        release_fail 'Homebrew 도구 resolver 입력이 올바르지 않습니다.'
+        return 1
+    }
+    release_trusted_directory "${prefix}" || return 1
+    physical_prefix="$(CDPATH= cd -P -- "${prefix}" && pwd -P)" || return 1
+    [[ "${physical_prefix}" = "${prefix}" ]] || {
+        release_fail 'Homebrew prefix canonical 경로가 올바르지 않습니다.'
+        return 1
+    }
+    # Homebrew's shared opt/Cellar parents are 0775 on a standard multi-admin
+    # installation. Accept only that owner-controlled shape; resolved formula,
+    # version, bin, and executable paths remain subject to the stricter checks.
+    release_homebrew_shared_directory "${physical_prefix}/opt" || return 1
+    release_homebrew_shared_directory "${physical_prefix}/Cellar" || return 1
+    formula_link="${physical_prefix}/opt/${formula}"
+    [[ -L "${formula_link}" && -d "${formula_link}" ]] || {
+        release_fail "고정된 ${binary} 도구를 찾을 수 없습니다. Homebrew ${formula}를 설치하세요."
+        return 1
+    }
+    bin_directory="$(CDPATH= cd -P -- "${formula_link}/bin" 2>/dev/null && pwd -P)" || {
+        release_fail "고정된 ${binary} 도구를 찾을 수 없습니다. Homebrew ${formula}를 설치하세요."
+        return 1
+    }
+    physical="${bin_directory}/${binary}"
+    case "${physical}" in
+        "${physical_prefix}/Cellar/${formula}/"*) ;;
+        *) release_fail "${binary} canonical 경로가 Homebrew Cellar 밖에 있습니다."; return 1 ;;
+    esac
+    relative=${physical#"${physical_prefix}/Cellar/${formula}/"}
+    version=${relative%%/*}
+    [[ -n "${version}" && "${relative}" = "${version}/bin/${binary}" ]] || {
+        release_fail "${binary} canonical 경로 구조가 올바르지 않습니다."
+        return 1
+    }
+    formula_directory="${physical_prefix}/Cellar/${formula}"
+    version_directory="${formula_directory}/${version}"
+    release_trusted_directory "${formula_directory}" || return 1
+    release_trusted_directory "${version_directory}" || return 1
+    release_trusted_directory "${bin_directory}" || return 1
+    release_trusted_executable "${physical}" || return 1
+    printf '%s\n' "${physical}"
+}
+
+release_homebrew_tool() {
+    release_resolve_homebrew_tool_at /opt/homebrew "$1" "$2"
+}
+
+release_node_executable() { release_homebrew_tool node node; }
+release_ripgrep_executable() { release_homebrew_tool ripgrep rg; }
 
 release_run_java() {
     local java_path
