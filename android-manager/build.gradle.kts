@@ -2,6 +2,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermission
 
 plugins {
     id("com.android.application")
@@ -51,6 +52,16 @@ fun releaseKeystorePathIssue(): String? {
         }
         if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
             return "release keystore parent가 directory가 아닙니다: $current"
+        }
+        val permissions = try {
+            Files.getPosixFilePermissions(current, LinkOption.NOFOLLOW_LINKS)
+        } catch (error: Exception) {
+            return "release keystore parent mode를 확인할 수 없습니다: $current"
+        }
+        if (PosixFilePermission.GROUP_WRITE in permissions ||
+            PosixFilePermission.OTHERS_WRITE in permissions
+        ) {
+            return "release keystore parent는 group 또는 other writable이면 안 됩니다: $current"
         }
         val canonicalCurrent = try {
             current.toRealPath()

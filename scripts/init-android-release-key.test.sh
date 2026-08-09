@@ -50,7 +50,9 @@ assert_mode() {
     local path=$1
     local expected=$2
     local actual
-    actual=$(stat -f '%Lp' "$path")
+    if ! actual=$(stat -f '%Lp' "$path" 2>/dev/null); then
+        actual=$(stat -c '%a' "$path")
+    fi
     [[ "$actual" = "$expected" ]] || fail "${path} mode가 기대와 다릅니다: ${actual}"
 }
 
@@ -129,6 +131,11 @@ case "${1:-}" in
             mkdir -p "$(dirname "${SIXBRIDGE_TEST_COMPETITOR_FILE}")"
             printf 'competitor key bytes\n' >"${SIXBRIDGE_TEST_COMPETITOR_FILE}"
         fi
+        if [[ -n "${SIXBRIDGE_TEST_COMPETITOR_DIRECTORY:-}" ]]; then
+            mkdir -p "${SIXBRIDGE_TEST_COMPETITOR_DIRECTORY}"
+            ln -s "${SIXBRIDGE_TEST_COMPETITOR_DIRECTORY}" \
+                "${SIXBRIDGE_TEST_COMPETITOR_SYMLINK}"
+        fi
         if [[ "${SIXBRIDGE_TEST_KEYTOOL_FAIL:-0}" = '1' ]]; then
             exit 42
         fi
@@ -199,6 +206,18 @@ ln -s "${outside_root}" "${CASE_ROOT}/.local"
 expect_failure parent-symlink 'symbolic link' run_init
 assert_keytool_calls 0
 
+reset_case group-writable-parent
+mkdir -p "${CASE_ROOT}/.local"
+chmod 770 "${CASE_ROOT}/.local"
+expect_failure group-writable-parent 'group 또는 other writable' run_init
+assert_keytool_calls 0
+
+reset_case other-writable-parent
+mkdir -p "${CASE_ROOT}/.local/keystore"
+chmod 707 "${CASE_ROOT}/.local/keystore"
+expect_failure other-writable-parent 'group 또는 other writable' run_init
+assert_keytool_calls 0
+
 reset_case root-symlink
 real_root="${FIXTURE_ROOT}/root-symlink-real"
 link_root="${FIXTURE_ROOT}/root-symlink-link"
@@ -254,6 +273,20 @@ expect_failure competitor-race '이미 존재' \
 competitor_sha=$(shasum -a 256 "${KEYSTORE}" | awk '{print $1}')
 [[ "${competitor_sha}" = "$(printf 'competitor key bytes\n' | shasum -a 256 | awk '{print $1}')" ]] || \
     fail '경쟁 프로세스가 만든 destination이 보존되지 않았습니다.'
+
+reset_case destination-directory-symlink-race
+outside_directory="${FIXTURE_ROOT}/outside-destination-directory"
+expect_failure destination-directory-symlink-race '이미 존재' \
+    env SIXBRIDGE_TEST_COMPETITOR_DIRECTORY="${outside_directory}" \
+        SIXBRIDGE_TEST_COMPETITOR_SYMLINK="${KEYSTORE}" \
+        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        SIXBRIDGE_KEYTOOL="${FIXTURE_ROOT}/keytool" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${INIT_SCRIPT}"
+[[ -L "${KEYSTORE}" ]] || fail '경쟁 프로세스가 만든 final symlink가 보존되지 않았습니다.'
+[[ ! -e "${outside_directory}/release.p12" ]] || \
+    fail '외부 directory에 release key hard link가 생성되었습니다.'
 
 reset_case concurrent-initialization
 pause_file="${FIXTURE_ROOT}/concurrent.pause"

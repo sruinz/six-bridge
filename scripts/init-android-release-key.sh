@@ -17,6 +17,22 @@ ROOT_DIR="$(CDPATH= cd -P -- "${RELEASE_ROOT_INPUT}" && pwd -P)"
 readonly ROOT_DIR
 readonly KEYSTORE="${ROOT_DIR}/.local/keystore/six-bridge-manager-release.p12"
 
+require_nonwritable_parent_mode() {
+    local path=$1
+    local label=$2
+    local mode
+
+    if ! mode=$(stat -f '%Lp' "${path}" 2>/dev/null); then
+        mode=$(stat -c '%a' "${path}") || \
+            fail "${label} mode를 확인할 수 없습니다: ${path}"
+    fi
+    [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || \
+        fail "${label} mode 형식이 올바르지 않습니다: ${path}"
+    if (( (8#${mode} & 022) != 0 )); then
+        fail "${label}은 group 또는 other writable이면 안 됩니다: ${path}"
+    fi
+}
+
 ensure_directory_component() {
     local path=$1
     local label=$2
@@ -36,6 +52,7 @@ ensure_directory_component() {
 
     [[ ! -L "${path}" && -d "${path}" ]] || \
         fail "${label}에 symbolic link가 있습니다: ${path}"
+    require_nonwritable_parent_mode "${path}" "${label}"
     physical_path="$(CDPATH= cd -P -- "${path}" && pwd -P)"
     [[ "${physical_path}" = "${ROOT_DIR}" || "${physical_path}" = "${ROOT_DIR}/"* ]] || \
         fail "${label}이 release root 밖을 가리킵니다: ${path}"
@@ -89,7 +106,7 @@ fi
 [[ -n "${fingerprint}" ]] || \
     fail 'keytool release key 검증에서 SHA-256 fingerprint를 찾지 못했습니다.'
 
-if ! ln "${TEMP_KEYSTORE}" "${KEYSTORE}"; then
+if ! ln -n "${TEMP_KEYSTORE}" "${KEYSTORE}"; then
     if [[ -e "${KEYSTORE}" || -L "${KEYSTORE}" ]]; then
         fail "release key가 이미 존재합니다: ${KEYSTORE}"
     fi
