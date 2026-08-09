@@ -393,7 +393,7 @@ release_system_executable() {
         # discovery/digest work; arbitrary system hardlinks remain rejected.
         if [[ "$(/usr/bin/uname -s)" = Darwin ]]; then
             case "${path}" in
-                /usr/bin/shasum|/usr/bin/git|/usr/bin/keytool) return 0 ;;
+                /usr/bin/shasum|/usr/bin/git|/usr/bin/keytool|/usr/bin/clang) return 0 ;;
             esac
         fi
         release_fail 'system release 도구에 hardlink가 포함되어 있습니다.'
@@ -540,7 +540,7 @@ release_tool() {
 
 release_verify_apk() {
     local apk=${1:-} expected_signer=${2:-} stage_root=${3:-} container=${4:-}
-    local raw_output signer_lines actual_signer application_id version_name version_code
+    local raw_output signer_lines actual_signer application_id version_name version_code apksigner_output
     local artifact_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity
 
     release_require_artifact_stage "${apk}" "${stage_root}" "${container}" || return 1
@@ -559,11 +559,26 @@ release_verify_apk() {
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
-    if ! raw_output=$(release_run_apksigner verify --verbose --print-certs "${snapshot}" 2>&1); then
+    apksigner_output=$(/usr/bin/mktemp '/tmp/sixbridge-release-apksigner.XXXXXX') || {
+        release_remove_verification_snapshot "${snapshot_dir}"
+        release_fail 'APK verifier output 임시 파일을 만들지 못했습니다.'
+        return 1
+    }
+    if declare -F run_release_step >/dev/null; then
+        if ! run_release_step release_run_apksigner verify --verbose --print-certs "${snapshot}" >"${apksigner_output}" 2>&1; then
+            /bin/rm -f "${apksigner_output}"
+            release_remove_verification_snapshot "${snapshot_dir}"
+            release_fail 'APK signature verification에 실패했습니다.'
+            return 1
+        fi
+        raw_output=$(/bin/cat "${apksigner_output}")
+    elif ! raw_output=$(release_run_apksigner verify --verbose --print-certs "${snapshot}" 2>&1); then
+        /bin/rm -f "${apksigner_output}"
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK signature verification에 실패했습니다.'
         return 1
     fi
+    /bin/rm -f "${apksigner_output}"
     release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }

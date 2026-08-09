@@ -99,6 +99,25 @@ release_verify_directory() {
         '') ;;
         *) return 97 ;;
     esac
+    case "${SIXBRIDGE_PREPARE_PUBLISH_BARRIER:-}" in
+        '') ;;
+        content|directory|final)
+            case "${directory##*/}" in
+                .sixbridge-release-publish.*)
+                    : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-publish-barrier-fired"
+                    case "${SIXBRIDGE_PREPARE_PUBLISH_BARRIER}" in
+                        content) printf '%s\n' snapshot-barrier-tamper >>"${STAGE_DIR}/${SIXBRIDGE_ANDROID_FILE}" ;;
+                        directory) /bin/mkdir "${STAGE_DIR}/snapshot-barrier-directory" ;;
+                        final)
+                            /bin/mkdir "${FINAL_DIR}"
+                            printf '%s\n' sentinel >"${FINAL_DIR}/sentinel"
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+        *) return 96 ;;
+    esac
 }
 EOF
 }
@@ -120,6 +139,16 @@ printf '%s\n' "PATH-KEYTOOL $*" >>"${SIXBRIDGE_PREPARE_LOG}"
 [[ "${SIXBRIDGE_PREPARE_KEYTOOL_FAIL:-0}" != 1 ]] || exit 61
 printf '%s\n' 'SHA256: 01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF'
 EOF
+    cat >"${bin}/env" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "PATH-ENV $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exec /usr/bin/env "$@"
+EOF
+    cat >"${bin}/clang" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "PATH-CLANG $*" >>"${SIXBRIDGE_PREPARE_LOG}"
+exit 99
+EOF
     cat >"${bin}/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
 exit 98
@@ -140,9 +169,10 @@ EOF
 #!/usr/bin/env bash
 [[ "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-0}" != 1 ]] || exit 62
 if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = 1 ]]; then
-  printf '%s\n' "$$" >"${SIXBRIDGE_PREPARE_CHILD_PID}"
+  /bin/sleep 600 &
+  printf '%s\n' "$$ $!" >"${SIXBRIDGE_PREPARE_CHILD_PID}"
   : >"${SIXBRIDGE_PREPARE_READY}"
-  while [[ ! -e "${SIXBRIDGE_PREPARE_CONTINUE}" ]]; do /bin/sleep 0.05; done
+  wait "$!"
 fi
 printf '%s\n' "Signer #1 certificate SHA-256 digest: ${SIXBRIDGE_PREPARE_SIGNER}"
 EOF
@@ -234,6 +264,8 @@ setup_case() {
     : >"${CASE_LOG}"
     copy_fixture_library "${CASE_ROOT}"
     create_fixture_tools "${CASE_ROOT}"
+    [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.c" ]] || \
+        cp "${ROOT_DIR}/scripts/release-atomic-publish.c" "${CASE_ROOT}/scripts/release-atomic-publish.c"
     cp "${ROOT_DIR}/docs/releases/v0.1.0-ko.md" "${CASE_ROOT}/docs/releases/v0.1.0-ko.md"
     cp "${TEMPLATE_KEYSTORE}" "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
     chmod 600 "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
@@ -249,7 +281,7 @@ setup_case() {
 run_prepare() {
     (
         cd "${CASE_ROOT}"
-        exec env \
+        exec /usr/bin/env \
             PATH="${CASE_ROOT}/bin:${PATH}" \
             SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
             SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
@@ -282,7 +314,7 @@ readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456
 
 setup_case invalid-version
 expect_failure invalid-version '지원하지 않는 release version' \
-    env PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+    /usr/bin/env PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
@@ -316,7 +348,7 @@ assert_no_final_directory "${CASE_ROOT}"
 
 setup_case missing-credential
 expect_failure missing-credential 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
-    env -u SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD \
+    /usr/bin/env -u SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD \
         PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
@@ -399,6 +431,27 @@ expect_failure post-verify-extra-symlink '정확히 다섯 개' \
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
+setup_case snapshot-barrier-content
+run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=content
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
+snapshot_content_final="${CASE_ROOT}/.local/releases/v0.1.0"
+assert_exact_release_files "${snapshot_content_final}"
+assert_not_contains "${snapshot_content_final}/SIX-Bridge-Manager-0.1.0-android.apk" 'snapshot-barrier-tamper' '검증 뒤 stage 변조가 final에 반영되었습니다.'
+
+setup_case snapshot-barrier-directory
+run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=directory
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
+snapshot_directory_final="${CASE_ROOT}/.local/releases/v0.1.0"
+assert_exact_release_files "${snapshot_directory_final}"
+
+setup_case publish-final-insertion
+expect_failure publish-final-insertion 'atomic no-replace' \
+    run_prepare env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=final
+[[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'external final insertion barrier가 실행되지 않았습니다.'
+[[ "$(cat "${CASE_ROOT}/.local/releases/v0.1.0/sentinel")" = sentinel ]] || fail '외부 final sentinel이 보존되지 않았습니다.'
+[[ -z "$(find "${CASE_ROOT}/.local/releases/v0.1.0" -name '.sixbridge-*' -print)" ]] || fail '기존 final 아래에 stage가 중첩되었습니다.'
+assert_no_release_work_entries "${CASE_ROOT}"
+
 setup_case success-one
 run_prepare
 final_one="${CASE_ROOT}/.local/releases/v0.1.0"
@@ -418,30 +471,41 @@ for signal in HUP INT TERM; do
     signal_ready="${CASE_ROOT}/ready"
     signal_continue="${CASE_ROOT}/continue"
     signal_child="${CASE_ROOT}/child.pid"
-    (
-        cd "${CASE_ROOT}"
-        exec env \
-            PATH="${CASE_ROOT}/bin:${PATH}" \
-            SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
-            SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
-            SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
-            SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
-            SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
-            SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-            SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=1 \
-            SIXBRIDGE_PREPARE_READY="${signal_ready}" \
-            SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
-            SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
-            "${PREPARE_SCRIPT}" 0.1.0
-    ) >"${signal_log}" 2>&1 &
+    /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "exec failed\n";' \
+        /usr/bin/env \
+        PATH="${CASE_ROOT}/bin:${PATH}" \
+        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
+        SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
+        SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=1 \
+        SIXBRIDGE_PREPARE_READY="${signal_ready}" \
+        SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
+        SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
+        "${PREPARE_SCRIPT}" 0.1.0 >"${signal_log}" 2>&1 &
     signal_pid=$!
     for _ in $(seq 1 100); do [[ -e "${signal_ready}" ]] && break; /bin/sleep 0.05; done
     [[ -e "${signal_ready}" ]] || fail "${signal} cleanup fixture가 verifier 대기 상태에 도달하지 못했습니다."
     kill -"${signal}" "${signal_pid}"
-    [[ -e "${signal_child}" ]] && kill -TERM "$(cat "${signal_child}")" 2>/dev/null || true
-    if wait "${signal_pid}"; then
-        fail "${signal} signal 뒤 prepare가 성공했습니다."
+    for _ in $(seq 1 40); do kill -0 "${signal_pid}" 2>/dev/null || break; /bin/sleep 0.05; done
+    if kill -0 "${signal_pid}" 2>/dev/null; then
+        [[ -e "${signal_child}" ]] && kill -TERM $(cat "${signal_child}") 2>/dev/null || true
+        wait "${signal_pid}" 2>/dev/null || true
+        fail "${signal} signal 뒤 parent-only cleanup이 child를 즉시 종료하지 못했습니다."
     fi
+    if wait "${signal_pid}"; then
+        signal_status=0
+        fail "${signal} signal 뒤 prepare가 성공했습니다."
+    else
+        signal_status=$?
+    fi
+    case "${signal}" in HUP) expected_signal_status=129 ;; INT) expected_signal_status=130 ;; TERM) expected_signal_status=143 ;; esac
+    [[ "${signal_status}" = "${expected_signal_status}" ]] || fail "${signal} signal status가 표준값과 다릅니다: ${signal_status}"
+    read -r signal_child_pid signal_grandchild_pid <"${signal_child}"
+    kill -0 "${signal_child_pid}" 2>/dev/null && fail "${signal} signal 뒤 verifier child가 남았습니다."
+    kill -0 "${signal_grandchild_pid}" 2>/dev/null && fail "${signal} signal 뒤 verifier process group child가 남았습니다."
     assert_no_final_directory "${CASE_ROOT}"
     assert_no_release_work_entries "${CASE_ROOT}"
     assert_log_has_no_secret "${signal_log}"
@@ -479,6 +543,8 @@ assert_contains "${final_one}/RELEASE-METADATA.json" "${commit_one}" 'metadata�
 
 setup_case path-shim
 run_prepare
+assert_not_contains "${CASE_LOG}" 'PATH-ENV' 'PATH env shim이 실행되었습니다.'
+assert_not_contains "${CASE_LOG}" 'PATH-CLANG' 'PATH clang shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-KEYTOOL' 'PATH keytool shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-GIT' 'PATH git shim이 실행되었습니다.'
 

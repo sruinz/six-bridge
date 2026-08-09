@@ -17,14 +17,21 @@ readonly RELEASE_NOTES="${ROOT_DIR}/docs/releases/v0.1.0-ko.md"
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
 readonly FINAL_DIR="${RELEASE_CONTAINER}/v0.1.0"
 readonly LOCK_DIR="${RELEASE_CONTAINER}/.sixbridge-v0.1.0.lock"
+readonly PUBLISH_HELPER_SOURCE="${ROOT_DIR}/scripts/release-atomic-publish.c"
 readonly ANDROID_OUTPUT="${ROOT_DIR}/android-manager/build/outputs/apk/release/android-manager-release.apk"
 readonly DMG_OUTPUT="${ROOT_DIR}/desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.0.dmg"
 
 STAGE_DIR=''
 STAGE_IDENTITY=''
+PUBLISH_DIR=''
+PUBLISH_IDENTITY=''
+PUBLISH_HELPER_DIR=''
+PUBLISH_HELPER=''
 CONTAINER_IDENTITY=''
 LOCK_IDENTITY=''
 OWNED_WORK_DIRECTORIES=()
+ACTIVE_CHILD_PID=''
+ACTIVE_CHILD_PGID=''
 
 stable_directory_identity() {
     local identity
@@ -64,10 +71,55 @@ cleanup_stage() {
     cleanup_owned_work_directories || true
     remove_owned_directory "${LOCK_DIR}" "${LOCK_IDENTITY}" || true
 }
+
+terminate_active_release_child() {
+    local pid=${ACTIVE_CHILD_PID:-} pgroup=${ACTIVE_CHILD_PGID:-} index
+    [[ -n "${pid}" ]] || return 0
+    if [[ -n "${pgroup}" ]]; then
+        /bin/kill -TERM -- "-${pgroup}" 2>/dev/null || true
+    fi
+    /bin/kill -TERM "${pid}" 2>/dev/null || true
+    for index in $(/usr/bin/seq 1 20); do
+        /bin/kill -0 "${pid}" 2>/dev/null || break
+        /bin/sleep 0.05
+    done
+    if /bin/kill -0 "${pid}" 2>/dev/null; then
+        [[ -z "${pgroup}" ]] || /bin/kill -KILL -- "-${pgroup}" 2>/dev/null || true
+        /bin/kill -KILL "${pid}" 2>/dev/null || true
+    fi
+    wait "${pid}" 2>/dev/null || true
+    ACTIVE_CHILD_PID=''
+    ACTIVE_CHILD_PGID=''
+}
+
+release_signal_exit() {
+    local status=$1
+    trap - HUP INT TERM
+    terminate_active_release_child
+    exit "${status}"
+}
+
+run_release_step() {
+    local status
+    set -m
+    "$@" &
+    ACTIVE_CHILD_PID=$!
+    ACTIVE_CHILD_PGID=$!
+    if wait "${ACTIVE_CHILD_PID}"; then
+        status=0
+    else
+        status=$?
+    fi
+    ACTIVE_CHILD_PID=''
+    ACTIVE_CHILD_PGID=''
+    set +m
+    return "${status}"
+}
+
 trap cleanup_stage EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'release_signal_exit 129' HUP
+trap 'release_signal_exit 130' INT
+trap 'release_signal_exit 143' TERM
 
 require_android_credentials() {
     local store_password=${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD:-}
@@ -203,23 +255,23 @@ copy_to_stage() {
 }
 
 capture_release_file_identities() {
-    local file
+    local directory=$1 file
     for file in "${SIXBRIDGE_RELEASE_FILES[@]}"; do
-        printf '%s|%s\n' "${file}" "$(release_file_identity "${STAGE_DIR}/${file}")" || return 1
+        printf '%s|%s\n' "${file}" "$(release_file_identity "${directory}/${file}")" || return 1
     done
 }
 
 assert_release_file_identities() {
-    local identities=$1 file identity
+    local directory=$1 identities=$2 file identity
     while IFS='|' read -r file identity; do
         [[ -n "${file}" ]] || continue
-        release_assert_file_identity "${STAGE_DIR}/${file}" "${identity}" || return 1
+        release_assert_file_identity "${directory}/${file}" "${identity}" || return 1
     done <<<"${identities}"
 }
 
 assert_exact_release_entries() {
-    local entries entry basename count=0
-    if ! entries=$(/usr/bin/find "${STAGE_DIR}" -maxdepth 1 -mindepth 1 -print 2>&1); then
+    local directory=$1 entries entry basename count=0
+    if ! entries=$(/usr/bin/find "${directory}" -maxdepth 1 -mindepth 1 -print 2>&1); then
         release_fail 'release directory를 읽지 못했습니다.'
         return 1
     fi
@@ -240,7 +292,58 @@ assert_exact_release_entries() {
     [[ "${count}" = 5 ]] || release_fail '필수 release file이 누락되었습니다.'
 }
 
+create_publish_snapshot() {
+    local file
+    PUBLISH_DIR=$(/usr/bin/mktemp -d "${RELEASE_CONTAINER}/.sixbridge-release-publish.XXXXXX") || {
+        release_fail 'publish snapshot directory를 만들지 못했습니다.'
+        return 1
+    }
+    release_validate_stage_root "${PUBLISH_DIR}" "${RELEASE_CONTAINER}" || return 1
+    release_register_owned_work_directory "${PUBLISH_DIR}" || return 1
+    for file in "${SIXBRIDGE_RELEASE_FILES[@]}"; do
+        release_require_single_link_file "${STAGE_DIR}/${file}" || return 1
+        /bin/cp -p -- "${STAGE_DIR}/${file}" "${PUBLISH_DIR}/${file}" || {
+            release_fail '검증된 release artifact를 publish snapshot에 복사하지 못했습니다.'
+            return 1
+        }
+        release_require_single_link_file "${PUBLISH_DIR}/${file}" || return 1
+    done
+    PUBLISH_IDENTITY=$(release_stage_identity "${PUBLISH_DIR}") || return 1
+    CONTAINER_IDENTITY=$(release_container_identity "${RELEASE_CONTAINER}") || return 1
+}
+
+compile_atomic_publish_helper() {
+    release_system_executable /usr/bin/env || return 1
+    release_system_executable /usr/bin/clang || return 1
+    release_private_file "${PUBLISH_HELPER_SOURCE}" || return 1
+    PUBLISH_HELPER_DIR=$(/usr/bin/mktemp -d "${RELEASE_CONTAINER}/.sixbridge-release-publish-helper.XXXXXX") || {
+        release_fail 'atomic publish helper directory를 만들지 못했습니다.'
+        return 1
+    }
+    release_validate_stage_root "${PUBLISH_HELPER_DIR}" "${RELEASE_CONTAINER}" || return 1
+    release_register_owned_work_directory "${PUBLISH_HELPER_DIR}" || return 1
+    PUBLISH_HELPER="${PUBLISH_HELPER_DIR}/release-atomic-publish"
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR=/tmp LANG=C LC_ALL=C \
+        /usr/bin/clang -Wall -Wextra -Werror -O2 "${PUBLISH_HELPER_SOURCE}" -o "${PUBLISH_HELPER}" || {
+        release_fail 'atomic no-replace publish helper를 만들지 못했습니다.'
+        return 1
+    }
+    release_trusted_executable "${PUBLISH_HELPER}"
+}
+
+publish_verified_snapshot() {
+    local source_leaf final_leaf
+    source_leaf=${PUBLISH_DIR##*/}
+    final_leaf=${FINAL_DIR##*/}
+    [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.0 ]] || {
+        release_fail 'atomic publish helper path가 올바르지 않습니다.'
+        return 1
+    }
+    "${PUBLISH_HELPER}" "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" "${source_leaf}" "${final_leaf}"
+}
+
 release_require_version "${1:-}"
+release_system_executable /usr/bin/env
 require_android_credentials
 validate_keystore
 release_regular_file "${RELEASE_NOTES}"
@@ -257,15 +360,15 @@ acquire_release_lock
 }
 
 cd "${ROOT_DIR}"
-if ! "${ROOT_DIR}/scripts/verify.sh"; then
+if ! run_release_step "${ROOT_DIR}/scripts/verify.sh"; then
     release_fail '전체 검증에 실패했습니다.'
     exit 1
 fi
-if ! ./gradlew :android-manager:assembleRelease; then
+if ! run_release_step ./gradlew :android-manager:assembleRelease; then
     release_fail 'Android release build에 실패했습니다.'
     exit 1
 fi
-if ! env -u SIXBRIDGE_MAC_SIGNING_IDENTITY \
+if ! run_release_step /usr/bin/env -u SIXBRIDGE_MAC_SIGNING_IDENTITY \
     -u SIXBRIDGE_MAC_NOTARIZATION_APPLE_ID \
     -u SIXBRIDGE_MAC_NOTARIZATION_PASSWORD \
     -u SIXBRIDGE_MAC_NOTARIZATION_TEAM_ID \
@@ -325,29 +428,40 @@ release_write_checksums "${STAGE_DIR}" "${RELEASE_CONTAINER}"
 STAGE_IDENTITY=$(release_stage_identity "${STAGE_DIR}")
 CONTAINER_IDENTITY=$(release_container_identity "${RELEASE_CONTAINER}")
 release_scan_tree "${STAGE_DIR}" "${STAGE_DIR}" "${RELEASE_CONTAINER}" "${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD}"
-RELEASE_FILE_IDENTITIES=$(capture_release_file_identities)
+RELEASE_FILE_IDENTITIES=$(capture_release_file_identities "${STAGE_DIR}")
 release_verify_directory "${STAGE_DIR}" "${SIGNER_SHA256}" "${RELEASE_CONTAINER}"
-assert_release_file_identities "${RELEASE_FILE_IDENTITIES}"
+assert_release_file_identities "${STAGE_DIR}" "${RELEASE_FILE_IDENTITIES}"
 release_verify_checksums "${STAGE_DIR}" "${STAGE_DIR}" "${RELEASE_CONTAINER}"
-assert_release_file_identities "${RELEASE_FILE_IDENTITIES}"
-assert_exact_release_entries
+assert_release_file_identities "${STAGE_DIR}" "${RELEASE_FILE_IDENTITIES}"
+assert_exact_release_entries "${STAGE_DIR}"
 STAGE_IDENTITY=$(release_stage_identity "${STAGE_DIR}")
 CONTAINER_IDENTITY=$(release_container_identity "${RELEASE_CONTAINER}")
 
+create_publish_snapshot
+compile_atomic_publish_helper
+PUBLISH_FILE_IDENTITIES=$(capture_release_file_identities "${PUBLISH_DIR}")
 [[ ! -e "${FINAL_DIR}" && ! -L "${FINAL_DIR}" ]] || {
     release_fail 'release directory가 이미 존재합니다.'
     exit 1
 }
+release_verify_directory "${PUBLISH_DIR}" "${SIGNER_SHA256}" "${RELEASE_CONTAINER}"
+assert_release_file_identities "${PUBLISH_DIR}" "${PUBLISH_FILE_IDENTITIES}"
+release_verify_checksums "${PUBLISH_DIR}" "${PUBLISH_DIR}" "${RELEASE_CONTAINER}"
+assert_release_file_identities "${PUBLISH_DIR}" "${PUBLISH_FILE_IDENTITIES}"
+assert_exact_release_entries "${PUBLISH_DIR}"
+PUBLISH_IDENTITY=$(release_stage_identity "${PUBLISH_DIR}")
+CONTAINER_IDENTITY=$(release_container_identity "${RELEASE_CONTAINER}")
+
 [[ "$(release_clean_commit)" = "${START_COMMIT}" ]] || {
     release_fail '게시 직전 git worktree 또는 commit이 변경되었습니다.'
     exit 1
 }
-release_assert_stage_identity "${STAGE_DIR}" "${RELEASE_CONTAINER}" "${STAGE_IDENTITY}" "${CONTAINER_IDENTITY}"
-if ! /bin/mv -n -- "${STAGE_DIR}" "${FINAL_DIR}"; then
+release_assert_stage_identity "${PUBLISH_DIR}" "${RELEASE_CONTAINER}" "${PUBLISH_IDENTITY}" "${CONTAINER_IDENTITY}"
+if ! publish_verified_snapshot; then
     release_fail 'release directory를 atomic no-replace 방식으로 publish하지 못했습니다.'
     exit 1
 fi
-[[ ! -e "${STAGE_DIR}" && ! -L "${STAGE_DIR}" ]] || {
+[[ ! -e "${PUBLISH_DIR}" && ! -L "${PUBLISH_DIR}" ]] || {
     release_fail 'release directory publish 중 기존 final path를 교체하지 못했습니다.'
     exit 1
 }
@@ -355,12 +469,11 @@ FINAL_IDENTITY=$(stable_directory_identity "${FINAL_DIR}") || {
     release_fail '게시된 final release directory inode를 읽지 못했습니다.'
     exit 1
 }
-[[ "${FINAL_IDENTITY}" = "${STAGE_IDENTITY%:*}" ]] || {
+[[ "${FINAL_IDENTITY}" = "${PUBLISH_IDENTITY%:*}" ]] || {
     release_fail '게시된 final release directory inode가 stage와 다릅니다.'
     exit 1
 }
-STAGE_DIR=''
-STAGE_IDENTITY=''
-CONTAINER_IDENTITY=''
+PUBLISH_DIR=''
+PUBLISH_IDENTITY=''
 
 printf 'v%s release directory를 준비했습니다: %s\n' "${SIXBRIDGE_RELEASE_VERSION}" "${FINAL_DIR}"
