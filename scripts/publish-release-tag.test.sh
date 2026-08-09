@@ -303,9 +303,14 @@ unset PUBLISH_FIXTURE_RACE PUBLISH_FIXTURE_RACE_MARKER
 
 # These publisher capabilities are intentionally absent: the fixture permits
 # only a normal non-force tag ref update to its local bare origin.
-if /usr/bin/grep -Eq -- '(curl|gh[[:space:]].*(release|api)|--force|[[:space:]]-f[[:space:]]|tag[[:space:]]+-d)' "${PUBLISH_SCRIPT}"; then
+force_push_pattern='git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]-f([[:space:]]|$)'
+if /usr/bin/grep -Eq -- "(curl|gh[[:space:]].*(release|api)|--force|${force_push_pattern}|tag[[:space:]]+-d)" "${PUBLISH_SCRIPT}"; then
     fail 'publisher에 Release API/force/delete tag 동작이 포함되어 있습니다.'
 fi
+printf '%s\n' 'git push origin -f refs/tags/v0.1.0' | /usr/bin/grep -Eq -- "${force_push_pattern}" ||
+    fail 'forced git push negative-control을 검출하지 못했습니다.'
+printf '%s\n' 'stat -f %z artifact' '[[ -f artifact ]]' | /usr/bin/grep -Eq -- "${force_push_pattern}" &&
+    fail 'force push 검출이 stat 또는 regular-file 검사에 오탐했습니다.'
 assert_contains "${PUBLISH_SCRIPT}" '"${tag_oid}:refs/tags/${RELEASE_TAG}"' 'publisher가 exact tag object OID refspec을 사용하지 않습니다.'
 
 printf 'publish release tag 검증 통과\n'
