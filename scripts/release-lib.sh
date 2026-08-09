@@ -293,8 +293,14 @@ release_file_identity_without_hash() {
 }
 
 release_android_sdk_root() {
-    local root='' line key value properties="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/local.properties"
-    if [[ -f "${properties}" && ! -L "${properties}" ]]; then
+    local root='' line key value properties="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/local.properties" physical_properties
+    if [[ -e "${properties}" || -L "${properties}" ]]; then
+        release_private_file "${properties}" || return 1
+        physical_properties="$(CDPATH= builtin cd -P -- "$(/usr/bin/dirname -- "${properties}")" && builtin pwd -P)/$(/usr/bin/basename -- "${properties}")"
+        [[ "${physical_properties}" = "${SIXBRIDGE_RELEASE_PROJECT_ROOT}/local.properties" ]] || {
+            release_fail 'local.properties가 project root 밖에 있습니다.'
+            return 1
+        }
         while IFS= read -r line || [[ -n "${line}" ]]; do
             key=${line%%=*}
             value=${line#*=}
@@ -304,6 +310,53 @@ release_android_sdk_root() {
     [[ -n "${root}" ]] || root='/opt/homebrew/share/android-commandlinetools'
     release_trusted_directory "${root}" || return 1
     printf '%s\n' "$(CDPATH= builtin cd -P -- "${root}" && builtin pwd -P)"
+}
+
+release_java_executable() {
+    local raw_output java_home java_path java_version major candidate
+    # This project already standardizes its local Android builds on Homebrew
+    # JDK homes. Do not accept JAVA_HOME/PATH here: caller-controlled runtime
+    # selection would let an SDK launcher execute an unverified JVM.
+    for candidate in \
+        '/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home' \
+        '/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home'; do
+        [[ -d "${candidate}" && ! -L "${candidate}" ]] || continue
+        java_home="$(CDPATH= builtin cd -P -- "${candidate}" && builtin pwd -P)"
+        case "${java_home}" in
+            /opt/homebrew/Cellar/openjdk@17/*/libexec/openjdk.jdk/Contents/Home|/opt/homebrew/Cellar/openjdk/*/libexec/openjdk.jdk/Contents/Home) ;;
+            *) java_home=''; continue ;;
+        esac
+        break
+    done
+    [[ -n "${java_home:-}" ]] || {
+        release_fail '고정된 Homebrew JDK를 찾을 수 없습니다.'
+        return 1
+    }
+    release_trusted_directory "${java_home}" || return 1
+    release_trusted_directory "${java_home}/bin" || return 1
+    java_path="$(CDPATH= builtin cd -P -- "${java_home}/bin" && builtin pwd -P)/java"
+    release_trusted_executable "${java_path}" || return 1
+    case "${java_path}" in
+        "$(CDPATH= builtin cd -P -- "${java_home}" && builtin pwd -P)"/bin/java) ;;
+        *) release_fail 'JDK executable이 canonical home 밖에 있습니다.'; return 1 ;;
+    esac
+    if ! raw_output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" LANG=C LC_ALL=C "${java_path}" -version 2>&1); then
+        release_fail 'JDK version을 확인하지 못했습니다.'
+        return 1
+    fi
+    java_version=$(printf '%s\n' "${raw_output}" | /usr/bin/awk -F'"' '/version/ { print $2; exit }')
+    major=${java_version%%.*}
+    [[ "${major}" =~ ^[0-9]+$ && ${major} -ge 17 ]] || {
+        release_fail 'JDK 17 이상이 필요합니다.'
+        return 1
+    }
+    printf '%s\n' "${java_path}"
+}
+
+release_run_java() {
+    local java_path
+    java_path=$(release_java_executable) || return 1
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" LANG=C LC_ALL=C "${java_path}" "$@"
 }
 
 release_trusted_executable() {
@@ -335,6 +388,9 @@ release_system_executable() {
     }
     links=$(release_link_count "${path}") || return 1
     [[ "${links}" = 1 ]] || {
+        # Apple ships selected sealed-system tools as hardlinks. The exception
+        # is deliberately limited to immutable absolute paths used only for
+        # discovery/digest work; arbitrary system hardlinks remain rejected.
         if [[ "${path}" = '/usr/bin/shasum' && "$(/usr/bin/uname -s)" = Darwin && "${links}" = 2 ]]; then
             return 0
         fi
@@ -365,7 +421,7 @@ release_private_file() {
 }
 
 release_validate_android_sdk() {
-    local root=$1 revision_file revision=''
+    local root=$1 revision_file revision='' apksigner_jar apkanalyzer_jar jar
     release_trusted_directory "${root}" || return 1
     release_trusted_directory "${root}/build-tools" || return 1
     release_trusted_directory "${root}/build-tools/36.0.0" || return 1
@@ -378,11 +434,36 @@ release_validate_android_sdk() {
         release_fail 'Android SDK build-tools 36.0.0 revision 계약이 올바르지 않습니다.'
         return 1
     }
-    release_trusted_executable "${root}/build-tools/36.0.0/apksigner" || return 1
+    apksigner_jar="${root}/build-tools/36.0.0/lib/apksigner.jar"
+    release_private_file "${apksigner_jar}" || return 1
     release_trusted_directory "${root}/cmdline-tools" || return 1
     release_trusted_directory "${root}/cmdline-tools/latest" || return 1
-    release_trusted_directory "${root}/cmdline-tools/latest/bin" || return 1
-    release_trusted_executable "${root}/cmdline-tools/latest/bin/apkanalyzer"
+    release_trusted_directory "${root}/cmdline-tools/latest/lib" || return 1
+    apkanalyzer_jar="${root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar"
+    release_private_file "${apkanalyzer_jar}" || return 1
+    while IFS= read -r -d '' jar; do
+        release_private_file "${jar}" || return 1
+    done < <(/usr/bin/find "${root}/cmdline-tools/latest/lib" -type f -name '*.jar' -print0)
+    [[ -z "$(/usr/bin/find "${root}/cmdline-tools/latest/lib" -type l -print -quit)" ]] || {
+        release_fail 'Android SDK classpath에 symbolic link가 포함되어 있습니다.'
+        return 1
+    }
+}
+
+release_run_apksigner() {
+    local sdk_root jar
+    sdk_root=$(release_android_sdk_root) || return 1
+    release_validate_android_sdk "${sdk_root}" || return 1
+    jar="${sdk_root}/build-tools/36.0.0/lib/apksigner.jar"
+    release_run_java -Xmx1024M -jar "${jar}" "$@"
+}
+
+release_run_apkanalyzer() {
+    local sdk_root jar
+    sdk_root=$(release_android_sdk_root) || return 1
+    release_validate_android_sdk "${sdk_root}" || return 1
+    jar="${sdk_root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar"
+    release_run_java "-Dcom.android.sdklib.toolsdir=${sdk_root}/cmdline-tools/latest" -classpath "${jar}" com.android.tools.apk.analyzer.ApkAnalyzerCli "$@"
 }
 
 release_tool() {
@@ -391,7 +472,7 @@ release_tool() {
         apksigner|apkanalyzer)
             sdk_root=$(release_android_sdk_root) || return 1
             release_validate_android_sdk "${sdk_root}" || return 1
-            [[ "${name}" = apksigner ]] && path="${sdk_root}/build-tools/36.0.0/apksigner" || path="${sdk_root}/cmdline-tools/latest/bin/apkanalyzer"
+            [[ "${name}" = apksigner ]] && path="${sdk_root}/build-tools/36.0.0/lib/apksigner.jar" || path="${sdk_root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar"
             ;;
         hdiutil) path='/usr/bin/hdiutil' ;;
         plistbuddy) path='/usr/libexec/PlistBuddy' ;;
@@ -401,7 +482,7 @@ release_tool() {
         *) release_fail '알 수 없는 release 도구입니다.'; return 1 ;;
     esac
     case "${name}" in
-        apksigner|apkanalyzer) release_trusted_executable "${path}" || return 1 ;;
+        apksigner|apkanalyzer) release_private_file "${path}" || return 1 ;;
         *) release_system_executable "${path}" || return 1 ;;
     esac
     printf '%s\n' "${path}"
@@ -410,7 +491,7 @@ release_tool() {
 release_verify_apk() {
     local apk=${1:-} expected_signer=${2:-} stage_root=${3:-} container=${4:-}
     local raw_output signer_lines actual_signer application_id version_name version_code
-    local apksigner apkanalyzer artifact_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity
+    local artifact_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity
 
     release_require_artifact_stage "${apk}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${apk}" || return 1
@@ -418,8 +499,6 @@ release_verify_apk() {
         release_fail 'expected signer SHA-256 형식이 올바르지 않습니다.'
         return 1
     }
-    apksigner=$(release_tool apksigner) || return 1
-    apkanalyzer=$(release_tool apkanalyzer) || return 1
     artifact_identity=$(release_file_identity "${apk}") || return 1
     snapshot_dir=$(release_create_verification_snapshot "${apk}" "${container}") || return 1
     snapshot="${snapshot_dir}/artifact"
@@ -427,7 +506,7 @@ release_verify_apk() {
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
-    if ! raw_output=$("${apksigner}" verify --verbose --print-certs "${snapshot}" 2>&1); then
+    if ! raw_output=$(release_run_apksigner verify --verbose --print-certs "${snapshot}" 2>&1); then
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK signature verification에 실패했습니다.'
         return 1
@@ -449,7 +528,7 @@ release_verify_apk() {
         return 1
     }
 
-    if ! application_id=$("${apkanalyzer}" manifest application-id "${snapshot}" 2>&1); then
+    if ! application_id=$(release_run_apkanalyzer manifest application-id "${snapshot}" 2>&1); then
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK application ID를 읽지 못했습니다.'
         return 1
@@ -462,7 +541,7 @@ release_verify_apk() {
         release_fail 'APK application ID가 계약과 다릅니다.'
         return 1
     }
-    if ! version_name=$("${apkanalyzer}" manifest version-name "${snapshot}" 2>&1); then
+    if ! version_name=$(release_run_apkanalyzer manifest version-name "${snapshot}" 2>&1); then
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionName을 읽지 못했습니다.'
         return 1
@@ -475,7 +554,7 @@ release_verify_apk() {
         release_fail 'APK versionName이 계약과 다릅니다.'
         return 1
     }
-    if ! version_code=$("${apkanalyzer}" manifest version-code "${snapshot}" 2>&1); then
+    if ! version_code=$(release_run_apkanalyzer manifest version-code "${snapshot}" 2>&1); then
         release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'APK versionCode를 읽지 못했습니다.'
         return 1
@@ -547,7 +626,7 @@ release_verify_dmg() {
         return 1
     }
     if ! raw_output=$("${hdiutil}" attach -readonly -nobrowse -mountpoint "${mountpoint}" "${snapshot}" 2>&1); then
-        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 0 || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG read-only mount에 실패했습니다.'
         return 1
     fi

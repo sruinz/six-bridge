@@ -66,8 +66,13 @@ case "$1" in
    /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents"
    : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
    [[ "${FAKE_EXTRA_APP:-0}" != 1 ]] || /bin/mkdir -p "${mountpoint}/Injected.app/Contents"
+   [[ "${FAKE_HDIUTIL_PARTIAL_ATTACH:-0}" != 1 ]] || exit 31
    ;;
- detach) /bin/rm -rf "$2";; *) exit 22;;
+ detach)
+   [[ -z "${FAKE_HDIUTIL_DETACH_LOG:-}" ]] || printf 'detach\n' >>"${FAKE_HDIUTIL_DETACH_LOG}"
+   /bin/rm -rf "$2"
+   ;;
+ *) exit 22;;
 esac
 EOF
     /bin/cat >"${FIXTURE_ROOT}/bin/PlistBuddy" <<'EOF'
@@ -102,6 +107,30 @@ export FAKE_PRODUCT_VERSION='0.1.0'
 export FAKE_NATIVE_VERSION='1.0.0'
 export FAKE_MINIMUM_VERSION='13.0'
 create_tools
+
+fake_java_home="${FIXTURE_ROOT}/fake-java-home"
+/bin/mkdir -p "${fake_java_home}/bin"
+/bin/cat >"${fake_java_home}/bin/java" <<'EOF'
+#!/usr/bin/env bash
+joined=" $* "
+case "${joined}" in
+  *apksigner.jar*)
+    printf '%s\n' 'FAKE_JVM_USED'
+    printf 'Signer #1 certificate SHA-256 digest: %s\n' "${FAKE_SIGNER}"
+    ;;
+  *com.android.tools.apk.analyzer.ApkAnalyzerCli*)
+    printf '%s\n' 'FAKE_JVM_USED'
+    case "${joined}" in
+      *' application-id '*) printf '%s\n' "${FAKE_APPLICATION_ID}" ;;
+      *' version-name '*) printf '%s\n' "${FAKE_VERSION_NAME}" ;;
+      *' version-code '*) printf '%s\n' "${FAKE_VERSION_CODE}" ;;
+      *) exit 42 ;;
+    esac
+    ;;
+  *) exit 41 ;;
+esac
+EOF
+/bin/chmod +x "${fake_java_home}/bin/java"
 
 # Production library must ignore test-mode and arbitrary tool environment variables.
 production_log="${FIXTURE_ROOT}/production-tool-boundary.log"
@@ -140,6 +169,14 @@ release_tool() {
     esac
 }
 
+release_run_apksigner() {
+    "${SIXBRIDGE_APKSIGNER}" "$@"
+}
+
+release_run_apkanalyzer() {
+    "${SIXBRIDGE_APKANALYZER}" "$@"
+}
+
 container="${FIXTURE_ROOT}"
 stage="${container}/stage"
 /bin/mkdir -p "${stage}"; /bin/chmod 700 "${container}" "${stage}"
@@ -155,6 +192,23 @@ expect_failure external-container '프로젝트 .local' release_validate_stage_r
 
 apk="${stage}/fixture.apk"; dmg="${stage}/fixture.dmg"
 make_file "${apk}" apk; make_file "${dmg}" dmg
+expect_failure production-apk-launcher-boundary 'APK signature verification' \
+  env PATH="${fake_java_home}/bin:/usr/bin:/bin" JAVA_HOME="${fake_java_home}" \
+  JAVA_OPTS='-Dfake=true' APKANALYZER_OPTS='-Dfake=true' JAVA_TOOL_OPTIONS='-Dfake=true' \
+  JDK_JAVA_OPTIONS='-Dfake=true' BASH_ENV=/dev/null ENV=/dev/null CLASSPATH=/tmp/fake-classpath \
+  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_verify_apk "$2" "$3" "$4" "$5"' _ \
+  "${LIBRARY}" "${apk}" "${SIGNER}" "${stage}" "${container}"
+production_apkanalyzer_log="${FIXTURE_ROOT}/production-apkanalyzer-boundary.log"
+set +e
+env PATH="${fake_java_home}/bin:/usr/bin:/bin" JAVA_HOME="${fake_java_home}" \
+  JAVA_OPTS='-Dfake=true' APKANALYZER_OPTS='-Dfake=true' JAVA_TOOL_OPTIONS='-Dfake=true' \
+  JDK_JAVA_OPTIONS='-Dfake=true' BASH_ENV=/dev/null ENV=/dev/null CLASSPATH=/tmp/fake-classpath \
+  SKIP_JDK_VERSION_CHECK=1 bash -c 'source "$1"; release_run_apkanalyzer manifest application-id "$2"' _ \
+  "${LIBRARY}" "${apk}" >"${production_apkanalyzer_log}" 2>&1
+production_apkanalyzer_status=$?
+set -e
+[[ "${production_apkanalyzer_status}" -ne 0 ]] || fail 'production apkanalyzer가 비-APK 입력을 허용했습니다.'
+assert_not_contains "${production_apkanalyzer_log}" 'FAKE_JVM_USED' 'production apkanalyzer가 PATH/JAVA_HOME의 JVM을 사용했습니다.'
 snapshot_check_dir=$(release_create_verification_snapshot "${apk}" "${container}")
 snapshot_check="${snapshot_check_dir}/artifact"
 [[ "$(release_link_count "${apk}")" = 1 && "$(release_link_count "${snapshot_check}")" = 1 ]] || fail 'verification snapshot이 독립 regular file이 아닙니다.'
@@ -181,6 +235,13 @@ expect_failure apk-outside-stage 'stage root 밖' release_verify_apk "${outside}
 
 dmg_work="${container}/mounts"; /bin/mkdir "${dmg_work}"; /bin/chmod 700 "${dmg_work}"
 release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+partial_attach_log="${FIXTURE_ROOT}/partial-attach.log"; : >"${partial_attach_log}"
+export FAKE_HDIUTIL_PARTIAL_ATTACH=1 FAKE_HDIUTIL_DETACH_LOG="${partial_attach_log}"
+expect_failure dmg-partial-attach 'DMG read-only mount' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+unset FAKE_HDIUTIL_PARTIAL_ATTACH FAKE_HDIUTIL_DETACH_LOG
+assert_contains "${partial_attach_log}" detach 'partial attach 뒤 detach가 실행되지 않았습니다.'
+remaining_dmg_work=$(/usr/bin/find "${dmg_work}" -mindepth 1 -maxdepth 1 -print -quit)
+[[ -z "${remaining_dmg_work}" ]] || fail 'partial attach 뒤 임시 mount 또는 snapshot이 남았습니다.'
 export FAKE_HDIUTIL_REQUIRE_SNAPSHOT=1 FAKE_HDIUTIL_SWAP_RESTORE_PATH="${dmg}"
 for attempt in 1 2 3 4 5 6 7 8; do
   release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
