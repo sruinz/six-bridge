@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${SIXBRIDGE_RELEASE_CONTRACT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 files=(
   SIX-Bridge-Manager-0.1.0-android.apk
   SIX-Bridge-0.1.0-macos-unsigned.dmg
@@ -20,9 +20,11 @@ for file in "${files[@]}"; do
 done
 grep -Fq '미서명·미공증' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "macOS 제한 안내가 없습니다."
 grep -Fq 'Google Play Protect' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Android 경고 안내가 없습니다."
-grep -Fq 'SHA256SUMS' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "SHA-256 확인 절차가 없습니다."
-grep -Fq 'RELEASE-METADATA.json' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "signer metadata 안내가 없습니다."
-grep -Fq 'Gatekeeper' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Gatekeeper 제한 안내가 없습니다."
+grep -Fq '다운로드한 APK와 DMG의 SHA-256을' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "다운로드 APK·DMG SHA-256 비교 안내가 없습니다."
+grep -Fq 'shasum -a 256 SIX-Bridge-Manager-0.1.0-android.apk' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Android SHA-256 명령이 없습니다."
+grep -Fq 'shasum -a 256 SIX-Bridge-0.1.0-macos-unsigned.dmg' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "macOS SHA-256 명령이 없습니다."
+grep -Fq '값이 다르거나 metadata의 제품 버전·signer 정보가 기대와 다르면 설치하거나' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "checksum·metadata 불일치 중단 안내가 없습니다."
+grep -Fq 'macOS Gatekeeper가 개발자를 확인할 수 없다는 경고를 표시할 수' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Gatekeeper 개발자 확인 경고 안내가 없습니다."
 grep -Fq 'https://developer.apple.com/support/developer-id/' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Apple Developer ID 링크가 없습니다."
 grep -Fq 'https://developer.apple.com/help/glossary/developer-id-certificate/' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Apple Developer ID certificate 링크가 없습니다."
 grep -Fq 'https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "Apple notarization 링크가 없습니다."
