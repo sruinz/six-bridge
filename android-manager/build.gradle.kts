@@ -1,4 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.nio.file.Files
+import java.nio.file.LinkOption
 
 plugins {
     id("com.android.application")
@@ -6,6 +8,17 @@ plugins {
     id("com.google.devtools.ksp")
     id("androidx.room")
 }
+
+val releaseStorePassword = providers.environmentVariable(
+    "SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD",
+)
+val releaseKeyPassword = providers.environmentVariable(
+    "SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD",
+)
+val releaseKeystore = rootProject.layout.projectDirectory.file(
+    ".local/keystore/six-bridge-manager-release.p12",
+)
+val releaseKeyAlias = "six-bridge-manager"
 
 android {
     namespace = "dev.sixbridge.manager"
@@ -36,9 +49,71 @@ android {
         }
     }
 
+    signingConfigs {
+        create("managerRelease") {
+            storeFile = releaseKeystore.asFile
+            storeType = "PKCS12"
+            keyAlias = releaseKeyAlias
+            if (releaseStorePassword.isPresent && releaseKeyPassword.isPresent) {
+                storePassword = releaseStorePassword.get()
+                keyPassword = releaseKeyPassword.get()
+            }
+        }
+    }
+
+    buildTypes.named("release") {
+        signingConfig = signingConfigs.getByName("managerRelease")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+val verifyManagerReleaseSigningInput by tasks.registering {
+    group = "verification"
+    description = "Android manager release 서명 입력을 검증합니다."
+
+    doLast {
+        val errors = buildList {
+            val keystorePath = releaseKeystore.asFile.toPath()
+            if (!Files.isRegularFile(keystorePath, LinkOption.NOFOLLOW_LINKS)) {
+                add("release keystore가 regular file이 아닙니다: ${releaseKeystore.asFile}")
+            }
+
+            val storePassword = releaseStorePassword.orNull
+            val keyPassword = releaseKeyPassword.orNull
+            if (storePassword.isNullOrEmpty()) {
+                add("SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD가 설정되지 않았습니다.")
+            }
+            if (keyPassword.isNullOrEmpty()) {
+                add("SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD가 설정되지 않았습니다.")
+            }
+            if (!storePassword.isNullOrEmpty() && storePassword.length < 16) {
+                add("SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD는 16자 이상이어야 합니다.")
+            }
+            if (!keyPassword.isNullOrEmpty() && keyPassword.length < 16) {
+                add("SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD는 16자 이상이어야 합니다.")
+            }
+            if (!storePassword.isNullOrEmpty() &&
+                !keyPassword.isNullOrEmpty() &&
+                storePassword != keyPassword
+            ) {
+                add("release store 및 key 비밀번호는 동일해야 합니다.")
+            }
+        }
+
+        check(errors.isEmpty()) {
+            "Android release 서명 입력 검증 실패:\n" +
+                errors.joinToString(separator = "\n") { "- $it" }
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name == "packageRelease") {
+        dependsOn(verifyManagerReleaseSigningInput)
     }
 }
 
