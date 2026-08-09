@@ -46,6 +46,24 @@ assert_keytool_calls() {
     [[ "$actual" = "$expected" ]] || fail "keytool 호출 횟수가 기대와 다릅니다: ${actual}"
 }
 
+assert_mode() {
+    local path=$1
+    local expected=$2
+    local actual
+    actual=$(stat -f '%Lp' "$path")
+    [[ "$actual" = "$expected" ]] || fail "${path} mode가 기대와 다릅니다: ${actual}"
+}
+
+wait_for_file() {
+    local path=$1
+    local attempts=0
+    while [[ ! -e "$path" && "$attempts" -lt 100 ]]; do
+        sleep 0.02
+        attempts=$((attempts + 1))
+    done
+    [[ -e "$path" ]] || fail "대기 파일이 생성되지 않았습니다: ${path}"
+}
+
 reset_case() {
     local name=$1
     CASE_ROOT="${FIXTURE_ROOT}/${name}"
@@ -99,8 +117,18 @@ done
 
 case "${1:-}" in
     -genkeypair)
+        if [[ -n "${SIXBRIDGE_TEST_KEYTOOL_PAUSE_READY:-}" ]]; then
+            : >"${SIXBRIDGE_TEST_KEYTOOL_PAUSE_READY}"
+            while [[ -e "${SIXBRIDGE_TEST_KEYTOOL_PAUSE_FILE}" ]]; do
+                sleep 0.02
+            done
+        fi
         mkdir -p "$(dirname "${keystore}")"
         printf 'partial key material\n' >"${keystore}"
+        if [[ -n "${SIXBRIDGE_TEST_COMPETITOR_FILE:-}" ]]; then
+            mkdir -p "$(dirname "${SIXBRIDGE_TEST_COMPETITOR_FILE}")"
+            printf 'competitor key bytes\n' >"${SIXBRIDGE_TEST_COMPETITOR_FILE}"
+        fi
         if [[ "${SIXBRIDGE_TEST_KEYTOOL_FAIL:-0}" = '1' ]]; then
             exit 42
         fi
@@ -164,9 +192,32 @@ symlink_after=$(shasum -a 256 "${target}" | awk '{print $1}')
 [[ "${symlink_before}" = "${symlink_after}" ]] || fail 'symlink target이 변경되었습니다.'
 assert_keytool_calls 0
 
+reset_case parent-symlink
+outside_root="${FIXTURE_ROOT}/outside-parent"
+mkdir -p "${outside_root}"
+ln -s "${outside_root}" "${CASE_ROOT}/.local"
+expect_failure parent-symlink 'symbolic link' run_init
+assert_keytool_calls 0
+
+reset_case root-symlink
+real_root="${FIXTURE_ROOT}/root-symlink-real"
+link_root="${FIXTURE_ROOT}/root-symlink-link"
+mkdir -p "${real_root}"
+ln -s "${real_root}" "${link_root}"
+expect_failure root-symlink 'symbolic link' \
+    env SIXBRIDGE_RELEASE_ROOT="${link_root}" \
+        SIXBRIDGE_KEYTOOL="${FIXTURE_ROOT}/keytool" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${INIT_SCRIPT}"
+assert_keytool_calls 0
+
 reset_case success
 run_init >"${FIXTURE_ROOT}/success.log" 2>&1
 [[ -f "${KEYSTORE}" && ! -L "${KEYSTORE}" ]] || fail '정상 초기화가 regular PKCS12 파일을 만들지 못했습니다.'
+assert_mode "${KEYSTORE}" 600
+assert_mode "${CASE_ROOT}/.local" 700
+assert_mode "${CASE_ROOT}/.local/keystore" 700
 assert_contains "${KEYTOOL_LOG}" '-genkeypair -storetype PKCS12' 'PKCS12 생성 인자가 없습니다.'
 assert_contains "${KEYTOOL_LOG}" '-storepass:env SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' 'storepass env 인자가 없습니다.'
 assert_contains "${KEYTOOL_LOG}" '-keypass:env SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD' 'keypass env 인자가 없습니다.'
@@ -174,6 +225,7 @@ assert_contains "${KEYTOOL_LOG}" '-alias six-bridge-manager' '고정 alias가 �
 assert_contains "${KEYTOOL_LOG}" '-keyalg RSA -keysize 3072 -validity 3650' 'RSA 3072 / validity 3650 인자가 없습니다.'
 assert_contains "${KEYTOOL_LOG}" '-list -v -storetype PKCS12' 'SHA-256 probe가 없습니다.'
 assert_not_contains "${KEYTOOL_LOG}" "${RELEASE_PASSWORD}" 'keytool argv에 실제 비밀번호가 기록되었습니다.'
+assert_not_contains "${FIXTURE_ROOT}/success.log" "${RELEASE_PASSWORD}" '정상 출력에 실제 비밀번호가 기록되었습니다.'
 success_sha=$(shasum -a 256 "${KEYSTORE}" | awk '{print $1}')
 expect_failure second-run '이미 존재' run_init
 [[ "${success_sha}" = "$(shasum -a 256 "${KEYSTORE}" | awk '{print $1}')" ]] || fail '두 번째 실행이 최초 key를 변경했습니다.'
@@ -189,5 +241,44 @@ expect_failure keytool-failure 'keytool이 release key 생성에 실패' \
         "${INIT_SCRIPT}"
 [[ ! -e "${KEYSTORE}" ]] || fail 'keytool 실패 뒤 이번 실행의 불완전 key가 남았습니다.'
 assert_keytool_calls 1
+
+reset_case competitor-race
+competitor_sha=''
+expect_failure competitor-race '이미 존재' \
+    env SIXBRIDGE_TEST_COMPETITOR_FILE="${KEYSTORE}" \
+        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        SIXBRIDGE_KEYTOOL="${FIXTURE_ROOT}/keytool" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${INIT_SCRIPT}"
+competitor_sha=$(shasum -a 256 "${KEYSTORE}" | awk '{print $1}')
+[[ "${competitor_sha}" = "$(printf 'competitor key bytes\n' | shasum -a 256 | awk '{print $1}')" ]] || \
+    fail '경쟁 프로세스가 만든 destination이 보존되지 않았습니다.'
+
+reset_case concurrent-initialization
+pause_file="${FIXTURE_ROOT}/concurrent.pause"
+pause_ready="${FIXTURE_ROOT}/concurrent.ready"
+: >"${pause_file}"
+set +e
+run_init SIXBRIDGE_TEST_KEYTOOL_PAUSE_FILE="${pause_file}" \
+    SIXBRIDGE_TEST_KEYTOOL_PAUSE_READY="${pause_ready}" \
+    >"${FIXTURE_ROOT}/concurrent-first.log" 2>&1 &
+first_pid=$!
+set -e
+wait_for_file "${pause_ready}"
+set +e
+run_init >"${FIXTURE_ROOT}/concurrent-second.log" 2>&1
+second_status=$?
+rm -f "${pause_file}"
+wait "${first_pid}"
+first_status=$?
+set -e
+success_count=0
+[[ "${first_status}" -eq 0 ]] && success_count=$((success_count + 1))
+[[ "${second_status}" -eq 0 ]] && success_count=$((success_count + 1))
+[[ "${success_count}" -eq 1 ]] || fail '동시 초기화에서 정확히 하나만 성공해야 합니다.'
+[[ -f "${KEYSTORE}" && ! -L "${KEYSTORE}" ]] || fail '동시 초기화 뒤 regular release key가 없습니다.'
+assert_not_contains "${FIXTURE_ROOT}/concurrent-first.log" "${RELEASE_PASSWORD}" '동시 초기화 첫 출력에 비밀번호가 있습니다.'
+assert_not_contains "${FIXTURE_ROOT}/concurrent-second.log" "${RELEASE_PASSWORD}" '동시 초기화 둘째 출력에 비밀번호가 있습니다.'
 
 printf 'init Android release key 검증 통과\n'

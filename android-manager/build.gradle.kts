@@ -1,6 +1,7 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.Path
 
 plugins {
     id("com.android.application")
@@ -19,6 +20,49 @@ val releaseKeystore = rootProject.layout.projectDirectory.file(
     ".local/keystore/six-bridge-manager-release.p12",
 )
 val releaseKeyAlias = "six-bridge-manager"
+
+fun releaseKeystorePathIssue(): String? {
+    val projectRoot = rootProject.layout.projectDirectory.asFile.toPath()
+        .toAbsolutePath()
+        .normalize()
+    if (Files.isSymbolicLink(projectRoot) ||
+        !Files.isDirectory(projectRoot, LinkOption.NOFOLLOW_LINKS)
+    ) {
+        return "project root가 symbolic link가 아닌 directory여야 합니다: $projectRoot"
+    }
+
+    val canonicalRoot = try {
+        projectRoot.toRealPath()
+    } catch (error: Exception) {
+        return "project root canonical path를 확인할 수 없습니다: $projectRoot"
+    }
+    if (canonicalRoot != projectRoot) {
+        return "project root 경로에 symbolic link component가 있습니다: $projectRoot"
+    }
+
+    var current: Path = projectRoot
+    for (component in listOf(".local", "keystore")) {
+        current = current.resolve(component)
+        if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+            continue
+        }
+        if (Files.isSymbolicLink(current)) {
+            return "release keystore parent에 symbolic link가 있습니다: $current"
+        }
+        if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+            return "release keystore parent가 directory가 아닙니다: $current"
+        }
+        val canonicalCurrent = try {
+            current.toRealPath()
+        } catch (error: Exception) {
+            return "release keystore parent canonical path를 확인할 수 없습니다: $current"
+        }
+        if (!canonicalCurrent.startsWith(canonicalRoot)) {
+            return "release keystore parent가 project root 밖을 가리킵니다: $current"
+        }
+    }
+    return null
+}
 
 android {
     namespace = "dev.sixbridge.manager"
@@ -77,6 +121,7 @@ val verifyManagerReleaseSigningInput by tasks.registering {
 
     doLast {
         val errors = buildList {
+            releaseKeystorePathIssue()?.let(::add)
             val keystorePath = releaseKeystore.asFile.toPath()
             if (!Files.isRegularFile(keystorePath, LinkOption.NOFOLLOW_LINKS)) {
                 add("release keystore가 regular file이 아닙니다: ${releaseKeystore.asFile}")
