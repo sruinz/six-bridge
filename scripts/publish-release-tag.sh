@@ -166,26 +166,14 @@ release_require_absent_tag() {
     }
 }
 
-release_require_local_tagger_identity() {
-    local name email identity
-    name=$(release_git config --local --get user.name 2>&1) || {
-        release_fail 'local Git tagger identity user.name이 필요합니다.'
-        return 1
-    }
-    email=$(release_git config --local --get user.email 2>&1) || {
-        release_fail 'local Git tagger identity user.email이 필요합니다.'
-        return 1
-    }
-    [[ -n "${name}" && -n "${email}" ]] || {
-        release_fail 'local Git tagger identity가 비어 있습니다.'
-        return 1
-    }
+release_require_tagger_identity() {
+    local identity
     identity=$(release_git var GIT_COMMITTER_IDENT 2>&1) || {
-        release_fail 'local Git tagger identity가 유효하지 않습니다.'
+        release_fail 'Git tagger identity가 유효하지 않습니다.'
         return 1
     }
     [[ -n "${identity}" ]] || {
-        release_fail 'local Git tagger identity가 유효하지 않습니다.'
+        release_fail 'Git tagger identity가 유효하지 않습니다.'
         return 1
     }
 }
@@ -221,7 +209,7 @@ release_preflight() {
     local head_commit signer
     head_commit=$(release_clean_main_at_origin) || return 1
     release_require_absent_tag || return 1
-    release_require_local_tagger_identity || return 1
+    release_require_tagger_identity || return 1
     signer=$(release_verify_artifacts "${head_commit}") || return 1
     printf '%s:%s\n' "${head_commit}" "${signer}"
 }

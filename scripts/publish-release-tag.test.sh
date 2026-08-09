@@ -154,12 +154,13 @@ setup_case() {
     /bin/cp -- "${PUBLISH_SCRIPT}" "${CASE_ROOT}/scripts/publish-release-tag.sh"
     /bin/chmod 700 "${CASE_ROOT}/scripts/publish-release-tag.sh" "${CASE_ROOT}/scripts/release-lib.sh"
     write_fixture_tools
-    printf '.local/\n' >"${CASE_ROOT}/.gitignore"
+    printf '.local/\n.gitconfig\n' >"${CASE_ROOT}/.gitignore"
     printf fixture >"${CASE_ROOT}/README"
     /usr/bin/git -C "${CASE_ROOT}" add .
     /usr/bin/git -C "${CASE_ROOT}" commit --quiet -m fixture
     /usr/bin/git -C "${CASE_ROOT}" remote add origin "${CASE_ORIGIN}"
     /usr/bin/git -C "${CASE_ROOT}" push --quiet -u origin main
+    printf '[user]\n\tname = Isolated global fixture\n\temail = global@example.invalid\n' >"${CASE_ROOT}/.gitconfig"
     create_release_directory
 }
 
@@ -238,11 +239,19 @@ setup_case eof
 expect_failure eof '백업 확인 입력을 읽지 못했습니다.' EOF
 assert_no_remote_tag eof
 
-setup_case no-local-identity
+setup_case global-identity-without-local-config
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.name
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.email
-expect_failure no-local-identity 'local Git tagger identity' 'v0.1.0 KEY BACKUP COMPLETE'
-assert_no_remote_tag no-local-identity
+global_identity_log="${FIXTURE_ROOT}/global-identity.log"
+printf '%s\n' 'v0.1.0 KEY BACKUP COMPLETE' | run_publish >"${global_identity_log}" 2>&1
+[[ "$(/usr/bin/git --git-dir="${CASE_ORIGIN}" cat-file -t refs/tags/v0.1.0)" = tag ]] || fail '격리된 global identity 정상 case가 annotated remote tag를 만들지 못했습니다.'
+
+setup_case no-identity
+/usr/bin/git -C "${CASE_ROOT}" config --unset user.name
+/usr/bin/git -C "${CASE_ROOT}" config --unset user.email
+/bin/rm -- "${CASE_ROOT}/.gitconfig"
+expect_failure no-identity 'Git tagger identity' 'v0.1.0 KEY BACKUP COMPLETE'
+assert_no_remote_tag no-identity
 
 setup_case push-failure
 /bin/cat >"${CASE_ORIGIN}/hooks/pre-receive" <<'EOF'
