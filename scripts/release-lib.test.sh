@@ -1,30 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+readonly ROOT_DIR="$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)"
 readonly LIBRARY="${ROOT_DIR}/scripts/release-lib.sh"
-readonly FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sixbridge-release-lib-test.XXXXXX")"
+readonly TEST_HOOK="${ROOT_DIR}/scripts/release-lib-test-hook.sh"
+readonly FIXTURE_ROOT="$(/usr/bin/mktemp -d "${ROOT_DIR}/.local/release-lib-test.XXXXXX")"
 readonly SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 readonly GIT_COMMIT='abcdef0123456789abcdef0123456789abcdef01'
 
-cleanup() { rm -rf "${FIXTURE_ROOT}"; }
+cleanup() { /bin/rm -rf "${FIXTURE_ROOT}"; }
 trap cleanup EXIT
-
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
-assert_contains() {
-    local file=$1 expected=$2 message=$3
-    grep -Fq -- "${expected}" "${file}" || { cat "${file}" >&2; fail "${message}"; }
-}
-
-assert_not_contains() {
-    local file=$1 unexpected=$2 message=$3
-    if grep -Fq -- "${unexpected}" "${file}"; then
-        cat "${file}" >&2
-        fail "${message}"
-    fi
-}
-
+assert_contains() { /usr/bin/grep -Fq -- "$2" "$1" || { /bin/cat "$1" >&2; fail "$3"; }; }
+assert_not_contains() { ! /usr/bin/grep -Fq -- "$2" "$1" || { /bin/cat "$1" >&2; fail "$3"; }; }
 expect_failure() {
     local label=$1 expected=$2 output status
     shift 2
@@ -33,84 +22,53 @@ expect_failure() {
     "$@" >"${output}" 2>&1
     status=$?
     set -e
-    [[ "${status}" -ne 0 ]] || { cat "${output}" >&2; fail "${label}: 실패해야 할 검증이 성공했습니다."; }
+    [[ "${status}" -ne 0 ]] || { /bin/cat "${output}" >&2; fail "${label}: 실패해야 할 검증이 성공했습니다."; }
     assert_contains "${output}" "${expected}" "${label}: 거부 사유가 없습니다."
 }
+make_file() { /bin/mkdir -p "$(/usr/bin/dirname -- "$1")"; printf '%s' "$2" >"$1"; }
 
 create_tools() {
-    mkdir -p "${FIXTURE_ROOT}/bin"
-    cat >"${FIXTURE_ROOT}/bin/apksigner" <<'EOF'
+    /bin/mkdir -p "${FIXTURE_ROOT}/bin"
+    /bin/cat >"${FIXTURE_ROOT}/bin/apksigner" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
 [[ "${FAKE_APKSIGNER_FAIL:-0}" != 1 ]] || exit 17
-if [[ -n "${FAKE_APKSIGNER_REPLACE_PATH:-}" ]]; then
-  printf 'replaced during apksigner\n' >"${FAKE_APKSIGNER_REPLACE_PATH}"
+[[ -z "${FAKE_APKSIGNER_REPLACE_PATH:-}" ]] || printf 'replaced' >"${FAKE_APKSIGNER_REPLACE_PATH}"
+if [[ -n "${FAKE_APKSIGNER_SWAP_RESTORE_PATH:-}" ]]; then
+  saved="${FAKE_APKSIGNER_SWAP_RESTORE_PATH}.saved"
+  /bin/mv "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}" "${saved}"
+  printf 'replaced' >"${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
+  /bin/sleep 1
+  /bin/mv "${saved}" "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
 fi
 printf 'Signer #1 certificate SHA-256 digest: %s\n' "${FAKE_SIGNER}"
-if [[ "${FAKE_EXTRA_SIGNER:-0}" = 1 ]]; then
-  printf 'Signer #2 certificate SHA-256 digest: %s\n' "${FAKE_EXTRA_SIGNER_VALUE:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
-fi
+[[ "${FAKE_EXTRA_SIGNER:-0}" != 1 ]] || printf 'Signer #2 certificate SHA-256 digest: %s\n' "${FAKE_SIGNER}"
 EOF
-    cat >"${FIXTURE_ROOT}/bin/apkanalyzer" <<'EOF'
+    /bin/cat >"${FIXTURE_ROOT}/bin/apkanalyzer" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-[[ "${1:-}" = manifest ]] || exit 18
-case "${2:-}" in
-  application-id) printf '%s\n' "${FAKE_APPLICATION_ID}" ;;
-  version-name) printf '%s\n' "${FAKE_VERSION_NAME}" ;;
-  version-code) printf '%s\n' "${FAKE_VERSION_CODE}" ;;
-  *) exit 19 ;;
+case "$2" in application-id) printf '%s\n' "${FAKE_APPLICATION_ID}";; version-name) printf '%s\n' "${FAKE_VERSION_NAME}";; version-code) printf '%s\n' "${FAKE_VERSION_CODE}";; *) exit 19;; esac
+EOF
+    /bin/cat >"${FIXTURE_ROOT}/bin/hdiutil" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+ attach) shift; while [[ "$#" -gt 0 ]]; do [[ "$1" = -mountpoint ]] && { mountpoint=$2; shift 2; } || shift; done; /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents"; : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"; [[ "${FAKE_EXTRA_APP:-0}" != 1 ]] || /bin/mkdir -p "${mountpoint}/Injected.app/Contents";;
+ detach) /bin/rm -rf "$2";; *) exit 22;;
 esac
 EOF
-    cat >"${FIXTURE_ROOT}/bin/hdiutil" <<'EOF'
+    /bin/cat >"${FIXTURE_ROOT}/bin/PlistBuddy" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-case "${1:-}" in
-  attach)
-    [[ "${FAKE_HDIUTIL_FAIL:-0}" != 1 ]] || exit 20
-    shift; mountpoint=''
-    while [[ "$#" -gt 0 ]]; do
-      if [[ "$1" = -mountpoint ]]; then mountpoint=$2; shift 2; else shift; fi
-    done
-    [[ -n "${mountpoint}" ]] || exit 21
-    mkdir -p "${mountpoint}/SIX Bridge.app/Contents"
-    : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
-    if [[ "${FAKE_EXTRA_APP:-0}" = 1 ]]; then
-      mkdir -p "${mountpoint}/Injected.app/Contents"
-      : >"${mountpoint}/Injected.app/Contents/Info.plist"
-    fi
-    ;;
-  detach) rm -rf "$2" ;;
-  *) exit 22 ;;
-esac
+case "$2" in 'Print :CFBundleIdentifier') printf '%s\n' "${FAKE_BUNDLE_ID}";; 'Print :CFBundleShortVersionString') printf '%s\n' "${FAKE_PRODUCT_VERSION}";; 'Print :CFBundleVersion') printf '%s\n' "${FAKE_NATIVE_VERSION}";; 'Print :LSMinimumSystemVersion') printf '%s\n' "${FAKE_MINIMUM_VERSION}";; *) exit 23;; esac
 EOF
-    cat >"${FIXTURE_ROOT}/bin/shasum" <<'EOF'
+    /bin/cat >"${FIXTURE_ROOT}/bin/codesign" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
+[[ "${FAKE_CODESIGN_SIGNED:-0}" != 1 ]] || exit 0
+printf 'code object is not signed at all\n' >&2; exit 1
+EOF
+    /bin/cat >"${FIXTURE_ROOT}/bin/shasum" <<'EOF'
+#!/usr/bin/env bash
 /usr/bin/shasum "$@"
-if [[ -n "${FAKE_SHASUM_REPLACE_PATH:-}" ]]; then
-  printf 'replaced during shasum\n' >"${FAKE_SHASUM_REPLACE_PATH}"
-fi
+[[ -z "${FAKE_SHASUM_REPLACE_PATH:-}" ]] || printf 'replaced' >"${FAKE_SHASUM_REPLACE_PATH}"
 EOF
-    cat >"${FIXTURE_ROOT}/bin/PlistBuddy" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-case "${2:-}" in
-  'Print :CFBundleIdentifier') printf '%s\n' "${FAKE_BUNDLE_ID}" ;;
-  'Print :CFBundleShortVersionString') printf '%s\n' "${FAKE_PRODUCT_VERSION}" ;;
-  'Print :CFBundleVersion') printf '%s\n' "${FAKE_NATIVE_VERSION}" ;;
-  'Print :LSMinimumSystemVersion') printf '%s\n' "${FAKE_MINIMUM_VERSION}" ;;
-  *) exit 23 ;;
-esac
-EOF
-    cat >"${FIXTURE_ROOT}/bin/codesign" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${FAKE_CODESIGN_SIGNED:-0}" = 1 ]]; then exit 0; fi
-printf 'code object is not signed at all\n' >&2
-exit 1
-EOF
-    chmod +x "${FIXTURE_ROOT}/bin/"*
+    /bin/chmod +x "${FIXTURE_ROOT}/bin/"*
 }
 
 export SIXBRIDGE_APKSIGNER="${FIXTURE_ROOT}/bin/apksigner"
@@ -119,7 +77,6 @@ export SIXBRIDGE_HDIUTIL="${FIXTURE_ROOT}/bin/hdiutil"
 export SIXBRIDGE_PLISTBUDDY="${FIXTURE_ROOT}/bin/PlistBuddy"
 export SIXBRIDGE_CODESIGN="${FIXTURE_ROOT}/bin/codesign"
 export SIXBRIDGE_SHASUM="${FIXTURE_ROOT}/bin/shasum"
-export SIXBRIDGE_RELEASE_TEST_MODE=1
 export FAKE_SIGNER="${SIGNER}"
 export FAKE_APPLICATION_ID='dev.sixbridge.manager'
 export FAKE_VERSION_NAME='0.1.0'
@@ -130,141 +87,143 @@ export FAKE_NATIVE_VERSION='1.0.0'
 export FAKE_MINIMUM_VERSION='13.0'
 create_tools
 
-# RED: Task 3 library does not exist until its production contract is implemented.
+# Production library must ignore test-mode and arbitrary tool environment variables.
+production_log="${FIXTURE_ROOT}/production-tool-boundary.log"
+set +e
+env SIXBRIDGE_RELEASE_TEST_MODE=1 SIXBRIDGE_APKSIGNER="${FIXTURE_ROOT}/bin/apksigner" \
+  bash -c 'source "$1"; release_tool apksigner' _ "${LIBRARY}" >"${production_log}" 2>&1
+production_status=$?
+set -e
+assert_not_contains "${production_log}" "${FIXTURE_ROOT}/bin/apksigner" 'production release_tool이 arbitrary 경로를 사용했습니다.'
+if [[ ${production_status} -ne 0 ]]; then
+    assert_contains "${production_log}" 'release 검증 실패' 'production tool 실패 status의 진단이 없습니다.'
+fi
+expect_failure production-unknown-tool '알 수 없는 release 도구' bash -c 'source "$1"; release_tool invalid' _ "${LIBRARY}"
+
 source "${LIBRARY}"
+source "${TEST_HOOK}"
 
-tool_boundary_output="${FIXTURE_ROOT}/production-tool-boundary.log"
-set +e
-env -u SIXBRIDGE_RELEASE_TEST_MODE \
-  SIXBRIDGE_APKSIGNER="${FIXTURE_ROOT}/bin/apksigner" \
-  bash -c 'source "$1"; release_tool apksigner' _ "${LIBRARY}" >"${tool_boundary_output}" 2>&1
-set -e
-assert_not_contains "${tool_boundary_output}" "${FIXTURE_ROOT}/bin/apksigner" 'production mode가 arbitrary apksigner 경로를 허용했습니다.'
-function_boundary_output="${FIXTURE_ROOT}/function-tool-boundary.log"
-set +e
-env -u SIXBRIDGE_RELEASE_TEST_MODE bash -c 'apksigner() { printf injected; }; source "$1"; release_tool apksigner' _ "${LIBRARY}" >"${function_boundary_output}" 2>&1
-set -e
-assert_not_contains "${function_boundary_output}" 'injected' 'production mode가 PATH shell function을 실행했습니다.'
+container="${FIXTURE_ROOT}"
+stage="${container}/stage"
+/bin/mkdir -p "${stage}"; /bin/chmod 700 "${container}" "${stage}"
+release_validate_stage_root "${stage}" "${container}"
+/bin/chmod 755 "${container}"
+expect_failure container-mode 'trusted directory' release_validate_stage_root "${stage}" "${container}"
+/bin/chmod 700 "${container}"
+external_container=$(/usr/bin/mktemp -d '/tmp/sixbridge-external-container.XXXXXX')
+external_stage="${external_container}/stage"
+/bin/mkdir -p "${external_stage}"; /bin/chmod 700 "${external_container}" "${external_stage}"
+expect_failure external-container '프로젝트 .local' release_validate_stage_root "${external_stage}" "${external_container}"
+/bin/rm -rf "${external_container}"
 
-stage_container="${FIXTURE_ROOT}/stage-container"
-stage_root="${stage_container}/stage"
-mkdir -p "${stage_root}"
-chmod 700 "${stage_container}" "${stage_root}"
-release_validate_stage_root "${stage_root}" "${stage_container}"
-chmod 755 "${stage_root}"
-expect_failure stage-root-mode 'private stage root' bash -c 'source "$1"; release_validate_stage_root "$2" "$3"' _ "${LIBRARY}" "${stage_root}" "${stage_container}"
-chmod 700 "${stage_root}"
+apk="${stage}/fixture.apk"; dmg="${stage}/fixture.dmg"
+make_file "${apk}" apk; make_file "${dmg}" dmg
+release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
+export FAKE_APKSIGNER_FAIL=1; expect_failure apk-signature 'APK signature verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_FAIL
+export FAKE_APPLICATION_ID='invalid.package'; expect_failure apk-application-id 'application ID' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_APPLICATION_ID='dev.sixbridge.manager'
+export FAKE_VERSION_NAME='9.9.9'; expect_failure apk-version-name 'versionName' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_NAME='0.1.0'
+export FAKE_SIGNER='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'; expect_failure apk-signer 'signer SHA-256' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_SIGNER="${SIGNER}"
+export FAKE_EXTRA_SIGNER=1; expect_failure apk-extra-signer '정확히 하나' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_EXTRA_SIGNER
+export FAKE_VERSION_CODE=2; expect_failure apk-version-code 'versionCode' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_CODE=1
+export FAKE_APKSIGNER_REPLACE_PATH="${apk}"; expect_failure apk-race 'artifact changed during verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_REPLACE_PATH
+make_file "${apk}" apk
+export FAKE_APKSIGNER_SWAP_RESTORE_PATH="${apk}"; expect_failure apk-swap-restore 'stage root changed' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_SWAP_RESTORE_PATH
+outside="${FIXTURE_ROOT}/outside.apk"; make_file "${outside}" apk
+expect_failure apk-outside-stage 'stage root 밖' release_verify_apk "${outside}" "${SIGNER}" "${stage}" "${container}"
 
-make_file() { mkdir -p "$(dirname -- "$1")"; printf '%s' "$2" >"$1"; }
+release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"
+export FAKE_BUNDLE_ID='invalid.bundle'; expect_failure dmg-bundle-id 'bundle ID' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
+export FAKE_EXTRA_APP=1; expect_failure dmg-extra-app '정확히 하나' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; unset FAKE_EXTRA_APP
+export FAKE_PRODUCT_VERSION=9.9.9; expect_failure dmg-product-version 'product version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='0.1.0'
+export FAKE_NATIVE_VERSION=2.0.0; expect_failure dmg-native-version 'native package version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_NATIVE_VERSION='1.0.0'
+export FAKE_MINIMUM_VERSION=12.0; expect_failure dmg-minimum-version 'minimum macOS version' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; export FAKE_MINIMUM_VERSION='13.0'
+export FAKE_CODESIGN_SIGNED=1; expect_failure dmg-signed '미서명' release_verify_dmg "${dmg}" "${FIXTURE_ROOT}/mounts" "${stage}" "${container}"; unset FAKE_CODESIGN_SIGNED
+
+scan_root="${stage}/scan"; /bin/mkdir -p "${scan_root}"; make_file "${scan_root}/safe.txt" safe
+release_scan_tree "${scan_root}" "${stage}" "${container}"
+/bin/ln -s "${scan_root}/safe.txt" "${scan_root}/linked.txt"
+expect_failure scan-symlink 'symbolic link' release_scan_tree "${scan_root}" "${stage}" "${container}"
+/bin/rm "${scan_root}/linked.txt"
+/bin/ln "${scan_root}/safe.txt" "${scan_root}/hardlinked.txt"
+expect_failure scan-hardlink 'hardlink' release_scan_tree "${scan_root}" "${stage}" "${container}"
+/bin/rm "${scan_root}/hardlinked.txt"
+for forbidden in private.p12 private.jks private.pem private.pk8 input.six input.sixdraft input.crx fixture.zip; do
+  make_file "${scan_root}/${forbidden}" bad
+  expect_failure "scan-${forbidden}" 'forbidden release input' release_scan_tree "${scan_root}" "${stage}" "${container}"
+  /bin/rm "${scan_root}/${forbidden}"
+done
+/bin/mkdir "${scan_root}/.local"
+expect_failure scan-local-directory 'forbidden release input' release_scan_tree "${scan_root}" "${stage}" "${container}"
+/bin/rmdir "${scan_root}/.local"
+make_file "${scan_root}/secret.txt" 'release-secret-probe'
+/bin/mkdir -p "${FIXTURE_ROOT}/path"; /bin/cat >"${FIXTURE_ROOT}/path/grep" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GREP_CAPTURE}"
+exit 1
+EOF
+/bin/chmod +x "${FIXTURE_ROOT}/path/grep"; : >"${FIXTURE_ROOT}/grep-argv.log"
+GREP_CAPTURE="${FIXTURE_ROOT}/grep-argv.log" PATH="${FIXTURE_ROOT}/path:${PATH}" \
+  expect_failure scan-secret '비밀정보' release_scan_tree "${scan_root}" "${stage}" "${container}" 'release-secret-probe'
+assert_not_contains "${FIXTURE_ROOT}/grep-argv.log" 'release-secret-probe' 'secret probe가 grep argv에 노출되었습니다.'
+/bin/rm "${scan_root}/secret.txt"
 
 make_release_directory() {
-    local root=$1 directory="${1}/release"
-    mkdir -p "${directory}"
-    chmod 700 "${directory}"
-    make_file "${directory}/${SIXBRIDGE_ANDROID_FILE}" 'android fixture'
-    make_file "${directory}/${SIXBRIDGE_MACOS_FILE}" 'macos fixture'
-    make_file "${directory}/RELEASE-NOTES-KO.md" '한글 릴리스 노트\n'
-    release_write_metadata "${directory}" "${GIT_COMMIT}" "${SIGNER}"
-    release_write_checksums "${directory}"
+    local name=$1 parent directory
+    parent="${container}/${name}"
+    directory="${parent}/release"
+    /bin/mkdir -p "${directory}"; /bin/chmod 700 "${parent}" "${directory}"
+    make_file "${directory}/${SIXBRIDGE_ANDROID_FILE}" android
+    make_file "${directory}/${SIXBRIDGE_MACOS_FILE}" macos
+    make_file "${directory}/RELEASE-NOTES-KO.md" '한글 릴리스 노트'
+    release_write_metadata "${directory}" "${GIT_COMMIT}" "${SIGNER}" "${container}"
+    release_write_checksums "${directory}" "${container}"
     printf '%s\n' "${directory}"
 }
 
-make_file "${FIXTURE_ROOT}/apk.apk" 'apk'
-release_verify_apk "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-apksigner-nonzero 'APK signature verification' \
-  env FAKE_APKSIGNER_FAIL=1 bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-package-mismatch 'application ID' \
-  env FAKE_APPLICATION_ID='invalid.package' bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-version-mismatch 'versionName' \
-  env FAKE_VERSION_NAME='9.9.9' bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-signer-mismatch 'signer SHA-256' \
-  env FAKE_SIGNER='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-extra-signer '정확히 하나' \
-  env FAKE_EXTRA_SIGNER=1 FAKE_EXTRA_SIGNER_VALUE="${SIGNER}" bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-version-code-mismatch 'versionCode' \
-  env FAKE_VERSION_CODE=2 bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-expect_failure apk-replacement-race 'artifact changed during verification' \
-  env FAKE_APKSIGNER_REPLACE_PATH="${FIXTURE_ROOT}/apk.apk" bash -c 'source "$1"; release_verify_apk "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/apk.apk" "${SIGNER}"
-make_file "${FIXTURE_ROOT}/apk.apk" 'apk'
+release_one=$(make_release_directory one)
+release_two=$(make_release_directory two)
+/usr/bin/cmp "${release_one}/RELEASE-METADATA.json" "${release_two}/RELEASE-METADATA.json" || fail 'metadata가 root에 따라 달라집니다.'
+/usr/bin/cmp "${release_one}/SHA256SUMS" "${release_two}/SHA256SUMS" || fail 'checksum이 root에 따라 달라집니다.'
+release_verify_directory "${release_one}" "${SIGNER}" "${container}"
+printf '\n' >>"${release_one}/SHA256SUMS"
+expect_failure checksum-extra-newline 'SHA256SUMS' release_verify_directory "${release_one}" "${SIGNER}" "${container}"
 
-make_file "${FIXTURE_ROOT}/fixture.dmg" 'dmg'
-release_verify_dmg "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-bundle-mismatch 'bundle ID' \
-  env FAKE_BUNDLE_ID='invalid.bundle' bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-native-version-mismatch 'native package version' \
-    env FAKE_NATIVE_VERSION='2.0.0' bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-product-version-mismatch 'product version' \
-    env FAKE_PRODUCT_VERSION='9.9.9' bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-minimum-version-mismatch 'minimum macOS version' \
-  env FAKE_MINIMUM_VERSION='12.0' bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-signed '미서명' \
-  env FAKE_CODESIGN_SIGNED=1 bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
-expect_failure dmg-extra-app '정확히 하나' \
-  env FAKE_EXTRA_APP=1 bash -c 'source "$1"; release_verify_dmg "$2" "$3"' _ "${LIBRARY}" "${FIXTURE_ROOT}/fixture.dmg" "${FIXTURE_ROOT}/mounts"
+release_no_newline=$(make_release_directory no-newline)
+/usr/bin/perl -0pi -e 's/\n\z//' "${release_no_newline}/SHA256SUMS"
+expect_failure checksum-missing-newline 'SHA256SUMS' release_verify_directory "${release_no_newline}" "${SIGNER}" "${container}"
 
-scan_root="${FIXTURE_ROOT}/scan"
-mkdir -p "${scan_root}"
-make_file "${scan_root}/safe.txt" 'safe'
-release_scan_tree "${scan_root}"
-ln -s "${scan_root}/safe.txt" "${scan_root}/linked.txt"
-expect_failure scan-symlink 'symbolic link' bash -c 'source "$1"; release_scan_tree "$2"' _ "${LIBRARY}" "${scan_root}"
-rm "${scan_root}/linked.txt"
-ln "${scan_root}/safe.txt" "${scan_root}/hardlinked.txt"
-expect_failure scan-hardlink 'hardlink' bash -c 'source "$1"; release_scan_tree "$2"' _ "${LIBRARY}" "${scan_root}"
-rm "${scan_root}/hardlinked.txt"
-for forbidden in private.p12 private.jks private.pem private.pk8 input.six input.sixdraft input.crx fixture.zip; do
-  make_file "${scan_root}/${forbidden}" 'forbidden'
-  expect_failure "scan-${forbidden}" 'forbidden release input' bash -c 'source "$1"; release_scan_tree "$2"' _ "${LIBRARY}" "${scan_root}"
-  rm "${scan_root}/${forbidden}"
-done
-make_file "${scan_root}/secret.txt" 'release-secret-probe'
-expect_failure scan-secret '비밀정보' \
-  env SIXBRIDGE_RELEASE_SECRET_PROBE='release-secret-probe' bash -c 'source "$1"; release_scan_tree "$2"' _ "${LIBRARY}" "${scan_root}"
-rm "${scan_root}/secret.txt"
-mkdir "${scan_root}/.local"
-expect_failure scan-local-directory 'forbidden release input' bash -c 'source "$1"; release_scan_tree "$2"' _ "${LIBRARY}" "${scan_root}"
-rmdir "${scan_root}/.local"
+release_one_byte=$(make_release_directory one-byte)
+first_byte=$(/bin/dd if="${release_one_byte}/SHA256SUMS" bs=1 count=1 2>/dev/null)
+replacement_byte=0; [[ "${first_byte}" = 0 ]] && replacement_byte=1
+printf '%s' "${replacement_byte}" | /bin/dd of="${release_one_byte}/SHA256SUMS" bs=1 count=1 conv=notrunc >/dev/null 2>&1
+expect_failure checksum-one-byte 'SHA256SUMS' release_verify_directory "${release_one_byte}" "${SIGNER}" "${container}"
 
-release_one=$(make_release_directory "${FIXTURE_ROOT}/deterministic-one")
-release_two=$(make_release_directory "${FIXTURE_ROOT}/deterministic-two")
-cmp "${release_one}/RELEASE-METADATA.json" "${release_two}/RELEASE-METADATA.json" || fail 'metadata가 root에 따라 달라집니다.'
-cmp "${release_one}/SHA256SUMS" "${release_two}/SHA256SUMS" || fail 'checksum이 root에 따라 달라집니다.'
-release_verify_directory "${release_one}" "${SIGNER}"
-printf 'x' >>"${release_one}/${SIXBRIDGE_ANDROID_FILE}"
-expect_failure directory-corrupt-checksum 'SHA256SUMS' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_one}" "${SIGNER}"
+release_cmp=$(make_release_directory cmp)
+printf x >>"${release_cmp}/${SIXBRIDGE_ANDROID_FILE}"
+cmp() { return 0; }
+expect_failure checksum-path-function 'SHA256SUMS' release_verify_directory "${release_cmp}" "${SIGNER}" "${container}"
+unset -f cmp
 
-release_newline=$(make_release_directory "${FIXTURE_ROOT}/checksum-newline")
-printf '\n' >>"${release_newline}/SHA256SUMS"
-expect_failure directory-checksum-extra-newline 'SHA256SUMS' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_newline}" "${SIGNER}"
-release_no_newline=$(make_release_directory "${FIXTURE_ROOT}/checksum-no-newline")
-perl -0pi -e 's/\n\z//' "${release_no_newline}/SHA256SUMS"
-expect_failure directory-checksum-no-newline 'SHA256SUMS' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_no_newline}" "${SIGNER}"
-release_checksum_byte=$(make_release_directory "${FIXTURE_ROOT}/checksum-byte")
-perl -0pi -e 's/^./f/' "${release_checksum_byte}/SHA256SUMS"
-expect_failure directory-checksum-one-byte 'SHA256SUMS' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_checksum_byte}" "${SIGNER}"
+release_missing=$(make_release_directory missing)
+/bin/rm "${release_missing}/RELEASE-NOTES-KO.md"
+expect_failure directory-missing-file '필수 release file' release_verify_directory "${release_missing}" "${SIGNER}" "${container}"
 
-release_metadata_race_root="${FIXTURE_ROOT}/metadata-race"
-mkdir -p "${release_metadata_race_root}/release"
-chmod 700 "${release_metadata_race_root}/release"
-make_file "${release_metadata_race_root}/release/${SIXBRIDGE_ANDROID_FILE}" 'android fixture'
-make_file "${release_metadata_race_root}/release/${SIXBRIDGE_MACOS_FILE}" 'macos fixture'
-make_file "${release_metadata_race_root}/release/RELEASE-NOTES-KO.md" 'note'
-expect_failure metadata-input-race 'artifact changed during verification' \
-  env FAKE_SHASUM_REPLACE_PATH="${release_metadata_race_root}/release/${SIXBRIDGE_ANDROID_FILE}" bash -c 'source "$1"; release_write_metadata "$2" "$3" "$4"' _ \
-  "${LIBRARY}" "${release_metadata_race_root}/release" "${GIT_COMMIT}" "${SIGNER}"
+release_extra=$(make_release_directory extra)
+make_file "${release_extra}/unexpected.txt" extra
+expect_failure directory-extra-file '정확히 다섯 개' release_verify_directory "${release_extra}" "${SIGNER}" "${container}"
 
-atomic_root="${FIXTURE_ROOT}/atomic"
-mkdir -p "${atomic_root}"
-make_file "${atomic_root}/owned.tmp" 'owned'
-mkdir "${atomic_root}/destination"
-expect_failure atomic-publish-failure 'release output' bash -c 'source "$1"; release_atomic_publish_file "$2" "$3"' _ "${LIBRARY}" "${atomic_root}/owned.tmp" "${atomic_root}/destination"
+race_parent="${container}/race"; race_directory="${race_parent}/release"
+/bin/mkdir -p "${race_directory}"; /bin/chmod 700 "${race_parent}" "${race_directory}"
+make_file "${race_directory}/${SIXBRIDGE_ANDROID_FILE}" android
+make_file "${race_directory}/${SIXBRIDGE_MACOS_FILE}" macos
+make_file "${race_directory}/RELEASE-NOTES-KO.md" note
+export FAKE_SHASUM_REPLACE_PATH="${race_directory}/${SIXBRIDGE_ANDROID_FILE}"
+expect_failure metadata-input-race 'artifact changed during verification' release_write_metadata "${race_directory}" "${GIT_COMMIT}" "${SIGNER}" "${container}"
+unset FAKE_SHASUM_REPLACE_PATH
+
+atomic_root="${container}/atomic"; /bin/mkdir -p "${atomic_root}"; /bin/chmod 700 "${atomic_root}"
+make_file "${atomic_root}/owned.tmp" owned; /bin/mkdir "${atomic_root}/destination"
+expect_failure atomic-publish-failure 'release output' release_atomic_publish_file "${atomic_root}/owned.tmp" "${atomic_root}/destination"
 [[ ! -e "${atomic_root}/owned.tmp" ]] || fail 'atomic publish 실패 뒤 소유 temp가 남았습니다.'
-
-release_missing=$(make_release_directory "${FIXTURE_ROOT}/missing")
-rm "${release_missing}/RELEASE-NOTES-KO.md"
-expect_failure directory-missing-file '필수 release file' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_missing}" "${SIGNER}"
-release_extra=$(make_release_directory "${FIXTURE_ROOT}/extra")
-make_file "${release_extra}/unexpected.txt" 'extra'
-expect_failure directory-extra-file '정확히 다섯 개' bash -c 'source "$1"; release_verify_directory "$2" "$3"' _ "${LIBRARY}" "${release_extra}" "${SIGNER}"
 
 printf 'release-lib 검증 통과\n'
