@@ -417,24 +417,42 @@ release_system_directory() {
     }
 }
 
+release_system_perl_directory() {
+    local path=$1 physical parent
+    case "${path}" in /System/Library/Perl/*) ;; *) release_fail 'system Perl library가 sealed system 밖에 있습니다.'; return 1 ;; esac
+    [[ -d "${path}" && ! -L "${path}" ]] || { release_fail 'system Perl library directory 형식이 올바르지 않습니다.'; return 1; }
+    physical="$(CDPATH= cd -P -- "${path}" && pwd -P)" || return 1
+    case "${physical}" in /System/Library/Perl/*) ;; *) release_fail 'system Perl library canonical containment가 올바르지 않습니다.'; return 1 ;; esac
+    parent="${physical}"
+    while [[ "${parent}" != /System ]]; do
+        release_system_directory "${parent}" || return 1
+        parent=$(/usr/bin/dirname -- "${parent}")
+    done
+}
+
+release_parse_system_perl_contract() {
+    local output=$1 perl privlib archlib
+    IFS='|' read -r perl privlib archlib <<<"${output}"
+    [[ "${perl}" = /usr/bin/perl && -n "${privlib}" && -n "${archlib}" && "${output}" != *$'\n'* ]] || {
+        release_fail 'system Perl library 출력 형식이 올바르지 않습니다.'
+        return 1
+    }
+    printf '%s|%s|%s\n' "${perl}" "${privlib}" "${archlib}"
+}
+
 release_system_perl() {
-    local output
+    local output perl privlib archlib
     release_system_executable /usr/bin/perl || return 1
-    release_system_directory /System || return 1
-    release_system_directory /System/Library || return 1
-    release_system_directory /System/Library/Perl || return 1
-    release_system_directory /System/Library/Perl/5.34 || return 1
-    release_system_directory /System/Library/Perl/5.34/darwin-thread-multi-2level || return 1
     output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
-        /usr/bin/perl -e 'BEGIN { @INC = (q{/System/Library/Perl/5.34/darwin-thread-multi-2level}, q{/System/Library/Perl/5.34}); } use Digest::SHA; use File::Spec; print "$INC{\"Digest/SHA.pm\"}\n$INC{\"File/Spec.pm\"}\n";') || {
-        release_fail 'system Perl module을 load하지 못했습니다.'
+        /usr/bin/perl -MConfig -e 'print "$^X|$Config{privlib}|$Config{archlib}\n";') || {
+        release_fail 'system Perl library 경로를 읽지 못했습니다.'
         return 1
     }
-    [[ "${output}" = $'/System/Library/Perl/5.34/darwin-thread-multi-2level/Digest/SHA.pm\n/System/Library/Perl/5.34/darwin-thread-multi-2level/File/Spec.pm' ]] || {
-        release_fail 'system Perl module canonical containment가 올바르지 않습니다.'
-        return 1
-    }
-    printf '%s\n' /usr/bin/perl
+    output=$(release_parse_system_perl_contract "${output}") || return 1
+    IFS='|' read -r perl privlib archlib <<<"${output}"
+    release_system_perl_directory "${privlib}" || return 1
+    release_system_perl_directory "${archlib}" || return 1
+    printf '%s|%s|%s\n' "${perl}" "${privlib}" "${archlib}"
 }
 
 release_darwin_atomic_publish_preflight() {

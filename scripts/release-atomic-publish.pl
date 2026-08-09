@@ -1,10 +1,4 @@
 #!/usr/bin/perl
-BEGIN {
-    @INC = (
-        '/System/Library/Perl/5.34/darwin-thread-multi-2level',
-        '/System/Library/Perl/5.34',
-    );
-}
 use strict;
 use warnings;
 use Digest::SHA;
@@ -60,9 +54,9 @@ sub verify_file {
     return $actual;
 }
 
-@ARGV == 10 or fail();
+@ARGV == 11 or fail();
 my ($source_parent, $destination_parent, $source_leaf, $destination_leaf,
-    $directory_identity, @identities) = @ARGV;
+    $directory_identity, $container_identity, @identities) = @ARGV;
 leaf($source_leaf) && leaf($destination_leaf) or fail();
 opendir(my $source_parent_handle, $source_parent) or fail();
 opendir(my $destination_parent_handle, $destination_parent) or fail();
@@ -73,6 +67,9 @@ my @destination_parent_stat = stat($destination_parent_handle);
 @source_parent_stat && @destination_parent_stat &&
     $source_parent_stat[0] == $destination_parent_stat[0] &&
     $source_parent_stat[1] == $destination_parent_stat[1] or fail();
+$container_identity =~ /\A(\d+):(\d+):/ or fail();
+$source_parent_stat[0] == $1 && $source_parent_stat[1] == $2 &&
+    $destination_parent_stat[0] == $1 && $destination_parent_stat[1] == $2 or fail();
 
 $directory_identity =~ /\A(\d+):(\d+):/ or fail();
 my ($expected_source_device, $expected_source_inode) = ($1, $2);

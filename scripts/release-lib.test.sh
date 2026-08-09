@@ -383,4 +383,11 @@ make_file "${atomic_root}/owned.tmp" owned; /bin/mkdir "${atomic_root}/destinati
 expect_failure atomic-publish-failure 'release output' release_atomic_publish_file "${atomic_root}/owned.tmp" "${atomic_root}/destination"
 [[ ! -e "${atomic_root}/owned.tmp" ]] || fail 'atomic publish 실패 뒤 소유 temp가 남았습니다.'
 
+for perl_contract in \
+    '/usr/bin/perl|/System/Library/Perl/5.30|/System/Library/Perl/5.30/darwin-thread-multi-2level' \
+    '/usr/bin/perl|/System/Library/Perl/5.34|/System/Library/Perl/5.34/darwin-thread-multi-2level'; do
+    [[ "$(release_parse_system_perl_contract "${perl_contract}")" = "${perl_contract}" ]] || fail 'version-agnostic Perl contract parser가 canonical output을 보존하지 않았습니다.'
+done
+expect_failure perl-contract-invalid '출력 형식' release_parse_system_perl_contract '/tmp/perl|/System/Library/Perl/5.34|/System/Library/Perl/5.34/arch'
+
 printf 'release-lib 검증 통과\n'

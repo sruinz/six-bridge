@@ -122,7 +122,7 @@ release_verify_directory() {
 }
 
 release_before_atomic_publish() {
-    local rebound entry
+    local rebound entry source_leaf
     case "${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}" in
         '') ;;
         content)
@@ -143,6 +143,15 @@ release_before_atomic_publish() {
             done
             /bin/rmdir "${rebound}"
             : >"${PUBLISH_DIR}/external-rebind-sentinel"
+            ;;
+        container-rebind)
+            : >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-native-publish-barrier-fired"
+            source_leaf=${PUBLISH_DIR##*/}
+            rebound="${RELEASE_CONTAINER}.fixture-rebound"
+            /bin/mv "${RELEASE_CONTAINER}" "${rebound}"
+            /bin/mkdir "${RELEASE_CONTAINER}"
+            /bin/mv "${rebound}/${source_leaf}" "${RELEASE_CONTAINER}/${source_leaf}"
+            : >"${RELEASE_CONTAINER}/external-container-sentinel"
             ;;
         *) return 95 ;;
     esac
@@ -176,6 +185,14 @@ EOF
 #!/usr/bin/env bash
 printf '%s\n' "PATH-PERL $*" >>"${SIXBRIDGE_PREPARE_LOG}"
 exit 99
+EOF
+    cat >"${bin}/FixtureLeak.pm" <<'EOF'
+BEGIN {
+    open(my $marker, '>', $ENV{SIXBRIDGE_PERL_STARTUP_MARKER}) or die $!;
+    print {$marker} $ENV{SIXBRIDGE_PERL_STARTUP_SECRET};
+    close $marker or die $!;
+}
+1;
 EOF
     cat >"${bin}/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
@@ -503,6 +520,17 @@ expect_failure native-publish-name-rebind 'atomic no-replace' \
 assert_no_final_directory "${CASE_ROOT}"
 [[ -n "$(find "${CASE_ROOT}/.local/releases" -name external-rebind-sentinel -print)" ]] || \
     fail '외부 name-rebind directory를 cleanup이 삭제했습니다.'
+
+setup_case native-publish-container-rebind
+expect_failure native-publish-container-rebind 'atomic no-replace' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER=container-rebind
+[[ -e "${CASE_ROOT}/.local/releases/external-container-sentinel" ]] || fail '외부 container sentinel이 보존되지 않았습니다.'
+
+setup_case perl-startup-injection
+perl_startup_marker="${CASE_ROOT}/perl-startup-marker"
+run_prepare /usr/bin/env PERL5LIB="${CASE_ROOT}/bin" PERL5OPT='-MFixtureLeak' \
+    SIXBRIDGE_PERL_STARTUP_MARKER="${perl_startup_marker}" SIXBRIDGE_PERL_STARTUP_SECRET="${SECRET_PROBE}"
+[[ ! -e "${perl_startup_marker}" ]] || fail 'worker launcher Perl이 inherited startup module을 실행했습니다.'
 
 setup_case success-one
 run_prepare

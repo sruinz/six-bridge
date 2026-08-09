@@ -28,6 +28,8 @@ PUBLISH_IDENTITY=''
 PUBLISH_HELPER=''
 PUBLISH_HELPER_IDENTITY=''
 PUBLISH_HELPER_SOURCE_IDENTITY=''
+PUBLISH_PERL_PRIVLIB=''
+PUBLISH_PERL_ARCHLIB=''
 RELEASE_TMPDIR=''
 CONTAINER_IDENTITY=''
 LOCK_IDENTITY=''
@@ -103,8 +105,31 @@ release_worker_signal_exit() {
 run_preparation_worker() {
     local status
     set -m
-    /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "worker exec failed\n";' \
-        /usr/bin/env SIXBRIDGE_PREPARE_WORKER=1 "$0" "$@" &
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LANG=C LC_ALL=C \
+        SIXBRIDGE_PREPARE_WORKER=1 \
+        SIXBRIDGE_RELEASE_ROOT="${SIXBRIDGE_RELEASE_ROOT:-}" \
+        SIXBRIDGE_PREPARE_FIXTURE_BIN="${SIXBRIDGE_PREPARE_FIXTURE_BIN:-}" \
+        SIXBRIDGE_PREPARE_LOG="${SIXBRIDGE_PREPARE_LOG:-}" \
+        SIXBRIDGE_PREPARE_SIGNER="${SIXBRIDGE_PREPARE_SIGNER:-}" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD:-}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD:-}" \
+        SIXBRIDGE_PREPARE_VERIFY_FAIL="${SIXBRIDGE_PREPARE_VERIFY_FAIL:-}" \
+        SIXBRIDGE_PREPARE_ANDROID_FAIL="${SIXBRIDGE_PREPARE_ANDROID_FAIL:-}" \
+        SIXBRIDGE_PREPARE_DMG_BUILD_FAIL="${SIXBRIDGE_PREPARE_DMG_BUILD_FAIL:-}" \
+        SIXBRIDGE_PREPARE_APK_VERIFY_FAIL="${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-}" \
+        SIXBRIDGE_PREPARE_JQ_FAIL="${SIXBRIDGE_PREPARE_JQ_FAIL:-}" \
+        SIXBRIDGE_PREPARE_MUTATE_SOURCE="${SIXBRIDGE_PREPARE_MUTATE_SOURCE:-}" \
+        SIXBRIDGE_PREPARE_MUTATE_HEAD="${SIXBRIDGE_PREPARE_MUTATE_HEAD:-}" \
+        SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION="${SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION:-}" \
+        SIXBRIDGE_PREPARE_PUBLISH_BARRIER="${SIXBRIDGE_PREPARE_PUBLISH_BARRIER:-}" \
+        SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER="${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}" \
+        SIXBRIDGE_PREPARE_WAIT_IN_VERIFY="${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-}" \
+        SIXBRIDGE_PREPARE_READY="${SIXBRIDGE_PREPARE_READY:-}" \
+        SIXBRIDGE_PREPARE_CONTINUE="${SIXBRIDGE_PREPARE_CONTINUE:-}" \
+        SIXBRIDGE_PREPARE_CHILD_PID="${SIXBRIDGE_PREPARE_CHILD_PID:-}" \
+        SIXBRIDGE_PREPARE_TMPDIR_RECORD="${SIXBRIDGE_PREPARE_TMPDIR_RECORD:-}" \
+        /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "worker exec failed\n";' \
+        /usr/bin/env "$0" "$@" &
     ACTIVE_CHILD_PID=$!
     ACTIVE_CHILD_PGID=$!
     if wait "${ACTIVE_CHILD_PID}"; then
@@ -325,10 +350,11 @@ create_publish_snapshot() {
 }
 
 compile_atomic_publish_helper() {
-    local source_identity perl
+    local source_identity perl perl_contract
     release_system_executable /usr/bin/env || return 1
     release_darwin_atomic_publish_preflight || return 1
-    perl=$(release_system_perl) || return 1
+    perl_contract=$(release_system_perl) || return 1
+    IFS='|' read -r perl PUBLISH_PERL_PRIVLIB PUBLISH_PERL_ARCHLIB <<<"${perl_contract}"
     release_private_file "${PUBLISH_HELPER_SOURCE}" || return 1
     source_identity=$(release_file_identity "${PUBLISH_HELPER_SOURCE}") || return 1
     release_assert_file_identity "${PUBLISH_HELPER_SOURCE}" "${source_identity}" || return 1
@@ -346,7 +372,7 @@ publish_manifest_identity() {
 }
 
 publish_verified_snapshot() {
-    local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity
+    local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity status source_device source_inode source_size source_fd_identity
     source_leaf=${PUBLISH_DIR##*/}
     final_leaf=${FINAL_DIR##*/}
     [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.0 ]] || {
@@ -360,10 +386,19 @@ publish_verified_snapshot() {
     notes_identity=$(publish_manifest_identity RELEASE-NOTES-KO.md "${PUBLISH_FILE_IDENTITIES}") || return 1
     release_assert_file_identity "${PUBLISH_HELPER}" "${PUBLISH_HELPER_IDENTITY}" || return 1
     release_assert_file_identity "${PUBLISH_HELPER_SOURCE}" "${PUBLISH_HELPER_SOURCE_IDENTITY}" || return 1
+    exec 9<"${PUBLISH_HELPER_SOURCE}" || return 1
+    IFS=: read -r source_device source_inode source_size _ <<<"${PUBLISH_HELPER_SOURCE_IDENTITY}"
+    source_fd_identity=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        /usr/bin/perl -e 'open(my $fh, q{<&=9}) or exit 1; my @s = stat($fh); print "$s[0]:$s[1]:$s[7]\n";') || { exec 9<&-; return 1; }
+    [[ "${source_fd_identity}" = "${source_device}:${source_inode}:${source_size}" ]] || { printf 'publisher source fd identity mismatch\n' >&2; exec 9<&-; return 1; }
     /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR="${RELEASE_TMPDIR}" LANG=C LC_ALL=C \
-        "${PUBLISH_HELPER}" "${PUBLISH_HELPER_SOURCE}" "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" \
-        "${source_leaf}" "${final_leaf}" "${PUBLISH_IDENTITY}" "${apk_identity}" "${dmg_identity}" \
+        SIXBRIDGE_PERL_INC="${PUBLISH_PERL_PRIVLIB}:${PUBLISH_PERL_ARCHLIB}" \
+        "${PUBLISH_HELPER}" -e 'BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); } my $script = shift @ARGV; do $script or die "publisher bootstrap failed\n";' /dev/fd/9 "${RELEASE_CONTAINER}" "${RELEASE_CONTAINER}" \
+        "${source_leaf}" "${final_leaf}" "${PUBLISH_IDENTITY}" "${CONTAINER_IDENTITY}" "${apk_identity}" "${dmg_identity}" \
         "${sums_identity}" "${metadata_identity}" "${notes_identity}"
+    status=$?
+    exec 9<&-
+    return "${status}"
 }
 
 prepare_release_worker() {
