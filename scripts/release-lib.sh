@@ -99,31 +99,6 @@ release_trusted_directory() {
     release_link_count "${path}" >/dev/null
 }
 
-release_homebrew_shared_directory() {
-    local path=${1:-} owner group mode current_owner current_groups
-    release_directory "${path}" || return 1
-    owner=$(release_stat_value '%u' "${path}") || return 1
-    current_owner=$(/usr/bin/id -u) || return 1
-    [[ "${owner}" = "${current_owner}" ]] || {
-        release_fail 'Homebrew shared directory owner가 현재 사용자와 다릅니다.'
-        return 1
-    }
-    mode=$(release_stat_value '%Lp' "${path}") || return 1
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#002)) = 0 ]] || {
-        release_fail 'Homebrew shared directory는 other write를 허용하면 안 됩니다.'
-        return 1
-    }
-    if (( (8#${mode} & 8#020) != 0 )); then
-        group=$(release_stat_value '%g' "${path}") || return 1
-        current_groups=" $(/usr/bin/id -G) " || return 1
-        [[ "${current_groups}" = *" ${group} "* ]] || {
-            release_fail 'Homebrew shared directory group이 현재 사용자의 group이 아닙니다.'
-            return 1
-        }
-    fi
-    release_link_count "${path}" >/dev/null
-}
-
 release_validate_release_container() {
     local container=${1:-} local_root="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/.local"
     local physical_container physical_local relative
@@ -348,34 +323,74 @@ release_android_sdk_root() {
     printf '%s\n' "$(CDPATH= builtin cd -P -- "${root}" && builtin pwd -P)"
 }
 
-release_java_executable() {
-    local raw_output java_home java_path java_version major candidate
-    # This project already standardizes its local Android builds on Homebrew
-    # JDK homes. Do not accept JAVA_HOME/PATH here: caller-controlled runtime
-    # selection would let an SDK launcher execute an unverified JVM.
-    for candidate in \
-        '/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home' \
-        '/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home'; do
-        [[ -d "${candidate}" && ! -L "${candidate}" ]] || continue
-        java_home="$(CDPATH= builtin cd -P -- "${candidate}" && builtin pwd -P)"
-        case "${java_home}" in
-            /opt/homebrew/Cellar/openjdk@17/*/libexec/openjdk.jdk/Contents/Home|/opt/homebrew/Cellar/openjdk/*/libexec/openjdk.jdk/Contents/Home) ;;
-            *) java_home=''; continue ;;
-        esac
-        break
-    done
-    [[ -n "${java_home:-}" ]] || {
+release_resolve_homebrew_java_at() {
+    local prefix=$1 formula=$2 physical_prefix formula_link java_home java_path
+    local relative version formula_directory version_directory directory
+    [[ "${prefix}" = /* && "${formula}" =~ ^[A-Za-z0-9@._+-]+$ ]] || {
+        release_fail 'Homebrew JDK resolver 입력이 올바르지 않습니다.'
+        return 1
+    }
+    release_trusted_directory "${prefix}" || return 1
+    physical_prefix="$(CDPATH= cd -P -- "${prefix}" && pwd -P)" || return 1
+    [[ "${physical_prefix}" = "${prefix}" ]] || {
+        release_fail 'Homebrew JDK prefix canonical 경로가 올바르지 않습니다.'
+        return 1
+    }
+    release_trusted_directory "${physical_prefix}/opt" || return 1
+    release_trusted_directory "${physical_prefix}/Cellar" || return 1
+    formula_link="${physical_prefix}/opt/${formula}"
+    [[ -L "${formula_link}" && -d "${formula_link}" ]] || {
         release_fail '고정된 Homebrew JDK를 찾을 수 없습니다.'
         return 1
     }
-    release_trusted_directory "${java_home}" || return 1
-    release_trusted_directory "${java_home}/bin" || return 1
-    java_path="$(CDPATH= builtin cd -P -- "${java_home}/bin" && builtin pwd -P)/java"
-    release_trusted_executable "${java_path}" || return 1
-    case "${java_path}" in
-        "$(CDPATH= builtin cd -P -- "${java_home}" && builtin pwd -P)"/bin/java) ;;
-        *) release_fail 'JDK executable이 canonical home 밖에 있습니다.'; return 1 ;;
+    java_home="$(CDPATH= cd -P -- "${formula_link}/libexec/openjdk.jdk/Contents/Home" 2>/dev/null && pwd -P)" || {
+        release_fail '고정된 Homebrew JDK를 찾을 수 없습니다.'
+        return 1
+    }
+    case "${java_home}" in
+        "${physical_prefix}/Cellar/${formula}/"*/libexec/openjdk.jdk/Contents/Home) ;;
+        *) release_fail 'JDK canonical 경로가 Homebrew Cellar 밖에 있습니다.'; return 1 ;;
     esac
+    relative=${java_home#"${physical_prefix}/Cellar/${formula}/"}
+    version=${relative%%/*}
+    [[ -n "${version}" && "${relative}" = "${version}/libexec/openjdk.jdk/Contents/Home" ]] || {
+        release_fail 'JDK canonical 경로 구조가 올바르지 않습니다.'
+        return 1
+    }
+    formula_directory="${physical_prefix}/Cellar/${formula}"
+    version_directory="${formula_directory}/${version}"
+    for directory in \
+        "${formula_directory}" \
+        "${version_directory}" \
+        "${version_directory}/libexec" \
+        "${version_directory}/libexec/openjdk.jdk" \
+        "${version_directory}/libexec/openjdk.jdk/Contents" \
+        "${java_home}" \
+        "${java_home}/bin"; do
+        release_trusted_directory "${directory}" || return 1
+    done
+    java_path="${java_home}/bin/java"
+    release_trusted_executable "${java_path}" || return 1
+    printf '%s\n' "${java_path}"
+}
+
+release_java_executable() {
+    local raw_output java_path java_version major formula
+    # This project already standardizes its local Android builds on Homebrew
+    # JDK homes. Do not accept JAVA_HOME/PATH here: caller-controlled runtime
+    # selection would let an SDK launcher execute an unverified JVM.
+    release_trusted_directory /opt/homebrew || return 1
+    release_trusted_directory /opt/homebrew/opt || return 1
+    release_trusted_directory /opt/homebrew/Cellar || return 1
+    for formula in openjdk@17 openjdk; do
+        [[ -L "/opt/homebrew/opt/${formula}" && -d "/opt/homebrew/opt/${formula}" ]] || continue
+        java_path=$(release_resolve_homebrew_java_at /opt/homebrew "${formula}") || return 1
+        break
+    done
+    [[ -n "${java_path:-}" ]] || {
+        release_fail '고정된 Homebrew JDK를 찾을 수 없습니다.'
+        return 1
+    }
     if ! raw_output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" LANG=C LC_ALL=C "${java_path}" -version 2>&1); then
         release_fail 'JDK version을 확인하지 못했습니다.'
         return 1
@@ -402,11 +417,8 @@ release_resolve_homebrew_tool_at() {
         release_fail 'Homebrew prefix canonical 경로가 올바르지 않습니다.'
         return 1
     }
-    # Homebrew's shared opt/Cellar parents are 0775 on a standard multi-admin
-    # installation. Accept only that owner-controlled shape; resolved formula,
-    # version, bin, and executable paths remain subject to the stricter checks.
-    release_homebrew_shared_directory "${physical_prefix}/opt" || return 1
-    release_homebrew_shared_directory "${physical_prefix}/Cellar" || return 1
+    release_trusted_directory "${physical_prefix}/opt" || return 1
+    release_trusted_directory "${physical_prefix}/Cellar" || return 1
     formula_link="${physical_prefix}/opt/${formula}"
     [[ -L "${formula_link}" && -d "${formula_link}" ]] || {
         release_fail "고정된 ${binary} 도구를 찾을 수 없습니다. Homebrew ${formula}를 설치하세요."

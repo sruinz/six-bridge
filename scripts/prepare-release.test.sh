@@ -17,6 +17,17 @@ fail() {
     exit 1
 }
 
+if /usr/bin/perl -0777 -e '
+    my $source = <>;
+    exit($source =~ m{/usr/bin/env(?:[^\n]*\\\n){0,12}[^\n]*SIXBRIDGE_ANDROID_RELEASE_(?:STORE|KEY)_PASSWORD=} ? 0 : 1);
+' "${PREPARE_SCRIPT}"; then
+    fail 'external /usr/bin/env argv에 Android release 비밀번호 assignment가 남아 있습니다.'
+fi
+
+if /usr/bin/grep -q 'SIXBRIDGE_PREPARE_SANITIZER_\(READY\|CONTINUE\)' "${PREPARE_SCRIPT}"; then
+    fail 'sanitizer 이전에 caller가 지정한 READY/CONTINUE 파일을 사용하는 경계가 남아 있습니다.'
+fi
+
 assert_contains() {
     local file=$1 expected=$2 message=$3
     grep -Fq -- "${expected}" "${file}" || {
@@ -65,6 +76,25 @@ assert_call_count() {
     [[ "${count}" = 1 ]] || fail "호출 횟수가 기대와 다릅니다 (${expected}): ${count}"
 }
 
+descendant_commands() {
+    local root_pid=$1 queue pid child commands=''
+    queue=${root_pid}
+    while [[ -n "${queue}" ]]; do
+        pid=${queue%% *}
+        if [[ "${queue}" = *' '* ]]; then
+            queue=${queue#* }
+        else
+            queue=''
+        fi
+        while IFS= read -r child; do
+            [[ -n "${child}" ]] || continue
+            commands+="$(/bin/ps -o command= -p "${child}")"$'\n'
+            queue="${queue:+${queue} }${child}"
+        done < <(/usr/bin/pgrep -P "${pid}" 2>/dev/null || true)
+    done
+    printf '%s' "${commands}"
+}
+
 run_homebrew_resolver() {
     local prefix=$1 formula=$2 binary=$3
     /bin/bash -c '
@@ -72,6 +102,15 @@ run_homebrew_resolver() {
         source "$1"
         release_resolve_homebrew_tool_at "$2" "$3" "$4"
     ' resolver "${ROOT_DIR}/scripts/release-lib.sh" "${prefix}" "${formula}" "${binary}"
+}
+
+run_homebrew_java_resolver() {
+    local prefix=$1 formula=$2
+    /bin/bash -c '
+        set -euo pipefail
+        source "$1"
+        release_resolve_homebrew_java_at "$2" "$3"
+    ' resolver "${ROOT_DIR}/scripts/release-lib.sh" "${prefix}" "${formula}"
 }
 
 copy_fixture_library() {
@@ -285,7 +324,10 @@ EOF
     cat >"${bin}/apksigner" <<'EOF'
 #!/usr/bin/env bash
 [[ "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-0}" != 1 ]] || exit 62
-if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = 1 ]]; then
+    if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = argv ]]; then
+      : >"${SIXBRIDGE_PREPARE_READY}"
+      while [[ ! -e "${SIXBRIDGE_PREPARE_CONTINUE}" ]]; do /bin/sleep 0.05; done
+    elif [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = 1 ]]; then
   printf '%s\n' "${TMPDIR}" >"${SIXBRIDGE_PREPARE_TMPDIR_RECORD}"
   : >"${TMPDIR}/sixbridge-release-fixture-child-temp"
   /bin/sleep 600 &
@@ -349,7 +391,8 @@ expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRI
 [[ "${GRADLE_USER_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/.local/gradle-home" ]]
 [[ "${HOME}" = /var/empty ]]
 [[ "$(/usr/bin/stat -f '%Lp' "${GRADLE_USER_HOME}")" = 700 ]]
-[[ -w "${GRADLE_USER_HOME}" && -x "${GRADLE_USER_HOME}" ]]
+[[ -r "${GRADLE_USER_HOME}" && -w "${GRADLE_USER_HOME}" && -x "${GRADLE_USER_HOME}" ]]
+[[ -z "${SIXBRIDGE_PREPARE_UNTRUSTED_SECRET+x}" ]]
 for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
   [[ -z "${!poisoned+x}" ]]
 done
@@ -460,9 +503,33 @@ printf '%s\n' key-material >"${TEMPLATE_KEYSTORE}"
 chmod 600 "${TEMPLATE_KEYSTORE}"
 readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
+set +e
+(
+    export SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}"
+    export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
+    exec "${PREPARE_SCRIPT}" 9.9.9
+) >"${FIXTURE_ROOT}/preflight-invalid-version.log" 2>&1
+preflight_status=$?
+set -e
+[[ "${preflight_status}" -ne 0 ]] || fail '실제 runtime 전 invalid version preflight가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/preflight-invalid-version.log" '지원하지 않는 release version' \
+    'invalid version이 실제 runtime prerequisite보다 먼저 거부되지 않았습니다.'
+
+set +e
+(
+    unset SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD
+    export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
+    exec "${PREPARE_SCRIPT}" 0.1.0
+) >"${FIXTURE_ROOT}/preflight-missing-credential.log" 2>&1
+preflight_status=$?
+set -e
+[[ "${preflight_status}" -ne 0 ]] || fail '실제 runtime 전 missing credential preflight가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/preflight-missing-credential.log" 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
+    'missing credential이 실제 runtime prerequisite보다 먼저 거부되지 않았습니다.'
+
 resolver_root="${FIXTURE_ROOT}/resolver-canonical"
 mkdir -p "${resolver_root}/opt" "${resolver_root}/Cellar/node/25.1.0/bin"
-chmod 775 "${resolver_root}/opt" "${resolver_root}/Cellar"
+chmod 755 "${resolver_root}/opt" "${resolver_root}/Cellar"
 cat >"${resolver_root}/Cellar/node/25.1.0/bin/node" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -480,15 +547,25 @@ set -e
 [[ "${resolver_output}" = "${resolver_root}/Cellar/node/25.1.0/bin/node" ]] || \
     fail "canonical Homebrew resolver 결과가 다릅니다: ${resolver_output}"
 
+chmod 775 "${resolver_root}/opt"
+set +e
+run_homebrew_resolver "${resolver_root}" node node >"${FIXTURE_ROOT}/resolver-group-writable.out" 2>&1
+resolver_status=$?
+set -e
+[[ "${resolver_status}" -ne 0 ]] || fail 'group-writable Homebrew resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/resolver-group-writable.out" 'group/other write' \
+    'group-writable Homebrew resolver의 명확한 거부 사유가 없습니다.'
+chmod 755 "${resolver_root}/opt"
+
 chmod 777 "${resolver_root}/opt"
 set +e
 run_homebrew_resolver "${resolver_root}" node node >"${FIXTURE_ROOT}/resolver-other-writable.out" 2>&1
 resolver_status=$?
 set -e
 [[ "${resolver_status}" -ne 0 ]] || fail 'other-writable Homebrew resolver가 성공했습니다.'
-assert_contains "${FIXTURE_ROOT}/resolver-other-writable.out" 'other write' \
+assert_contains "${FIXTURE_ROOT}/resolver-other-writable.out" 'group/other write' \
     'other-writable Homebrew resolver의 거부 사유가 없습니다.'
-chmod 775 "${resolver_root}/opt"
+chmod 755 "${resolver_root}/opt"
 
 resolver_external="${FIXTURE_ROOT}/resolver-external"
 resolver_external_target="${FIXTURE_ROOT}/resolver-external-target"
@@ -524,6 +601,102 @@ set -e
 assert_contains "${FIXTURE_ROOT}/resolver-missing.out" '고정된 rg 도구를 찾을 수 없습니다.' \
     '누락된 Homebrew rg prerequisite의 한글 거부 사유가 없습니다.'
 
+jdk_resolver_root="${FIXTURE_ROOT}/jdk-resolver-canonical"
+mkdir -p "${jdk_resolver_root}/opt" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home/bin"
+chmod 755 "${jdk_resolver_root}/opt" "${jdk_resolver_root}/Cellar" \
+    "${jdk_resolver_root}/Cellar/openjdk@17" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home" \
+    "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home/bin"
+cat >"${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home/bin/java" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod 700 "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home/bin/java"
+ln -s ../Cellar/openjdk@17/17.0.12 "${jdk_resolver_root}/opt/openjdk@17"
+jdk_resolver_output=$(run_homebrew_java_resolver "${jdk_resolver_root}" openjdk@17) || \
+    fail 'canonical Homebrew JDK resolver가 실패했습니다.'
+[[ "${jdk_resolver_output}" = "${jdk_resolver_root}/Cellar/openjdk@17/17.0.12/libexec/openjdk.jdk/Contents/Home/bin/java" ]] || \
+    fail "canonical Homebrew JDK resolver 결과가 다릅니다: ${jdk_resolver_output}"
+
+chmod 775 "${jdk_resolver_root}/opt"
+set +e
+run_homebrew_java_resolver "${jdk_resolver_root}" openjdk@17 >"${FIXTURE_ROOT}/jdk-resolver-opt-group-writable.out" 2>&1
+jdk_resolver_status=$?
+set -e
+[[ "${jdk_resolver_status}" -ne 0 ]] || fail 'group-writable Homebrew JDK opt resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/jdk-resolver-opt-group-writable.out" 'group/other write' \
+    'group-writable Homebrew JDK opt resolver의 명확한 거부 사유가 없습니다.'
+chmod 755 "${jdk_resolver_root}/opt"
+
+chmod 775 "${jdk_resolver_root}/Cellar"
+set +e
+run_homebrew_java_resolver "${jdk_resolver_root}" openjdk@17 >"${FIXTURE_ROOT}/jdk-resolver-cellar-group-writable.out" 2>&1
+jdk_resolver_status=$?
+set -e
+[[ "${jdk_resolver_status}" -ne 0 ]] || fail 'group-writable Homebrew JDK Cellar resolver가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/jdk-resolver-cellar-group-writable.out" 'group/other write' \
+    'group-writable Homebrew JDK Cellar resolver의 명확한 거부 사유가 없습니다.'
+chmod 755 "${jdk_resolver_root}/Cellar"
+
+setup_case entrypoint-path-bash
+entrypoint_path_marker="${CASE_ROOT}/entrypoint-path-bash-marker"
+cat >"${CASE_ROOT}/bin/bash" <<EOF
+#!/bin/bash
+: >"${entrypoint_path_marker}"
+exec /bin/bash "\$@"
+EOF
+chmod +x "${CASE_ROOT}/bin/bash"
+set +e
+/usr/bin/env -i PATH="${CASE_ROOT}/bin:/usr/bin:/bin" HOME=/var/empty LANG=C LC_ALL=C \
+    SIXBRIDGE_PREPARE_WORKER=1 \
+    "${PREPARE_SCRIPT}" 9.9.9 >"${FIXTURE_ROOT}/entrypoint-path-bash.log" 2>&1
+entrypoint_status=$?
+set -e
+[[ "${entrypoint_status}" -ne 0 ]] || fail 'entrypoint PATH poison fixture가 성공했습니다.'
+[[ ! -e "${entrypoint_path_marker}" ]] || fail 'entrypoint가 PATH의 bash shim을 실행했습니다.'
+assert_contains "${FIXTURE_ROOT}/entrypoint-path-bash.log" '지원하지 않는 release version' \
+    'entrypoint PATH poison fixture가 worker의 version 검증까지 도달하지 못했습니다.'
+
+setup_case entrypoint-shell-startup
+entrypoint_bash_env_marker="${CASE_ROOT}/entrypoint-bash-env-marker"
+entrypoint_env_marker="${CASE_ROOT}/entrypoint-env-marker"
+entrypoint_function_marker="${CASE_ROOT}/entrypoint-function-marker"
+entrypoint_shellopts_marker="${CASE_ROOT}/entrypoint-shellopts-marker"
+printf ': >%q\n' "${entrypoint_bash_env_marker}" >"${CASE_ROOT}/poison-bash-env.sh"
+printf ': >%q\n' "${entrypoint_env_marker}" >"${CASE_ROOT}/poison-env.sh"
+set +e
+/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LANG=C LC_ALL=C \
+    BASH_ENV="${CASE_ROOT}/poison-bash-env.sh" ENV="${CASE_ROOT}/poison-env.sh" \
+    SHELLOPTS=xtrace PS4='+$(: >"${SIXBRIDGE_ENTRYPOINT_SHELLOPTS_MARKER}") ' \
+    SIXBRIDGE_ENTRYPOINT_FUNCTION_MARKER="${entrypoint_function_marker}" \
+    SIXBRIDGE_ENTRYPOINT_SHELLOPTS_MARKER="${entrypoint_shellopts_marker}" \
+    'BASH_FUNC_dirname%%=() { : > "$SIXBRIDGE_ENTRYPOINT_FUNCTION_MARKER"; /usr/bin/dirname "$@"; }' \
+    SIXBRIDGE_PREPARE_WORKER=1 \
+    "${PREPARE_SCRIPT}" 9.9.9 >"${FIXTURE_ROOT}/entrypoint-shell-startup.log" 2>&1
+entrypoint_status=$?
+set -e
+[[ "${entrypoint_status}" -ne 0 ]] || fail 'entrypoint shell startup poison fixture가 성공했습니다.'
+[[ ! -e "${entrypoint_bash_env_marker}" ]] || fail 'entrypoint가 inherited BASH_ENV를 실행했습니다.'
+[[ ! -e "${entrypoint_env_marker}" ]] || fail 'entrypoint가 inherited ENV를 실행했습니다.'
+[[ ! -e "${entrypoint_function_marker}" ]] || fail 'entrypoint가 exported dirname function을 실행했습니다.'
+[[ ! -e "${entrypoint_shellopts_marker}" ]] || fail 'entrypoint가 inherited SHELLOPTS/xtrace를 실행했습니다.'
+assert_contains "${FIXTURE_ROOT}/entrypoint-shell-startup.log" '지원하지 않는 release version' \
+    'entrypoint shell startup poison fixture가 worker의 version 검증까지 도달하지 못했습니다.'
+
+setup_case entrypoint-shebang-bypass
+set +e
+/bin/bash "${PREPARE_SCRIPT}" 9.9.9 >"${FIXTURE_ROOT}/entrypoint-shebang-bypass.log" 2>&1
+entrypoint_status=$?
+set -e
+[[ "${entrypoint_status}" -ne 0 ]] || fail 'privileged shebang 우회 fixture가 성공했습니다.'
+assert_contains "${FIXTURE_ROOT}/entrypoint-shebang-bypass.log" 'privileged Bash' \
+    '직접 /bin/bash 호출의 명확한 entrypoint 거부 사유가 없습니다.'
+
 setup_case invalid-version
 expect_failure invalid-version '지원하지 않는 release version' \
     /usr/bin/env PATH="${CASE_ROOT}/bin:${PATH}" SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
@@ -531,6 +704,8 @@ expect_failure invalid-version '지원하지 않는 release version' \
         SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
         "${PREPARE_SCRIPT}" 9.9.9
+[[ ! -s "${CASE_LOG}" ]] || fail 'invalid version preflight 전에 runtime/build 도구가 실행되었습니다.'
+[[ ! -e "${CASE_ROOT}/.local/gradle-home" ]] || fail 'invalid version preflight 전에 GRADLE_USER_HOME이 생성되었습니다.'
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case missing-key
@@ -583,7 +758,89 @@ assert_no_final_directory "${CASE_ROOT}"
 setup_case gradle-home-nonwritable
 mkdir -p "${CASE_ROOT}/.local/gradle-home"
 chmod 500 "${CASE_ROOT}/.local/gradle-home"
-expect_failure gradle-home-nonwritable 'write 가능한 private directory' run_prepare
+expect_failure gradle-home-nonwritable '정확히 0700' run_prepare
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case gradle-home-no-read
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 300 "${CASE_ROOT}/.local/gradle-home"
+expect_failure gradle-home-no-read '정확히 0700' run_prepare
+chmod 700 "${CASE_ROOT}/.local/gradle-home"
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case sanitized-worker-argv
+sanitizer_ready="${CASE_ROOT}/.local/sanitizer-ready"
+sanitizer_continue="${CASE_ROOT}/.local/sanitizer-continue"
+sanitizer_log="${FIXTURE_ROOT}/sanitized-worker-argv.log"
+(
+    cd "${CASE_ROOT}"
+    export PATH="${CASE_ROOT}/bin:${PATH}"
+    export SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}"
+    export SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin"
+    export SIXBRIDGE_PREPARE_LOG="${CASE_LOG}"
+    export SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}"
+    export SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}"
+    export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
+    export SIXBRIDGE_PREPARE_WORKER=1
+    export SIXBRIDGE_PREPARE_UNTRUSTED_SECRET="${SECRET_PROBE}"
+    export SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=argv
+    export SIXBRIDGE_PREPARE_READY="${sanitizer_ready}"
+    export SIXBRIDGE_PREPARE_CONTINUE="${sanitizer_continue}"
+    exec "${PREPARE_SCRIPT}" 0.1.0
+) >"${sanitizer_log}" 2>&1 &
+sanitizer_parent_pid=$!
+for _ in $(seq 1 100); do [[ -e "${sanitizer_ready}" ]] && break; /bin/sleep 0.05; done
+[[ -e "${sanitizer_ready}" ]] || {
+    kill -TERM "${sanitizer_parent_pid}" 2>/dev/null || true
+    wait "${sanitizer_parent_pid}" 2>/dev/null || true
+    cat "${sanitizer_log}" >&2
+    fail 'sanitized worker가 argv 검사 barrier에 도달하지 못했습니다.'
+}
+sanitizer_commands=$(descendant_commands "${sanitizer_parent_pid}")
+[[ "${sanitizer_commands}" != *"${RELEASE_PASSWORD}"* ]] || {
+    printf '%s\n' "${sanitizer_commands}" >&2
+    fail 'worker child argv에 실제 Android release 비밀번호가 노출되었습니다.'
+}
+[[ "${sanitizer_commands}" != *"${SECRET_PROBE}"* ]] || {
+    printf '%s\n' "${sanitizer_commands}" >&2
+    fail 'worker child argv에 secret probe가 노출되었습니다.'
+}
+: >"${sanitizer_continue}"
+if ! wait "${sanitizer_parent_pid}"; then
+    cat "${sanitizer_log}" >&2
+    fail 'argv 검사 뒤 sanitized worker가 정상 release를 완료하지 못했습니다.'
+fi
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
+assert_log_has_no_secret "${sanitizer_log}"
+
+setup_case internal-worker-no-bootstrap
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 700 "${CASE_ROOT}/.local/gradle-home"
+internal_runtime_path="/usr/bin:/bin:${CASE_ROOT}/runtime/node/bin:${CASE_ROOT}/runtime/rg/bin"
+expect_failure internal-worker-no-bootstrap 'sanitized worker bootstrap' \
+    /usr/bin/env -i PATH="${internal_runtime_path}" \
+        JAVA_HOME="${CASE_ROOT}/runtime/jdk" \
+        GRADLE_USER_HOME="${CASE_ROOT}/.local/gradle-home" \
+        HOME=/var/empty LANG=C LC_ALL=C \
+        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" \
+        SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
+        SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${PREPARE_SCRIPT}" --sixbridge-internal-worker 0.1.0
+assert_no_final_directory "${CASE_ROOT}"
+
+setup_case internal-worker-poison
+mkdir -p "${CASE_ROOT}/.local/gradle-home"
+chmod 700 "${CASE_ROOT}/.local/gradle-home"
+expect_failure internal-worker-poison 'sanitized worker' \
+    /usr/bin/env -i PATH=/caller/poison HOME=/var/empty LANG=C LC_ALL=C \
+        JAVA_HOME=/caller/poison-jdk GRADLE_USER_HOME="${CASE_ROOT}/.local/gradle-home" \
+        SIXBRIDGE_RELEASE_ROOT="${CASE_ROOT}" \
+        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
+        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
+        "${PREPARE_SCRIPT}" --sixbridge-internal-worker 0.1.0
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case runtime-node-resolution-mismatch
@@ -603,6 +860,8 @@ expect_failure missing-credential 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
         "${PREPARE_SCRIPT}" 0.1.0
+[[ ! -s "${CASE_LOG}" ]] || fail 'missing credential preflight 전에 runtime/build 도구가 실행되었습니다.'
+[[ ! -e "${CASE_ROOT}/.local/gradle-home" ]] || fail 'missing credential preflight 전에 GRADLE_USER_HOME이 생성되었습니다.'
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case existing-directory

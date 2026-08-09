@@ -1,7 +1,21 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+
+case $- in
+    *p*) ;;
+    *) printf 'release 검증 실패: prepare-release.sh는 privileged Bash direct-exec로 실행해야 합니다.\n' >&2; exit 1 ;;
+esac
+[[ "${BASH:-}" = /bin/bash ]] || {
+    printf 'release 검증 실패: prepare-release.sh의 Bash interpreter가 올바르지 않습니다.\n' >&2
+    exit 1
+}
+ENTRY_INHERITED_PATH=${PATH:-}
+PATH=/usr/bin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE
+export -n BASHOPTS SHELLOPTS
 set -euo pipefail
 
-ROOT_INPUT="${SIXBRIDGE_RELEASE_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)}"
+ROOT_INPUT="${SIXBRIDGE_RELEASE_ROOT:-$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)}"
 [[ -d "${ROOT_INPUT}" && ! -L "${ROOT_INPUT}" ]] || {
     printf 'release 검증 실패: release root는 symbolic link가 아닌 directory여야 합니다.\n' >&2
     exit 1
@@ -103,8 +117,10 @@ release_worker_signal_exit() {
 }
 
 run_preparation_worker() {
-    local status java_path java_home node_path rg_path gradle_home local_root physical_local
-    local runtime_path resolved_node resolved_rg
+    local status java_path java_home node_path rg_path gradle_home gradle_mode local_root physical_local
+    local runtime_path resolved_node resolved_rg sanitizer_script perl_sanitizer
+    release_require_version "${1:-}" || return 1
+    require_android_credentials || return 1
     java_path=$(release_java_executable) || return 1
     java_home=${java_path%/bin/java}
     node_path=$(release_node_executable) || return 1
@@ -123,9 +139,14 @@ run_preparation_worker() {
         (umask 077; /bin/mkdir -- "${gradle_home}") || return 1
     fi
     release_private_directory "${gradle_home}" || return 1
+    gradle_mode=$(release_stat_value '%Lp' "${gradle_home}") || return 1
+    [[ "${gradle_mode}" = 700 ]] || {
+        release_fail 'GRADLE_USER_HOME mode는 정확히 0700이어야 합니다.'
+        return 1
+    }
     [[ "$(CDPATH= cd -P -- "${gradle_home}" && pwd -P)" = "${ROOT_DIR}/.local/gradle-home" ]] || { release_fail 'GRADLE_USER_HOME containment가 올바르지 않습니다.'; return 1; }
-    [[ -w "${gradle_home}" && -x "${gradle_home}" ]] || {
-        release_fail 'GRADLE_USER_HOME은 write 가능한 private directory여야 합니다.'
+    [[ -r "${gradle_home}" && -w "${gradle_home}" && -x "${gradle_home}" ]] || {
+        release_fail 'GRADLE_USER_HOME은 read/write/search 가능한 private directory여야 합니다.'
         return 1
     }
     runtime_path="/usr/bin:/bin:$(/usr/bin/dirname -- "${node_path}"):$(/usr/bin/dirname -- "${rg_path}")"
@@ -147,32 +168,87 @@ run_preparation_worker() {
         release_fail 'sanitized PATH의 rg가 검증된 canonical 도구와 다릅니다.'
         return 1
     }
+    sanitizer_script='
+set -euo pipefail
+perl_sanitizer=$1
+target=$2
+runtime_path=$3
+java_home=$4
+gradle_home=$5
+shift 5
+values=(
+    "${runtime_path}"
+    "${java_home}"
+    "${gradle_home}"
+    /var/empty
+    C
+    C
+    "${SIXBRIDGE_RELEASE_ROOT:-}"
+    "${SIXBRIDGE_PREPARE_FIXTURE_BIN:-}"
+    "${SIXBRIDGE_PREPARE_LOG:-}"
+    "${SIXBRIDGE_PREPARE_SIGNER:-}"
+    "${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD:-}"
+    "${SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD:-}"
+    "${SIXBRIDGE_PREPARE_VERIFY_FAIL:-}"
+    "${SIXBRIDGE_PREPARE_ANDROID_FAIL:-}"
+    "${SIXBRIDGE_PREPARE_DMG_BUILD_FAIL:-}"
+    "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-}"
+    "${SIXBRIDGE_PREPARE_JQ_FAIL:-}"
+    "${SIXBRIDGE_PREPARE_MUTATE_SOURCE:-}"
+    "${SIXBRIDGE_PREPARE_MUTATE_HEAD:-}"
+    "${SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION:-}"
+    "${SIXBRIDGE_PREPARE_PUBLISH_BARRIER:-}"
+    "${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}"
+    "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-}"
+    "${SIXBRIDGE_PREPARE_READY:-}"
+    "${SIXBRIDGE_PREPARE_CONTINUE:-}"
+    "${SIXBRIDGE_PREPARE_CHILD_PID:-}"
+    "${SIXBRIDGE_PREPARE_TMPDIR_RECORD:-}"
+)
+exec 8< <(printf "%s\0" sixbridge-sanitized-worker-v1)
+exec 9< <(
+    for ((index = 0; index < ${#values[@]}; index++)); do
+        printf "%s\0" "${values[index]}"
+    done
+)
+exec -c /usr/bin/perl -e "${perl_sanitizer}" "${target}" --sixbridge-internal-worker "$@"
+'
+    perl_sanitizer='
+use strict;
+use warnings;
+my @names = qw(
+    PATH JAVA_HOME GRADLE_USER_HOME HOME LANG LC_ALL SIXBRIDGE_RELEASE_ROOT
+    SIXBRIDGE_PREPARE_FIXTURE_BIN SIXBRIDGE_PREPARE_LOG SIXBRIDGE_PREPARE_SIGNER
+    SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD
+    SIXBRIDGE_PREPARE_VERIFY_FAIL SIXBRIDGE_PREPARE_ANDROID_FAIL
+    SIXBRIDGE_PREPARE_DMG_BUILD_FAIL SIXBRIDGE_PREPARE_APK_VERIFY_FAIL
+    SIXBRIDGE_PREPARE_JQ_FAIL SIXBRIDGE_PREPARE_MUTATE_SOURCE
+    SIXBRIDGE_PREPARE_MUTATE_HEAD SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION
+    SIXBRIDGE_PREPARE_PUBLISH_BARRIER SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER
+    SIXBRIDGE_PREPARE_WAIT_IN_VERIFY SIXBRIDGE_PREPARE_READY
+    SIXBRIDGE_PREPARE_CONTINUE SIXBRIDGE_PREPARE_CHILD_PID
+    SIXBRIDGE_PREPARE_TMPDIR_RECORD
+);
+open(my $values_fh, q{<&=9}) or die q{worker environment fd open failed\n};
+binmode($values_fh);
+local $/;
+my $payload = <$values_fh>;
+defined($payload) or die q{worker environment fd read failed\n};
+close($values_fh) or die q{worker environment fd close failed\n};
+my @values = split(/\0/, $payload, -1);
+pop(@values) if @values && $values[-1] eq q{};
+@values == @names or die q{worker environment field count failed\n};
+%ENV = ();
+@ENV{@names} = @values;
+$SIG{HUP} = q{DEFAULT};
+$SIG{INT} = q{DEFAULT};
+$SIG{TERM} = q{DEFAULT};
+my ($target, @args) = @ARGV;
+exec {$target} $target, @args or die q{worker exec failed\n};
+'
     set -m
-    /usr/bin/env -i PATH="${runtime_path}" JAVA_HOME="${java_home}" GRADLE_USER_HOME="${gradle_home}" HOME=/var/empty LANG=C LC_ALL=C \
-        SIXBRIDGE_PREPARE_WORKER=1 \
-        SIXBRIDGE_RELEASE_ROOT="${SIXBRIDGE_RELEASE_ROOT:-}" \
-        SIXBRIDGE_PREPARE_FIXTURE_BIN="${SIXBRIDGE_PREPARE_FIXTURE_BIN:-}" \
-        SIXBRIDGE_PREPARE_LOG="${SIXBRIDGE_PREPARE_LOG:-}" \
-        SIXBRIDGE_PREPARE_SIGNER="${SIXBRIDGE_PREPARE_SIGNER:-}" \
-        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD:-}" \
-        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD:-}" \
-        SIXBRIDGE_PREPARE_VERIFY_FAIL="${SIXBRIDGE_PREPARE_VERIFY_FAIL:-}" \
-        SIXBRIDGE_PREPARE_ANDROID_FAIL="${SIXBRIDGE_PREPARE_ANDROID_FAIL:-}" \
-        SIXBRIDGE_PREPARE_DMG_BUILD_FAIL="${SIXBRIDGE_PREPARE_DMG_BUILD_FAIL:-}" \
-        SIXBRIDGE_PREPARE_APK_VERIFY_FAIL="${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-}" \
-        SIXBRIDGE_PREPARE_JQ_FAIL="${SIXBRIDGE_PREPARE_JQ_FAIL:-}" \
-        SIXBRIDGE_PREPARE_MUTATE_SOURCE="${SIXBRIDGE_PREPARE_MUTATE_SOURCE:-}" \
-        SIXBRIDGE_PREPARE_MUTATE_HEAD="${SIXBRIDGE_PREPARE_MUTATE_HEAD:-}" \
-        SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION="${SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION:-}" \
-        SIXBRIDGE_PREPARE_PUBLISH_BARRIER="${SIXBRIDGE_PREPARE_PUBLISH_BARRIER:-}" \
-        SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER="${SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER:-}" \
-        SIXBRIDGE_PREPARE_WAIT_IN_VERIFY="${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-}" \
-        SIXBRIDGE_PREPARE_READY="${SIXBRIDGE_PREPARE_READY:-}" \
-        SIXBRIDGE_PREPARE_CONTINUE="${SIXBRIDGE_PREPARE_CONTINUE:-}" \
-        SIXBRIDGE_PREPARE_CHILD_PID="${SIXBRIDGE_PREPARE_CHILD_PID:-}" \
-        SIXBRIDGE_PREPARE_TMPDIR_RECORD="${SIXBRIDGE_PREPARE_TMPDIR_RECORD:-}" \
-        /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "worker exec failed\n";' \
-        /usr/bin/env "$0" "$@" &
+    /bin/bash --noprofile --norc -p -c "${sanitizer_script}" sixbridge-sanitizer \
+        "${perl_sanitizer}" "$0" "${runtime_path}" "${java_home}" "${gradle_home}" "$@" &
     ACTIVE_CHILD_PID=$!
     ACTIVE_CHILD_PGID=$!
     if wait "${ACTIVE_CHILD_PID}"; then
@@ -212,6 +288,86 @@ require_android_credentials() {
     }
 }
 
+validate_internal_worker_bootstrap() {
+    local bootstrap extra
+    if ! IFS= read -r -d '' bootstrap 2>/dev/null <&8; then
+        release_fail 'sanitized worker bootstrap fd가 없거나 손상됐습니다.'
+        return 1
+    fi
+    if IFS= read -r -n 1 extra 2>/dev/null <&8; then
+        exec 8<&-
+        release_fail 'sanitized worker bootstrap payload가 올바르지 않습니다.'
+        return 1
+    fi
+    exec 8<&-
+    [[ "${bootstrap}" = sixbridge-sanitized-worker-v1 ]] || {
+        release_fail 'sanitized worker bootstrap payload가 올바르지 않습니다.'
+        return 1
+    }
+}
+
+validate_sanitized_worker_environment() {
+    local name exported_names expected_path java_path node_path rg_path gradle_mode
+    exported_names=$(compgen -e)
+    while IFS= read -r name; do
+        [[ -n "${name}" ]] || continue
+        case "${name}" in
+            PATH|JAVA_HOME|GRADLE_USER_HOME|HOME|LANG|LC_ALL|PWD|SHLVL|_|\
+            SIXBRIDGE_RELEASE_ROOT|SIXBRIDGE_PREPARE_FIXTURE_BIN|SIXBRIDGE_PREPARE_LOG|\
+            SIXBRIDGE_PREPARE_SIGNER|SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD|\
+            SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD|SIXBRIDGE_PREPARE_VERIFY_FAIL|\
+            SIXBRIDGE_PREPARE_ANDROID_FAIL|SIXBRIDGE_PREPARE_DMG_BUILD_FAIL|\
+            SIXBRIDGE_PREPARE_APK_VERIFY_FAIL|SIXBRIDGE_PREPARE_JQ_FAIL|\
+            SIXBRIDGE_PREPARE_MUTATE_SOURCE|SIXBRIDGE_PREPARE_MUTATE_HEAD|\
+            SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION|SIXBRIDGE_PREPARE_PUBLISH_BARRIER|\
+            SIXBRIDGE_PREPARE_NATIVE_PUBLISH_BARRIER|SIXBRIDGE_PREPARE_WAIT_IN_VERIFY|\
+            SIXBRIDGE_PREPARE_READY|SIXBRIDGE_PREPARE_CONTINUE|\
+            SIXBRIDGE_PREPARE_CHILD_PID|SIXBRIDGE_PREPARE_TMPDIR_RECORD) ;;
+            *) release_fail "sanitized worker environment에 허용되지 않은 export가 있습니다: ${name}"; return 1 ;;
+        esac
+    done <<<"${exported_names}"
+    [[ "${HOME:-}" = /var/empty && "${LANG:-}" = C && "${LC_ALL:-}" = C ]] || {
+        release_fail 'sanitized worker locale 또는 HOME이 올바르지 않습니다.'
+        return 1
+    }
+    java_path=$(release_java_executable) || return 1
+    node_path=$(release_node_executable) || return 1
+    rg_path=$(release_ripgrep_executable) || return 1
+    [[ "${JAVA_HOME:-}" = "${java_path%/bin/java}" ]] || {
+        release_fail 'sanitized worker JAVA_HOME이 검증된 canonical JDK와 다릅니다.'
+        return 1
+    }
+    [[ "${GRADLE_USER_HOME:-}" = "${ROOT_DIR}/.local/gradle-home" ]] || {
+        release_fail 'sanitized worker GRADLE_USER_HOME이 canonical 경로와 다릅니다.'
+        return 1
+    }
+    [[ ! -L "${GRADLE_USER_HOME}" ]] || {
+        release_fail 'sanitized worker GRADLE_USER_HOME symbolic link는 허용되지 않습니다.'
+        return 1
+    }
+    release_private_directory "${GRADLE_USER_HOME}" || return 1
+    gradle_mode=$(release_stat_value '%Lp' "${GRADLE_USER_HOME}") || return 1
+    [[ "${gradle_mode}" = 700 && -r "${GRADLE_USER_HOME}" && -w "${GRADLE_USER_HOME}" && -x "${GRADLE_USER_HOME}" ]] || {
+        release_fail 'sanitized worker GRADLE_USER_HOME은 정확한 0700 read/write/search directory여야 합니다.'
+        return 1
+    }
+    expected_path="/usr/bin:/bin:$(/usr/bin/dirname -- "${node_path}"):$(/usr/bin/dirname -- "${rg_path}")"
+    [[ "${ENTRY_INHERITED_PATH}" = "${expected_path}" ]] || {
+        release_fail 'sanitized worker PATH가 검증된 canonical runtime 경로와 다릅니다.'
+        return 1
+    }
+    PATH=${ENTRY_INHERITED_PATH}
+    export PATH
+    [[ "$(/bin/bash --noprofile --norc -p -c 'command -v node')" = "${node_path}" ]] || {
+        release_fail 'sanitized worker node가 검증된 canonical 도구와 다릅니다.'
+        return 1
+    }
+    [[ "$(/bin/bash --noprofile --norc -p -c 'command -v rg')" = "${rg_path}" ]] || {
+        release_fail 'sanitized worker rg가 검증된 canonical 도구와 다릅니다.'
+        return 1
+    }
+}
+
 validate_keystore() {
     local keystore_dir physical_dir expected_dir mode
     release_trusted_directory "${ROOT_DIR}/.local" || return 1
@@ -236,9 +392,7 @@ release_keytool() {
     java_path=$(release_java_executable) || return 1
     keytool_path="${java_path%/java}/keytool"
     release_trusted_executable "${keytool_path}" || return 1
-    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR="${RELEASE_TMPDIR:-/tmp}" LANG=C LC_ALL=C \
-        SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD}" \
-        SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD}" \
+    PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR="${RELEASE_TMPDIR:-/tmp}" LANG=C LC_ALL=C \
         "${keytool_path}" "$@"
 }
 
@@ -585,7 +739,12 @@ PUBLISH_IDENTITY=''
 printf 'v%s release directory를 준비했습니다: %s\n' "${SIXBRIDGE_RELEASE_VERSION}" "${FINAL_DIR}"
 }
 
-if [[ "${SIXBRIDGE_PREPARE_WORKER:-}" = 1 ]]; then
+if [[ "${1:-}" = --sixbridge-internal-worker ]]; then
+    shift
+    release_require_version "${1:-}"
+    require_android_credentials
+    validate_internal_worker_bootstrap
+    validate_sanitized_worker_environment
     set +m
     trap cleanup_stage EXIT
     trap 'release_worker_signal_exit 129' HUP
@@ -595,4 +754,5 @@ if [[ "${SIXBRIDGE_PREPARE_WORKER:-}" = 1 ]]; then
     exit $?
 fi
 
+unset SIXBRIDGE_PREPARE_WORKER
 run_preparation_worker "$@"
