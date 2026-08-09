@@ -33,10 +33,9 @@ create_tools() {
 [[ "${FAKE_APKSIGNER_FAIL:-0}" != 1 ]] || exit 17
 [[ -z "${FAKE_APKSIGNER_REPLACE_PATH:-}" ]] || printf 'replaced' >"${FAKE_APKSIGNER_REPLACE_PATH}"
 if [[ -n "${FAKE_APKSIGNER_SWAP_RESTORE_PATH:-}" ]]; then
-  saved="${FAKE_APKSIGNER_SWAP_RESTORE_PATH}.saved"
-  /bin/mv "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}" "${saved}"
+  saved=$(/bin/cat -- "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}")
   printf 'replaced' >"${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
-  /bin/mv "${saved}" "${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
+  printf '%s' "${saved}" >"${FAKE_APKSIGNER_SWAP_RESTORE_PATH}"
 fi
 if [[ "${FAKE_APKSIGNER_REQUIRE_SNAPSHOT:-0}" = 1 ]]; then
   case "${!#}" in */.sixbridge-release-snapshot.*/artifact) ;; *) exit 29;; esac
@@ -51,7 +50,23 @@ EOF
     /bin/cat >"${FIXTURE_ROOT}/bin/hdiutil" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
- attach) shift; while [[ "$#" -gt 0 ]]; do [[ "$1" = -mountpoint ]] && { mountpoint=$2; shift 2; } || shift; done; /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents"; : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"; [[ "${FAKE_EXTRA_APP:-0}" != 1 ]] || /bin/mkdir -p "${mountpoint}/Injected.app/Contents";;
+ attach)
+   source=${!#}
+   if [[ "${FAKE_HDIUTIL_REQUIRE_SNAPSHOT:-0}" = 1 ]]; then
+     case "${source}" in */.sixbridge-release-snapshot.*/artifact) ;; *) exit 30;; esac
+   fi
+   [[ -z "${FAKE_HDIUTIL_REPLACE_PATH:-}" ]] || printf 'replaced' >"${FAKE_HDIUTIL_REPLACE_PATH}"
+   if [[ -n "${FAKE_HDIUTIL_SWAP_RESTORE_PATH:-}" ]]; then
+     saved=$(/bin/cat -- "${FAKE_HDIUTIL_SWAP_RESTORE_PATH}")
+     printf 'replaced' >"${FAKE_HDIUTIL_SWAP_RESTORE_PATH}"
+     printf '%s' "${saved}" >"${FAKE_HDIUTIL_SWAP_RESTORE_PATH}"
+   fi
+   shift
+   while [[ "$#" -gt 0 ]]; do [[ "$1" = -mountpoint ]] && { mountpoint=$2; shift 2; } || shift; done
+   /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents"
+   : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
+   [[ "${FAKE_EXTRA_APP:-0}" != 1 ]] || /bin/mkdir -p "${mountpoint}/Injected.app/Contents"
+   ;;
  detach) /bin/rm -rf "$2";; *) exit 22;;
 esac
 EOF
@@ -140,6 +155,13 @@ expect_failure external-container '프로젝트 .local' release_validate_stage_r
 
 apk="${stage}/fixture.apk"; dmg="${stage}/fixture.dmg"
 make_file "${apk}" apk; make_file "${dmg}" dmg
+snapshot_check_dir=$(release_create_verification_snapshot "${apk}" "${container}")
+snapshot_check="${snapshot_check_dir}/artifact"
+[[ "$(release_link_count "${apk}")" = 1 && "$(release_link_count "${snapshot_check}")" = 1 ]] || fail 'verification snapshot이 독립 regular file이 아닙니다.'
+printf 'mutated' >"${apk}"
+[[ "$(/bin/cat -- "${snapshot_check}")" = apk ]] || fail 'verification snapshot이 원본 쓰기의 영향을 받습니다.'
+make_file "${apk}" apk
+release_remove_verification_snapshot "${snapshot_check_dir}"
 release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
 export FAKE_APKSIGNER_FAIL=1; expect_failure apk-signature 'APK signature verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_FAIL
 export FAKE_APPLICATION_ID='invalid.package'; expect_failure apk-application-id 'application ID' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_APPLICATION_ID='dev.sixbridge.manager'
@@ -150,13 +172,24 @@ export FAKE_VERSION_CODE=2; expect_failure apk-version-code 'versionCode' releas
 export FAKE_APKSIGNER_REPLACE_PATH="${apk}"; expect_failure apk-race 'artifact changed during verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_REPLACE_PATH
 make_file "${apk}" apk
 export FAKE_APKSIGNER_SWAP_RESTORE_PATH="${apk}" FAKE_APKSIGNER_REQUIRE_SNAPSHOT=1
-expect_failure apk-swap-restore 'stage root changed' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
+for attempt in 1 2 3 4 5 6 7 8; do
+  release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
+done
 unset FAKE_APKSIGNER_SWAP_RESTORE_PATH FAKE_APKSIGNER_REQUIRE_SNAPSHOT
 outside="${FIXTURE_ROOT}/outside.apk"; make_file "${outside}" apk
 expect_failure apk-outside-stage 'stage root 밖' release_verify_apk "${outside}" "${SIGNER}" "${stage}" "${container}"
 
 dmg_work="${container}/mounts"; /bin/mkdir "${dmg_work}"; /bin/chmod 700 "${dmg_work}"
 release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+export FAKE_HDIUTIL_REQUIRE_SNAPSHOT=1 FAKE_HDIUTIL_SWAP_RESTORE_PATH="${dmg}"
+for attempt in 1 2 3 4 5 6 7 8; do
+  release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+done
+unset FAKE_HDIUTIL_REQUIRE_SNAPSHOT FAKE_HDIUTIL_SWAP_RESTORE_PATH
+export FAKE_HDIUTIL_REPLACE_PATH="${dmg}"
+expect_failure dmg-race 'artifact changed during verification' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+unset FAKE_HDIUTIL_REPLACE_PATH
+make_file "${dmg}" dmg
 export FAKE_BUNDLE_ID='invalid.bundle'; expect_failure dmg-bundle-id 'bundle ID' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
 export FAKE_EXTRA_APP=1; expect_failure dmg-extra-app '정확히 하나' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_EXTRA_APP
 export FAKE_PRODUCT_VERSION=9.9.9; expect_failure dmg-product-version 'product version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='0.1.0'

@@ -210,41 +210,32 @@ release_assert_file_identity() {
     [[ "${actual}" = "${expected}" ]] || release_fail 'artifact changed during verification.'
 }
 
-release_snapshot_identity() {
-    local path=$1 device inode size digest
-    release_regular_file "${path}" || return 1
-    device=$(release_stat_value '%d' "${path}") || return 1
-    inode=$(release_stat_value '%i' "${path}") || return 1
-    size=$(release_stat_value '%z' "${path}") || return 1
-    digest=$(release_sha256_unchecked "${path}") || return 1
-    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${size}" "${digest}"
-}
-
-release_assert_snapshot_identity() {
-    local path=$1 expected=$2 actual
-    actual=$(release_snapshot_identity "${path}") || return 1
-    [[ "${actual}" = "${expected}" ]] || release_fail 'artifact changed during verification.'
-}
-
 release_create_verification_snapshot() {
-    local artifact=$1 container=$2 snapshot_dir snapshot snapshot_identity artifact_identity
-    release_validate_release_container "${container}" || return 1
-    artifact_identity=$(release_snapshot_identity "${artifact}") || return 1
-    snapshot_dir=$(/usr/bin/mktemp -d "${container}/.sixbridge-release-snapshot.XXXXXX") || {
+    local artifact=$1 container=$2 snapshot_parent=${3:-$2} snapshot_dir snapshot snapshot_identity artifact_identity artifact_digest snapshot_digest
+    if [[ "${snapshot_parent}" = "${container}" ]]; then
+        release_validate_release_container "${container}" || return 1
+    else
+        release_validate_private_work_directory "${snapshot_parent}" "${container}" || return 1
+    fi
+    artifact_identity=$(release_file_identity "${artifact}") || return 1
+    snapshot_dir=$(/usr/bin/mktemp -d "${snapshot_parent}/.sixbridge-release-snapshot.XXXXXX") || {
         release_fail 'verification snapshot directory를 만들지 못했습니다.'
         return 1
     }
     release_private_directory "${snapshot_dir}" || { /bin/rm -rf "${snapshot_dir}"; return 1; }
     snapshot="${snapshot_dir}/artifact"
-    if ! /bin/ln "${artifact}" "${snapshot}"; then
+    if ! /bin/cp -p "${artifact}" "${snapshot}"; then
         /bin/rm -rf "${snapshot_dir}"
         release_fail 'verification snapshot을 만들지 못했습니다.'
         return 1
     fi
-    snapshot_identity=$(release_snapshot_identity "${snapshot}") || { /bin/rm -rf "${snapshot_dir}"; return 1; }
-    [[ "${snapshot_identity}" = "${artifact_identity}" ]] || {
+    release_assert_file_identity "${artifact}" "${artifact_identity}" || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    snapshot_identity=$(release_file_identity "${snapshot}") || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    artifact_digest=${artifact_identity##*:}
+    snapshot_digest=${snapshot_identity##*:}
+    [[ "${snapshot_digest}" = "${artifact_digest}" ]] || {
         /bin/rm -rf "${snapshot_dir}"
-        release_fail 'verification snapshot identity가 원본과 다릅니다.'
+        release_fail 'verification snapshot 내용이 원본과 다릅니다.'
         return 1
     }
     printf '%s\n' "${snapshot_dir}"
@@ -430,9 +421,9 @@ release_verify_apk() {
     apksigner=$(release_tool apksigner) || return 1
     apkanalyzer=$(release_tool apkanalyzer) || return 1
     artifact_identity=$(release_file_identity "${apk}") || return 1
-    snapshot_identity=$(release_snapshot_identity "${apk}") || return 1
     snapshot_dir=$(release_create_verification_snapshot "${apk}" "${container}") || return 1
     snapshot="${snapshot_dir}/artifact"
+    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
@@ -441,8 +432,8 @@ release_verify_apk() {
         release_fail 'APK signature verification에 실패했습니다.'
         return 1
     fi
-    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     signer_lines=$(printf '%s\n' "${raw_output}" | /usr/bin/awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print $2}')
     [[ "$(printf '%s\n' "${signer_lines}" | /usr/bin/awk 'NF {count += 1} END {print count + 0}')" = 1 ]] || {
@@ -463,8 +454,8 @@ release_verify_apk() {
         release_fail 'APK application ID를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${application_id}" = 'dev.sixbridge.manager' ]] || {
         release_remove_verification_snapshot "${snapshot_dir}"
@@ -476,8 +467,8 @@ release_verify_apk() {
         release_fail 'APK versionName을 읽지 못했습니다.'
         return 1
     fi
-    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${version_name}" = "${SIXBRIDGE_RELEASE_VERSION}" ]] || {
         release_remove_verification_snapshot "${snapshot_dir}"
@@ -489,8 +480,8 @@ release_verify_apk() {
         release_fail 'APK versionCode를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_snapshot_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_snapshot_identity "${apk}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     [[ "${version_code}" = '1' ]] || {
         release_remove_verification_snapshot "${snapshot_dir}"
@@ -511,6 +502,17 @@ release_dmg_detach() {
     /bin/rmdir "${mountpoint}" 2>/dev/null || true
 }
 
+release_dmg_cleanup() {
+    local mountpoint=${1:-} snapshot_dir=${2:-} attached=${3:-0} status=0
+    if [[ "${attached}" = 1 ]]; then
+        release_dmg_detach "${mountpoint}" || status=1
+    else
+        /bin/rmdir "${mountpoint}" 2>/dev/null || true
+    fi
+    release_remove_verification_snapshot "${snapshot_dir}" || status=1
+    return "${status}"
+}
+
 release_dmg_value() {
     local plist=$1 key=$2 raw_output plistbuddy
     plistbuddy=$(release_tool plistbuddy) || return 1
@@ -524,7 +526,7 @@ release_dmg_value() {
 release_verify_dmg() {
     local dmg=${1:-} work_dir=${2:-} stage_root=${3:-} container=${4:-}
     local mountpoint app_path plist raw_output bundle_id product_version native_version minimum_version
-    local hdiutil codesign dmg_identity stage_identity container_identity app_candidate app_count=0
+    local hdiutil codesign dmg_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity app_candidate app_count=0
 
     release_require_artifact_stage "${dmg}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${dmg}" || return 1
@@ -533,24 +535,32 @@ release_verify_dmg() {
     release_tool plistbuddy >/dev/null || return 1
     codesign=$(release_tool codesign) || return 1
     dmg_identity=$(release_file_identity "${dmg}") || return 1
-    stage_identity=$(release_stage_identity "${stage_root}") || return 1
-    container_identity=$(release_container_identity "${container}") || return 1
+    snapshot_dir=$(release_create_verification_snapshot "${dmg}" "${container}" "${work_dir}") || return 1
+    snapshot="${snapshot_dir}/artifact"
+    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
 
     mountpoint=$(/usr/bin/mktemp -d "${work_dir}/sixbridge-dmg.XXXXXX") || {
+        release_remove_verification_snapshot "${snapshot_dir}"
         release_fail 'DMG mount directory를 만들지 못했습니다.'
         return 1
     }
-    if ! raw_output=$("${hdiutil}" attach -readonly -nobrowse -mountpoint "${mountpoint}" "${dmg}" 2>&1); then
-        /bin/rmdir "${mountpoint}" 2>/dev/null || true
+    if ! raw_output=$("${hdiutil}" attach -readonly -nobrowse -mountpoint "${mountpoint}" "${snapshot}" 2>&1); then
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 0 || true
         release_fail 'DMG read-only mount에 실패했습니다.'
         return 1
     fi
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        return 1
+    }
     release_assert_file_identity "${dmg}" "${dmg_identity}" || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
 
@@ -560,71 +570,76 @@ release_verify_dmg() {
         app_count=$((app_count + 1))
     done < <(/usr/bin/find "${mountpoint}" -mindepth 1 -maxdepth 1 -name '*.app' -print0)
     if [[ "${app_count}" != 1 || -L "${app_path}" || ! -d "${app_path}" ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG app bundle이 정확히 하나여야 합니다.'
         return 1
     fi
     plist="${app_path}/Contents/Info.plist"
     if [[ -L "${plist}" || ! -f "${plist}" ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG Info.plist가 없습니다.'
         return 1
     fi
     bundle_id=$(release_dmg_value "${plist}" CFBundleIdentifier) || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     product_version=$(release_dmg_value "${plist}" CFBundleShortVersionString) || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     native_version=$(release_dmg_value "${plist}" CFBundleVersion) || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     minimum_version=$(release_dmg_value "${plist}" LSMinimumSystemVersion) || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     if [[ "${bundle_id}" != 'dev.sixbridge.desktop' ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG bundle ID가 계약과 다릅니다.'
         return 1
     fi
     if [[ "${product_version}" != "${SIXBRIDGE_RELEASE_VERSION}" ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG product version이 계약과 다릅니다.'
         return 1
     fi
     if [[ "${native_version}" != '1.0.0' ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG native package version이 계약과 다릅니다.'
         return 1
     fi
     if [[ "${minimum_version}" != '13.0' ]]; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG minimum macOS version이 계약과 다릅니다.'
         return 1
     fi
     if raw_output=$("${codesign}" -dv --verbose=4 "${app_path}" 2>&1); then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG는 v0.1.0에서 미서명이어야 합니다.'
         return 1
     fi
     if ! printf '%s\n' "${raw_output}" | /usr/bin/grep -Fq 'not signed at all'; then
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'codesign이 미서명 상태를 확인하지 못했습니다.'
         return 1
     fi
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        return 1
+    }
     release_assert_file_identity "${dmg}" "${dmg_identity}" || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || {
-        release_dmg_detach "${mountpoint}" || true
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
-    release_dmg_detach "${mountpoint}"
+    release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || return 1
+    release_assert_file_identity "${dmg}" "${dmg_identity}"
 }
 
 release_file_contains_secret() {
