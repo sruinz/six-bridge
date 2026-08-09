@@ -250,6 +250,7 @@ setup_case no-identity
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.name
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.email
 /bin/rm -- "${CASE_ROOT}/.gitconfig"
+printf '[user]\n\tuseConfigOnly = true\n' >"${CASE_ROOT}/.gitconfig"
 expect_failure no-identity 'Git tagger identity' 'v0.1.0 KEY BACKUP COMPLETE'
 assert_no_remote_tag no-identity
 
