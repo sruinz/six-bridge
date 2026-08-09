@@ -71,7 +71,7 @@ release_private_directory() {
         return 1
     }
     mode=$(release_stat_value '%Lp' "${path}") || return 1
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 077)) = 0 ]] || {
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#077)) = 0 ]] || {
         release_fail 'trusted directory는 group/other 접근을 허용하면 안 됩니다.'
         return 1
     }
@@ -88,7 +88,7 @@ release_trusted_directory() {
         return 1
     }
     mode=$(release_stat_value '%Lp' "${path}") || return 1
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 022)) = 0 ]] || {
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
         release_fail 'trusted directory는 group/other write를 허용하면 안 됩니다.'
         return 1
     }
@@ -382,7 +382,7 @@ release_system_executable() {
         return 1
     }
     mode=$(release_stat_value '%Lp' "${path}") || return 1
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 022)) = 0 ]] || {
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
         release_fail 'system release 도구가 group/other write를 허용합니다.'
         return 1
     }
@@ -391,8 +391,10 @@ release_system_executable() {
         # Apple ships selected sealed-system tools as hardlinks. The exception
         # is deliberately limited to immutable absolute paths used only for
         # discovery/digest work; arbitrary system hardlinks remain rejected.
-        if [[ "${path}" = '/usr/bin/shasum' && "$(/usr/bin/uname -s)" = Darwin && "${links}" = 2 ]]; then
-            return 0
+        if [[ "$(/usr/bin/uname -s)" = Darwin ]]; then
+            case "${path}" in
+                /usr/bin/shasum|/usr/bin/git|/usr/bin/keytool) return 0 ;;
+            esac
         fi
         release_fail 'system release 도구에 hardlink가 포함되어 있습니다.'
         return 1
@@ -409,7 +411,7 @@ release_private_file() {
         return 1
     }
     mode=$(release_stat_value '%Lp' "${path}") || return 1
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 022)) = 0 ]] || {
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && $((8#${mode} & 8#022)) = 0 ]] || {
         release_fail 'trusted file은 group/other write를 허용하면 안 됩니다.'
         return 1
     }
@@ -549,6 +551,9 @@ release_verify_apk() {
     }
     artifact_identity=$(release_file_identity "${apk}") || return 1
     snapshot_dir=$(release_create_verification_snapshot "${apk}" "${container}") || return 1
+    if declare -F release_register_owned_work_directory >/dev/null; then
+        release_register_owned_work_directory "${snapshot_dir}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    fi
     snapshot="${snapshot_dir}/artifact"
     snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
@@ -663,6 +668,9 @@ release_verify_dmg() {
     codesign=$(release_tool codesign) || return 1
     dmg_identity=$(release_file_identity "${dmg}") || return 1
     snapshot_dir=$(release_create_verification_snapshot "${dmg}" "${container}" "${work_dir}") || return 1
+    if declare -F release_register_owned_work_directory >/dev/null; then
+        release_register_owned_work_directory "${snapshot_dir}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    fi
     snapshot="${snapshot_dir}/artifact"
     snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
     stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
@@ -1112,6 +1120,9 @@ release_verify_directory() {
         return 1
     }
     release_private_directory "${work_dir}" || { /bin/rm -rf "${work_dir}"; return 1; }
+    if declare -F release_register_owned_work_directory >/dev/null; then
+        release_register_owned_work_directory "${work_dir}" || { /bin/rm -rf "${work_dir}"; return 1; }
+    fi
     stage_identity=$(release_stage_identity "${directory}") || { /bin/rm -rf "${work_dir}"; return 1; }
     container_identity=$(release_container_identity "${container}") || { /bin/rm -rf "${work_dir}"; return 1; }
     if ! release_verify_dmg "${physical_directory}/${SIXBRIDGE_MACOS_FILE}" "${work_dir}" "${directory}" "${container}"; then
