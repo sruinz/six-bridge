@@ -105,6 +105,217 @@ release_bind_project_root "${ROOT_DIR}" || exit 1
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
 readonly RELEASE_DIRECTORY="${RELEASE_CONTAINER}/v0.1.0"
 readonly RELEASE_TAG='v0.1.0'
+SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER=''
+SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=''
+SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=''
+OWNED_WORK_DIRECTORIES=()
+PUBLISH_ACTIVE_CHILD_PID=''
+PUBLISH_ACTIVE_CHILD_PGID=''
+PUBLISH_DEFERRED_SIGNAL_STATUS=''
+PUBLISH_SIGNAL_EXITING=0
+PUBLISH_TRANSIENT_ROOT=''
+
+stable_directory_identity() {
+    local identity
+    identity=$(release_stage_identity "$1") || return 1
+    printf '%s\n' "${identity%:*}"
+}
+
+remove_owned_directory() {
+    local path=$1 expected=$2
+    [[ -n "${path}" && -n "${expected}" ]] || return 0
+    [[ -e "${path}" || -L "${path}" ]] || return 0
+    release_validate_stage_root "${path}" "${RELEASE_CONTAINER}" || return 1
+    release_atomic_remove_owned_directory "${path}" "${expected}"
+}
+
+release_register_owned_work_directory() {
+    local path=$1 expected=${2:-} identity
+    release_validate_stage_root "${path}" "${RELEASE_CONTAINER}" || return 1
+    identity=$(release_owned_directory_identity "${path}") || return 1
+    [[ -z "${expected}" || "${identity}" = "${expected}" ]] || {
+        release_fail 'owned work directory identity가 등록 전에 변경되었습니다.'
+        return 1
+    }
+    OWNED_WORK_DIRECTORIES+=("${path}|${identity}")
+}
+
+cleanup_owned_work_directories() {
+    local record path identity index
+    index=$((${#OWNED_WORK_DIRECTORIES[@]} - 1))
+    while [[ "${index}" -ge 0 ]]; do
+        record=${OWNED_WORK_DIRECTORIES[${index}]}
+        if [[ -n "${record}" ]]; then
+            path=${record%%|*}
+            identity=${record#*|}
+            remove_owned_directory "${path}" "${identity}" || return 1
+        fi
+        index=$((index - 1))
+    done
+}
+
+cleanup_publish_transient_root() {
+    cleanup_owned_work_directories
+    [[ -z "${PUBLISH_TRANSIENT_ROOT}" ||
+       (! -e "${PUBLISH_TRANSIENT_ROOT}" && ! -L "${PUBLISH_TRANSIENT_ROOT}") ]] || {
+        release_fail 'publish transient root를 정리하지 못했습니다.'
+        return 1
+    }
+}
+
+release_after_dmg_signal_cleanup() {
+    cleanup_owned_work_directories
+}
+
+publish_install_signal_handlers() {
+    trap 'publish_signal_exit 129' HUP
+    trap 'publish_signal_exit 130' INT
+    trap 'publish_signal_exit 143' TERM
+}
+
+publish_defer_signal() {
+    local status=$1
+    [[ -n "${PUBLISH_DEFERRED_SIGNAL_STATUS}" ]] ||
+        PUBLISH_DEFERRED_SIGNAL_STATUS=${status}
+}
+
+publish_install_deferred_signal_handlers() {
+    trap 'publish_defer_signal 129' HUP
+    trap 'publish_defer_signal 130' INT
+    trap 'publish_defer_signal 143' TERM
+}
+
+terminate_publish_child() {
+    local pid=${PUBLISH_ACTIVE_CHILD_PID:-} pgroup=${PUBLISH_ACTIVE_CHILD_PGID:-} _
+    [[ -n "${pid}" ]] || return 0
+    if [[ -n "${pgroup}" ]] && /bin/kill -TERM -- "-${pgroup}" 2>/dev/null; then
+        :
+    else
+        /bin/kill -TERM "${pid}" 2>/dev/null || true
+    fi
+    for _ in {1..20}; do
+        /bin/kill -0 "${pid}" 2>/dev/null || break
+        /bin/sleep 0.05
+    done
+    if /bin/kill -0 "${pid}" 2>/dev/null; then
+        if [[ -n "${pgroup}" ]]; then
+            /bin/kill -KILL -- "-${pgroup}" 2>/dev/null || true
+        else
+            /bin/kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    fi
+    wait "${pid}" 2>/dev/null || true
+    if [[ -n "${pgroup}" ]] && /bin/kill -0 -- "-${pgroup}" 2>/dev/null; then
+        /bin/kill -KILL -- "-${pgroup}" 2>/dev/null || true
+        for _ in {1..20}; do
+            /bin/kill -0 -- "-${pgroup}" 2>/dev/null || break
+            /bin/sleep 0.05
+        done
+    fi
+    if [[ -n "${pgroup}" ]] && /bin/kill -0 -- "-${pgroup}" 2>/dev/null; then
+        release_fail 'publish verifier process group을 종료하지 못했습니다.'
+        return 1
+    fi
+    PUBLISH_ACTIVE_CHILD_PID=''
+    PUBLISH_ACTIVE_CHILD_PGID=''
+}
+
+publish_signal_exit() {
+    local status=$1
+    [[ "${PUBLISH_SIGNAL_EXITING}" = 0 ]] || {
+        trap '' HUP INT TERM
+        exit "${status}"
+    }
+    PUBLISH_SIGNAL_EXITING=1
+    trap '' HUP INT TERM
+    if ! terminate_publish_child; then
+        exit "${status}"
+    fi
+    cleanup_publish_transient_root || true
+    exit "${status}"
+}
+
+publish_exit_cleanup() {
+    local status=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! release_dmg_has_active_state && [[ -z "${PUBLISH_ACTIVE_CHILD_PID}" ]]; then
+        cleanup_publish_transient_root || true
+    fi
+    exit "${status}"
+}
+
+run_release_step() {
+    local status deferred_status spawned_pid spawn_barrier_status=0
+    [[ -z "${PUBLISH_ACTIVE_CHILD_PID}" ]] || {
+        release_fail 'publish verifier child가 이미 실행 중입니다.'
+        return 1
+    }
+    PUBLISH_DEFERRED_SIGNAL_STATUS=''
+    publish_install_deferred_signal_handlers
+    set -m
+    "$@" &
+    spawned_pid=$!
+    if declare -F publish_after_release_step_spawn >/dev/null; then
+        publish_after_release_step_spawn "${spawned_pid}" || spawn_barrier_status=$?
+    fi
+    PUBLISH_ACTIVE_CHILD_PID=${spawned_pid}
+    PUBLISH_ACTIVE_CHILD_PGID=${spawned_pid}
+    publish_install_signal_handlers
+    deferred_status=${PUBLISH_DEFERRED_SIGNAL_STATUS}
+    PUBLISH_DEFERRED_SIGNAL_STATUS=''
+    [[ -z "${deferred_status}" ]] || publish_signal_exit "${deferred_status}"
+    if [[ "${spawn_barrier_status}" -ne 0 ]]; then
+        terminate_publish_child || true
+        set +m
+        publish_install_signal_handlers
+        return "${spawn_barrier_status}"
+    fi
+    if wait "${PUBLISH_ACTIVE_CHILD_PID}"; then
+        status=0
+    else
+        status=$?
+    fi
+    PUBLISH_ACTIVE_CHILD_PID=''
+    PUBLISH_ACTIVE_CHILD_PGID=''
+    set +m
+    publish_install_signal_handlers
+    return "${status}"
+}
+
+create_publish_transient_root() {
+    local candidate='' create_status=0 deferred_status
+    release_validate_release_container "${RELEASE_CONTAINER}" || return 1
+    PUBLISH_DEFERRED_SIGNAL_STATUS=''
+    publish_install_deferred_signal_handlers
+    candidate=$(/usr/bin/mktemp -d \
+        "${RELEASE_CONTAINER}/.sixbridge-publish-transient.XXXXXX") || create_status=$?
+    if [[ "${create_status}" = 0 ]]; then
+        release_private_directory "${candidate}" || create_status=$?
+    fi
+    if [[ "${create_status}" = 0 ]]; then
+        release_register_owned_work_directory "${candidate}" || create_status=$?
+    fi
+    if [[ "${create_status}" = 0 ]]; then
+        PUBLISH_TRANSIENT_ROOT=${candidate}
+        SIXBRIDGE_RELEASE_TRANSIENT_ROOT=${candidate}
+        TMPDIR=${candidate}
+        export SIXBRIDGE_RELEASE_TRANSIENT_ROOT TMPDIR
+    elif [[ -n "${candidate}" ]]; then
+        /bin/rmdir -- "${candidate}" 2>/dev/null || true
+    fi
+    publish_install_signal_handlers
+    deferred_status=${PUBLISH_DEFERRED_SIGNAL_STATUS}
+    PUBLISH_DEFERRED_SIGNAL_STATUS=''
+    [[ -z "${deferred_status}" ]] || publish_signal_exit "${deferred_status}"
+    [[ "${create_status}" = 0 ]] || {
+        release_fail 'publish transient root를 만들지 못했습니다.'
+        return 1
+    }
+}
+
+publish_install_signal_handlers
+trap publish_exit_cleanup EXIT
 
 release_git() {
     release_system_executable /usr/bin/git || return 1
@@ -190,6 +401,7 @@ release_metadata_value() {
 
 release_verify_artifacts() {
     local expected_commit=$1 signer metadata_commit
+    SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER=''
     release_validate_release_container "${RELEASE_CONTAINER}" || return 1
     signer=$(release_metadata_value '.android.signerSha256') || return 1
     [[ "${signer}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -202,16 +414,24 @@ release_verify_artifacts() {
         release_fail 'release metadata gitCommit이 현재 HEAD와 다릅니다.'
         return 1
     }
-    printf '%s\n' "${signer}"
+    SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER=${signer}
 }
 
 release_preflight() {
     local head_commit signer
+    SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=''
+    SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=''
     head_commit=$(release_clean_main_at_origin) || return 1
     release_require_absent_tag || return 1
     release_require_tagger_identity || return 1
-    signer=$(release_verify_artifacts "${head_commit}") || return 1
-    printf '%s:%s\n' "${head_commit}" "${signer}"
+    release_verify_artifacts "${head_commit}" || return 1
+    signer=${SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER}
+    [[ -n "${signer}" ]] || {
+        release_fail 'release artifact signer 결과가 비어 있습니다.'
+        return 1
+    }
+    SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=${head_commit}
+    SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=${signer}
 }
 
 release_verify_created_tag() {
@@ -239,9 +459,11 @@ release_verify_created_tag() {
 
 [[ "$#" = 1 ]] || { release_fail '사용법: publish-release-tag.sh 0.1.0'; exit 1; }
 release_require_version "$1" || exit 1
+create_publish_transient_root || exit 1
 
-preflight=$(release_preflight) || exit 1
-IFS=: read -r head_commit signer <<<"${preflight}"
+release_preflight || exit 1
+head_commit=${SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT}
+signer=${SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER}
 
 printf '계속하려면 v0.1.0 KEY BACKUP COMPLETE를 입력하세요: '
 IFS= read -r confirmation || { release_fail '백업 확인 입력을 읽지 못했습니다.'; exit 1; }
@@ -250,12 +472,15 @@ IFS= read -r confirmation || { release_fail '백업 확인 입력을 읽지 못�
     exit 1
 }
 
-preflight=$(release_preflight) || exit 1
-IFS=: read -r verified_commit verified_signer <<<"${preflight}"
+release_preflight || exit 1
+verified_commit=${SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT}
+verified_signer=${SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER}
 [[ "${verified_commit}" = "${head_commit}" && "${verified_signer}" = "${signer}" ]] || {
     release_fail '확인 중 git 또는 release artifact가 변경되었습니다.'
     exit 1
 }
+cleanup_publish_transient_root || exit 1
+trap - EXIT HUP INT TERM
 
 # These hooks are intentionally absent from the production release library.
 # The fixture-only library supplies them to exercise the two publish races.

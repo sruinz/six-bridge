@@ -167,36 +167,49 @@ stable_directory_identity() {
 }
 
 remove_owned_directory() {
-    local path=$1 expected=$2 actual
+    local path=$1 expected=$2
     [[ -n "${path}" && -n "${expected}" ]] || return 0
-    [[ -d "${path}" && ! -L "${path}" ]] || return 0
-    release_validate_stage_root "${path}" "${RELEASE_CONTAINER}" || return 0
-    actual=$(stable_directory_identity "${path}") || return 0
-    [[ "${actual}" = "${expected}" ]] || return 0
-    /bin/rm -rf -- "${path}"
+    [[ -e "${path}" || -L "${path}" ]] || return 0
+    release_validate_stage_root "${path}" "${RELEASE_CONTAINER}" || return 1
+    release_atomic_remove_owned_directory "${path}" "${expected}"
 }
 
 release_register_owned_work_directory() {
-    local path=$1 identity
+    local path=$1 expected=${2:-} identity
     release_validate_stage_root "${path}" "${RELEASE_CONTAINER}" || return 1
-    identity=$(stable_directory_identity "${path}") || return 1
+    identity=$(release_owned_directory_identity "${path}") || return 1
+    [[ -z "${expected}" || "${identity}" = "${expected}" ]] || {
+        release_fail 'owned work directory identity가 등록 전에 변경되었습니다.'
+        return 1
+    }
     OWNED_WORK_DIRECTORIES+=("${path}|${identity}")
 }
 
 cleanup_owned_work_directories() {
-    local record path identity
-    for record in "${OWNED_WORK_DIRECTORIES[@]:-}"; do
-        [[ -n "${record}" ]] || continue
-        path=${record%%|*}
-        identity=${record#*|}
-        remove_owned_directory "${path}" "${identity}" || true
+    local record path identity index
+    index=$((${#OWNED_WORK_DIRECTORIES[@]} - 1))
+    while [[ "${index}" -ge 0 ]]; do
+        record=${OWNED_WORK_DIRECTORIES[${index}]}
+        if [[ -n "${record}" ]]; then
+            path=${record%%|*}
+            identity=${record#*|}
+            remove_owned_directory "${path}" "${identity}" || return 1
+        fi
+        index=$((index - 1))
     done
 }
 
 cleanup_stage() {
-    remove_owned_directory "${STAGE_DIR}" "${STAGE_IDENTITY%:*}" || true
-    cleanup_owned_work_directories || true
-    remove_owned_directory "${LOCK_DIR}" "${LOCK_IDENTITY}" || true
+    if ! release_dmg_cleanup_active; then
+        return 0
+    fi
+    cleanup_owned_work_directories || return 1
+    remove_owned_directory "${STAGE_DIR}" "${STAGE_IDENTITY%:*}" || return 1
+    remove_owned_directory "${LOCK_DIR}" "${LOCK_IDENTITY}" || return 1
+}
+
+release_after_dmg_signal_cleanup() {
+    cleanup_stage
 }
 
 terminate_preparation_worker() {
@@ -222,7 +235,7 @@ release_signal_exit() {
 release_worker_signal_exit() {
     local status=$1
     trap - HUP INT TERM
-    cleanup_stage
+    cleanup_stage || true
     exit "${status}"
 }
 
@@ -236,7 +249,8 @@ emit_preparation_worker_program() {
         ACTIVE_CHILD_PID ACTIVE_CHILD_PGID
     for name in \
         stable_directory_identity remove_owned_directory release_register_owned_work_directory \
-        cleanup_owned_work_directories cleanup_stage release_worker_signal_exit \
+        cleanup_owned_work_directories cleanup_stage release_after_dmg_signal_cleanup \
+        release_worker_signal_exit \
         require_android_credentials validate_sanitized_worker_environment validate_keystore \
         release_keytool release_git release_clean_commit read_signer_sha256 \
         create_release_container acquire_release_lock create_release_temp_directory \
@@ -780,7 +794,7 @@ publish_verified_snapshot() {
 }
 
 prepare_release_worker() {
-local android_sdk_root
+local android_sdk_root DMG_WORK_DIR DMG_WORK_DIR_IDENTITY
 release_require_version "${1:-}"
 release_system_executable /usr/bin/env
 require_android_credentials
@@ -853,13 +867,17 @@ DMG_WORK_DIR=$(/usr/bin/mktemp -d "${RELEASE_CONTAINER}/.sixbridge-prepare-dmg.X
     release_fail 'DMG verification work directory를 만들지 못했습니다.'
     exit 1
 }
-release_private_directory "${DMG_WORK_DIR}" || { /bin/rm -rf -- "${DMG_WORK_DIR}"; exit 1; }
-release_register_owned_work_directory "${DMG_WORK_DIR}"
-if ! release_verify_dmg "${STAGE_DIR}/${SIXBRIDGE_MACOS_FILE}" "${DMG_WORK_DIR}" "${STAGE_DIR}" "${RELEASE_CONTAINER}"; then
-    /bin/rm -rf -- "${DMG_WORK_DIR}"
-    exit 1
-fi
-/bin/rm -rf -- "${DMG_WORK_DIR}"
+    release_private_directory "${DMG_WORK_DIR}" || exit 1
+    DMG_WORK_DIR_IDENTITY=$(release_owned_directory_identity "${DMG_WORK_DIR}") || exit 1
+    release_register_owned_work_directory "${DMG_WORK_DIR}" "${DMG_WORK_DIR_IDENTITY}"
+    if ! release_verify_dmg "${STAGE_DIR}/${SIXBRIDGE_MACOS_FILE}" "${DMG_WORK_DIR}" "${STAGE_DIR}" "${RELEASE_CONTAINER}"; then
+        if ! release_dmg_has_active_state; then
+            remove_owned_directory "${DMG_WORK_DIR}" "${DMG_WORK_DIR_IDENTITY}" || true
+        fi
+        exit 1
+    fi
+    release_dmg_has_active_state && { release_fail 'DMG active mount state가 정상 검증 뒤 남았습니다.'; exit 1; }
+    remove_owned_directory "${DMG_WORK_DIR}" "${DMG_WORK_DIR_IDENTITY}"
 
 release_scan_tree "${STAGE_DIR}" "${STAGE_DIR}" "${RELEASE_CONTAINER}" "${SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD}"
 GIT_COMMIT=$(release_clean_commit)

@@ -14,6 +14,30 @@ readonly SIXBRIDGE_RELEASE_FILES=(
     'RELEASE-NOTES-KO.md'
 )
 SIXBRIDGE_RELEASE_PROJECT_ROOT=''
+SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=''
+SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY=''
+SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR=''
+SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR_IDENTITY=''
+SIXBRIDGE_ACTIVE_DMG_SNAPSHOT=''
+SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY=''
+SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=''
+SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT=''
+SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR=''
+SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=''
+SIXBRIDGE_ACTIVE_DMG_PHASE=''
+SIXBRIDGE_ACTIVE_DMG_DEVICE=''
+SIXBRIDGE_ACTIVE_DMG_ATTACHED=0
+SIXBRIDGE_ACTIVE_DMG_CLEANING=0
+SIXBRIDGE_DMG_INVENTORY_STATE='UNKNOWN'
+SIXBRIDGE_DMG_INVENTORY_DEVICE=''
+SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT=''
+SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP=''
+SIXBRIDGE_DMG_PREVIOUS_INT_TRAP=''
+SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP=''
+SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+SIXBRIDGE_DMG_SIGNAL_EXITING=0
+SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR=''
+SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR_IDENTITY=''
 
 release_fail() {
     printf 'release 검증 실패: %s\n' "$1" >&2
@@ -78,7 +102,7 @@ release_regular_file() {
 release_directory() {
     local path=${1:-}
     [[ -n "${path}" && ! -L "${path}" && -d "${path}" ]] ||
-        release_fail 'symbolic link가 아닌 directory가 필요합니다.'
+        release_fail "symbolic link가 아닌 directory가 필요합니다: ${path:-없음}"
 }
 
 release_stage_identity() {
@@ -176,6 +200,17 @@ release_validate_stage_root() {
     release_container_identity "${physical_container}" >/dev/null
 }
 
+release_verification_transient_root() {
+    local container=$1 root=${SIXBRIDGE_RELEASE_TRANSIENT_ROOT:-}
+    [[ -n "${root}" ]] || return 1
+    release_validate_stage_root "${root}" "${container}" || return 1
+    case "${root##*/}" in
+        .sixbridge-publish-transient.*) ;;
+        *) release_fail 'release verifier transient root 경로가 올바르지 않습니다.'; return 1 ;;
+    esac
+    printf '%s\n' "${root}"
+}
+
 release_assert_stage_identity() {
     local stage_root=$1 container=$2 expected_stage=$3 expected_container=$4 actual
     release_validate_stage_root "${stage_root}" "${container}" || return 1
@@ -262,7 +297,10 @@ release_assert_file_identity() {
 }
 
 release_create_verification_snapshot() {
-    local artifact=$1 container=$2 snapshot_parent=${3:-$2} snapshot_dir snapshot snapshot_identity artifact_identity artifact_digest snapshot_digest
+    local artifact=$1 container=$2 snapshot_parent=${3:-$2} snapshot_dir snapshot
+    local snapshot_dir_identity snapshot_identity artifact_identity artifact_digest snapshot_digest
+    SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR=''
+    SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR_IDENTITY=''
     if [[ "${snapshot_parent}" = "${container}" ]]; then
         release_validate_release_container "${container}" || return 1
     else
@@ -273,29 +311,148 @@ release_create_verification_snapshot() {
         release_fail 'verification snapshot directory를 만들지 못했습니다.'
         return 1
     }
-    release_private_directory "${snapshot_dir}" || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    release_private_directory "${snapshot_dir}" || return 1
+    snapshot_dir_identity=$(release_owned_directory_identity "${snapshot_dir}") || return 1
     snapshot="${snapshot_dir}/artifact"
     if ! /bin/cp -p "${artifact}" "${snapshot}"; then
-        /bin/rm -rf "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'verification snapshot을 만들지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${artifact}" "${artifact_identity}" || { /bin/rm -rf "${snapshot_dir}"; return 1; }
-    snapshot_identity=$(release_file_identity "${snapshot}") || { /bin/rm -rf "${snapshot_dir}"; return 1; }
+    release_assert_file_identity "${artifact}" "${artifact_identity}" || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        return 1
+    }
+    snapshot_identity=$(release_file_identity "${snapshot}") || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        return 1
+    }
     artifact_digest=${artifact_identity##*:}
     snapshot_digest=${snapshot_identity##*:}
     [[ "${snapshot_digest}" = "${artifact_digest}" ]] || {
-        /bin/rm -rf "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'verification snapshot 내용이 원본과 다릅니다.'
         return 1
     }
-    printf '%s\n' "${snapshot_dir}"
+    SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR=${snapshot_dir}
+    SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR_IDENTITY=${snapshot_dir_identity}
+}
+
+release_owned_directory_identity() {
+    local path=${1:-} device inode owner mode
+    release_private_directory "${path}" || return 1
+    device=$(release_stat_value '%d' "${path}") || return 1
+    inode=$(release_stat_value '%i' "${path}") || return 1
+    owner=$(release_stat_value '%u' "${path}") || return 1
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${owner}" "${mode}"
+}
+
+release_atomic_remove_owned_path() {
+    local path=${1:-} expected=${2:-} kind=${3:-} parent leaf perl_contract perl privlib archlib
+    [[ -n "${path}" && "${expected}" =~ ^[0-9]+:[1-9][0-9]*:[0-9]+:[0-7]{3,4}$ ]] || {
+        release_fail 'owned path cleanup identity가 올바르지 않습니다.'
+        return 1
+    }
+    [[ "${kind}" = directory || "${kind}" = fifo ]] || {
+        release_fail 'owned path cleanup kind가 올바르지 않습니다.'
+        return 1
+    }
+    parent=$(/usr/bin/dirname -- "${path}") || return 1
+    leaf=$(/usr/bin/basename -- "${path}") || return 1
+    [[ -n "${leaf}" && "${leaf}" != . && "${leaf}" != .. ]] || {
+        release_fail 'owned path cleanup leaf가 올바르지 않습니다.'
+        return 1
+    }
+    if [[ "${parent}" = /private/tmp ]]; then
+        [[ "$(release_dmg_mount_root)" = /private/tmp ]] || return 1
+    else
+        release_trusted_directory "${parent}" || return 1
+    fi
+    perl_contract=$(release_system_perl) || return 1
+    IFS='|' read -r perl privlib archlib <<<"${perl_contract}"
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        SIXBRIDGE_PERL_INC="${privlib}:${archlib}" \
+        "${perl}" -e '
+            BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); }
+            use strict;
+            use warnings;
+            use Errno qw(EEXIST);
+            use Fcntl qw(O_DIRECTORY O_NONBLOCK O_RDONLY O_NOFOLLOW);
+            use File::Path qw(remove_tree);
+            use constant O_CLOEXEC => 0x01000000;
+
+            sub fail { print STDERR "release atomic path cleanup failed\n"; exit 71; }
+            sub openat_fd {
+                my ($directory_fd, $name, $flags) = @_;
+                my $fd = syscall(463, $directory_fd, $name, $flags, 0);
+                $fd >= 0 or fail();
+                return $fd;
+            }
+            sub matches {
+                my ($fh, $expected, $kind) = @_;
+                my ($device, $inode, $owner, $mode) = split(/:/, $expected, 4);
+                my @s = stat($fh);
+                my $right_kind = $kind eq q{directory} ? -d _ : -p _;
+                return @s && $right_kind && $s[0] == $device && $s[1] == $inode &&
+                    $s[4] == $owner && ($s[2] & 07777) == oct($mode);
+            }
+
+            my ($parent, $leaf, $expected, $kind) = @ARGV;
+            defined($parent) && defined($leaf) && defined($expected) && defined($kind) &&
+                ($kind eq q{directory} || $kind eq q{fifo}) &&
+                $leaf ne q{} && $leaf ne q{.} && $leaf ne q{..} &&
+                index($leaf, q{/}) < 0 or fail();
+            my $parent_fd;
+            sysopen(my $parent_fh, $parent,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) or fail();
+            $parent_fd = fileno($parent_fh);
+            my $open_flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+            $open_flags |= $kind eq q{directory} ? O_DIRECTORY : O_NONBLOCK;
+            my $source_fd = openat_fd($parent_fd, $leaf, $open_flags);
+            open(my $source_fh, q{<&=}. $source_fd) or fail();
+            matches($source_fh, $expected, $kind) or fail();
+
+            my $claim;
+            for my $attempt (0 .. 127) {
+                $claim = sprintf(q{.sixbridge-release-remove.%d.%d.%08x},
+                    $$, $attempt, int(rand(0xffffffff)));
+                my $rc = syscall(488, $parent_fd, $leaf, $parent_fd, $claim, 0x14);
+                last if $rc == 0;
+                $! == EEXIST or fail();
+                undef $claim;
+            }
+            defined($claim) or fail();
+            my $claim_fd = openat_fd($parent_fd, $claim, $open_flags);
+            open(my $claim_fh, q{<&=}. $claim_fd) or fail();
+            matches($claim_fh, $expected, $kind) or fail();
+            !lstat("$parent/$leaf") or fail();
+            close($source_fh) or fail();
+            close($claim_fh) or fail();
+
+            if ($kind eq q{fifo}) {
+                syscall(472, $parent_fd, $claim, 0) == 0 or fail();
+            } else {
+                my $errors;
+                remove_tree("$parent/$claim", { safe => 1, error => \$errors });
+                (!$errors || !@$errors) or fail();
+            }
+            !lstat("$parent/$claim") or fail();
+            !lstat("$parent/$leaf") or fail();
+            close($parent_fh) or fail();
+        ' "${parent}" "${leaf}" "${expected}" "${kind}" || {
+            release_fail "owned path를 identity-bound cleanup하지 못했습니다: ${path}"
+            return 1
+        }
+}
+
+release_atomic_remove_owned_directory() {
+    release_atomic_remove_owned_path "${1:-}" "${2:-}" directory
 }
 
 release_remove_verification_snapshot() {
-    local snapshot_dir=${1:-}
-    [[ -n "${snapshot_dir}" && -d "${snapshot_dir}" && ! -L "${snapshot_dir}" ]] || return 0
-    /bin/rm -rf "${snapshot_dir}"
+    local snapshot_dir=${1:-} expected=${2:-}
+    release_atomic_remove_owned_directory "${snapshot_dir}" "${expected}"
 }
 
 release_sha256_unchecked() {
@@ -665,36 +822,48 @@ release_validate_private_descendant_file() {
 }
 
 release_validate_android_classpath() {
-    local lib=$1 scan_parent scan_dir jars_file links_file jar status=0
+    local lib=$1 scan_parent scan_dir scan_dir_identity jars_file links_file jar status=0
     release_trusted_directory "${lib}" || return 1
-    scan_parent="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/.local"
-    release_trusted_directory "${scan_parent}" || return 1
+    if [[ -n "${SIXBRIDGE_RELEASE_TRANSIENT_ROOT:-}" ]]; then
+        scan_parent=$(release_verification_transient_root \
+            "$(/usr/bin/dirname -- "${SIXBRIDGE_RELEASE_TRANSIENT_ROOT}")") || return 1
+    else
+        scan_parent="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/.local"
+        release_trusted_directory "${scan_parent}" || return 1
+    fi
     scan_dir=$(/usr/bin/mktemp -d "${scan_parent}/.sixbridge-sdk-classpath.XXXXXX") || {
         release_fail 'Android SDK classpath 임시 directory를 만들지 못했습니다.'
         return 1
     }
-    release_private_directory "${scan_dir}" || { /bin/rm -rf "${scan_dir}"; return 1; }
+    release_private_directory "${scan_dir}" || return 1
+    scan_dir_identity=$(release_owned_directory_identity "${scan_dir}") || return 1
+    if declare -F release_register_owned_work_directory >/dev/null; then
+        release_register_owned_work_directory "${scan_dir}" "${scan_dir_identity}" || {
+            release_atomic_remove_owned_directory "${scan_dir}" "${scan_dir_identity}" || true
+            return 1
+        }
+    fi
     jars_file="${scan_dir}/jars.nul"
     links_file="${scan_dir}/links.nul"
     if ! /usr/bin/find "${lib}" -xdev -type l -print0 >"${links_file}"; then
-        /bin/rm -rf "${scan_dir}"
+        release_atomic_remove_owned_directory "${scan_dir}" "${scan_dir_identity}" || true
         release_fail 'Android SDK classpath 열거에 실패했습니다.'
         return 1
     fi
     if [[ -s "${links_file}" ]]; then
-        /bin/rm -rf "${scan_dir}"
+        release_atomic_remove_owned_directory "${scan_dir}" "${scan_dir_identity}" || true
         release_fail 'Android SDK classpath에 symbolic link가 포함되어 있습니다.'
         return 1
     fi
     if ! /usr/bin/find "${lib}" -xdev -type f -name '*.jar' -print0 >"${jars_file}"; then
-        /bin/rm -rf "${scan_dir}"
+        release_atomic_remove_owned_directory "${scan_dir}" "${scan_dir_identity}" || true
         release_fail 'Android SDK classpath 열거에 실패했습니다.'
         return 1
     fi
     while IFS= read -r -d '' jar; do
         release_validate_private_descendant_file "${lib}" "${jar}" || { status=1; break; }
     done <"${jars_file}"
-    /bin/rm -rf "${scan_dir}"
+    release_atomic_remove_owned_directory "${scan_dir}" "${scan_dir_identity}" || return 1
     return "${status}"
 }
 
@@ -750,6 +919,7 @@ release_tool() {
             [[ "${name}" = apksigner ]] && path="${sdk_root}/build-tools/36.0.0/lib/apksigner.jar" || path="${sdk_root}/cmdline-tools/latest/lib/apkanalyzer-classpath.jar"
             ;;
         hdiutil) path='/usr/bin/hdiutil' ;;
+        plutil) path='/usr/bin/plutil' ;;
         plistbuddy) path='/usr/libexec/PlistBuddy' ;;
         codesign) path='/usr/bin/codesign' ;;
         jq) path='/usr/bin/jq' ;;
@@ -763,10 +933,37 @@ release_tool() {
     printf '%s\n' "${path}"
 }
 
+release_capture_verifier_output() {
+    local output=$1
+    shift
+    if [[ ! -e "${output}" && ! -L "${output}" ]]; then
+        (umask 077; : >"${output}") || return 1
+    else
+        release_private_file "${output}" || return 1
+        : >"${output}" || return 1
+    fi
+    release_private_file "${output}" || return 1
+    if declare -F run_release_step >/dev/null; then
+        run_release_step "$@" >"${output}" 2>&1 || return 1
+    else
+        "$@" >"${output}" 2>&1 || return 1
+    fi
+    release_private_file "${output}"
+}
+
+release_read_verifier_line() {
+    local input=$1 value extra
+    {
+        IFS= read -r value || return 1
+        ! IFS= read -r extra || return 1
+    } <"${input}"
+    printf '%s\n' "${value}"
+}
+
 release_verify_apk() {
     local apk=${1:-} expected_signer=${2:-} stage_root=${3:-} container=${4:-}
-    local raw_output signer_lines actual_signer application_id version_name version_code apksigner_output
-    local artifact_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity
+    local signer_lines actual_signer application_id version_name version_code apksigner_output analyzer_output
+    local artifact_identity snapshot_identity snapshot_dir snapshot_dir_identity snapshot snapshot_parent stage_identity container_identity
 
     release_require_artifact_stage "${apk}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${apk}" || return 1
@@ -775,114 +972,823 @@ release_verify_apk() {
         return 1
     }
     artifact_identity=$(release_file_identity "${apk}") || return 1
-    snapshot_dir=$(release_create_verification_snapshot "${apk}" "${container}") || return 1
+    snapshot_parent=${container}
+    if [[ -n "${SIXBRIDGE_RELEASE_TRANSIENT_ROOT:-}" ]]; then
+        snapshot_parent=$(release_verification_transient_root "${container}") || return 1
+    fi
+    release_create_verification_snapshot "${apk}" "${container}" "${snapshot_parent}" || return 1
+    snapshot_dir=${SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR}
+    snapshot_dir_identity=${SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR_IDENTITY}
     if declare -F release_register_owned_work_directory >/dev/null; then
-        release_register_owned_work_directory "${snapshot_dir}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+        release_register_owned_work_directory "${snapshot_dir}" "${snapshot_dir_identity}" || {
+            release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+            return 1
+        }
     fi
     snapshot="${snapshot_dir}/artifact"
-    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
 
-    apksigner_output=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/sixbridge-release-apksigner.XXXXXX") || {
-        release_remove_verification_snapshot "${snapshot_dir}"
-        release_fail 'APK verifier output 임시 파일을 만들지 못했습니다.'
-        return 1
-    }
-    if declare -F run_release_step >/dev/null; then
-        if ! run_release_step release_run_apksigner verify --verbose --print-certs "${snapshot}" >"${apksigner_output}" 2>&1; then
-            /bin/rm -f "${apksigner_output}"
-            release_remove_verification_snapshot "${snapshot_dir}"
-            release_fail 'APK signature verification에 실패했습니다.'
-            return 1
-        fi
-        raw_output=$(/bin/cat "${apksigner_output}")
-    elif ! raw_output=$(release_run_apksigner verify --verbose --print-certs "${snapshot}" 2>&1); then
-        /bin/rm -f "${apksigner_output}"
-        release_remove_verification_snapshot "${snapshot_dir}"
+    apksigner_output="${snapshot_dir}/apksigner.output"
+    analyzer_output="${snapshot_dir}/apkanalyzer.output"
+    if ! release_capture_verifier_output "${apksigner_output}" \
+        release_run_apksigner verify --verbose --print-certs "${snapshot}"; then
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK signature verification에 실패했습니다.'
         return 1
     fi
-    /bin/rm -f "${apksigner_output}"
-    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    signer_lines=$(printf '%s\n' "${raw_output}" | /usr/bin/awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print $2}')
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    signer_lines=$(/usr/bin/awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print $2}' "${apksigner_output}")
     [[ "$(printf '%s\n' "${signer_lines}" | /usr/bin/awk 'NF {count += 1} END {print count + 0}')" = 1 ]] || {
-        release_remove_verification_snapshot "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK signer는 정확히 하나여야 합니다.'
         return 1
     }
     actual_signer=${signer_lines}
     actual_signer=$(printf '%s' "${actual_signer}" | /usr/bin/tr '[:upper:]' '[:lower:]')
     [[ "${actual_signer}" = "${expected_signer}" ]] || {
-        release_remove_verification_snapshot "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK signer SHA-256가 예상 값과 다릅니다.'
         return 1
     }
 
-    if ! application_id=$(release_run_apkanalyzer manifest application-id "${snapshot}" 2>&1); then
-        release_remove_verification_snapshot "${snapshot_dir}"
+    if ! release_capture_verifier_output "${analyzer_output}" \
+        release_run_apkanalyzer manifest application-id "${snapshot}"; then
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK application ID를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    application_id=$(release_read_verifier_line "${analyzer_output}") || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        release_fail 'APK application ID 출력 형식이 올바르지 않습니다.'
+        return 1
+    }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
     [[ "${application_id}" = 'dev.sixbridge.manager' ]] || {
-        release_remove_verification_snapshot "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK application ID가 계약과 다릅니다.'
         return 1
     }
-    if ! version_name=$(release_run_apkanalyzer manifest version-name "${snapshot}" 2>&1); then
-        release_remove_verification_snapshot "${snapshot_dir}"
+    if ! release_capture_verifier_output "${analyzer_output}" \
+        release_run_apkanalyzer manifest version-name "${snapshot}"; then
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK versionName을 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    version_name=$(release_read_verifier_line "${analyzer_output}") || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        release_fail 'APK versionName 출력 형식이 올바르지 않습니다.'
+        return 1
+    }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
     [[ "${version_name}" = "${SIXBRIDGE_RELEASE_VERSION}" ]] || {
-        release_remove_verification_snapshot "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK versionName이 계약과 다릅니다.'
         return 1
     }
-    if ! version_code=$(release_run_apkanalyzer manifest version-code "${snapshot}" 2>&1); then
-        release_remove_verification_snapshot "${snapshot_dir}"
+    if ! release_capture_verifier_output "${analyzer_output}" \
+        release_run_apkanalyzer manifest version-code "${snapshot}"; then
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK versionCode를 읽지 못했습니다.'
         return 1
     fi
-    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    version_code=$(release_read_verifier_line "${analyzer_output}") || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        release_fail 'APK versionCode 출력 형식이 올바르지 않습니다.'
+        return 1
+    }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
     [[ "${version_code}" = '1' ]] || {
-        release_remove_verification_snapshot "${snapshot_dir}"
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK versionCode가 계약과 다릅니다.'
         return 1
     }
-    release_remove_verification_snapshot "${snapshot_dir}" || return 1
+    release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || return 1
     release_assert_file_identity "${apk}" "${artifact_identity}"
 }
 
-release_dmg_detach() {
-    local mountpoint=$1 hdiutil
+release_dmg_mount_root() {
+    local root=/private/tmp physical owner group mode permissions
+    release_directory "${root}" || return 1
+    physical="$(CDPATH= builtin cd -P -- "${root}" && builtin pwd -P)" || return 1
+    owner=$(release_stat_value '%u' "${root}") || return 1
+    group=$(release_stat_value '%g' "${root}") || return 1
+    mode=$(release_stat_value '%Lp' "${root}") || return 1
+    permissions=$(/usr/bin/stat -f '%Sp' "${root}" 2>/dev/null) || return 1
+    [[ "${physical}" = "${root}" && "${owner}" = 0 && "${group}" = 0 &&
+       "${mode}" = 777 && "${permissions}" = drwxrwxrwt ]] || {
+        release_fail 'DMG local mount root trust가 올바르지 않습니다.'
+        return 1
+    }
+    printf '%s\n' "${root}"
+}
+
+release_dmg_mountpoint_identity() {
+    local mountpoint=${1:-} root physical parent basename owner mode current_owner device inode
+    root=$(release_dmg_mount_root) || return 1
+    release_private_directory "${mountpoint}" || return 1
+    physical="$(CDPATH= builtin cd -P -- "${mountpoint}" && builtin pwd -P)" || return 1
+    parent="$(CDPATH= builtin cd -P -- "$(/usr/bin/dirname -- "${mountpoint}")" && builtin pwd -P)" || return 1
+    basename=$(/usr/bin/basename -- "${mountpoint}") || return 1
+    case "${basename}" in sixbridge-dmg.*) ;; *) release_fail 'DMG local mountpoint 이름이 올바르지 않습니다.'; return 1 ;; esac
+    [[ "${parent}" = "${root}" && "${physical}" = "${root}/${basename}" ]] || {
+        release_fail 'DMG local mountpoint containment가 올바르지 않습니다.'
+        return 1
+    }
+    owner=$(release_stat_value '%u' "${mountpoint}") || return 1
+    current_owner=$(/usr/bin/id -u) || return 1
+    mode=$(release_stat_value '%Lp' "${mountpoint}") || return 1
+    [[ "${owner}" = "${current_owner}" && "${mode}" = 700 ]] || {
+        release_fail 'DMG local mountpoint owner 또는 mode가 올바르지 않습니다.'
+        return 1
+    }
+    device=$(release_stat_value '%d' "${mountpoint}") || return 1
+    inode=$(release_stat_value '%i' "${mountpoint}") || return 1
+    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${owner}" "${mode}"
+}
+
+release_dmg_mountpoint_candidate() {
+    local snapshot_dir=${1:-} root=${2:-} device inode
+    release_private_directory "${snapshot_dir}" || return 1
+    [[ "${root}" = /private/tmp ]] || {
+        release_fail 'DMG local mount root가 올바르지 않습니다.'
+        return 1
+    }
+    device=$(release_stat_value '%d' "${snapshot_dir}") || return 1
+    inode=$(release_stat_value '%i' "${snapshot_dir}") || return 1
+    [[ "${device}" =~ ^[0-9]+$ && "${inode}" =~ ^[1-9][0-9]*$ ]] || {
+        release_fail 'DMG backing snapshot directory identity가 올바르지 않습니다.'
+        return 1
+    }
+    printf '%s/sixbridge-dmg.%s.%s\n' "${root}" "${device}" "${inode}"
+}
+
+release_dmg_mountpoint_created_barrier() {
+    :
+}
+
+release_dmg_mountpoint_record_barrier() {
+    :
+}
+
+release_dmg_fifo_path_identity() {
+    local path=${1:-} device inode owner mode links current_owner
+    [[ -n "${path}" && -p "${path}" && ! -L "${path}" ]] || {
+        release_fail 'DMG identity FIFO 형식이 올바르지 않습니다.'
+        return 1
+    }
+    device=$(release_stat_value '%d' "${path}") || return 1
+    inode=$(release_stat_value '%i' "${path}") || return 1
+    owner=$(release_stat_value '%u' "${path}") || return 1
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    links=$(release_link_count "${path}") || return 1
+    current_owner=$(/usr/bin/id -u) || return 1
+    [[ "${owner}" = "${current_owner}" && "${mode}" = 600 && "${links}" = 1 ]] || {
+        release_fail 'DMG identity FIFO owner, mode 또는 link count가 올바르지 않습니다.'
+        return 1
+    }
+    printf '%s:%s:%s:%s\n' "${device}" "${inode}" "${owner}" "${mode}"
+}
+
+release_dmg_fifo_fd_identity() {
+    local fd=${1:-} perl_contract perl privlib archlib
+    [[ "${fd}" =~ ^[0-9]+$ ]] || return 1
+    perl_contract=$(release_system_perl) || return 1
+    IFS='|' read -r perl privlib archlib <<<"${perl_contract}"
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        "${perl}" -e '
+            use strict;
+            use warnings;
+            my $fd = shift @ARGV;
+            $fd =~ /\A\d+\z/ or exit 1;
+            open(my $fh, "<&=$fd") or exit 1;
+            my @s = stat($fh);
+            @s && -p _ && $s[3] == 1 or exit 1;
+            printf "%d:%d:%d:%03o\n", $s[0], $s[1], $s[4], $s[2] & 0777;
+        ' "${fd}"
+}
+
+release_dmg_close_identity_fds() {
+    exec 7>&- 8<&- 9>&- || true
+}
+
+release_dmg_terminate_acquire_child() {
+    local child=${SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD:-} _
+    [[ -n "${child}" ]] || return 0
+    [[ "${child}" =~ ^[1-9][0-9]*$ ]] || return 1
+    /bin/kill -TERM -- "-${child}" 2>/dev/null || /bin/kill -TERM "${child}" 2>/dev/null || true
+    for _ in {1..20}; do
+        /bin/kill -0 "${child}" 2>/dev/null || break
+        /bin/sleep 0.05
+    done
+    if /bin/kill -0 "${child}" 2>/dev/null; then
+        /bin/kill -KILL -- "-${child}" 2>/dev/null || /bin/kill -KILL "${child}" 2>/dev/null || true
+    fi
+    wait "${child}" 2>/dev/null || true
+    SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=''
+}
+
+release_dmg_mountpoint_child_exit() {
+    local status=$1 created_mountpoint=${2:-} expected_identity=${3:-} committed=${4:-0}
+    local actual_identity=''
+    trap - EXIT
+    if [[ "${status}" != 0 && "${committed}" != 1 &&
+          -n "${created_mountpoint}" && -n "${expected_identity}" ]]; then
+        actual_identity=$(release_dmg_mountpoint_identity "${created_mountpoint}" 2>/dev/null || true)
+        [[ "${actual_identity}" != "${expected_identity}" ]] ||
+            /bin/rmdir "${created_mountpoint}" 2>/dev/null || true
+    fi
+    exit "${status}"
+}
+
+release_create_dmg_mountpoint() {
+    local mountpoint=${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT:-} expected_mountpoint
+    local root=${1:-} fifo fifo_identity fd_identity child
+    local read_status=0 wait_status=0 deferred_status payload='' extra='' current_identity=''
+    [[ -n "${root}" && -n "${mountpoint}" &&
+       "${SIXBRIDGE_ACTIVE_DMG_PHASE}" = PENDING ]] || {
+        release_fail 'DMG pending mount state가 올바르지 않습니다.'
+        return 1
+    }
+    expected_mountpoint=$(release_dmg_mountpoint_candidate "${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR}" "${root}") || return 1
+    [[ "${mountpoint}" = "${expected_mountpoint}" ]] || {
+        release_fail 'DMG pending mountpoint candidate가 변경되었습니다.'
+        return 1
+    }
+    fifo="${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR}/dmg-mountpoint.identity.fifo"
+    [[ ! -e "${fifo}" && ! -L "${fifo}" ]] || return 1
+    release_system_executable /usr/bin/mkfifo || return 1
+    (umask 077; /usr/bin/mkfifo -m 600 -- "${fifo}") || return 1
+    fifo_identity=$(release_dmg_fifo_path_identity "${fifo}") || return 1
+    exec 7<>"${fifo}" || return 1
+    fd_identity=$(release_dmg_fifo_fd_identity 7) || { release_dmg_close_identity_fds; return 1; }
+    [[ "${fd_identity}" = "${fifo_identity}" ]] || { release_dmg_close_identity_fds; return 1; }
+    exec 8<"${fifo}" || { release_dmg_close_identity_fds; return 1; }
+    fd_identity=$(release_dmg_fifo_fd_identity 8) || { release_dmg_close_identity_fds; return 1; }
+    [[ "${fd_identity}" = "${fifo_identity}" ]] || { release_dmg_close_identity_fds; return 1; }
+    exec 9>"${fifo}" || { release_dmg_close_identity_fds; return 1; }
+    fd_identity=$(release_dmg_fifo_fd_identity 9) || { release_dmg_close_identity_fds; return 1; }
+    [[ "${fd_identity}" = "${fifo_identity}" ]] || { release_dmg_close_identity_fds; return 1; }
+    release_atomic_remove_owned_path "${fifo}" "${fifo_identity}" fifo || {
+        release_dmg_close_identity_fds
+        return 1
+    }
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    release_dmg_install_deferred_signal_handlers
+    set -m
+    (
+        local created_mountpoint=${mountpoint} created_identity='' mountpoint_committed=0
+        trap 'release_dmg_mountpoint_child_exit "$?" "${created_mountpoint:-}" "${created_identity:-}" "${mountpoint_committed:-0}"' EXIT
+        exec 7>&- 8<&-
+        umask 077
+        /bin/mkdir -m 700 -- "${created_mountpoint}" || exit 1
+        created_identity=$(release_dmg_mountpoint_identity "${created_mountpoint}") || exit 1
+        release_dmg_mountpoint_record_barrier "${created_mountpoint}" || :
+        printf '%s\n' "${created_identity}" >&9 || exit 1
+        mountpoint_committed=1
+    ) &
+    child=$!
+    set +m
+    SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=${child}
+    exec 7>&- 9>&-
+    while :; do
+        if IFS= read -r payload <&8; then
+            break
+        else
+            read_status=$?
+        fi
+        if [[ "${read_status}" -gt 128 && -n "${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}" ]]; then
+            read_status=0
+            continue
+        fi
+        break
+    done
+    if wait "${child}"; then wait_status=0; else wait_status=$?; fi
+    SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=''
+    while [[ "${read_status}" = 0 ]]; do
+        if IFS= read -r extra <&8; then
+            read_status=1
+            break
+        else
+            read_status=$?
+        fi
+        if [[ "${read_status}" = 1 ]]; then
+            read_status=0
+            break
+        fi
+        if [[ "${read_status}" -gt 128 && -n "${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}" ]]; then
+            read_status=0
+            continue
+        fi
+        break
+    done
+    exec 8<&-
+    release_dmg_install_signal_handlers
+    deferred_status=${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    if [[ "${read_status}" != 0 || "${wait_status}" != 0 || -n "${extra}" ||
+          ! "${payload}" =~ ^[0-9]+:[1-9][0-9]*:[0-9]+:700$ ]]; then
+        if [[ ! -e "${mountpoint}" && ! -L "${mountpoint}" ]]; then
+            SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=''
+            SIXBRIDGE_ACTIVE_DMG_PHASE='SNAPSHOT_CLEANUP'
+        fi
+        release_fail 'DMG local mount directory를 만들지 못했습니다.'
+        return 1
+    fi
+    current_identity=$(release_dmg_mountpoint_identity "${mountpoint}") || return 1
+    [[ "${current_identity}" = "${payload}" ]] || return 1
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY=${payload}
+    SIXBRIDGE_ACTIVE_DMG_PHASE='MOUNTPOINT_READY'
+    if [[ -n "${deferred_status}" ]]; then
+        release_dmg_signal_exit "${deferred_status}"
+    fi
+    release_dmg_mountpoint_created_barrier || return 1
+}
+
+release_dmg_private_file() {
+    local path=$1 mode
+    release_private_file "${path}" || return 1
+    mode=$(release_stat_value '%Lp' "${path}") || return 1
+    [[ "${mode}" = 600 ]] || {
+        release_fail 'DMG private file mode는 정확히 0600이어야 합니다.'
+        return 1
+    }
+}
+
+release_dmg_inventory_unknown() {
+    SIXBRIDGE_DMG_INVENTORY_STATE='UNKNOWN'
+    SIXBRIDGE_DMG_INVENTORY_DEVICE=''
+    SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT=''
+    release_fail 'DMG device inventory를 확정할 수 없습니다.'
+}
+
+release_dmg_inventory() {
+    local snapshot=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT:-}
+    local expected_identity=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY:-}
+    local snapshot_dir=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR:-}
+    local hdiutil plutil info_file error_file path type count index image_path image_identity
+    local matches=0 entity_count entity_index device device_base unique_base='' selected_device=''
+    local device_count=0 root_device='' entity_mountpoint='' selected_mountpoint=''
+
+    SIXBRIDGE_DMG_INVENTORY_STATE='UNKNOWN'
+    SIXBRIDGE_DMG_INVENTORY_DEVICE=''
+    SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT=''
+    [[ -n "${snapshot}" && -n "${expected_identity}" && -n "${snapshot_dir}" ]] || {
+        release_dmg_inventory_unknown
+        return 1
+    }
+    release_assert_file_identity "${snapshot}" "${expected_identity}" || return 1
+    info_file="${snapshot_dir}/dmg-info.plist"
+    error_file="${snapshot_dir}/dmg-info.stderr"
+    for path in "${info_file}" "${error_file}"; do
+        if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+            (umask 077; : >"${path}") || return 1
+        else
+            release_dmg_private_file "${path}" || return 1
+            : >"${path}" || return 1
+        fi
+        release_dmg_private_file "${path}" || return 1
+    done
     hdiutil=$(release_tool hdiutil) || return 1
-    if ! "${hdiutil}" detach "${mountpoint}" >/dev/null 2>&1; then
+    plutil=$(release_tool plutil) || return 1
+    if ! "${hdiutil}" info -plist >"${info_file}" 2>"${error_file}"; then
+        release_dmg_inventory_unknown
+        return 1
+    fi
+    release_dmg_private_file "${info_file}" || return 1
+    release_dmg_private_file "${error_file}" || return 1
+    type=$("${plutil}" -type images "${info_file}" 2>>"${error_file}") || {
+        release_dmg_inventory_unknown
+        return 1
+    }
+    [[ "${type}" = array ]] || { release_dmg_inventory_unknown; return 1; }
+    count=$("${plutil}" -extract images raw -o - "${info_file}" 2>>"${error_file}") || {
+        release_dmg_inventory_unknown
+        return 1
+    }
+    [[ "${count}" =~ ^[0-9]+$ && "${count}" -le 1024 ]] || {
+        release_dmg_inventory_unknown
+        return 1
+    }
+    index=0
+    while [[ "${index}" -lt "${count}" ]]; do
+        type=$("${plutil}" -type "images.${index}.image-path" "${info_file}" 2>>"${error_file}") || {
+            release_dmg_inventory_unknown
+            return 1
+        }
+        [[ "${type}" = string ]] || { release_dmg_inventory_unknown; return 1; }
+        image_path=$("${plutil}" -extract "images.${index}.image-path" raw -o - "${info_file}" 2>>"${error_file}") || {
+            release_dmg_inventory_unknown
+            return 1
+        }
+        image_identity=$(release_file_identity "${image_path}" 2>/dev/null || true)
+        if [[ "${image_identity}" = "${expected_identity}" ]]; then
+            matches=$((matches + 1))
+            [[ "${matches}" = 1 ]] || { release_dmg_inventory_unknown; return 1; }
+            type=$("${plutil}" -type "images.${index}.system-entities" "${info_file}" 2>>"${error_file}") || {
+                release_dmg_inventory_unknown
+                return 1
+            }
+            [[ "${type}" = array ]] || { release_dmg_inventory_unknown; return 1; }
+            entity_count=$("${plutil}" -extract "images.${index}.system-entities" raw -o - "${info_file}" 2>>"${error_file}") || {
+                release_dmg_inventory_unknown
+                return 1
+            }
+            [[ "${entity_count}" =~ ^[1-9][0-9]*$ && "${entity_count}" -le 1024 ]] || {
+                release_dmg_inventory_unknown
+                return 1
+            }
+            entity_index=0
+            while [[ "${entity_index}" -lt "${entity_count}" ]]; do
+                type=$("${plutil}" -type "images.${index}.system-entities.${entity_index}.dev-entry" "${info_file}" 2>>"${error_file}") || {
+                    release_dmg_inventory_unknown
+                    return 1
+                }
+                [[ "${type}" = string ]] || { release_dmg_inventory_unknown; return 1; }
+                device=$("${plutil}" -extract "images.${index}.system-entities.${entity_index}.dev-entry" raw -o - "${info_file}" 2>>"${error_file}") || {
+                    release_dmg_inventory_unknown
+                    return 1
+                }
+                [[ "${device}" =~ ^(/dev/disk[0-9]+)(s[0-9]+)?$ ]] || {
+                    release_dmg_inventory_unknown
+                    return 1
+                }
+                device_base=${BASH_REMATCH[1]}
+                if [[ -n "${unique_base}" && "${unique_base}" != "${device_base}" ]]; then
+                    release_dmg_inventory_unknown
+                    return 1
+                fi
+                unique_base=${device_base}
+                selected_device=${device}
+                device_count=$((device_count + 1))
+                [[ "${device}" != "${device_base}" ]] || root_device=${device}
+                if type=$("${plutil}" -type "images.${index}.system-entities.${entity_index}.mount-point" \
+                    "${info_file}" 2>>"${error_file}"); then
+                    [[ "${type}" = string ]] || { release_dmg_inventory_unknown; return 1; }
+                    entity_mountpoint=$("${plutil}" -extract \
+                        "images.${index}.system-entities.${entity_index}.mount-point" raw -o - \
+                        "${info_file}" 2>>"${error_file}") || {
+                        release_dmg_inventory_unknown
+                        return 1
+                    }
+                    [[ -n "${entity_mountpoint}" ]] || { release_dmg_inventory_unknown; return 1; }
+                    if [[ -n "${selected_mountpoint}" &&
+                          "${selected_mountpoint}" != "${entity_mountpoint}" ]]; then
+                        release_dmg_inventory_unknown
+                        return 1
+                    fi
+                    selected_mountpoint=${entity_mountpoint}
+                fi
+                entity_index=$((entity_index + 1))
+            done
+        fi
+        index=$((index + 1))
+    done
+    release_assert_file_identity "${snapshot}" "${expected_identity}" || {
+        release_dmg_inventory_unknown
+        return 1
+    }
+    if [[ "${matches}" = 0 ]]; then
+        SIXBRIDGE_DMG_INVENTORY_STATE='ABSENT'
+        return 0
+    fi
+    if [[ -n "${root_device}" ]]; then
+        selected_device=${root_device}
+    elif [[ "${device_count}" != 1 ]]; then
+        release_dmg_inventory_unknown
+        return 1
+    fi
+    SIXBRIDGE_DMG_INVENTORY_STATE='OWNED'
+    SIXBRIDGE_DMG_INVENTORY_DEVICE=${selected_device}
+    SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT=${selected_mountpoint}
+}
+
+release_dmg_restore_signal_handlers() {
+    if [[ -n "${SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP}" ]]; then eval "${SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP}"; else trap - HUP; fi
+    if [[ -n "${SIXBRIDGE_DMG_PREVIOUS_INT_TRAP}" ]]; then eval "${SIXBRIDGE_DMG_PREVIOUS_INT_TRAP}"; else trap - INT; fi
+    if [[ -n "${SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP}" ]]; then eval "${SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP}"; else trap - TERM; fi
+    SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP=''
+    SIXBRIDGE_DMG_PREVIOUS_INT_TRAP=''
+    SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP=''
+}
+
+release_dmg_install_signal_handlers() {
+    trap 'release_dmg_signal_exit 129' HUP
+    trap 'release_dmg_signal_exit 130' INT
+    trap 'release_dmg_signal_exit 143' TERM
+}
+
+release_dmg_defer_signal() {
+    local status=$1
+    [[ -n "${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}" ]] ||
+        SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=${status}
+}
+
+release_dmg_install_deferred_signal_handlers() {
+    trap 'release_dmg_defer_signal 129' HUP
+    trap 'release_dmg_defer_signal 130' INT
+    trap 'release_dmg_defer_signal 143' TERM
+}
+
+release_dmg_attach_spawned_barrier() {
+    :
+}
+
+release_dmg_signal_exit_barrier() {
+    :
+}
+
+release_dmg_signal_exit() {
+    local status=$1 cleanup_succeeded=0
+    if [[ "${SIXBRIDGE_DMG_SIGNAL_EXITING}" != 0 ]]; then
+        trap '' HUP INT TERM
+        exit "${status}"
+    fi
+    SIXBRIDGE_DMG_SIGNAL_EXITING=1
+    trap '' HUP INT TERM
+    if release_dmg_cleanup_active; then
+        cleanup_succeeded=1
+    fi
+    if [[ "${cleanup_succeeded}" = 1 ]] &&
+       declare -F release_after_dmg_signal_cleanup >/dev/null; then
+        release_after_dmg_signal_cleanup "${status}" || true
+    fi
+    SIXBRIDGE_DMG_SIGNAL_EXITING=1
+    trap '' HUP INT TERM
+    release_dmg_signal_exit_barrier || true
+    exit "${status}"
+}
+
+release_dmg_register_pending() {
+    local snapshot_dir=$1 snapshot=$2 snapshot_identity=$3 snapshot_dir_identity=$4
+    local stdout_file stderr_file actual_snapshot_dir_identity
+    local mount_root mountpoint path
+    release_dmg_has_active_state && {
+        release_fail '다른 DMG active state가 이미 존재합니다.'
+        return 1
+    }
+    [[ -n "${snapshot_dir}" && -n "${snapshot}" && -n "${snapshot_identity}" &&
+       -n "${snapshot_dir_identity}" ]] || {
+        release_fail 'DMG pending state가 올바르지 않습니다.'
+        return 1
+    }
+    release_private_directory "${snapshot_dir}" || return 1
+    actual_snapshot_dir_identity=$(release_owned_directory_identity "${snapshot_dir}") || return 1
+    [[ "${actual_snapshot_dir_identity}" = "${snapshot_dir_identity}" ]] || {
+        release_fail 'DMG pending snapshot directory identity가 변경되었습니다.'
+        return 1
+    }
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || return 1
+    mount_root=$(release_dmg_mount_root) || return 1
+    mountpoint=$(release_dmg_mountpoint_candidate "${snapshot_dir}" "${mount_root}") || return 1
+    stdout_file="${snapshot_dir}/dmg-attach.stdout"
+    stderr_file="${snapshot_dir}/dmg-attach.stderr"
+    for path in "${stdout_file}" "${stderr_file}"; do
+        [[ ! -e "${path}" && ! -L "${path}" ]] || {
+            release_fail 'DMG pending private record가 이미 존재합니다.'
+            return 1
+        }
+        (umask 077; : >"${path}") || return 1
+        release_dmg_private_file "${path}" || return 1
+    done
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=${mountpoint}
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY=''
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR=${snapshot_dir}
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR_IDENTITY=${snapshot_dir_identity}
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT=${snapshot}
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY=${snapshot_identity}
+    SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT=${stdout_file}
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR=${stderr_file}
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=''
+    SIXBRIDGE_ACTIVE_DMG_PHASE='PENDING'
+    SIXBRIDGE_ACTIVE_DMG_DEVICE=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACHED=0
+    SIXBRIDGE_ACTIVE_DMG_CLEANING=0
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    SIXBRIDGE_DMG_SIGNAL_EXITING=0
+    trap -p HUP >"${stdout_file}" || return 1
+    IFS= read -r SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP <"${stdout_file}" ||
+        SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP=''
+    : >"${stdout_file}" || return 1
+    trap -p INT >"${stdout_file}" || return 1
+    IFS= read -r SIXBRIDGE_DMG_PREVIOUS_INT_TRAP <"${stdout_file}" ||
+        SIXBRIDGE_DMG_PREVIOUS_INT_TRAP=''
+    : >"${stdout_file}" || return 1
+    trap -p TERM >"${stdout_file}" || return 1
+    IFS= read -r SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP <"${stdout_file}" ||
+        SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP=''
+    : >"${stdout_file}" || return 1
+    release_dmg_install_signal_handlers
+}
+
+release_dmg_has_active_state() {
+    [[ -n "${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR_IDENTITY}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_PHASE}" ||
+       -n "${SIXBRIDGE_ACTIVE_DMG_DEVICE}" ||
+       -n "${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}" ||
+       "${SIXBRIDGE_ACTIVE_DMG_ATTACHED}" != 0 ||
+       "${SIXBRIDGE_ACTIVE_DMG_CLEANING}" != 0 ]]
+}
+
+release_dmg_clear_active() {
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=''
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY=''
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR=''
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR_IDENTITY=''
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT=''
+    SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY=''
+    SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=''
+    SIXBRIDGE_ACTIVE_DMG_PHASE=''
+    SIXBRIDGE_ACTIVE_DMG_DEVICE=''
+    SIXBRIDGE_ACTIVE_DMG_ATTACHED=0
+    SIXBRIDGE_ACTIVE_DMG_CLEANING=0
+    SIXBRIDGE_DMG_INVENTORY_STATE='UNKNOWN'
+    SIXBRIDGE_DMG_INVENTORY_DEVICE=''
+    SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT=''
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    if [[ "${SIXBRIDGE_DMG_SIGNAL_EXITING}" = 1 ]]; then
+        SIXBRIDGE_DMG_PREVIOUS_HUP_TRAP=''
+        SIXBRIDGE_DMG_PREVIOUS_INT_TRAP=''
+        SIXBRIDGE_DMG_PREVIOUS_TERM_TRAP=''
+        trap '' HUP INT TERM
+    else
+        release_dmg_restore_signal_handlers
+    fi
+}
+
+release_dmg_detach() {
+    local device=$1 hdiutil
+    hdiutil=$(release_tool hdiutil) || return 1
+    [[ "${device}" =~ ^/dev/disk[0-9]+(s[0-9]+)?$ ]] || {
+        release_fail 'DMG detach device 형식이 올바르지 않습니다.'
+        return 1
+    }
+    if ! "${hdiutil}" detach "${device}" >/dev/null 2>&1; then
         release_fail 'DMG mount detach에 실패했습니다.'
         return 1
     fi
-    /bin/rmdir "${mountpoint}" 2>/dev/null || true
+}
+
+release_dmg_cleanup_preserve() {
+    local message=$1
+    SIXBRIDGE_ACTIVE_DMG_CLEANING=0
+    if [[ "${SIXBRIDGE_DMG_SIGNAL_EXITING}" = 1 ]]; then
+        trap '' HUP INT TERM
+    else
+        release_dmg_install_signal_handlers
+    fi
+    release_fail "${message}"
+}
+
+release_dmg_cleanup_active() {
+    local mountpoint=${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT:-}
+    local expected_identity=${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY:-}
+    local snapshot_dir=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR:-}
+    local snapshot_dir_identity=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_DIR_IDENTITY:-}
+    local snapshot=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT:-}
+    local snapshot_identity=${SIXBRIDGE_ACTIVE_DMG_SNAPSHOT_IDENTITY:-}
+    local child=${SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD:-} acquire_child=${SIXBRIDGE_ACTIVE_DMG_ACQUIRE_CHILD:-}
+    local actual_identity device
+    release_dmg_has_active_state || return 0
+    [[ "${SIXBRIDGE_ACTIVE_DMG_CLEANING}" = 0 ]] || {
+        release_fail 'DMG cleanup이 이미 진행 중입니다.'
+        return 1
+    }
+    SIXBRIDGE_ACTIVE_DMG_CLEANING=1
+    trap '' HUP INT TERM
+    if [[ -n "${acquire_child}" ]]; then
+        release_dmg_terminate_acquire_child || {
+            release_dmg_cleanup_preserve 'DMG mountpoint acquire child를 종료하지 못해 evidence를 보존했습니다.'
+            return 1
+        }
+    fi
+    if [[ -n "${child}" ]]; then
+        [[ "${child}" =~ ^[1-9][0-9]*$ ]] || {
+            release_dmg_cleanup_preserve 'DMG attach child PID가 올바르지 않아 evidence를 보존했습니다.'
+            return 1
+        }
+        /bin/kill -TERM "${child}" 2>/dev/null || true
+        wait "${child}" 2>/dev/null || true
+        SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=''
+    fi
+    if [[ -n "${mountpoint}" && -z "${expected_identity}" ]]; then
+        if [[ ! -e "${mountpoint}" && ! -L "${mountpoint}" ]]; then
+            SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=''
+            SIXBRIDGE_ACTIVE_DMG_PHASE='SNAPSHOT_CLEANUP'
+            mountpoint=''
+        else
+            release_dmg_cleanup_preserve "DMG mountpoint identity를 확정할 수 없어 backing snapshot을 보존했습니다: ${snapshot_dir}"
+            return 1
+        fi
+    fi
+    if [[ "${SIXBRIDGE_ACTIVE_DMG_ATTACHED}" = 1 ]]; then
+        release_dmg_inventory || {
+            release_dmg_cleanup_preserve "DMG device inventory가 UNKNOWN이어서 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+            return 1
+        }
+        case "${SIXBRIDGE_DMG_INVENTORY_STATE}" in
+            ABSENT) ;;
+            OWNED)
+                device=${SIXBRIDGE_DMG_INVENTORY_DEVICE}
+                if [[ -n "${SIXBRIDGE_ACTIVE_DMG_DEVICE}" &&
+                      "${SIXBRIDGE_ACTIVE_DMG_DEVICE}" != "${device}" ]]; then
+                    release_dmg_cleanup_preserve "DMG device inventory가 변경되어 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                fi
+                SIXBRIDGE_ACTIVE_DMG_DEVICE=${device}
+                release_dmg_inventory || {
+                    release_dmg_cleanup_preserve "DMG detach 직전 inventory를 확정할 수 없어 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                }
+                [[ "${SIXBRIDGE_DMG_INVENTORY_STATE}" = OWNED &&
+                   "${SIXBRIDGE_DMG_INVENTORY_DEVICE}" = "${device}" ]] || {
+                    release_dmg_cleanup_preserve "DMG detach 직전 inventory가 달라져 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                }
+                release_dmg_detach "${device}" || {
+                    release_dmg_cleanup_preserve "DMG mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                }
+                release_dmg_inventory || {
+                    release_dmg_cleanup_preserve "DMG detach 후 inventory를 확정할 수 없어 evidence를 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                }
+                [[ "${SIXBRIDGE_DMG_INVENTORY_STATE}" = ABSENT ]] || {
+                    release_dmg_cleanup_preserve "DMG detach 후 inventory가 남아 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                    return 1
+                }
+                SIXBRIDGE_ACTIVE_DMG_ATTACHED=0
+                SIXBRIDGE_ACTIVE_DMG_DEVICE=''
+                ;;
+            *)
+                release_dmg_cleanup_preserve "DMG device inventory가 UNKNOWN이어서 mount와 backing snapshot을 보존했습니다: ${mountpoint:-없음} / ${snapshot_dir}"
+                return 1
+                ;;
+        esac
+    fi
+    if [[ -z "${mountpoint}" ]]; then
+        [[ -n "${snapshot_dir}" && -n "${snapshot_dir_identity}" &&
+           -n "${snapshot}" && -n "${snapshot_identity}" ]] || {
+            release_dmg_cleanup_preserve 'DMG pending snapshot state가 불완전하여 evidence를 보존했습니다.'
+            return 1
+        }
+        release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
+            release_dmg_cleanup_preserve "DMG backing snapshot identity가 달라 evidence를 보존했습니다: ${snapshot_dir}"
+            return 1
+        }
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || {
+            release_dmg_cleanup_preserve "DMG backing snapshot을 제거하지 못해 evidence를 보존했습니다: ${snapshot_dir}"
+            return 1
+        }
+        release_dmg_clear_active
+        return 0
+    fi
+    actual_identity=$(release_dmg_mountpoint_identity "${mountpoint}") || {
+        release_dmg_cleanup_preserve "DMG mountpoint identity를 확인할 수 없어 backing snapshot을 보존했습니다: ${snapshot_dir}"
+        return 1
+    }
+    [[ "${actual_identity}" = "${expected_identity}" ]] || {
+        release_dmg_cleanup_preserve "DMG mountpoint identity가 복구되지 않아 backing snapshot을 보존했습니다: ${snapshot_dir}"
+        return 1
+    }
+    if ! release_atomic_remove_owned_directory "${mountpoint}" "${expected_identity}"; then
+        release_dmg_cleanup_preserve "DMG local mountpoint를 제거하지 못해 backing snapshot을 보존했습니다: ${snapshot_dir}"
+        return 1
+    fi
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT=''
+    SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT_IDENTITY=''
+    SIXBRIDGE_ACTIVE_DMG_PHASE='SNAPSHOT_CLEANUP'
+    release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || {
+        release_dmg_cleanup_preserve "DMG backing snapshot을 제거하지 못해 evidence를 보존했습니다: ${snapshot_dir}"
+        return 1
+    }
+    release_dmg_clear_active
 }
 
 release_dmg_cleanup() {
-    local mountpoint=${1:-} snapshot_dir=${2:-} attached=${3:-0} status=0
-    if [[ "${attached}" = 1 ]]; then
-        release_dmg_detach "${mountpoint}" || status=1
-    else
-        /bin/rmdir "${mountpoint}" 2>/dev/null || true
-    fi
-    release_remove_verification_snapshot "${snapshot_dir}" || status=1
-    return "${status}"
+    release_dmg_cleanup_active
 }
 
 release_dmg_value() {
@@ -895,10 +1801,218 @@ release_dmg_value() {
     printf '%s\n' "${raw_output}"
 }
 
+release_verify_desktop_app_properties() {
+    local app_path=$1 snapshot_dir=$2 app_dir cfg cfg_identity jar_list jar_candidate jar_count=0
+    local main_jar='' main_jar_name jar_identity perl_contract perl privlib archlib scanner_status
+    app_dir="${app_path}/Contents/app"
+    release_trusted_directory "${app_path}/Contents" || return 1
+    release_trusted_directory "${app_dir}" || return 1
+    cfg="${app_dir}/SIX Bridge.cfg"
+    release_validate_private_descendant_file "${app_dir}" "${cfg}" || return 1
+    cfg_identity=$(release_file_identity "${cfg}") || return 1
+    jar_list="${snapshot_dir}/dmg-app-jars.nul"
+    [[ ! -e "${jar_list}" && ! -L "${jar_list}" ]] || {
+        release_fail 'DMG app JAR 목록 파일이 이미 존재합니다.'
+        return 1
+    }
+    (umask 077; : >"${jar_list}") || return 1
+    release_dmg_private_file "${jar_list}" || { /bin/rm -f -- "${jar_list}"; return 1; }
+    if ! /usr/bin/find "${app_dir}" -xdev -mindepth 1 -maxdepth 1 \
+        -name "desktop-app-${SIXBRIDGE_RELEASE_VERSION}-SNAPSHOT-*.jar" \
+        -print0 >"${jar_list}"; then
+        /bin/rm -f -- "${jar_list}"
+        release_fail 'DMG desktop app JAR를 열거하지 못했습니다.'
+        return 1
+    fi
+    while IFS= read -r -d '' jar_candidate; do
+        jar_count=$((jar_count + 1))
+        main_jar=${jar_candidate}
+    done <"${jar_list}"
+    /bin/rm -f -- "${jar_list}"
+    [[ "${jar_count}" = 1 && -n "${main_jar}" ]] || {
+        release_fail 'DMG desktop app JAR는 정확히 하나여야 합니다.'
+        return 1
+    }
+    release_validate_private_descendant_file "${app_dir}" "${main_jar}" || return 1
+    main_jar_name=$(/usr/bin/basename -- "${main_jar}") || return 1
+    jar_identity=$(release_file_identity "${main_jar}") || return 1
+    perl_contract=$(release_system_perl) || return 1
+    IFS='|' read -r perl privlib archlib <<<"${perl_contract}"
+    if /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C \
+        SIXBRIDGE_PERL_INC="${privlib}:${archlib}" \
+        "${perl}" -e '
+            BEGIN { @INC = split(/:/, $ENV{SIXBRIDGE_PERL_INC}); }
+            use strict;
+            use warnings;
+            use Digest::SHA;
+            use Fcntl qw(O_RDONLY O_NOFOLLOW SEEK_SET S_ISREG);
+            use IO::Uncompress::Unzip;
+            my ($path, $expected, $version, $cfg_path, $cfg_expected,
+                $expected_basename) = @ARGV;
+            sub verified_file_bytes {
+                my ($file_path, $identity, $max_size, $error_status) = @_;
+                sysopen(my $file, $file_path, O_RDONLY | O_NOFOLLOW)
+                    or exit $error_status;
+                binmode($file);
+                my @before = stat($file);
+                @before && S_ISREG($before[2]) or exit $error_status;
+                my ($device, $inode, $size, $links, $digest) =
+                    split(/:/, $identity, 5);
+                defined($digest) && $digest =~ /\A[0-9a-f]{64}\z/
+                    or exit $error_status;
+                join(q{:}, @before[0,1,7,3]) eq
+                    join(q{:}, $device, $inode, $size, $links)
+                    or exit $error_status;
+                $before[7] <= $max_size or exit $error_status;
+                my $sha = Digest::SHA->new(256);
+                my $bytes = q{};
+                while (1) {
+                    my $read = sysread($file, my $chunk, 65536);
+                    defined($read) or exit $error_status;
+                    last if $read == 0;
+                    length($bytes) + $read <= $max_size or exit $error_status;
+                    $bytes .= $chunk;
+                    $sha->add($chunk);
+                }
+                length($bytes) == $before[7] && $sha->hexdigest eq $digest
+                    or exit $error_status;
+                my @after = stat($file);
+                @after && join(q{:}, @before[0,1,7,3,4,2,10]) eq
+                    join(q{:}, @after[0,1,7,3,4,2,10])
+                    or exit $error_status;
+                close($file) or exit $error_status;
+                return $bytes;
+            }
+            my $cfg_bytes = verified_file_bytes(
+                $cfg_path, $cfg_expected, 1024 * 1024, 3);
+            index($cfg_bytes, "\0") < 0 or exit 3;
+            my $section = q{};
+            my $application_classpath_count = 0;
+            my $application_mainclass_count = 0;
+            my $selected_classpath_count = 0;
+            my $cfg_lines = 0;
+            for my $line (split(/\n/, $cfg_bytes, -1)) {
+                ++$cfg_lines <= 4096 or exit 3;
+                $line =~ s/\r\z//;
+                if ($line =~ /\A\[([^\]\r\n]+)\]\z/) {
+                    $section = $1;
+                    next;
+                }
+                if ($line =~ /\Aapp\.classpath=(.*)\z/) {
+                    my $value = $1;
+                    if ($section eq q{Application}) {
+                        ++$application_classpath_count;
+                        if ($application_classpath_count == 1) {
+                            $value eq q{$APPDIR/} . $expected_basename
+                                or exit 3;
+                        }
+                        if ($value eq q{$APPDIR/} . $expected_basename) {
+                            ++$selected_classpath_count;
+                        }
+                    } elsif ($value eq q{$APPDIR/} . $expected_basename) {
+                        exit 3;
+                    }
+                }
+                if ($line =~ /\Aapp\.mainclass=(.*)\z/) {
+                    $section eq q{Application} or exit 3;
+                    ++$application_mainclass_count;
+                    $1 eq q{dev.sixbridge.desktop.MainKt} or exit 3;
+                }
+            }
+            $application_classpath_count >= 1 &&
+                $selected_classpath_count == 1 &&
+                $application_mainclass_count == 1 or exit 3;
+            sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW) or exit 2;
+            binmode($fh);
+            my @before = stat($fh);
+            @before && S_ISREG($before[2]) or exit 2;
+            my ($device, $inode, $size, $links, $digest) =
+                split(/:/, $expected, 5);
+            defined($digest) && $digest =~ /\A[0-9a-f]{64}\z/ or exit 2;
+            join(q{:}, @before[0,1,7,3]) eq
+                join(q{:}, $device, $inode, $size, $links) or exit 2;
+            $before[7] <= 16 * 1024 * 1024 or exit 2;
+            my $sha = Digest::SHA->new(256);
+            my $total = 0;
+            while (1) {
+                my $read = sysread($fh, my $chunk, 65536);
+                defined($read) or exit 2;
+                last if $read == 0;
+                $total += $read;
+                $sha->add($chunk);
+            }
+            $total == $before[7] && $sha->hexdigest eq $digest or exit 2;
+            sysseek($fh, 0, SEEK_SET) == 0 or exit 2;
+            my $zip = IO::Uncompress::Unzip->new(
+                $fh, MultiStream => 0, Strict => 1, Transparent => 0)
+                or exit 2;
+            my $count = 0;
+            my $properties = q{};
+            my $uncompressed_total = 0;
+            while (1) {
+                my $header = $zip->getHeaderInfo();
+                my $name = $header->{Name};
+                defined($name) && length($name) or exit 2;
+                index($name, "\0") < 0 &&
+                    index($name, q{\\}) < 0 &&
+                    index($name, q{//}) < 0 &&
+                    $name !~ m{\A[A-Za-z]:} &&
+                    $name !~ m{(?:\A/|(?:\A|/)\.\.(?:/|\z)|(?:\A|/)\.(?:/|\z))}
+                    or exit 2;
+                my $entry = q{};
+                while (1) {
+                    my $read = $zip->read(my $chunk, 4096);
+                    defined($read) && $read >= 0 or exit 2;
+                    last if $read == 0;
+                    $uncompressed_total += $read;
+                    $uncompressed_total <= 16 * 1024 * 1024 or exit 2;
+                    if ($name eq q{app.properties}) {
+                        $entry .= $chunk;
+                        length($entry) <= 4096 or exit 2;
+                    }
+                }
+                if ($name eq q{app.properties}) {
+                    ++$count;
+                    $properties = $entry;
+                }
+                my $next = $zip->nextStream();
+                if (defined($next) && $next == 1) {
+                    next;
+                }
+                defined($next) && $next == 0 or exit 2;
+                last;
+            }
+            my $canonical = qq{name=SIX Bridge\n} .
+                qq{applicationId=dev.sixbridge.desktop\n} .
+                qq{version=$version\nminimumMacOs=13.0\n};
+            $count == 1 && $properties eq $canonical or exit 2;
+            my @after = stat($fh);
+            @after or exit 2;
+            join(q{:}, @before[0,1,7,3,4,2,10]) eq
+                join(q{:}, @after[0,1,7,3,4,2,10]) or exit 2;
+            close($fh) or exit 2;
+            exit 0;
+        ' "${main_jar}" "${jar_identity}" "${SIXBRIDGE_RELEASE_VERSION}" \
+          "${cfg}" "${cfg_identity}" "${main_jar_name}"; then
+        scanner_status=0
+    else
+        scanner_status=$?
+    fi
+    case "${scanner_status}" in
+        0) ;;
+        3) release_fail 'DMG launcher classpath와 desktop app JAR가 일치하지 않습니다.'; return 1 ;;
+        *) release_fail 'DMG app.properties version 계약을 검증하지 못했습니다.'; return 1 ;;
+    esac
+    release_assert_file_identity "${cfg}" "${cfg_identity}" || return 1
+    release_assert_file_identity "${main_jar}" "${jar_identity}"
+}
+
 release_verify_dmg() {
     local dmg=${1:-} work_dir=${2:-} stage_root=${3:-} container=${4:-}
-    local mountpoint app_path plist raw_output bundle_id product_version native_version minimum_version
-    local hdiutil codesign dmg_identity snapshot_identity snapshot_dir snapshot stage_identity container_identity app_candidate app_count=0
+    local mountpoint app_path plist raw_output bundle_id package_version native_version minimum_version
+    local hdiutil codesign codesign_status dmg_identity snapshot_identity snapshot_dir snapshot_dir_identity
+    local snapshot stage_identity container_identity app_candidate app_count=0
+    local mount_root attach_status attach_child attach_barrier_status=0 deferred_status
 
     release_require_artifact_stage "${dmg}" "${stage_root}" "${container}" || return 1
     release_require_single_link_file "${dmg}" || return 1
@@ -907,25 +2021,96 @@ release_verify_dmg() {
     release_tool plistbuddy >/dev/null || return 1
     codesign=$(release_tool codesign) || return 1
     dmg_identity=$(release_file_identity "${dmg}") || return 1
-    snapshot_dir=$(release_create_verification_snapshot "${dmg}" "${container}" "${work_dir}") || return 1
+    release_create_verification_snapshot "${dmg}" "${container}" "${work_dir}" || return 1
+    snapshot_dir=${SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR}
+    snapshot_dir_identity=${SIXBRIDGE_VERIFICATION_SNAPSHOT_DIR_IDENTITY}
     if declare -F release_register_owned_work_directory >/dev/null; then
-        release_register_owned_work_directory "${snapshot_dir}" || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+        release_register_owned_work_directory "${snapshot_dir}" "${snapshot_dir_identity}" || {
+            release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+            return 1
+        }
     fi
     snapshot="${snapshot_dir}/artifact"
-    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
-    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}"; return 1; }
+    snapshot_identity=$(release_file_identity "${snapshot}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    stage_identity=$(release_stage_identity "${stage_root}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    container_identity=$(release_container_identity "${container}") || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
 
-    mountpoint=$(/usr/bin/mktemp -d "${work_dir}/sixbridge-dmg.XXXXXX") || {
-        release_remove_verification_snapshot "${snapshot_dir}"
-        release_fail 'DMG mount directory를 만들지 못했습니다.'
-        return 1
-    }
-    if ! raw_output=$("${hdiutil}" attach -readonly -nobrowse -mountpoint "${mountpoint}" "${snapshot}" 2>&1); then
-        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
-        release_fail 'DMG read-only mount에 실패했습니다.'
+    if raw_output=$("${codesign}" -dv --verbose=4 "${snapshot}" 2>&1); then
+        codesign_status=0
+    else
+        codesign_status=$?
+    fi
+    if [[ "${codesign_status}" != 1 ||
+          "${raw_output}" != "${snapshot}: code object is not signed at all" ]]; then
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        release_fail 'DMG container가 미서명 상태가 아닙니다.'
         return 1
     fi
+    release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_file_identity "${dmg}" "${dmg_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+    release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
+
+    release_dmg_register_pending "${snapshot_dir}" "${snapshot}" "${snapshot_identity}" \
+        "${snapshot_dir_identity}" || {
+        release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
+        return 1
+    }
+    mount_root=$(release_dmg_mount_root) || { release_dmg_cleanup_active || true; return 1; }
+    release_create_dmg_mountpoint "${mount_root}" || { release_dmg_cleanup_active || true; return 1; }
+    mountpoint=${SIXBRIDGE_ACTIVE_DMG_MOUNTPOINT}
+    if ! release_dmg_inventory || [[ "${SIXBRIDGE_DMG_INVENTORY_STATE}" != ABSENT ]]; then
+        release_dmg_cleanup_preserve "DMG attach 전 device inventory가 ABSENT가 아니어서 evidence를 보존했습니다: ${mountpoint} / ${snapshot_dir}" || true
+        return 1
+    fi
+    release_dmg_private_file "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT}" || { release_dmg_cleanup_active || true; return 1; }
+    release_dmg_private_file "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR}" || { release_dmg_cleanup_active || true; return 1; }
+    : >"${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT}" || { release_dmg_cleanup_active || true; return 1; }
+    : >"${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR}" || { release_dmg_cleanup_active || true; return 1; }
+    SIXBRIDGE_ACTIVE_DMG_ATTACHED=1
+    SIXBRIDGE_ACTIVE_DMG_PHASE='ATTACHING'
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    release_dmg_install_deferred_signal_handlers
+    "${hdiutil}" attach -readonly -nobrowse -mountpoint "${mountpoint}" "${snapshot}" \
+        >"${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT}" 2>"${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR}" &
+    attach_child=$!
+    release_dmg_attach_spawned_barrier "${attach_child}" || attach_barrier_status=$?
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=${attach_child}
+    release_dmg_install_signal_handlers
+    deferred_status=${SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS}
+    SIXBRIDGE_DMG_DEFERRED_SIGNAL_STATUS=''
+    if [[ -n "${deferred_status}" ]]; then
+        release_dmg_signal_exit "${deferred_status}"
+    fi
+    [[ "${attach_child}" =~ ^[1-9][0-9]*$ ]] || {
+        release_dmg_cleanup_active || true
+        release_fail 'DMG attach child PID를 확인하지 못했습니다.'
+        return 1
+    }
+    if [[ "${attach_barrier_status}" != 0 ]]; then
+        release_dmg_cleanup_active || true
+        release_fail 'DMG attach child 등록 barrier가 실패했습니다.'
+        return 1
+    fi
+    if wait "${attach_child}"; then attach_status=0; else attach_status=$?; fi
+    SIXBRIDGE_ACTIVE_DMG_ATTACH_CHILD=''
+    raw_output=$({ /bin/cat -- "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDOUT}"; /bin/cat -- "${SIXBRIDGE_ACTIVE_DMG_ATTACH_STDERR}"; })
+    if [[ "${attach_status}" != 0 ]]; then
+        release_fail "DMG read-only mount에 실패했습니다: ${raw_output}" || true
+        release_dmg_cleanup_active || true
+        return 1
+    fi
+    if ! release_dmg_inventory || [[ "${SIXBRIDGE_DMG_INVENTORY_STATE}" != OWNED ]]; then
+        release_fail 'DMG attach 성공 뒤 device inventory를 확정하지 못했습니다.' || true
+        release_dmg_cleanup_active || true
+        return 1
+    fi
+    if [[ "${SIXBRIDGE_DMG_INVENTORY_MOUNTPOINT}" != "${mountpoint}" ]]; then
+        release_fail 'DMG attach 성공 뒤 inventory mountpoint가 요청한 mountpoint와 다릅니다.' || true
+        release_dmg_cleanup_active || true
+        return 1
+    fi
+    SIXBRIDGE_ACTIVE_DMG_DEVICE=${SIXBRIDGE_DMG_INVENTORY_DEVICE}
+    SIXBRIDGE_ACTIVE_DMG_PHASE='MOUNTED'
     release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
@@ -959,7 +2144,7 @@ release_verify_dmg() {
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
-    product_version=$(release_dmg_value "${plist}" CFBundleShortVersionString) || {
+    package_version=$(release_dmg_value "${plist}" CFBundleShortVersionString) || {
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
@@ -976,9 +2161,9 @@ release_verify_dmg() {
         release_fail 'DMG bundle ID가 계약과 다릅니다.'
         return 1
     fi
-    if [[ "${product_version}" != "${SIXBRIDGE_RELEASE_VERSION}" ]]; then
+    if [[ "${package_version}" != '1.0.0' ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
-        release_fail 'DMG product version이 계약과 다릅니다.'
+        release_fail 'DMG package version이 계약과 다릅니다.'
         return 1
     fi
     if [[ "${native_version}" != '1.0.0' ]]; then
@@ -991,14 +2176,27 @@ release_verify_dmg() {
         release_fail 'DMG minimum macOS version이 계약과 다릅니다.'
         return 1
     fi
-    if raw_output=$("${codesign}" -dv --verbose=4 "${app_path}" 2>&1); then
+    if ! release_verify_desktop_app_properties "${app_path}" "${snapshot_dir}"; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
-        release_fail 'DMG는 v0.1.0에서 미서명이어야 합니다.'
         return 1
     fi
-    if ! printf '%s\n' "${raw_output}" | /usr/bin/grep -Fq 'not signed at all'; then
+    if raw_output=$("${codesign}" -dv --verbose=4 "${app_path}" 2>&1); then
+        codesign_status=0
+    else
+        codesign_status=$?
+    fi
+    if [[ "${codesign_status}" = 0 ]]; then
+        if ! /usr/bin/grep -Fqx 'Signature=adhoc' <<<"${raw_output}" ||
+           ! /usr/bin/grep -Fqx 'TeamIdentifier=not set' <<<"${raw_output}" ||
+           /usr/bin/grep -Eq '^Authority=' <<<"${raw_output}"; then
+            release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+            release_fail 'DMG에 Developer ID 서명이 있으면 안 됩니다.'
+            return 1
+        fi
+    elif [[ "${codesign_status}" != 1 ||
+            "${raw_output}" != "${app_path}: code object is not signed at all" ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
-        release_fail 'codesign이 미서명 상태를 확인하지 못했습니다.'
+        release_fail 'codesign이 Developer ID 미서명 상태를 확인하지 못했습니다.'
         return 1
     fi
     release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
@@ -1375,10 +2573,21 @@ release_verify_checksums() {
     done
     # Do not create verifier-owned temporary files in the release tree: doing
     # so would modify the stage directory identity that this function checks.
-    expected_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/sixbridge-release-checksums.XXXXXX") || {
+    if [[ -n "${SIXBRIDGE_RELEASE_TRANSIENT_ROOT:-}" ]]; then
+        expected_file="$(release_verification_transient_root "${container}")/sixbridge-release-checksums.XXXXXX"
+    else
+        expected_file="${TMPDIR:-/tmp}/sixbridge-release-checksums.XXXXXX"
+    fi
+    expected_file=$(/usr/bin/mktemp "${expected_file}") || {
         release_fail 'checksum 비교 임시 파일을 만들지 못했습니다.'
         return 1
     }
+    if declare -F release_checksum_temp_created_barrier >/dev/null; then
+        release_checksum_temp_created_barrier "${expected_file}" || {
+            /bin/rm -f "${expected_file}"
+            return 1
+        }
+    fi
     printf '%s' "${expected}" >"${expected_file}" || {
         /bin/rm -f "${expected_file}"
         release_fail 'checksum 비교 데이터를 만들지 못했습니다.'
@@ -1400,7 +2609,8 @@ release_verify_checksums() {
 
 release_verify_directory() {
     local directory=${1:-} expected_signer=${2:-} container=${3:-}
-    local physical_directory entries entry basename count=0 work_dir stage_identity container_identity
+    local physical_directory entries entry basename count=0 work_parent work_dir work_dir_identity
+    local stage_identity container_identity
     release_validate_stage_root "${directory}" "${container}" || return 1
     [[ "${expected_signer}" =~ ^[0-9a-f]{64}$ ]] || {
         release_fail 'expected signer SHA-256 형식이 올바르지 않습니다.'
@@ -1435,20 +2645,37 @@ release_verify_directory() {
     release_verify_checksums "${physical_directory}" "${directory}" "${container}" || return 1
     release_verify_metadata "${physical_directory}" "${expected_signer}" "${directory}" "${container}" || return 1
     release_verify_apk "${physical_directory}/${SIXBRIDGE_ANDROID_FILE}" "${expected_signer}" "${directory}" "${container}" || return 1
-    work_dir=$(/usr/bin/mktemp -d "${container}/.sixbridge-release-verify.XXXXXX") || {
+    work_parent=${container}
+    if [[ -n "${SIXBRIDGE_RELEASE_TRANSIENT_ROOT:-}" ]]; then
+        work_parent=$(release_verification_transient_root "${container}") || return 1
+    fi
+    work_dir=$(/usr/bin/mktemp -d "${work_parent}/.sixbridge-release-verify.XXXXXX") || {
         release_fail 'DMG verification work directory를 만들지 못했습니다.'
         return 1
     }
-    release_private_directory "${work_dir}" || { /bin/rm -rf "${work_dir}"; return 1; }
+    release_private_directory "${work_dir}" || return 1
+    work_dir_identity=$(release_owned_directory_identity "${work_dir}") || return 1
     if declare -F release_register_owned_work_directory >/dev/null; then
-        release_register_owned_work_directory "${work_dir}" || { /bin/rm -rf "${work_dir}"; return 1; }
+        release_register_owned_work_directory "${work_dir}" "${work_dir_identity}" || {
+            release_atomic_remove_owned_directory "${work_dir}" "${work_dir_identity}" || true
+            return 1
+        }
     fi
-    stage_identity=$(release_stage_identity "${directory}") || { /bin/rm -rf "${work_dir}"; return 1; }
-    container_identity=$(release_container_identity "${container}") || { /bin/rm -rf "${work_dir}"; return 1; }
+    stage_identity=$(release_stage_identity "${directory}") || { release_atomic_remove_owned_directory "${work_dir}" "${work_dir_identity}" || true; return 1; }
+    container_identity=$(release_container_identity "${container}") || { release_atomic_remove_owned_directory "${work_dir}" "${work_dir_identity}" || true; return 1; }
     if ! release_verify_dmg "${physical_directory}/${SIXBRIDGE_MACOS_FILE}" "${work_dir}" "${directory}" "${container}"; then
-        /bin/rm -rf "${work_dir}"
+        if ! release_dmg_has_active_state; then
+            release_atomic_remove_owned_directory "${work_dir}" "${work_dir_identity}" || true
+        fi
         return 1
     fi
-    /bin/rm -rf "${work_dir}"
+    release_dmg_has_active_state && {
+        release_fail 'DMG active mount state가 정상 검증 뒤 남았습니다.'
+        return 1
+    }
+    if declare -F release_after_dmg_verification_cleanup_barrier >/dev/null; then
+        release_after_dmg_verification_cleanup_barrier "${work_dir}" || return 1
+    fi
+    release_atomic_remove_owned_directory "${work_dir}" "${work_dir_identity}" || return 1
     release_assert_stage_identity "${directory}" "${container}" "${stage_identity}" "${container_identity}"
 }

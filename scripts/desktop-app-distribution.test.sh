@@ -181,6 +181,7 @@ app_bundle="$(find desktop-app/build/compose/binaries/main/app -maxdepth 1 -type
 app_plist="$app_bundle/Contents/Info.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_plist")" == "dev.sixbridge.desktop" ]] || fail "packaged bundle ID가 일치하지 않습니다."
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_plist")" == "1.0.0" ]] || fail "macOS native package version이 일치하지 않습니다."
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_plist")" == "1.0.0" ]] || fail "macOS native build version이 일치하지 않습니다."
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app_plist")" == "13.0" ]] || fail "packaged minimum macOS version이 일치하지 않습니다."
 
 scan_roots=(

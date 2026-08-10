@@ -8,9 +8,47 @@ readonly RELEASE_PASSWORD='fixture-release-password'
 readonly SECRET_PROBE='fixture-secret-probe'
 readonly TEMPLATE_KEYSTORE="${FIXTURE_ROOT}/fixture-release.p12"
 readonly PRIVATE_TMP_RELEASE_ENTRIES_BEFORE="$(find /private/tmp -maxdepth 1 -name 'sixbridge-release-*' -print 2>/dev/null | LC_ALL=C sort)"
+readonly PRIVATE_TMP_DMG_ENTRIES_BEFORE="$(find /private/tmp -maxdepth 1 -name 'sixbridge-dmg.*' -print 2>/dev/null | LC_ALL=C sort)"
 readonly NATIVE_JDK17_JAVA='/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin/java'
 
-cleanup() { rm -rf "${FIXTURE_ROOT}"; }
+cleanup_fake_dmg_manifest() {
+    local manifest=${1:-} candidate expected_identity nonce extra parent basename owner current_uid
+    local actual_identity marker marker_state
+    [[ -f "${manifest}" && ! -L "${manifest}" ]] || return 0
+    current_uid=$(/usr/bin/id -u) || return 0
+    while IFS=$'\t' read -r candidate expected_identity nonce extra; do
+        [[ -n "${candidate}" && -n "${expected_identity}" && -n "${nonce}" && -z "${extra:-}" ]] || continue
+        case "${nonce}" in *[!0-9a-f-]*) continue ;; esac
+        case "${expected_identity}" in *[!0-9:]*) continue ;; esac
+        parent=$(/usr/bin/dirname -- "${candidate}" 2>/dev/null) || continue
+        basename=$(/usr/bin/basename -- "${candidate}" 2>/dev/null) || continue
+        [[ "${parent}" = /private/tmp ]] || continue
+        case "${basename}" in sixbridge-dmg.*) ;; *) continue ;; esac
+        [[ -d "${candidate}" && ! -L "${candidate}" ]] || continue
+        owner=$(/usr/bin/stat -f '%u' "${candidate}" 2>/dev/null) || continue
+        actual_identity=$(/usr/bin/stat -f '%d:%i' "${candidate}" 2>/dev/null) || continue
+        [[ "${owner}" = "${current_uid}" && "${actual_identity}" = "${expected_identity}" ]] || continue
+        marker="${candidate}/.sixbridge-fixture-${nonce}"
+        [[ -f "${marker}" && ! -L "${marker}" ]] || continue
+        marker_state=$(/usr/bin/stat -f '%u:%Lp' "${marker}" 2>/dev/null) || continue
+        [[ "${marker_state}" = "${current_uid}:600" ]] || continue
+        [[ "$(/bin/cat -- "${marker}" 2>/dev/null)" = "${nonce}" ]] || continue
+        /bin/rm -rf -- "${candidate}"
+    done <"${manifest}"
+}
+
+cleanup_fake_dmg_manifests() {
+    local fixture_root=${1:-} manifest
+    [[ -d "${fixture_root}" && ! -L "${fixture_root}" ]] || return 0
+    while IFS= read -r manifest; do
+        cleanup_fake_dmg_manifest "${manifest}"
+    done < <(/usr/bin/find "${fixture_root}" -type f -name '*.dmg-mount-manifest' -print 2>/dev/null)
+}
+
+cleanup() {
+    cleanup_fake_dmg_manifests "${FIXTURE_ROOT}"
+    /bin/rm -rf "${FIXTURE_ROOT}"
+}
 trap cleanup EXIT
 
 fail() {
@@ -143,6 +181,7 @@ release_tool() {
         apksigner) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apksigner" ;;
         apkanalyzer) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apkanalyzer" ;;
         hdiutil) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/hdiutil" ;;
+        plutil) printf '%s\n' /usr/bin/plutil ;;
         plistbuddy) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/PlistBuddy" ;;
         codesign) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/codesign" ;;
         jq) printf '%s\n' "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/jq" ;;
@@ -159,6 +198,18 @@ release_android_sdk_root() {
 }
 release_validate_android_sdk() {
     [[ "$1" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk" && -d "$1" ]]
+}
+release_after_dmg_verification_cleanup_barrier() {
+    local work_dir=$1 parked
+    [[ "${SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION:-}" = work-rebind ]] || return 0
+    parked="${work_dir}.parked"
+    /bin/mv -- "${work_dir}" "${parked}" || return 1
+    /bin/mkdir -m 700 -- "${work_dir}" || return 1
+    printf 'preserve\n' >"${work_dir}/sentinel"
+    printf '%s\n' "${work_dir}" \
+        >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-work-rebind.path"
+    printf '%s\n' "${parked}" \
+        >"${SIXBRIDGE_RELEASE_ROOT}/.local/releases/.fixture-work-rebind.parked"
 }
 release_node_executable() {
     case "${SIXBRIDGE_PREPARE_RUNTIME_MISMATCH:-}" in
@@ -385,17 +436,109 @@ esac
 EOF
     cat >"${bin}/hdiutil" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+state_root="${SIXBRIDGE_PREPARE_LOG}.dmg-state"
+state_source="${state_root}/source"
+state_mountpoint="${state_root}/mountpoint"
+state_device="${state_root}/device"
+/bin/mkdir -p "${state_root}"
+/bin/chmod 700 "${state_root}"
+
+write_inventory() {
+  local plist
+  plist=$(/usr/bin/mktemp "${state_root}/info.XXXXXX.plist")
+  /usr/bin/plutil -create xml1 "${plist}"
+  /usr/bin/plutil -insert images -array "${plist}"
+  if [[ -f "${state_source}" ]]; then
+    /usr/bin/plutil -insert images.0 -dictionary "${plist}"
+    /usr/bin/plutil -insert images.0.image-path -string "$(/bin/cat -- "${state_source}")" "${plist}"
+    /usr/bin/plutil -insert images.0.system-entities -array "${plist}"
+    /usr/bin/plutil -insert images.0.system-entities.0 -dictionary "${plist}"
+    /usr/bin/plutil -insert images.0.system-entities.0.dev-entry -string \
+      "$(/bin/cat -- "${state_device}")" "${plist}"
+    /usr/bin/plutil -insert images.0.system-entities.0.mount-point -string \
+      "$(/bin/cat -- "${state_mountpoint}")" "${plist}"
+  fi
+  /bin/cat -- "${plist}"
+  /bin/rm -f -- "${plist}"
+}
+
 case "$1" in
+  info)
+    [[ "${2:-}" = -plist ]] || exit 65
+    write_inventory
+    ;;
   attach)
     [[ "${SIXBRIDGE_PREPARE_DMG_VERIFY_FAIL:-0}" != 1 ]] || exit 64
+    source=${!#}
     shift
     while [[ "$#" -gt 0 ]]; do
       if [[ "$1" = -mountpoint ]]; then mountpoint=$2; shift 2; else shift; fi
     done
-    mkdir -p "${mountpoint}/SIX Bridge.app/Contents"
+    case "${mountpoint}" in /private/tmp/sixbridge-dmg.*) ;; *) exit 67 ;; esac
+    [[ "$(/usr/bin/stat -f '%u:%Lp' "${mountpoint}")" = "$(/usr/bin/id -u):700" ]] || exit 68
+    printf '%s\n' "${source}" >"${SIXBRIDGE_PREPARE_LOG}.dmg-source"
+    printf '%s\n' "${mountpoint}" >"${SIXBRIDGE_PREPARE_LOG}.dmg-mount"
+    manifest="${SIXBRIDGE_PREPARE_LOG}.dmg-mount-manifest"
+    nonce=$(LC_ALL=C /usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
+    printf '%s' "${nonce}" >"${SIXBRIDGE_PREPARE_LOG}.dmg-nonce"
+    /bin/chmod 600 "${SIXBRIDGE_PREPARE_LOG}.dmg-nonce"
+    record_fake_dmg_object() {
+      candidate=$1
+      marker="${candidate}/.sixbridge-fixture-${nonce}"
+      (umask 077; printf '%s' "${nonce}" >"${marker}")
+      /bin/chmod 600 "${marker}"
+      identity=$(/usr/bin/stat -f '%d:%i' "${candidate}")
+      printf '%s\t%s\t%s\n' "${candidate}" "${identity}" "${nonce}" >>"${manifest}"
+    }
+    record_fake_dmg_object "${mountpoint}"
+    mv "${mountpoint}" "${mountpoint}.underlay"
+    record_fake_dmg_object "${mountpoint}.underlay"
+    mkdir -m 700 "${mountpoint}"
+    record_fake_dmg_object "${mountpoint}"
+    mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app"
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
+    printf '%s\n' \
+      '[Application]' \
+      'app.classpath=$APPDIR/desktop-app-0.1.0-SNAPSHOT-fixture.jar' \
+      'app.mainclass=dev.sixbridge.desktop.MainKt' \
+      >"${mountpoint}/SIX Bridge.app/Contents/app/SIX Bridge.cfg"
+    mkdir -p "${state_root}/jar-input"
+    printf '%s\n' \
+      'name=SIX Bridge' \
+      'applicationId=dev.sixbridge.desktop' \
+      'version=0.1.0' \
+      'minimumMacOs=13.0' \
+      >"${state_root}/jar-input/app.properties"
+    (CDPATH= builtin cd -- "${state_root}/jar-input" && \
+      /usr/bin/zip -q -X \
+        "${mountpoint}/SIX Bridge.app/Contents/app/desktop-app-0.1.0-SNAPSHOT-fixture.jar" \
+        app.properties)
+    printf '%s' "${source}" >"${state_source}"
+    printf '%s' "${mountpoint}" >"${state_mountpoint}"
+    printf '%s' '/dev/disk71' >"${state_device}"
+    if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = dmg ]]; then
+      printf '%s\n' "${TMPDIR}" >"${SIXBRIDGE_PREPARE_TMPDIR_RECORD}"
+      : >"${TMPDIR}/sixbridge-release-fixture-child-temp"
+      /bin/sleep 600 &
+      printf '%s\n' "$$ $!" >"${SIXBRIDGE_PREPARE_CHILD_PID}"
+      : >"${SIXBRIDGE_PREPARE_READY}"
+      wait "$!"
+    fi
     ;;
-  detach) rm -rf "$2" ;;
+  detach)
+    source=$(/bin/cat -- "${state_source}")
+    [[ -f "${source}" ]] || exit 69
+    printf '%s\n' 'HDIUTIL-DETACH snapshot-present=1' >>"${SIXBRIDGE_PREPARE_LOG}"
+    [[ "${SIXBRIDGE_PREPARE_DMG_VERIFY_FAIL:-0}" != detach ]] || exit 70
+    [[ "${2:-}" = "$(/bin/cat -- "${state_device}")" ]] || exit 71
+    mountpoint=$(/bin/cat -- "${state_mountpoint}")
+    rm -rf "${mountpoint}"
+    nonce=$(/bin/cat -- "${SIXBRIDGE_PREPARE_LOG}.dmg-nonce")
+    /bin/rm -f -- "${mountpoint}.underlay/.sixbridge-fixture-${nonce}"
+    mv "${mountpoint}.underlay" "${mountpoint}"
+    /bin/rm -f -- "${state_source}" "${state_mountpoint}" "${state_device}"
+    ;;
   *) exit 65 ;;
 esac
 EOF
@@ -403,16 +546,23 @@ EOF
 #!/usr/bin/env bash
 case "$2" in
   'Print :CFBundleIdentifier') printf '%s\n' dev.sixbridge.desktop ;;
-  'Print :CFBundleShortVersionString') printf '%s\n' 0.1.0 ;;
+  'Print :CFBundleShortVersionString') printf '%s\n' 1.0.0 ;;
   'Print :CFBundleVersion') printf '%s\n' 1.0.0 ;;
   'Print :LSMinimumSystemVersion') printf '%s\n' 13.0 ;;
   *) exit 66 ;;
 esac
 EOF
-    cat >"${bin}/codesign" <<'EOF'
+cat >"${bin}/codesign" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' 'code object is not signed at all' >&2
-exit 1
+target=${!#}
+case "${target}" in
+  */.sixbridge-release-snapshot.*/artifact)
+    printf '%s: code object is not signed at all\n' "${target}" >&2
+    exit 1
+    ;;
+esac
+printf '%s\n' 'CodeDirectory v=20500 flags=0x10002(adhoc,runtime)' 'Signature=adhoc' 'TeamIdentifier=not set' >&2
+exit 0
 EOF
     cat >"${bin}/jq" <<'EOF'
 #!/usr/bin/env bash
@@ -595,6 +745,83 @@ chmod 600 "${TEMPLATE_KEYSTORE}"
 readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 [[ -x "${NATIVE_JDK17_JAVA}" ]] || fail "UTF-8 locale fixture JDK 17을 찾을 수 없습니다: ${NATIVE_JDK17_JAVA}"
+
+if [[ "${SIXBRIDGE_PREPARE_TEST_NORMAL_ONLY:-0}" = 1 ]]; then
+    setup_case normal-only
+    run_prepare
+    normal_final="${CASE_ROOT}/.local/releases/v0.1.0"
+    assert_exact_release_files "${normal_final}"
+    assert_no_release_work_entries "${CASE_ROOT}"
+    normal_snapshot=$(/bin/cat -- "${CASE_LOG}.dmg-source")
+    normal_mountpoint=$(/bin/cat -- "${CASE_LOG}.dmg-mount")
+    [[ ! -e "${normal_snapshot}" && ! -L "${normal_snapshot}" &&
+       ! -e "${normal_mountpoint}" && ! -L "${normal_mountpoint}" ]] ||
+        fail '정상 prepare 뒤 DMG snapshot 또는 mountpoint가 남았습니다.'
+    for normal_state in source mountpoint device; do
+        [[ ! -e "${CASE_LOG}.dmg-state/${normal_state}" ]] ||
+            fail "정상 prepare 뒤 fake hdiutil ${normal_state} state가 남았습니다."
+    done
+    printf '%s\n' 'prepare 정상 DMG inventory 통합 검증 통과'
+    exit 0
+fi
+
+if [[ "${SIXBRIDGE_PREPARE_TEST_SIGNAL_ONLY:-0}" != 1 ]]; then
+setup_case fake-dmg-manifest-cleanup
+fixture_cleanup_source="${CASE_ROOT}/fixture-cleanup.dmg"
+: >"${fixture_cleanup_source}"
+fixture_cleanup_mountpoint=$(/usr/bin/mktemp -d '/private/tmp/sixbridge-dmg.XXXXXX')
+/bin/chmod 700 "${fixture_cleanup_mountpoint}"
+set +e
+(
+    trap 'cleanup_fake_dmg_manifests "${FIXTURE_ROOT}"' EXIT
+    SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" "${CASE_ROOT}/bin/hdiutil" \
+        attach -readonly -nobrowse -mountpoint "${fixture_cleanup_mountpoint}" \
+        "${fixture_cleanup_source}"
+    exit 91
+)
+fixture_cleanup_status=$?
+set -e
+[[ "${fixture_cleanup_status}" = 91 ]] || fail "prepare fake DMG 중간 실패 status가 다릅니다: ${fixture_cleanup_status}"
+if [[ -e "${fixture_cleanup_mountpoint}" || -L "${fixture_cleanup_mountpoint}" ||
+      -e "${fixture_cleanup_mountpoint}.underlay" || -L "${fixture_cleanup_mountpoint}.underlay" ]]; then
+    /bin/rm -rf -- "${fixture_cleanup_mountpoint}" "${fixture_cleanup_mountpoint}.underlay"
+    fail 'prepare fake DMG 중간 실패 뒤 exact local overlay 또는 underlay가 남았습니다.'
+fi
+
+fixture_reused_mountpoint=$(/usr/bin/mktemp -d '/private/tmp/sixbridge-dmg.XXXXXX')
+/bin/chmod 700 "${fixture_reused_mountpoint}"
+set +e
+(
+    trap 'cleanup_fake_dmg_manifests "${FIXTURE_ROOT}"' EXIT
+    SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" "${CASE_ROOT}/bin/hdiutil" \
+        attach -readonly -nobrowse -mountpoint "${fixture_reused_mountpoint}" \
+        "${fixture_cleanup_source}"
+    /bin/rm -rf -- "${fixture_reused_mountpoint}"
+    /bin/mkdir -m 700 "${fixture_reused_mountpoint}"
+    : >"${fixture_reused_mountpoint}/same-user-reused-path"
+    exit 92
+)
+fixture_reused_status=$?
+set -e
+[[ "${fixture_reused_status}" = 92 ]] || fail "prepare fake DMG path reuse status가 다릅니다: ${fixture_reused_status}"
+fixture_reused_preserved=0
+[[ -f "${fixture_reused_mountpoint}/same-user-reused-path" ]] && fixture_reused_preserved=1
+/bin/rm -rf -- "${fixture_reused_mountpoint}" "${fixture_reused_mountpoint}.underlay"
+[[ "${fixture_reused_preserved}" = 1 ]] || fail 'prepare manifest cleanup이 같은 UID로 재사용된 경로를 삭제했습니다.'
+
+fixture_unmanifested_sentinel=$(/usr/bin/mktemp -d '/private/tmp/sixbridge-dmg.unmanifested.XXXXXX')
+/bin/chmod 700 "${fixture_unmanifested_sentinel}"
+: >"${fixture_unmanifested_sentinel}/preserve"
+cleanup_fake_dmg_manifests "${FIXTURE_ROOT}"
+fixture_sentinel_preserved=0
+[[ -f "${fixture_unmanifested_sentinel}/preserve" ]] && fixture_sentinel_preserved=1
+/bin/rm -rf -- "${fixture_unmanifested_sentinel}"
+[[ "${fixture_sentinel_preserved}" = 1 ]] || fail 'prepare manifest에 없는 같은 prefix sentinel을 cleanup이 삭제했습니다.'
+
+if [[ "${SIXBRIDGE_PREPARE_TEST_DMG_MANIFEST_ONLY:-0}" = 1 ]]; then
+    printf '%s\n' 'prepare fake DMG manifest 검증 통과'
+    exit 0
+fi
 
 setup_case forged-public-internal-worker
 mkdir -p "${CASE_ROOT}/.local/gradle-home"
@@ -1174,6 +1401,17 @@ expect_failure post-verify-extra-symlink '정확히 다섯 개' \
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
+setup_case post-verify-work-rebind
+expect_failure post-verify-work-rebind 'identity-bound cleanup' \
+    run_prepare /usr/bin/env SIXBRIDGE_PREPARE_POST_VERIFY_MUTATION=work-rebind
+work_rebind_path=$(/bin/cat -- "${CASE_ROOT}/.local/releases/.fixture-work-rebind.path")
+work_rebind_parked=$(/bin/cat -- "${CASE_ROOT}/.local/releases/.fixture-work-rebind.parked")
+work_rebind_ancestor=$(/usr/bin/dirname -- "${work_rebind_path}")
+[[ -f "${work_rebind_path}/sentinel" && -d "${work_rebind_parked}" &&
+   -d "${work_rebind_ancestor}" ]] ||
+    fail 'prepare cleanup이 work replacement, original 또는 ancestor evidence를 보존하지 않았습니다.'
+assert_no_final_directory "${CASE_ROOT}"
+
 setup_case snapshot-barrier-content
 run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=content
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
@@ -1269,6 +1507,7 @@ assert_not_contains "${CASE_LOG}" "${RELEASE_PASSWORD}" '호출 log에 실제 �
 if rg -n --hidden --glob '!*' "${SECRET_PROBE}|${RELEASE_PASSWORD}" "${final_one}" >/dev/null; then
     fail '정상 release directory에 secret probe 또는 비밀번호가 포함되었습니다.'
 fi
+fi
 
 for signal in HUP INT TERM; do
     setup_case "signal-${signal}"
@@ -1276,6 +1515,7 @@ for signal in HUP INT TERM; do
     signal_ready="${CASE_ROOT}/ready"
     signal_continue="${CASE_ROOT}/continue"
     signal_child="${CASE_ROOT}/child.pid"
+    if [[ "${signal}" = TERM ]]; then signal_wait_mode=dmg; else signal_wait_mode=1; fi
     /usr/bin/perl -e '$SIG{HUP} = "DEFAULT"; $SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "exec failed\n";' \
         /usr/bin/env \
         PATH="${CASE_ROOT}/bin:${PATH}" \
@@ -1284,15 +1524,26 @@ for signal in HUP INT TERM; do
         SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}" \
         SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=1 \
+        SIXBRIDGE_PREPARE_WAIT_IN_VERIFY="${signal_wait_mode}" \
         SIXBRIDGE_PREPARE_READY="${signal_ready}" \
         SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
         SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
         SIXBRIDGE_PREPARE_TMPDIR_RECORD="${CASE_ROOT}/child-tmpdir" \
         "${CASE_PREPARE_SCRIPT}" 0.1.0 >"${signal_log}" 2>&1 &
     signal_pid=$!
-    for _ in $(seq 1 100); do [[ -e "${signal_ready}" ]] && break; /bin/sleep 0.05; done
-    [[ -e "${signal_ready}" ]] || fail "${signal} cleanup fixture가 verifier 대기 상태에 도달하지 못했습니다."
+    signal_ready_started=${SECONDS}
+    for _ in $(seq 1 400); do
+        [[ -e "${signal_ready}" ]] && break
+        kill -0 "${signal_pid}" 2>/dev/null || break
+        /bin/sleep 0.05
+    done
+    [[ -e "${signal_ready}" ]] || {
+        /bin/cat -- "${signal_log}" >&2 || true
+        kill -TERM "${signal_pid}" 2>/dev/null || true
+        wait "${signal_pid}" 2>/dev/null || true
+        fail "${signal} cleanup fixture가 verifier 대기 상태에 도달하지 못했습니다."
+    }
+    printf '%s\n' "prepare signal ${signal} ready=$((SECONDS - signal_ready_started))s"
     kill -"${signal}" "${signal_pid}"
     for _ in $(seq 1 40); do kill -0 "${signal_pid}" 2>/dev/null || break; /bin/sleep 0.05; done
     if kill -0 "${signal_pid}" 2>/dev/null; then
@@ -1318,8 +1569,20 @@ for signal in HUP INT TERM; do
     case "${signal_tmpdir}" in "${signal_root}"/.local/releases/.sixbridge-release-tmp.*) ;; *) fail "${signal} child TMPDIR이 이번 release private work root가 아닙니다: ${signal_tmpdir}" ;; esac
     [[ ! -e "${signal_tmpdir}" && ! -L "${signal_tmpdir}" ]] || fail "${signal} signal 뒤 child TMPDIR이 남았습니다."
     [[ "$(find /private/tmp -maxdepth 1 -name 'sixbridge-release-*' -print 2>/dev/null | LC_ALL=C sort)" = "${PRIVATE_TMP_RELEASE_ENTRIES_BEFORE}" ]] || fail "${signal} signal 뒤 새 /private/tmp release temp가 남았습니다."
+    [[ "$(find /private/tmp -maxdepth 1 -name 'sixbridge-dmg.*' -print 2>/dev/null | LC_ALL=C sort)" = "${PRIVATE_TMP_DMG_ENTRIES_BEFORE}" ]] || fail "${signal} signal 뒤 새 /private/tmp DMG mountpoint가 남았습니다."
+    if [[ "${signal}" = TERM ]]; then
+        assert_call_count "${CASE_LOG}" 'HDIUTIL-DETACH snapshot-present=1'
+        signal_dmg_source=$(/bin/cat -- "${CASE_LOG}.dmg-source")
+        signal_dmg_mount=$(/bin/cat -- "${CASE_LOG}.dmg-mount")
+        [[ ! -e "${signal_dmg_source}" && ! -e "${signal_dmg_mount}" ]] || fail 'TERM 뒤 DMG snapshot 또는 local mountpoint가 남았습니다.'
+    fi
     assert_log_has_no_secret "${signal_log}"
 done
+
+if [[ "${SIXBRIDGE_PREPARE_TEST_SIGNAL_ONLY:-0}" = 1 ]]; then
+    printf '%s\n' 'prepare signal cleanup 검증 통과'
+    exit 0
+fi
 
 setup_case eight-way-concurrency
 concurrent_successes=0
@@ -1359,5 +1622,8 @@ assert_not_contains "${CASE_LOG}" 'PATH-KEYTOOL' 'PATH keytool shim이 실행되
 assert_not_contains "${CASE_LOG}" 'PATH-GIT' 'PATH git shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-NODE' 'PATH node shim이 실행되었습니다.'
 assert_not_contains "${CASE_LOG}" 'PATH-RG' 'PATH rg shim이 실행되었습니다.'
+
+[[ "$(find /private/tmp -maxdepth 1 -name 'sixbridge-dmg.*' -print 2>/dev/null | LC_ALL=C sort)" = "${PRIVATE_TMP_DMG_ENTRIES_BEFORE}" ]] || \
+    fail 'prepare fixture 뒤 새 /private/tmp DMG mountpoint가 남았습니다.'
 
 printf 'prepare release 검증 통과\n'
