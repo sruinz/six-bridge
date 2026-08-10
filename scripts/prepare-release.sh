@@ -440,7 +440,7 @@ prepare_release_worker "$@"
     /bin/bash --noprofile --norc -p -c "${sanitizer_script}" sixbridge-sanitizer \
         "${perl_sanitizer}" "${worker_bootstrap}" "${ROOT_DIR}" \
         "${RELEASE_LIB_IDENTITY}" \
-        "${runtime_path}" "${java_home}" "${gradle_home}" "$@" &
+        "${runtime_path}" "${java_home}" "${gradle_home}" "$@" </dev/null &
     ACTIVE_CHILD_PID=$!
     ACTIVE_CHILD_PGID=$!
     exec 6<&- 7<&-

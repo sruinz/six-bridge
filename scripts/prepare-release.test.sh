@@ -341,6 +341,9 @@ EOF
     cat >"${bin}/apksigner" <<'EOF'
 #!/usr/bin/env bash
 [[ "${SIXBRIDGE_PREPARE_APK_VERIFY_FAIL:-0}" != 1 ]] || exit 62
+if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = non-tty-stdin ]]; then
+  [[ ! -t 0 ]] || exit 91
+fi
     if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = argv ]]; then
       : >"${SIXBRIDGE_PREPARE_READY}"
       while [[ ! -e "${SIXBRIDGE_PREPARE_CONTINUE}" ]]; do /bin/sleep 0.05; done
@@ -966,6 +969,24 @@ if ! wait "${sanitizer_parent_pid}"; then
 fi
 assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
 assert_log_has_no_secret "${sanitizer_log}"
+
+setup_case tty-worker-stdin
+tty_worker_log="${FIXTURE_ROOT}/tty-worker-stdin.log"
+set +e
+(
+    cd "${CASE_ROOT}"
+    export PATH="${CASE_ROOT}/bin:${PATH}"
+    export SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin"
+    export SIXBRIDGE_PREPARE_LOG="${CASE_LOG}"
+    export SIXBRIDGE_PREPARE_SIGNER="${FIXTURE_SIGNER}"
+    export SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}"
+    export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
+    export SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=non-tty-stdin
+    /usr/bin/script -q "${tty_worker_log}" "${CASE_PREPARE_SCRIPT}" 0.1.0
+)
+set -e
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
+assert_log_has_no_secret "${tty_worker_log}"
 
 setup_case runtime-node-resolution-mismatch
 expect_failure runtime-node-resolution-mismatch 'sanitized PATH의 node가 검증된 canonical 도구와 다릅니다.' \
