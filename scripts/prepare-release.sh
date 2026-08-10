@@ -780,10 +780,17 @@ publish_verified_snapshot() {
 }
 
 prepare_release_worker() {
+local android_sdk_root
 release_require_version "${1:-}"
 release_system_executable /usr/bin/env
 require_android_credentials
 validate_keystore
+android_sdk_root=$(release_android_sdk_root) || exit 1
+release_validate_android_sdk "${android_sdk_root}" || exit 1
+ANDROID_HOME=${android_sdk_root}
+ANDROID_SDK_ROOT=${android_sdk_root}
+readonly ANDROID_HOME ANDROID_SDK_ROOT
+export ANDROID_HOME ANDROID_SDK_ROOT
 release_regular_file "${RELEASE_NOTES}"
 START_COMMIT=$(release_clean_commit)
 [[ ! -e "${FINAL_DIR}" && ! -L "${FINAL_DIR}" ]] || {

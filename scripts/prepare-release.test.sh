@@ -154,6 +154,12 @@ release_tool() {
 release_run_apksigner() { "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apksigner" "$@"; }
 release_run_apkanalyzer() { "${SIXBRIDGE_PREPARE_FIXTURE_BIN}/apkanalyzer" "$@"; }
 release_java_executable() { printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk/bin/java"; }
+release_android_sdk_root() {
+    printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk"
+}
+release_validate_android_sdk() {
+    [[ "$1" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk" && -d "$1" ]]
+}
 release_node_executable() {
     case "${SIXBRIDGE_PREPARE_RUNTIME_MISMATCH:-}" in
         node) printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin/node-verified" ;;
@@ -269,7 +275,8 @@ create_fixture_tools() {
     local root=$1
     local bin="${root}/bin"
     mkdir -p "${bin}"
-    mkdir -p "${root}/runtime/jdk/bin" "${root}/runtime/node/bin" "${root}/runtime/rg/bin"
+    mkdir -p "${root}/runtime/jdk/bin" "${root}/runtime/node/bin" \
+        "${root}/runtime/rg/bin" "${root}/runtime/android-sdk"
 
     cat >"${bin}/git" <<'EOF'
 #!/usr/bin/env bash
@@ -416,6 +423,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin"
+expected_sdk="${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk"
 [[ "${PATH}" = "${expected_path}" ]]
 [[ "${JAVA_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk" ]]
 [[ "${GRADLE_USER_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/.local/gradle-home" ]]
@@ -427,6 +435,9 @@ for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NOD
   [[ -z "${!poisoned+x}" ]]
 done
 ! /usr/bin/env | /usr/bin/grep -Fq 'BAD-NAME=poison'
+ANDROID_HOME="${expected_sdk}"
+ANDROID_SDK_ROOT="${expected_sdk}"
+export ANDROID_HOME ANDROID_SDK_ROOT
 if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = utf8-nonascii ]]; then
   case "${SIXBRIDGE_RELEASE_ROOT}" in
     *'한글경로'*) ;;
@@ -478,10 +489,15 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 expected_path="/usr/bin:/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/node/bin:${SIXBRIDGE_RELEASE_ROOT}/runtime/rg/bin"
+expected_sdk="${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk"
 [[ "${PATH}" = "${expected_path}" ]]
 [[ "${JAVA_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/jdk" ]]
 [[ "${GRADLE_USER_HOME}" = "${SIXBRIDGE_RELEASE_ROOT}/.local/gradle-home" ]]
 [[ "${HOME}" = /var/empty ]]
+[[ "${ANDROID_HOME:-}" = "${expected_sdk}" && "${ANDROID_SDK_ROOT:-}" = "${expected_sdk}" ]] || {
+  printf 'SDK_ENV_DIAG: 검증된 Android SDK가 final Gradle에 전달되지 않았습니다.\n' >&2
+  exit 75
+}
 for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NODE_OPTIONS; do
   [[ -z "${!poisoned+x}" ]]
 done
@@ -737,6 +753,16 @@ set -e
 [[ "${preflight_status}" -ne 0 ]] || fail '실제 runtime 전 missing credential preflight가 성공했습니다.'
 assert_contains "${FIXTURE_ROOT}/preflight-missing-credential.log" 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
     'missing credential이 실제 runtime prerequisite보다 먼저 거부되지 않았습니다.'
+
+setup_case sdk-worker-propagation
+sdk_worker_log="${FIXTURE_ROOT}/sdk-worker-propagation.log"
+if ! run_prepare /usr/bin/env ANDROID_HOME=/caller/poison-sdk \
+    ANDROID_SDK_ROOT=/caller/poison-sdk-root >"${sdk_worker_log}" 2>&1; then
+    cat "${sdk_worker_log}" >&2
+    fail '검증된 Android SDK가 verify 이후 final Gradle까지 전달되지 않았습니다.'
+fi
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
+assert_log_has_no_secret "${sdk_worker_log}"
 
 resolver_root="${FIXTURE_ROOT}/resolver-canonical"
 mkdir -p "${resolver_root}/opt" "${resolver_root}/Cellar/node/25.1.0/bin"
