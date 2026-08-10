@@ -462,4 +462,25 @@ for perl_contract in \
 done
 expect_failure perl-contract-invalid '출력 형식' release_parse_system_perl_contract '/tmp/perl|/System/Library/Perl/5.34|/System/Library/Perl/5.34/arch'
 
+[[ "$(release_utf8_locale)" = UTF-8 ]] || fail 'release UTF-8 locale charmap 계약이 올바르지 않습니다.'
+utf8_java="${FIXTURE_ROOT}/utf8-java"
+utf8_java_log="${FIXTURE_ROOT}/utf8-java.log"
+utf8_java_arg="${FIXTURE_ROOT}/한글경로/검증-대상.apk"
+/bin/mkdir -p "$(/usr/bin/dirname -- "${utf8_java_arg}")"
+/bin/cat >"${utf8_java}" <<'EOF'
+#!/usr/bin/env bash
+[[ "${LANG}" = C && "${LC_CTYPE}" = UTF-8 && -z "${LC_ALL+x}" ]] || exit 51
+[[ "${1:-}" = --sixbridge-locale-probe ]] || exit 52
+case "${2:-}" in
+  *'한글경로/검증-대상.apk') ;;
+  *) exit 53 ;;
+esac
+printf '%s\n' "${2}" >"${3}"
+EOF
+/bin/chmod 700 "${utf8_java}"
+release_java_executable() { printf '%s\n' "${utf8_java}"; }
+LC_ALL=C release_run_java --sixbridge-locale-probe "${utf8_java_arg}" "${utf8_java_log}"
+[[ "$(/bin/cat -- "${utf8_java_log}")" = "${utf8_java_arg}" ]] || \
+    fail 'release_run_java가 한글 경로 argv를 정확히 보존하지 않았습니다.'
+
 printf 'release-lib 검증 통과\n'

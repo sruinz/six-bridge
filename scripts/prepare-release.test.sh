@@ -8,6 +8,7 @@ readonly RELEASE_PASSWORD='fixture-release-password'
 readonly SECRET_PROBE='fixture-secret-probe'
 readonly TEMPLATE_KEYSTORE="${FIXTURE_ROOT}/fixture-release.p12"
 readonly PRIVATE_TMP_RELEASE_ENTRIES_BEFORE="$(find /private/tmp -maxdepth 1 -name 'sixbridge-release-*' -print 2>/dev/null | LC_ALL=C sort)"
+readonly NATIVE_JDK17_JAVA='/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin/java'
 
 cleanup() { rm -rf "${FIXTURE_ROOT}"; }
 trap cleanup EXIT
@@ -309,11 +310,13 @@ BEGIN {
 }
 1;
 EOF
-    cat >"${root}/runtime/jdk/bin/java" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "RUNTIME-JAVA $*" >>"${SIXBRIDGE_PREPARE_LOG}"
-exit 0
-EOF
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'if [[ "${1:-}" = --sixbridge-encoding-probe ]]; then' \
+        "  exec \"${NATIVE_JDK17_JAVA}\" -XshowSettings:properties -version" \
+        'fi' \
+        'printf '\''%s\n'\'' "RUNTIME-JAVA $*" >>"${SIXBRIDGE_PREPARE_LOG}"' \
+        'exit 0' >"${root}/runtime/jdk/bin/java"
 cat >"${root}/runtime/jdk/bin/keytool" <<'EOF'
 #!/usr/bin/env bash
 while [[ "$#" -gt 0 ]]; do
@@ -323,6 +326,13 @@ while [[ "$#" -gt 0 ]]; do
   fi
   shift
 done
+if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = utf8-nonascii ]]; then
+  [[ "${LANG}" = C && "${LC_CTYPE}" = UTF-8 && -z "${LC_ALL+x}" ]] || exit 62
+  case "${keystore}" in
+    *'한글경로'*) ;;
+    *) exit 63 ;;
+  esac
+fi
 [[ "$(cat "${keystore}")" != keytool-fail ]] || exit 61
 printf '%s\n' 'SHA256: 01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF'
 EOF
@@ -417,6 +427,17 @@ for poisoned in JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS GRADLE_OPTS NOD
   [[ -z "${!poisoned+x}" ]]
 done
 ! /usr/bin/env | /usr/bin/grep -Fq 'BAD-NAME=poison'
+if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = utf8-nonascii ]]; then
+  case "${SIXBRIDGE_RELEASE_ROOT}" in
+    *'한글경로'*) ;;
+    *) exit 79 ;;
+  esac
+  java_settings=$("${JAVA_HOME}/bin/java" --sixbridge-encoding-probe 2>&1)
+  /usr/bin/grep -Fq 'file.encoding = UTF-8' <<<"${java_settings}"
+  /usr/bin/grep -Fq 'native.encoding = UTF-8' <<<"${java_settings}"
+  /usr/bin/grep -Fq "user.dir = ${SIXBRIDGE_RELEASE_ROOT}" <<<"${java_settings}"
+  [[ "${LANG}" = C && "${LC_CTYPE}" = UTF-8 && -z "${LC_ALL+x}" ]]
+fi
 "${JAVA_HOME}/bin/java" verify
 node verify
 rg verify
@@ -526,6 +547,8 @@ expect_failure() {
 printf '%s\n' key-material >"${TEMPLATE_KEYSTORE}"
 chmod 600 "${TEMPLATE_KEYSTORE}"
 readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+
+[[ -x "${NATIVE_JDK17_JAVA}" ]] || fail "UTF-8 locale fixture JDK 17을 찾을 수 없습니다: ${NATIVE_JDK17_JAVA}"
 
 setup_case forged-public-internal-worker
 mkdir -p "${CASE_ROOT}/.local/gradle-home"
@@ -987,6 +1010,16 @@ set +e
 set -e
 assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
 assert_log_has_no_secret "${tty_worker_log}"
+
+setup_case 'utf8-worker-한글경로'
+utf8_worker_log="${FIXTURE_ROOT}/utf8-worker-nonascii.log"
+if ! run_prepare /usr/bin/env LC_ALL=C SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=utf8-nonascii \
+    >"${utf8_worker_log}" 2>&1; then
+    cat "${utf8_worker_log}" >&2
+    fail '한글 경로의 JDK 17 worker가 UTF-8 locale로 release를 완료하지 못했습니다.'
+fi
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.0"
+assert_log_has_no_secret "${utf8_worker_log}"
 
 setup_case runtime-node-resolution-mismatch
 expect_failure runtime-node-resolution-mismatch 'sanitized PATH의 node가 검증된 canonical 도구와 다릅니다.' \

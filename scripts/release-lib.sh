@@ -20,6 +20,22 @@ release_fail() {
     return 1
 }
 
+release_utf8_locale() {
+    local charmap
+    release_system_executable /usr/bin/env || return 1
+    release_system_executable /usr/bin/locale || return 1
+    if ! charmap=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty \
+        LANG=C LC_CTYPE=UTF-8 /usr/bin/locale charmap 2>/dev/null); then
+        release_fail 'UTF-8 release locale을 사용할 수 없습니다.'
+        return 1
+    fi
+    [[ "${charmap}" = UTF-8 ]] || {
+        release_fail 'release locale charmap은 UTF-8이어야 합니다.'
+        return 1
+    }
+    printf '%s\n' "${charmap}"
+}
+
 release_bind_project_root() {
     local requested=${1:-} physical
     [[ -n "${requested}" && "${requested}" = /* && -d "${requested}" && ! -L "${requested}" ]] || {
@@ -417,7 +433,9 @@ release_java_executable() {
         release_fail '고정된 Homebrew JDK를 찾을 수 없습니다.'
         return 1
     }
-    if ! raw_output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" LANG=C LC_ALL=C "${java_path}" -version 2>&1); then
+    release_utf8_locale >/dev/null || return 1
+    if ! raw_output=$(/usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" \
+        LANG=C LC_CTYPE=UTF-8 "${java_path}" -version 2>&1); then
         release_fail 'JDK version을 확인하지 못했습니다.'
         return 1
     fi
@@ -486,7 +504,9 @@ release_ripgrep_executable() { release_homebrew_tool ripgrep rg; }
 release_run_java() {
     local java_path
     java_path=$(release_java_executable) || return 1
-    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" LANG=C LC_ALL=C "${java_path}" "$@"
+    release_utf8_locale >/dev/null || return 1
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME="${SIXBRIDGE_RELEASE_PROJECT_ROOT}" \
+        LANG=C LC_CTYPE=UTF-8 "${java_path}" "$@"
 }
 
 release_trusted_executable() {

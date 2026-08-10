@@ -253,6 +253,7 @@ run_preparation_worker() {
     local runtime_path resolved_node resolved_rg sanitizer_script perl_sanitizer worker_bootstrap
     release_require_version "${1:-}" || return 1
     require_android_credentials || return 1
+    release_utf8_locale >/dev/null || return 1
     java_path=$(release_java_executable) || return 1
     java_home=${java_path%/bin/java}
     node_path=$(release_node_executable) || return 1
@@ -316,7 +317,7 @@ values=(
     "${gradle_home}"
     /var/empty
     C
-    C
+    UTF-8
     "${SIXBRIDGE_RELEASE_ROOT:-}"
     "${SIXBRIDGE_PREPARE_FIXTURE_BIN:-}"
     "${SIXBRIDGE_PREPARE_LOG:-}"
@@ -351,7 +352,7 @@ exec -c /usr/bin/perl -e "${perl_sanitizer}" "${worker_bootstrap}" "${root}" \
 use strict;
 use warnings;
 my @names = qw(
-    PATH JAVA_HOME GRADLE_USER_HOME HOME LANG LC_ALL SIXBRIDGE_RELEASE_ROOT
+    PATH JAVA_HOME GRADLE_USER_HOME HOME LANG LC_CTYPE SIXBRIDGE_RELEASE_ROOT
     SIXBRIDGE_PREPARE_FIXTURE_BIN SIXBRIDGE_PREPARE_LOG SIXBRIDGE_PREPARE_SIGNER
     SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD
     SIXBRIDGE_PREPARE_VERIFY_FAIL SIXBRIDGE_PREPARE_ANDROID_FAIL
@@ -487,7 +488,7 @@ validate_sanitized_worker_environment() {
     while IFS= read -r name; do
         [[ -n "${name}" ]] || continue
         case "${name}" in
-            PATH|JAVA_HOME|GRADLE_USER_HOME|HOME|LANG|LC_ALL|PWD|SHLVL|_|\
+            PATH|JAVA_HOME|GRADLE_USER_HOME|HOME|LANG|LC_CTYPE|PWD|SHLVL|_|\
             SIXBRIDGE_RELEASE_ROOT|SIXBRIDGE_PREPARE_FIXTURE_BIN|SIXBRIDGE_PREPARE_LOG|\
             SIXBRIDGE_PREPARE_SIGNER|SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD|\
             SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD|SIXBRIDGE_PREPARE_VERIFY_FAIL|\
@@ -501,7 +502,9 @@ validate_sanitized_worker_environment() {
             *) release_fail "sanitized worker environment에 허용되지 않은 export가 있습니다: ${name}"; return 1 ;;
         esac
     done <<<"${exported_names}"
-    [[ "${HOME:-}" = /var/empty && "${LANG:-}" = C && "${LC_ALL:-}" = C ]] || {
+    release_utf8_locale >/dev/null || return 1
+    [[ "${HOME:-}" = /var/empty && "${LANG:-}" = C && "${LC_CTYPE:-}" = UTF-8 &&
+       -z "${LC_ALL+x}" ]] || {
         release_fail 'sanitized worker locale 또는 HOME이 올바르지 않습니다.'
         return 1
     }
@@ -567,8 +570,10 @@ release_keytool() {
     java_path=$(release_java_executable) || return 1
     keytool_path="${java_path%/java}/keytool"
     release_trusted_executable "${keytool_path}" || return 1
-    PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR="${RELEASE_TMPDIR:-/tmp}" LANG=C LC_ALL=C \
-        "${keytool_path}" "$@"
+    release_utf8_locale >/dev/null || return 1
+    PATH=/usr/bin:/bin HOME="${ROOT_DIR}" TMPDIR="${RELEASE_TMPDIR:-/tmp}" \
+        LANG=C LC_CTYPE=UTF-8 \
+        /usr/bin/env -u LC_ALL "${keytool_path}" "$@"
 }
 
 release_git() {
