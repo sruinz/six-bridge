@@ -430,13 +430,43 @@ done
 if [[ "${SIXBRIDGE_PREPARE_WAIT_IN_VERIFY:-0}" = utf8-nonascii ]]; then
   case "${SIXBRIDGE_RELEASE_ROOT}" in
     *'한글경로'*) ;;
-    *) exit 79 ;;
+    *) printf 'UTF8_DIAG: release root에 한글경로가 없습니다: %s\n' "${SIXBRIDGE_RELEASE_ROOT}" >&2; exit 79 ;;
   esac
   java_settings=$("${JAVA_HOME}/bin/java" --sixbridge-encoding-probe 2>&1)
-  /usr/bin/grep -Fq 'file.encoding = UTF-8' <<<"${java_settings}"
-  /usr/bin/grep -Fq 'native.encoding = UTF-8' <<<"${java_settings}"
-  /usr/bin/grep -Fq "user.dir = ${SIXBRIDGE_RELEASE_ROOT}" <<<"${java_settings}"
-  [[ "${LANG}" = C && "${LC_CTYPE}" = UTF-8 && -z "${LC_ALL+x}" ]]
+  /usr/bin/grep -Fq 'file.encoding = UTF-8' <<<"${java_settings}" || {
+    printf 'UTF8_DIAG: file.encoding이 UTF-8이 아닙니다.\n%s\n' "${java_settings}" >&2
+    exit 80
+  }
+  /usr/bin/grep -Fq 'native.encoding = UTF-8' <<<"${java_settings}" || {
+    printf 'UTF8_DIAG: native.encoding이 UTF-8이 아닙니다.\n%s\n' "${java_settings}" >&2
+    exit 81
+  }
+  java_user_dir=$(/usr/bin/sed -n 's/^[[:space:]]*user[.]dir = //p' <<<"${java_settings}")
+  case "${java_user_dir}" in
+    ''|*'?'*)
+      printf 'UTF8_DIAG: user.dir을 손실 없이 추출하지 못했습니다.\nuser.dir=%s\n%s\n' \
+        "${java_user_dir}" "${java_settings}" >&2
+      exit 82
+      ;;
+  esac
+  [[ -d "${SIXBRIDGE_RELEASE_ROOT}" && -d "${java_user_dir}" ]] || {
+    printf 'UTF8_DIAG: release root 또는 user.dir이 실제 directory가 아닙니다.\nexpected=%s\nuser.dir=%s\n' \
+      "${SIXBRIDGE_RELEASE_ROOT}" "${java_user_dir}" >&2
+    exit 82
+  }
+  release_root_identity=$(/usr/bin/stat -f '%d:%i' "${SIXBRIDGE_RELEASE_ROOT}")
+  java_user_dir_identity=$(/usr/bin/stat -f '%d:%i' "${java_user_dir}")
+  [[ "${java_user_dir_identity}" = "${release_root_identity}" ]] || {
+    printf 'UTF8_DIAG: user.dir이 release root와 같은 directory를 가리키지 않습니다.\nexpected=%s (%s)\nuser.dir=%s (%s)\n' \
+      "${SIXBRIDGE_RELEASE_ROOT}" "${release_root_identity}" \
+      "${java_user_dir}" "${java_user_dir_identity}" >&2
+    exit 82
+  }
+  [[ "${LANG}" = C && "${LC_CTYPE}" = UTF-8 && -z "${LC_ALL+x}" ]] || {
+    printf 'UTF8_DIAG: locale이 다릅니다. LANG=%s LC_CTYPE=%s LC_ALL_SET=%s\n' \
+      "${LANG:-}" "${LC_CTYPE:-}" "${LC_ALL+x}" >&2
+    exit 83
+  }
 fi
 "${JAVA_HOME}/bin/java" verify
 node verify
