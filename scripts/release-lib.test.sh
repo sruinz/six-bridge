@@ -328,17 +328,30 @@ fifo_expected_identity=$(release_file_identity "${fifo_scan_path}")
 /bin/rm "${fifo_scan_path}"
 /usr/bin/mkfifo "${fifo_scan_path}"
 fifo_status_file="${FIXTURE_ROOT}/fifo-scan.status"
+set -m
 (
+  /bin/sleep 0.25
   set +e
   release_file_contains_secret "${fifo_scan_path}" probe "${fifo_expected_identity}"
   printf '%s\n' "$?" >"${fifo_status_file}"
 ) &
 fifo_scan_pid=$!
-/bin/sleep 0.2
-if /bin/kill -0 "${fifo_scan_pid}" 2>/dev/null; then
-  /bin/kill -TERM "${fifo_scan_pid}" 2>/dev/null || true
+set +m
+fifo_scan_attempts=0
+while [[ ! -s "${fifo_status_file}" && "${fifo_scan_attempts}" -lt 100 ]]; do
+  /bin/kill -0 "${fifo_scan_pid}" 2>/dev/null || break
+  /bin/sleep 0.05
+  fifo_scan_attempts=$((fifo_scan_attempts + 1))
+done
+if [[ ! -s "${fifo_status_file}" ]]; then
+  if /bin/kill -0 "${fifo_scan_pid}" 2>/dev/null; then
+    /bin/kill -TERM -- "-${fifo_scan_pid}" 2>/dev/null || true
+    fifo_scan_failure='path가 FIFO로 바뀐 binary secret scanner가 block되었습니다.'
+  else
+    fifo_scan_failure='FIFO scanner가 status를 기록하지 않고 종료했습니다.'
+  fi
   wait "${fifo_scan_pid}" 2>/dev/null || true
-  fail 'path가 FIFO로 바뀐 binary secret scanner가 block되었습니다.'
+  fail "${fifo_scan_failure}"
 fi
 wait "${fifo_scan_pid}" 2>/dev/null || true
 [[ "$(/bin/cat "${fifo_status_file}")" = 2 ]] || fail 'FIFO scanner 오류가 clean으로 처리되었습니다.'
