@@ -45,9 +45,29 @@ cleanup_fake_dmg_manifests() {
     done < <(/usr/bin/find "${fixture_root}" -type f -name '*.dmg-mount-manifest' -print 2>/dev/null)
 }
 
+cleanup_fixture_root() {
+    local fixture_root=${1:-} attempt absent_checks=0
+    [[ -n "${fixture_root}" ]] || return 1
+    for attempt in $(/usr/bin/seq 1 40); do
+        if [[ -e "${fixture_root}" || -L "${fixture_root}" ]]; then
+            absent_checks=0
+            /bin/rm -rf -- "${fixture_root}" 2>/dev/null || true
+        fi
+        if [[ ! -e "${fixture_root}" && ! -L "${fixture_root}" ]]; then
+            absent_checks=$((absent_checks + 1))
+            [[ "${absent_checks}" = 3 ]] && return 0
+        else
+            absent_checks=0
+        fi
+        /bin/sleep 0.05
+    done
+    /bin/rm -rf -- "${fixture_root}"
+    [[ ! -e "${fixture_root}" && ! -L "${fixture_root}" ]]
+}
+
 cleanup() {
     cleanup_fake_dmg_manifests "${FIXTURE_ROOT}"
-    /bin/rm -rf "${FIXTURE_ROOT}"
+    cleanup_fixture_root "${FIXTURE_ROOT}"
 }
 trap cleanup EXIT
 
@@ -55,6 +75,25 @@ fail() {
     printf 'FAIL: %s\n' "$1" >&2
     exit 1
 }
+
+if [[ "${SIXBRIDGE_PREPARE_TEST_CLEANUP_RACE_ONLY:-0}" = 1 ]]; then
+    (
+        while [[ -d "${FIXTURE_ROOT}" ]]; do /bin/sleep 0.005; done
+        /bin/mkdir -p -- "${FIXTURE_ROOT}"
+        : >"${FIXTURE_ROOT}/.DS_Store"
+    ) &
+    cleanup_race_writer=$!
+    cleanup_race_status=0
+    cleanup || cleanup_race_status=$?
+    wait "${cleanup_race_writer}"
+    if [[ "${cleanup_race_status}" != 0 || -e "${FIXTURE_ROOT}" || -L "${FIXTURE_ROOT}" ]]; then
+        /bin/rm -rf -- "${FIXTURE_ROOT}"
+        fail 'fixture cleanup이 삭제 직후 metadata 재생성 경쟁을 정리하지 못했습니다.'
+    fi
+    trap - EXIT
+    printf 'prepare fixture cleanup race 검증 통과\n'
+    exit 0
+fi
 
 if /usr/bin/perl -0777 -e '
     my $source = <>;
