@@ -197,7 +197,8 @@ release_android_sdk_root() {
     printf '%s\n' "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk"
 }
 release_validate_android_sdk() {
-    [[ "$1" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk" && -d "$1" ]]
+    [[ "$1" = "${SIXBRIDGE_RELEASE_ROOT}/runtime/android-sdk" && -d "$1" ]] || return 1
+    release_validate_android_classpath "$1"
 }
 release_after_dmg_verification_cleanup_barrier() {
     local work_dir=$1 parked
@@ -748,10 +749,14 @@ readonly FIXTURE_SIGNER='0123456789abcdef0123456789abcdef0123456789abcdef0123456
 
 if [[ "${SIXBRIDGE_PREPARE_TEST_NORMAL_ONLY:-0}" = 1 ]]; then
     setup_case normal-only
+    /bin/mkdir -m 700 -- "${CASE_ROOT}/.local/releases"
     run_prepare
     normal_final="${CASE_ROOT}/.local/releases/v0.1.0"
     assert_exact_release_files "${normal_final}"
     assert_no_release_work_entries "${CASE_ROOT}"
+    [[ -z "$(/usr/bin/find "${CASE_ROOT}/.local" -maxdepth 1 \
+        -name '.sixbridge-sdk-classpath.*' -print)" ]] ||
+        fail '정상 prepare 뒤 Android SDK classpath 임시 directory가 남았습니다.'
     normal_snapshot=$(/bin/cat -- "${CASE_LOG}.dmg-source")
     normal_mountpoint=$(/bin/cat -- "${CASE_LOG}.dmg-mount")
     [[ ! -e "${normal_snapshot}" && ! -L "${normal_snapshot}" &&
@@ -1544,13 +1549,15 @@ for signal in HUP INT TERM; do
         fail "${signal} cleanup fixture가 verifier 대기 상태에 도달하지 못했습니다."
     }
     printf '%s\n' "prepare signal ${signal} ready=$((SECONDS - signal_ready_started))s"
+    signal_exit_started=${SECONDS}
     kill -"${signal}" "${signal_pid}"
-    for _ in $(seq 1 40); do kill -0 "${signal_pid}" 2>/dev/null || break; /bin/sleep 0.05; done
+    for _ in $(seq 1 200); do kill -0 "${signal_pid}" 2>/dev/null || break; /bin/sleep 0.05; done
     if kill -0 "${signal_pid}" 2>/dev/null; then
         [[ -e "${signal_child}" ]] && kill -TERM $(cat "${signal_child}") 2>/dev/null || true
         wait "${signal_pid}" 2>/dev/null || true
-        fail "${signal} signal 뒤 parent-only cleanup이 child를 즉시 종료하지 못했습니다."
+        fail "${signal} signal 뒤 parent-only cleanup이 bounded 시간 안에 child를 종료하지 못했습니다."
     fi
+    printf '%s\n' "prepare signal ${signal} exit=$((SECONDS - signal_exit_started))s"
     if wait "${signal_pid}"; then
         signal_status=0
         fail "${signal} signal 뒤 prepare가 성공했습니다."

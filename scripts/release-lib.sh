@@ -205,7 +205,7 @@ release_verification_transient_root() {
     [[ -n "${root}" ]] || return 1
     release_validate_stage_root "${root}" "${container}" || return 1
     case "${root##*/}" in
-        .sixbridge-publish-transient.*) ;;
+        .sixbridge-publish-transient.*|.sixbridge-release-tmp.*) ;;
         *) release_fail 'release verifier transient root 경로가 올바르지 않습니다.'; return 1 ;;
     esac
     printf '%s\n' "${root}"
