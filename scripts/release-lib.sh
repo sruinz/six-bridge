@@ -2009,7 +2009,9 @@ release_verify_desktop_app_properties() {
 
 release_verify_dmg() {
     local dmg=${1:-} work_dir=${2:-} stage_root=${3:-} container=${4:-}
-    local mountpoint app_path plist raw_output bundle_id package_version native_version minimum_version
+    local mountpoint app_path applications_link applications_target plist raw_output
+    local bundle_id package_version native_version minimum_version icon_name mounted_icon expected_icon
+    local mounted_icon_identity expected_icon_identity
     local hdiutil codesign codesign_status dmg_identity snapshot_identity snapshot_dir snapshot_dir_identity
     local snapshot stage_identity container_identity app_candidate app_count=0
     local mount_root attach_status attach_child attach_barrier_status=0 deferred_status
@@ -2134,6 +2136,14 @@ release_verify_dmg() {
         release_fail 'DMG app bundle이 정확히 하나여야 합니다.'
         return 1
     fi
+    applications_link="${mountpoint}/Applications"
+    if [[ ! -L "${applications_link}" ]] ||
+       ! applications_target=$(/usr/bin/readlink "${applications_link}") ||
+       [[ "${applications_target}" != /Applications ]]; then
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        release_fail 'DMG Applications 설치 링크가 정확히 /Applications를 가리켜야 합니다.'
+        return 1
+    fi
     plist="${app_path}/Contents/Info.plist"
     if [[ -L "${plist}" || ! -f "${plist}" ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
@@ -2156,6 +2166,10 @@ release_verify_dmg() {
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1
     }
+    icon_name=$(release_dmg_value "${plist}" CFBundleIconFile) || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        return 1
+    }
     if [[ "${bundle_id}" != 'dev.sixbridge.desktop' ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG bundle ID가 계약과 다릅니다.'
@@ -2174,6 +2188,28 @@ release_verify_dmg() {
     if [[ "${minimum_version}" != '13.0' ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG minimum macOS version이 계약과 다릅니다.'
+        return 1
+    fi
+    if [[ "${icon_name}" != 'SIX Bridge.icns' ]]; then
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        release_fail 'DMG app icon 이름이 계약과 다릅니다.'
+        return 1
+    fi
+    expected_icon="${SIXBRIDGE_RELEASE_PROJECT_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns"
+    mounted_icon="${app_path}/Contents/Resources/${icon_name}"
+    expected_icon_identity=$(release_file_identity "${expected_icon}") || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        release_fail 'DMG app icon 기준 파일을 검증하지 못했습니다.'
+        return 1
+    }
+    mounted_icon_identity=$(release_file_identity "${mounted_icon}") || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        release_fail 'DMG app icon 파일을 검증하지 못했습니다.'
+        return 1
+    }
+    if [[ "${mounted_icon_identity##*:}" != "${expected_icon_identity##*:}" ]]; then
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        release_fail 'DMG app icon 내용이 승인된 아이콘과 다릅니다.'
         return 1
     fi
     if ! release_verify_desktop_app_properties "${app_path}" "${snapshot_dir}"; then
@@ -2199,6 +2235,14 @@ release_verify_dmg() {
         release_fail 'codesign이 Developer ID 미서명 상태를 확인하지 못했습니다.'
         return 1
     fi
+    release_assert_file_identity "${expected_icon}" "${expected_icon_identity}" || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        return 1
+    }
+    release_assert_file_identity "${mounted_icon}" "${mounted_icon_identity}" || {
+        release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
+        return 1
+    }
     release_assert_file_identity "${snapshot}" "${snapshot_identity}" || {
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         return 1

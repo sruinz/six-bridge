@@ -497,7 +497,11 @@ case "$1" in
     record_fake_dmg_object "${mountpoint}.underlay"
     mkdir -m 700 "${mountpoint}"
     record_fake_dmg_object "${mountpoint}"
-    mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app"
+    /bin/ln -s /Applications "${mountpoint}/Applications"
+    mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app" \
+      "${mountpoint}/SIX Bridge.app/Contents/Resources"
+    /bin/cp -- "${SIXBRIDGE_RELEASE_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns" \
+      "${mountpoint}/SIX Bridge.app/Contents/Resources/SIX Bridge.icns"
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
     printf '%s\n' \
       '[Application]' \
@@ -550,6 +554,7 @@ case "$2" in
   'Print :CFBundleShortVersionString') printf '%s\n' 1.0.0 ;;
   'Print :CFBundleVersion') printf '%s\n' 1.0.0 ;;
   'Print :LSMinimumSystemVersion') printf '%s\n' 13.0 ;;
+  'Print :CFBundleIconFile') printf '%s\n' 'SIX Bridge.icns' ;;
   *) exit 66 ;;
 esac
 EOF
@@ -691,7 +696,8 @@ setup_case() {
     CASE_PREPARE_SCRIPT="${CASE_ROOT}/scripts/prepare-release.sh"
     CASE_LOG="${CASE_ROOT}/.local/calls.log"
     rm -rf "${CASE_ROOT}"
-    mkdir -p "${CASE_ROOT}/scripts" "${CASE_ROOT}/docs/releases" "${CASE_ROOT}/.local/keystore"
+    mkdir -p "${CASE_ROOT}/scripts" "${CASE_ROOT}/docs/releases" "${CASE_ROOT}/.local/keystore" \
+        "${CASE_ROOT}/desktop-app/src/main/package-resources"
     chmod 700 "${CASE_ROOT}/.local" "${CASE_ROOT}/.local/keystore"
     : >"${CASE_LOG}"
     copy_fixture_library "${CASE_ROOT}"
@@ -701,6 +707,8 @@ setup_case() {
     [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.pl" ]] || \
         cp "${ROOT_DIR}/scripts/release-atomic-publish.pl" "${CASE_ROOT}/scripts/release-atomic-publish.pl"
     cp "${ROOT_DIR}/docs/releases/v0.1.0-ko.md" "${CASE_ROOT}/docs/releases/v0.1.0-ko.md"
+    cp "${ROOT_DIR}/desktop-app/src/main/package-resources/six-bridge.icns" \
+        "${CASE_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns"
     cp "${TEMPLATE_KEYSTORE}" "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
     chmod 600 "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
     printf '%s\n' '.local/' '**/build/' >"${CASE_ROOT}/.gitignore"

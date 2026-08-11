@@ -201,9 +201,22 @@ case "$1" in
    record_fake_dmg_object "${mountpoint}.underlay"
    /bin/mkdir -m 700 "${mountpoint}"
    record_fake_dmg_object "${mountpoint}"
+   case "${FAKE_DMG_APPLICATIONS_MODE:-normal}" in
+     normal) /bin/ln -s /Applications "${mountpoint}/Applications" ;;
+     missing) ;;
+     wrong-target) /bin/ln -s /private/tmp "${mountpoint}/Applications" ;;
+     regular) printf 'not a link\n' >"${mountpoint}/Applications" ;;
+     *) exit 46 ;;
+   esac
    app_bundle="${mountpoint}/SIX Bridge.app"
-   /bin/mkdir -p "${app_bundle}/Contents/app"
+   /bin/mkdir -p "${app_bundle}/Contents/app" "${app_bundle}/Contents/Resources"
    : >"${app_bundle}/Contents/Info.plist"
+   case "${FAKE_DMG_ICON_MODE:-normal}" in
+     normal) /bin/cp -- "${FAKE_DMG_ICON_SOURCE:?}" "${app_bundle}/Contents/Resources/SIX Bridge.icns" ;;
+     missing) ;;
+     wrong-content) printf 'wrong icon\n' >"${app_bundle}/Contents/Resources/SIX Bridge.icns" ;;
+     *) exit 47 ;;
+   esac
    app_properties_root=$(/usr/bin/mktemp -d "${state_root}/app-properties.XXXXXX")
    printf 'name=SIX Bridge\napplicationId=dev.sixbridge.desktop\nversion=%s\nminimumMacOs=13.0\n' \
      "${FAKE_APP_PROPERTIES_VERSION:-0.1.0}" >"${app_properties_root}/app.properties"
@@ -351,7 +364,7 @@ exec /usr/bin/plutil "$@"
 EOF
     /bin/cat >"${FIXTURE_ROOT}/bin/PlistBuddy" <<'EOF'
 #!/usr/bin/env bash
-case "$2" in 'Print :CFBundleIdentifier') printf '%s\n' "${FAKE_BUNDLE_ID}";; 'Print :CFBundleShortVersionString') printf '%s\n' "${FAKE_PRODUCT_VERSION}";; 'Print :CFBundleVersion') printf '%s\n' "${FAKE_NATIVE_VERSION}";; 'Print :LSMinimumSystemVersion') printf '%s\n' "${FAKE_MINIMUM_VERSION}";; *) exit 23;; esac
+case "$2" in 'Print :CFBundleIdentifier') printf '%s\n' "${FAKE_BUNDLE_ID}";; 'Print :CFBundleShortVersionString') printf '%s\n' "${FAKE_PRODUCT_VERSION}";; 'Print :CFBundleVersion') printf '%s\n' "${FAKE_NATIVE_VERSION}";; 'Print :LSMinimumSystemVersion') printf '%s\n' "${FAKE_MINIMUM_VERSION}";; 'Print :CFBundleIconFile') printf '%s\n' "${FAKE_ICON_NAME}";; *) exit 23;; esac
 EOF
     /bin/cat >"${FIXTURE_ROOT}/bin/codesign" <<'EOF'
 #!/usr/bin/env bash
@@ -405,6 +418,8 @@ export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
 export FAKE_PRODUCT_VERSION='1.0.0'
 export FAKE_NATIVE_VERSION='1.0.0'
 export FAKE_MINIMUM_VERSION='13.0'
+export FAKE_ICON_NAME='SIX Bridge.icns'
+export FAKE_DMG_ICON_SOURCE="${ROOT_DIR}/desktop-app/src/main/package-resources/six-bridge.icns"
 export FAKE_APP_PROPERTIES_VERSION='0.1.0'
 create_tools
 
@@ -591,6 +606,27 @@ outside="${FIXTURE_ROOT}/outside.apk"; make_file "${outside}" apk
 expect_failure apk-outside-stage 'stage root 밖' release_verify_apk "${outside}" "${SIGNER}" "${stage}" "${container}"
 
 dmg_work="${container}/mounts"; /bin/mkdir "${dmg_work}"; /bin/chmod 700 "${dmg_work}"
+for applications_mode in missing wrong-target regular; do
+  export FAKE_DMG_APPLICATIONS_MODE=${applications_mode}
+  expect_failure "dmg-applications-${applications_mode}" 'Applications 설치 링크' \
+    release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+done
+unset FAKE_DMG_APPLICATIONS_MODE
+export FAKE_ICON_NAME='Default.icns'
+expect_failure dmg-icon-name 'DMG app icon' \
+  release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+export FAKE_ICON_NAME='SIX Bridge.icns'
+for icon_mode in missing wrong-content; do
+  export FAKE_DMG_ICON_MODE=${icon_mode}
+  expect_failure "dmg-icon-${icon_mode}" 'DMG app icon' \
+    release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+done
+unset FAKE_DMG_ICON_MODE
+release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
+if [[ "${SIXBRIDGE_RELEASE_TEST_DMG_INSTALL_ONLY:-0}" = 1 ]]; then
+  printf 'release-lib DMG 설치 UX RED/GREEN 검증 통과\n'
+  exit 0
+fi
 verify_app_properties_contract() {
   release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
   export FAKE_APP_PROPERTIES_VERSION='9.9.9'

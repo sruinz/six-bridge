@@ -355,7 +355,11 @@ case "$1" in
     record_fake_dmg_object "${mountpoint}.underlay"
     /bin/mkdir -m 700 "${mountpoint}"
     record_fake_dmg_object "${mountpoint}"
-    /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app"
+    /bin/ln -s /Applications "${mountpoint}/Applications"
+    /bin/mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app" \
+      "${mountpoint}/SIX Bridge.app/Contents/Resources"
+    /bin/cp -- "${HOME}/desktop-app/src/main/package-resources/six-bridge.icns" \
+      "${mountpoint}/SIX Bridge.app/Contents/Resources/SIX Bridge.icns"
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
     printf '%s\n' \
       '[Application]' \
@@ -415,6 +419,7 @@ case "$2" in
   'Print :CFBundleShortVersionString') printf '%s\n' 1.0.0 ;;
   'Print :CFBundleVersion') printf '%s\n' 1.0.0 ;;
   'Print :LSMinimumSystemVersion') printf '%s\n' 13.0 ;;
+  'Print :CFBundleIconFile') printf '%s\n' 'SIX Bridge.icns' ;;
   *) exit 21 ;;
 esac
 EOF
@@ -451,12 +456,15 @@ setup_case() {
     local name=$1
     CASE_ROOT="${FIXTURE_ROOT}/${name}/repo"
     CASE_ORIGIN="${FIXTURE_ROOT}/${name}/origin.git"
-    /bin/mkdir -p -- "${CASE_ROOT}/scripts"
+    /bin/mkdir -p -- "${CASE_ROOT}/scripts" \
+        "${CASE_ROOT}/desktop-app/src/main/package-resources"
     /usr/bin/git init --bare --quiet "${CASE_ORIGIN}"
     /usr/bin/git -C "${CASE_ROOT}" init --quiet -b main
     /usr/bin/git -C "${CASE_ROOT}" config user.name 'SIX Bridge fixture'
     /usr/bin/git -C "${CASE_ROOT}" config user.email fixture@example.invalid
     write_fixture_library
+    /bin/cp -- "${ROOT_DIR}/desktop-app/src/main/package-resources/six-bridge.icns" \
+        "${CASE_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns"
     /bin/cp -- "${PUBLISH_SCRIPT}" "${CASE_ROOT}/scripts/publish-release-tag.sh"
     /bin/chmod 700 "${CASE_ROOT}/scripts/publish-release-tag.sh" "${CASE_ROOT}/scripts/release-lib.sh"
     write_fixture_tools
