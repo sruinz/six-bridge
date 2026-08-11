@@ -375,7 +375,14 @@ async function fixtureWorker(directory, behavior, firstOnly = true) {
     const temp = \`.\${process.env.SIX_PROBE_GROUP_ID}.\${process.env.SIX_PROBE_TOKEN}.tmp\`;
     if (selected !== 'success') fs.writeFileSync(temp, 'fixture-temp', { flag: 'wx', mode: 0o600 });
     const protocol = (status) => JSON.stringify({ status, version: 1 }) + '\\n';
-    if (selected === 'success') { process.stdout.write(protocol('created')); process.exit(0); }
+    const recoveryDelayMs = ${JSON.stringify(firstOnly ? 75 : 0)};
+    if (selected === 'success') {
+      setTimeout(() => {
+        process.stdout.write(protocol('created'));
+        process.exit(0);
+      }, recoveryDelayMs);
+      return;
+    }
     if (selected === 'timeout') { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); }
     else if (selected === 'stdout-overflow') { process.stdout.write('x'.repeat(300)); setInterval(() => {}, 1000); }
     else if (selected === 'stderr-overflow') { process.stderr.write('x'.repeat(5000)); setInterval(() => {}, 1000); }
@@ -781,7 +788,7 @@ test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot�
         pool: evidenceReceiverTestHooks.workerPool(1, 2),
         spawnProcess: tracker.spawnProcess,
         storageWorkerPath,
-        workerTimeoutMs: 50,
+        workerTimeoutMs: 1_000,
       });
       await receiver.listen({ host: '127.0.0.1', port: 0 });
       const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
@@ -793,7 +800,12 @@ test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot�
         if (behavior === 'timeout') {
           assert.deepEqual(tracker.stats().signals, ['SIGTERM', 'SIGKILL']);
         }
-        assert.equal((await post(baseUrl, evidence())).status, 201);
+        const recoveryResponse = await post(baseUrl, evidence());
+        assert.equal(recoveryResponse.status, 201, JSON.stringify({
+          body: recoveryResponse.body,
+          sessionFiles: await readdir(path.join(rootDir, 'session-20260802')),
+          stats: tracker.stats(),
+        }));
         assert.equal(tracker.stats().active, 0);
       } finally {
         await receiver.close();
@@ -820,7 +832,7 @@ test('worker timeout·출력·protocol·exit·spawn 실패는 cleanup 후 slot�
         return tracker.spawnProcess(command, args, options);
       },
       storageWorkerPath,
-      workerTimeoutMs: 50,
+      workerTimeoutMs: 1_000,
     });
     await receiver.listen({ host: '127.0.0.1', port: 0 });
     const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
