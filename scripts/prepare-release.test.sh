@@ -442,6 +442,7 @@ state_root="${SIXBRIDGE_PREPARE_LOG}.dmg-state"
 state_source="${state_root}/source"
 state_mountpoint="${state_root}/mountpoint"
 state_device="${state_root}/device"
+fixture_root="$(CDPATH= builtin cd -- "$('/usr/bin/dirname' -- "$0")/.." && builtin pwd -P)"
 /bin/mkdir -p "${state_root}"
 /bin/chmod 700 "${state_root}"
 
@@ -500,7 +501,7 @@ case "$1" in
     /bin/ln -s /Applications "${mountpoint}/Applications"
     mkdir -p "${mountpoint}/SIX Bridge.app/Contents/app" \
       "${mountpoint}/SIX Bridge.app/Contents/Resources"
-    /bin/cp -- "${SIXBRIDGE_RELEASE_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns" \
+    /bin/cp -- "${SIXBRIDGE_RELEASE_ROOT:-${fixture_root}}/desktop-app/src/main/package-resources/six-bridge.icns" \
       "${mountpoint}/SIX Bridge.app/Contents/Resources/SIX Bridge.icns"
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
     printf '%s\n' \
