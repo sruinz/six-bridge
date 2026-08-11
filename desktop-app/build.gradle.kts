@@ -1,4 +1,7 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
 
 plugins {
     kotlin("jvm")
@@ -58,6 +61,7 @@ compose.desktop {
             macOS {
                 bundleID = "dev.sixbridge.desktop"
                 minimumSystemVersion = "13.0"
+                iconFile.set(project.file("src/main/package-resources/six-bridge.icns"))
                 if (macReleaseCredentialsPresent) {
                     signing {
                         sign.set(true)
@@ -86,6 +90,36 @@ tasks.test {
 tasks.processResources {
     from(rootProject.layout.projectDirectory.dir("profiles")) {
         into("profiles/builtin")
+    }
+}
+
+val prepareDmgInstallLink by tasks.registering {
+    group = "distribution"
+    description = "DMG app-image에 /Applications 설치 링크를 준비합니다."
+    dependsOn("createDistributable")
+    outputs.upToDateWhen { false }
+    doLast {
+        val appImageRoot = layout.buildDirectory
+            .dir("compose/binaries/main/app")
+            .get().asFile.toPath()
+        if (!Files.isDirectory(appImageRoot, LinkOption.NOFOLLOW_LINKS)) {
+            throw GradleException("DMG app-image root가 private directory가 아닙니다.")
+        }
+        val applicationsLink = appImageRoot.resolve("Applications")
+        if (Files.exists(applicationsLink, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isSymbolicLink(applicationsLink) ||
+                Files.readSymbolicLink(applicationsLink) != Path.of("/Applications")) {
+                throw GradleException("DMG Applications 경로가 정확한 설치 링크가 아닙니다.")
+            }
+        } else {
+            Files.createSymbolicLink(applicationsLink, Path.of("/Applications"))
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name == "packageDmg") {
+        dependsOn(prepareDmgInstallLink)
     }
 }
 

@@ -166,7 +166,29 @@ fi
 run_unsigned_gradle \
   -Pcompose.desktop.packaging.checkJdkVendor=false \
   :desktop-app:processResources \
-  :desktop-app:createDistributable
+  :desktop-app:prepareDmgInstallLink
+
+applications_link="desktop-app/build/compose/binaries/main/app/Applications"
+[[ -L "$applications_link" ]] || fail "DMG Applications 설치 링크가 없습니다."
+[[ "$(readlink "$applications_link")" == /Applications ]] || \
+  fail "DMG Applications 설치 링크 target이 올바르지 않습니다."
+rm "$applications_link"
+printf 'occupied\n' >"$applications_link"
+set +e
+occupied_link_output="$(
+  run_unsigned_gradle \
+    -Pcompose.desktop.packaging.checkJdkVendor=false \
+    :desktop-app:prepareDmgInstallLink 2>&1
+)"
+occupied_link_status=$?
+set -e
+[[ $occupied_link_status -ne 0 ]] || fail "선점된 Applications 경로를 덮어썼습니다."
+rg -q 'DMG Applications 경로가 정확한 설치 링크가 아닙니다[.]' \
+  <<<"$occupied_link_output" || fail "선점된 Applications 경로 오류가 일치하지 않습니다."
+[[ ! -L "$applications_link" && "$(<"$applications_link")" == occupied ]] || \
+  fail "선점된 Applications 경로가 변경됐습니다."
+rm "$applications_link"
+ln -s /Applications "$applications_link"
 
 resource_root="desktop-app/build/resources/main"
 for resource in \
@@ -183,6 +205,18 @@ app_plist="$app_bundle/Contents/Info.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_plist")" == "1.0.0" ]] || fail "macOS native package version이 일치하지 않습니다."
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_plist")" == "1.0.0" ]] || fail "macOS native build version이 일치하지 않습니다."
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app_plist")" == "13.0" ]] || fail "packaged minimum macOS version이 일치하지 않습니다."
+packaging_icon="desktop-app/src/main/package-resources/six-bridge.icns"
+[[ -f "$packaging_icon" && ! -L "$packaging_icon" ]] || fail "승인된 macOS packaging 아이콘이 없습니다."
+app_icon_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_plist")"
+[[ "$app_icon_name" == "SIX Bridge.icns" ]] || fail "packaged macOS icon 이름이 일치하지 않습니다."
+app_icon="$app_bundle/Contents/Resources/$app_icon_name"
+[[ -f "$app_icon" && ! -L "$app_icon" ]] || fail "packaged macOS icon이 없습니다."
+packaging_icon_digest="$(shasum -a 256 "$packaging_icon" | awk '{ print $1 }')"
+app_icon_digest="$(shasum -a 256 "$app_icon" | awk '{ print $1 }')"
+[[ "$app_icon_digest" == "$packaging_icon_digest" ]] || fail "packaged macOS icon이 승인된 아이콘과 다릅니다."
+default_icon="desktop-app/build/compose/default-resources/1.11.1/default-icon-mac.icns"
+default_icon_digest="$(shasum -a 256 "$default_icon" | awk '{ print $1 }')"
+[[ "$app_icon_digest" != "$default_icon_digest" ]] || fail "Compose 기본 macOS icon이 배포물에 포함됐습니다."
 
 scan_roots=(
   desktop-app/src/main/resources
