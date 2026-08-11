@@ -75,6 +75,46 @@ expect_failure() {
     assert_contains "${output}" "${expected}" "${label}: 거부 사유가 없습니다."
 }
 
+PUBLISH_FIXTURE_WAIT_STATUS=''
+PUBLISH_FIXTURE_WAIT_TIMED_OUT=0
+
+wait_for_publish_fixture_group() {
+    local publish_pid=$1 timeout_marker=$2 watchdog_pid wait_status
+    PUBLISH_FIXTURE_WAIT_STATUS=''
+    PUBLISH_FIXTURE_WAIT_TIMED_OUT=0
+    /bin/rm -f -- "${timeout_marker}"
+    (
+        /bin/sleep 10
+        (umask 077; : >"${timeout_marker}")
+        /bin/kill -TERM -- "-${publish_pid}" 2>/dev/null || true
+        /bin/sleep 1
+        /bin/kill -KILL -- "-${publish_pid}" 2>/dev/null || true
+    ) &
+    watchdog_pid=$!
+    if wait "${publish_pid}"; then
+        wait_status=0
+    else
+        wait_status=$?
+    fi
+    if /bin/kill -0 "${watchdog_pid}" 2>/dev/null; then
+        /bin/kill -TERM "${watchdog_pid}" 2>/dev/null || true
+    fi
+    wait "${watchdog_pid}" 2>/dev/null || true
+    PUBLISH_FIXTURE_WAIT_STATUS=${wait_status}
+    if [[ -f "${timeout_marker}" ]]; then
+        PUBLISH_FIXTURE_WAIT_TIMED_OUT=1
+        /bin/kill -KILL -- "-${publish_pid}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+terminate_publish_fixture_group() {
+    local publish_pid=$1 timeout_marker=$2
+    /bin/kill -TERM -- "-${publish_pid}" 2>/dev/null || true
+    wait_for_publish_fixture_group "${publish_pid}" "${timeout_marker}" || true
+}
+
 write_fixture_library() {
     /bin/cp -- "${ROOT_DIR}/scripts/release-lib.sh" "${CASE_ROOT}/scripts/release-lib.sh"
     /bin/cat >>"${CASE_ROOT}/scripts/release-lib.sh" <<'EOF'
@@ -117,10 +157,9 @@ release_after_dmg_verification_cleanup_barrier() {
     case "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_KIND:-}" in
         post-dmg)
             printf '%s\n' "${work_dir}" >"${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_PATH_RECORD}"
-            : >"${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_READY}"
-            while [[ ! -f "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_CONTINUE}" ]]; do
-                /bin/sleep 0.05
-            done
+            "${SIXBRIDGE_PUBLISH_FIXTURE_BIN}/post-dmg-foreground-barrier" \
+                "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_CHILD_RECORD}" \
+                "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_READY}"
             ;;
         work-rebind)
             parked="${work_dir}.parked"
@@ -237,6 +276,13 @@ EOF
 while [[ ! -f "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_CONTINUE}" ]]; do
   /bin/sleep 0.05
 done
+EOF
+    /bin/cat >"${CASE_ROOT}/bin/post-dmg-foreground-barrier" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+(umask 077; printf '%s\n' "$$" >"$1")
+(umask 077; : >"$2")
+exec /bin/sleep 60
 EOF
     /bin/cat >"${CASE_ROOT}/bin/term-ignoring-grandchild" <<'EOF'
 #!/usr/bin/perl
@@ -568,6 +614,9 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_OUTSIDE_DMG_SIGNAL_ONLY:-0}" = 1 ]]; then
 exit 1
 EOF
         /bin/chmod 700 "${CASE_ORIGIN}/hooks/pre-receive"
+        publish_monitor_was_enabled=0
+        case $- in *m*) publish_monitor_was_enabled=1 ;; esac
+        set -m
         /usr/bin/env -i \
             PATH="${CASE_ROOT}/bin:/usr/bin:/bin" \
             HOME="${CASE_ROOT}" \
@@ -593,15 +642,20 @@ EOF
             ' "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.0 \
             <"${confirmation_file}" >"${signal_log}" 2>&1 &
         publish_pid=$!
-        for _ in {1..200}; do
+        [[ "${publish_monitor_was_enabled}" = 1 ]] || set +m
+        publish_timeout_marker="${CASE_ROOT}/.local/publish-wait.timeout"
+        /bin/kill -0 -- "-${publish_pid}" 2>/dev/null || {
+            terminate_publish_fixture_group "${publish_pid}" "${publish_timeout_marker}"
+            fail "${barrier_kind}/${signal_case}: publisher process group을 확정하지 못했습니다."
+        }
+        for _ in {1..400}; do
             [[ -f "${verifier_ready}" && -s "${verifier_path_record}" ]] && break
             /bin/kill -0 "${publish_pid}" 2>/dev/null || break
             /bin/sleep 0.05
         done
         [[ -f "${verifier_ready}" && -s "${verifier_path_record}" ]] || {
             /bin/cat -- "${signal_log}" >&2 || true
-            /bin/kill -TERM "${publish_pid}" 2>/dev/null || true
-            wait "${publish_pid}" 2>/dev/null || true
+            terminate_publish_fixture_group "${publish_pid}" "${publish_timeout_marker}"
             fail "${barrier_kind}/${signal_case}: verifier barrier에 도달하지 못했습니다."
         }
         verifier_path=$(/bin/cat -- "${verifier_path_record}")
@@ -609,12 +663,15 @@ EOF
         [[ ! -s "${verifier_child_record}" ]] || verifier_child=$(/bin/cat -- "${verifier_child_record}")
         transient_root=$(/usr/bin/find "${CASE_ROOT}/.local/releases" -mindepth 1 -maxdepth 1 \
             -type d -name '.sixbridge-publish-transient.*' -print | /usr/bin/awk 'NR == 1 {print}')
-        /bin/kill -s "${signal_case}" "${publish_pid}"
+        /bin/kill -s "${signal_case}" -- "-${publish_pid}"
         [[ "${barrier_kind}" != spawn ]] || : >"${verifier_continue}"
-        set +e
-        wait "${publish_pid}"
-        publish_status=$?
-        set -e
+        publish_wait_succeeded=1
+        wait_for_publish_fixture_group "${publish_pid}" "${publish_timeout_marker}" ||
+            publish_wait_succeeded=0
+        publish_status=${PUBLISH_FIXTURE_WAIT_STATUS:-255}
+        publish_wait_timed_out=${PUBLISH_FIXTURE_WAIT_TIMED_OUT}
+        publisher_group_alive=0
+        /bin/kill -0 -- "-${publish_pid}" 2>/dev/null && publisher_group_alive=1
         verifier_child_alive=0
         if [[ -n "${verifier_child}" ]] && /bin/kill -0 "${verifier_child}" 2>/dev/null; then
             verifier_child_alive=1
@@ -659,14 +716,18 @@ EOF
         /usr/bin/find "${verifier_tmp}" -mindepth 1 -maxdepth 1 -type f -delete
 
         if [[ "${publish_status}" != "${expected_status}" ||
+              "${publish_wait_succeeded}" != 1 || "${publish_wait_timed_out}" != 0 ||
+              "${publisher_group_alive}" != 0 ||
               "${verifier_child_alive}" != 0 ||
               "${verifier_grandchild_alive}" != 0 || "${verifier_group_alive}" != 0 ||
               "${verifier_path_left}" != 0 ||
               "${transient_left}" != 0 ||
               "${verifier_tmp_count}" != 0 || "${local_tag_left}" != 0 ||
               "${remote_tag_left}" != 0 || "${push_marker_left}" != 0 ]]; then
-            printf 'RED outside-DMG %s/%s status=%s child=%s grandchild=%s group=%s path=%s transient=%s tmp=%s local=%s remote=%s push=%s\n' \
-                "${barrier_kind}" "${signal_case}" "${publish_status}" "${verifier_child_alive}" \
+            printf 'RED outside-DMG %s/%s status=%s wait=%s timeout=%s publisher-group=%s child=%s grandchild=%s group=%s path=%s transient=%s tmp=%s local=%s remote=%s push=%s\n' \
+                "${barrier_kind}" "${signal_case}" "${publish_status}" \
+                "${publish_wait_succeeded}" "${publish_wait_timed_out}" "${publisher_group_alive}" \
+                "${verifier_child_alive}" \
                 "${verifier_grandchild_alive}" "${verifier_group_alive}" "${verifier_path_left}" \
                 "${transient_left}" "${verifier_tmp_count}" "${local_tag_left}" \
                 "${remote_tag_left}" "${push_marker_left}" >&2
