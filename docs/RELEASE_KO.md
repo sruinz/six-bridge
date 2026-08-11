@@ -35,6 +35,9 @@ SIX Bridge v0.1.0은 사용자가 직접 개발했거나 적법한 변환 권한
 있습니다. 이 파일은 Apple Developer ID 서명이나 Apple 공증을 받지 않았으며,
 Gatekeeper를 자동으로 우회하거나 시스템 보안 설정을 변경하지 않습니다.
 
+DMG를 연 뒤 `SIX Bridge.app`을 `Applications` 링크로 끌어 놓으세요.
+복사가 끝나면 DMG를 추출하고 Applications 폴더에서 SIX Bridge를 실행합니다.
+
 무료 Apple 개발자 계정은 외부 배포용 Developer ID 인증서와 Apple 공증을
 제공하지 않습니다. 관련 Apple 정책은 [Developer ID 지원 문서](https://developer.apple.com/support/developer-id/),
 [Developer ID certificate 용어](https://developer.apple.com/help/glossary/developer-id-certificate/),
