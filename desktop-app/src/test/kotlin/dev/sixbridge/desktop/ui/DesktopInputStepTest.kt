@@ -1,12 +1,18 @@
 package dev.sixbridge.desktop.ui
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.v2.runComposeUiTest
+import androidx.compose.ui.unit.dp
 import dev.sixbridge.desktop.app.DesktopConversionState
 import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import dev.sixbridge.desktop.profile.DesktopProfileOption
@@ -35,6 +41,11 @@ class DesktopInputStepTest {
         onNodeWithTag("input:profile").assertExists()
         onNodeWithTag("input:advanced-profile").assertExists()
         onNodeWithTag("input:analyze").assertIsNotEnabled()
+        onNodeWithTag("input:brand").assertExists()
+        onNodeWithTag("input:step-extension").assertExists()
+        onNodeWithTag("input:step-profile").assertExists()
+        onNodeWithTag("input:step-ready").assertExists()
+        onNodeWithTag("input:ready-summary").assertExists()
     }
 
     @Test
@@ -92,8 +103,24 @@ class DesktopInputStepTest {
         )
         setContent { DesktopApp(state, profiles()) { actions = actions + it } }
 
+        onNodeWithTag("input:verified-badge").assertExists()
+        onNodeWithText("확장 분석하기").assertExists()
         onNodeWithTag("input:analyze").performScrollTo().assertIsEnabled().performClick()
         runOnIdle { assertEquals(listOf(DesktopAction.Analyze), actions) }
+    }
+
+    @Test
+    fun `compact 폭에서도 모든 핵심 입력 action을 제공한다`() = runComposeUiTest {
+        setContent {
+            Box(Modifier.width(900.dp).height(700.dp)) {
+                InputStep(DesktopConversionState.Input(), profiles(), onAction = {})
+            }
+        }
+
+        onNodeWithTag("input:url").assertExists()
+        onNodeWithTag("input:drop").assertExists()
+        onNodeWithTag("input:profile").assertExists()
+        onNodeWithTag("input:analyze").assertExists()
     }
 
     @Test
