@@ -7,6 +7,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -45,7 +46,9 @@ class DesktopInputStepTest {
         onNodeWithTag("input:step-extension").assertExists()
         onNodeWithTag("input:step-profile").assertExists()
         onNodeWithTag("input:step-ready").assertExists()
-        onNodeWithTag("input:ready-summary").assertExists()
+        onNodeWithTag("input:ready-summary")
+            .assertExists()
+            .assertTextContains("입력 없음", substring = true)
     }
 
     @Test
@@ -104,6 +107,9 @@ class DesktopInputStepTest {
         setContent { DesktopApp(state, profiles()) { actions = actions + it } }
 
         onNodeWithTag("input:verified-badge").assertExists()
+        onNodeWithTag("input:ready-summary")
+            .assertTextContains("입력 준비됨", substring = true)
+            .assertTextContains("profile 검증됨", substring = true)
         onNodeWithText("확장 분석하기").assertExists()
         onNodeWithTag("input:analyze").performScrollTo().assertIsEnabled().performClick()
         runOnIdle { assertEquals(listOf(DesktopAction.Analyze), actions) }

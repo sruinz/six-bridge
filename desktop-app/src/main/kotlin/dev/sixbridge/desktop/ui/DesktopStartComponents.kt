@@ -32,7 +32,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.semantics
@@ -44,8 +43,6 @@ import androidx.compose.ui.unit.sp
 import dev.sixbridge.desktop.conversion.DesktopExtensionInput
 import dev.sixbridge.desktop.profile.DesktopProfileOption
 import org.jetbrains.skia.Image as SkiaImage
-
-private val VerifiedGreen = Color(0xFF4BCB70)
 
 @Composable
 internal fun DesktopStartHeader(modifier: Modifier = Modifier) {
@@ -193,6 +190,7 @@ internal fun DesktopProfilePanel(
 ) {
     var profileMenuExpanded by remember { mutableStateOf(false) }
     val verified = selectedProfile?.selectable == true
+    val verifiedColor = desktopVerifiedColor()
 
     Surface(
         modifier = modifier
@@ -217,7 +215,7 @@ internal fun DesktopProfilePanel(
                 Icon(
                     imageVector = Icons.Default.CheckCircleOutline,
                     contentDescription = null,
-                    tint = if (verified) VerifiedGreen else MaterialTheme.colors.onSurface.copy(alpha = 0.38f),
+                    tint = if (verified) verifiedColor else MaterialTheme.colors.onSurface.copy(alpha = 0.38f),
                 )
                 Column(modifier = Modifier.weight(1f)) {
                     Text("대상 profile", fontWeight = FontWeight.SemiBold)
@@ -230,13 +228,13 @@ internal fun DesktopProfilePanel(
                 }
                 if (verified) {
                     Surface(
-                        color = VerifiedGreen.copy(alpha = 0.14f),
+                        color = verifiedColor.copy(alpha = 0.14f),
                         shape = RoundedCornerShape(6.dp),
                         modifier = Modifier.semantics { testTag = "input:verified-badge" },
                     ) {
                         Text(
                             text = "검증됨",
-                            color = VerifiedGreen,
+                            color = verifiedColor,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 13.sp,
@@ -320,10 +318,10 @@ internal fun DesktopReadinessBar(
             Column(modifier = Modifier.weight(1f)) {
                 Text("분석 준비", fontWeight = FontWeight.SemiBold)
                 Text(
-                    text = if (inputReady && profileReady) {
-                        "분석을 시작할 수 있습니다."
-                    } else {
-                        "입력과 profile을 확인하세요."
+                    text = buildString {
+                        append(if (inputReady) "입력 준비됨" else "입력 없음")
+                        append(" · ")
+                        append(if (profileReady) "profile 검증됨" else "profile 확인 필요")
                     },
                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.58f),
                     fontSize = 13.sp,
