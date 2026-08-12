@@ -17,6 +17,7 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":bundle-contract"))
     implementation(compose.desktop.currentOs)
+    implementation("org.jetbrains.compose.material:material-icons-extended:1.7.3")
     implementation("com.google.jimfs:jimfs:1.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
@@ -90,6 +91,12 @@ tasks.test {
 tasks.processResources {
     from(rootProject.layout.projectDirectory.dir("profiles")) {
         into("profiles/builtin")
+    }
+    from(rootProject.layout.projectDirectory.file(
+        "docs/assets/six-bridge-manager-app-icon.png",
+    )) {
+        into("images")
+        rename { "six-bridge.png" }
     }
 }
 

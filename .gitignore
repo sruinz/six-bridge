@@ -9,6 +9,7 @@ local.properties
 *.apk
 *.apk.idsig
 *.crx
+*.p12
 
 # SIX Bridge keeps extension sources and all signing material local.
 .local/
