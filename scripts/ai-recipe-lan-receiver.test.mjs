@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   startReceiver,
@@ -12,6 +13,15 @@ import {
 } from "./ai-recipe-lan-receiver.mjs";
 
 const expectedUrl = "https://www.youtube.com/watch?v=test123";
+const receiverScript = fileURLToPath(
+  new URL("./ai-recipe-lan-receiver.mjs", import.meta.url),
+);
+
+async function createCliProject() {
+  const project = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-cli-"));
+  await mkdir(path.join(project, ".local", "evidence"), { recursive: true });
+  return project;
+}
 
 function request(url, method = "GET") {
   return new Promise((resolve, reject) => {
@@ -30,10 +40,10 @@ function request(url, method = "GET") {
   });
 }
 
-function runCli(argumentsList, onStdout) {
+function runCli(argumentsList, { cwd, onStdout } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["scripts/ai-recipe-lan-receiver.mjs", ...argumentsList], {
-      cwd: process.cwd(),
+    const child = spawn(process.execPath, [receiverScript, ...argumentsList], {
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -289,15 +299,17 @@ test("timeout은 실패 evidence를 redaction해 기록한다", async (t) => {
 });
 
 test("CLI는 evidence 직접 자식만 허용하고 symlink를 거부한다", async (t) => {
+  const project = await createCliProject();
   const evidenceDirectory = ".local/evidence";
   const suffix = `${process.pid}-${Date.now()}`;
   const directEvidence = `${evidenceDirectory}/ai-recipe-lan-test-${suffix}.json`;
   const symlinkEvidence = `${evidenceDirectory}/ai-recipe-lan-link-${suffix}.json`;
+  const directEvidencePath = path.join(project, directEvidence);
+  const symlinkEvidencePath = path.join(project, symlinkEvidence);
   const externalDirectory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
   const externalEvidence = path.join(externalDirectory, "evidence.json");
   t.after(async () => {
-    await rm(directEvidence, { force: true });
-    await rm(symlinkEvidence, { force: true });
+    await rm(project, { recursive: true, force: true });
     await rm(externalDirectory, { recursive: true, force: true });
   });
 
@@ -305,16 +317,16 @@ test("CLI는 evidence 직접 자식만 허용하고 symlink를 거부한다", as
     "--advertise-host", "127.0.0.1",
     "--expected-url", expectedUrl,
     "--evidence", externalEvidence,
-  ]);
+  ], { cwd: project });
   assert.equal(outside.code, 1);
   assert.match(outside.stderr, /directly inside \.local\/evidence/);
 
-  await symlink(externalEvidence, symlinkEvidence);
+  await symlink(externalEvidence, symlinkEvidencePath);
   const symlinkResult = await runCli([
     "--advertise-host", "127.0.0.1",
     "--expected-url", expectedUrl,
     "--evidence", symlinkEvidence,
-  ]);
+  ], { cwd: project });
   assert.equal(symlinkResult.code, 1);
   assert.match(symlinkResult.stderr, /symbolic link/);
 
@@ -323,23 +335,20 @@ test("CLI는 evidence 직접 자식만 허용하고 symlink를 거부한다", as
     "--expected-url", expectedUrl,
     "--evidence", directEvidence,
     "--timeout-ms", "1",
-  ]);
+  ], { cwd: project });
   assert.equal(direct.code, 1);
-  assert.equal(JSON.parse(await readFile(directEvidence, "utf8")).requestMatched, false);
+  assert.equal(JSON.parse(await readFile(directEvidencePath, "utf8")).requestMatched, false);
 });
 
 test("CLI는 실행 중 evidence root가 바뀌어도 외부에 쓰지 않는다", async (t) => {
-  const evidenceRoot = ".local/evidence";
+  const project = await createCliProject();
+  const evidenceRoot = path.join(project, ".local", "evidence");
   const suffix = `${process.pid}-${Date.now()}`;
-  const movedRoot = `.local/evidence-moved-${suffix}`;
+  const movedRoot = path.join(project, ".local", `evidence-moved-${suffix}`);
   const filename = `ai-recipe-lan-root-race-${suffix}.json`;
   const externalDirectory = await mkdtemp(path.join(os.tmpdir(), "ai-recipe-receiver-"));
-  let rootSwapped = false;
   t.after(async () => {
-    if (rootSwapped) {
-      await rm(evidenceRoot, { recursive: true, force: true });
-      await rename(movedRoot, evidenceRoot);
-    }
+    await rm(project, { recursive: true, force: true });
     await rm(externalDirectory, { recursive: true, force: true });
   });
 
@@ -350,17 +359,19 @@ test("CLI는 실행 중 evidence root가 바뀌어도 외부에 쓰지 않는다
   const resultPromise = runCli([
     "--advertise-host", "127.0.0.1",
     "--expected-url", expectedUrl,
-    "--evidence", `${evidenceRoot}/${filename}`,
+    "--evidence", `.local/evidence/${filename}`,
     "--timeout-ms", "75",
-  ], (stdout) => {
-    if (stdout.startsWith("baseUrl=")) {
-      receiverStarted();
-    }
+  ], {
+    cwd: project,
+    onStdout(stdout) {
+      if (stdout.startsWith("baseUrl=")) {
+        receiverStarted();
+      }
+    },
   });
   await started;
   await rename(evidenceRoot, movedRoot);
   await symlink(externalDirectory, evidenceRoot);
-  rootSwapped = true;
 
   const result = await resultPromise;
   assert.equal(result.code, 1);
