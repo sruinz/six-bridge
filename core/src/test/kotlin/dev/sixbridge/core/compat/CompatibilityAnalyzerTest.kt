@@ -290,6 +290,30 @@ class CompatibilityAnalyzerTest {
     }
 
     @Test
+    fun `MV3 options chrome_style은 삼성 브라우저에서 거부하는 manifest로 차단한다`() {
+        val source = Files.createTempDirectory("six-mv3-chrome-style")
+        source.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "AI to Pinry",
+              "version": "0.2.1",
+              "options_ui": {
+                "page": "options.html",
+                "chrome_style": true
+              }
+            }
+            """.trimIndent(),
+        )
+        source.resolve("options.html").writeText("<title>Options</title>")
+
+        val report = CompatibilityAnalyzer().analyze(source, profile)
+
+        assertEquals(CompatibilityStatus.BLOCKED, report.status)
+        assertTrue(report.issues.any { it.code == "manifest_v3_chrome_style_unsupported" })
+    }
+
+    @Test
     fun `reports the extension id declared by manifest key`() {
         val source = Files.createTempDirectory("six-key")
         val publicKey = KeyPairGenerator.getInstance("RSA")

@@ -216,6 +216,28 @@ class CompatibilityAnalyzer(
                 issues,
             )
         }
+        val optionsUi = manifest["options_ui"] as? JsonObject
+        if (optionsUi != null && "chrome_style" in optionsUi) {
+            issues += CompatibilityIssue(
+                code = "manifest_v3_chrome_style_unsupported",
+                message = "Manifest V3에서 options_ui.chrome_style 항목을 제거하세요. " +
+                    "삼성 브라우저가 이 항목을 거부합니다.",
+                blocking = true,
+            )
+            return report(
+                CompatibilityStatus.BLOCKED,
+                manifestVersion,
+                name,
+                version,
+                manifestKey,
+                manifestKeyExtensionId,
+                permissions,
+                usedApis,
+                unsupported,
+                classification,
+                issues,
+            )
+        }
         val resourceIssues = validateResources(extensionRoot, manifest)
         if (resourceIssues.isNotEmpty()) {
             issues += resourceIssues
