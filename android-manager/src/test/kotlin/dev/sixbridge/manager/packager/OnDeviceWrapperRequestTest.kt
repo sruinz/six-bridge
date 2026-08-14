@@ -36,6 +36,7 @@ class OnDeviceWrapperRequestTest {
     private val passthroughProof = Crx3Verifier.verify(passthroughCrx)
     private val passthroughKey = identityKey(InstallationIdentityMode.PASSTHROUGH)
     private val convertedKey = identityKey(InstallationIdentityMode.CONVERTED)
+    private val preparedKey = identityKey(InstallationIdentityMode.PREPARED)
 
     @Test
     fun `canonical ZIP과 passthrough CRX를 동시에 또는 모두 없이 받지 않는다`() {
@@ -193,6 +194,31 @@ class OnDeviceWrapperRequestTest {
         }
     }
 
+    @Test
+    fun `converted canonical ZIP은 passthrough terminal 보고서를 허용한다`() {
+        val fixture = convertedRequestFixture(conversionState = "passthrough")
+
+        val validated = fixture.request.validateFor(fixture.identity, fixture.crx)
+
+        assertEquals("passthrough", validated.compatibility.conversionState)
+    }
+
+    @Test
+    fun `non-terminal compatibility state는 prepared와 converted package를 거부한다`() {
+        listOf("automatic", "requires-approval", "unavailable").forEach { conversionState ->
+            val converted = convertedRequestFixture(conversionState)
+            val preparedIdentity = packageIdentity(passthroughProof.extensionId)
+            val prepared = preparedRequest(conversionState)
+
+            assertFailsWith<IllegalArgumentException> {
+                converted.request.validateFor(converted.identity, converted.crx)
+            }
+            assertFailsWith<IllegalArgumentException> {
+                prepared.validateFor(preparedIdentity, passthroughCrx)
+            }
+        }
+    }
+
     private fun passthroughRequest(
         compatibility: ContractCompatibilityReport = compatibility(
             extensionId = passthroughProof.extensionId,
@@ -222,6 +248,64 @@ class OnDeviceWrapperRequestTest {
         ),
         outputApk = File("unused.apk"),
     )
+
+    private fun preparedRequest(conversionState: String) = OnDeviceWrapperRequest(
+        reservation = reservation(preparedKey, passthroughProof.extensionId),
+        canonicalSourceZip = null,
+        passthroughCrx = passthroughCrx,
+        descriptorName = "SIX 테스트",
+        descriptorVersion = "1.0",
+        sourceKind = "ZIP",
+        compatibility = compatibility(
+            extensionId = passthroughProof.extensionId,
+            sourceSha256 = passthroughProof.zipSha256,
+        ).copy(conversionState = conversionState),
+        outputApk = File("unused.apk"),
+    )
+
+    private fun convertedRequestFixture(
+        conversionState: String,
+    ): ConvertedRequestFixture {
+        val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val crx = Crx3Writer.create(
+            canonicalZip,
+            object : Crx3SigningKey {
+                override fun publicKeyDer(): ByteArray = pair.public.encoded
+
+                override fun signSha256Rsa(payload: ByteArray): ByteArray =
+                    Signature.getInstance("SHA256withRSA").run {
+                        initSign(pair.private)
+                        update(payload)
+                        sign()
+                    }
+            },
+        ).bytes
+        val proof = Crx3Verifier.verify(crx)
+        val identity = OnDevicePackageIdentity(
+            extensionId = proof.extensionId,
+            packageName = "dev.sixbridge.ext.${proof.extensionId}",
+            wrapperSignerSha256 = "f".repeat(64),
+            crxKeyAlias = "test.alias",
+            crxPublicKeyDer = pair.public.encoded,
+        )
+        return ConvertedRequestFixture(
+            request = OnDeviceWrapperRequest(
+                reservation = reservation(convertedKey, proof.extensionId, "test.alias"),
+                canonicalSourceZip = canonicalZip,
+                passthroughCrx = null,
+                descriptorName = "SIX 테스트",
+                descriptorVersion = "1.0",
+                sourceKind = "ZIP",
+                compatibility = compatibility(
+                    extensionId = proof.extensionId,
+                    sourceSha256 = proof.zipSha256,
+                ).copy(conversionState = conversionState),
+                outputApk = File("unused.apk"),
+            ),
+            identity = identity,
+            crx = crx,
+        )
+    }
 
     private fun packageIdentity(extensionId: String) = OnDevicePackageIdentity(
         extensionId = extensionId,
@@ -392,6 +476,12 @@ class OnDeviceWrapperRequestTest {
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    private data class ConvertedRequestFixture(
+        val request: OnDeviceWrapperRequest,
+        val identity: OnDevicePackageIdentity,
+        val crx: ByteArray,
+    )
 
     private companion object {
         const val JOB_TOKEN = "00000000-0000-4000-8000-000000000001"

@@ -232,6 +232,37 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
+    fun convertedCanonicalZipWithPassthroughReportPackagesVerifiedWrapper() {
+        val packager = OnDeviceWrapperPackager(context)
+        val output = File(root, "converted-passthrough-report.apk")
+
+        try {
+            val result = packageClaim(
+                packager,
+                request(
+                    packager = packager,
+                    source = canonicalSourceZip(),
+                    versionCode = 47,
+                    output = output,
+                    conversionState = "passthrough",
+                ),
+            )
+            val verified = AndroidWrapperVerifier(
+                AndroidArchiveInspector(context.packageManager),
+            ).verify(
+                result.outputApk,
+                result.descriptor,
+                result.compatibility,
+            )
+
+            assertEquals("passthrough", result.compatibility.conversionState)
+            assertTrue(verified is WrapperVerificationResult.Success)
+        } finally {
+            output.delete()
+        }
+    }
+
+    @Test
     fun snapshotsMutableSourceBeforeValidationAndCrxCreation() {
         val originalZip = canonicalSourceZip()
         val mutableZip = originalZip.copyOf()
@@ -1080,6 +1111,7 @@ class OnDevicePackagerGateInstrumentedTest {
         output: File,
         persistentDatabaseName: String? = null,
         failPackagingFinish: Boolean = false,
+        conversionState: String = "converted",
     ): ClaimedRequest {
         val database = if (persistentDatabaseName == null) {
             Room.inMemoryDatabaseBuilder(context, ManagerDatabase::class.java)
@@ -1153,7 +1185,7 @@ class OnDevicePackagerGateInstrumentedTest {
                         compatibility = compatibility(
                             extensionId = identity.extensionId,
                             sourceSha256 = sha256(source),
-                            conversionState = "converted",
+                            conversionState = conversionState,
                             originalExtensionId = ORIGINAL_EXTENSION_ID,
                         ),
                         outputApk = output,

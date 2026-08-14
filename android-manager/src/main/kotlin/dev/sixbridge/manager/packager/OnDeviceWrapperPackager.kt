@@ -649,6 +649,9 @@ class OnDeviceWrapperPackager(context: Context) {
         ) {
             "compatibility extension identity가 descriptor와 일치하지 않습니다."
         }
+        require(isTerminalPackageConversionState(report.conversionState)) {
+            "package compatibility conversion state가 terminal 상태가 아닙니다."
+        }
         when (request.reservation.identityKey.mode) {
             InstallationIdentityMode.PASSTHROUGH -> {
                 require(identity.crxKeyAlias == null && identity.crxPublicKeyDer == null) {
@@ -677,9 +680,6 @@ class OnDeviceWrapperPackager(context: Context) {
                         sha256(request.canonicalSourceZip!!) == proof.zipSha256,
                 ) {
                     "converted CRX3 proof가 package identity 또는 canonical ZIP과 일치하지 않습니다."
-                }
-                require(report.conversionState != "passthrough") {
-                    "converted package에는 passthrough compatibility를 사용할 수 없습니다."
                 }
             }
         }
@@ -1251,6 +1251,9 @@ private fun requireBoundRequest(
     ) {
         "compatibility extension identity가 descriptor와 일치하지 않습니다."
     }
+    require(isTerminalPackageConversionState(report.conversionState)) {
+        "package compatibility conversion state가 terminal 상태가 아닙니다."
+    }
     require(
         request.reservation.extensionId == identity.extensionId &&
             request.reservation.packageName == identity.packageName &&
@@ -1294,12 +1297,12 @@ private fun requireBoundRequest(
             ) {
                 "converted CRX3 proof가 package identity 또는 canonical ZIP과 일치하지 않습니다."
             }
-            require(report.conversionState != "passthrough") {
-                "converted package에는 passthrough compatibility를 사용할 수 없습니다."
-            }
         }
     }
 }
+
+private fun isTerminalPackageConversionState(value: String): Boolean =
+    value == "passthrough" || value == "converted"
 
 private fun sha256Hex(bytes: ByteArray): String =
     MessageDigest.getInstance("SHA-256")
