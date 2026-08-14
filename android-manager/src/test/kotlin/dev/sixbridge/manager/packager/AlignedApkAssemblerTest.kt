@@ -160,10 +160,11 @@ class AlignedApkAssemblerTest {
     fun `최대 합계 출력은 temp 생성 전에 거부하고 기존 output을 보존한다`() {
         val output = File(work, "size-boundary.apk").apply { writeText("keep") }
         val oversizedManifest = ByteArray(MAX_CRX_BYTES)
-        val maximumCrx = ByteArray(MAX_CRX_BYTES)
+        val maximumCrx = File(work, "maximum.crx")
+        RandomAccessFile(maximumCrx, "rw").use { it.setLength(MAX_CRX_BYTES.toLong()) }
 
         assertFailsWith<IllegalArgumentException> {
-            assembler().assemble(ApkAssemblyRequest(template, oversizedManifest, maximumCrx, output))
+            assembler().assemble(ApkAssemblyPathRequest(template, oversizedManifest, maximumCrx, output))
         }
         assertEquals("keep", output.readText())
         assertTrue(work.listFiles().orEmpty().none { it.name.startsWith(".size-boundary.apk.") })
