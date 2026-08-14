@@ -14,10 +14,25 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-class ConversionIdentityLedger(
+internal data class ConversionIdentityLedgerHooks(
+    val afterBundleReadyCommit: () -> Unit = {},
+    val afterCommittedOutputCleanup: () -> Unit = {},
+)
+
+internal fun interface ConversionIdentityCommittedOutputCleaner {
+    suspend fun discard(
+        identitySha256: String,
+        claimUuid: UUID,
+        wrapperSha256: String,
+        outputFileName: String,
+    )
+}
+
+class ConversionIdentityLedger internal constructor(
     private val dao: ConversionIdentityDao,
     private val localIdentityFactory: () -> UUID = UUID::randomUUID,
     private val currentTimeMillis: () -> Long = System::currentTimeMillis,
+    private val hooks: ConversionIdentityLedgerHooks = ConversionIdentityLedgerHooks(),
 ) {
     private val reserveMutex = Mutex()
     private val issuer = Any()
@@ -53,12 +68,28 @@ class ConversionIdentityLedger(
     internal fun ownerLifecycle(
         packager: OnDeviceWrapperPackager,
     ): ConversionIdentityOwnerLifecycle = ConversionIdentityOwnerLifecycle(
-        this,
-        OwnerLifecyclePackager.Full(packager),
+        ledger = this,
+        outputCleaner = ConversionIdentityCommittedOutputCleaner { identitySha256, claimUuid, wrapperSha256, outputFileName ->
+            packager.discardPublishedOutput(
+                identitySha256 = identitySha256,
+                claimUuid = claimUuid,
+                outputFileName = outputFileName,
+                wrapperSha256 = wrapperSha256,
+            )
+        },
+        failedAttemptPackager = packager,
+    )
+
+    internal fun ownerLifecycle(
+        outputCleaner: ConversionIdentityCommittedOutputCleaner,
+    ): ConversionIdentityOwnerLifecycle = ConversionIdentityOwnerLifecycle(
+        ledger = this,
+        outputCleaner = outputCleaner,
+        failedAttemptPackager = null,
     )
 
     internal fun ownerLifecycleForReservationTests(): ConversionIdentityOwnerLifecycle =
-        ConversionIdentityOwnerLifecycle(this, OwnerLifecyclePackager.ReservationTests)
+        ownerLifecycle(ConversionIdentityCommittedOutputCleaner { _, _, _, _ -> })
 
     private class IssuedReservation(
         override val identityKey: InstallationIdentityKey,
@@ -735,14 +766,37 @@ class ConversionIdentityLedger(
             dao.getLeaseByOwnerToken(ownerToken) == null
     }
 
-    private suspend fun finalizePackagedForBundleReady(
+    private suspend fun commitBundleReady(
         ownerToken: String,
         expectedGeneration: Long,
         bundleSha256: String,
+        outputCleaner: ConversionIdentityCommittedOutputCleaner,
     ): Boolean = reserveMutex.withLock {
         requireOwnerToken(ownerToken)
         requireLowerHexSha256(bundleSha256, "완료 bundle")
-        dao.finalizePackagedForBundleReady(ownerToken, expectedGeneration, bundleSha256)
+        val lease = dao.claimBundleReadyCommit(ownerToken, expectedGeneration, bundleSha256)
+            ?: return@withLock true
+        hooks.afterBundleReadyCommit()
+        val committed = lease.toPackagedRecovery()
+        check(lease.state.isCleaningCommittedLeaseState()) {
+            "commit된 output cleanup lease가 CLEANING_COMMITTED 상태가 아닙니다."
+        }
+        outputCleaner.discard(
+            identitySha256 = committed.identitySha256,
+            claimUuid = committed.claimUuid,
+            wrapperSha256 = committed.wrapperSha256,
+            outputFileName = committed.outputFileName,
+        )
+        hooks.afterCommittedOutputCleanup()
+        val deleted = dao.deleteLease(
+            identitySha256 = lease.identitySha256,
+            ownerToken = ownerToken,
+            state = lease.state,
+        )
+        check(deleted == 1 || dao.getLease(lease.identitySha256) == null) {
+            "CLEANING_COMMITTED identity lease finalize에 실패했습니다."
+        }
+        true
     }
 
     suspend fun listExistingTargets(
@@ -874,7 +928,8 @@ class ConversionIdentityLedger(
                 (
                     state.isPublishingState() ||
                         state.isPackagedState() ||
-                        state.isCleaningPackagedState()
+                        state.isCleaningPackagedState() ||
+                        state.isCleaningCommittedLeaseState()
                     ),
         ) {
             "PACKAGED identity lease proof가 손상되었습니다."
@@ -1024,36 +1079,31 @@ class ConversionIdentityLedger(
 
     internal class ConversionIdentityOwnerLifecycle internal constructor(
         private val ledger: ConversionIdentityLedger,
-        private val packager: OwnerLifecyclePackager,
+        private val outputCleaner: ConversionIdentityCommittedOutputCleaner,
+        private val failedAttemptPackager: OnDeviceWrapperPackager?,
     ) {
         suspend fun releaseFailedAttempt(ownerToken: String) {
-            when (val binding = packager) {
-                is OwnerLifecyclePackager.Full ->
-                    ledger.releaseFailedAttempt(ownerToken, binding.packager)
-                OwnerLifecyclePackager.ReservationTests ->
-                    ledger.releaseFailedAttempt(ownerToken)
+            val packager = failedAttemptPackager
+            if (packager == null) {
+                ledger.releaseFailedAttempt(ownerToken)
+            } else {
+                ledger.releaseFailedAttempt(ownerToken, packager)
             }
         }
 
         suspend fun isOwnerDiscardComplete(ownerToken: String): Boolean =
             ledger.isOwnerDiscardComplete(ownerToken)
 
-        suspend fun finalizeBundleReady(
+        suspend fun commitBundleReady(
             ownerToken: String,
             expectedGeneration: Long,
             bundleSha256: String,
-        ) {
-            ledger.finalizePackagedForBundleReady(
-                ownerToken,
-                expectedGeneration,
-                bundleSha256,
-            )
-        }
-    }
-
-    internal sealed interface OwnerLifecyclePackager {
-        class Full(val packager: OnDeviceWrapperPackager) : OwnerLifecyclePackager
-        data object ReservationTests : OwnerLifecyclePackager
+        ): Boolean = ledger.commitBundleReady(
+            ownerToken,
+            expectedGeneration,
+            bundleSha256,
+            outputCleaner,
+        )
     }
 }
 
@@ -1072,6 +1122,9 @@ private val PACKAGED_STATE = Regex(
 )
 private val CLEANING_PACKAGED_STATE = Regex(
     "CLEANING_PACKAGED:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[0-9a-f]{64}:[0-9a-f]{2,510}",
+)
+private val CLEANING_COMMITTED_STATE = Regex(
+    "CLEANING_COMMITTED:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[0-9a-f]{64}:[0-9a-f]{2,510}",
 )
 
 private fun packagingState(claimUuid: UUID): String = "PACKAGING:$claimUuid"
@@ -1101,7 +1154,11 @@ private fun String.isPublishingState(): Boolean = PUBLISHING_STATE.matches(this)
 
 private fun String.isPackagedState(): Boolean = PACKAGED_STATE.matches(this)
 
+internal fun String.isPackagedLeaseState(): Boolean = isPackagedState()
+
 private fun String.isCleaningPackagedState(): Boolean = CLEANING_PACKAGED_STATE.matches(this)
+
+internal fun String.isCleaningCommittedLeaseState(): Boolean = CLEANING_COMMITTED_STATE.matches(this)
 
 private fun packagedState(publishingState: String): String {
     require(publishingState.isPublishingState()) {
@@ -1117,6 +1174,13 @@ private fun cleaningPackagedState(publishedState: String): String {
     return "CLEANING_PACKAGED:${publishedState.substringAfter(':')}"
 }
 
+internal fun cleaningCommittedState(packagedState: String): String {
+    require(packagedState.isPackagedState()) {
+        "committed output identity lease proof가 PACKAGED 상태가 아닙니다."
+    }
+    return "CLEANING_COMMITTED:${packagedState.substringAfter(':')}"
+}
+
 internal fun requireValidPackagedLeaseState(state: String) {
     require(state.isPackagedState()) {
         "BUNDLE_READY finalize 대상 identity lease가 PACKAGED 상태가 아닙니다."
@@ -1126,6 +1190,13 @@ internal fun requireValidPackagedLeaseState(state: String) {
     UUID.fromString(parts[1])
     requireLowerHexSha256(parts[2], "PACKAGED wrapper")
     decodeHex(parts[3])
+}
+
+internal fun requireValidCleaningCommittedLeaseState(state: String) {
+    require(state.isCleaningCommittedLeaseState()) {
+        "BUNDLE_READY resume 대상 identity lease가 CLEANING_COMMITTED 상태가 아닙니다."
+    }
+    requireValidPackagedLeaseState("PACKAGED:${state.substringAfter(':')}")
 }
 
 private fun encodeHex(value: String): String =

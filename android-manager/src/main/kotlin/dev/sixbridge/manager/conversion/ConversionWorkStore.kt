@@ -263,7 +263,7 @@ class ConversionWorkStore internal constructor(
                 val stored = requireNotNull(dao.get())
                 val restored = stored.toRestored(tokenDirectory)
                     ?: throw IllegalStateException("완료 작업을 복구할 수 없습니다.")
-                identityOwnerLifecycle.finalizeBundleReady(
+                identityOwnerLifecycle.commitBundleReady(
                     restored.token,
                     stored.generation,
                     requireNotNull(restored.bundleSha256),
@@ -368,7 +368,7 @@ class ConversionWorkStore internal constructor(
                 return@withContext null
             }
             if (restored.stage == ConversionJobStage.BUNDLE_READY) {
-                identityOwnerLifecycle.finalizeBundleReady(
+                identityOwnerLifecycle.commitBundleReady(
                     restored.token,
                     row.generation,
                     requireNotNull(restored.bundleSha256),

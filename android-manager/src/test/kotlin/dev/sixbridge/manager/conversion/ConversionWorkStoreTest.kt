@@ -41,6 +41,7 @@ class ConversionWorkStoreTest {
     private lateinit var sourceRoot: File
     private lateinit var dao: FakeConversionJobDao
     private lateinit var identityDao: FakeOwnerIdentityDao
+    private lateinit var committedOutputCleaner: FakeCommittedOutputCleaner
     private var now = 1_800_000_000_000L
     private var tokenSequence = 0
     private var fileSequence = 0
@@ -51,6 +52,7 @@ class ConversionWorkStoreTest {
         sourceRoot = createTempDirectory("conversion-input-source").toFile()
         dao = FakeConversionJobDao()
         identityDao = FakeOwnerIdentityDao(dao)
+        committedOutputCleaner = FakeCommittedOutputCleaner()
     }
 
     @After
@@ -832,13 +834,13 @@ class ConversionWorkStoreTest {
     }
 
     @Test
-    fun `identity lease finalize는 durable BUNDLE_READY 뒤에만 호출한다`() = runTest {
+    fun `BUNDLE_READY commit은 exact provisional과 packaged proof를 함께 active로 승격한다`() = runTest {
         val store = store()
         val created = store.create(artifact("input".encodeToByteArray()))
-        identityDao.addPackaged(created.token)
+        val identitySha256 = identityDao.addProvisionalPackaged(created.token, versionCode = 7)
+        committedOutputCleaner.add("wrapper.apk")
         store.markAwaitingApproval(created.token, PROFILE_SHA)
         store.markBuilding(created.token, emptySet(), PROFILE_SHA)
-        assertTrue(identityDao.events.isEmpty())
         val bundle = File(sourceRoot, "owned-ready.six").apply {
             writeText("verified bundle identity lifecycle")
         }
@@ -846,7 +848,220 @@ class ConversionWorkStoreTest {
 
         store.markBundleReady(created.token, bundle, expected)
 
-        assertEquals(listOf("finalize:${created.token}:$expected"), identityDao.events)
+        val active = requireNotNull(identityDao.identity(identitySha256))
+        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+        assertNull(active.provisionOwnerToken)
+        assertEquals(7, active.lastSuccessfulVersionCode)
+        assertNull(identityDao.lease(identitySha256))
+        assertEquals(
+            listOf("$identitySha256:11111111-1111-4111-8111-111111111111:${"c".repeat(64)}:wrapper.apk"),
+            committedOutputCleaner.calls,
+        )
+        assertFalse(committedOutputCleaner.exists("wrapper.apk"))
+    }
+
+    @Test
+    fun `BUNDLE_READY proof mismatch는 provisional과 PACKAGED lease를 변경하지 않는다`() = runTest {
+        val crashing = store(
+            hooks = ConversionWorkStoreHooks(
+                afterBundleTransition = { error("simulated crash before identity commit") },
+            ),
+        )
+        val created = crashing.create(artifact("input".encodeToByteArray()))
+        val identitySha256 = identityDao.addProvisionalPackaged(created.token, versionCode = 3)
+        crashing.markAwaitingApproval(created.token, PROFILE_SHA)
+        crashing.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "proof.six").apply { writeText("verified bundle proof") }
+        val expected = sha256(bundle.readBytes())
+        assertFailsWith<IllegalStateException> {
+            crashing.markBundleReady(created.token, bundle, expected)
+        }
+        val row = requireNotNull(dao.get())
+        val lifecycle = ownerLifecycle()
+
+        listOf(
+            Triple(UUID(9, 9).toString(), row.generation, expected),
+            Triple(created.token, row.generation + 1, expected),
+            Triple(created.token, row.generation, "e".repeat(64)),
+        ).forEach { (owner, generation, sha) ->
+            assertFailsWith<IllegalArgumentException> {
+                lifecycle.commitBundleReady(owner, generation, sha)
+            }
+            val provisional = requireNotNull(identityDao.identity(identitySha256))
+            assertEquals(ConversionIdentityLifecycleState.PROVISIONAL.name, provisional.lifecycleState)
+            assertEquals(created.token, provisional.provisionOwnerToken)
+            assertEquals(3, provisional.lastReservedVersionCode)
+            assertNull(provisional.lastSuccessfulVersionCode)
+            assertTrue(requireNotNull(identityDao.lease(identitySha256)).state.startsWith("PACKAGED:"))
+        }
+    }
+
+    @Test
+    fun `identity lifecycle과 lease update matrix는 invalid commit을 모두 보존한다`() = runTest {
+        val crashing = store(
+            hooks = ConversionWorkStoreHooks(
+                afterBundleTransition = { error("simulated crash before identity commit") },
+            ),
+        )
+        val created = crashing.create(artifact("input".encodeToByteArray()))
+        val identitySha256 = identityDao.addProvisionalPackaged(created.token, versionCode = 4)
+        crashing.markAwaitingApproval(created.token, PROFILE_SHA)
+        crashing.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "matrix.six").apply { writeText("verified bundle matrix") }
+        val bundleSha256 = sha256(bundle.readBytes())
+        assertFailsWith<IllegalStateException> {
+            crashing.markBundleReady(created.token, bundle, bundleSha256)
+        }
+        val row = requireNotNull(dao.get())
+        val baselineIdentity = requireNotNull(identityDao.identity(identitySha256))
+        val baselineLease = requireNotNull(identityDao.lease(identitySha256))
+        val otherOwner = UUID(8, 8).toString()
+        val invalidStates = listOf(
+            baselineIdentity.copy(provisionOwnerToken = otherOwner) to baselineLease,
+            baselineIdentity.copy(
+                lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+                provisionOwnerToken = created.token,
+            ) to baselineLease,
+            baselineIdentity.copy(
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                provisionOwnerToken = null,
+            ) to baselineLease,
+            baselineIdentity.copy(lastReservedVersionCode = 5) to baselineLease,
+            baselineIdentity to baselineLease.copy(state = ConversionIdentityLeaseState.RESERVED.name),
+        )
+
+        invalidStates.forEach { (identity, lease) ->
+            identityDao.forceIdentity(identity)
+            identityDao.forceLease(lease)
+            assertFailsWith<IllegalArgumentException> {
+                ownerLifecycle().commitBundleReady(
+                    created.token,
+                    row.generation,
+                    bundleSha256,
+                )
+            }
+            assertEquals(identity, identityDao.identity(identitySha256))
+            assertEquals(lease, identityDao.lease(identitySha256))
+        }
+
+        identityDao.forceIdentity(baselineIdentity)
+        identityDao.forceLease(null)
+        assertFailsWith<IllegalArgumentException> {
+            ownerLifecycle().commitBundleReady(created.token, row.generation, bundleSha256)
+        }
+        assertEquals(baselineIdentity, identityDao.identity(identitySha256))
+
+        val alreadyActive = baselineIdentity.copy(
+            lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+            provisionOwnerToken = null,
+            lastSuccessfulVersionCode = 4,
+        )
+        identityDao.forceIdentity(alreadyActive)
+        assertTrue(ownerLifecycle().commitBundleReady(created.token, row.generation, bundleSha256))
+        assertEquals(alreadyActive, identityDao.identity(identitySha256))
+    }
+
+    @Test
+    fun `BUNDLE_READY job commit 직후 crash는 재시작에서 active commit과 exact output cleanup을 마친다`() = runTest {
+        val crashing = store(
+            hooks = ConversionWorkStoreHooks(
+                afterBundleTransition = { error("simulated crash after job commit") },
+            ),
+        )
+        val created = crashing.create(artifact("input".encodeToByteArray()))
+        val identitySha256 = identityDao.addProvisionalPackaged(created.token, versionCode = 5)
+        committedOutputCleaner.add("wrapper.apk")
+        crashing.markAwaitingApproval(created.token, PROFILE_SHA)
+        crashing.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "job-crash.six").apply { writeText("verified bundle job crash") }
+        val expected = sha256(bundle.readBytes())
+
+        assertFailsWith<IllegalStateException> {
+            crashing.markBundleReady(created.token, bundle, expected)
+        }
+        assertEquals(ConversionJobStage.BUNDLE_READY.name, requireNotNull(dao.get()).stage)
+        assertEquals(
+            ConversionIdentityLifecycleState.PROVISIONAL.name,
+            requireNotNull(identityDao.identity(identitySha256)).lifecycleState,
+        )
+
+        val restored = requireNotNull(store().restore())
+        assertEquals(ConversionJobStage.BUNDLE_READY, restored.stage)
+        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, identityDao.identity(identitySha256)?.lifecycleState)
+        assertNull(identityDao.lease(identitySha256))
+        assertFalse(committedOutputCleaner.exists("wrapper.apk"))
+        assertEquals(created.token, requireNotNull(store().restore()).token)
+    }
+
+    @Test
+    fun `ACTIVE CLEANING_COMMITTED DB commit 직후 crash는 재시작에서 output과 lease만 정리한다`() = runTest {
+        val crashing = store(
+            identityHooks = ConversionIdentityLedgerHooks(
+                afterBundleReadyCommit = { error("simulated crash after identity commit") },
+            ),
+        )
+        val created = crashing.create(artifact("input".encodeToByteArray()))
+        val identitySha256 = identityDao.addProvisionalPackaged(created.token, versionCode = 6)
+        committedOutputCleaner.add("wrapper.apk")
+        crashing.markAwaitingApproval(created.token, PROFILE_SHA)
+        crashing.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "identity-crash.six").apply {
+            writeText("verified bundle identity crash")
+        }
+
+        assertFailsWith<IllegalStateException> {
+            crashing.markBundleReady(created.token, bundle, sha256(bundle.readBytes()))
+        }
+        val committed = requireNotNull(identityDao.identity(identitySha256))
+        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, committed.lifecycleState)
+        assertNull(committed.provisionOwnerToken)
+        assertEquals(6, committed.lastSuccessfulVersionCode)
+        assertTrue(
+            requireNotNull(identityDao.lease(identitySha256)).state.startsWith("CLEANING_COMMITTED:"),
+        )
+        assertTrue(committedOutputCleaner.exists("wrapper.apk"))
+
+        assertEquals(ConversionJobStage.BUNDLE_READY, requireNotNull(store().restore()).stage)
+        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, identityDao.identity(identitySha256)?.lifecycleState)
+        assertNull(identityDao.lease(identitySha256))
+        assertFalse(committedOutputCleaner.exists("wrapper.apk"))
+    }
+
+    @Test
+    fun `committed output 삭제 직후 crash는 재시작에서 exact-state lease delete만 재개한다`() = runTest {
+        val crashing = store(
+            identityHooks = ConversionIdentityLedgerHooks(
+                afterCommittedOutputCleanup = { error("simulated crash after output cleanup") },
+            ),
+        )
+        val created = crashing.create(artifact("input".encodeToByteArray()))
+        val identitySha256 = identityDao.addActivePackaged(
+            ownerToken = created.token,
+            versionCode = 9,
+            lastSuccessfulVersionCode = 8,
+        )
+        committedOutputCleaner.add("wrapper.apk")
+        crashing.markAwaitingApproval(created.token, PROFILE_SHA)
+        crashing.markBuilding(created.token, emptySet(), PROFILE_SHA)
+        val bundle = File(sourceRoot, "cleanup-crash.six").apply {
+            writeText("verified bundle cleanup crash")
+        }
+
+        assertFailsWith<IllegalStateException> {
+            crashing.markBundleReady(created.token, bundle, sha256(bundle.readBytes()))
+        }
+        val active = requireNotNull(identityDao.identity(identitySha256))
+        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+        assertNull(active.provisionOwnerToken)
+        assertEquals(9, active.lastSuccessfulVersionCode)
+        assertFalse(committedOutputCleaner.exists("wrapper.apk"))
+        assertTrue(
+            requireNotNull(identityDao.lease(identitySha256)).state.startsWith("CLEANING_COMMITTED:"),
+        )
+
+        assertEquals(ConversionJobStage.BUNDLE_READY, requireNotNull(store().restore()).stage)
+        assertNull(identityDao.lease(identitySha256))
+        assertEquals(2, committedOutputCleaner.calls.size)
     }
 
     @Test
@@ -1417,6 +1632,7 @@ class ConversionWorkStoreTest {
 
     private fun store(
         hooks: ConversionWorkStoreHooks = ConversionWorkStoreHooks(),
+        identityHooks: ConversionIdentityLedgerHooks = ConversionIdentityLedgerHooks(),
         bundleVerifier: ConversionBundleVerifier = ConversionBundleVerifier { input ->
             input.bufferedReader().readText().startsWith("verified bundle")
         },
@@ -1425,7 +1641,9 @@ class ConversionWorkStoreTest {
         dao = dao,
         bundleVerifier = bundleVerifier,
         identityOwnerLifecycle =
-            ConversionIdentityLedger(identityDao).ownerLifecycleForReservationTests(),
+            ConversionIdentityLedger(identityDao, hooks = identityHooks).ownerLifecycle(
+                committedOutputCleaner,
+            ),
         clock = { now },
         tokenFactory = {
             tokenSequence += 1
@@ -1437,6 +1655,11 @@ class ConversionWorkStoreTest {
         },
         hooks = hooks,
     )
+
+    private fun ownerLifecycle(
+        hooks: ConversionIdentityLedgerHooks = ConversionIdentityLedgerHooks(),
+    ): ConversionIdentityOwnerLifecycle =
+        ConversionIdentityLedger(identityDao, hooks = hooks).ownerLifecycle(committedOutputCleaner)
 
     private fun conversionCoordinator(
         workStore: ConversionWorkStore,
@@ -1642,19 +1865,79 @@ class ConversionWorkStoreTest {
             addReserved(ownerToken)
         }
 
+        fun addProvisionalPackaged(
+            ownerToken: String,
+            versionCode: Int,
+        ): String {
+            val identitySha256 = addIdentity(
+                ownerToken = ownerToken,
+                versionCode = versionCode,
+                lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisionOwnerToken = ownerToken,
+                lastSuccessfulVersionCode = null,
+            )
+            addPackaged(ownerToken, versionCode)
+            return identitySha256
+        }
+
+        fun addActivePackaged(
+            ownerToken: String,
+            versionCode: Int,
+            lastSuccessfulVersionCode: Int,
+        ): String {
+            val identitySha256 = addIdentity(
+                ownerToken = ownerToken,
+                versionCode = versionCode,
+                lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+                provisionOwnerToken = null,
+                lastSuccessfulVersionCode = lastSuccessfulVersionCode,
+            )
+            addPackaged(ownerToken, versionCode)
+            return identitySha256
+        }
+
+        private fun addIdentity(
+            ownerToken: String,
+            versionCode: Int,
+            lifecycleState: String,
+            provisionOwnerToken: String?,
+            lastSuccessfulVersionCode: Int?,
+        ): String {
+            val identitySha256 = identitySha256(ownerToken)
+            identities[identitySha256] = ConversionIdentityEntity(
+                identitySha256 = identitySha256,
+                logicalSourceIdentity = "project:${identitySha256.take(32)}",
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.PASSTHROUGH.name,
+                displayName = "Identity",
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "b".repeat(64),
+                crxKeyAlias = null,
+                lastReservedVersionCode = versionCode,
+                lifecycleState = lifecycleState,
+                provisionOwnerToken = provisionOwnerToken,
+                crxPublicKeySha256 = null,
+                lastSuccessfulVersionCode = lastSuccessfulVersionCode,
+                lifecycleUpdatedAtEpochMillis = 1,
+            )
+            return identitySha256
+        }
+
         fun hasProvisionOwner(ownerToken: String): Boolean =
             identities.values.any { it.provisionOwnerToken == ownerToken }
 
         fun hasLeaseOwner(ownerToken: String): Boolean =
             leases.values.any { it.ownerToken == ownerToken }
 
-        fun addPackaged(ownerToken: String) = addLease(
+        fun addPackaged(ownerToken: String, versionCode: Int = 1) = addLease(
             ownerToken,
             "PACKAGED:11111111-1111-4111-8111-111111111111:" +
                 "${"c".repeat(64)}:777261707065722e61706b",
+            versionCode,
         )
 
-        private fun addLease(ownerToken: String, state: String) {
+        private fun addLease(ownerToken: String, state: String, versionCode: Int = 1) {
             val identitySha256 = identitySha256(ownerToken)
             leases[identitySha256] = ConversionIdentityLeaseEntity(
                 identitySha256 = identitySha256,
@@ -1666,8 +1949,21 @@ class ConversionWorkStoreTest {
                 packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
                 wrapperSignerSha256 = "b".repeat(64),
                 crxPublicKeySha256 = null,
-                reservedVersionCode = 1,
+                reservedVersionCode = versionCode,
             )
+        }
+
+        fun identity(identitySha256: String): ConversionIdentityEntity? = identities[identitySha256]
+
+        fun lease(identitySha256: String): ConversionIdentityLeaseEntity? = leases[identitySha256]
+
+        fun forceIdentity(identity: ConversionIdentityEntity) {
+            identities[identity.identitySha256] = identity
+        }
+
+        fun forceLease(lease: ConversionIdentityLeaseEntity?) {
+            leases.clear()
+            lease?.let { leases[it.identitySha256] = it }
         }
 
         private fun identitySha256(ownerToken: String): String =
@@ -1766,6 +2062,27 @@ class ConversionWorkStoreTest {
             mode: String,
             profileMajorVersion: Int,
         ): List<ConversionIdentityEntity> = emptyList()
+    }
+
+    private class FakeCommittedOutputCleaner : ConversionIdentityCommittedOutputCleaner {
+        private val outputs = linkedSetOf<String>()
+        val calls = mutableListOf<String>()
+
+        fun add(outputFileName: String) {
+            outputs += outputFileName
+        }
+
+        fun exists(outputFileName: String): Boolean = outputFileName in outputs
+
+        override suspend fun discard(
+            identitySha256: String,
+            claimUuid: UUID,
+            wrapperSha256: String,
+            outputFileName: String,
+        ) {
+            calls += "$identitySha256:$claimUuid:$wrapperSha256:$outputFileName"
+            outputs -= outputFileName
+        }
     }
 
     private class FakeConversionJobDao : ConversionJobDao() {

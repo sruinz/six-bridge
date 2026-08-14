@@ -386,11 +386,11 @@ interface ConversionIdentityDao {
     }
 
     @Transaction
-    suspend fun finalizePackagedForBundleReady(
+    suspend fun claimBundleReadyCommit(
         ownerToken: String,
         expectedGeneration: Long,
         bundleSha256: String,
-    ): Boolean {
+    ): ConversionIdentityLeaseEntity? {
         val job = getJobForIdentityFinalization()
             ?: throw IllegalArgumentException("BUNDLE_READY 작업을 찾을 수 없습니다.")
         require(
@@ -399,20 +399,102 @@ interface ConversionIdentityDao {
                 job.generation == expectedGeneration &&
                 job.bundleSha256 == bundleSha256,
         ) {
-            "identity finalize proof가 committed BUNDLE_READY 작업과 일치하지 않습니다."
+            "identity commit proof가 committed BUNDLE_READY 작업과 일치하지 않습니다."
         }
-        val lease = getLeaseByOwnerToken(ownerToken) ?: return true
-        requireValidPackagedLeaseState(lease.state)
+        val lease = getLeaseByOwnerToken(ownerToken)
+        if (lease == null) {
+            require(findByProvisionOwnerToken(ownerToken) == null) {
+                "BUNDLE_READY owner의 PROVISIONAL identity가 lease 없이 남아 있습니다."
+            }
+            return null
+        }
+        val packaged = when {
+            lease.state.isPackagedLeaseState() -> {
+                requireValidPackagedLeaseState(lease.state)
+                true
+            }
+            lease.state.isCleaningCommittedLeaseState() -> {
+                requireValidCleaningCommittedLeaseState(lease.state)
+                false
+            }
+            else -> throw IllegalArgumentException(
+                "BUNDLE_READY commit 대상 identity lease가 PACKAGED 상태가 아닙니다.",
+            )
+        }
+        val current = get(lease.identitySha256)
+            ?: throw IllegalArgumentException("commit할 예약 identity를 찾을 수 없습니다.")
+        requireCommittedLeaseMatchesIdentity(current, lease)
+        val versionCode = requireNotNull(lease.reservedVersionCode) {
+            "commit할 identity lease version이 없습니다."
+        }
+        require(versionCode > 0 && current.lastReservedVersionCode == versionCode) {
+            "commit할 identity version이 현재 예약과 일치하지 않습니다."
+        }
+        if (!packaged) {
+            require(
+                current.lifecycleState == ConversionIdentityLifecycleState.ACTIVE.name &&
+                    current.provisionOwnerToken == null &&
+                    current.lastSuccessfulVersionCode == versionCode,
+            ) {
+                "CLEANING_COMMITTED identity lifecycle proof가 일치하지 않습니다."
+            }
+            return lease
+        }
+        when (current.lifecycleState) {
+            ConversionIdentityLifecycleState.PROVISIONAL.name -> require(
+                current.provisionOwnerToken == ownerToken,
+            ) {
+                "PROVISIONAL identity owner가 BUNDLE_READY owner와 일치하지 않습니다."
+            }
+            ConversionIdentityLifecycleState.ACTIVE.name -> require(
+                current.provisionOwnerToken == null,
+            ) {
+                "ACTIVE identity에 PROVISIONAL owner가 남아 있습니다."
+            }
+            ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+            ConversionIdentityLifecycleState.CLEANING.name,
+            -> throw IllegalArgumentException(
+                "현재 lifecycle의 identity는 BUNDLE_READY로 commit할 수 없습니다.",
+            )
+            else -> throw IllegalArgumentException("identity lifecycle이 손상되었습니다.")
+        }
+        update(
+            current.copy(
+                lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+                provisionOwnerToken = null,
+                lastSuccessfulVersionCode = versionCode,
+                lifecycleUpdatedAtEpochMillis = job.updatedAtEpochMillis,
+            ),
+        )
+        val cleaningState = cleaningCommittedState(lease.state)
         check(
-            deleteLease(
+            transitionLease(
                 identitySha256 = lease.identitySha256,
                 ownerToken = ownerToken,
-                state = lease.state,
+                expectedState = lease.state,
+                nextState = cleaningState,
             ) == 1,
         ) {
-            "BUNDLE_READY identity lease finalize에 실패했습니다."
+            "BUNDLE_READY identity lease를 CLEANING_COMMITTED로 commit하지 못했습니다."
         }
-        return true
+        return requireNotNull(getLease(lease.identitySha256))
+    }
+
+}
+
+private fun requireCommittedLeaseMatchesIdentity(
+    identity: ConversionIdentityEntity,
+    lease: ConversionIdentityLeaseEntity,
+) {
+    require(
+        identity.identitySha256 == lease.identitySha256 &&
+            identity.crxKeyAlias == lease.crxKeyAlias &&
+            identity.extensionId == lease.extensionId &&
+            identity.packageName == lease.packageName &&
+            identity.wrapperSignerSha256 == lease.wrapperSignerSha256 &&
+            identity.crxPublicKeySha256 == lease.crxPublicKeySha256,
+    ) {
+        "commit할 identity lease binding이 원장과 일치하지 않습니다."
     }
 }
 

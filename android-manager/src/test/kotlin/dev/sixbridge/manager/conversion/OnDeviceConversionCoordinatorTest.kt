@@ -287,7 +287,8 @@ class OnDeviceConversionCoordinatorTest {
                 "package",
                 "publish",
                 "import",
-                "bundle-ready",
+                "bundle-ready-job-commit",
+                "identity-commit",
             ),
             events,
         )
@@ -1326,9 +1327,10 @@ class OnDeviceConversionCoordinatorTest {
                     bundle: File,
                     expectedSha256: String,
                 ) {
-                    events += "bundle-ready"
+                    events += "bundle-ready-job-commit"
                     stage = ConversionJobStage.BUNDLE_READY
                     activeOwner = null
+                    events += "identity-commit"
                 }
 
                 override suspend fun discard(token: String): Boolean {

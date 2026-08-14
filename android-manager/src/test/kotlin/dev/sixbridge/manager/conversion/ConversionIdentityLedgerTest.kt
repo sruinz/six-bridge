@@ -233,7 +233,7 @@ class ConversionIdentityLedgerTest {
     }
 
     @Test
-    fun `PACKAGED proof는 owner token으로 복구하고 BUNDLE_READY finalize만 제거한다`() =
+    fun `PACKAGED proof는 exact BUNDLE_READY에서 active와 CLEANING_COMMITTED로 함께 commit한다`() =
         runTest {
             val dao = FakeConversionIdentityDao()
             val ledger = ConversionIdentityLedger(dao)
@@ -264,7 +264,7 @@ class ConversionIdentityLedgerTest {
                 Triple(JOB_ONE, 7L, "e".repeat(64)),
             ).forEach { (ownerToken, generation, bundleSha256) ->
                 assertFailsWith<IllegalArgumentException> {
-                    dao.finalizePackagedForBundleReady(
+                    dao.claimBundleReadyCommit(
                         ownerToken,
                         generation,
                         bundleSha256,
@@ -276,12 +276,21 @@ class ConversionIdentityLedgerTest {
                 stage = ConversionJobStage.BUILDING.name,
             )
             assertFailsWith<IllegalArgumentException> {
-                dao.finalizePackagedForBundleReady(JOB_ONE, 7, "d".repeat(64))
+                dao.claimBundleReadyCommit(JOB_ONE, 7, "d".repeat(64))
             }
             dao.finalizationJob = bundleReadyJob(JOB_ONE, 7, "d".repeat(64))
-            assertTrue(dao.finalizePackagedForBundleReady(JOB_ONE, 7, "d".repeat(64)))
-            assertNull(dao.getLease(key.identitySha256))
-            assertTrue(dao.finalizePackagedForBundleReady(JOB_ONE, 7, "d".repeat(64)))
+            val committed = requireNotNull(
+                dao.claimBundleReadyCommit(JOB_ONE, 7, "d".repeat(64)),
+            )
+            assertTrue(committed.state.startsWith("CLEANING_COMMITTED:"))
+            val active = requireNotNull(dao.get(key.identitySha256))
+            assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+            assertNull(active.provisionOwnerToken)
+            assertEquals(reserved.versionCode, active.lastSuccessfulVersionCode)
+            assertEquals(
+                committed,
+                dao.claimBundleReadyCommit(JOB_ONE, 7, "d".repeat(64)),
+            )
             assertEquals(1, reserved.versionCode)
         }
 
@@ -321,7 +330,7 @@ class ConversionIdentityLedgerTest {
                 }
                 assertFailsWith<IllegalArgumentException> {
                     dao.finalizationJob = bundleReadyJob(ownerToken, 7, "d".repeat(64))
-                    dao.finalizePackagedForBundleReady(ownerToken, 7, "d".repeat(64))
+                    dao.claimBundleReadyCommit(ownerToken, 7, "d".repeat(64))
                 }
                 assertEquals(malformed, dao.getLease(key.identitySha256)?.state)
             }

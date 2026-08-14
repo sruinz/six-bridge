@@ -30,4 +30,5 @@ internal enum class ConversionIdentityLeaseState {
     RESERVED,
     PACKAGING,
     CLEANING,
+    CLEANING_COMMITTED,
 }
