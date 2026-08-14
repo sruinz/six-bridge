@@ -311,7 +311,7 @@ class DraftIdentityPreviewInstrumentedTest {
         } finally {
             runBlocking {
                 ownerToken?.let {
-                    runCatching { ledger.abortByOwnerToken(it, packager) }
+                    runCatching { ledger.releaseFailedAttempt(it, packager) }
                     runCatching { workStore.discard(it) }
                 }
             }
@@ -463,7 +463,7 @@ class DraftIdentityPreviewInstrumentedTest {
         } finally {
             runBlocking {
                 ownerToken?.let {
-                    runCatching { ledger.abortByOwnerToken(it, packager) }
+                    runCatching { ledger.releaseFailedAttempt(it, packager) }
                     runCatching { workStore.discard(it) }
                 }
             }

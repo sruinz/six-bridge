@@ -197,7 +197,7 @@ class OnDeviceConversionCoordinatorTest {
             assertEquals(1, fixture.events.count { it == "release" })
             assertTrue(fixture.inputOrphaned)
             assertTrue("profile" !in fixture.events)
-            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertTrue(fixture.abortedOwnerTokens.isEmpty())
             assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
             assertEquals(listOf(fixture.token), fixture.discardedTokens)
         }
@@ -287,7 +287,6 @@ class OnDeviceConversionCoordinatorTest {
                 "package",
                 "publish",
                 "import",
-                "abort",
                 "bundle-ready",
             ),
             events,
@@ -296,6 +295,7 @@ class OnDeviceConversionCoordinatorTest {
         assertEquals("Example", ready.review.name)
         assertTrue(Regex("^[0-9a-f]{64}$").matches(ready.review.wrapperSha256))
         assertTrue(Regex("^[0-9a-f]{64}$").matches(ready.review.signerSha256))
+        assertTrue(fixture.abortedOwnerTokens.isEmpty())
         assertNull(fixture.activeOwner)
     }
 
@@ -597,13 +597,13 @@ class OnDeviceConversionCoordinatorTest {
 
         assertEquals(AnalysisSafetyPolicy.mobile, fixture.analysisPolicy)
         assertTrue(fixture.analysisCancellationObserved)
-        assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+        assertTrue(fixture.abortedOwnerTokens.isEmpty())
         assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
         assertEquals(listOf(fixture.token), fixture.discardedTokens)
     }
 
     @Test
-    fun `분석 취소 cleanup 일부 실패는 exact token cancellation으로 보존한다`() =
+    fun `분석 취소는 identity failed-attempt release와 분리해 정리한다`() =
         runBlocking {
             val analysisEntered = CountDownLatch(1)
             val allowAnalysis = CountDownLatch(1)
@@ -628,10 +628,8 @@ class OnDeviceConversionCoordinatorTest {
             allowAnalysis.countDown()
             deferred.join()
 
-            val cancellation =
-                assertIs<ConversionCleanupCancellationException>(observed.get())
-            assertEquals(fixture.token, cancellation.token)
-            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertIs<CancellationException>(observed.get())
+            assertTrue(fixture.abortedOwnerTokens.isEmpty())
             assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
             assertEquals(listOf(fixture.token), fixture.discardedTokens)
         }
@@ -750,6 +748,7 @@ class OnDeviceConversionCoordinatorTest {
 
         assertEquals(failed.generated, restored.generated)
         assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
+        assertTrue(fixture.abortedOwnerTokens.isEmpty())
         assertNull(fixture.activeOwner)
     }
 
@@ -964,7 +963,7 @@ class OnDeviceConversionCoordinatorTest {
                 fixture.coordinator().restore(),
             )
             assertEquals(0, fixture.analyzeCalls)
-            assertEquals(listOf(fixture.token), fixture.abortedOwnerTokens)
+            assertTrue(fixture.abortedOwnerTokens.isEmpty())
             assertEquals(listOf(fixture.token), fixture.discardedBundleTokens)
             assertEquals(listOf(fixture.token), fixture.discardedTokens)
         }
@@ -1120,8 +1119,8 @@ class OnDeviceConversionCoordinatorTest {
 
         assertTrue(coordinator.discard(analysis.token))
 
-        assertTrue(fixture.ownerAborted)
-        assertNull(fixture.activeOwner)
+        assertFalse(fixture.ownerAborted)
+        assertEquals(analysis.token, fixture.activeOwner)
         assertTrue(!failed.generated.file.exists())
         assertTrue(fixture.workDiscarded)
     }

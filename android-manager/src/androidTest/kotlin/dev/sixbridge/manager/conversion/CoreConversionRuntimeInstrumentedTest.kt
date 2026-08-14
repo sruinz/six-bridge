@@ -1485,7 +1485,6 @@ class CoreConversionRuntimeInstrumentedTest {
         } finally {
             kotlinx.coroutines.runBlocking {
                 conversionToken?.let {
-                    runCatching { ledger.abortByOwnerToken(it, packager) }
                     runCatching { coordinator().discard(it) }
                 }
             }

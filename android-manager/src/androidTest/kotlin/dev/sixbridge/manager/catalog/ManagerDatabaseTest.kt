@@ -485,7 +485,7 @@ class ManagerDatabaseTest {
 
         val dao = database.conversionIdentityDao()
         val first = ledger.reserve(request, firstOwner)
-        assertTrue(ledger.abortReservationByOwnerToken(firstOwner))
+        assertTrue(ledger.releaseFailedAttempt(firstOwner))
         val second = ledger.reserve(request, secondOwner)
         val stored = requireNotNull(dao.get(key.identitySha256))
 
@@ -525,7 +525,7 @@ class ManagerDatabaseTest {
             crxPublicKeySha256 = null,
             packagingState = "PACKAGING:33333333-3333-4333-8333-333333333333",
         )
-        assertTrue(ledger.abortReservationByOwnerToken(secondOwner))
+        assertTrue(ledger.releaseFailedAttempt(secondOwner))
     }
 
     @Test

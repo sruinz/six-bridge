@@ -304,7 +304,6 @@ internal interface ConversionIdentityPort {
         ownerToken: String,
     ): ReservedPackageIdentity
     suspend fun releaseFailedAttempt(ownerToken: String)
-    suspend fun abort(ownerToken: String) = releaseFailedAttempt(ownerToken)
 }
 
 internal fun interface ConversionInstalledPort {

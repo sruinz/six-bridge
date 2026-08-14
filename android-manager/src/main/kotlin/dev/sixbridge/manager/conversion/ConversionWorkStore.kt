@@ -91,6 +91,21 @@ class ConversionWorkStore internal constructor(
                         .map(File::getName)
                         .filter(::isCanonicalUuid)
                         .toSet()
+                    val existing = dao.get()
+                    val existingCleanup = existing
+                        ?.cleanupTokensJson
+                        ?.let(::decodeCleanupTokens)
+                        .orEmpty()
+                    val priorOwners = buildSet {
+                        addAll(discoveredCleanup)
+                        existing?.token?.takeIf(::isCanonicalUuid)?.let(::add)
+                        addAll(existingCleanup.filter(::isCanonicalUuid))
+                    }
+                    if (priorOwners.any { !identityOwnerLifecycle.isOwnerDiscardComplete(it) }) {
+                        throw IllegalStateException(
+                            "Task 5 identity owner discard가 완료되지 않았습니다.",
+                        )
+                    }
                     var claimed = dao.claimCreate(
                         ConversionJobEntity(
                             token = token,
@@ -426,6 +441,7 @@ class ConversionWorkStore internal constructor(
         row: ConversionJobEntity?,
         token: String,
     ): Boolean {
+        if (!identityOwnerLifecycle.isOwnerDiscardComplete(token)) return false
         val tokenPath = directChild(root, token).toPath()
         val physicalExists = Files.exists(tokenPath, NOFOLLOW_LINKS)
         if (row == null) return !physicalExists
@@ -447,7 +463,6 @@ class ConversionWorkStore internal constructor(
             cleanup = decodeCleanupTokens(claimed.cleanupTokensJson) ?: return false
             if (token !in cleanup) return false
         }
-        identityOwnerLifecycle.abort(token)
         if (!deleteTokenDirectory(root, token)) return false
         return dao.updateCleanupTokens(
             token = claimed.token,
@@ -894,7 +909,7 @@ class ConversionWorkStore internal constructor(
             val pending = decodeCleanupTokens(row.cleanupTokensJson) ?: return null
             val token = pending.firstOrNull() ?: return row
             if (!isCanonicalUuid(token) || token == row.token) return null
-            identityOwnerLifecycle.abort(token)
+            if (!identityOwnerLifecycle.isOwnerDiscardComplete(token)) return null
             if (!deleteTokenDirectory(root, token)) return null
             val remaining = pending - token
             val changed = dao.updateCleanupTokens(
@@ -969,8 +984,8 @@ class ConversionWorkStore internal constructor(
         if (cleanup.any { !isCanonicalUuid(it) }) return false
         val tokens = if (isCanonicalUuid(row.token)) cleanup + row.token else cleanup
         if (tokens.any { !isCanonicalUuid(it) }) return false
+        if (tokens.any { !identityOwnerLifecycle.isOwnerDiscardComplete(it) }) return false
         for (token in tokens) {
-            identityOwnerLifecycle.abort(token)
             if (!deleteTokenDirectory(root, token)) return false
         }
         return true

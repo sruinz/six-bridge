@@ -291,12 +291,12 @@ internal class OnDeviceConversionCoordinator(
             } catch (error: CancellationException) {
                 throw error
             } catch (_: IllegalArgumentException) {
-                abortOwner(token)
+                releaseFailedAttempt(token)
                 return@withLock ConversionBuildResult.Failure(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
             } catch (_: Throwable) {
-                abortOwner(token)
+                releaseFailedAttempt(token)
                 return@withLock ConversionBuildResult.Failure(
                     ConversionFailureCode.KEYSTORE,
                 )
@@ -310,7 +310,7 @@ internal class OnDeviceConversionCoordinator(
                         installedWrapper.signerSha256 != resolved.identity.wrapperSignerSha256
                     )
             ) {
-                abortOwner(token)
+                releaseFailedAttempt(token)
                 return@withLock ConversionBuildResult.Failure(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
@@ -337,17 +337,24 @@ internal class OnDeviceConversionCoordinator(
                     ConversionFailureCode.BUNDLE_IO,
                     generated,
                 )
-            abortOwner(token)
             work.markBundleReady(token, generated.file, generated.sha256)
             ConversionBuildResult.BundleReady(review, generated)
         } catch (error: CancellationException) {
             if (generated == null) {
-                if (building) recoverFailedBuild(token, profileSha256) else abortOwner(token)
+                if (building) {
+                    recoverFailedBuild(token, profileSha256)
+                } else {
+                    releaseFailedAttempt(token)
+                }
             }
             throw error
         } catch (error: Throwable) {
             if (generated == null) {
-                if (building) recoverFailedBuild(token, profileSha256) else abortOwner(token)
+                if (building) {
+                    recoverFailedBuild(token, profileSha256)
+                } else {
+                    releaseFailedAttempt(token)
+                }
             }
             ConversionBuildResult.Failure(error.toBuildFailureCode(), generated)
         }
@@ -373,10 +380,9 @@ internal class OnDeviceConversionCoordinator(
     }
 
     override suspend fun discard(token: String): Boolean {
-        abortOwner(token)
-        val bundleDiscarded = bundles.discard(token)
         val workDiscarded = work.discard(token)
-        return bundleDiscarded && workDiscarded
+        if (!workDiscarded) return false
+        return bundles.discard(token)
     }
 
     override fun copyGenerated(token: String, output: OutputStream): String? =
@@ -421,30 +427,23 @@ internal class OnDeviceConversionCoordinator(
         if (!importReview) return RestoredConversion.GeneratedPending(generated)
         val review = imports.importGenerated(generated)
             ?: return RestoredConversion.GeneratedPending(generated)
-        abortOwner(job.token)
         work.markBundleReady(job.token, generated.file, generated.sha256)
         return RestoredConversion.BundleReady(review, generated)
     }
 
     private suspend fun discardInterrupted(token: String): RestoredConversion =
         withContext(NonCancellable) {
-            val ownerDiscarded = try {
-                identities.abort(token)
-                true
-            } catch (_: Exception) {
-                false
-            }
-            val bundleDiscarded = try {
-                bundles.discard(token)
-            } catch (_: Exception) {
-                false
-            }
             val workDiscarded = try {
                 work.discard(token)
             } catch (_: Exception) {
                 false
             }
-            if (ownerDiscarded && bundleDiscarded && workDiscarded) {
+            val bundleDiscarded = workDiscarded && try {
+                bundles.discard(token)
+            } catch (_: Exception) {
+                false
+            }
+            if (bundleDiscarded) {
                 RestoredConversion.InterruptedDiscarded
             } else {
                 RestoredConversion.InterruptedCleanupPending(token)
@@ -460,7 +459,6 @@ internal class OnDeviceConversionCoordinator(
             if (!importReview) return RestoredConversion.GeneratedPending(generated)
             val review = imports.importGenerated(generated)
                 ?: return RestoredConversion.GeneratedPending(generated)
-            abortOwner(job.token)
             work.markBundleReady(job.token, generated.file, generated.sha256)
             return RestoredConversion.BundleReady(review, generated)
         }
@@ -587,15 +585,15 @@ internal class OnDeviceConversionCoordinator(
             ConversionFailureCode.INPUT_INVALID
         }
 
-    private suspend fun abortOwner(token: String) {
+    private suspend fun releaseFailedAttempt(token: String) {
         withContext(NonCancellable) {
-            identities.abort(token)
+            identities.releaseFailedAttempt(token)
         }
     }
 
     private suspend fun recoverFailedBuild(token: String, profileSha256: String) {
         withContext(NonCancellable) {
-            identities.abort(token)
+            identities.releaseFailedAttempt(token)
             work.resetAwaitingApproval(token, profileSha256)
         }
     }

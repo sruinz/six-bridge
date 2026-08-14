@@ -606,15 +606,6 @@ class ConversionIdentityLedger(
         ownerToken: String,
     ): Boolean = releaseFailedAttemptInternal(ownerToken, null)
 
-    suspend fun abortByOwnerToken(
-        ownerToken: String,
-        packager: OnDeviceWrapperPackager,
-    ): Boolean = releaseFailedAttempt(ownerToken, packager)
-
-    internal suspend fun abortReservationByOwnerToken(
-        ownerToken: String,
-    ): Boolean = releaseFailedAttempt(ownerToken)
-
     private suspend fun releaseFailedAttemptInternal(
         ownerToken: String,
         packager: OnDeviceWrapperPackager?,
@@ -734,6 +725,14 @@ class ConversionIdentityLedger(
             else -> throw IllegalArgumentException("abort할 수 없는 identity lease 상태입니다.")
         }
         true
+    }
+
+    private suspend fun isOwnerDiscardComplete(
+        ownerToken: String,
+    ): Boolean = reserveMutex.withLock {
+        requireOwnerToken(ownerToken)
+        dao.findByProvisionOwnerToken(ownerToken) == null &&
+            dao.getLeaseByOwnerToken(ownerToken) == null
     }
 
     private suspend fun finalizePackagedForBundleReady(
@@ -1027,7 +1026,7 @@ class ConversionIdentityLedger(
         private val ledger: ConversionIdentityLedger,
         private val packager: OwnerLifecyclePackager,
     ) {
-        suspend fun abort(ownerToken: String) {
+        suspend fun releaseFailedAttempt(ownerToken: String) {
             when (val binding = packager) {
                 is OwnerLifecyclePackager.Full ->
                     ledger.releaseFailedAttempt(ownerToken, binding.packager)
@@ -1035,6 +1034,9 @@ class ConversionIdentityLedger(
                     ledger.releaseFailedAttempt(ownerToken)
             }
         }
+
+        suspend fun isOwnerDiscardComplete(ownerToken: String): Boolean =
+            ledger.isOwnerDiscardComplete(ownerToken)
 
         suspend fun finalizeBundleReady(
             ownerToken: String,
