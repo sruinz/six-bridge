@@ -6,16 +6,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
-import dev.sixbridge.core.conversion.ConversionPreparationEngine
-import dev.sixbridge.core.draft.DraftConversionPlan
-import dev.sixbridge.core.draft.DraftInputMetadata
-import dev.sixbridge.core.draft.DraftMetadata
-import dev.sixbridge.core.draft.DraftSelectedAdapter
 import dev.sixbridge.core.draft.DraftSourceKind
 import dev.sixbridge.core.draft.SixDraft
-import dev.sixbridge.core.draft.SixDraftPayload
 import dev.sixbridge.core.input.ExtensionInputKind
-import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.catalog.ManagerDatabase
@@ -46,6 +39,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class DraftIdentityPreviewInstrumentedTest {
     private val context = InstrumentationRegistry.getInstrumentation().targetContext
+    private val testContext = InstrumentationRegistry.getInstrumentation().context
 
     @Test
     fun crx3PassthroughDraftPreviewMatchesResolvedAndReservedIdentityKey() =
@@ -302,10 +296,12 @@ class DraftIdentityPreviewInstrumentedTest {
                 assertNull(
                     database.conversionIdentityDao().getLeaseByOwnerToken(job.token),
                 )
-                assertTrue(outcome.exceptionOrNull() is IllegalArgumentException)
+                val failure = outcome.exceptionOrNull()
+                assertTrue(failure is ConversionIdentityException)
+                assertTrue(failure?.cause is IllegalArgumentException)
                 assertEquals(
-                    "prepared identity mode와 passthrough CRX proof가 일치하지 않습니다.",
-                    outcome.exceptionOrNull()?.message,
+                    "Failed requirement.",
+                    failure?.cause?.message,
                 )
             }
         } finally {
@@ -323,57 +319,29 @@ class DraftIdentityPreviewInstrumentedTest {
 
     private fun assertPassthroughDraftPreview(inputKind: ExtensionInputKind) {
         val profile = profile()
-        val crx = externalSignedCrx(simpleExtensionZip())
-        val crxProof = Crx3Verifier.verify(crx)
-        val sourceIdentity = "store:${crxProof.extensionId}"
-        val prepared = ConversionPreparationEngine().use {
-            it.prepare(
-                PortableExtensionInput.fromCrx(
-                    kind = inputKind,
-                    crxBytes = crx,
-                    expectedExtensionId = crxProof.extensionId,
-                    signedDraftSourceIdentity = sourceIdentity,
-                ),
-                profile,
-                emptySet(),
-            )
+        val assetName = when (inputKind) {
+            ExtensionInputKind.CRX3 ->
+                "draft-identity-preview-crx3-schema2.sixdraft"
+            ExtensionInputKind.CHROME_WEB_STORE ->
+                "draft-identity-preview-chrome-web-store-schema2.sixdraft"
+            else -> error("passthrough fixture input kind가 아닙니다: $inputKind")
         }
-        check(prepared.passthroughCrx != null)
-        val selected = prepared.compatibilityAfter.adapterDecisions
-            .filter { it.applied }
-            .map { DraftSelectedAdapter(it.id, it.version) }
-        val compatibilityBefore = prepared.compatibilityBefore.copy(
-            originalExtensionId = crxProof.extensionId,
-        )
-        val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV2(
-                coreVersion = "draft-preview-gate",
-                adapterVersions = selected.associate { it.id to it.version },
-                sourceIdentity = sourceIdentity,
-            ),
-            input = DraftInputMetadata(
-                inputKind = inputKind,
-                originalSourceSha256 = prepared.originalSourceSha256,
-                browserProfileSha256 = prepared.browserProfileSha256,
-                originalExtensionId = crxProof.extensionId,
-                originalExtensionVersion = requireNotNull(
-                    prepared.compatibilityBefore.extensionVersion,
-                ),
-                sourceIdentity = sourceIdentity,
-            ),
-            sourceKind = DraftSourceKind.CRX,
-            source = crx,
-            plan = DraftConversionPlan.create(
-                compatibilityBefore,
-                selected,
-            ),
-            compatibilityBefore = compatibilityBefore,
-            compatibilityAfter = prepared.compatibilityAfter,
-        )
-        val draftBytes = SixDraft.createBytes(
-            payload,
-            KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
-        )
+        val draftBytes = assetBytes(assetName)
+        val verified = SixDraft.read(draftBytes)
+        val payload = verified.payload
+        val crxProof = Crx3Verifier.verify(payload.source)
+        check(payload.draft.schemaVersion == 2)
+        check(payload.input.inputKind == inputKind)
+        check(payload.sourceKind == DraftSourceKind.CRX)
+        check(payload.input.browserProfileSha256 == profile.canonicalSha256())
+        check(payload.input.originalExtensionId == crxProof.extensionId)
+        check(payload.draft.sourceIdentity == "store:${crxProof.extensionId}")
+        check(payload.plan.selectedAdapters.isEmpty())
+        check(!payload.compatibilityBefore.manifestKeyPresent)
+        check(payload.compatibilityBefore.manifestKeyExtensionId == null)
+        check(!payload.compatibilityAfter.manifestKeyPresent)
+        check(payload.compatibilityAfter.manifestKeyExtensionId == null)
+        check(payload.compatibilityAfter.convertedExtensionId == crxProof.extensionId)
         val database = Room.inMemoryDatabaseBuilder(
             context,
             ManagerDatabase::class.java,
@@ -493,61 +461,30 @@ class DraftIdentityPreviewInstrumentedTest {
     }
 
     private fun schemaV3PreparedDraft(profile: BrowserProfile): PreparedDraftFixture {
-        val sourceIdentity = "project:${UUID.randomUUID().toString().replace("-", "")}"
-        val prepared = ConversionPreparationEngine().use {
-            it.prepare(
-                PortableExtensionInput.fromZip(
-                    kind = ExtensionInputKind.ZIP,
-                    zipBytes = simpleExtensionZip(),
-                    signedDraftSourceIdentity = sourceIdentity,
-                ),
-                profile,
-                emptySet(),
-            )
-        }
-        val preparedCrx = externalSignedCrx(prepared.transformedSourceZip)
-        val proof = Crx3Verifier.verify(preparedCrx)
-        val selected = prepared.compatibilityAfter.adapterDecisions
-            .filter { it.applied }
-            .map { DraftSelectedAdapter(it.id, it.version) }
-        val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV3(
-                coreVersion = "schema3-full-path",
-                adapterVersions = selected.associate { it.id to it.version },
-                sourceIdentity = sourceIdentity,
-            ),
-            input = DraftInputMetadata(
-                inputKind = ExtensionInputKind.ZIP,
-                originalSourceSha256 = prepared.originalSourceSha256,
-                browserProfileSha256 = prepared.browserProfileSha256,
-                originalExtensionId = prepared.originalExtensionId,
-                originalExtensionVersion = requireNotNull(
-                    prepared.compatibilityBefore.extensionVersion,
-                ),
-                sourceIdentity = sourceIdentity,
-            ),
-            sourceKind = DraftSourceKind.PREPARED_CRX,
-            source = preparedCrx,
-            plan = DraftConversionPlan.create(
-                prepared.compatibilityBefore,
-                selected,
-            ),
-            compatibilityBefore = prepared.compatibilityBefore,
-            compatibilityAfter = prepared.compatibilityAfter.copy(
-                convertedExtensionId = proof.extensionId,
-                sourceSha256 = proof.zipSha256,
-            ),
-        )
+        val draft = assetBytes("draft-identity-preview-prepared-schema3.sixdraft")
+        val verified = SixDraft.read(draft)
+        val payload = verified.payload
+        val proof = Crx3Verifier.verify(payload.source)
+        check(payload.draft.schemaVersion == 3)
+        check(payload.input.inputKind == ExtensionInputKind.ZIP)
+        check(payload.sourceKind == DraftSourceKind.PREPARED_CRX)
+        check(payload.input.browserProfileSha256 == profile.canonicalSha256())
+        check(payload.draft.sourceIdentity == payload.input.sourceIdentity)
+        check(!payload.compatibilityBefore.manifestKeyPresent)
+        check(payload.compatibilityBefore.manifestKeyExtensionId == null)
+        check(!payload.compatibilityAfter.manifestKeyPresent)
+        check(payload.compatibilityAfter.manifestKeyExtensionId == null)
+        check(payload.compatibilityAfter.convertedExtensionId == proof.extensionId)
         return PreparedDraftFixture(
-            draft = SixDraft.createBytes(
-                payload,
-                KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
-            ),
-            preparedCrx = preparedCrx,
+            draft = draft,
+            preparedCrx = payload.source,
             extensionId = proof.extensionId,
-            sourceIdentity = sourceIdentity,
+            sourceIdentity = payload.draft.sourceIdentity,
         )
     }
+
+    private fun assetBytes(name: String): ByteArray =
+        testContext.assets.open(name).use { it.readBytes() }
 
     private fun simpleExtensionZip(): ByteArray = ByteArrayOutputStream().use { output ->
         ZipOutputStream(output).use { zip ->

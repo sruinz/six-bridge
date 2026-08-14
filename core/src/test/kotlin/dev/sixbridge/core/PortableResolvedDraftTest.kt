@@ -23,7 +23,10 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.spec.X509EncodedKeySpec
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -33,6 +36,13 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.apache.commons.compress.archivers.zip.UnixStat
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+import org.apache.commons.compress.archivers.zip.ZipFile as CommonsZipFile
+import org.apache.commons.compress.utils.SeekableInMemoryByteChannel
 
 class PortableResolvedDraftTest {
     @Test
@@ -305,6 +315,151 @@ class PortableResolvedDraftTest {
         }
     }
 
+    @Test
+    fun `Android identity preview fixtures는 signed semantics와 entry allowlist를 고정한다`() {
+        identityPreviewFixtures.forEach { fixture ->
+            val fixtureBytes = Files.readAllBytes(fixture.path)
+            val outerEntries = readRegularZipEntries(fixtureBytes, fixture.name)
+            val verified = SixDraft.read(fixtureBytes)
+            val payload = verified.payload
+            val crx = Crx3.parse(payload.source)
+
+            assertEquals(fixture.sha256, sha256(fixtureBytes), fixture.name)
+            assertEquals(fixture.schemaVersion, payload.draft.schemaVersion, fixture.name)
+            assertEquals(fixture.inputKind, payload.input.inputKind, fixture.name)
+            assertEquals(fixture.sourceKind, payload.sourceKind, fixture.name)
+            assertEquals(profile.canonicalSha256(), payload.input.browserProfileSha256)
+            assertEquals(payload.draft.sourceIdentity, payload.input.sourceIdentity)
+            assertEquals(
+                setOf(
+                    "compatibility-after.json",
+                    "compatibility-before.json",
+                    "conversion-plan.json",
+                    "draft-signature.json",
+                    "draft.json",
+                    "expected.json",
+                    "input.json",
+                    fixture.sourceKind.entryName,
+                ),
+                outerEntries.keys,
+                fixture.name,
+            )
+            assertEquals(outerEntries.keys, verified.entryNames, fixture.name)
+            assertEquals(64, verified.signerFingerprint.length, fixture.name)
+            val outerJson = outerEntries
+                .filterKeys { it.endsWith(".json") }
+                .values
+                .joinToString("\n") { it.decodeToString() }
+            FORBIDDEN_FIXTURE_PATTERNS.forEach { forbidden ->
+                assertFalse(forbidden.containsMatchIn(outerJson), fixture.name)
+            }
+
+            val embeddedEntries = readRegularZipEntries(crx.zipBytes, "${fixture.name} CRX")
+            assertEquals(setOf("manifest.json"), embeddedEntries.keys, fixture.name)
+            val manifest = Json.parseToJsonElement(
+                embeddedEntries.getValue("manifest.json").decodeToString(),
+            ).jsonObject
+            assertEquals(
+                setOf("manifest_version", "name", "version"),
+                manifest.keys,
+                fixture.name,
+            )
+            assertEquals("3", manifest.getValue("manifest_version").jsonPrimitive.content)
+            assertEquals(fixture.extensionName, manifest.getValue("name").jsonPrimitive.content)
+            assertEquals("1.0", manifest.getValue("version").jsonPrimitive.content)
+            assertEquals(
+                "RSA",
+                KeyFactory.getInstance("RSA")
+                    .generatePublic(X509EncodedKeySpec(crx.publicKey))
+                    .algorithm,
+                fixture.name,
+            )
+            assertFalse(payload.compatibilityBefore.manifestKeyPresent, fixture.name)
+            assertEquals(null, payload.compatibilityBefore.manifestKeyExtensionId, fixture.name)
+            assertFalse(payload.compatibilityAfter.manifestKeyPresent, fixture.name)
+            assertEquals(null, payload.compatibilityAfter.manifestKeyExtensionId, fixture.name)
+            assertEquals(crx.extensionId, payload.compatibilityAfter.convertedExtensionId)
+
+            if (fixture.schemaVersion == 2) {
+                assertTrue(payload.plan.selectedAdapters.isEmpty(), fixture.name)
+                assertEquals(
+                    ConversionState.PASSTHROUGH,
+                    payload.compatibilityAfter.conversionState,
+                    fixture.name,
+                )
+                assertEquals(crx.extensionId, payload.input.originalExtensionId, fixture.name)
+                assertEquals(
+                    "store:${crx.extensionId}",
+                    payload.draft.sourceIdentity,
+                    fixture.name,
+                )
+                assertEquals(
+                    payload.expected.originalSourceSha256,
+                    payload.expected.transformedSourceSha256,
+                    fixture.name,
+                )
+            } else {
+                assertEquals(
+                    PREPARED_FIXTURE_SOURCE_IDENTITY,
+                    payload.draft.sourceIdentity,
+                    fixture.name,
+                )
+            }
+        }
+    }
+
+    private fun readRegularZipEntries(
+        bytes: ByteArray,
+        label: String,
+    ): LinkedHashMap<String, ByteArray> {
+        val entries = linkedMapOf<String, ByteArray>()
+        SeekableInMemoryByteChannel(bytes).use { channel ->
+            CommonsZipFile.builder()
+                .setSeekableByteChannel(channel)
+                .get()
+                .use { zip ->
+                    zip.entries.asSequence().forEach { entry ->
+                        val segments = entry.name.split('/')
+                        assertFalse(
+                            entry.isDirectory,
+                            "$label: directory entry ${entry.name}",
+                        )
+                        assertTrue(
+                            zip.canReadEntryData(entry),
+                            "$label: unreadable ${entry.name}",
+                        )
+                        assertFalse(entry.isUnixSymlink, "$label: symlink ${entry.name}")
+                        if (entry.platform == ZipArchiveEntry.PLATFORM_UNIX) {
+                            assertEquals(
+                                UnixStat.FILE_FLAG,
+                                entry.unixMode and UnixStat.FILE_TYPE_FLAG,
+                                "$label: non-regular ${entry.name}",
+                            )
+                        }
+                        assertFalse(
+                            entry.name.startsWith('/') || '\\' in entry.name,
+                            label,
+                        )
+                        assertTrue(
+                            segments.all { it.isNotEmpty() && it != "." && it != ".." },
+                            "$label: unsafe entry ${entry.name}",
+                        )
+                        assertFalse(
+                            entries.containsKey(entry.name),
+                            "$label: duplicate ${entry.name}",
+                        )
+                        entries[entry.name] = zip.getInputStream(entry).use { it.readBytes() }
+                    }
+                }
+        }
+        return entries
+    }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
     private class SecureFixture : AutoCloseable {
         private val fileSystem = Jimfs.newFileSystem(
             Configuration.unix().toBuilder()
@@ -425,6 +580,23 @@ class PortableResolvedDraftTest {
 
     private companion object {
         private const val PRIVATE_SENTINEL = "SIX_PRIVATE_SENTINEL_DO_NOT_LOG"
+        private const val PREPARED_FIXTURE_SOURCE_IDENTITY =
+            "project:cccccccccccccccccccccccccccccccc"
+        private val FORBIDDEN_FIXTURE_PATTERNS = listOf(
+            Regex("BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY", RegexOption.IGNORE_CASE),
+            Regex("/(?:Users|Volumes|private/var)/", RegexOption.IGNORE_CASE),
+            Regex("\\b(?:[a-z0-9-]+\\.)+local\\b", RegexOption.IGNORE_CASE),
+            Regex(
+                "\\b(?:10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|" +
+                    "172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})\\b",
+            ),
+            Regex("\\bSM-[A-Z0-9]+\\b", RegexOption.IGNORE_CASE),
+            Regex("\\bemulator-\\d+\\b", RegexOption.IGNORE_CASE),
+            Regex(
+                "\\b(?:ANDROID_SERIAL|localhost|hostname|adb\\s+shell)\\b",
+                RegexOption.IGNORE_CASE,
+            ),
+        )
         private val platformSource =
             Path.of("../fixtures/popup-autofill-internal-url-platform")
         private val popupGuardSource =
@@ -436,6 +608,47 @@ class PortableResolvedDraftTest {
         private val popupOriginalDraftAsset = Path.of(
             "../android-manager/src/androidTest/assets/" +
                 "popup-autofill-original.sixdraft",
+        )
+        private val identityPreviewFixtures = listOf(
+            IdentityPreviewFixture(
+                name = "CRX3 schema 2",
+                path = Path.of(
+                    "../android-manager/src/androidTest/assets/" +
+                        "draft-identity-preview-crx3-schema2.sixdraft",
+                ),
+                schemaVersion = 2,
+                inputKind = ExtensionInputKind.CRX3,
+                sourceKind = DraftSourceKind.CRX,
+                extensionName = "Identity Preview",
+                sha256 =
+                    "9658077d6236ebf13ac98b25ebcc0bd4b0b98673fcb04d77ece14a813d41b14b",
+            ),
+            IdentityPreviewFixture(
+                name = "Chrome Web Store schema 2",
+                path = Path.of(
+                    "../android-manager/src/androidTest/assets/" +
+                        "draft-identity-preview-chrome-web-store-schema2.sixdraft",
+                ),
+                schemaVersion = 2,
+                inputKind = ExtensionInputKind.CHROME_WEB_STORE,
+                sourceKind = DraftSourceKind.CRX,
+                extensionName = "Identity Preview",
+                sha256 =
+                    "652613abf2096fc4c4c1c39c365ab96fb5c2e954114a0996605231d2f442d5ff",
+            ),
+            IdentityPreviewFixture(
+                name = "prepared schema 3",
+                path = Path.of(
+                    "../android-manager/src/androidTest/assets/" +
+                        "draft-identity-preview-prepared-schema3.sixdraft",
+                ),
+                schemaVersion = 3,
+                inputKind = ExtensionInputKind.ZIP,
+                sourceKind = DraftSourceKind.PREPARED_CRX,
+                extensionName = "Preview",
+                sha256 =
+                    "34a4390db6664560194724bd0920fc4109109f5e07bb130d206fb1cf635078a2",
+            ),
         )
         val profile = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",
@@ -450,4 +663,14 @@ class PortableResolvedDraftTest {
         )
         val platformProfile = profile
     }
+
+    private data class IdentityPreviewFixture(
+        val name: String,
+        val path: Path,
+        val schemaVersion: Int,
+        val inputKind: ExtensionInputKind,
+        val sourceKind: DraftSourceKind,
+        val extensionName: String,
+        val sha256: String,
+    )
 }
