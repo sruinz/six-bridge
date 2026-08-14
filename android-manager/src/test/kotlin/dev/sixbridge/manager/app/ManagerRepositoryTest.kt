@@ -1059,6 +1059,63 @@ class ManagerRepositoryTest {
             Unit
         }
 
+    @Test
+    fun `legacy promotion 취소는 동일 예외를 재전파하고 해당 import token을 정리한다`() =
+        runBlocking {
+            val cacheRoot = temporaryFolder.newFolder("promotion-cancellation-cache")
+            val retainedRoot = File(cacheRoot, "imports").apply { check(mkdir()) }
+            val imported = importedBundle(retainedRoot)
+            val retainedImports = RetainedImportStore(retainedRoot) { _, _, _ ->
+                WrapperVerificationResult.Success(imported.verifiedApk)
+            }
+            val untouched = importedBundle(retainedRoot, token = SECOND_TOKEN)
+            assertTrue(retainedImports.save(untouched))
+            val generatedFile = temporaryFolder.newFile("promotion-cancellation.six")
+                .apply { writeText("bundle") }
+            val generated = GeneratedBundle(
+                token = TOKEN,
+                file = generatedFile,
+                sha256 = "f".repeat(64),
+                suggestedFileName = "$TOKEN.six",
+            )
+            val pendingStore = StartupPendingStore(null, cacheRoot)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val cancellation = CancellationException("simulated promotion cancellation")
+            val repository = managerRepository(
+                root = cacheRoot,
+                retainedImports = retainedImports,
+                gateway = gateway,
+                pendingStore = pendingStore,
+                installed = installed,
+                catalog = catalog,
+                coordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                ),
+                generatedImporter = { ImportResult.Success(imported) },
+                promoteLegacyFromVerifiedBundle = {
+                    assertNotNull(retainedImports.load(TOKEN))
+                    throw cancellation
+                },
+            )
+
+            val thrown = assertFailsWith<CancellationException> {
+                repository.importGenerated(generated)
+            }
+
+            assertSame(cancellation, thrown)
+            assertFalse(File(retainedRoot, TOKEN).exists())
+            assertNull(retainedImports.load(TOKEN))
+            assertTrue(File(retainedRoot, SECOND_TOKEN).isDirectory)
+            assertNotNull(retainedImports.load(SECOND_TOKEN))
+            Unit
+        }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `generated terminal finalize death 뒤 실제 retained review로 같은 설치를 다시 시작한다`() {

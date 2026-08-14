@@ -25,6 +25,7 @@ import dev.sixbridge.manager.conversion.DefaultConversionIdentityPort
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
+import dev.sixbridge.manager.conversion.VerifiedIdentityProof
 import dev.sixbridge.manager.conversion.encodeCleanupTokens
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -460,6 +461,110 @@ class ManagerDatabaseTest {
                 assertNull(active.crxPublicKeySha256)
             }
             Unit
+        }
+
+    @Test
+    fun current_bundle_legacy_promotion_rechecks_exact_job_inside_room_transaction() =
+        runBlocking {
+            val identityDao = database.conversionIdentityDao()
+            val jobDao = database.conversionJobDao()
+            val bundleSha256 = "c".repeat(64)
+            val cases = listOf(null, "token", "generation", "stage", "bundleSha256")
+
+            cases.forEachIndexed { index, changedColumn ->
+                database.clearAllTables()
+                val discriminator = ('a'.code + index).toChar().toString()
+                val legacy = v5Identity(discriminator, null).copy(
+                    mode = InstallationIdentityMode.PASSTHROUGH.name,
+                    crxKeyAlias = null,
+                    lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                    crxPublicKeySha256 = null,
+                    lastSuccessfulVersionCode = null,
+                )
+                identityDao.insert(legacy)
+                val created = jobDao.claimCreate(conversionJob(TOKEN))
+                assertEquals(
+                    1,
+                    jobDao.transition(
+                        token = created.token,
+                        expectedStage = ConversionJobStage.INPUT_READY.name,
+                        expectedGeneration = created.generation,
+                        expectedProfileSha256 = null,
+                        nextStage = ConversionJobStage.BUNDLE_READY.name,
+                        approvedAdapterIdsJson = "[]",
+                        profileSha256 = "d".repeat(64),
+                        bundleFileName = "$TOKEN.six",
+                        bundleSha256 = bundleSha256,
+                        updatedAtEpochMillis = 2,
+                    ),
+                )
+                val observedJob = requireNotNull(jobDao.get())
+                val proof = VerifiedIdentityProof(
+                    packageName = legacy.packageName,
+                    extensionId = legacy.extensionId,
+                    wrapperSignerSha256 = legacy.wrapperSignerSha256,
+                    versionCode = 7,
+                )
+                val observed = CurrentBundleReadyProof.Verified(
+                    ownerToken = observedJob.token,
+                    generation = observedJob.generation,
+                    bundleSha256 = requireNotNull(observedJob.bundleSha256),
+                    proof = proof,
+                )
+                val expectedJob = when (changedColumn) {
+                    null -> observedJob
+                    "token" -> observedJob.copy(token = SECOND_TOKEN)
+                    "generation" -> observedJob.copy(generation = observedJob.generation + 1)
+                    "stage" -> observedJob.copy(stage = ConversionJobStage.BUILDING.name)
+                    "bundleSha256" -> observedJob.copy(bundleSha256 = "e".repeat(64))
+                    else -> error("unknown mutation")
+                }
+                if (changedColumn != null) {
+                    database.openHelper.writableDatabase.execSQL(
+                        "UPDATE conversion_job SET $changedColumn = ? WHERE singletonId = 1",
+                        arrayOf<Any?>(
+                            when (changedColumn) {
+                                "token" -> expectedJob.token
+                                "generation" -> expectedJob.generation
+                                "stage" -> expectedJob.stage
+                                "bundleSha256" -> expectedJob.bundleSha256
+                                else -> error("unknown mutation")
+                            },
+                        ),
+                    )
+                }
+                assertEquals(expectedJob, jobDao.get())
+                queries.clear()
+
+                val promoted = identityDao.promoteLegacyIdentity(
+                    expected = legacy,
+                    proof = proof,
+                    verifiedPublicKeySha256 = null,
+                    lifecycleUpdatedAtEpochMillis = 1234,
+                    observedCurrentBundle = observed,
+                )
+
+                val caseName = changedColumn ?: "unchanged control"
+                if (changedColumn == null) {
+                    assertTrue(caseName, promoted)
+                    requireNotNull(identityDao.get(legacy.identitySha256)).also { active ->
+                        assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+                        assertEquals(proof.versionCode, active.lastSuccessfulVersionCode)
+                    }
+                } else {
+                    assertFalse(caseName, promoted)
+                    assertEquals(caseName, legacy, identityDao.get(legacy.identitySha256))
+                }
+                val jobSelectIndex = queries.indexOfFirst { query ->
+                    query.startsWith("SELECT * FROM conversion_job WHERE singletonId = 1")
+                }
+                val transactionIndex = queries.indexOfFirst { query -> query.startsWith("BEGIN") }
+                assertTrue("$caseName job recheck must be recorded", jobSelectIndex >= 0)
+                assertTrue(
+                    "$caseName job recheck must stay inside the promotion transaction",
+                    transactionIndex in 0 until jobSelectIndex,
+                )
+            }
         }
 
     @Test
@@ -1475,6 +1580,8 @@ class ManagerDatabaseTest {
     )
 
     private companion object {
+        const val TOKEN = "11111111-1111-4111-8111-111111111111"
+        const val SECOND_TOKEN = "22222222-2222-4222-8222-222222222222"
         const val MIGRATION_DATABASE = "manager-migration-1-2.db"
         const val MIGRATION_V2_DATABASE = "manager-migration-2-3.db"
         const val MIGRATION_V2_COLLISION_DATABASE = "manager-migration-2-3-collision.db"
