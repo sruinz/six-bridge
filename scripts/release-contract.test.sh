@@ -59,8 +59,12 @@ grep -Fq '계정·cookie·storage 내용' "$ROOT_DIR/docs/RELEASE_KO.md" || fail
 grep -Fq '원본/변환 확장과 사용자 데이터가 포함된 로그' "$ROOT_DIR/docs/RELEASE_KO.md" || fail "민감 로그 제출 금지 안내가 없습니다."
 grep -Fq 'https://github.com/sruinz/six-bridge/tree/v0.1.1' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "v0.1.1 절대 source URL이 없습니다."
 grep -Fq 'compatibility passthrough' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "zero-adapter compatibility passthrough 안내가 없습니다."
+grep -Fq 'passthrough 신원으로 오인하지 않으며' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "zero-adapter identity mode 경계가 없습니다."
+grep -Fq '새로 만들거나 검증된 기존 대상으로 선택·결속한 `CONVERTED` 설치 신원' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "CreateNew·UseExisting identity 안내가 없습니다."
 grep -Fq 'provisional identity' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "재시도 identity 재사용 안내가 없습니다."
 grep -Fq 'storage_area_unknown' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "storage_area_unknown 경고 안내가 없습니다."
 grep -Fq '비차단 정적 경고' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "storage 경고의 비차단 경계가 없습니다."
 grep -Fq 'v0.1.0 Release·tag·assets' "$ROOT_DIR/docs/releases/v0.1.1-ko.md" || fail "v0.1.0 보존 안내가 없습니다."
+grep -Fq '[v0.1.1 다운로드](https://github.com/sruinz/six-bridge/releases/tag/v0.1.1)' "$ROOT_DIR/README.md" || fail "README v0.1.1 Release 다운로드 링크가 없습니다."
+grep -Fq '[v0.1.0 역사 릴리스 노트](docs/releases/v0.1.0-ko.md)' "$ROOT_DIR/README.md" || fail "README v0.1.0 역사 링크가 없습니다."
 printf 'release 계약 검증 통과\n'
