@@ -18,8 +18,11 @@ import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCoordinatorPort
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.GeneratedBundle
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.conversion.VerifiedIdentityProof
@@ -1006,6 +1009,60 @@ class ManagerRepositoryTest {
                     "copy",
                     "discard",
                 ),
+                calls,
+            )
+        }
+
+    @Test
+    fun `repository는 legacy 목록과 exact cleanup 결과만 management service에 위임한다`() =
+        runBlocking {
+            val root = temporaryFolder.newFolder("legacy-management-repository")
+            val pendingStore = StartupPendingStore(null, root)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val identity = LegacyConversionIdentity(
+                identitySha256 = "a".repeat(64),
+                displayName = "이전 변환",
+                mode = InstallationIdentityMode.CONVERTED,
+                packageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+                extensionId = "b".repeat(32),
+                wrapperSignerSha256 = "c".repeat(64),
+            )
+            val calls = mutableListOf<String>()
+            val repository = managerRepository(
+                root = root,
+                retainedImports = RetainedImportStore(root) { _, _, _ ->
+                    error("보존 import를 읽지 않습니다.")
+                },
+                gateway = gateway,
+                pendingStore = pendingStore,
+                installed = installed,
+                catalog = catalog,
+                coordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                ),
+                listLegacyUnknown = {
+                    calls += "list"
+                    listOf(identity)
+                },
+                discardLegacyUnknown = { identitySha256 ->
+                    calls += "discard:$identitySha256"
+                    ConversionIdentityCleanupResult.Blocked("강한 proof가 없습니다.")
+                },
+            )
+
+            assertEquals(listOf(identity), repository.listLegacyUnknown())
+            assertEquals(
+                ConversionIdentityCleanupResult.Blocked("강한 proof가 없습니다."),
+                repository.discardLegacyUnknown(identity.identitySha256),
+            )
+            assertEquals(
+                listOf("list", "discard:${identity.identitySha256}"),
                 calls,
             )
         }
@@ -3707,6 +3764,10 @@ class ManagerRepositoryTest {
             ImportResult.Failure(ImportFailure(ImportFailureCode.CACHE_IO))
         },
         promoteLegacyFromVerifiedBundle: suspend (VerifiedIdentityProof) -> Boolean = { false },
+        listLegacyUnknown: suspend () -> List<LegacyConversionIdentity> = { emptyList() },
+        discardLegacyUnknown: suspend (String) -> ConversionIdentityCleanupResult = {
+            ConversionIdentityCleanupResult.NothingOwned
+        },
     ) = DefaultManagerRepository(
         importer = BundleImportService(
             BundleSource { error("직접 import하지 않습니다.") },
@@ -3740,6 +3801,8 @@ class ManagerRepositoryTest {
         conversionCoordinator = conversionCoordinator,
         generatedImporter = generatedImporter,
         promoteLegacyFromVerifiedBundle = promoteLegacyFromVerifiedBundle,
+        listLegacyUnknown = listLegacyUnknown,
+        discardLegacyUnknown = discardLegacyUnknown,
     )
 
     private fun legacyInstallRepository(

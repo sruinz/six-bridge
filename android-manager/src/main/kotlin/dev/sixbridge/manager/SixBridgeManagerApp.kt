@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.sixbridge.manager.ui.HomeScreen
 import dev.sixbridge.manager.ui.ConversionAnalysisScreen
+import dev.sixbridge.manager.ui.ConversionIdentityManagementScreen
 import dev.sixbridge.manager.ui.ConversionInputScreen
 import dev.sixbridge.manager.ui.ConversionResultScreen
 import dev.sixbridge.manager.ui.ConversionUiState
@@ -86,6 +87,11 @@ fun ManagerAppContent(
             onAction = onAction,
             modifier = modifier,
         )
+        ManagerRoute.ConversionIdentityManagement -> ConversionIdentityManagementScreen(
+            state = state.conversionIdentityManagementState,
+            onAction = onAction,
+            modifier = modifier,
+        )
         is ManagerRoute.ConversionAnalysis -> ConversionAnalysisScreen(
             state = state.conversionState,
             message = state.message,
@@ -150,6 +156,7 @@ internal fun ManagerRoute.backAction(): ManagerAction? = when (this) {
     is ManagerRoute.ConversionAnalysis,
     is ManagerRoute.ConversionResult,
     -> ManagerAction.CancelConversion
+    ManagerRoute.ConversionIdentityManagement -> ManagerAction.ReturnHome
     is ManagerRoute.Review -> ManagerAction.CancelReview
     is ManagerRoute.Report -> ManagerAction.ReturnHome
 }

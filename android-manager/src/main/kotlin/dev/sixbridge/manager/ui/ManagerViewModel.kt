@@ -19,6 +19,7 @@ import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
@@ -92,6 +93,7 @@ class ManagerViewModel(
     private var routeOperation: Job? = null
     private var routeCleanup: Job? = null
     private var routeCleanupFailed = false
+    private var identityManagementJob: Job? = null
     private val scheduledConversionCleanupTokens = mutableSetOf<String>()
     private var conversionIoJob: Job? = null
     private var conversionIoResult: CompletableDeferred<GeneratedDocumentSaveResult>? = null
@@ -223,6 +225,14 @@ class ManagerViewModel(
             ManagerAction.OpenDraftFilePicker -> requestDraftFilePicker()
             is ManagerAction.DraftFileSelected -> acceptDraftFileResult(action)
             ManagerAction.OpenConversionInput -> openConversionInput()
+            ManagerAction.OpenConversionIdentityManagement ->
+                openConversionIdentityManagement()
+            is ManagerAction.RequestLegacyIdentityCleanup ->
+                requestLegacyIdentityCleanup(action.identitySha256)
+            ManagerAction.DismissLegacyIdentityCleanupConfirmation ->
+                dismissLegacyIdentityCleanupConfirmation()
+            is ManagerAction.ConfirmLegacyIdentityCleanup ->
+                confirmLegacyIdentityCleanup(action.identitySha256)
             is ManagerAction.ConversionUrlChanged -> updateConversionUrl(action.value)
             ManagerAction.OpenConversionFilePicker -> requestConversionFilePicker()
             is ManagerAction.ConversionFileSelected -> acceptConversionFileResult(action)
@@ -291,6 +301,10 @@ class ManagerViewModel(
                 it.copy(
                     route = ManagerRoute.Home,
                     reportInstallSupportStatus = null,
+                    conversionIdentityManagementState =
+                        it.conversionIdentityManagementState.copy(
+                            pendingCleanupIdentitySha256 = null,
+                        ),
                 )
             }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
@@ -424,6 +438,155 @@ class ManagerViewModel(
             )
         }
         clearSavedConversion()
+    }
+
+    private fun openConversionIdentityManagement() {
+        val current = mutableState.value
+        if (identityManagementJob?.isActive == true) {
+            mutableState.update {
+                it.copy(
+                    route = ManagerRoute.ConversionIdentityManagement,
+                    message = null,
+                )
+            }
+            return
+        }
+        if (current.route == ManagerRoute.ConversionIdentityManagement &&
+            !current.conversionIdentityManagementState.loadFailed
+        ) {
+            return
+        }
+        mutableState.update {
+            it.copy(
+                route = ManagerRoute.ConversionIdentityManagement,
+                conversionIdentityManagementState =
+                    it.conversionIdentityManagementState.copy(
+                        loading = true,
+                        pendingCleanupIdentitySha256 = null,
+                        outcome = null,
+                        loadFailed = false,
+                    ),
+                message = null,
+            )
+        }
+        identityManagementJob = viewModelScope.launch {
+            val identities = try {
+                repository.listLegacyUnknown()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                mutableState.update {
+                    it.copy(
+                        conversionIdentityManagementState =
+                            it.conversionIdentityManagementState.copy(
+                                loading = false,
+                                loadFailed = true,
+                            ),
+                    )
+                }
+                return@launch
+            }
+            mutableState.update {
+                it.copy(
+                    conversionIdentityManagementState =
+                        it.conversionIdentityManagementState.copy(
+                            identities = identities,
+                            loading = false,
+                            loadFailed = false,
+                        ),
+                )
+            }
+        }
+    }
+
+    private fun requestLegacyIdentityCleanup(identitySha256: String) {
+        if (mutableState.value.route != ManagerRoute.ConversionIdentityManagement) return
+        mutableState.update {
+            it.copy(
+                conversionIdentityManagementState =
+                    it.conversionIdentityManagementState.requestCleanup(identitySha256),
+            )
+        }
+    }
+
+    private fun dismissLegacyIdentityCleanupConfirmation() {
+        mutableState.update {
+            val management = it.conversionIdentityManagementState
+            if (management.cleanupInProgressIdentitySha256 != null) {
+                it
+            } else {
+                it.copy(
+                    conversionIdentityManagementState = management.copy(
+                        pendingCleanupIdentitySha256 = null,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun confirmLegacyIdentityCleanup(identitySha256: String) {
+        if (mutableState.value.route != ManagerRoute.ConversionIdentityManagement) return
+        val management = mutableState.value.conversionIdentityManagementState
+        val identity = management.pendingCleanupIdentity
+            ?.takeIf { it.identitySha256 == identitySha256 }
+            ?: return
+        if (management.cleanupInProgressIdentitySha256 != null ||
+            identityManagementJob?.isActive == true
+        ) {
+            return
+        }
+        mutableState.update {
+            it.copy(
+                conversionIdentityManagementState =
+                    it.conversionIdentityManagementState.copy(
+                        pendingCleanupIdentitySha256 = null,
+                        cleanupInProgressIdentitySha256 = identitySha256,
+                        outcome = null,
+                        loadFailed = false,
+                    ),
+            )
+        }
+        identityManagementJob = viewModelScope.launch {
+            val result = try {
+                repository.discardLegacyUnknown(identitySha256)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                ConversionIdentityCleanupResult.Blocked(
+                    "정리 proof를 다시 확인하지 못했습니다.",
+                )
+            }
+            val refreshed = try {
+                repository.listLegacyUnknown()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+            val outcome = when (result) {
+                ConversionIdentityCleanupResult.Removed ->
+                    ConversionIdentityCleanupUiOutcome.Removed(identity.displayName)
+                ConversionIdentityCleanupResult.NothingOwned ->
+                    ConversionIdentityCleanupUiOutcome.AlreadyAbsent(identity.displayName)
+                is ConversionIdentityCleanupResult.Blocked ->
+                    ConversionIdentityCleanupUiOutcome.Preserved(
+                        identity.displayName,
+                        result.reason,
+                    )
+            }
+            mutableState.update {
+                val previous = it.conversionIdentityManagementState
+                it.copy(
+                    conversionIdentityManagementState = previous.copy(
+                        identities = refreshed ?: previous.identities,
+                        loading = false,
+                        cleanupInProgressIdentitySha256 = null,
+                        outcome = outcome,
+                        loadFailed = refreshed == null,
+                    ),
+                )
+            }
+        }
     }
 
     private fun updateConversionUrl(value: String) {

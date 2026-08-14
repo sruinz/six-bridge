@@ -24,6 +24,14 @@ class ManagerBackNavigationTest {
     }
 
     @Test
+    fun `이전 버전 신원 관리 back은 home으로 돌아간다`() {
+        assertEquals(
+            ManagerAction.ReturnHome,
+            ManagerRoute.ConversionIdentityManagement.backAction(),
+        )
+    }
+
+    @Test
     fun `home은 system back 기본 동작을 가로채지 않는다`() {
         assertNull(ManagerRoute.Home.backAction())
     }

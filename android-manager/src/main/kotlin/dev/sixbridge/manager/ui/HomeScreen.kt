@@ -80,6 +80,15 @@ fun HomeScreen(
         ) {
             Text(text = stringResource(R.string.home_open_addons))
         }
+        OutlinedButton(
+            onClick = { onAction(ManagerAction.OpenConversionIdentityManagement) },
+            enabled = mutationsEnabled,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("home:manage-conversion-identities"),
+        ) {
+            Text(text = stringResource(R.string.home_manage_conversion_identities))
+        }
         Text(
             text = stringResource(R.string.home_package_status_notice),
             style = MaterialTheme.typography.bodySmall,

@@ -23,10 +23,13 @@ import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
+import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
@@ -1400,6 +1403,152 @@ class ManagerViewModelTest {
         viewModel.accept(ManagerAction.ReturnHome)
         assertEquals(ManagerRoute.Home, viewModel.state.value.route)
     }
+
+    @Test
+    fun `legacy 관리 진입은 startup gate를 지키고 재진입 중 목록을 중복 요청하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val blockedRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(recoveryBlocked = true)
+                legacyIdentities = listOf(legacyIdentity())
+            }
+            val blocked = ManagerViewModel(blockedRepository, SavedStateHandle())
+            advanceUntilIdle()
+
+            blocked.accept(ManagerAction.OpenConversionIdentityManagement)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, blocked.state.value.route)
+            assertEquals(0, blockedRepository.legacyListRequests)
+
+            val repository = FakeManagerRepository().apply {
+                legacyIdentities = listOf(legacyIdentity())
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            advanceUntilIdle()
+
+            assertEquals(
+                ManagerRoute.ConversionIdentityManagement,
+                viewModel.state.value.route,
+            )
+            assertEquals(1, repository.legacyListRequests)
+            assertEquals(
+                repository.legacyIdentities,
+                viewModel.state.value.conversionIdentityManagementState.identities,
+            )
+        }
+
+    @Test
+    fun `legacy 목록 요청 중 back 후 재진입해도 기존 요청을 공유한다`() =
+        runTest(dispatcher.scheduler) {
+            val pendingList = CompletableDeferred<List<LegacyConversionIdentity>>()
+            val repository = FakeManagerRepository().apply {
+                legacyListDeferred = pendingList
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            dispatcher.scheduler.runCurrent()
+            assertEquals(1, repository.legacyListRequests)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            dispatcher.scheduler.runCurrent()
+
+            assertEquals(
+                ManagerRoute.ConversionIdentityManagement,
+                viewModel.state.value.route,
+            )
+            assertEquals(1, repository.legacyListRequests)
+
+            pendingList.complete(listOf(legacyIdentity()))
+            advanceUntilIdle()
+            assertEquals(
+                listOf(legacyIdentity()),
+                viewModel.state.value.conversionIdentityManagementState.identities,
+            )
+        }
+
+    @Test
+    fun `legacy cleanup은 exact confirm을 한 번만 위임하고 blocked 결과를 보존으로 표시한 뒤 reload한다`() =
+        runTest(dispatcher.scheduler) {
+            val identity = legacyIdentity()
+            val repository = FakeManagerRepository().apply {
+                legacyIdentities = listOf(identity)
+                legacyCleanupResult = ConversionIdentityCleanupResult.Blocked(
+                    "강한 identity proof가 없습니다.",
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.RequestLegacyIdentityCleanup(identity.identitySha256),
+            )
+            assertEquals(
+                identity,
+                viewModel.state.value.conversionIdentityManagementState
+                    .pendingCleanupIdentity,
+            )
+
+            viewModel.accept(ManagerAction.ConfirmLegacyIdentityCleanup("b".repeat(64)))
+            viewModel.accept(
+                ManagerAction.ConfirmLegacyIdentityCleanup(identity.identitySha256),
+            )
+            viewModel.accept(
+                ManagerAction.ConfirmLegacyIdentityCleanup(identity.identitySha256),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf(identity.identitySha256), repository.legacyCleanupRequests)
+            assertEquals(2, repository.legacyListRequests)
+            val state = viewModel.state.value.conversionIdentityManagementState
+            assertEquals(
+                ConversionIdentityCleanupUiOutcome.Preserved(
+                    identity.displayName,
+                    "강한 identity proof가 없습니다.",
+                ),
+                state.outcome,
+            )
+            assertEquals(listOf(identity), state.identities)
+            assertNull(state.cleanupInProgressIdentitySha256)
+        }
+
+    @Test
+    fun `legacy cleanup Removed 후 reload한 목록에서 exact row가 사라진다`() =
+        runTest(dispatcher.scheduler) {
+            val identity = legacyIdentity()
+            val repository = FakeManagerRepository().apply {
+                legacyIdentities = listOf(identity)
+                legacyCleanupResult = ConversionIdentityCleanupResult.Removed
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionIdentityManagement)
+            advanceUntilIdle()
+
+            viewModel.accept(
+                ManagerAction.RequestLegacyIdentityCleanup(identity.identitySha256),
+            )
+            viewModel.accept(
+                ManagerAction.ConfirmLegacyIdentityCleanup(identity.identitySha256),
+            )
+            advanceUntilIdle()
+
+            val state = viewModel.state.value.conversionIdentityManagementState
+            assertTrue(state.identities.isEmpty())
+            assertEquals(
+                ConversionIdentityCleanupUiOutcome.Removed(identity.displayName),
+                state.outcome,
+            )
+            assertEquals(2, repository.legacyListRequests)
+        }
 
     @Test
     fun `catalog의 정상 report status와 내용만 표시 모델로 사용한다`() =
@@ -9482,6 +9631,15 @@ class ManagerViewModelTest {
         wrapperSignerSha256 = "f".repeat(64),
     )
 
+    private fun legacyIdentity() = LegacyConversionIdentity(
+        identitySha256 = "9".repeat(64),
+        displayName = "이전 변환 대상",
+        mode = InstallationIdentityMode.CONVERTED,
+        packageName = PACKAGE,
+        extensionId = EXTENSION_ID,
+        wrapperSignerSha256 = "f".repeat(64),
+    )
+
     private fun review(
         status: ContractCompatibilityStatus,
         token: String = TOKEN,
@@ -9583,6 +9741,12 @@ private class FakeManagerRepository : ManagerRepository {
     var lastPartialConfirmed = false
     var resumeRequests = 0
     var reconcileRequests = 0
+    var legacyIdentities = emptyList<LegacyConversionIdentity>()
+    var legacyListDeferred: CompletableDeferred<List<LegacyConversionIdentity>>? = null
+    var legacyListRequests = 0
+    val legacyCleanupRequests = mutableListOf<String>()
+    var legacyCleanupResult: ConversionIdentityCleanupResult =
+        ConversionIdentityCleanupResult.NothingOwned
     var installApkExport: InstallApkExport? = null
     val installApkExportedTokens = mutableListOf<String>()
     var reconcileManualCalls = 0
@@ -10125,6 +10289,24 @@ private class FakeManagerRepository : ManagerRepository {
 
     override suspend fun reconcileCatalog() {
         reconcileRequests += 1
+    }
+
+    override suspend fun listLegacyUnknown(): List<LegacyConversionIdentity> {
+        legacyListRequests += 1
+        return legacyListDeferred?.await() ?: legacyIdentities
+    }
+
+    override suspend fun discardLegacyUnknown(
+        identitySha256: String,
+    ): ConversionIdentityCleanupResult {
+        legacyCleanupRequests += identitySha256
+        return legacyCleanupResult.also { result ->
+            if (result == ConversionIdentityCleanupResult.Removed) {
+                legacyIdentities = legacyIdentities.filterNot {
+                    it.identitySha256 == identitySha256
+                }
+            }
+        }
     }
 
     fun cleanupRequestCount(): Int =

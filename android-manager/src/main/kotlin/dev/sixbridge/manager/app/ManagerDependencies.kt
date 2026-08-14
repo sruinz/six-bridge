@@ -245,6 +245,8 @@ class ManagerDependencies private constructor(
                 },
                 promoteLegacyFromVerifiedBundle =
                     identityManagement::promoteLegacyFromVerifiedBundle,
+                listLegacyUnknown = identityManagement::listLegacyUnknown,
+                discardLegacyUnknown = identityManagement::discardLegacyUnknown,
             )
             repository.start(applicationScope, catalog)
             return ManagerDependencies(repository, applicationScope)

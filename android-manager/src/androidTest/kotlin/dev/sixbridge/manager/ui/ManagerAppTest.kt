@@ -68,6 +68,8 @@ import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.InstallationIdentityMode
+import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -135,6 +137,7 @@ class ManagerAppTest {
             "home:convert-on-device",
             "home:import-draft",
             "home:open-addons",
+            "home:manage-conversion-identities",
             "extension:$PACKAGE:report",
             "extension:$PACKAGE:remove",
             "home:add-six",
@@ -149,6 +152,7 @@ class ManagerAppTest {
                 ManagerAction.OpenConversionInput,
                 ManagerAction.OpenDraftFilePicker,
                 ManagerAction.OpenSamsungAddOns,
+                ManagerAction.OpenConversionIdentityManagement,
                 ManagerAction.OpenReport(PACKAGE),
                 ManagerAction.Remove(PACKAGE),
             ),
@@ -181,6 +185,7 @@ class ManagerAppTest {
                 "home:import-draft",
                 "home:add-six",
                 "home:open-addons",
+                "home:manage-conversion-identities",
                 "extension:$PACKAGE:remove",
             ).forEach { tag ->
                 composeRule.onNodeWithTag("home:scroll").performScrollToNode(hasTestTag(tag))
@@ -209,6 +214,145 @@ class ManagerAppTest {
             .performClick()
 
         assertEquals(listOf(ManagerAction.OpenDraftFilePicker), actions)
+    }
+
+    @Test
+    fun conversion_analysis_renders_only_active_targets_not_separate_legacy_rows() {
+        val active = ExistingConversionTarget(
+            identitySha256 = "1".repeat(64),
+            displayName = "활성 변환 대상",
+            extensionId = EXTENSION_ID,
+            packageName = PACKAGE,
+            wrapperSignerSha256 = SIGNER_SHA256,
+        )
+        val initial = conversionAnalysisState()
+        val ready = initial.conversionState as ConversionUiState.AnalysisReady
+        val firstLegacy = legacyIdentity("2".repeat(64), "이전 신원 1")
+        val secondLegacy = legacyIdentity("3".repeat(64), "이전 신원 2")
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = initial.copy(
+                    conversionState = ready.copy(
+                        identityRequirement =
+                            IdentityRequirement.UserSelectionRequired(listOf(active)),
+                    ),
+                    conversionIdentityManagementState =
+                        ConversionIdentityManagementUiState(
+                            identities = listOf(firstLegacy, secondLegacy),
+                        ),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(
+            "conversion:identity-existing:${active.identitySha256}",
+        ).assertExists()
+        composeRule.onNodeWithTag(
+            "conversion:identity-existing:${firstLegacy.identitySha256}",
+        ).assertDoesNotExist()
+        composeRule.onNodeWithTag(
+            "conversion:identity-existing:${secondLegacy.identitySha256}",
+        ).assertDoesNotExist()
+    }
+
+    @Test
+    fun legacy_management_binds_details_and_requires_exact_two_step_confirmation() {
+        val identity = legacyIdentity("2".repeat(64), "이전 변환 대상")
+        var state by mutableStateOf(
+            ManagerUiState(
+                route = ManagerRoute.ConversionIdentityManagement,
+                startupRecoveryState = StartupRecoveryUiState.READY,
+                conversionIdentityManagementState =
+                    ConversionIdentityManagementUiState(identities = listOf(identity)),
+            ),
+        )
+        val actions = mutableListOf<ManagerAction>()
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = state,
+                onAction = { action ->
+                    actions += action
+                    if (action is ManagerAction.RequestLegacyIdentityCleanup) {
+                        state = state.copy(
+                            conversionIdentityManagementState =
+                                state.conversionIdentityManagementState.requestCleanup(
+                                    action.identitySha256,
+                                ),
+                        )
+                    }
+                },
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("identity-management:screen")
+            .performScrollToNode(
+                hasTestTag("identity-management:request:${identity.identitySha256}"),
+            )
+        composeRule.onNodeWithText(identity.displayName).assertIsDisplayed()
+        composeRule.onNodeWithText("Package: ${identity.packageName}").assertExists()
+        composeRule.onNodeWithText("Extension ID: ${identity.extensionId}").assertExists()
+        composeRule.onNodeWithText(
+            "Signer SHA-256: ${summarizeIdentitySha256(identity.wrapperSignerSha256)}",
+        ).assertExists()
+        composeRule.onNodeWithText("LEGACY_UNKNOWN").assertExists()
+        composeRule.onNodeWithText("전체 정리").assertDoesNotExist()
+        composeRule.onNodeWithTag(
+            "identity-management:request:${identity.identitySha256}",
+        ).performClick()
+
+        composeRule.onNodeWithTag("identity-management:confirm-dialog")
+            .assertIsDisplayed()
+        composeRule.onNodeWithText(
+            "이 신원은 이전 변환의 업데이트 키일 수 있습니다.",
+            substring = true,
+        ).assertIsDisplayed()
+        composeRule.onNodeWithTag(
+            "identity-management:confirm:${identity.identitySha256}",
+        ).performClick()
+
+        assertEquals(
+            listOf(
+                ManagerAction.RequestLegacyIdentityCleanup(identity.identitySha256),
+                ManagerAction.ConfirmLegacyIdentityCleanup(identity.identitySha256),
+            ),
+            actions,
+        )
+    }
+
+    @Test
+    fun legacy_management_distinguishes_removed_from_preserved_outcomes() {
+        var outcome by mutableStateOf<ConversionIdentityCleanupUiOutcome>(
+            ConversionIdentityCleanupUiOutcome.Preserved(
+                "이전 변환 대상",
+                "강한 proof가 없습니다.",
+            ),
+        )
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = ManagerUiState(
+                    route = ManagerRoute.ConversionIdentityManagement,
+                    conversionIdentityManagementState =
+                        ConversionIdentityManagementUiState(outcome = outcome),
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("identity-management:outcome")
+            .assertTextContains("보존", substring = true)
+            .assertTextContains("강한 proof가 없습니다.", substring = true)
+        composeRule.onNodeWithText("정리했습니다.", substring = true)
+            .assertDoesNotExist()
+
+        composeRule.runOnIdle {
+            outcome = ConversionIdentityCleanupUiOutcome.Removed("이전 변환 대상")
+        }
+        composeRule.onNodeWithTag("identity-management:outcome")
+            .assertTextContains("정리했습니다.", substring = true)
     }
 
     @Test
@@ -1271,6 +1415,13 @@ class ManagerAppTest {
         pressBack()
         composeRule.waitForIdle()
         assertEquals(listOf(ManagerAction.ReturnHome), actions)
+
+        actions.clear()
+        state = ManagerUiState(route = ManagerRoute.ConversionIdentityManagement)
+        composeRule.waitForIdle()
+        pressBack()
+        composeRule.waitForIdle()
+        assertEquals(listOf(ManagerAction.ReturnHome), actions)
     }
 
     @Test
@@ -1491,6 +1642,18 @@ class ManagerAppTest {
         convertedExtensionId = EXTENSION_ID,
         sourceSha256 = "b".repeat(64),
         browserProfileSha256 = "c".repeat(64),
+    )
+
+    private fun legacyIdentity(
+        identitySha256: String,
+        displayName: String,
+    ) = LegacyConversionIdentity(
+        identitySha256 = identitySha256,
+        displayName = displayName,
+        mode = InstallationIdentityMode.CONVERTED,
+        packageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+        extensionId = "b".repeat(32),
+        wrapperSignerSha256 = "c".repeat(64),
     )
 
     private fun pngBytes(): ByteArray = ByteArrayOutputStream().use { output ->

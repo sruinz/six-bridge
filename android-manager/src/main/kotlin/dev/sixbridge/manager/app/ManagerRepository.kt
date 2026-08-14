@@ -19,6 +19,8 @@ import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCoordinatorPort
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
+import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.conversion.VerifiedIdentityProof
@@ -255,6 +257,10 @@ interface ManagerRepository {
     suspend fun reconcileUninstall(packageName: String): UninstallOutcome
     fun samsungAddOns(): RepositoryNavigationResult
     suspend fun reconcileCatalog()
+    suspend fun listLegacyUnknown(): List<LegacyConversionIdentity> = emptyList()
+    suspend fun discardLegacyUnknown(
+        identitySha256: String,
+    ): ConversionIdentityCleanupResult = ConversionIdentityCleanupResult.NothingOwned
 }
 
 @Suppress("DEPRECATION")
@@ -278,6 +284,10 @@ internal class DefaultManagerRepository(
     private val reconcileLegacyIdentities: suspend () -> Unit = {},
     private val promoteLegacyFromVerifiedBundle: suspend (VerifiedIdentityProof) -> Boolean = {
         false
+    },
+    private val listLegacyUnknown: suspend () -> List<LegacyConversionIdentity> = { emptyList() },
+    private val discardLegacyUnknown: suspend (String) -> ConversionIdentityCleanupResult = {
+        ConversionIdentityCleanupResult.NothingOwned
     },
 ) : ManagerRepository {
     private val started = AtomicBoolean()
@@ -653,6 +663,13 @@ internal class DefaultManagerRepository(
     override suspend fun reconcileCatalog() {
         catalogPublisher.reconcile()
     }
+
+    override suspend fun listLegacyUnknown(): List<LegacyConversionIdentity> =
+        listLegacyUnknown.invoke()
+
+    override suspend fun discardLegacyUnknown(
+        identitySha256: String,
+    ): ConversionIdentityCleanupResult = discardLegacyUnknown.invoke(identitySha256)
 }
 
 internal class RepositoryStartup(

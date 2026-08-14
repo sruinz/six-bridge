@@ -10,6 +10,7 @@ import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.manager.install.InstallState
@@ -19,10 +20,43 @@ import java.io.File
 sealed interface ManagerRoute {
     data object Home : ManagerRoute
     data object ConversionInput : ManagerRoute
+    data object ConversionIdentityManagement : ManagerRoute
     data class ConversionAnalysis(val token: String) : ManagerRoute
     data class ConversionResult(val token: String) : ManagerRoute
     data class Review(val token: String) : ManagerRoute
     data class Report(val packageName: String) : ManagerRoute
+}
+
+data class ConversionIdentityManagementUiState(
+    val identities: List<LegacyConversionIdentity> = emptyList(),
+    val loading: Boolean = false,
+    val pendingCleanupIdentitySha256: String? = null,
+    val cleanupInProgressIdentitySha256: String? = null,
+    val outcome: ConversionIdentityCleanupUiOutcome? = null,
+    val loadFailed: Boolean = false,
+) {
+    val pendingCleanupIdentity: LegacyConversionIdentity?
+        get() = identities.singleOrNull {
+            it.identitySha256 == pendingCleanupIdentitySha256
+        }
+
+    fun requestCleanup(identitySha256: String): ConversionIdentityManagementUiState {
+        if (loading || cleanupInProgressIdentitySha256 != null) return this
+        if (identities.none { it.identitySha256 == identitySha256 }) return this
+        return copy(pendingCleanupIdentitySha256 = identitySha256, outcome = null)
+    }
+}
+
+sealed interface ConversionIdentityCleanupUiOutcome {
+    val displayName: String
+
+    data class Removed(override val displayName: String) : ConversionIdentityCleanupUiOutcome
+    data class AlreadyAbsent(override val displayName: String) :
+        ConversionIdentityCleanupUiOutcome
+    data class Preserved(
+        override val displayName: String,
+        val reason: String,
+    ) : ConversionIdentityCleanupUiOutcome
 }
 
 data class ManagedExtensionItem(
@@ -214,6 +248,8 @@ data class ManagerUiState(
     val installed: List<ManagedExtensionItem> = emptyList(),
     val importState: ImportUiState = ImportUiState.Idle,
     val conversionState: ConversionUiState = ConversionUiState.Idle,
+    val conversionIdentityManagementState: ConversionIdentityManagementUiState =
+        ConversionIdentityManagementUiState(),
     val conversionCleanupPending: Boolean = false,
     val conversionUrl: String = "",
     val installState: InstallState = InstallState.Idle,
@@ -238,6 +274,10 @@ sealed interface ManagerAction {
         val launchId: Long,
     ) : ManagerAction
     data object OpenConversionInput : ManagerAction
+    data object OpenConversionIdentityManagement : ManagerAction
+    data class RequestLegacyIdentityCleanup(val identitySha256: String) : ManagerAction
+    data object DismissLegacyIdentityCleanupConfirmation : ManagerAction
+    data class ConfirmLegacyIdentityCleanup(val identitySha256: String) : ManagerAction
     data class ConversionUrlChanged(val value: String) : ManagerAction
     data object OpenConversionFilePicker : ManagerAction
     data class ConversionFileSelected(
