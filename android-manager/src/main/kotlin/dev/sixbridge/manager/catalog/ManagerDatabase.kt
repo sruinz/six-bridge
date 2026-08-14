@@ -17,7 +17,7 @@ import dev.sixbridge.manager.conversion.ConversionJobEntity
         ConversionIdentityLeaseEntity::class,
         ConversionJobEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class ManagerDatabase : RoomDatabase() {
@@ -184,6 +184,82 @@ abstract class ManagerDatabase : RoomDatabase() {
                     CREATE UNIQUE INDEX IF NOT EXISTS
                     `index_conversion_identity_leases_ownerToken`
                     ON `conversion_identity_leases` (`ownerToken`)
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        val MIGRATION_4_5: Migration = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE `conversion_identities_v5` (
+                        `identitySha256` TEXT NOT NULL,
+                        `logicalSourceIdentity` TEXT NOT NULL,
+                        `profileMajorVersion` INTEGER NOT NULL,
+                        `mode` TEXT NOT NULL,
+                        `displayName` TEXT NOT NULL,
+                        `extensionId` TEXT NOT NULL,
+                        `packageName` TEXT NOT NULL,
+                        `wrapperSignerSha256` TEXT NOT NULL,
+                        `crxKeyAlias` TEXT,
+                        `lastReservedVersionCode` INTEGER NOT NULL,
+                        `lifecycleState` TEXT NOT NULL,
+                        `provisionOwnerToken` TEXT,
+                        `crxPublicKeySha256` TEXT,
+                        `lastSuccessfulVersionCode` INTEGER,
+                        `lifecycleUpdatedAtEpochMillis` INTEGER NOT NULL,
+                        PRIMARY KEY(`identitySha256`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO `conversion_identities_v5` (
+                        `identitySha256`, `logicalSourceIdentity`, `profileMajorVersion`,
+                        `mode`, `displayName`, `extensionId`, `packageName`,
+                        `wrapperSignerSha256`, `crxKeyAlias`, `lastReservedVersionCode`,
+                        `lifecycleState`, `provisionOwnerToken`, `crxPublicKeySha256`,
+                        `lastSuccessfulVersionCode`, `lifecycleUpdatedAtEpochMillis`
+                    )
+                    SELECT
+                        `identitySha256`, `logicalSourceIdentity`, `profileMajorVersion`,
+                        `mode`, `displayName`, `extensionId`, `packageName`,
+                        `wrapperSignerSha256`, `crxKeyAlias`, `lastReservedVersionCode`,
+                        'LEGACY_UNKNOWN', NULL, NULL, NULL, 0
+                    FROM `conversion_identities`
+                    """.trimIndent(),
+                )
+                db.execSQL("DROP TABLE `conversion_identities`")
+                db.execSQL(
+                    "ALTER TABLE `conversion_identities_v5` RENAME TO `conversion_identities`",
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_extensionId`
+                    ON `conversion_identities` (`extensionId`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_packageName`
+                    ON `conversion_identities` (`packageName`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_crxKeyAlias`
+                    ON `conversion_identities` (`crxKeyAlias`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    `index_conversion_identities_provisionOwnerToken`
+                    ON `conversion_identities` (`provisionOwnerToken`)
                     """.trimIndent(),
                 )
             }

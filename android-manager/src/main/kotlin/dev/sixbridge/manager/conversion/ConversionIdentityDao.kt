@@ -218,7 +218,25 @@ interface ConversionIdentityDao {
         if (next > Int.MAX_VALUE) {
             throw IllegalStateException("versionCode 예약값이 범위를 초과했습니다.")
         }
-        val stored = requested.copy(lastReservedVersionCode = next.toInt())
+        val stored = if (current == null) {
+            requested.copy(
+                lastReservedVersionCode = next.toInt(),
+                lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisionOwnerToken = reservationOwnerToken,
+                crxPublicKeySha256 = crxPublicKeySha256,
+                lastSuccessfulVersionCode = null,
+                lifecycleUpdatedAtEpochMillis = createdAtEpochMillis,
+            )
+        } else {
+            requested.copy(
+                lastReservedVersionCode = next.toInt(),
+                lifecycleState = current.lifecycleState,
+                provisionOwnerToken = current.provisionOwnerToken,
+                crxPublicKeySha256 = current.crxPublicKeySha256,
+                lastSuccessfulVersionCode = current.lastSuccessfulVersionCode,
+                lifecycleUpdatedAtEpochMillis = current.lifecycleUpdatedAtEpochMillis,
+            )
+        }
         if (current == null) {
             insert(stored)
         } else {

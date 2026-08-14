@@ -4,12 +4,20 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+internal enum class ConversionIdentityLifecycleState {
+    PROVISIONAL,
+    ACTIVE,
+    LEGACY_UNKNOWN,
+    CLEANING,
+}
+
 @Entity(
     tableName = "conversion_identities",
     indices = [
         Index(value = ["extensionId"], unique = true),
         Index(value = ["packageName"], unique = true),
         Index(value = ["crxKeyAlias"], unique = true),
+        Index(value = ["provisionOwnerToken"], unique = true),
     ],
 )
 data class ConversionIdentityEntity(
@@ -23,4 +31,9 @@ data class ConversionIdentityEntity(
     val wrapperSignerSha256: String,
     val crxKeyAlias: String?,
     val lastReservedVersionCode: Int,
+    val lifecycleState: String,
+    val provisionOwnerToken: String?,
+    val crxPublicKeySha256: String?,
+    val lastSuccessfulVersionCode: Int?,
+    val lifecycleUpdatedAtEpochMillis: Long,
 )

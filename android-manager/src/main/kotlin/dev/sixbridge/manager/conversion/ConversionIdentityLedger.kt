@@ -166,14 +166,15 @@ class ConversionIdentityLedger(
         ) {
             "READY lease capability가 예약 identity 또는 binding과 일치하지 않습니다."
         }
-        val requested = request.toEntity()
+        val createdAtEpochMillis = currentTimeMillis()
+        val requested = request.toEntity(ownerToken, createdAtEpochMillis)
         val stored = try {
             dao.reserve(
                 requested = requested,
                 installedVersionCode = request.installedVersionCode,
                 readyOwnerToken = unreservedLease?.ownerToken?.toString(),
                 reservationOwnerToken = ownerToken,
-                createdAtEpochMillis = currentTimeMillis(),
+                createdAtEpochMillis = createdAtEpochMillis,
                 crxPublicKeySha256 = request.packageBinding.crxPublicKeySha256,
             )
         } catch (_: SQLiteConstraintException) {
@@ -719,7 +720,10 @@ class ConversionIdentityLedger(
         }
     }
 
-    private fun ConversionIdentityReservation.toEntity(): ConversionIdentityEntity {
+    private fun ConversionIdentityReservation.toEntity(
+        ownerToken: String,
+        lifecycleUpdatedAtEpochMillis: Long,
+    ): ConversionIdentityEntity {
         val binding = packageBinding
         return ConversionIdentityEntity(
             identitySha256 = identityKey.identitySha256,
@@ -732,6 +736,11 @@ class ConversionIdentityLedger(
             wrapperSignerSha256 = binding.wrapperSignerSha256,
             crxKeyAlias = binding.crxKeyAlias,
             lastReservedVersionCode = 0,
+            lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+            provisionOwnerToken = ownerToken,
+            crxPublicKeySha256 = binding.crxPublicKeySha256,
+            lastSuccessfulVersionCode = null,
+            lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
         )
     }
 
@@ -854,6 +863,11 @@ class ConversionIdentityLedger(
         wrapperSignerSha256 = wrapperSignerSha256,
         crxKeyAlias = crxKeyAlias,
         lastReservedVersionCode = versionCode,
+        lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+        provisionOwnerToken = ownerToken,
+        crxPublicKeySha256 = crxPublicKeySha256,
+        lastSuccessfulVersionCode = null,
+        lifecycleUpdatedAtEpochMillis = 0,
     )
 
     private fun OnDevicePackageIdentity.toBinding() = ConversionPackageBinding(

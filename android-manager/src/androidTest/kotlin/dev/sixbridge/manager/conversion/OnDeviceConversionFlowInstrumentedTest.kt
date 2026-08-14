@@ -73,6 +73,7 @@ class OnDeviceConversionFlowInstrumentedTest {
             ManagerDatabase.MIGRATION_1_2,
             ManagerDatabase.MIGRATION_2_3,
             ManagerDatabase.MIGRATION_3_4,
+            ManagerDatabase.MIGRATION_4_5,
         ).allowMainThreadQueries().build()
         val inputRoot = File(context.filesDir, INPUT_DIRECTORY)
         val workRoot = File(context.filesDir, WORK_DIRECTORY)

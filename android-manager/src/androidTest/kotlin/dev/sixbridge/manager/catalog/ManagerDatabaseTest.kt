@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.catalog
 
+import android.database.sqlite.SQLiteConstraintException
 import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.test.core.app.ApplicationProvider
@@ -326,6 +327,11 @@ class ManagerDatabaseTest {
                 wrapperSignerSha256 = "2".repeat(64),
                 crxKeyAlias = null,
                 lastReservedVersionCode = 0,
+                lifecycleState = "PROVISIONAL",
+                provisionOwnerToken = null,
+                crxPublicKeySha256 = null,
+                lastSuccessfulVersionCode = null,
+                lifecycleUpdatedAtEpochMillis = 0,
             )
 
             val reserved = coroutineScope {
@@ -364,6 +370,11 @@ class ManagerDatabaseTest {
                 wrapperSignerSha256 = "2".repeat(64),
                 crxKeyAlias = null,
                 lastReservedVersionCode = 0,
+                lifecycleState = "PROVISIONAL",
+                provisionOwnerToken = null,
+                crxPublicKeySha256 = null,
+                lastSuccessfulVersionCode = null,
+                lifecycleUpdatedAtEpochMillis = 0,
             )
             val competing = base.copy(
                 identitySha256 = "3".repeat(64),
@@ -390,9 +401,17 @@ class ManagerDatabaseTest {
             }
 
             assertEquals(1, results.count { it.isSuccess })
-            val winner = results.firstNotNullOfOrNull { it.getOrNull() }
-            assertTrue(winner == base.copy(lastReservedVersionCode = 1) ||
-                winner == competing.copy(lastReservedVersionCode = 1))
+            val winnerIndex = results.indexOfFirst { it.isSuccess }
+            val winner = results[winnerIndex].getOrThrow()
+            val winnerRequest = listOf(base, competing)[winnerIndex]
+            assertEquals(
+                winnerRequest.copy(
+                    lastReservedVersionCode = 1,
+                    provisionOwnerToken = "unique-owner-$winnerIndex",
+                    lifecycleUpdatedAtEpochMillis = winnerIndex.toLong(),
+                ),
+                winner,
+            )
 
             val passthrough = base.copy(
                 identitySha256 = "4".repeat(64),
@@ -412,6 +431,33 @@ class ManagerDatabaseTest {
                     )
                 }.isFailure,
             )
+        }
+
+    @Test
+    fun conversion_identity_provision_owner_unique_index_allows_nulls_and_rejects_duplicate_value() =
+        runBlocking {
+            val dao = database.conversionIdentityDao()
+
+            dao.insert(v5Identity(discriminator = "7", provisionOwnerToken = null))
+            dao.insert(v5Identity(discriminator = "8", provisionOwnerToken = null))
+
+            assertEquals(2, dao.listByModeAndProfile("CONVERTED", 30).size)
+
+            dao.insert(
+                v5Identity(
+                    discriminator = "9",
+                    provisionOwnerToken = "00000000-0000-4000-8000-000000000090",
+                ),
+            )
+            val duplicate = runCatching {
+                dao.insert(
+                    v5Identity(
+                        discriminator = "a",
+                        provisionOwnerToken = "00000000-0000-4000-8000-000000000090",
+                    ),
+                )
+            }.exceptionOrNull()
+            assertTrue(duplicate is SQLiteConstraintException)
         }
 
     @Test
@@ -513,6 +559,11 @@ class ManagerDatabaseTest {
                 wrapperSignerSha256 = "d".repeat(64),
                 crxKeyAlias = alias,
                 lastReservedVersionCode = 0,
+                lifecycleState = "PROVISIONAL",
+                provisionOwnerToken = null,
+                crxPublicKeySha256 = "e".repeat(64),
+                lastSuccessfulVersionCode = null,
+                lifecycleUpdatedAtEpochMillis = 0,
             )
 
             val outcomes = coroutineScope {
@@ -824,6 +875,195 @@ class ManagerDatabaseTest {
     }
 
     @Test
+    fun migration_4_to_5_preserves_identity_lease_and_job_with_unknown_lifecycle() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(MIGRATION_V4_DATABASE)
+        migrationHelper.createDatabase(MIGRATION_V4_DATABASE, 4).apply {
+            listOf(
+                arrayOf<Any?>(
+                    "1".repeat(64),
+                    "project:${"1".repeat(32)}",
+                    30,
+                    "CONVERTED",
+                    "Converted legacy identity",
+                    "a".repeat(32),
+                    "dev.sixbridge.ext.${"a".repeat(32)}",
+                    "2".repeat(64),
+                    "sixbridge.crx.rsa.v1.${"1".repeat(64)}",
+                    17,
+                ),
+                arrayOf<Any?>(
+                    "3".repeat(64),
+                    "store:${"b".repeat(32)}",
+                    31,
+                    "PASSTHROUGH",
+                    "Passthrough legacy identity",
+                    "b".repeat(32),
+                    "dev.sixbridge.ext.${"b".repeat(32)}",
+                    "4".repeat(64),
+                    null,
+                    23,
+                ),
+            ).forEach { identity ->
+                execSQL(
+                    """
+                    INSERT INTO conversion_identities (
+                        identitySha256, logicalSourceIdentity, profileMajorVersion, mode,
+                        displayName, extensionId, packageName, wrapperSignerSha256,
+                        crxKeyAlias, lastReservedVersionCode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                    identity,
+                )
+            }
+            execSQL(
+                """
+                INSERT INTO conversion_identity_leases (
+                    identitySha256, crxKeyAlias, ownerToken, state, createdAtEpochMillis,
+                    extensionId, packageName, wrapperSignerSha256, crxPublicKeySha256,
+                    reservedVersionCode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "1".repeat(64),
+                    "sixbridge.crx.rsa.v1.${"1".repeat(64)}",
+                    "00000000-0000-4000-8000-000000000041",
+                    "RESERVED",
+                    4100L,
+                    "a".repeat(32),
+                    "dev.sixbridge.ext.${"a".repeat(32)}",
+                    "2".repeat(64),
+                    "5".repeat(64),
+                    17,
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO conversion_job (
+                    singletonId, token, generation, inputKind, inputSha256, inputFileName,
+                    stage, approvedAdapterIdsJson, profileSha256, bundleFileName,
+                    bundleSha256, cleanupTokensJson, updatedAtEpochMillis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    1,
+                    "00000000-0000-4000-8000-000000000041",
+                    9L,
+                    "ZIP",
+                    "6".repeat(64),
+                    "00000000-0000-4000-8000-000000000041.input",
+                    "BUILDING",
+                    "[\"adapter-one\"]",
+                    "7".repeat(64),
+                    null,
+                    null,
+                    "[]",
+                    4200L,
+                ),
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_V4_DATABASE,
+            5,
+            true,
+            ManagerDatabase.MIGRATION_4_5,
+        )
+        migrated.query(
+            """
+            SELECT identitySha256, logicalSourceIdentity, profileMajorVersion, mode,
+                   displayName, extensionId, packageName, wrapperSignerSha256,
+                   crxKeyAlias, lastReservedVersionCode, lifecycleState,
+                   provisionOwnerToken, crxPublicKeySha256, lastSuccessfulVersionCode,
+                   lifecycleUpdatedAtEpochMillis
+            FROM conversion_identities
+            ORDER BY identitySha256
+            """.trimIndent(),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("1".repeat(64), cursor.getString(0))
+            assertEquals("project:${"1".repeat(32)}", cursor.getString(1))
+            assertEquals(30, cursor.getInt(2))
+            assertEquals("CONVERTED", cursor.getString(3))
+            assertEquals("Converted legacy identity", cursor.getString(4))
+            assertEquals("a".repeat(32), cursor.getString(5))
+            assertEquals("dev.sixbridge.ext.${"a".repeat(32)}", cursor.getString(6))
+            assertEquals("2".repeat(64), cursor.getString(7))
+            assertEquals("sixbridge.crx.rsa.v1.${"1".repeat(64)}", cursor.getString(8))
+            assertEquals(17, cursor.getInt(9))
+            assertEquals("LEGACY_UNKNOWN", cursor.getString(10))
+            assertTrue(cursor.isNull(11))
+            assertTrue(cursor.isNull(12))
+            assertTrue(cursor.isNull(13))
+            assertEquals(0L, cursor.getLong(14))
+
+            assertTrue(cursor.moveToNext())
+            assertEquals("3".repeat(64), cursor.getString(0))
+            assertEquals("store:${"b".repeat(32)}", cursor.getString(1))
+            assertEquals(31, cursor.getInt(2))
+            assertEquals("PASSTHROUGH", cursor.getString(3))
+            assertEquals("Passthrough legacy identity", cursor.getString(4))
+            assertEquals("b".repeat(32), cursor.getString(5))
+            assertEquals("dev.sixbridge.ext.${"b".repeat(32)}", cursor.getString(6))
+            assertEquals("4".repeat(64), cursor.getString(7))
+            assertTrue(cursor.isNull(8))
+            assertEquals(23, cursor.getInt(9))
+            assertEquals("LEGACY_UNKNOWN", cursor.getString(10))
+            assertTrue(cursor.isNull(11))
+            assertTrue(cursor.isNull(12))
+            assertTrue(cursor.isNull(13))
+            assertEquals(0L, cursor.getLong(14))
+            assertFalse(cursor.moveToNext())
+        }
+        migrated.query(
+            """
+            SELECT crxKeyAlias, ownerToken, state, createdAtEpochMillis, extensionId,
+                   packageName, wrapperSignerSha256, crxPublicKeySha256, reservedVersionCode
+            FROM conversion_identity_leases WHERE identitySha256 = ?
+            """.trimIndent(),
+            arrayOf("1".repeat(64)),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("sixbridge.crx.rsa.v1.${"1".repeat(64)}", cursor.getString(0))
+            assertEquals("00000000-0000-4000-8000-000000000041", cursor.getString(1))
+            assertEquals("RESERVED", cursor.getString(2))
+            assertEquals(4100L, cursor.getLong(3))
+            assertEquals("a".repeat(32), cursor.getString(4))
+            assertEquals("dev.sixbridge.ext.${"a".repeat(32)}", cursor.getString(5))
+            assertEquals("2".repeat(64), cursor.getString(6))
+            assertEquals("5".repeat(64), cursor.getString(7))
+            assertEquals(17, cursor.getInt(8))
+            assertFalse(cursor.moveToNext())
+        }
+        migrated.query(
+            """
+            SELECT token, generation, inputKind, inputSha256, inputFileName, stage,
+                   approvedAdapterIdsJson, profileSha256, bundleFileName, bundleSha256,
+                   cleanupTokensJson, updatedAtEpochMillis
+            FROM conversion_job WHERE singletonId = 1
+            """.trimIndent(),
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("00000000-0000-4000-8000-000000000041", cursor.getString(0))
+            assertEquals(9L, cursor.getLong(1))
+            assertEquals("ZIP", cursor.getString(2))
+            assertEquals("6".repeat(64), cursor.getString(3))
+            assertEquals("00000000-0000-4000-8000-000000000041.input", cursor.getString(4))
+            assertEquals("BUILDING", cursor.getString(5))
+            assertEquals("[\"adapter-one\"]", cursor.getString(6))
+            assertEquals("7".repeat(64), cursor.getString(7))
+            assertTrue(cursor.isNull(8))
+            assertTrue(cursor.isNull(9))
+            assertEquals("[]", cursor.getString(10))
+            assertEquals(4200L, cursor.getLong(11))
+            assertFalse(cursor.moveToNext())
+        }
+        migrated.close()
+        context.deleteDatabase(MIGRATION_V4_DATABASE)
+    }
+
+    @Test
     fun migration_2_to_3_first_restore_preserves_input_for_every_old_job_stage() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val now = System.currentTimeMillis()
@@ -913,6 +1153,7 @@ class ManagerDatabaseTest {
             ).addMigrations(
                 ManagerDatabase.MIGRATION_2_3,
                 ManagerDatabase.MIGRATION_3_4,
+                ManagerDatabase.MIGRATION_4_5,
             )
                 .allowMainThreadQueries()
                 .build()
@@ -1048,6 +1289,27 @@ class ManagerDatabaseTest {
         updatedAtEpochMillis = 1,
     )
 
+    private fun v5Identity(
+        discriminator: String,
+        provisionOwnerToken: String?,
+    ) = ConversionIdentityEntity(
+        identitySha256 = discriminator.repeat(64),
+        logicalSourceIdentity = "project:${discriminator.repeat(32)}",
+        profileMajorVersion = 30,
+        mode = "CONVERTED",
+        displayName = "Unique owner $discriminator",
+        extensionId = discriminator.repeat(32),
+        packageName = "dev.sixbridge.ext.${discriminator.repeat(32)}",
+        wrapperSignerSha256 = "f".repeat(64),
+        crxKeyAlias = "sixbridge.crx.rsa.v1.${discriminator.repeat(64)}",
+        lastReservedVersionCode = 1,
+        lifecycleState = "PROVISIONAL",
+        provisionOwnerToken = provisionOwnerToken,
+        crxPublicKeySha256 = discriminator.repeat(64),
+        lastSuccessfulVersionCode = null,
+        lifecycleUpdatedAtEpochMillis = 100L,
+    )
+
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256")
             .digest(bytes)
@@ -1066,5 +1328,6 @@ class ManagerDatabaseTest {
         const val MIGRATION_V2_DATABASE = "manager-migration-2-3.db"
         const val MIGRATION_V2_COLLISION_DATABASE = "manager-migration-2-3-collision.db"
         const val MIGRATION_V3_DATABASE = "manager-migration-3-4.db"
+        const val MIGRATION_V4_DATABASE = "manager-migration-4-5.db"
     }
 }

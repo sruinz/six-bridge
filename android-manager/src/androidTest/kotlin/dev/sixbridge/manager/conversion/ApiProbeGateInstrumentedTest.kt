@@ -66,6 +66,7 @@ class ApiProbeGateInstrumentedTest {
             ManagerDatabase.MIGRATION_1_2,
             ManagerDatabase.MIGRATION_2_3,
             ManagerDatabase.MIGRATION_3_4,
+            ManagerDatabase.MIGRATION_4_5,
         ).allowMainThreadQueries().build()
         try {
             groups.forEach { group ->

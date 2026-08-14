@@ -116,6 +116,28 @@ class ConversionIdentityLedgerTest {
         }
 
     @Test
+    fun `새 예약 row는 job owner에 귀속된 PROVISIONAL lifecycle로 시작한다`() = runTest {
+        val dao = FakeConversionIdentityDao()
+        val ledger = ConversionIdentityLedger(
+            dao = dao,
+            currentTimeMillis = { 1234L },
+        )
+        val key = passthroughKey()
+
+        ledger.reserve(
+            reservation(key, binding = bindingFor(key)),
+            ownerToken = JOB_ONE,
+        )
+
+        val stored = requireNotNull(dao.get(key.identitySha256))
+        assertEquals(ConversionIdentityLifecycleState.PROVISIONAL.name, stored.lifecycleState)
+        assertEquals(JOB_ONE, stored.provisionOwnerToken)
+        assertNull(stored.crxPublicKeySha256)
+        assertNull(stored.lastSuccessfulVersionCode)
+        assertEquals(1234L, stored.lifecycleUpdatedAtEpochMillis)
+    }
+
+    @Test
     fun `미예약 abort는 packager 없이 lease를 버리지 않는다`() = runTest {
         val dao = FakeConversionIdentityDao()
         val ledger = ConversionIdentityLedger(dao)
@@ -681,6 +703,11 @@ class ConversionIdentityLedgerTest {
         wrapperSignerSha256 = binding.wrapperSignerSha256,
         crxKeyAlias = binding.crxKeyAlias,
         lastReservedVersionCode = 0,
+        lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+        provisionOwnerToken = null,
+        crxPublicKeySha256 = binding.crxPublicKeySha256,
+        lastSuccessfulVersionCode = null,
+        lifecycleUpdatedAtEpochMillis = 0,
     )
 
     private fun bundleReadyJob(
@@ -829,7 +856,15 @@ class ConversionIdentityLedgerTest {
             require(installedVersionCode == null || installedVersionCode in 0 until Int.MAX_VALUE.toLong())
             val current = rows[requested.identitySha256]
             if (current != null) {
-                require(current.copy(displayName = requested.displayName, lastReservedVersionCode = 0) ==
+                require(current.copy(
+                    displayName = requested.displayName,
+                    lastReservedVersionCode = 0,
+                    lifecycleState = requested.lifecycleState,
+                    provisionOwnerToken = requested.provisionOwnerToken,
+                    crxPublicKeySha256 = requested.crxPublicKeySha256,
+                    lastSuccessfulVersionCode = requested.lastSuccessfulVersionCode,
+                    lifecycleUpdatedAtEpochMillis = requested.lifecycleUpdatedAtEpochMillis,
+                ) ==
                     requested.copy(lastReservedVersionCode = 0))
             }
             require(rows.values.none {
@@ -845,7 +880,26 @@ class ConversionIdentityLedgerTest {
                 installedVersionCode?.plus(1) ?: 1,
             )
             check(next <= Int.MAX_VALUE)
-            requested.copy(lastReservedVersionCode = next.toInt()).also { stored ->
+            val stored = if (current == null) {
+                requested.copy(
+                    lastReservedVersionCode = next.toInt(),
+                    lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                    provisionOwnerToken = reservationOwnerToken,
+                    crxPublicKeySha256 = crxPublicKeySha256,
+                    lastSuccessfulVersionCode = null,
+                    lifecycleUpdatedAtEpochMillis = createdAtEpochMillis,
+                )
+            } else {
+                requested.copy(
+                    lastReservedVersionCode = next.toInt(),
+                    lifecycleState = current.lifecycleState,
+                    provisionOwnerToken = current.provisionOwnerToken,
+                    crxPublicKeySha256 = current.crxPublicKeySha256,
+                    lastSuccessfulVersionCode = current.lastSuccessfulVersionCode,
+                    lifecycleUpdatedAtEpochMillis = current.lifecycleUpdatedAtEpochMillis,
+                )
+            }
+            stored.also {
                 require(leases[requested.identitySha256] == null)
                 rows[requested.identitySha256] = stored
                 leases[requested.identitySha256] = ConversionIdentityLeaseEntity(
