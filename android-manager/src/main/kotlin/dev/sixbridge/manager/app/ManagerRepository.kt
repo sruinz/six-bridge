@@ -21,6 +21,7 @@ import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
+import dev.sixbridge.manager.conversion.VerifiedIdentityProof
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.IconPersistenceResult
 import dev.sixbridge.manager.importer.BundleImportService
@@ -274,6 +275,10 @@ internal class DefaultManagerRepository(
     private val recoverIdentityCleanup: suspend () -> Boolean = { true },
     private val generatedImporter: suspend (GeneratedBundle) -> ImportResult =
         importer::importGenerated,
+    private val reconcileLegacyIdentities: suspend () -> Unit = {},
+    private val promoteLegacyFromVerifiedBundle: suspend (VerifiedIdentityProof) -> Boolean = {
+        false
+    },
 ) : ManagerRepository {
     private val started = AtomicBoolean()
     private val launchChannel = Channel<RepositoryLaunch>(Channel.UNLIMITED)
@@ -290,6 +295,7 @@ internal class DefaultManagerRepository(
         ioDispatcher = ioDispatcher,
         afterStartupCleanup = systemInstallCoordinator::reconcileAfterStartupCleanup,
         recoverIdentityCleanup = recoverIdentityCleanup,
+        reconcileLegacyIdentities = reconcileLegacyIdentities,
     )
 
     override val catalog: Flow<List<CatalogRecord>> = catalogPublisher.state
@@ -444,6 +450,16 @@ internal class DefaultManagerRepository(
                     importer.discard(result.value.token)
                     ManagerImportResult.Failure(ImportFailure(ImportFailureCode.CACHE_IO))
                 } else {
+                    result.value.verifiedIdentityProofOrNull()?.let { proof ->
+                        try {
+                            promoteLegacyFromVerifiedBundle(proof)
+                        } catch (error: CancellationException) {
+                            importer.discard(result.value.token)
+                            throw error
+                        } catch (_: Exception) {
+                            // The verified retained import stays usable; reconciliation can retry.
+                        }
+                    }
                     ManagerImportResult.Success(result.value.toReview())
                 }
             }
@@ -650,6 +666,7 @@ internal class RepositoryStartup(
     private val maxAttempts: Int = 3,
     private val afterStartupCleanup: suspend () -> Unit = {},
     private val recoverIdentityCleanup: suspend () -> Boolean = { true },
+    private val reconcileLegacyIdentities: suspend () -> Unit = {},
 ) {
     private val mutex = Mutex()
     private val ready = CompletableDeferred<StartupSnapshot>()
@@ -707,6 +724,7 @@ internal class RepositoryStartup(
                         ready.complete(StartupSnapshot.RecoveryBlocked)
                         return@withLock
                     }
+                    reconcileLegacyIdentities()
                     startupCleanup.run()
                     afterStartupCleanup()
                     val recovery = when (val snapshot = pendingStore.recoveryStoreSnapshot()) {
@@ -1339,6 +1357,17 @@ private fun retainedFileSha256(file: File): String {
         }
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+private fun ImportedBundle.verifiedIdentityProofOrNull(): VerifiedIdentityProof? {
+    val versionCode = verifiedApk.versionCode
+    if (versionCode !in 1..Int.MAX_VALUE.toLong()) return null
+    return VerifiedIdentityProof(
+        packageName = verifiedApk.packageName,
+        extensionId = verifiedApk.extensionId,
+        wrapperSignerSha256 = verifiedApk.signerSha256,
+        versionCode = versionCode.toInt(),
+    )
 }
 
 internal fun ImportedBundle.toReview() = ReviewBundle(

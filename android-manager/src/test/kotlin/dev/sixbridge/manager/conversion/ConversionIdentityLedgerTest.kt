@@ -917,6 +917,90 @@ class ConversionIdentityLedgerTest {
             assertEquals(1234, stored.lifecycleUpdatedAtEpochMillis)
         }
 
+    @Test
+    fun `legacy promotion transaction은 exact snapshot에 success version과 high watermark를 함께 commit한다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val key = passthroughKey()
+            val legacy = entity(key, bindingFor(key)).copy(
+                lastReservedVersionCode = 19,
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                crxPublicKeySha256 = null,
+            )
+            val proof = VerifiedIdentityProof(
+                packageName = legacy.packageName,
+                extensionId = legacy.extensionId,
+                wrapperSignerSha256 = legacy.wrapperSignerSha256,
+                versionCode = 17,
+            )
+            dao.force(legacy)
+
+            assertTrue(
+                dao.promoteLegacyIdentity(
+                    expected = legacy,
+                    proof = proof,
+                    verifiedPublicKeySha256 = null,
+                    lifecycleUpdatedAtEpochMillis = 1234,
+                    observedCurrentBundle = null,
+                ),
+            )
+
+            val active = requireNotNull(dao.get(legacy.identitySha256))
+            assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+            assertEquals(17, active.lastSuccessfulVersionCode)
+            assertEquals(19, active.lastReservedVersionCode)
+            assertEquals(1234, active.lifecycleUpdatedAtEpochMillis)
+            assertTrue(
+                !dao.promoteLegacyIdentity(
+                    expected = legacy,
+                    proof = proof,
+                    verifiedPublicKeySha256 = null,
+                    lifecycleUpdatedAtEpochMillis = 1235,
+                    observedCurrentBundle = null,
+                ),
+            )
+        }
+
+    @Test
+    fun `legacy BUNDLE_READY promotion CAS는 reader 후 job snapshot이 바뀌면 거부한다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val key = passthroughKey()
+            val legacy = entity(key, bindingFor(key)).copy(
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                crxPublicKeySha256 = null,
+            )
+            val proof = VerifiedIdentityProof(
+                packageName = legacy.packageName,
+                extensionId = legacy.extensionId,
+                wrapperSignerSha256 = legacy.wrapperSignerSha256,
+                versionCode = 3,
+            )
+            val observed = CurrentBundleReadyProof.Verified(
+                ownerToken = JOB_ONE,
+                generation = 4,
+                bundleSha256 = "d".repeat(64),
+                proof = proof,
+            )
+            dao.force(legacy)
+            dao.finalizationJob = bundleReadyJob(
+                token = JOB_ONE,
+                generation = 5,
+                bundleSha256 = observed.bundleSha256,
+            )
+
+            assertTrue(
+                !dao.promoteLegacyIdentity(
+                    expected = legacy,
+                    proof = proof,
+                    verifiedPublicKeySha256 = null,
+                    lifecycleUpdatedAtEpochMillis = 1234,
+                    observedCurrentBundle = observed,
+                ),
+            )
+            assertEquals(legacy, dao.get(legacy.identitySha256))
+        }
+
     private fun ledger() = ConversionIdentityLedger(FakeConversionIdentityDao())
 
     private suspend fun resolveSelectionForOwner(

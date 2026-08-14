@@ -436,6 +436,249 @@ class ConversionIdentityManagementTest {
         )
     }
 
+    @Test
+    fun `installed exact proof는 legacy만 ACTIVE로 승격하고 성공 version과 reserved floor를 보존한다`() =
+        runTest {
+            val converted = convertedIdentity(
+                identitySha256 = "7a".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            val passthrough = externalIdentity(
+                identitySha256 = "7b".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            ).copy(
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                lastReservedVersionCode = 12,
+            )
+            val retired = convertedIdentity(
+                identitySha256 = "7c".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.RETIRED,
+            )
+            for (identity in listOf(converted, passthrough, retired)) dao.insert(identity)
+            keys.add(keyProof(converted))
+            keys.add(keyProof(retired))
+            installed.values = listOf(
+                installed(converted).copy(versionCode = 8),
+                installed(passthrough).copy(versionCode = 7),
+                installed(retired).copy(versionCode = 9),
+            )
+
+            val result = management().reconcileLegacyIdentities()
+
+            assertEquals(setOf(converted.identitySha256, passthrough.identitySha256), result.promotedIdentitySha256)
+            assertTrue(result.retainedIdentitySha256.isEmpty())
+            assertTrue(result.blockedReasons.isEmpty())
+            requireNotNull(dao.get(converted.identitySha256)).also { active ->
+                assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+                assertEquals(8, active.lastSuccessfulVersionCode)
+                assertEquals(8, active.lastReservedVersionCode)
+                assertEquals(publicKeySha256(converted.identitySha256), active.crxPublicKeySha256)
+            }
+            requireNotNull(dao.get(passthrough.identitySha256)).also { active ->
+                assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+                assertEquals(7, active.lastSuccessfulVersionCode)
+                assertEquals(12, active.lastReservedVersionCode)
+                assertNull(active.crxPublicKeySha256)
+            }
+            assertEquals(retired, dao.get(retired.identitySha256))
+            assertTrue(keys.contains(converted.identitySha256))
+            assertTrue(keys.contains(retired.identitySha256))
+        }
+
+    @Test
+    fun `bundle proof unreadable은 독립 installed 승격을 막지 않고 bundle 후보만 보존한다`() =
+        runTest {
+            val installedLegacy = externalIdentity(
+                identitySha256 = "8a".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name)
+            val bundleLegacy = externalIdentity(
+                identitySha256 = "8b".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PREPARED,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name)
+            dao.insert(installedLegacy)
+            dao.insert(bundleLegacy)
+            installed.values = listOf(installed(installedLegacy).copy(versionCode = 6))
+            bundleProofs.current = CurrentBundleReadyProof.Unreadable("private bundle read failed")
+
+            val result = management().reconcileLegacyIdentities()
+
+            assertEquals(setOf(installedLegacy.identitySha256), result.promotedIdentitySha256)
+            assertEquals(setOf(bundleLegacy.identitySha256), result.retainedIdentitySha256)
+            assertTrue(result.blockedReasons.getValue(bundleLegacy.identitySha256).contains("private bundle read failed"))
+            assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, dao.get(installedLegacy.identitySha256)?.lifecycleState)
+            assertEquals(ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name, dao.get(bundleLegacy.identitySha256)?.lifecycleState)
+        }
+
+    @Test
+    fun `current BUNDLE_READY와 retained import exact proof만 legacy를 idempotent하게 승격한다`() =
+        runTest {
+            val currentBundle = externalIdentity(
+                identitySha256 = "9a".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PREPARED,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name)
+            val imported = convertedIdentity(
+                identitySha256 = "9b".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            val retired = externalIdentity(
+                identitySha256 = "9c".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.RETIRED.name)
+            for (identity in listOf(currentBundle, imported, retired)) dao.insert(identity)
+            keys.add(keyProof(imported))
+            setBundleReadyJob(
+                JOB_ONE,
+                proof(currentBundle, versionCode = 21),
+            )
+
+            val startup = management().reconcileLegacyIdentities()
+            val importPromoted = management().promoteLegacyFromVerifiedBundle(
+                proof(imported, versionCode = 22),
+            )
+            val retiredPromoted = management().promoteLegacyFromVerifiedBundle(
+                proof(retired, versionCode = 23),
+            )
+            val repeated = management().reconcileLegacyIdentities()
+
+            assertEquals(setOf(currentBundle.identitySha256), startup.promotedIdentitySha256)
+            assertEquals(setOf(imported.identitySha256), startup.retainedIdentitySha256)
+            assertTrue(importPromoted)
+            assertFalse(retiredPromoted)
+            assertTrue(repeated.promotedIdentitySha256.isEmpty())
+            assertTrue(repeated.retainedIdentitySha256.isEmpty())
+            assertEquals(21, dao.get(currentBundle.identitySha256)?.lastSuccessfulVersionCode)
+            assertEquals(22, dao.get(imported.identitySha256)?.lastSuccessfulVersionCode)
+            assertEquals(publicKeySha256(imported.identitySha256), dao.get(imported.identitySha256)?.crxPublicKeySha256)
+            assertEquals(retired, dao.get(retired.identitySha256))
+        }
+
+    @Test
+    fun `partial binding invalid version과 converted alias key mismatch는 legacy row와 key를 보존한다`() =
+        runTest {
+            val partial = externalIdentity(
+                identitySha256 = "aa".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name)
+            val invalidVersion = externalIdentity(
+                identitySha256 = "ab".repeat(32),
+                ownerToken = null,
+                mode = InstallationIdentityMode.PREPARED,
+            ).copy(lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name)
+            val wrongKey = convertedIdentity(
+                identitySha256 = "ac".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            for (identity in listOf(partial, invalidVersion, wrongKey)) dao.insert(identity)
+            installed.values = listOf(
+                installed(partial).copy(extensionId = "p".repeat(32)),
+                installed(invalidVersion).copy(versionCode = Int.MAX_VALUE.toLong() + 1),
+                installed(wrongKey).copy(versionCode = 17),
+            )
+            keys.add(
+                keyProof(wrongKey).copy(
+                    alias = "wrong.${wrongKey.identitySha256}",
+                ),
+            )
+
+            val result = management().reconcileLegacyIdentities()
+
+            assertEquals(emptySet<String>(), result.promotedIdentitySha256)
+            assertEquals(
+                setOf(partial.identitySha256, invalidVersion.identitySha256, wrongKey.identitySha256),
+                result.retainedIdentitySha256,
+            )
+            listOf(partial, invalidVersion, wrongKey).forEach { original ->
+                assertEquals(original, dao.get(original.identitySha256))
+            }
+            assertTrue(keys.contains(wrongKey.identitySha256))
+        }
+
+    @Test
+    fun `converted key proof가 없거나 extension digest가 다르고 읽기 실패하면 legacy를 보존한다`() =
+        runTest {
+            val aliasMissingBase = convertedIdentity(
+                identitySha256 = "ad".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            )
+            val aliasMissing = aliasMissingBase.copy(
+                crxKeyAlias = null,
+                crxPublicKeySha256 = null,
+            )
+            val keyAbsent = convertedIdentity(
+                identitySha256 = "ae".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            val extensionMismatch = convertedIdentity(
+                identitySha256 = "af".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            val digestMismatchBase = convertedIdentity(
+                identitySha256 = "ba".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            )
+            val digestMismatch = digestMismatchBase.copy(
+                crxPublicKeySha256 = "f".repeat(64),
+            )
+            val unreadable = convertedIdentity(
+                identitySha256 = "bb".repeat(32),
+                ownerToken = null,
+                lifecycle = ConversionIdentityLifecycleState.LEGACY_UNKNOWN,
+            ).copy(crxPublicKeySha256 = null)
+            val identities = listOf(
+                aliasMissing,
+                keyAbsent,
+                extensionMismatch,
+                digestMismatch,
+                unreadable,
+            )
+            identities.forEach { identity ->
+                dao.insert(identity)
+                installed.values += installed(identity).copy(versionCode = 17)
+            }
+            keys.add(keyProof(aliasMissingBase))
+            keys.add(
+                keyProof(extensionMismatch).copy(
+                    extensionId = "p".repeat(32),
+                ),
+            )
+            keys.add(keyProof(digestMismatchBase))
+            keys.set(
+                unreadable.identitySha256,
+                ConversionIdentityKeyProof.Unreadable("Keystore read failed"),
+            )
+
+            val result = management().reconcileLegacyIdentities()
+
+            assertEquals(emptySet<String>(), result.promotedIdentitySha256)
+            assertEquals(
+                identities.mapTo(linkedSetOf(), ConversionIdentityEntity::identitySha256),
+                result.retainedIdentitySha256,
+            )
+            identities.forEach { identity ->
+                assertEquals(identity, dao.get(identity.identitySha256))
+            }
+            assertTrue(keys.contains(aliasMissing.identitySha256))
+            assertFalse(keys.contains(keyAbsent.identitySha256))
+            assertTrue(keys.contains(extensionMismatch.identitySha256))
+            assertTrue(keys.contains(digestMismatch.identitySha256))
+            assertTrue(keys.contains(unreadable.identitySha256))
+        }
+
     private fun management(
         hooks: ConversionIdentityManagementHooks = ConversionIdentityManagementHooks(),
     ) = ConversionIdentityManagement(
@@ -560,6 +803,16 @@ class ConversionIdentityManagementTest {
         signerSha256 = identity.wrapperSignerSha256,
     )
 
+    private fun proof(
+        identity: ConversionIdentityEntity,
+        versionCode: Int,
+    ) = VerifiedIdentityProof(
+        packageName = identity.packageName,
+        extensionId = identity.extensionId,
+        wrapperSignerSha256 = identity.wrapperSignerSha256,
+        versionCode = versionCode,
+    )
+
     private fun lease(identity: ConversionIdentityEntity, ownerToken: String) =
         ConversionIdentityLeaseEntity(
             identitySha256 = identity.identitySha256,
@@ -575,12 +828,17 @@ class ConversionIdentityManagementTest {
         )
 
     private class FakeInstalledWrappers : InstalledWrapperRepository {
-        var current: InstalledWrapper? = null
+        var values: List<InstalledWrapper> = emptyList()
+        var current: InstalledWrapper?
+            get() = values.singleOrNull()
+            set(value) {
+                values = listOfNotNull(value)
+            }
         var failure: Throwable? = null
-        override suspend fun findAll(): List<InstalledWrapper> = listOfNotNull(current)
+        override suspend fun findAll(): List<InstalledWrapper> = values
         override suspend fun find(packageName: String): InstalledWrapper? {
             failure?.let { throw it }
-            return current?.takeIf { it.packageName == packageName }
+            return values.singleOrNull { it.packageName == packageName }
         }
     }
 
@@ -604,7 +862,7 @@ class ConversionIdentityManagementTest {
     }
 
     private class FakeConversionIdentityKeyInspector : ConversionIdentityKeyInspector {
-        private val proofs = linkedMapOf<String, ConversionIdentityKeyProof.Verified>()
+        private val proofs = linkedMapOf<String, ConversionIdentityKeyProof>()
         var inspectCalls = 0
             private set
         val size: Int
@@ -612,6 +870,10 @@ class ConversionIdentityManagementTest {
 
         fun add(proof: ConversionIdentityKeyProof.Verified) {
             proofs[proof.alias.substringAfterLast('.')] = proof
+        }
+
+        fun set(identitySha256: String, proof: ConversionIdentityKeyProof) {
+            proofs[identitySha256] = proof
         }
 
         fun contains(identitySha256: String): Boolean = identitySha256 in proofs

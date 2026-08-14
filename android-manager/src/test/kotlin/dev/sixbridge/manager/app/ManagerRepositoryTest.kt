@@ -22,6 +22,7 @@ import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
+import dev.sixbridge.manager.conversion.VerifiedIdentityProof
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.InstalledExtensionIconSource
 import dev.sixbridge.manager.importer.ImportedBundle
@@ -352,9 +353,11 @@ class ManagerRepositoryTest {
     fun `durable Invalid recovery는 retry 없이 readiness를 blocked로 완료한다`() =
         runTest {
             listOf("pending", "terminal", "final", "handoff").forEach { invalidRecord ->
+                var reconciliationCalls = 0
                 val fixture = startupFixture(
                     invalidRecord = invalidRecord,
                     retryDelayMillis = 1,
+                    reconcileLegacyIdentities = { reconciliationCalls += 1 },
                 )
 
                 val result = withTimeout(500) { fixture.startup.awaitReady() }
@@ -364,6 +367,7 @@ class ManagerRepositoryTest {
                 assertEquals(0, fixture.store.nullableLoadReads, invalidRecord)
                 assertEquals(0, fixture.store.discardAttempts, invalidRecord)
                 assertEquals(InstallState.Idle, fixture.coordinator.state.value, invalidRecord)
+                assertEquals(0, reconciliationCalls, invalidRecord)
             }
         }
 
@@ -399,10 +403,44 @@ class ManagerRepositoryTest {
             assertIs<StartupSnapshot.Ready>(awaiting.await())
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `startup READY는 legacy identity reconciliation을 await한 뒤에만 완료된다`() =
+        runTest {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var startupCleanupCompletions = 0
+            val fixture = startupFixture(
+                invalidRecord = "legacy-reconciliation",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = listOf(
+                    emptyRecoverySnapshot(),
+                    emptyRecoverySnapshot(),
+                    emptyRecoverySnapshot(),
+                ),
+                reconcileLegacyIdentities = {
+                    entered.complete(Unit)
+                    release.await()
+                },
+                afterStartupCleanup = { startupCleanupCompletions += 1 },
+            )
+
+            val awaiting = async { fixture.startup.awaitReady() }
+            entered.await()
+            runCurrent()
+
+            assertFalse(awaiting.isCompleted)
+            assertEquals(0, startupCleanupCompletions)
+            release.complete(Unit)
+            assertIs<StartupSnapshot.Ready>(awaiting.await())
+            assertEquals(1, startupCleanupCompletions)
+        }
+
     @Test
     fun `identity CLEANING recovery가 blocked면 startup cleanup을 실행하지 않고 RecoveryBlocked로 완료한다`() =
         runTest {
             var recoveryCalls = 0
+            var reconciliationCalls = 0
             val fixture = startupFixture(
                 invalidRecord = "identity-cleaning",
                 retryDelayMillis = 1,
@@ -411,6 +449,7 @@ class ManagerRepositoryTest {
                     recoveryCalls += 1
                     false
                 },
+                reconcileLegacyIdentities = { reconciliationCalls += 1 },
             )
 
             val result = fixture.startup.awaitReady()
@@ -418,6 +457,33 @@ class ManagerRepositoryTest {
             assertEquals(StartupSnapshot.RecoveryBlocked, result)
             assertEquals(1, recoveryCalls)
             assertEquals(1, fixture.store.recoverySnapshotReads)
+            assertEquals(0, fixture.store.nullableLoadReads)
+            assertEquals(0, fixture.installed.findAllCalls)
+            assertEquals(0, reconciliationCalls)
+        }
+
+    @Test
+    fun `legacy reconciliation 예외은 최대 시도 후 startup cleanup 없이 RecoveryBlocked로 완료한다`() =
+        runTest {
+            var reconciliationCalls = 0
+            var startupCleanupCompletions = 0
+            val fixture = startupFixture(
+                invalidRecord = "legacy-reconciliation-failure",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = List(3) { emptyRecoverySnapshot() },
+                reconcileLegacyIdentities = {
+                    reconciliationCalls += 1
+                    error("simulated reconciliation failure")
+                },
+                afterStartupCleanup = { startupCleanupCompletions += 1 },
+            )
+
+            val result = withTimeout(500) { fixture.startup.awaitReady() }
+
+            assertEquals(StartupSnapshot.RecoveryBlocked, result)
+            assertEquals(3, reconciliationCalls)
+            assertEquals(3, fixture.store.recoverySnapshotReads)
+            assertEquals(0, startupCleanupCompletions)
             assertEquals(0, fixture.store.nullableLoadReads)
             assertEquals(0, fixture.installed.findAllCalls)
         }
@@ -898,6 +964,20 @@ class ManagerRepositoryTest {
                     assertEquals(generated, it)
                     ImportResult.Success(imported)
                 },
+                promoteLegacyFromVerifiedBundle = { proof ->
+                    calls += "promote-legacy"
+                    assertNotNull(retainedImports.load(TOKEN))
+                    assertEquals(
+                        VerifiedIdentityProof(
+                            packageName = imported.verifiedApk.packageName,
+                            extensionId = imported.verifiedApk.extensionId,
+                            wrapperSignerSha256 = imported.verifiedApk.signerSha256,
+                            versionCode = imported.verifiedApk.versionCode.toInt(),
+                        ),
+                        proof,
+                    )
+                    true
+                },
             )
 
             val importedResult =
@@ -917,9 +997,66 @@ class ManagerRepositoryTest {
             assertEquals("bundle", copied.toString(Charsets.UTF_8.name()))
             assertTrue(repository.discardConversion(TOKEN))
             assertEquals(
-                listOf("import-generated", "begin", "build", "restore", "copy", "discard"),
+                listOf(
+                    "import-generated",
+                    "promote-legacy",
+                    "begin",
+                    "build",
+                    "restore",
+                    "copy",
+                    "discard",
+                ),
                 calls,
             )
+        }
+
+    @Test
+    fun `검증 보존된 import는 legacy promotion 예외에도 review와 durable bundle을 유지한다`() =
+        runBlocking {
+            val retainedRoot = temporaryFolder.newFolder("promotion-failure-retained")
+            val imported = importedBundle(retainedRoot)
+            val retainedImports = RetainedImportStore(retainedRoot) { _, _, _ ->
+                WrapperVerificationResult.Success(imported.verifiedApk)
+            }
+            val generatedFile = temporaryFolder.newFile("promotion-failure.six")
+                .apply { writeText("bundle") }
+            val generated = GeneratedBundle(
+                token = TOKEN,
+                file = generatedFile,
+                sha256 = "f".repeat(64),
+                suggestedFileName = "$TOKEN.six",
+            )
+            val pendingStore = StartupPendingStore(null, retainedRoot)
+            val gateway = StartupGateway(emptyList())
+            val installed = FakeInstalledWrappers(emptyList())
+            val catalog = FakeCatalog(emptyList())
+            val repository = managerRepository(
+                root = retainedRoot,
+                retainedImports = retainedImports,
+                gateway = gateway,
+                pendingStore = pendingStore,
+                installed = installed,
+                catalog = catalog,
+                coordinator = InstallCoordinator(
+                    InstallPolicy(),
+                    gateway,
+                    pendingStore,
+                    installed,
+                    catalog,
+                ),
+                generatedImporter = { ImportResult.Success(imported) },
+                promoteLegacyFromVerifiedBundle = {
+                    error("simulated legacy promotion failure")
+                },
+            )
+
+            val result = assertIs<ManagerImportResult.Success>(
+                repository.importGenerated(generated),
+            )
+
+            assertEquals(TOKEN, result.review.token)
+            assertNotNull(retainedImports.load(TOKEN))
+            Unit
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -3512,6 +3649,7 @@ class ManagerRepositoryTest {
         generatedImporter: suspend (GeneratedBundle) -> ImportResult = {
             ImportResult.Failure(ImportFailure(ImportFailureCode.CACHE_IO))
         },
+        promoteLegacyFromVerifiedBundle: suspend (VerifiedIdentityProof) -> Boolean = { false },
     ) = DefaultManagerRepository(
         importer = BundleImportService(
             BundleSource { error("직접 import하지 않습니다.") },
@@ -3544,6 +3682,7 @@ class ManagerRepositoryTest {
         afterInstallRequest = afterInstallRequest,
         conversionCoordinator = conversionCoordinator,
         generatedImporter = generatedImporter,
+        promoteLegacyFromVerifiedBundle = promoteLegacyFromVerifiedBundle,
     )
 
     private fun legacyInstallRepository(
@@ -3636,6 +3775,8 @@ class ManagerRepositoryTest {
         retryDelayMillis: Long,
         recoverySnapshotSequence: List<RecoveryStoreSnapshot>? = null,
         recoverIdentityCleanup: suspend () -> Boolean = { true },
+        reconcileLegacyIdentities: suspend () -> Unit = {},
+        afterStartupCleanup: suspend () -> Unit = {},
     ): StartupTestFixture {
         val root = temporaryFolder.newFolder("blocked-startup-$invalidRecord")
         val store = StartupPendingStore(null)
@@ -3694,7 +3835,9 @@ class ManagerRepositoryTest {
             catalogPublisher = publisher,
             ioDispatcher = Dispatchers.Unconfined,
             retryDelayMillis = retryDelayMillis,
+            afterStartupCleanup = afterStartupCleanup,
             recoverIdentityCleanup = recoverIdentityCleanup,
+            reconcileLegacyIdentities = reconcileLegacyIdentities,
         )
         return StartupTestFixture(startup, store, coordinator, installed, router, calls)
     }

@@ -162,11 +162,29 @@ class InstalledWrapperRepositoryTest {
         assertNull(repository.find("dev.sixbridge.ext.other"))
     }
 
+    @Test
+    fun `legacy promotion proof용 installed fact는 양수 Int version과 canonical signer만 반환한다`() =
+        runBlocking {
+            val repository = PackageManagerInstalledWrapperRepository(
+                InstalledWrapperPackageGateway {
+                    listOf(
+                        facts(extensionId = VALID_ID, versionCode = 7),
+                        facts(extensionId = id('b'), versionCode = 0),
+                        facts(extensionId = id('c'), versionCode = Int.MAX_VALUE.toLong() + 1),
+                        facts(extensionId = id('d'), signerSha256 = listOf("NOT-A-SHA256")),
+                    )
+                },
+            )
+
+            assertEquals(listOf("dev.sixbridge.ext.$VALID_ID"), repository.findAll().map { it.packageName })
+        }
+
     private fun facts(
         extensionId: String,
         packageName: String = "dev.sixbridge.ext.$extensionId",
         metadataExtensionId: String = extensionId,
         name: String = "Example",
+        versionCode: Long = 7,
         signerSha256: List<String> = listOf(SIGNER),
         apkSha256: String? = null,
         installSourceEvidence: InstallSourceEvidence = InstallSourceEvidence.Unavailable,
@@ -189,7 +207,7 @@ class InstalledWrapperRepositoryTest {
     ) = InstalledWrapperPackageFacts(
         packageName = packageName,
         applicationLabel = name,
-        versionCode = 7,
+        versionCode = versionCode,
         signerSha256 = signerSha256,
         matchedActivity = matchedActivity,
         resolvedIntentFilter = filter,

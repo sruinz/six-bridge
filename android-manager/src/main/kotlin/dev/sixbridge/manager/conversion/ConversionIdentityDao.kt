@@ -252,6 +252,67 @@ interface ConversionIdentityDao {
         ) == 1
     }
 
+    @Transaction
+    suspend fun promoteLegacyIdentity(
+        expected: ConversionIdentityEntity,
+        proof: VerifiedIdentityProof,
+        verifiedPublicKeySha256: String?,
+        lifecycleUpdatedAtEpochMillis: Long,
+        observedCurrentBundle: CurrentBundleReadyProof.Verified?,
+    ): Boolean {
+        if (lifecycleUpdatedAtEpochMillis < 0 ||
+            proof.versionCode <= 0 ||
+            !EXTENSION_ID.matches(proof.extensionId) ||
+            proof.packageName != "dev.sixbridge.ext.${proof.extensionId}" ||
+            !SHA256.matches(proof.wrapperSignerSha256) ||
+            get(expected.identitySha256) != expected ||
+            expected.lifecycleState != ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name ||
+            expected.provisionOwnerToken != null ||
+            expected.packageName != proof.packageName ||
+            expected.extensionId != proof.extensionId ||
+            expected.wrapperSignerSha256 != proof.wrapperSignerSha256
+        ) {
+            return false
+        }
+        if (observedCurrentBundle != null &&
+            (observedCurrentBundle.proof != proof || !jobMatches(observedCurrentBundle))
+        ) {
+            return false
+        }
+        when (expected.mode) {
+            InstallationIdentityMode.CONVERTED.name -> {
+                if (expected.crxKeyAlias.isNullOrBlank() ||
+                    !SHA256.matches(verifiedPublicKeySha256.orEmpty()) ||
+                    expected.crxPublicKeySha256?.let { it != verifiedPublicKeySha256 } == true
+                ) {
+                    return false
+                }
+            }
+            InstallationIdentityMode.PASSTHROUGH.name,
+            InstallationIdentityMode.PREPARED.name,
+            -> if (expected.crxKeyAlias != null ||
+                expected.crxPublicKeySha256 != null ||
+                verifiedPublicKeySha256 != null
+            ) {
+                return false
+            }
+            else -> return false
+        }
+        val promoted = expected.copy(
+            lastReservedVersionCode = maxOf(
+                expected.lastReservedVersionCode,
+                proof.versionCode,
+            ),
+            lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+            provisionOwnerToken = null,
+            crxPublicKeySha256 = verifiedPublicKeySha256,
+            lastSuccessfulVersionCode = proof.versionCode,
+            lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
+        )
+        update(promoted)
+        return get(expected.identitySha256) == promoted
+    }
+
     private suspend fun jobMatches(observed: CurrentBundleReadyProof): Boolean {
         val job = getJobForIdentityFinalization()
         return when (observed) {
@@ -263,6 +324,11 @@ interface ConversionIdentityDao {
                     job.stage == ConversionJobStage.BUNDLE_READY.name &&
                     job.bundleSha256 == observed.bundleSha256
         }
+    }
+
+    private companion object {
+        val EXTENSION_ID = Regex("[a-p]{32}")
+        val SHA256 = Regex("[0-9a-f]{64}")
     }
 
     @Transaction

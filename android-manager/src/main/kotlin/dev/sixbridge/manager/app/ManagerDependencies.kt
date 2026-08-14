@@ -173,7 +173,13 @@ class ManagerDependencies private constructor(
                     }
                 },
                 runtime = DefaultConversionRuntime(),
-                identities = DefaultConversionIdentityPort(identityLedger, packager),
+                identities = DefaultConversionIdentityPort(
+                    ledger = identityLedger,
+                    packager = packager,
+                    reconcileLegacyIdentities = {
+                        identityManagement.reconcileLegacyIdentities()
+                    },
+                ),
                 installed = ConversionInstalledPort(installedWrappers::find),
                 packages = DefaultConversionPackagePort(
                     identityLedger,
@@ -234,6 +240,11 @@ class ManagerDependencies private constructor(
                 catalogPublisher = catalogPublisher,
                 conversionCoordinator = conversionCoordinator,
                 recoverIdentityCleanup = identityManagement::recoverIdentityCleanup,
+                reconcileLegacyIdentities = {
+                    identityManagement.reconcileLegacyIdentities()
+                },
+                promoteLegacyFromVerifiedBundle =
+                    identityManagement::promoteLegacyFromVerifiedBundle,
             )
             repository.start(applicationScope, catalog)
             return ManagerDependencies(repository, applicationScope)

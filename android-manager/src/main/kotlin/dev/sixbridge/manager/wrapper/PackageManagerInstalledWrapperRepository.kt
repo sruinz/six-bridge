@@ -32,6 +32,8 @@ class PackageManagerInstalledWrapperRepository(
         if (!EXTENSION_ID.matches(extensionId)) return null
         if (facts.packageName != "$PACKAGE_PREFIX$extensionId") return null
         if (facts.signerSha256.size != 1) return null
+        if (!SHA256.matches(facts.signerSha256.single())) return null
+        if (facts.versionCode !in 1..Int.MAX_VALUE.toLong()) return null
         if (facts.matchedActivity.packageName != facts.packageName ||
             facts.matchedActivity.name != DISCOVERY_ACTIVITY ||
             !facts.matchedActivity.exported
@@ -87,6 +89,7 @@ class PackageManagerInstalledWrapperRepository(
         const val SIX_SCHEME = "six"
         const val EX_HOST = "ex"
         val EXTENSION_ID = Regex("[a-p]{32}")
+        val SHA256 = Regex("[0-9a-f]{64}")
     }
 }
 

@@ -8,24 +8,34 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionIdentityEntity
+import dev.sixbridge.manager.conversion.ConversionIdentityKeyInspector
+import dev.sixbridge.manager.conversion.ConversionIdentityKeyProof
 import dev.sixbridge.manager.conversion.ConversionIdentityLeaseEntity
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityLifecycleState
+import dev.sixbridge.manager.conversion.ConversionIdentityManagement
 import dev.sixbridge.manager.conversion.ConversionIdentityReservation
 import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.ConversionJobEntity
 import dev.sixbridge.manager.conversion.ConversionJobStage
 import dev.sixbridge.manager.conversion.ConversionWorkStore
+import dev.sixbridge.manager.conversion.CurrentBundleReadyProof
+import dev.sixbridge.manager.conversion.CurrentBundleReadyProofReader
+import dev.sixbridge.manager.conversion.DefaultConversionIdentityPort
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LogicalSourceIdentity
 import dev.sixbridge.manager.conversion.encodeCleanupTokens
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
+import dev.sixbridge.manager.wrapper.InstalledWrapper
+import dev.sixbridge.manager.wrapper.InstalledWrapperRepository
 import java.io.File
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -356,6 +366,146 @@ class ManagerDatabaseTest {
         }
 
     @Test
+    fun legacy_reconciliation_commits_exact_installed_proof_and_converted_key_in_real_room() =
+        runBlocking {
+            val dao = database.conversionIdentityDao()
+            val converted = ConversionIdentityEntity(
+                identitySha256 = "a".repeat(64),
+                logicalSourceIdentity = "project:${"a".repeat(32)}",
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.CONVERTED.name,
+                displayName = "Converted legacy",
+                extensionId = "a".repeat(32),
+                packageName = "dev.sixbridge.ext.${"a".repeat(32)}",
+                wrapperSignerSha256 = "c".repeat(64),
+                crxKeyAlias = "sixbridge.crx.rsa.v1.${"a".repeat(64)}",
+                lastReservedVersionCode = 17,
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                provisionOwnerToken = null,
+                crxPublicKeySha256 = null,
+                lastSuccessfulVersionCode = null,
+                lifecycleUpdatedAtEpochMillis = 0,
+            )
+            val passthrough = converted.copy(
+                identitySha256 = "b".repeat(64),
+                logicalSourceIdentity = "store:${"b".repeat(32)}",
+                mode = InstallationIdentityMode.PASSTHROUGH.name,
+                displayName = "Passthrough legacy",
+                extensionId = "b".repeat(32),
+                packageName = "dev.sixbridge.ext.${"b".repeat(32)}",
+                crxKeyAlias = null,
+                lastReservedVersionCode = 23,
+            )
+            dao.insert(converted)
+            dao.insert(passthrough)
+            val installed = listOf(
+                InstalledWrapper(
+                    packageName = converted.packageName,
+                    extensionId = converted.extensionId,
+                    name = converted.displayName,
+                    versionCode = 29,
+                    signerSha256 = converted.wrapperSignerSha256,
+                ),
+                InstalledWrapper(
+                    packageName = passthrough.packageName,
+                    extensionId = passthrough.extensionId,
+                    name = passthrough.displayName,
+                    versionCode = 19,
+                    signerSha256 = passthrough.wrapperSignerSha256,
+                ),
+            )
+            val management = ConversionIdentityManagement(
+                dao = dao,
+                installedWrappers = object : InstalledWrapperRepository {
+                    override suspend fun findAll() = installed
+                    override suspend fun find(packageName: String) =
+                        installed.singleOrNull { it.packageName == packageName }
+                },
+                currentBundleReadyProofReader = CurrentBundleReadyProofReader {
+                    CurrentBundleReadyProof.Absent
+                },
+                keyInspector = object : ConversionIdentityKeyInspector {
+                    override suspend fun <T> withIdentityLock(
+                        identitySha256: String,
+                        block: suspend () -> T,
+                    ): T = block()
+
+                    override fun inspect(identitySha256: String) =
+                        if (identitySha256 == converted.identitySha256) {
+                            ConversionIdentityKeyProof.Verified(
+                                alias = requireNotNull(converted.crxKeyAlias),
+                                extensionId = converted.extensionId,
+                                publicKeySha256 = "d".repeat(64),
+                            )
+                        } else {
+                            ConversionIdentityKeyProof.Absent
+                        }
+                },
+                currentTimeMillis = { 1234L },
+            )
+
+            val result = management.reconcileLegacyIdentities()
+
+            assertEquals(setOf(converted.identitySha256, passthrough.identitySha256), result.promotedIdentitySha256)
+            requireNotNull(dao.get(converted.identitySha256)).also { active ->
+                assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+                assertEquals(29, active.lastSuccessfulVersionCode)
+                assertEquals(29, active.lastReservedVersionCode)
+                assertEquals("d".repeat(64), active.crxPublicKeySha256)
+            }
+            requireNotNull(dao.get(passthrough.identitySha256)).also { active ->
+                assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+                assertEquals(19, active.lastSuccessfulVersionCode)
+                assertEquals(23, active.lastReservedVersionCode)
+                assertNull(active.crxPublicKeySha256)
+            }
+            Unit
+        }
+
+    @Test
+    fun existing_target_query_awaits_legacy_reconciliation_before_reading_active_rows() =
+        runBlocking {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val dao = database.conversionIdentityDao()
+            val active = ConversionIdentityEntity(
+                identitySha256 = "e".repeat(64),
+                logicalSourceIdentity = "project:${"e".repeat(32)}",
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.CONVERTED.name,
+                displayName = "Active target",
+                extensionId = "e".repeat(32),
+                packageName = "dev.sixbridge.ext.${"e".repeat(32)}",
+                wrapperSignerSha256 = "f".repeat(64),
+                crxKeyAlias = "sixbridge.crx.rsa.v1.${"e".repeat(64)}",
+                lastReservedVersionCode = 3,
+                lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+                provisionOwnerToken = null,
+                crxPublicKeySha256 = "d".repeat(64),
+                lastSuccessfulVersionCode = 3,
+                lifecycleUpdatedAtEpochMillis = 1,
+            )
+            dao.insert(active)
+            val port = DefaultConversionIdentityPort(
+                ledger = ConversionIdentityLedger(dao),
+                packager = OnDeviceWrapperPackager(
+                    ApplicationProvider.getApplicationContext(),
+                ),
+                reconcileLegacyIdentities = {
+                    entered.complete(Unit)
+                    release.await()
+                },
+            )
+
+            val query = async { port.existingTargets(30) }
+            entered.await()
+            assertFalse(query.isCompleted)
+            release.complete(Unit)
+
+            assertEquals(listOf(active.identitySha256), query.await().map { it.identitySha256 })
+        }
+
+    @Test
     fun conversion_identity_unique_binding_rejects_cross_profile_and_mode_races() =
         runBlocking {
             val dao = database.conversionIdentityDao()
@@ -486,7 +636,8 @@ class ManagerDatabaseTest {
         val dao = database.conversionIdentityDao()
         val first = ledger.reserve(request, firstOwner)
         assertTrue(ledger.releaseFailedAttempt(firstOwner))
-        val second = ledger.reserve(request, secondOwner)
+        assertTrue(runCatching { ledger.reserve(request, secondOwner) }.isFailure)
+        val second = ledger.reserve(request, firstOwner)
         val stored = requireNotNull(dao.get(key.identitySha256))
 
         assertTrue(
@@ -505,7 +656,7 @@ class ManagerDatabaseTest {
                 dao.claimForPackaging(
                     requested = stored,
                     versionCode = second.versionCode,
-                    ownerToken = firstOwner,
+                    ownerToken = secondOwner,
                     crxPublicKeySha256 = null,
                     packagingState = "PACKAGING:22222222-2222-4222-8222-222222222222",
                 )
@@ -521,11 +672,11 @@ class ManagerDatabaseTest {
         dao.claimForPackaging(
             requested = stored,
             versionCode = second.versionCode,
-            ownerToken = secondOwner,
+            ownerToken = firstOwner,
             crxPublicKeySha256 = null,
             packagingState = "PACKAGING:33333333-3333-4333-8333-333333333333",
         )
-        assertTrue(ledger.releaseFailedAttempt(secondOwner))
+        assertTrue(ledger.releaseFailedAttempt(firstOwner))
     }
 
     @Test

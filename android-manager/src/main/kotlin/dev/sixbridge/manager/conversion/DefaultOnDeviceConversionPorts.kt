@@ -458,9 +458,12 @@ internal class DefaultConversionRuntime(
 internal class DefaultConversionIdentityPort(
     private val ledger: ConversionIdentityLedger,
     private val packager: OnDeviceWrapperPackager,
+    private val reconcileLegacyIdentities: suspend () -> Unit = {},
 ) : ConversionIdentityPort {
-    override suspend fun existingTargets(profileMajorVersion: Int) =
-        ledger.listExistingTargets(profileMajorVersion)
+    override suspend fun existingTargets(profileMajorVersion: Int): List<ExistingConversionTarget> {
+        reconcileLegacyIdentities()
+        return ledger.listExistingTargets(profileMajorVersion)
+    }
 
     override suspend fun resolve(
         prepared: PreparedConversionSnapshot,

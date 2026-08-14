@@ -16,6 +16,12 @@ data class LegacyConversionIdentity(
     val wrapperSignerSha256: String,
 )
 
+data class LegacyReconciliationResult(
+    val promotedIdentitySha256: Set<String>,
+    val retainedIdentitySha256: Set<String>,
+    val blockedReasons: Map<String, String>,
+)
+
 sealed interface ConversionIdentityCleanupResult {
     data object Removed : ConversionIdentityCleanupResult
     data object NothingOwned : ConversionIdentityCleanupResult
@@ -59,7 +65,7 @@ class ConversionIdentityManagement internal constructor(
     private val currentTimeMillis: () -> Long = System::currentTimeMillis,
     private val hooks: ConversionIdentityManagementHooks = ConversionIdentityManagementHooks(),
 ) {
-    private val cleanupMutex = Mutex()
+    private val managementMutex = Mutex()
 
     suspend fun listLegacyUnknown(): List<LegacyConversionIdentity> =
         dao.listByLifecycle(ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name).map { entity ->
@@ -75,9 +81,117 @@ class ConversionIdentityManagement internal constructor(
             )
         }
 
+    suspend fun reconcileLegacyIdentities(): LegacyReconciliationResult =
+        managementMutex.withLock {
+            val legacy = dao.listByLifecycle(
+                ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+            )
+            if (legacy.isEmpty()) {
+                return@withLock LegacyReconciliationResult(emptySet(), emptySet(), emptyMap())
+            }
+            val promoted = linkedSetOf<String>()
+            val blockedReasons = linkedMapOf<String, String>()
+            val installedSnapshot = try {
+                InstalledSnapshot.Available(installedWrappers.findAll())
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                InstalledSnapshot.Unreadable("설치 wrapper proof를 읽을 수 없습니다.")
+            }
+
+            for (identity in legacy) {
+                val candidate = installedSnapshot.proofFor(identity)
+                if (candidate.proof == null) {
+                    blockedReasons[identity.identitySha256] = candidate.reason
+                    continue
+                }
+                val attempt = promoteLegacy(
+                    expected = identity,
+                    proof = candidate.proof,
+                    observedCurrentBundle = null,
+                )
+                if (attempt.promoted) {
+                    promoted += identity.identitySha256
+                    blockedReasons -= identity.identitySha256
+                } else {
+                    blockedReasons[identity.identitySha256] = attempt.reason
+                }
+            }
+
+            val bundleCandidates = legacy.filterNot { it.identitySha256 in promoted }
+            if (bundleCandidates.isNotEmpty()) {
+                val currentBundle = try {
+                    currentBundleReadyProofReader.read()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    CurrentBundleReadyProof.Unreadable(
+                        "현재 BUNDLE_READY proof를 읽을 수 없습니다.",
+                    )
+                }
+                for (identity in bundleCandidates) {
+                    when (currentBundle) {
+                        CurrentBundleReadyProof.Absent ->
+                            blockedReasons.putIfAbsent(
+                                identity.identitySha256,
+                                "강한 identity proof가 없습니다.",
+                            )
+                        is CurrentBundleReadyProof.Unreadable ->
+                            blockedReasons[identity.identitySha256] = currentBundle.reason
+                        is CurrentBundleReadyProof.Verified -> {
+                            if (!currentBundle.proof.matches(identity)) {
+                                blockedReasons.putIfAbsent(
+                                    identity.identitySha256,
+                                    "현재 BUNDLE_READY proof가 identity binding과 일치하지 않습니다.",
+                                )
+                                continue
+                            }
+                            val attempt = promoteLegacy(
+                                expected = identity,
+                                proof = currentBundle.proof,
+                                observedCurrentBundle = currentBundle,
+                            )
+                            if (attempt.promoted) {
+                                promoted += identity.identitySha256
+                                blockedReasons -= identity.identitySha256
+                            } else {
+                                blockedReasons[identity.identitySha256] = attempt.reason
+                            }
+                        }
+                    }
+                }
+            }
+            val retained = legacy
+                .asSequence()
+                .map(ConversionIdentityEntity::identitySha256)
+                .filterNot(promoted::contains)
+                .toCollection(linkedSetOf())
+            LegacyReconciliationResult(
+                promotedIdentitySha256 = promoted,
+                retainedIdentitySha256 = retained,
+                blockedReasons = blockedReasons.filterKeys(retained::contains),
+            )
+        }
+
+    suspend fun promoteLegacyFromVerifiedBundle(
+        proof: VerifiedIdentityProof,
+    ): Boolean = managementMutex.withLock {
+        if (proof.validationIssue() != null) return@withLock false
+        val current = dao.findByPackageName(proof.packageName)
+            ?: return@withLock false
+        if (current.lifecycleState != ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name) {
+            return@withLock false
+        }
+        promoteLegacy(
+            expected = current,
+            proof = proof,
+            observedCurrentBundle = null,
+        ).promoted
+    }
+
     suspend fun discardIdentityOwner(
         ownerToken: String,
-    ): ConversionIdentityCleanupResult = cleanupMutex.withLock {
+    ): ConversionIdentityCleanupResult = managementMutex.withLock {
         requireCanonicalOwnerToken(ownerToken)
         val current = dao.findByProvisionOwnerToken(ownerToken)
             ?: return@withLock ConversionIdentityCleanupResult.NothingOwned
@@ -94,7 +208,7 @@ class ConversionIdentityManagement internal constructor(
 
     suspend fun discardLegacyUnknown(
         identitySha256: String,
-    ): ConversionIdentityCleanupResult = cleanupMutex.withLock {
+    ): ConversionIdentityCleanupResult = managementMutex.withLock {
         requireSha256(identitySha256, "이전 버전 identity")
         val current = dao.get(identitySha256)
             ?: return@withLock ConversionIdentityCleanupResult.NothingOwned
@@ -114,10 +228,92 @@ class ConversionIdentityManagement internal constructor(
         cleanup(current, ConversionIdentityLifecycleState.LEGACY_UNKNOWN)
     }
 
-    suspend fun recoverIdentityCleanup(): Boolean = cleanupMutex.withLock {
+    suspend fun recoverIdentityCleanup(): Boolean = managementMutex.withLock {
         dao.listByLifecycle(ConversionIdentityLifecycleState.CLEANING.name).all { current ->
             cleanupClaimed(current) == ConversionIdentityCleanupResult.Removed
         }
+    }
+
+    private suspend fun promoteLegacy(
+        expected: ConversionIdentityEntity,
+        proof: VerifiedIdentityProof,
+        observedCurrentBundle: CurrentBundleReadyProof.Verified?,
+    ): LegacyPromotionAttempt {
+        proof.validationIssue()?.let { return LegacyPromotionAttempt(false, it) }
+        if (!proof.matches(expected)) {
+            return LegacyPromotionAttempt(false, "identity binding proof가 일치하지 않습니다.")
+        }
+        return when (enumValueOrNull<InstallationIdentityMode>(expected.mode)) {
+            InstallationIdentityMode.CONVERTED ->
+                keyInspector.withIdentityLock(expected.identitySha256) {
+                    val verifiedKey = when (
+                        val inspected = keyInspector.inspect(expected.identitySha256)
+                    ) {
+                        ConversionIdentityKeyProof.Absent ->
+                            return@withIdentityLock LegacyPromotionAttempt(
+                                false,
+                                "converted identity alias가 없습니다.",
+                            )
+                        is ConversionIdentityKeyProof.Unreadable ->
+                            return@withIdentityLock LegacyPromotionAttempt(false, inspected.reason)
+                        is ConversionIdentityKeyProof.Verified -> inspected
+                    }
+                    if (expected.crxKeyAlias.isNullOrBlank() ||
+                        verifiedKey.alias != expected.crxKeyAlias ||
+                        verifiedKey.extensionId != expected.extensionId ||
+                        !MANAGEMENT_SHA256.matches(verifiedKey.publicKeySha256) ||
+                        expected.crxPublicKeySha256?.let {
+                            it != verifiedKey.publicKeySha256
+                        } == true
+                    ) {
+                        return@withIdentityLock LegacyPromotionAttempt(
+                            false,
+                            "converted identity key binding이 일치하지 않습니다.",
+                        )
+                    }
+                    promoteLegacyCas(
+                        expected = expected,
+                        proof = proof,
+                        verifiedPublicKeySha256 = verifiedKey.publicKeySha256,
+                        observedCurrentBundle = observedCurrentBundle,
+                    )
+                }
+            InstallationIdentityMode.PASSTHROUGH,
+            InstallationIdentityMode.PREPARED,
+            -> if (expected.crxKeyAlias != null || expected.crxPublicKeySha256 != null) {
+                LegacyPromotionAttempt(
+                    false,
+                    "외부 서명 identity key proof가 손상되었습니다.",
+                )
+            } else {
+                promoteLegacyCas(
+                    expected = expected,
+                    proof = proof,
+                    verifiedPublicKeySha256 = null,
+                    observedCurrentBundle = observedCurrentBundle,
+                )
+            }
+            null -> LegacyPromotionAttempt(false, "identity mode가 손상되었습니다.")
+        }
+    }
+
+    private suspend fun promoteLegacyCas(
+        expected: ConversionIdentityEntity,
+        proof: VerifiedIdentityProof,
+        verifiedPublicKeySha256: String?,
+        observedCurrentBundle: CurrentBundleReadyProof.Verified?,
+    ): LegacyPromotionAttempt {
+        val promoted = dao.promoteLegacyIdentity(
+            expected = expected,
+            proof = proof,
+            verifiedPublicKeySha256 = verifiedPublicKeySha256,
+            lifecycleUpdatedAtEpochMillis = now(),
+            observedCurrentBundle = observedCurrentBundle,
+        )
+        return LegacyPromotionAttempt(
+            promoted = promoted,
+            reason = if (promoted) "" else "LEGACY_UNKNOWN ACTIVE CAS가 실패했습니다.",
+        )
     }
 
     private suspend fun cleanup(
@@ -321,6 +517,77 @@ class ConversionIdentityManagement internal constructor(
     }
 }
 
+private data class LegacyPromotionAttempt(
+    val promoted: Boolean,
+    val reason: String,
+)
+
+private data class InstalledProofCandidate(
+    val proof: VerifiedIdentityProof?,
+    val reason: String,
+)
+
+private sealed interface InstalledSnapshot {
+    data class Available(
+        val byPackage: Map<String, List<InstalledWrapper>>,
+    ) : InstalledSnapshot {
+        constructor(values: List<InstalledWrapper>) : this(values.groupBy(InstalledWrapper::packageName))
+    }
+
+    data class Unreadable(val reason: String) : InstalledSnapshot
+}
+
+private fun InstalledSnapshot.proofFor(
+    identity: ConversionIdentityEntity,
+): InstalledProofCandidate = when (this) {
+    is InstalledSnapshot.Unreadable -> InstalledProofCandidate(null, reason)
+    is InstalledSnapshot.Available -> {
+        val wrappers = byPackage[identity.packageName].orEmpty()
+        if (wrappers.size > 1) {
+            InstalledProofCandidate(null, "설치 wrapper proof가 모호합니다.")
+        } else if (wrappers.isEmpty()) {
+            InstalledProofCandidate(null, "설치 wrapper proof가 없습니다.")
+        } else {
+            val wrapper = wrappers.single()
+            if (wrapper.packageName != identity.packageName ||
+                wrapper.extensionId != identity.extensionId ||
+                wrapper.signerSha256 != identity.wrapperSignerSha256
+            ) {
+                InstalledProofCandidate(null, "설치 wrapper binding proof가 일치하지 않습니다.")
+            } else if (wrapper.versionCode !in 1..Int.MAX_VALUE.toLong()) {
+                InstalledProofCandidate(null, "설치 wrapper versionCode proof가 올바르지 않습니다.")
+            } else {
+                val proof = VerifiedIdentityProof(
+                    packageName = wrapper.packageName,
+                    extensionId = wrapper.extensionId,
+                    wrapperSignerSha256 = wrapper.signerSha256,
+                    versionCode = wrapper.versionCode.toInt(),
+                )
+                proof.validationIssue()?.let { issue ->
+                    InstalledProofCandidate(null, issue)
+                } ?: InstalledProofCandidate(proof, "")
+            }
+        }
+    }
+}
+
+private fun VerifiedIdentityProof.matches(
+    identity: ConversionIdentityEntity,
+): Boolean = packageName == identity.packageName &&
+    extensionId == identity.extensionId &&
+    wrapperSignerSha256 == identity.wrapperSignerSha256
+
+private fun VerifiedIdentityProof.validationIssue(): String? = when {
+    !MANAGEMENT_EXTENSION_ID.matches(extensionId) ->
+        "identity proof extension ID가 올바르지 않습니다."
+    packageName != "dev.sixbridge.ext.$extensionId" ->
+        "identity proof package가 extension ID와 일치하지 않습니다."
+    !MANAGEMENT_SHA256.matches(wrapperSignerSha256) ->
+        "identity proof wrapper signer가 올바르지 않습니다."
+    versionCode <= 0 -> "identity proof versionCode가 올바르지 않습니다."
+    else -> null
+}
+
 private fun InstalledWrapper?.matches(identity: ConversionIdentityEntity): Boolean =
     this != null &&
         packageName == identity.packageName &&
@@ -348,3 +615,6 @@ private fun requireSha256(value: String, label: String) {
 
 private inline fun <reified T : Enum<T>> enumValueOrNull(value: String): T? =
     enumValues<T>().firstOrNull { it.name == value }
+
+private val MANAGEMENT_EXTENSION_ID = Regex("[a-p]{32}")
+private val MANAGEMENT_SHA256 = Regex("[0-9a-f]{64}")
