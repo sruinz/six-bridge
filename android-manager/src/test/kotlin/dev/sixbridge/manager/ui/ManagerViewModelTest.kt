@@ -945,6 +945,36 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `PrepareReviewedInstall은 다른 manual install을 정리한 뒤 exact review를 시작한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingManualInstall(SECOND_TOKEN)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(SECOND_TOKEN to null),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(1, repository.installRequests)
+            assertEquals(
+                listOf("cancelInstall", "install:start", "install:end"),
+                repository.lifecycleEvents,
+            )
+        }
+
+    @Test
     fun `PrepareReviewedInstall 직후 owner가 바뀌면 기존 설치 결과를 적용하지 않는다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
@@ -1006,6 +1036,42 @@ class ManagerViewModelTest {
                 ).installOwnerActive,
             )
             assertEquals(1, repository.installRequests)
+        }
+
+    @Test
+    fun `generated install은 다른 manual install을 정리한 뒤 current review를 시작한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.BundleReady(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(
+                    mapOf(
+                        ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                        ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingManualInstall(SECOND_TOKEN)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(SECOND_TOKEN to null),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(1, repository.installRequests)
+            assertEquals(
+                listOf("cancelInstall", "install:start", "install:end"),
+                repository.lifecycleEvents,
+            )
         }
 
     @Test
@@ -3007,6 +3073,34 @@ class ManagerViewModelTest {
                 assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState).review.token,
             )
             assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `새 six import는 소유 화면이 사라진 manual install을 먼저 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE).copy(token = SECOND_TOKEN),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingManualInstall(TOKEN)
+            advanceUntilIdle()
+
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(TOKEN to null),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+                    .review
+                    .token,
+            )
         }
 
     @Test
@@ -9171,6 +9265,42 @@ class ManagerViewModelTest {
                     assertIs<OnDeviceInputRequest.Saf>(
                         repository.conversionRequests.single(),
                     ).uri,
+            )
+        }
+
+    @Test
+    fun `새 zip 변환은 소유 화면이 사라진 manual install을 먼저 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = conversionAnalysis()
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingManualInstall(TOKEN)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.OpenConversionFilePicker)
+            val effect = assertIs<ManagerEffect.PickConversionDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(
+                ManagerAction.ConversionFileSelected(
+                    uri = unitTestUri(),
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(TOKEN to null),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(1, repository.conversionRequests.size)
+            assertEquals(
+                ManagerRoute.ConversionAnalysis(TOKEN),
+                viewModel.state.value.route,
             )
         }
 

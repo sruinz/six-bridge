@@ -1164,6 +1164,44 @@ class ManagerAppTest {
     }
 
     @Test
+    fun unrelated_manual_install_does_not_claim_current_review() {
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = reviewState(ContractCompatibilityStatus.COMPATIBLE).copy(
+                    installState = InstallState.AwaitingManualInstall(SECOND_TOKEN),
+                    message = null,
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("review:scroll")
+            .performScrollToNode(hasTestTag("review:install"))
+        composeRule.onNodeWithText("APK를 저장했습니다.").assertDoesNotExist()
+        composeRule.onNodeWithTag("review:install").assertIsEnabled()
+    }
+
+    @Test
+    fun unrelated_manual_install_does_not_claim_current_conversion_result() {
+        composeRule.setDarkContent {
+            ManagerAppContent(
+                state = conversionResultState().copy(
+                    installState = InstallState.AwaitingManualInstall(SECOND_TOKEN),
+                    message = null,
+                ),
+                onAction = {},
+                onAddSix = {},
+            )
+        }
+
+        composeRule.onNodeWithTag("conversion:result-screen")
+            .performScrollToNode(hasTestTag("conversion:install"))
+        composeRule.onNodeWithText("APK를 저장했습니다.").assertDoesNotExist()
+        composeRule.onNodeWithTag("conversion:install").assertIsEnabled()
+    }
+
+    @Test
     fun blocked_and_unknown_reviews_cannot_be_installed() {
         var state by mutableStateOf(reviewState(ContractCompatibilityStatus.BLOCKED))
         composeRule.setDarkContent {

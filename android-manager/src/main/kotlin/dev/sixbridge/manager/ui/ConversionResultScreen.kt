@@ -20,6 +20,7 @@ fun ConversionResultScreen(
     onInstall: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val ownedInstallState = installState.forImportToken(ready.review?.token)
     CenteredScrollableColumn(
         modifier = modifier,
         testTagModifier = Modifier.testTag("conversion:result-screen"),
@@ -56,7 +57,9 @@ fun ConversionResultScreen(
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }
-        if (installState is dev.sixbridge.manager.install.InstallState.AwaitingManualInstall) {
+        if (ownedInstallState is
+            dev.sixbridge.manager.install.InstallState.AwaitingManualInstall
+        ) {
             ManualInstallHandoff(onAction)
         } else {
             Button(
@@ -65,7 +68,7 @@ fun ConversionResultScreen(
                     !ready.installOwnerActive &&
                     !ready.cleanupPending &&
                     !ready.cleanupInProgress &&
-                    !installState.isActiveInstall(),
+                    !ownedInstallState.isActiveInstall(),
                 modifier = Modifier.fillMaxWidth().testTag("conversion:install"),
             ) {
                 Text(stringResource(R.string.review_install))

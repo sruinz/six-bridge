@@ -32,10 +32,11 @@ fun ReviewScreen(
     modifier: Modifier = Modifier,
 ) {
     val review = ready.review
-    val installBusy = installState != InstallState.Idle &&
-        installState !is InstallState.Failed &&
-        installState !is InstallState.Installed &&
-        installState != InstallState.Cancelled
+    val ownedInstallState = installState.forImportToken(review.token)
+    val installBusy = ownedInstallState != InstallState.Idle &&
+        ownedInstallState !is InstallState.Failed &&
+        ownedInstallState !is InstallState.Installed &&
+        ownedInstallState != InstallState.Cancelled
     CenteredScrollableColumn(
         modifier = modifier,
         testTagModifier = Modifier.testTag("review:scroll"),
@@ -141,7 +142,7 @@ fun ReviewScreen(
                 Text(text = stringResource(R.string.review_partial_notice))
             }
         }
-        InstallProgress(installState)
+        InstallProgress(ownedInstallState)
         message?.let { currentMessage ->
             MessageCard(
                 message = currentMessage,
@@ -162,7 +163,7 @@ fun ReviewScreen(
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }
-        if (installState is InstallState.AwaitingManualInstall) {
+        if (ownedInstallState is InstallState.AwaitingManualInstall) {
             ManualInstallHandoff(onAction)
         } else {
             Button(
@@ -180,6 +181,14 @@ fun ReviewScreen(
             Text(text = stringResource(R.string.review_cancel))
         }
     }
+}
+
+internal fun InstallState.forImportToken(importToken: String?): InstallState = when (this) {
+    is InstallState.PreparingApkExport ->
+        if (this.importToken == importToken) this else InstallState.Idle
+    is InstallState.AwaitingManualInstall ->
+        if (this.importToken == importToken) this else InstallState.Idle
+    else -> this
 }
 
 @Composable

@@ -691,17 +691,33 @@ class ManagerViewModel(
 
     private fun beginConversion(request: OnDeviceInputRequest) {
         if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
+        moveOwnedReviewToPendingDiscard()
+        val supersededInstall = detachInstallJob()
+        supersededInstall?.cancel()
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
-        mutableState.update {
-            it.copy(
-                route = ManagerRoute.ConversionInput,
-                conversionState = ConversionUiState.Acquiring,
-                message = null,
-            )
-        }
         routeOperation = viewModelScope.launch {
             if (!awaitRouteMutation(ticket)) return@launch
+            supersededInstall?.cancelAndJoin()
+            val cleaned = try {
+                cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return@launch
+            }
+            if (!cleaned || generation != operationGeneration) return@launch
+            if (!discardPendingReviews()) return@launch
+            if (generation != operationGeneration) return@launch
+            completedReplacementCleanupGeneration = generation
+            clearSavedReviewAndSession()
+            mutableState.update {
+                it.copy(
+                    route = ManagerRoute.ConversionInput,
+                    conversionState = ConversionUiState.Acquiring,
+                    message = null,
+                )
+            }
             val result = try {
                 repository.beginConversion(request)
             } catch (error: ConversionCleanupCancellationException) {
@@ -1925,6 +1941,36 @@ class ManagerViewModel(
         val generation = operationGeneration
         val reviewToken = ready.review.token
         installJob = viewModelScope.launch {
+            val manualOwnerToken = when (val state = repository.installState.value) {
+                is InstallState.PreparingApkExport -> state.importToken
+                is InstallState.AwaitingManualInstall -> state.importToken
+                else -> null
+            }
+            if (manualOwnerToken != null && manualOwnerToken != reviewToken) {
+                val cleaned = try {
+                    cancelInstallForRoute(
+                        generation = generation,
+                        suppressTerminalOnSuccess = true,
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    false
+                }
+                if (!cleaned ||
+                    generation != operationGeneration ||
+                    !isCurrentReviewOwner(reviewToken)
+                ) {
+                    if (generation == operationGeneration &&
+                        isCurrentReviewOwner(reviewToken)
+                    ) {
+                        mutableState.update {
+                            it.copy(message = installFailureMessage("CLEANUP_FAILED"))
+                        }
+                    }
+                    return@launch
+                }
+            }
             val attemptResult = repository.install(ready.review, ready.partialConfirmed)
             if (generation != operationGeneration) return@launch
             val generatedOwner = generatedInstallOwnerToken
@@ -2661,11 +2707,17 @@ class ManagerViewModel(
         generation: Long,
         suppressTerminalOnSuccess: Boolean,
     ): Boolean {
-        val expectedReviewToken =
-            ownedReviewToken ?: savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
         val previous = repository.installState.value
+        val persistedManualOwner = when (previous) {
+            is InstallState.PreparingApkExport -> previous.importToken
+            is InstallState.AwaitingManualInstall -> previous.importToken
+            else -> null
+        }
+        val expectedReviewToken = persistedManualOwner ?: ownedReviewToken
+            ?: savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
         val replacingActiveInstall =
-            previous == InstallState.UnknownSourcesPermissionRequired ||
+            persistedManualOwner != null ||
+                previous == InstallState.UnknownSourcesPermissionRequired ||
             previous is InstallState.WritingSession ||
             previous is InstallState.AwaitingUserApproval ||
             previous is InstallState.Failed &&
