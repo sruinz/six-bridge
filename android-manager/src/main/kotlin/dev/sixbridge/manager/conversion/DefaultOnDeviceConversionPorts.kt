@@ -13,8 +13,9 @@ import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.conversion.PreparedConversion
-import dev.sixbridge.core.draft.DraftReplayResult
 import dev.sixbridge.core.draft.ControlledSixDraft
+import dev.sixbridge.core.draft.DraftReplayResult
+import dev.sixbridge.core.draft.DraftSourceKind
 import dev.sixbridge.core.draft.SixDraft
 import dev.sixbridge.core.draft.SixDraftReplay
 import dev.sixbridge.core.draft.VerifiedPreparedSixDraft
@@ -195,7 +196,11 @@ internal class DefaultConversionRuntime(
                 return preparedSnapshot(controlled.verified, profile, approvedAdapterIds, control)
             }
             val draft = (controlled as ControlledSixDraft.Legacy).verified
-            sourceKind = draft.payload.input.inputKind.name
+            sourceKind = when (draft.payload.sourceKind) {
+                DraftSourceKind.ZIP -> ExtensionInputKind.ZIP.name
+                DraftSourceKind.CRX -> draft.payload.input.inputKind.name
+                DraftSourceKind.PREPARED_CRX -> error("prepared draft control 분기가 올바르지 않습니다.")
+            }
             if (draft.payload.input.browserProfileSha256 == profile.canonicalSha256()) {
                 when (
                     val replayed = SixDraftReplay().replay(

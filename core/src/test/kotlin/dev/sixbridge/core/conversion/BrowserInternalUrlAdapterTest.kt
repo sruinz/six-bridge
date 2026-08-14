@@ -111,6 +111,19 @@ class BrowserInternalUrlAdapterTest {
     }
 
     @Test
+    fun `malformed UTF-8 manifest는 대체 문자로 허용하지 않는다`() {
+        val source = fixtureRootFromFiles()
+        Files.write(
+            source.resolve("manifest.json"),
+            byteArrayOf('{'.code.toByte(), 0xc3.toByte(), 0x28, '}'.code.toByte()),
+        )
+
+        assertFailsWith<java.nio.charset.MalformedInputException> {
+            BrowserInternalUrlProof.runtimeIndex(source)
+        }
+    }
+
+    @Test
     fun `HTML과 JavaScript exact span을 상태별 목적지로 뒤 offset부터 변환한다`() {
         val prepared = prepareFixture()
         val transformed = extract(prepared.transformedSourceZip)

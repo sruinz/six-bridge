@@ -60,9 +60,9 @@ internal class ActionPopupEntryAdapter : MobileAdapter {
             ),
         )
         installAsset(root, marker)
-        Files.writeString(
+        writeManifestUtf8Strict(
             manifestPath,
-            JsonObject(manifest + (OPTIONS_UI to options)).toString(),
+            JsonObject(manifest + (OPTIONS_UI to options)),
         )
         return decision.copy(applied = true)
     }

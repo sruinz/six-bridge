@@ -5,12 +5,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.profile.BrowserProfile
+import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.app.ReviewBundle
 import dev.sixbridge.manager.app.toReview
 import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.importer.BundleImportService
 import dev.sixbridge.manager.importer.GeneratedBundleStoreSource
 import dev.sixbridge.manager.importer.ImportResult
+import dev.sixbridge.manager.packager.OnDevicePackagerTestHooks
 import dev.sixbridge.manager.packager.OnDeviceWrapperPackager
 import dev.sixbridge.manager.profile.AndroidSamsungBrowserProfileProvider
 import dev.sixbridge.manager.profile.SamsungBrowserProfileResult
@@ -21,6 +24,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.KeyStore
 import java.security.MessageDigest
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -30,6 +34,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -59,6 +65,105 @@ class OnDeviceConversionFlowInstrumentedTest {
         assertEquals(initial.signerSha256, result.signerSha256)
         assertTrue(result.versionCode > initial.versionCode)
         writeEvidence("update-result.json", result)
+    }
+
+    @Test
+    fun markerlessCreateNewReachesBundleReadyWithOneActiveTarget() = runBlocking {
+        val fixture = MarkerlessFlowFixture(markerlessSmartContextZip())
+        try {
+            val analysis = fixture.begin()
+            assertTrue(
+                (analysis.identityRequirement as IdentityRequirement.UserSelectionRequired)
+                    .existingTargets.isEmpty(),
+            )
+
+            val ready = fixture.build(
+                analysis,
+                InstallationIdentitySelection.CreateNew,
+            )
+            fixture.assertConvertedZipBundle(ready)
+
+            val active = fixture.onlyIdentity()
+            assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, active.lifecycleState)
+            assertNull(active.provisionOwnerToken)
+            assertEquals(active.lastReservedVersionCode, active.lastSuccessfulVersionCode)
+            assertEquals(ready.review.wrapperVersionCode, active.lastSuccessfulVersionCode)
+            assertNull(fixture.identityDao.getLeaseByOwnerToken(analysis.token))
+            assertFalse(fixture.packager.outputFile(analysis.token).exists())
+            assertEquals(setOf(requireNotNull(active.crxKeyAlias)), fixture.newCrxAliases())
+
+            assertTrue(fixture.discardCurrent())
+            val next = fixture.begin()
+            val targets =
+                (next.identityRequirement as IdentityRequirement.UserSelectionRequired)
+                    .existingTargets
+            assertEquals(1, targets.size)
+            assertEquals(active.identitySha256, targets.single().identitySha256)
+            assertEquals(active.extensionId, targets.single().extensionId)
+            assertEquals(active.packageName, targets.single().packageName)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun packageFailureRetryKeepsOneIdentityAndOneTarget() = runBlocking {
+        val fixture = MarkerlessFlowFixture(
+            sourceZip = markerlessSmartContextZip(),
+            failFirstPackage = true,
+        )
+        try {
+            val analysis = fixture.begin()
+            val failed = fixture.coordinator.build(
+                token = analysis.token,
+                approvedAdapterIds = analysis.requiredApprovals,
+                partialConfirmed = true,
+                identitySelection = InstallationIdentitySelection.CreateNew,
+            )
+            check(failed is ConversionBuildResult.Failure)
+            assertEquals(ConversionFailureCode.PACKAGE, failed.code)
+
+            val provisional = fixture.onlyIdentity()
+            assertEquals(
+                ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisional.lifecycleState,
+            )
+            assertEquals(analysis.token, provisional.provisionOwnerToken)
+            assertEquals(1, provisional.lastReservedVersionCode)
+            assertNull(fixture.identityDao.getLeaseByOwnerToken(analysis.token))
+            assertEquals(
+                setOf(requireNotNull(provisional.crxKeyAlias)),
+                fixture.newCrxAliases(),
+            )
+
+            val ready = fixture.build(
+                analysis,
+                InstallationIdentitySelection.CreateNew,
+            )
+            fixture.assertConvertedZipBundle(ready)
+
+            val active = fixture.onlyIdentity()
+            assertEquals(provisional.identitySha256, active.identitySha256)
+            assertEquals(provisional.crxKeyAlias, active.crxKeyAlias)
+            assertTrue(active.lastReservedVersionCode > provisional.lastReservedVersionCode)
+            assertEquals(ready.review.wrapperVersionCode, active.lastSuccessfulVersionCode)
+            assertEquals(
+                setOf(requireNotNull(active.crxKeyAlias)),
+                fixture.newCrxAliases(),
+            )
+            assertNull(fixture.identityDao.getLeaseByOwnerToken(analysis.token))
+            assertFalse(fixture.packager.outputFile(analysis.token).exists())
+
+            assertTrue(fixture.discardCurrent())
+            val next = fixture.begin()
+            val targets =
+                (next.identityRequirement as IdentityRequirement.UserSelectionRequired)
+                    .existingTargets
+            assertEquals(1, targets.size)
+            assertEquals(active.identitySha256, targets.single().identitySha256)
+        } finally {
+            fixture.close()
+        }
     }
 
     private fun runFullConversion(phase: String): FlowEvidence = runBlocking {
@@ -212,6 +317,211 @@ class OnDeviceConversionFlowInstrumentedTest {
             crxSha256 = extension.crxSha256,
         )
     }
+
+    private inner class MarkerlessFlowFixture(
+        sourceZip: ByteArray,
+        failFirstPackage: Boolean = false,
+    ) {
+        private val inputRoot = File(
+            context.filesDir,
+            "markerless-input/${java.util.UUID.randomUUID()}",
+        )
+        private val workRoot = File(
+            context.filesDir,
+            "markerless-work/${java.util.UUID.randomUUID()}",
+        )
+        private val importRoot = File(
+            context.cacheDir,
+            "markerless-import/${java.util.UUID.randomUUID()}",
+        )
+        private val initialCrxAliases = productionCrxAliases()
+        private var packageFailuresRemaining = if (failFirstPackage) 1 else 0
+        private var currentToken: String? = null
+
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ManagerDatabase::class.java,
+        ).allowMainThreadQueries().build()
+        val identityDao = database.conversionIdentityDao()
+        val packager = OnDeviceWrapperPackager(
+            context,
+            OnDevicePackagerTestHooks(
+                afterRequestValidated = {
+                    if (packageFailuresRemaining > 0) {
+                        packageFailuresRemaining -= 1
+                        throw IllegalArgumentException("injected package failure")
+                    }
+                },
+            ),
+        )
+        private val ledger = ConversionIdentityLedger(identityDao)
+        private val generatedStore = GeneratedBundleStore(context)
+        private val verifierRoot = File(context.cacheDir, "markerless-verifier").apply {
+            mkdirs()
+        }
+        private val verifier = AndroidWrapperVerifier(
+            AndroidArchiveInspector(context.packageManager),
+            File(verifierRoot, java.util.UUID.randomUUID().toString()),
+        )
+        private val importer = BundleImportService(
+            source = GeneratedBundleStoreSource(generatedStore),
+            verifier = verifier,
+            cacheDirectory = importRoot,
+        )
+        private val inputService = OnDeviceInputService(
+            privateRoot = inputRoot,
+            safInputOpener = SafInputOpener { ByteArrayInputStream(sourceZip) },
+        )
+        private val workStore = ConversionWorkStore(
+            privateRoot = workRoot,
+            dao = database.conversionJobDao(),
+            bundleVerifier = ConversionBundleVerifier { input ->
+                runCatching {
+                    SixBundleContract.read(input)
+                    true
+                }.getOrDefault(false)
+            },
+            identityOwnerLifecycle = ledger.ownerLifecycle(packager),
+        )
+        val coordinator = OnDeviceConversionCoordinator(
+            input = inputService,
+            work = DefaultConversionWorkPort(workStore),
+            profiles = ConversionProfilePort {
+                SamsungProfileSnapshot.Supported(testProfile())
+            },
+            runtime = DefaultConversionRuntime(),
+            identities = DefaultConversionIdentityPort(ledger, packager),
+            installed = ConversionInstalledPort { null },
+            packages = DefaultConversionPackagePort(ledger, packager),
+            bundles = DefaultConversionBundlePort(generatedStore),
+            imports = DefaultConversionGeneratedImportPort(
+                ConversionGeneratedImportPort { generated ->
+                    when (val imported = importer.importGenerated(generated)) {
+                        is ImportResult.Failure -> null
+                        is ImportResult.Success -> imported.value.toReview()
+                    }
+                },
+            ),
+        )
+
+        suspend fun begin(): ConversionBeginResult.AnalysisReady {
+            val result = coordinator.begin(
+                OnDeviceInputRequest.Saf(android.net.Uri.EMPTY),
+            )
+            check(result is ConversionBeginResult.AnalysisReady) {
+                "markerless ZIP 분석에 실패했습니다: $result"
+            }
+            currentToken = result.token
+            return result
+        }
+
+        suspend fun build(
+            analysis: ConversionBeginResult.AnalysisReady,
+            selection: InstallationIdentitySelection,
+        ): ConversionBuildResult.BundleReady {
+            val result = coordinator.build(
+                token = analysis.token,
+                approvedAdapterIds = analysis.requiredApprovals,
+                partialConfirmed = true,
+                identitySelection = selection,
+            )
+            check(result is ConversionBuildResult.BundleReady) {
+                "markerless ZIP bundle 생성에 실패했습니다: $result"
+            }
+            return result
+        }
+
+        suspend fun onlyIdentity(): ConversionIdentityEntity {
+            val rows = identityDao.listByModeAndProfile(
+                InstallationIdentityMode.CONVERTED.name,
+                testProfile().majorVersion,
+            )
+            assertEquals(1, rows.size)
+            return rows.single()
+        }
+
+        fun newCrxAliases(): Set<String> = productionCrxAliases() - initialCrxAliases
+
+        fun assertConvertedZipBundle(ready: ConversionBuildResult.BundleReady) {
+            val contents = ready.generated.file.inputStream().use(SixBundleContract::read)
+            assertEquals("ZIP", contents.extension.sourceKind)
+            assertEquals("converted", contents.compatibility.conversionState)
+            assertEquals(ready.review.extensionId, contents.extension.extensionId)
+            assertEquals(ready.review.wrapperVersionCode, contents.extension.wrapperVersionCode)
+        }
+
+        suspend fun discardCurrent(): Boolean {
+            val token = currentToken ?: return true
+            val discarded = coordinator.discard(token)
+            if (discarded) currentToken = null
+            return discarded
+        }
+
+        suspend fun close() {
+            runCatching { discardCurrent() }
+            val rows = runCatching {
+                identityDao.listByModeAndProfile(
+                    InstallationIdentityMode.CONVERTED.name,
+                    testProfile().majorVersion,
+                )
+            }.getOrDefault(emptyList())
+            rows.forEach { row ->
+                val alias = row.crxKeyAlias ?: return@forEach
+                runCatching {
+                    packager.deleteUnreservedIdentity(
+                        identitySha256 = row.identitySha256,
+                        expectedAlias = alias,
+                        expectedExtensionId = row.extensionId,
+                        expectedPublicKeySha256 = row.crxPublicKeySha256,
+                    )
+                }
+            }
+            database.close()
+            inputRoot.deleteRecursively()
+            workRoot.deleteRecursively()
+            importRoot.deleteRecursively()
+            assertEquals(initialCrxAliases, productionCrxAliases())
+        }
+    }
+
+    private fun markerlessSmartContextZip(): ByteArray {
+        val sourceRoot = Files.createTempDirectory(
+            context.cacheDir.toPath(),
+            "markerless-smart-context-",
+        )
+        return try {
+            listOf("manifest.json", "content.js").forEach { name ->
+                testContext.assets.open("$ASSET_DIRECTORY/$name").use { input ->
+                    Files.copy(input, sourceRoot.resolve(name))
+                }
+            }
+            ExtensionZip.createBytes(sourceRoot, includeProjectMarker = false)
+        } finally {
+            sourceRoot.toFile().deleteRecursively()
+        }
+    }
+
+    private fun productionCrxAliases(): Set<String> {
+        val aliases = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.aliases()
+        return buildSet {
+            while (aliases.hasMoreElements()) {
+                val alias = aliases.nextElement()
+                if (alias.startsWith("sixbridge.crx.rsa.v1.")) add(alias)
+            }
+        }
+    }
+
+    private fun testProfile() = BrowserProfile(
+        browserPackage = "com.sec.android.app.sbrowser",
+        versionName = BrowserProfile.BASELINE_VERSION,
+        versionCode = 1_300_261_502,
+        majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION,
+        supportedApis = BrowserProfile.POC_SUPPORTED_APIS,
+        wrapperContract = WrapperContract.complete(),
+        sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+        sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
+    )
 
     private fun smartContextZip(): ByteArray {
         val sourceRoot = Files.createTempDirectory(

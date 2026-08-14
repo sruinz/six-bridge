@@ -45,6 +45,36 @@ class DraftSignatureTest {
     }
 
     @Test
+    fun `malformed and non Ed25519 X509 public keys are rejected`() {
+        val entries = mapOf("draft.json" to "payload".encodeToByteArray())
+        val valid = DraftSignature.sign(
+            entries,
+            KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
+        )
+        val invalidKeys = listOf(
+            byteArrayOf(1, 2, 3),
+            KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
+                .generateKeyPair().public.encoded,
+        )
+
+        invalidKeys.forEach { publicKey ->
+            assertFails { DraftSignature.fingerprint(publicKey) }
+            assertFalse(
+                DraftSignature.verify(
+                    entries,
+                    DraftSignatureRecord.create(
+                        schemaVersion = DraftSignature.SCHEMA_VERSION,
+                        algorithm = DraftSignature.ALGORITHM,
+                        keyId = DraftSignature.sha256(publicKey),
+                        publicKey = publicKey,
+                        signature = valid.signature,
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
     fun `public API requires explicit trusted and key roots`() {
         val constructors = DraftSigningKeyStore::class.java.constructors.toList()
 

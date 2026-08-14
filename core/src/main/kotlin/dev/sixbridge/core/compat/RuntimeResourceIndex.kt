@@ -49,7 +49,7 @@ class RuntimeResourceIndex private constructor(
             root,
             manifest,
             control,
-            Files::readString,
+            { path -> Files.newBufferedReader(path, Charsets.UTF_8).use { it.readText() } },
             AnalysisBudgetLedger(control.policy),
         )
 
@@ -76,7 +76,7 @@ class RuntimeResourceIndex private constructor(
             root,
             manifest,
             control,
-            Files::readString,
+            { path -> Files.newBufferedReader(path, Charsets.UTF_8).use { it.readText() } },
             ledger,
             emitStage,
         )

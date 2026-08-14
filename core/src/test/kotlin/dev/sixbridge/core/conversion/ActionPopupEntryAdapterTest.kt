@@ -7,6 +7,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.nio.charset.CharacterCodingException
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createSymbolicLinkPointingTo
@@ -18,10 +19,26 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ActionPopupEntryAdapterTest {
+    @Test
+    fun `manifest strict writer는 lone surrogate를 대체 문자로 쓰지 않는다`() {
+        val output = Files.createTempFile("six-action-strict-utf8-", ".json")
+        try {
+            assertFailsWith<CharacterCodingException> {
+                writeManifestUtf8Strict(
+                    output,
+                    JsonObject(mapOf("description" to JsonPrimitive("\ud800"))),
+                )
+            }
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
     @Test
     fun `adds only options ui and deterministic provenance`() {
         val source = extension(worker = "background.js")

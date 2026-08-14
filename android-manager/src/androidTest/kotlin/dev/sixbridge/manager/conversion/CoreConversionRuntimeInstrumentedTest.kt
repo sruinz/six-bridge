@@ -30,14 +30,8 @@ import dev.sixbridge.manager.wrapper.AndroidWrapperVerifier
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.PreparedConversion
-import dev.sixbridge.core.draft.DraftConversionPlan
-import dev.sixbridge.core.draft.DraftInputMetadata
-import dev.sixbridge.core.draft.DraftMetadata
 import dev.sixbridge.core.draft.DraftReplayResult
-import dev.sixbridge.core.draft.DraftSelectedAdapter
-import dev.sixbridge.core.draft.DraftSourceKind
 import dev.sixbridge.core.draft.SixDraft
-import dev.sixbridge.core.draft.SixDraftPayload
 import dev.sixbridge.core.draft.SixDraftReplay
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.input.ExtensionZip
@@ -49,7 +43,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Proxy
 import java.nio.file.Files
-import java.security.KeyPairGenerator
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipEntry
@@ -835,9 +829,109 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
+    fun projectMarkerActionAndStorageAdaptersUseAndroidSafeUtf8Io() {
+        fun fixtureZip(prefix: String, files: Map<String, String>): ByteArray {
+            val root = Files.createTempDirectory(targetContext.cacheDir.toPath(), prefix)
+            return try {
+                files.forEach { (name, contents) ->
+                    val path = root.resolve(name)
+                    Files.createDirectories(requireNotNull(path.parent))
+                    Files.write(path, contents.encodeToByteArray())
+                }
+                Files.write(
+                    root.resolve(".sixbridge-project-id"),
+                    "sixbridge-project-v1:${"a".repeat(32)}\n".encodeToByteArray(),
+                )
+                ExtensionZip.createBytes(root, includeProjectMarker = true)
+            } finally {
+                root.toFile().deleteRecursively()
+            }
+        }
+
+        val actionInput = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            fixtureZip(
+                "sixbridge-action-utf8-",
+                mapOf(
+                    "manifest.json" to
+                        """{"manifest_version":3,"name":"Action","version":"1","permissions":["storage"],"host_permissions":["https://example.test/*"],"action":{"default_popup":"popup.html"},"content_scripts":[{"matches":["https://example.test/*"],"js":["content.js"]}]}""",
+                    "popup.html" to
+                        "<html><head></head><body><p>popup</p></body></html>",
+                    "content.js" to "console.log('content');",
+                ),
+            ),
+        )
+        val action = ConversionPreparationEngine().use {
+            assertTrue(
+                it.analyze(actionInput, profile()).adapterDecisions.any { decision ->
+                    decision.id == "action-popup-entry"
+                },
+            )
+            it.prepare(
+                actionInput,
+                profile(),
+                setOf("action-popup-entry"),
+            )
+        }
+        assertEquals(setOf("action-popup-entry"), action.appliedAdapterIds)
+
+        val loneSurrogateInput = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            fixtureZip(
+                "sixbridge-action-surrogate-",
+                mapOf(
+                    "manifest.json" to
+                        """{"manifest_version":3,"name":"Action","version":"1","description":"\ud800","action":{"default_popup":"popup.html"},"content_scripts":[{"matches":["https://example.test/*"],"js":["content.js"]}]}""",
+                    "popup.html" to
+                        "<html><head></head><body><p>popup</p></body></html>",
+                    "content.js" to "console.log('content');",
+                ),
+            ),
+        )
+        assertThrows(
+            dev.sixbridge.core.conversion.ConversionExecutionException::class.java,
+        ) {
+            ConversionPreparationEngine().use {
+                it.prepare(
+                    loneSurrogateInput,
+                    profile(),
+                    setOf("action-popup-entry"),
+                )
+            }
+        }
+
+        val storage = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    ExtensionInputKind.ZIP,
+                    fixtureZip(
+                        "sixbridge-storage-utf8-",
+                        mapOf(
+                            "manifest.json" to
+                                """{"manifest_version":3,"name":"Storage","version":"1","permissions":["storage"],"content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+                            "content.js" to "chrome.storage.sync.get('key');",
+                        ),
+                    ),
+                ),
+                profile().copy(
+                    supportedFeatures = setOf("storage.local"),
+                    unavailableFeatures = setOf("storage.sync"),
+                ),
+                emptySet(),
+            )
+        }
+        assertEquals(setOf("storage-fallback"), storage.appliedAdapterIds)
+    }
+
+    @Test
     fun portableDraftReplayMatchesDirectAndroidPreparationForBothAdapters() {
-        val sourceIdentity = "project:${"e".repeat(32)}"
-        val source = platformFixtureZip(includeInternalUrls = true)
+        val draft = SixDraft.read(
+            testContext.assets.open(
+                "popup-autofill-internal-url-platform.sixdraft",
+            ).use { it.readBytes() },
+        )
+        val sourceIdentity = requireNotNull(draft.payload.draft.sourceIdentity)
+        val source = draft.payload.source
         val profile = internalUrlProfile()
         val approvals = setOf("popup-native-autofill-guard")
         val direct = ConversionPreparationEngine().use {
@@ -851,37 +945,6 @@ class CoreConversionRuntimeInstrumentedTest {
                 approvals,
             )
         }
-        val selected = direct.compatibilityAfter.adapterDecisions
-            .filter { it.applied }
-            .map { DraftSelectedAdapter(it.id, it.version) }
-        val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV2(
-                coreVersion = "android-platform-parity",
-                adapterVersions = selected.associate { it.id to it.version },
-                sourceIdentity = sourceIdentity,
-            ),
-            input = DraftInputMetadata(
-                inputKind = ExtensionInputKind.ZIP,
-                originalSourceSha256 = direct.originalSourceSha256,
-                browserProfileSha256 = direct.browserProfileSha256,
-                originalExtensionId = direct.originalExtensionId,
-                originalExtensionVersion = requireNotNull(
-                    direct.compatibilityBefore.extensionVersion,
-                ),
-                sourceIdentity = sourceIdentity,
-            ),
-            sourceKind = DraftSourceKind.ZIP,
-            source = source,
-            plan = DraftConversionPlan.create(direct.compatibilityBefore, selected),
-            compatibilityBefore = direct.compatibilityBefore,
-            compatibilityAfter = direct.compatibilityAfter,
-        )
-        val draft = SixDraft.read(
-            SixDraft.createBytes(
-                payload,
-                KeyPairGenerator.getInstance("Ed25519").generateKeyPair(),
-            ),
-        )
         val replayed = (SixDraftReplay().replay(
             draft = draft,
             profile = profile,
@@ -957,7 +1020,7 @@ class CoreConversionRuntimeInstrumentedTest {
     }
 
     @Test
-    fun originalPopupChoiceIsNoOpOnAndroid() {
+    fun zeroAdapterZipDraftPackagesPassthroughBundle() {
         val draftFile = File(targetContext.cacheDir, "popup-autofill-original.sixdraft")
         testContext.assets.open("popup-autofill-original.sixdraft").use { input ->
             draftFile.outputStream().use(input::copyTo)
@@ -994,8 +1057,16 @@ class CoreConversionRuntimeInstrumentedTest {
             ConversionState.PASSTHROUGH,
             replayedPrepared.compatibilityAfter.conversionState,
         )
+        assertEquals(InstallationIdentityMode.CONVERTED, replayed.identityMode)
+        assertEquals("ZIP", replayed.sourceKind)
         assertTrue(verified.payload.plan.selectedAdapters.isEmpty())
         assertTrue(replayedPrepared.appliedAdapterIds.isEmpty())
+
+        packageDraftThroughDefaultPorts(
+            draftFile = draftFile,
+            profile = profile(),
+            expectedConversionState = "passthrough",
+        )
     }
 
     @Test
@@ -1031,74 +1102,35 @@ class CoreConversionRuntimeInstrumentedTest {
 
     @Test
     fun schemaV2Ed25519DraftReadAndReplayOnAndroid() {
-        val sourceIdentity = "project:${"1".repeat(32)}"
-        val source = canonicalAssetZip("ondevice-conversion")
-        val profile = profile()
-        val prepared = ConversionPreparationEngine().use {
-            it.prepare(
-                PortableExtensionInput.fromZip(
-                    kind = ExtensionInputKind.ZIP,
-                    zipBytes = source,
-                    signedDraftSourceIdentity = sourceIdentity,
-                ),
-                profile,
-                emptySet(),
-            )
-        }
-        assertEquals(sha256(source), prepared.originalSourceSha256)
-        val selected = prepared.compatibilityAfter.adapterDecisions
-            .filter { it.applied }
-            .map { DraftSelectedAdapter(it.id, it.version) }
-        val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV2(
-                coreVersion = "android-runtime-gate",
-                adapterVersions = selected.associate { it.id to it.version },
-                sourceIdentity = sourceIdentity,
-            ),
-            input = DraftInputMetadata(
-                inputKind = ExtensionInputKind.ZIP,
-                originalSourceSha256 = prepared.originalSourceSha256,
-                browserProfileSha256 = prepared.browserProfileSha256,
-                originalExtensionId = prepared.originalExtensionId,
-                originalExtensionVersion = requireNotNull(
-                    prepared.compatibilityBefore.extensionVersion,
-                ),
-                sourceIdentity = sourceIdentity,
-            ),
-            sourceKind = DraftSourceKind.ZIP,
-            source = source,
-            plan = DraftConversionPlan.create(
-                prepared.compatibilityBefore,
-                selected,
-            ),
-            compatibilityBefore = prepared.compatibilityBefore,
-            compatibilityAfter = prepared.compatibilityAfter,
-        )
-        val signingKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
-        val verified = SixDraft.read(SixDraft.createBytes(payload, signingKey))
+        val draftBytes = testContext.assets.open(
+            "popup-autofill-internal-url-platform.sixdraft",
+        ).use { it.readBytes() }
+        val verified = SixDraft.read(draftBytes)
+        val profile = internalUrlProfile()
+        val approvals = setOf("popup-native-autofill-guard")
         val replay = SixDraftReplay().replay(
             draft = verified,
             profile = profile,
-            approvedAdapterIds = emptySet(),
+            approvedAdapterIds = approvals,
         )
         assertTrue(replay is DraftReplayResult.Ready)
         val replayed = (replay as DraftReplayResult.Ready).prepared
 
         assertEquals(2, verified.payload.draft.schemaVersion)
-        assertArrayEquals(signingKey.public.encoded, verified.signerPublicKey)
-        assertEquals(sha256(signingKey.public.encoded), verified.signerFingerprint)
+        assertTrue(verified.signerPublicKey.isNotEmpty())
+        assertEquals(sha256(verified.signerPublicKey), verified.signerFingerprint)
         assertEquals(
             verified.payload.expected.transformedSourceSha256,
             replayed.transformedSourceSha256,
         )
         assertEquals(verified.payload.expected.planSha256, replayed.planSha256)
         assertEquals(
-            setOf("desktop-selection-event-bridge"),
+            setOf("browser-internal-url-mapper", "popup-native-autofill-guard"),
             replayed.appliedAdapterIds,
         )
 
         val draftFile = File(targetContext.cacheDir, "runtime-profile-change.six")
-        draftFile.writeBytes(SixDraft.createBytes(payload, signingKey))
+        draftFile.writeBytes(draftBytes)
         try {
             val runtime = DefaultConversionRuntime()
             val same = runtime.analyze(
@@ -1113,7 +1145,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 draftFile,
                 OnDeviceInputKind.SIX_DRAFT,
                 profile,
-                same.requiredApprovals,
+                approvals,
             )
             assertEquals("ZIP", samePrepared.sourceKind)
             assertEquals(
@@ -1138,7 +1170,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 draftFile,
                 OnDeviceInputKind.SIX_DRAFT,
                 changedProfile,
-                changed.requiredApprovals,
+                approvals,
             )
             assertEquals(
                 changedProfile.canonicalSha256(),
@@ -1153,6 +1185,7 @@ class CoreConversionRuntimeInstrumentedTest {
             packageDraftThroughDefaultPorts(
                 draftFile = draftFile,
                 profile = profile,
+                approvedAdapterIds = approvals,
             )
         } finally {
             draftFile.delete()
@@ -1164,7 +1197,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 "signerFingerprint=${verified.signerFingerprint} " +
                 "sourceSha256=${replayed.transformedSourceSha256} " +
                 "planSha256=${replayed.planSha256} " +
-                "adapter=${replayed.appliedAdapterIds.single()}",
+                "adapters=${replayed.appliedAdapterIds.sorted().joinToString(",")}",
         )
     }
 
@@ -1182,73 +1215,6 @@ class CoreConversionRuntimeInstrumentedTest {
             output.toByteArray()
         }
 
-    private fun platformFixtureZip(includeInternalUrls: Boolean): ByteArray {
-        val cacheRoot = targetContext.cacheDir.toPath()
-        Files.createDirectories(cacheRoot)
-        val root = Files.createTempDirectory(cacheRoot, "sixbridge-platform-parity-")
-        return try {
-            Files.write(
-                root.resolve("manifest.json"),
-                """
-                {
-                  "manifest_version": 3,
-                  "name": "Android Platform Fixture",
-                  "version": "1",
-                  "action": { "default_popup": "popup.html" },
-                  "options_ui": { "page": "options.html", "open_in_tab": true }
-                }
-                """.trimIndent().encodeToByteArray(),
-            )
-            val link = if (includeInternalUrls) {
-                "<a href=\"chrome://extensions\">add-ons</a>"
-            } else {
-                ""
-            }
-            Files.write(
-                root.resolve("popup.html"),
-                (
-                    "<!doctype html><html><head><script src=\"popup.js\"></script></head>" +
-                        "<body><input type=\"email\">$link</body></html>"
-                    ).encodeToByteArray(),
-            )
-            Files.write(
-                root.resolve("popup.js"),
-                (if (includeInternalUrls) {
-                    "const addOns = 'edge://extensions/';"
-                } else {
-                    "const ready = true;"
-                }).encodeToByteArray(),
-            )
-            Files.write(
-                root.resolve("options.html"),
-                "<!doctype html><html><head></head><body>options</body></html>"
-                    .encodeToByteArray(),
-            )
-            ExtensionZip.createBytes(root, includeProjectMarker = true)
-        } finally {
-            root.toFile().deleteRecursively()
-        }
-    }
-
-    private fun canonicalAssetZip(directory: String): ByteArray {
-        val cacheRoot = targetContext.cacheDir.toPath()
-        Files.createDirectories(cacheRoot)
-        val root = Files.createTempDirectory(
-            cacheRoot,
-            "sixbridge-draft-source-",
-        )
-        return try {
-            listOf("content.js", "manifest.json").forEach { name ->
-                testContext.assets.open("$directory/$name").use { input ->
-                    Files.copy(input, root.resolve(name))
-                }
-            }
-            ExtensionZip.createBytes(root, includeProjectMarker = true)
-        } finally {
-            root.toFile().deleteRecursively()
-        }
-    }
-
     private fun reportMarker(marker: String) {
         println(marker)
         InstrumentationRegistry.getInstrumentation().sendStatus(
@@ -1260,6 +1226,8 @@ class CoreConversionRuntimeInstrumentedTest {
     private fun packageDraftThroughDefaultPorts(
         draftFile: File,
         profile: BrowserProfile,
+        expectedConversionState: String? = null,
+        approvedAdapterIds: Set<String>? = null,
     ) {
         val database = Room.inMemoryDatabaseBuilder(
             targetContext,
@@ -1281,8 +1249,22 @@ class CoreConversionRuntimeInstrumentedTest {
             targetContext.cacheDir,
             "draft-package-import/${UUID.randomUUID()}",
         )
+        val initialCrxAliases = productionCrxAliases()
         val packager = OnDeviceWrapperPackager(targetContext)
-        val ledger = ConversionIdentityLedger(database.conversionIdentityDao())
+        var conversionToken: String? = null
+        var committedCleanupLeaseState: String? = null
+        val ledger = ConversionIdentityLedger(
+            dao = database.conversionIdentityDao(),
+            hooks = ConversionIdentityLedgerHooks(
+                afterBundleReadyCommit = {
+                    committedCleanupLeaseState = kotlinx.coroutines.runBlocking {
+                        database.conversionIdentityDao()
+                            .getLeaseByOwnerToken(requireNotNull(conversionToken))
+                            ?.state
+                    }
+                },
+            ),
+        )
         val generatedStore = GeneratedBundleStore(targetContext)
         var failBeforeBundlePublish = true
         var failAfterBundleTransition = true
@@ -1363,7 +1345,6 @@ class CoreConversionRuntimeInstrumentedTest {
                 }
             },
         )
-        var conversionToken: String? = null
         try {
             kotlinx.coroutines.runBlocking {
                 val firstCoordinator = coordinator()
@@ -1374,9 +1355,10 @@ class CoreConversionRuntimeInstrumentedTest {
                 )
                 check(analysis is ConversionBeginResult.AnalysisReady)
                 conversionToken = analysis.token
+                val approvals = approvedAdapterIds ?: analysis.requiredApprovals
                 val importFailed = firstCoordinator.build(
                     token = analysis.token,
-                    approvedAdapterIds = analysis.requiredApprovals,
+                    approvedAdapterIds = approvals,
                     partialConfirmed = true,
                     identitySelection = null,
                 )
@@ -1405,7 +1387,7 @@ class CoreConversionRuntimeInstrumentedTest {
 
                 val rebuilt = firstCoordinator.build(
                     token = analysis.token,
-                    approvedAdapterIds = analysis.requiredApprovals,
+                    approvedAdapterIds = approvals,
                     partialConfirmed = true,
                     identitySelection = null,
                 )
@@ -1420,7 +1402,7 @@ class CoreConversionRuntimeInstrumentedTest {
                     runCatching {
                         coordinator().build(
                             token = analysis.token,
-                            approvedAdapterIds = analysis.requiredApprovals,
+                            approvedAdapterIds = approvals,
                             partialConfirmed = true,
                             identitySelection = null,
                         )
@@ -1430,15 +1412,18 @@ class CoreConversionRuntimeInstrumentedTest {
                     ConversionJobStage.BUILDING.name,
                     requireNotNull(database.conversionJobDao().get()).stage,
                 )
-                assertNull(
-                    database.conversionIdentityDao().getLeaseByOwnerToken(analysis.token),
+                assertTrue(
+                    requireNotNull(
+                        database.conversionIdentityDao()
+                            .getLeaseByOwnerToken(analysis.token),
+                    ).state.startsWith("PACKAGED:"),
                 )
 
                 assertTrue(
                     runCatching {
                         coordinator().build(
                             token = analysis.token,
-                            approvedAdapterIds = analysis.requiredApprovals,
+                            approvedAdapterIds = approvals,
                             partialConfirmed = true,
                             identitySelection = null,
                         )
@@ -1447,6 +1432,12 @@ class CoreConversionRuntimeInstrumentedTest {
                 assertEquals(
                     ConversionJobStage.BUNDLE_READY.name,
                     requireNotNull(database.conversionJobDao().get()).stage,
+                )
+                assertTrue(
+                    requireNotNull(
+                        database.conversionIdentityDao()
+                            .getLeaseByOwnerToken(analysis.token),
+                    ).state.startsWith("PACKAGED:"),
                 )
                 val restored = coordinator().restore()
                 check(restored is RestoredConversion.BundleReady)
@@ -1462,6 +1453,7 @@ class CoreConversionRuntimeInstrumentedTest {
                 assertNull(
                     database.conversionIdentityDao().getLeaseByOwnerToken(analysis.token),
                 )
+                assertTrue(requireNotNull(committedCleanupLeaseState).startsWith("CLEANING_COMMITTED:"))
                 assertFalse(
                     File(
                         targetContext.filesDir,
@@ -1472,6 +1464,17 @@ class CoreConversionRuntimeInstrumentedTest {
                 val contents =
                     ready.generated.file.inputStream().use(SixBundleContract::read)
                 assertEquals("ZIP", contents.extension.sourceKind)
+                expectedConversionState?.let {
+                    assertEquals(it, contents.compatibility.conversionState)
+                }
+                assertEquals(
+                    1,
+                    database.conversionIdentityDao()
+                        .listByModeAndProfile(
+                            InstallationIdentityMode.CONVERTED.name,
+                            profile.majorVersion,
+                        ).size,
+                )
                 assertTrue(
                     File(
                         workRoot,
@@ -1483,15 +1486,42 @@ class CoreConversionRuntimeInstrumentedTest {
                 assertTrue(requireNotNull(retainedReview).wrapperFile.isFile)
             }
         } finally {
-            kotlinx.coroutines.runBlocking {
+            val identities = kotlinx.coroutines.runBlocking {
                 conversionToken?.let {
                     runCatching { coordinator().discard(it) }
+                }
+                database.conversionIdentityDao().listByModeAndProfile(
+                    InstallationIdentityMode.CONVERTED.name,
+                    profile.majorVersion,
+                )
+            }
+            identities.forEach { identity ->
+                identity.crxKeyAlias?.let { alias ->
+                    assertTrue(
+                        packager.deleteUnreservedIdentity(
+                            identitySha256 = identity.identitySha256,
+                            expectedAlias = alias,
+                            expectedExtensionId = identity.extensionId,
+                            expectedPublicKeySha256 = identity.crxPublicKeySha256,
+                        ),
+                    )
                 }
             }
             database.close()
             input.parentFile?.deleteRecursively()
             workRoot.deleteRecursively()
             importCache.deleteRecursively()
+            assertEquals(initialCrxAliases, productionCrxAliases())
+        }
+    }
+
+    private fun productionCrxAliases(): Set<String> {
+        val aliases = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.aliases()
+        return buildSet {
+            while (aliases.hasMoreElements()) {
+                val alias = aliases.nextElement()
+                if (alias.startsWith("sixbridge.crx.rsa.v1.")) add(alias)
+            }
         }
     }
 

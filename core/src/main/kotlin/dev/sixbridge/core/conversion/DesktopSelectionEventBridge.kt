@@ -55,7 +55,7 @@ internal class DesktopSelectionEventBridge : MobileAdapter {
         installAsset(assetDestination, assetBytes)
         if (changed) {
             val updatedManifest = JsonObject(manifest + (CONTENT_SCRIPTS to updatedContentScripts))
-            Files.writeString(manifestPath, updatedManifest.toString())
+            writeManifestUtf8Strict(manifestPath, updatedManifest)
         }
         return decision.copy(applied = true)
     }

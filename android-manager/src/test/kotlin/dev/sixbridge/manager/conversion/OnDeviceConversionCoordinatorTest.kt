@@ -749,6 +749,47 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `package domain 실패 후 같은 job 재시도는 version을 재사용하지 않는다`() =
+        runTest {
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                packageFailure = ConversionPackageException(
+                    IllegalArgumentException("injected package failure"),
+                )
+            }
+            val coordinator = fixture.coordinator()
+            val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                coordinator.begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            val failed = assertIs<ConversionBuildResult.Failure>(
+                coordinator.build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    true,
+                    null,
+                ),
+            )
+            assertEquals(ConversionFailureCode.PACKAGE, failed.code)
+            assertEquals(listOf(1), fixture.reservedVersionCodes)
+
+            fixture.packageFailure = null
+            assertIs<ConversionBuildResult.BundleReady>(
+                coordinator.build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    true,
+                    null,
+                ),
+            )
+
+            assertEquals(listOf(1, 2), fixture.reservedVersionCodes)
+            assertEquals(2, fixture.events.count { it == "reserve" })
+            assertEquals(2, fixture.events.count { it == "package" })
+        }
+
+    @Test
     fun `blocked와 미확인 partial은 reserve 전에 차단한다`() = runTest {
         val blocked = Fixture(temporaryFolder, mutableListOf()).apply {
             compatibilityStatus = CompatibilityStatus.BLOCKED

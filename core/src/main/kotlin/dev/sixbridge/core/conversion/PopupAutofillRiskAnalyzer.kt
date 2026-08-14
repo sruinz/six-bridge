@@ -94,7 +94,7 @@ internal class PopupAutofillRiskAnalyzer {
             return unavailableRisk(popupPath ?: declaredPopup)
         }
         val source = try {
-            Files.readString(root.resolve(popupPath))
+            Files.newBufferedReader(root.resolve(popupPath), UTF_8).use { it.readText() }
         } catch (error: java.util.concurrent.CancellationException) {
             throw error
         } catch (_: Exception) {
@@ -225,7 +225,9 @@ internal class PopupAutofillRiskAnalyzer {
         }
         val marker = root.resolve(PopupNativeAutofillGuardContract.MARKER_PATH)
         if (!Files.isRegularFile(marker, NOFOLLOW_LINKS)) return null
-        val json = Json.parseToJsonElement(Files.readString(marker, UTF_8)) as? JsonObject
+        val json = Json.parseToJsonElement(
+            Files.newBufferedReader(marker, UTF_8).use { it.readText() },
+        ) as? JsonObject
             ?: return null
         val markerVersion = json["version"] as? JsonPrimitive
         if (json.keys != MARKER_KEYS ||

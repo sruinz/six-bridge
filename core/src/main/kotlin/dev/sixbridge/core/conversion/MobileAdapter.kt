@@ -1,6 +1,9 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.profile.BrowserProfile
+import kotlinx.serialization.json.JsonObject
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
 import java.nio.file.Path
 
 internal interface MobileAdapter {
@@ -44,3 +47,9 @@ internal fun SelectedAdapter.toDecision(): AdapterDecision = AdapterDecision(
     changes = changes,
     remainingLimitations = remainingLimitations,
 )
+
+internal fun writeManifestUtf8Strict(path: Path, manifest: JsonObject) {
+    Files.newBufferedWriter(path, UTF_8).use { writer ->
+        writer.write(manifest.toString())
+    }
+}

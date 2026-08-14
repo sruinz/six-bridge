@@ -296,7 +296,7 @@ class MobilePatternAnalyzer private constructor(
             if (extension !in INTERNAL_URL_TEXT_EXTENSIONS) return@forEach
             val relativePath = root.relativize(resource.toAbsolutePath().normalize())
                 .joinToString("/") { it.toString() }
-            val source = Files.readString(resource)
+            val source = Files.newBufferedReader(resource, Charsets.UTF_8).use { it.readText() }
             val candidates = when (extension) {
                 "html" -> SafeHtmlDocument.parse(source, control::checkCancelled)
                     .urlAttributes

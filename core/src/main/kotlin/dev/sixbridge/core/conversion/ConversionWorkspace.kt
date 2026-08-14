@@ -637,7 +637,7 @@ class ConversionWorkspace private constructor(
             check(
                 Files.isRegularFile(marker, NOFOLLOW_LINKS) &&
                     !Files.isSymbolicLink(marker) &&
-                    Files.readString(marker) ==
+                    Files.newBufferedReader(marker, Charsets.UTF_8).use { it.readText() } ==
                     markerContent(ACTIVE, record.token),
             ) {
                 "conversion workspace ownership marker가 다릅니다."
@@ -666,9 +666,9 @@ class ConversionWorkspace private constructor(
 
         private fun writeNewMarker(root: Path, token: String) {
             val marker = markerPath(root)
-            Files.writeString(
+            Files.write(
                 marker,
-                markerContent(ACTIVE, token),
+                markerContent(ACTIVE, token).toByteArray(Charsets.UTF_8),
                 CREATE_NEW,
                 WRITE,
                 NOFOLLOW_LINKS,

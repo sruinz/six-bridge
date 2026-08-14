@@ -1,11 +1,10 @@
 package dev.sixbridge.core.draft
 
+import com.google.crypto.tink.subtle.Ed25519Verify
 import java.io.ByteArrayOutputStream
-import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.security.Signature
-import java.security.spec.X509EncodedKeySpec
 
 class DraftSignatureRecord private constructor(
     val schemaVersion: Int,
@@ -114,22 +113,17 @@ object DraftSignature {
             return false
         }
         val publicKeyBytes = record.publicKey
-        if (record.keyId != fingerprint(publicKeyBytes)) return false
-        val publicKey = try {
-            KeyFactory.getInstance(ALGORITHM)
-                .generatePublic(X509EncodedKeySpec(publicKeyBytes))
+        if (record.keyId != sha256(publicKeyBytes)) return false
+        val rawPublicKey = try {
+            rawEd25519PublicKey(publicKeyBytes)
         } catch (_: Exception) {
             return false
         }
-        return try {
-            Signature.getInstance(ALGORITHM).run {
-                initVerify(publicKey)
-                update(canonicalPayload(entries))
-                verify(record.signature)
-            }
-        } catch (_: Exception) {
-            false
-        }
+        return verifyEd25519Signature(
+            rawPublicKey,
+            canonicalPayload(entries),
+            record.signature,
+        )
     }
 
     internal fun verifyDigests(
@@ -143,22 +137,17 @@ object DraftSignature {
             return false
         }
         val publicKeyBytes = record.publicKey
-        if (record.keyId != fingerprint(publicKeyBytes)) return false
-        val publicKey = try {
-            KeyFactory.getInstance(ALGORITHM)
-                .generatePublic(X509EncodedKeySpec(publicKeyBytes))
+        if (record.keyId != sha256(publicKeyBytes)) return false
+        val rawPublicKey = try {
+            rawEd25519PublicKey(publicKeyBytes)
         } catch (_: Exception) {
             return false
         }
-        return try {
-            Signature.getInstance(ALGORITHM).run {
-                initVerify(publicKey)
-                update(canonicalDigestPayload(entries))
-                verify(record.signature)
-            }
-        } catch (_: Exception) {
-            false
-        }
+        return verifyEd25519Signature(
+            rawPublicKey,
+            canonicalDigestPayload(entries),
+            record.signature,
+        )
     }
 
     fun fingerprint(publicKey: ByteArray): String {
@@ -173,14 +162,35 @@ object DraftSignature {
 
     private fun validateEd25519PublicKey(publicKey: ByteArray) {
         try {
-            KeyFactory.getInstance(ALGORITHM)
-                .generatePublic(X509EncodedKeySpec(publicKey))
+            rawEd25519PublicKey(publicKey)
         } catch (error: Exception) {
             throw IllegalArgumentException(
                 "SixDraft signer 공개 키가 Ed25519 X.509 형식이 아닙니다.",
                 error,
             )
         }
+    }
+
+    private fun rawEd25519PublicKey(encoded: ByteArray): ByteArray {
+        require(
+            encoded.size == ED25519_X509_PREFIX.size + ED25519_PUBLIC_KEY_SIZE &&
+                encoded.copyOfRange(0, ED25519_X509_PREFIX.size)
+                    .contentEquals(ED25519_X509_PREFIX),
+        ) {
+            "공개 키의 X.509 AlgorithmIdentifier가 Ed25519가 아닙니다."
+        }
+        return encoded.copyOfRange(ED25519_X509_PREFIX.size, encoded.size)
+    }
+
+    private fun verifyEd25519Signature(
+        rawPublicKey: ByteArray,
+        payload: ByteArray,
+        signature: ByteArray,
+    ): Boolean = try {
+        Ed25519Verify(rawPublicKey).verify(signature, payload)
+        true
+    } catch (_: Exception) {
+        false
     }
 
     private fun isCanonicalEntryName(name: String): Boolean =
@@ -214,4 +224,19 @@ object DraftSignature {
     }
 
     private val SHA256 = Regex("[0-9a-f]{64}")
+    private val ED25519_X509_PREFIX = byteArrayOf(
+        0x30,
+        0x2a,
+        0x30,
+        0x05,
+        0x06,
+        0x03,
+        0x2b,
+        0x65,
+        0x70,
+        0x03,
+        0x21,
+        0x00,
+    )
+    private const val ED25519_PUBLIC_KEY_SIZE = 32
 }

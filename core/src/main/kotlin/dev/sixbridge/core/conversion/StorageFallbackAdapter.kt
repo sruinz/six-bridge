@@ -112,12 +112,14 @@ internal class StorageFallbackAdapter : MobileAdapter {
             decision.copy(applied = true, changes = emptyList())
         } else {
             plans.forEach { plan ->
-                Files.writeString(
+                Files.write(
                     plan.stagedPath,
-                    plan.convertedSource,
-                    UTF_8,
+                    plan.convertedSource.toByteArray(UTF_8),
                 )
-                check(Files.readString(plan.stagedPath, UTF_8) == plan.convertedSource) {
+                check(
+                    Files.newBufferedReader(plan.stagedPath, UTF_8).use { it.readText() } ==
+                        plan.convertedSource,
+                ) {
                     "storage target 변환 결과 검증에 실패했습니다."
                 }
             }
@@ -159,7 +161,7 @@ internal class StorageFallbackAdapter : MobileAdapter {
                 "인라인 runtime script는 storage fallback으로 변환할 수 없습니다."
             }
             val originalPath = verifiedFile(originalRoot, relativePath)
-            val originalSource = Files.readString(originalPath, UTF_8)
+            val originalSource = Files.newBufferedReader(originalPath, UTF_8).use { it.readText() }
             check(scripts.all { it.source == originalSource }) {
                 "immutable runtime 색인과 target bytes가 다릅니다."
             }
@@ -175,10 +177,10 @@ internal class StorageFallbackAdapter : MobileAdapter {
                 relativePath = relativePath,
                 originalSource = originalSource,
                 convertedSource = rewrite.source,
-                currentSource = Files.readString(
+                currentSource = Files.newBufferedReader(
                     verifiedFile(stagedRoot, relativePath),
                     UTF_8,
-                ),
+                ).use { it.readText() },
                 stagedPath = verifiedFile(stagedRoot, relativePath),
                 replacements = rewrite.replacements,
             )
@@ -286,7 +288,9 @@ internal class StorageFallbackAdapter : MobileAdapter {
     private fun manifest(root: Path): JsonObject {
         val path = verifiedFile(root, MANIFEST)
         return runCatching {
-            Json.parseToJsonElement(Files.readString(path, UTF_8)) as? JsonObject
+            Json.parseToJsonElement(
+                Files.newBufferedReader(path, UTF_8).use { it.readText() },
+            ) as? JsonObject
         }.getOrNull() ?: throw IllegalStateException("manifest.json을 해석할 수 없습니다.")
     }
 

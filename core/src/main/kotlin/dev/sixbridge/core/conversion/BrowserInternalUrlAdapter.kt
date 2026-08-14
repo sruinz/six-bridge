@@ -100,7 +100,7 @@ internal class BrowserInternalUrlAdapter : MobileAdapter {
             .toSortedMap()
             .forEach { (relativePath, pathOccurrences) ->
                 val path = BrowserInternalUrlProof.verifiedFile(root, relativePath)
-                var source = Files.readString(path, UTF_8)
+                var source = Files.newBufferedReader(path, UTF_8).use { it.readText() }
                 pathOccurrences.sortedByDescending { it.contentRange.first }
                     .forEach { occurrence ->
                         val rule = requireNotNull(
@@ -117,7 +117,7 @@ internal class BrowserInternalUrlAdapter : MobileAdapter {
                             rule.replacement,
                         )
                     }
-                Files.writeString(path, source, UTF_8)
+                Files.write(path, source.toByteArray(UTF_8))
             }
         assets.forEach { BrowserInternalUrlProof.install(root, it) }
         BrowserInternalUrlProof.install(
@@ -227,7 +227,8 @@ internal object BrowserInternalUrlProof {
 
     fun runtimeIndex(root: Path): RuntimeResourceIndex {
         val manifest = Json.parseToJsonElement(
-            Files.readString(verifiedFile(root, "manifest.json"), UTF_8),
+            Files.newBufferedReader(verifiedFile(root, "manifest.json"), UTF_8)
+                .use { it.readText() },
         ) as JsonObject
         return RuntimeResourceIndex.create(root, manifest)
     }
@@ -237,7 +238,7 @@ internal object BrowserInternalUrlProof {
             val extension = resource.extension.lowercase()
             if (extension !in SCANNED_EXTENSIONS) return@flatMap emptyList()
             val relativePath = relativePath(root, resource)
-            val source = Files.readString(resource, UTF_8)
+            val source = Files.newBufferedReader(resource, UTF_8).use { it.readText() }
             when (extension) {
                 "html" -> SafeHtmlDocument.parse(source) {}.urlAttributes.map {
                     BrowserInternalUrlOccurrence(
@@ -268,7 +269,9 @@ internal object BrowserInternalUrlProof {
     ): List<BrowserInternalUrlMarkerSpan>? = runCatching {
         val marker = root.resolve(MARKER_PATH)
         if (!Files.isRegularFile(marker, NOFOLLOW_LINKS)) return null
-        val json = Json.parseToJsonElement(Files.readString(marker, UTF_8)) as JsonObject
+        val json = Json.parseToJsonElement(
+            Files.newBufferedReader(marker, UTF_8).use { it.readText() },
+        ) as JsonObject
         val version = json["version"] as? JsonPrimitive
         val array = json["spans"] as? JsonArray
         if (json.keys != setOf("adapter", "version", "spans") ||

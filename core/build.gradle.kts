@@ -13,6 +13,7 @@ kotlin {
 
 dependencies {
     implementation(project(":bundle-contract"))
+    implementation("com.google.crypto.tink:tink:1.23.0")
     implementation("org.apache.commons:commons-compress:1.28.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 

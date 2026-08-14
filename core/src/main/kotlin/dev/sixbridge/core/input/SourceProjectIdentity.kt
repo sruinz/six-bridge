@@ -296,7 +296,9 @@ class SourceProjectIdentityStore(
                     "source project identity marker는 owner만 수정할 수 있어야 합니다: $path"
                 }
             }
-            val value = Files.readString(path).trim()
+            val value = Files.newBufferedReader(path, StandardCharsets.UTF_8)
+                .use { it.readText() }
+                .trim()
             val match = MARKER_FORMAT.matchEntire(value)
                 ?: throw IllegalArgumentException(
                     "source project identity marker 형식이 올바르지 않습니다.",

@@ -26,7 +26,7 @@ internal class PopupNativeAutofillGuardAdapter : MobileAdapter {
         val root = context.stagedRoot
         val popupPath = PopupAutofillProof.parse(selected.evidence).popupPath
         val popup = verifiedFile(root, popupPath)
-        val current = Files.readString(popup, UTF_8)
+        val current = Files.newBufferedReader(popup, UTF_8).use { it.readText() }
         val assetBytes = PopupNativeAutofillGuardContract.assetBytes()
         val proof = PopupAutofillProof.fromApplied(
             popupPath,
@@ -82,7 +82,7 @@ internal class PopupNativeAutofillGuardAdapter : MobileAdapter {
             PopupNativeAutofillGuardContract.ASSET_PATH,
             assetBytes,
         )
-        Files.writeString(popup, transformed, UTF_8)
+        Files.write(popup, transformed.toByteArray(UTF_8))
         writeMarker(root, proof)
         return applied(decision, popupPath, proof)
     }
