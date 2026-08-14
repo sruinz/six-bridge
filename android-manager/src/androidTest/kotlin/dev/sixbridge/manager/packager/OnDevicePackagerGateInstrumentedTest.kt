@@ -16,6 +16,7 @@ import dev.sixbridge.manager.catalog.ManagerDatabase
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionIdentityDao
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityKeyProof
 import dev.sixbridge.manager.conversion.ConversionIdentityReservation
 import dev.sixbridge.manager.conversion.ConversionPackageBinding
 import dev.sixbridge.manager.conversion.ConversionWorkStore
@@ -771,6 +772,77 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
+    fun identityCleanupInspectorRequiresExactAliasExtensionAndPublicKeyProof() = runBlocking {
+        val firstKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(UUID.randomUUID().toString().replace("-", "")),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
+        val otherKey = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker(UUID.randomUUID().toString().replace("-", "")),
+            profileMajorVersion = 28,
+            mode = InstallationIdentityMode.CONVERTED,
+        )
+        val packager = OnDeviceWrapperPackager(context)
+        val first = packager.createOrRecoverUnreservedIdentity(firstKey, UUID.randomUUID())
+        val other = packager.createOrRecoverUnreservedIdentity(otherKey, UUID.randomUUID())
+        val inspector = packager.identityKeyInspector()
+        val firstAlias = requireNotNull(first.identity.crxKeyAlias)
+        val firstPublicKeySha256 = sha256(requireNotNull(first.identity.crxPublicKeyDer))
+        val otherAlias = requireNotNull(other.identity.crxKeyAlias)
+        val otherPublicKeySha256 = sha256(requireNotNull(other.identity.crxPublicKeyDer))
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        try {
+            val proof = inspector.withIdentityLock(firstKey.identitySha256) {
+                inspector.inspect(firstKey.identitySha256)
+            }
+            assertEquals(
+                ConversionIdentityKeyProof.Verified(
+                    alias = firstAlias,
+                    extensionId = first.identity.extensionId,
+                    publicKeySha256 = firstPublicKeySha256,
+                ),
+                proof,
+            )
+
+            assertThrows(IllegalArgumentException::class.java) {
+                inspector.delete(
+                    identitySha256 = firstKey.identitySha256,
+                    expectedAlias = firstAlias,
+                    expectedExtensionId = other.identity.extensionId,
+                    expectedPublicKeySha256 = firstPublicKeySha256,
+                )
+            }
+            assertTrue(keyStore.containsAlias(firstAlias))
+            assertTrue(keyStore.containsAlias(otherAlias))
+
+            assertTrue(
+                inspector.delete(
+                    identitySha256 = firstKey.identitySha256,
+                    expectedAlias = firstAlias,
+                    expectedExtensionId = first.identity.extensionId,
+                    expectedPublicKeySha256 = firstPublicKeySha256,
+                ),
+            )
+            assertFalse(keyStore.containsAlias(firstAlias))
+            assertTrue(keyStore.containsAlias(otherAlias))
+        } finally {
+            packager.deleteUnreservedIdentity(
+                identitySha256 = firstKey.identitySha256,
+                expectedAlias = firstAlias,
+                expectedExtensionId = first.identity.extensionId,
+                expectedPublicKeySha256 = firstPublicKeySha256,
+            )
+            packager.deleteUnreservedIdentity(
+                identitySha256 = otherKey.identitySha256,
+                expectedAlias = otherAlias,
+                expectedExtensionId = other.identity.extensionId,
+                expectedPublicKeySha256 = otherPublicKeySha256,
+            )
+        }
+    }
+
+    @Test
     fun unreservedResolveAndAbortSerializeKeyCreationWithIdentityFileLock() = runBlocking {
         val identityKey = InstallationIdentityKey.create(
             LogicalSourceIdentity.projectMarker(
@@ -1320,8 +1392,32 @@ class OnDevicePackagerGateInstrumentedTest {
     ): OnDeviceWrapperResult {
         return try {
             runBlocking {
-                packager.packageWrapper(claimed.ledger, claimed.request).also { result ->
+                val result = packager.packageWrapper(claimed.ledger, claimed.request)
+                val inspectionRoot = File(root, "test-inspection").apply {
+                    check(mkdirs() || isDirectory)
+                }
+                val inspectionSnapshot = Files.createTempFile(
+                    inspectionRoot.toPath(),
+                    "committed-wrapper-inspection-",
+                    ".apk",
+                )
+                var restored = false
+                try {
+                    Files.copy(
+                        result.outputApk.toPath(),
+                        inspectionSnapshot,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
                     completeConversionJob(claimed, result)
+                    Files.move(
+                        inspectionSnapshot,
+                        result.outputApk.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                    restored = true
+                    result
+                } finally {
+                    if (!restored) Files.deleteIfExists(inspectionSnapshot)
                 }
             }
         } finally {

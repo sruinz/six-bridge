@@ -67,6 +67,7 @@ class ConversionIdentityLedger internal constructor(
 
     internal fun ownerLifecycle(
         packager: OnDeviceWrapperPackager,
+        identityManagement: ConversionIdentityManagement? = null,
     ): ConversionIdentityOwnerLifecycle = ConversionIdentityOwnerLifecycle(
         ledger = this,
         outputCleaner = ConversionIdentityCommittedOutputCleaner { identitySha256, claimUuid, wrapperSha256, outputFileName ->
@@ -78,14 +79,17 @@ class ConversionIdentityLedger internal constructor(
             )
         },
         failedAttemptPackager = packager,
+        identityManagement = identityManagement,
     )
 
     internal fun ownerLifecycle(
         outputCleaner: ConversionIdentityCommittedOutputCleaner,
+        identityManagement: ConversionIdentityManagement? = null,
     ): ConversionIdentityOwnerLifecycle = ConversionIdentityOwnerLifecycle(
         ledger = this,
         outputCleaner = outputCleaner,
         failedAttemptPackager = null,
+        identityManagement = identityManagement,
     )
 
     internal fun ownerLifecycleForReservationTests(): ConversionIdentityOwnerLifecycle =
@@ -1081,6 +1085,7 @@ class ConversionIdentityLedger internal constructor(
         private val ledger: ConversionIdentityLedger,
         private val outputCleaner: ConversionIdentityCommittedOutputCleaner,
         private val failedAttemptPackager: OnDeviceWrapperPackager?,
+        private val identityManagement: ConversionIdentityManagement?,
     ) {
         suspend fun releaseFailedAttempt(ownerToken: String) {
             val packager = failedAttemptPackager
@@ -1093,6 +1098,30 @@ class ConversionIdentityLedger internal constructor(
 
         suspend fun isOwnerDiscardComplete(ownerToken: String): Boolean =
             ledger.isOwnerDiscardComplete(ownerToken)
+
+        suspend fun discardIdentityOwner(
+            ownerToken: String,
+        ): ConversionIdentityCleanupResult {
+            try {
+                releaseFailedAttempt(ownerToken)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                return ConversionIdentityCleanupResult.Blocked(
+                    error.message ?: "identity failed-attempt cleanup에 실패했습니다.",
+                )
+            }
+            val management = identityManagement
+            return if (management != null) {
+                management.discardIdentityOwner(ownerToken)
+            } else if (isOwnerDiscardComplete(ownerToken)) {
+                ConversionIdentityCleanupResult.NothingOwned
+            } else {
+                ConversionIdentityCleanupResult.Blocked(
+                    "identity permanent cleanup service가 없습니다.",
+                )
+            }
+        }
 
         suspend fun commitBundleReady(
             ownerToken: String,

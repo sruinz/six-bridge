@@ -23,6 +23,15 @@ interface ConversionIdentityDao {
     @Query("SELECT * FROM conversion_identities WHERE provisionOwnerToken = :ownerToken LIMIT 1")
     suspend fun findByProvisionOwnerToken(ownerToken: String): ConversionIdentityEntity?
 
+    @Query(
+        """
+        SELECT * FROM conversion_identities
+        WHERE lifecycleState = :lifecycleState
+        ORDER BY displayName COLLATE NOCASE, identitySha256
+        """,
+    )
+    suspend fun listByLifecycle(lifecycleState: String): List<ConversionIdentityEntity>
+
     @Insert
     suspend fun insert(entity: ConversionIdentityEntity)
 
@@ -110,6 +119,145 @@ interface ConversionIdentityDao {
         ownerToken: String,
         state: String,
     ): Int
+
+    @Query(
+        """
+        UPDATE conversion_identities
+        SET lifecycleState = 'CLEANING',
+            crxPublicKeySha256 = :cleanupCrxPublicKeySha256,
+            lifecycleUpdatedAtEpochMillis = :lifecycleUpdatedAtEpochMillis
+        WHERE identitySha256 = :identitySha256
+          AND lifecycleState = :expectedLifecycleState
+          AND (
+            (:expectedProvisionOwnerToken IS NULL AND provisionOwnerToken IS NULL)
+            OR provisionOwnerToken = :expectedProvisionOwnerToken
+          )
+          AND (
+            (:expectedCrxPublicKeySha256 IS NULL AND crxPublicKeySha256 IS NULL)
+            OR crxPublicKeySha256 = :expectedCrxPublicKeySha256
+          )
+          AND (
+            (:expectedCrxKeyAlias IS NULL AND crxKeyAlias IS NULL)
+            OR crxKeyAlias = :expectedCrxKeyAlias
+          )
+          AND mode = :expectedMode
+          AND extensionId = :expectedExtensionId
+          AND packageName = :expectedPackageName
+          AND wrapperSignerSha256 = :expectedWrapperSignerSha256
+          AND lastReservedVersionCode = :expectedLastReservedVersionCode
+        """,
+    )
+    suspend fun transitionIdentityToCleaning(
+        identitySha256: String,
+        expectedLifecycleState: String,
+        expectedProvisionOwnerToken: String?,
+        expectedCrxPublicKeySha256: String?,
+        expectedCrxKeyAlias: String?,
+        expectedMode: String,
+        expectedExtensionId: String,
+        expectedPackageName: String,
+        expectedWrapperSignerSha256: String,
+        expectedLastReservedVersionCode: Int,
+        cleanupCrxPublicKeySha256: String?,
+        lifecycleUpdatedAtEpochMillis: Long,
+    ): Int
+
+    @Query(
+        """
+        DELETE FROM conversion_identities
+        WHERE identitySha256 = :identitySha256
+          AND lifecycleState = 'CLEANING'
+          AND (
+            (:provisionOwnerToken IS NULL AND provisionOwnerToken IS NULL)
+            OR provisionOwnerToken = :provisionOwnerToken
+          )
+          AND (
+            (:crxKeyAlias IS NULL AND crxKeyAlias IS NULL)
+            OR crxKeyAlias = :crxKeyAlias
+          )
+          AND (
+            (:crxPublicKeySha256 IS NULL AND crxPublicKeySha256 IS NULL)
+            OR crxPublicKeySha256 = :crxPublicKeySha256
+          )
+          AND mode = :mode
+          AND extensionId = :extensionId
+          AND packageName = :packageName
+          AND wrapperSignerSha256 = :wrapperSignerSha256
+        """,
+    )
+    suspend fun deleteCleaningIdentity(
+        identitySha256: String,
+        provisionOwnerToken: String?,
+        crxKeyAlias: String?,
+        crxPublicKeySha256: String?,
+        mode: String,
+        extensionId: String,
+        packageName: String,
+        wrapperSignerSha256: String,
+    ): Int
+
+    @Transaction
+    suspend fun claimIdentityCleanup(
+        expected: ConversionIdentityEntity,
+        cleanupCrxPublicKeySha256: String?,
+        lifecycleUpdatedAtEpochMillis: Long,
+        observedBundleProof: CurrentBundleReadyProof,
+    ): ConversionIdentityEntity? {
+        if (getLease(expected.identitySha256) != null || !jobMatches(observedBundleProof)) return null
+        val changed = transitionIdentityToCleaning(
+            identitySha256 = expected.identitySha256,
+            expectedLifecycleState = expected.lifecycleState,
+            expectedProvisionOwnerToken = expected.provisionOwnerToken,
+            expectedCrxPublicKeySha256 = expected.crxPublicKeySha256,
+            expectedCrxKeyAlias = expected.crxKeyAlias,
+            expectedMode = expected.mode,
+            expectedExtensionId = expected.extensionId,
+            expectedPackageName = expected.packageName,
+            expectedWrapperSignerSha256 = expected.wrapperSignerSha256,
+            expectedLastReservedVersionCode = expected.lastReservedVersionCode,
+            cleanupCrxPublicKeySha256 = cleanupCrxPublicKeySha256,
+            lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
+        )
+        return if (changed == 1) get(expected.identitySha256) else null
+    }
+
+    @Transaction
+    suspend fun deleteClaimedIdentity(
+        expected: ConversionIdentityEntity,
+        observedBundleProof: CurrentBundleReadyProof,
+    ): Boolean {
+        if (getLease(expected.identitySha256) != null || !jobMatches(observedBundleProof)) {
+            return false
+        }
+        if (get(expected.identitySha256) != expected ||
+            expected.lifecycleState != ConversionIdentityLifecycleState.CLEANING.name
+        ) {
+            return false
+        }
+        return deleteCleaningIdentity(
+            identitySha256 = expected.identitySha256,
+            provisionOwnerToken = expected.provisionOwnerToken,
+            crxKeyAlias = expected.crxKeyAlias,
+            crxPublicKeySha256 = expected.crxPublicKeySha256,
+            mode = expected.mode,
+            extensionId = expected.extensionId,
+            packageName = expected.packageName,
+            wrapperSignerSha256 = expected.wrapperSignerSha256,
+        ) == 1
+    }
+
+    private suspend fun jobMatches(observed: CurrentBundleReadyProof): Boolean {
+        val job = getJobForIdentityFinalization()
+        return when (observed) {
+            CurrentBundleReadyProof.Absent -> job?.stage != ConversionJobStage.BUNDLE_READY.name
+            is CurrentBundleReadyProof.Unreadable -> false
+            is CurrentBundleReadyProof.Verified ->
+                job?.token == observed.ownerToken &&
+                    job.generation == observed.generation &&
+                    job.stage == ConversionJobStage.BUNDLE_READY.name &&
+                    job.bundleSha256 == observed.bundleSha256
+        }
+    }
 
     @Transaction
     suspend fun claimCleanup(

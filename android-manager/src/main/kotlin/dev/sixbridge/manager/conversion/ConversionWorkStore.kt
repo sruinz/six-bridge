@@ -10,7 +10,6 @@ import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardOpenOption.CREATE_NEW
 import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.WRITE
@@ -18,7 +17,6 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.Clock
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -61,15 +59,18 @@ internal data class ConversionWorkStoreHooks(
 class ConversionWorkStore internal constructor(
     private val privateRoot: File,
     private val dao: ConversionJobDao,
-    private val bundleVerifier: ConversionBundleVerifier,
+    bundleVerifier: ConversionBundleVerifier,
     private val identityOwnerLifecycle: ConversionIdentityOwnerLifecycle,
     private val clock: () -> Long = { Clock.systemUTC().millis() },
     private val tokenFactory: () -> String = { UUID.randomUUID().toString() },
     private val fileNameFactory: () -> String = { UUID.randomUUID().toString() },
     private val hooks: ConversionWorkStoreHooks = ConversionWorkStoreHooks(),
 ) {
-    private val mutex = rootMutex(
-        privateRoot.toPath().toAbsolutePath().normalize().toString(),
+    private val mutex = ConversionPrivateRootLocks.mutex(privateRoot)
+    private val bundleStorage = PrivateConversionBundleStorage(
+        privateRoot = privateRoot,
+        bundleVerifier = bundleVerifier,
+        afterBundleVerified = hooks.afterBundleVerified,
     )
 
     suspend fun create(
@@ -81,31 +82,14 @@ class ConversionWorkStore internal constructor(
                 try {
                     validateArtifactBoundary(artifact)
                     val root = requirePrivateRoot()
+                    if (!cleanupBeforeCreate(root)) {
+                        throw IllegalStateException(
+                            "이전 작업의 identity와 private storage cleanup을 완료하지 못했습니다.",
+                        )
+                    }
                     val token = requireCanonicalUuid(tokenFactory(), "작업 token")
                     val inputFileName =
                         "${requireCanonicalUuid(fileNameFactory(), "입력 파일명")}.input"
-                    val discoveredCleanup = (
-                        listFiles(root)
-                            ?: throw IllegalStateException("private 작업 저장소를 열거할 수 없습니다.")
-                        )
-                        .map(File::getName)
-                        .filter(::isCanonicalUuid)
-                        .toSet()
-                    val existing = dao.get()
-                    val existingCleanup = existing
-                        ?.cleanupTokensJson
-                        ?.let(::decodeCleanupTokens)
-                        .orEmpty()
-                    val priorOwners = buildSet {
-                        addAll(discoveredCleanup)
-                        existing?.token?.takeIf(::isCanonicalUuid)?.let(::add)
-                        addAll(existingCleanup.filter(::isCanonicalUuid))
-                    }
-                    if (priorOwners.any { !identityOwnerLifecycle.isOwnerDiscardComplete(it) }) {
-                        throw IllegalStateException(
-                            "Task 5 identity owner discard가 완료되지 않았습니다.",
-                        )
-                    }
                     var claimed = dao.claimCreate(
                         ConversionJobEntity(
                             token = token,
@@ -118,7 +102,7 @@ class ConversionWorkStore internal constructor(
                             profileSha256 = null,
                             bundleFileName = null,
                             bundleSha256 = null,
-                            cleanupTokensJson = encodeCleanupTokens(discoveredCleanup),
+                            cleanupTokensJson = encodeCleanupTokens(emptySet()),
                             updatedAtEpochMillis = now(),
                         ),
                     )
@@ -243,7 +227,7 @@ class ConversionWorkStore internal constructor(
                     expectedSha256 = expectedSha256,
                     label = "생성 bundle",
                 )
-                publishVerifiedBundle(temporary, published, expectedSha256)
+                bundleStorage.publishVerified(temporary, published, expectedSha256)
                 hooks.afterBundlePublished()
                 val updated = dao.transition(
                     token = token,
@@ -384,7 +368,7 @@ class ConversionWorkStore internal constructor(
         deferInterruptedCleanup: Boolean,
     ): ConversionWorkStartupRestore.Interrupted? {
         val alreadyClaimed = row.stage == ConversionJobStage.DISCARDING.name
-        val claimed = if (alreadyClaimed) row else claimDiscarding(row) ?: return null
+        val claimed = if (alreadyClaimed) row else claimDiscarding(root, row) ?: return null
         if (!alreadyClaimed) hooks.afterDiscardClaim()
         val interrupted = claimed.toInterruptedRestore()
         if (deferInterruptedCleanup && interrupted != null) return interrupted
@@ -430,18 +414,63 @@ class ConversionWorkStore internal constructor(
                 return@withContext discardOtherToken(root, row, token)
             }
             val reconciled = reconcileCleanupTokens(root, row) ?: return@withContext false
-            val claimed = claimDiscarding(reconciled) ?: return@withContext false
+            val claimed = claimDiscarding(root, reconciled) ?: return@withContext false
             hooks.afterDiscardClaim()
             discardClaimed(root, claimed)
         }
     }
+
+    private suspend fun cleanupBeforeCreate(root: File): Boolean {
+        dao.get()?.let { stored ->
+            val reconciled = reconcileCleanupTokens(root, stored) ?: return false
+            val wasClaimed = reconciled.stage == ConversionJobStage.DISCARDING.name
+            val claimed = claimDiscarding(root, reconciled) ?: return false
+            if (!wasClaimed) hooks.afterDiscardClaim()
+            if (!discardClaimed(root, claimed)) return false
+        }
+        val orphans = (listFiles(root) ?: return false)
+            .map(File::getName)
+            .filter(::isCanonicalUuid)
+            .sorted()
+        for (token in orphans) {
+            if (!permanentlyDiscardOwner(token) || !deleteTokenDirectory(root, token)) {
+                return false
+            }
+        }
+        return dao.get() == null
+    }
+
+    private suspend fun commitBundleReadyBeforeDiscard(
+        root: File,
+        row: ConversionJobEntity,
+    ): Boolean {
+        val tokenDirectory = runCatching { requireTokenDirectory(root, row.token) }.getOrNull()
+            ?: return false
+        val restored = row.toRestored(tokenDirectory)
+            ?.takeIf { it.stage == ConversionJobStage.BUNDLE_READY }
+            ?: return false
+        val committed = identityOwnerLifecycle.commitBundleReady(
+            ownerToken = row.token,
+            expectedGeneration = row.generation,
+            bundleSha256 = requireNotNull(restored.bundleSha256),
+        )
+        return committed && identityOwnerLifecycle.isOwnerDiscardComplete(row.token)
+    }
+
+    private suspend fun permanentlyDiscardOwner(token: String): Boolean =
+        when (identityOwnerLifecycle.discardIdentityOwner(token)) {
+            ConversionIdentityCleanupResult.Removed,
+            ConversionIdentityCleanupResult.NothingOwned,
+            -> true
+            is ConversionIdentityCleanupResult.Blocked -> false
+        }
 
     private suspend fun discardOtherToken(
         root: File,
         row: ConversionJobEntity?,
         token: String,
     ): Boolean {
-        if (!identityOwnerLifecycle.isOwnerDiscardComplete(token)) return false
+        if (!permanentlyDiscardOwner(token)) return false
         val tokenPath = directChild(root, token).toPath()
         val physicalExists = Files.exists(tokenPath, NOFOLLOW_LINKS)
         if (row == null) return !physicalExists
@@ -515,14 +544,7 @@ class ConversionWorkStore internal constructor(
     ): T = mutex.withLock {
         withContext(Dispatchers.IO) {
             val row = requireCurrent(token, ConversionJobStage.BUNDLE_READY)
-            val name = row.bundleFileName
-                ?: throw IllegalStateException("완료 bundle 파일명이 없습니다.")
-            val expectedSha256 = row.bundleSha256
-                ?: throw IllegalStateException("완료 bundle hash가 없습니다.")
-            val root = requirePrivateRoot()
-            val tokenDirectory = requireTokenDirectory(root, token)
-            val bundle = directChild(tokenDirectory, name)
-            consumeVerifiedBundle(bundle, expectedSha256, consume)
+            bundleStorage.consumeStored(row, consume)
         }
     }
 
@@ -630,15 +652,7 @@ class ConversionWorkStore internal constructor(
                 ) {
                     return null
                 }
-                val name = bundleFileName ?: return null
-                if (!isPrivateFileName(name, BUNDLE_SUFFIX)) return null
-                val file = runCatching { directChild(tokenDirectory, name) }.getOrNull()
-                    ?: return null
-                if (!isRegularDirectFile(tokenDirectory, file)) return null
-                if (runCatching {
-                        verifyBundleFile(file, requireNotNull(bundleSha256))
-                    }.isFailure
-                ) return null
+                if (runCatching { bundleStorage.verifyStored(this) }.isFailure) return null
                 bundleSha256
             }
             ConversionJobStage.DISCARDING -> return null
@@ -725,28 +739,6 @@ class ConversionWorkStore internal constructor(
             state
         }
 
-    private fun verifyBundleFile(file: File, expectedSha256: String) {
-        withStableFile(file) { channel, state ->
-            verifyHashAndBundle(channel, file, state, expectedSha256)
-        }
-    }
-
-    private fun publishVerifiedBundle(
-        temporary: File,
-        published: File,
-        expectedSha256: String,
-    ) {
-        withStableFile(temporary) { channel, state ->
-            verifyHashAndBundle(channel, temporary, state, expectedSha256)
-            Files.move(temporary.toPath(), published.toPath(), ATOMIC_MOVE)
-            requireStableFile(published, state, "bundle publish")
-            require(published.setReadOnly()) {
-                "private bundle을 불변 상태로 고정할 수 없습니다."
-            }
-            requireStableFile(published, state, "bundle 고정")
-        }
-    }
-
     private fun <T> consumeVerifiedFile(
         file: File,
         expectedSha256: String,
@@ -763,42 +755,6 @@ class ConversionWorkStore internal constructor(
         val result = consume(BoundedChannelInputStream(channel, state.size))
         requireStableFile(file, state, "소비")
         result
-    }
-
-    private fun <T> consumeVerifiedBundle(
-        file: File,
-        expectedSha256: String,
-        consume: (InputStream) -> T,
-    ): T = withStableFile(file) { channel, state ->
-        verifyHashAndBundle(channel, file, state, expectedSha256)
-        requireStableFile(file, state, "bundle 소비 직전")
-        channel.position(0)
-        val result = consume(BoundedChannelInputStream(channel, state.size))
-        requireStableFile(file, state, "bundle 소비")
-        result
-    }
-
-    private fun verifyHashAndBundle(
-        channel: FileChannel,
-        file: File,
-        state: DirectFileState,
-        expectedSha256: String,
-    ) {
-        requireSafeSha256(expectedSha256, "private bundle")
-        require(hashChannel(channel) == expectedSha256) {
-            "private bundle hash가 일치하지 않습니다."
-        }
-        requireStableFile(file, state, "bundle hash 검증")
-        channel.position(0)
-        val stream = BoundedChannelInputStream(channel, state.size)
-        require(bundleVerifier.verify(stream)) {
-            "private bundle 재검증에 실패했습니다."
-        }
-        require(stream.remainingBytes == 0L) {
-            "bundle verifier가 전체 snapshot을 소비하지 않았습니다."
-        }
-        hooks.afterBundleVerified()
-        requireStableFile(file, state, "bundle 검증")
     }
 
     private inline fun <T> withStableFile(
@@ -909,7 +865,7 @@ class ConversionWorkStore internal constructor(
             val pending = decodeCleanupTokens(row.cleanupTokensJson) ?: return null
             val token = pending.firstOrNull() ?: return row
             if (!isCanonicalUuid(token) || token == row.token) return null
-            if (!identityOwnerLifecycle.isOwnerDiscardComplete(token)) return null
+            if (!permanentlyDiscardOwner(token)) return null
             if (!deleteTokenDirectory(root, token)) return null
             val remaining = pending - token
             val changed = dao.updateCleanupTokens(
@@ -949,13 +905,21 @@ class ConversionWorkStore internal constructor(
     }
 
     private suspend fun discardInvalid(root: File, row: ConversionJobEntity) {
-        val claimed = claimDiscarding(row) ?: return
+        val claimed = claimDiscarding(root, row) ?: return
         hooks.afterDiscardClaim()
         discardClaimed(root, claimed)
     }
 
-    private suspend fun claimDiscarding(row: ConversionJobEntity): ConversionJobEntity? {
+    private suspend fun claimDiscarding(
+        root: File,
+        row: ConversionJobEntity,
+    ): ConversionJobEntity? {
         if (row.stage == ConversionJobStage.DISCARDING.name) return row
+        if (row.stage == ConversionJobStage.BUNDLE_READY.name &&
+            !commitBundleReadyBeforeDiscard(root, row)
+        ) {
+            return null
+        }
         val changed = dao.transition(
             token = row.token,
             expectedStage = row.stage,
@@ -984,7 +948,7 @@ class ConversionWorkStore internal constructor(
         if (cleanup.any { !isCanonicalUuid(it) }) return false
         val tokens = if (isCanonicalUuid(row.token)) cleanup + row.token else cleanup
         if (tokens.any { !isCanonicalUuid(it) }) return false
-        if (tokens.any { !identityOwnerLifecycle.isOwnerDiscardComplete(it) }) return false
+        if (tokens.any { !permanentlyDiscardOwner(it) }) return false
         for (token in tokens) {
             if (!deleteTokenDirectory(root, token)) return false
         }
@@ -1084,12 +1048,7 @@ class ConversionWorkStore internal constructor(
         const val MAX_CLOCK_SKEW_MILLIS = 5L * 60 * 1000
         private const val TASK6_INPUT_FILE_NAME = "input.bin"
         private const val INPUT_SUFFIX = ".input"
-        private const val BUNDLE_SUFFIX = ".six"
         private const val STREAM_BUFFER_SIZE = 64 * 1024
-        private val ROOT_MUTEXES = ConcurrentHashMap<String, Mutex>()
-
-        private fun rootMutex(path: String): Mutex =
-            ROOT_MUTEXES.computeIfAbsent(path) { Mutex() }
     }
 }
 

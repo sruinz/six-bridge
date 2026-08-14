@@ -12,9 +12,11 @@ import dev.sixbridge.manager.conversion.AnalysisCacheCleaner
 import dev.sixbridge.manager.conversion.ConversionBundleVerifier
 import dev.sixbridge.manager.conversion.ConversionGeneratedImportPort
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityManagement
 import dev.sixbridge.manager.conversion.ConversionInstalledPort
 import dev.sixbridge.manager.conversion.ConversionProfilePort
 import dev.sixbridge.manager.conversion.ConversionWorkStore
+import dev.sixbridge.manager.conversion.CurrentBundleIdentityProofParser
 import dev.sixbridge.manager.conversion.DefaultConversionBundlePort
 import dev.sixbridge.manager.conversion.DefaultConversionIdentityPort
 import dev.sixbridge.manager.conversion.DefaultConversionPackagePort
@@ -24,6 +26,8 @@ import dev.sixbridge.manager.conversion.GeneratedBundleStore
 import dev.sixbridge.manager.conversion.OnDeviceConversionCoordinator
 import dev.sixbridge.manager.conversion.OnDeviceInputService
 import dev.sixbridge.manager.conversion.SamsungProfileSnapshot
+import dev.sixbridge.manager.conversion.StoredCurrentBundleReadyProofReader
+import dev.sixbridge.manager.conversion.VerifiedIdentityProof
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.ContentProviderInstalledExtensionIconSource
 import dev.sixbridge.manager.importer.BundleImportService
@@ -115,13 +119,38 @@ class ManagerDependencies private constructor(
             )
             val identityLedger = ConversionIdentityLedger(database.conversionIdentityDao())
             val packager = OnDeviceWrapperPackager(application)
-            val workStore = ConversionWorkStore(
-                privateRoot = File(application.filesDir, "conversion-work"),
+            val conversionRoot = File(application.filesDir, "conversion-work")
+            val conversionBundleVerifier = ConversionBundleVerifier {
+                runCatching { SixBundleContract.read(it); true }.getOrDefault(false)
+            }
+            val currentBundleProofReader = StoredCurrentBundleReadyProofReader(
+                privateRoot = conversionRoot,
                 dao = database.conversionJobDao(),
-                bundleVerifier = ConversionBundleVerifier {
-                    runCatching { SixBundleContract.read(it); true }.getOrDefault(false)
+                bundleVerifier = conversionBundleVerifier,
+                proofParser = CurrentBundleIdentityProofParser { input ->
+                    val extension = SixBundleContract.read(input).extension
+                    VerifiedIdentityProof(
+                        packageName = extension.wrapperPackage,
+                        extensionId = extension.extensionId,
+                        wrapperSignerSha256 = extension.signerSha256,
+                        versionCode = extension.wrapperVersionCode,
+                    )
                 },
-                identityOwnerLifecycle = identityLedger.ownerLifecycle(packager),
+            )
+            val identityManagement = ConversionIdentityManagement(
+                dao = database.conversionIdentityDao(),
+                installedWrappers = installedWrappers,
+                currentBundleReadyProofReader = currentBundleProofReader,
+                keyInspector = packager.identityKeyInspector(),
+            )
+            val workStore = ConversionWorkStore(
+                privateRoot = conversionRoot,
+                dao = database.conversionJobDao(),
+                bundleVerifier = conversionBundleVerifier,
+                identityOwnerLifecycle = identityLedger.ownerLifecycle(
+                    packager,
+                    identityManagement,
+                ),
             )
             val profileProvider = AndroidSamsungBrowserProfileProvider(application)
             val inputService = OnDeviceInputService(
@@ -204,6 +233,7 @@ class ManagerDependencies private constructor(
                     AndroidSamsungBrowserNavigator(application.packageManager),
                 catalogPublisher = catalogPublisher,
                 conversionCoordinator = conversionCoordinator,
+                recoverIdentityCleanup = identityManagement::recoverIdentityCleanup,
             )
             repository.start(applicationScope, catalog)
             return ManagerDependencies(repository, applicationScope)

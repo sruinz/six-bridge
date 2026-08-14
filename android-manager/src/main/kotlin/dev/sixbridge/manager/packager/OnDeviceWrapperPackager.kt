@@ -8,6 +8,8 @@ import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.Crx3Writer
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.manager.conversion.ConversionIdentityLedger
+import dev.sixbridge.manager.conversion.ConversionIdentityKeyInspector
+import dev.sixbridge.manager.conversion.ConversionIdentityKeyProof
 import dev.sixbridge.manager.conversion.InstallationIdentityKey
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.wrapper.AndroidArchiveInspector
@@ -229,6 +231,53 @@ class OnDeviceWrapperPackager(context: Context) {
             "converted 신원만 CRX alias를 가집니다."
         }
         return identityStore.crxAlias(identityKey.identitySha256)
+    }
+
+    internal fun identityKeyInspector(): ConversionIdentityKeyInspector =
+        object : ConversionIdentityKeyInspector {
+            override suspend fun <T> withIdentityLock(
+                identitySha256: String,
+                block: suspend () -> T,
+            ): T = withIdentityMutationLockForLedger(identitySha256, block)
+
+            override fun inspect(identitySha256: String): ConversionIdentityKeyProof =
+                inspectIdentityKey(identitySha256)
+
+            override fun delete(
+                identitySha256: String,
+                expectedAlias: String,
+                expectedExtensionId: String,
+                expectedPublicKeySha256: String,
+            ): Boolean = deleteUnreservedIdentity(
+                identitySha256 = identitySha256,
+                expectedAlias = expectedAlias,
+                expectedExtensionId = expectedExtensionId,
+                expectedPublicKeySha256 = expectedPublicKeySha256,
+            )
+        }
+
+    @Synchronized
+    private fun inspectIdentityKey(identitySha256: String): ConversionIdentityKeyProof {
+        if (!SHA256.matches(identitySha256)) {
+            return ConversionIdentityKeyProof.Unreadable("identity SHA-256이 올바르지 않습니다.")
+        }
+        return try {
+            if (!identityStore.hasCrxIdentity(identitySha256)) {
+                ConversionIdentityKeyProof.Absent
+            } else {
+                val current = identityStore.existingCrxIdentity(identitySha256)
+                val publicKey = current.certificate.publicKey.encoded.copyOf()
+                ConversionIdentityKeyProof.Verified(
+                    alias = current.alias,
+                    extensionId = Crx3.extensionId(publicKey),
+                    publicKeySha256 = sha256(publicKey),
+                )
+            }
+        } catch (error: Exception) {
+            ConversionIdentityKeyProof.Unreadable(
+                error.message ?: "Android Keystore identity proof를 읽을 수 없습니다.",
+            )
+        }
     }
 
     private fun resolveIdentitySnapshot(

@@ -1060,6 +1060,14 @@ class ConversionIdentityLedgerTest {
                 rows.values.singleOrNull { it.provisionOwnerToken == ownerToken }
             }
 
+        override suspend fun listByLifecycle(
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = synchronized(rows) {
+            rows.values.filter { it.lifecycleState == lifecycleState }
+                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
+                .sortedBy { it.identitySha256 }
+        }
+
         override suspend fun insert(entity: ConversionIdentityEntity) {
             synchronized(rows) {
                 check(rows.putIfAbsent(entity.identitySha256, entity) == null)
@@ -1155,6 +1163,69 @@ class ConversionIdentityLedgerTest {
                 0
             } else {
                 leases.remove(identitySha256)
+                1
+            }
+        }
+
+        override suspend fun transitionIdentityToCleaning(
+            identitySha256: String,
+            expectedLifecycleState: String,
+            expectedProvisionOwnerToken: String?,
+            expectedCrxPublicKeySha256: String?,
+            expectedCrxKeyAlias: String?,
+            expectedMode: String,
+            expectedExtensionId: String,
+            expectedPackageName: String,
+            expectedWrapperSignerSha256: String,
+            expectedLastReservedVersionCode: Int,
+            cleanupCrxPublicKeySha256: String?,
+            lifecycleUpdatedAtEpochMillis: Long,
+        ): Int = synchronized(rows) {
+            val current = rows[identitySha256]
+            if (current?.lifecycleState != expectedLifecycleState ||
+                current.provisionOwnerToken != expectedProvisionOwnerToken ||
+                current.crxPublicKeySha256 != expectedCrxPublicKeySha256 ||
+                current.crxKeyAlias != expectedCrxKeyAlias ||
+                current.mode != expectedMode ||
+                current.extensionId != expectedExtensionId ||
+                current.packageName != expectedPackageName ||
+                current.wrapperSignerSha256 != expectedWrapperSignerSha256 ||
+                current.lastReservedVersionCode != expectedLastReservedVersionCode
+            ) {
+                0
+            } else {
+                rows[identitySha256] = current.copy(
+                    lifecycleState = ConversionIdentityLifecycleState.CLEANING.name,
+                    crxPublicKeySha256 = cleanupCrxPublicKeySha256,
+                    lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
+                )
+                1
+            }
+        }
+
+        override suspend fun deleteCleaningIdentity(
+            identitySha256: String,
+            provisionOwnerToken: String?,
+            crxKeyAlias: String?,
+            crxPublicKeySha256: String?,
+            mode: String,
+            extensionId: String,
+            packageName: String,
+            wrapperSignerSha256: String,
+        ): Int = synchronized(rows) {
+            val current = rows[identitySha256]
+            if (current?.lifecycleState != ConversionIdentityLifecycleState.CLEANING.name ||
+                current.provisionOwnerToken != provisionOwnerToken ||
+                current.crxKeyAlias != crxKeyAlias ||
+                current.crxPublicKeySha256 != crxPublicKeySha256 ||
+                current.mode != mode ||
+                current.extensionId != extensionId ||
+                current.packageName != packageName ||
+                current.wrapperSignerSha256 != wrapperSignerSha256
+            ) {
+                0
+            } else {
+                rows.remove(identitySha256)
                 1
             }
         }

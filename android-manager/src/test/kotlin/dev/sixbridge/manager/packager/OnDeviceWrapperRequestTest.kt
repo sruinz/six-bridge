@@ -347,6 +347,9 @@ class OnDeviceWrapperRequestTest {
         override suspend fun findByProvisionOwnerToken(
             ownerToken: String,
         ): ConversionIdentityEntity? = null
+        override suspend fun listByLifecycle(
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
         override suspend fun insert(entity: ConversionIdentityEntity) = error("unused")
         override suspend fun update(entity: ConversionIdentityEntity) = error("unused")
         override suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity? = null
@@ -380,6 +383,32 @@ class OnDeviceWrapperRequestTest {
             identitySha256: String,
             ownerToken: String,
             state: String,
+        ): Int = error("unused")
+
+        override suspend fun transitionIdentityToCleaning(
+            identitySha256: String,
+            expectedLifecycleState: String,
+            expectedProvisionOwnerToken: String?,
+            expectedCrxPublicKeySha256: String?,
+            expectedCrxKeyAlias: String?,
+            expectedMode: String,
+            expectedExtensionId: String,
+            expectedPackageName: String,
+            expectedWrapperSignerSha256: String,
+            expectedLastReservedVersionCode: Int,
+            cleanupCrxPublicKeySha256: String?,
+            lifecycleUpdatedAtEpochMillis: Long,
+        ): Int = error("unused")
+
+        override suspend fun deleteCleaningIdentity(
+            identitySha256: String,
+            provisionOwnerToken: String?,
+            crxKeyAlias: String?,
+            crxPublicKeySha256: String?,
+            mode: String,
+            extensionId: String,
+            packageName: String,
+            wrapperSignerSha256: String,
         ): Int = error("unused")
 
         override suspend fun updateForReservation(

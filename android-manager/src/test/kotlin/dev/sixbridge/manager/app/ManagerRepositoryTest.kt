@@ -367,6 +367,61 @@ class ManagerRepositoryTest {
             }
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `startup READY는 CLEANING identity recovery가 완료될 때까지 반환되지 않는다`() =
+        runTest {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val fixture = startupFixture(
+                invalidRecord = "identity-cleaning",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = listOf(
+                    emptyRecoverySnapshot(),
+                    emptyRecoverySnapshot(),
+                    emptyRecoverySnapshot(),
+                ),
+                recoverIdentityCleanup = {
+                    entered.complete(Unit)
+                    release.await()
+                    true
+                },
+            )
+
+            val awaiting = async { fixture.startup.awaitReady() }
+            entered.await()
+            runCurrent()
+
+            assertFalse(awaiting.isCompleted)
+            assertEquals(1, fixture.store.recoverySnapshotReads)
+
+            release.complete(Unit)
+            assertIs<StartupSnapshot.Ready>(awaiting.await())
+        }
+
+    @Test
+    fun `identity CLEANING recovery가 blocked면 startup cleanup을 실행하지 않고 RecoveryBlocked로 완료한다`() =
+        runTest {
+            var recoveryCalls = 0
+            val fixture = startupFixture(
+                invalidRecord = "identity-cleaning",
+                retryDelayMillis = 1,
+                recoverySnapshotSequence = listOf(emptyRecoverySnapshot()),
+                recoverIdentityCleanup = {
+                    recoveryCalls += 1
+                    false
+                },
+            )
+
+            val result = fixture.startup.awaitReady()
+
+            assertEquals(StartupSnapshot.RecoveryBlocked, result)
+            assertEquals(1, recoveryCalls)
+            assertEquals(1, fixture.store.recoverySnapshotReads)
+            assertEquals(0, fixture.store.nullableLoadReads)
+            assertEquals(0, fixture.installed.findAllCalls)
+        }
+
     @Test
     fun `영구 startup 예외는 기본 최대 시도 뒤 RecoveryBlocked로 완료한다`() =
         runTest {
@@ -3580,6 +3635,7 @@ class ManagerRepositoryTest {
         invalidRecord: String,
         retryDelayMillis: Long,
         recoverySnapshotSequence: List<RecoveryStoreSnapshot>? = null,
+        recoverIdentityCleanup: suspend () -> Boolean = { true },
     ): StartupTestFixture {
         val root = temporaryFolder.newFolder("blocked-startup-$invalidRecord")
         val store = StartupPendingStore(null)
@@ -3638,6 +3694,7 @@ class ManagerRepositoryTest {
             catalogPublisher = publisher,
             ioDispatcher = Dispatchers.Unconfined,
             retryDelayMillis = retryDelayMillis,
+            recoverIdentityCleanup = recoverIdentityCleanup,
         )
         return StartupTestFixture(startup, store, coordinator, installed, router, calls)
     }

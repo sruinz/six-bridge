@@ -271,6 +271,7 @@ internal class DefaultManagerRepository(
     private val afterInstallRequest: suspend (InstallState) -> Unit = {},
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val conversionCoordinator: ConversionCoordinatorPort? = null,
+    private val recoverIdentityCleanup: suspend () -> Boolean = { true },
     private val generatedImporter: suspend (GeneratedBundle) -> ImportResult =
         importer::importGenerated,
 ) : ManagerRepository {
@@ -288,6 +289,7 @@ internal class DefaultManagerRepository(
         catalogPublisher = catalogPublisher,
         ioDispatcher = ioDispatcher,
         afterStartupCleanup = systemInstallCoordinator::reconcileAfterStartupCleanup,
+        recoverIdentityCleanup = recoverIdentityCleanup,
     )
 
     override val catalog: Flow<List<CatalogRecord>> = catalogPublisher.state
@@ -647,6 +649,7 @@ internal class RepositoryStartup(
     private val retryDelayMillis: Long = 250,
     private val maxAttempts: Int = 3,
     private val afterStartupCleanup: suspend () -> Unit = {},
+    private val recoverIdentityCleanup: suspend () -> Boolean = { true },
 ) {
     private val mutex = Mutex()
     private val ready = CompletableDeferred<StartupSnapshot>()
@@ -699,6 +702,10 @@ internal class RepositoryStartup(
                             ready.complete(StartupSnapshot.RecoveryBlocked)
                             return@withLock
                         }
+                    }
+                    if (!recoverIdentityCleanup()) {
+                        ready.complete(StartupSnapshot.RecoveryBlocked)
+                        return@withLock
                     }
                     startupCleanup.run()
                     afterStartupCleanup()
