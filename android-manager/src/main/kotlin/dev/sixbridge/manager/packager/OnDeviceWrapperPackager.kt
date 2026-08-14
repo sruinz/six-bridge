@@ -68,6 +68,83 @@ data class OnDevicePackageIdentity(
     val crxPublicKeyDer: ByteArray?,
 )
 
+internal interface OnDevicePackagerKeyStoreSource {
+    fun crxAlias(identitySha256: String): String
+    fun wrapperIdentity(): AndroidSigningIdentity
+    fun existingWrapperIdentity(): AndroidSigningIdentity
+    fun createCrxIdentityIfAbsent(identitySha256: String): AndroidSigningIdentity?
+    fun existingCrxIdentity(identitySha256: String): AndroidSigningIdentity
+    fun existingCrxSigningKey(identitySha256: String): AndroidKeystoreCrxSigningKey
+}
+
+internal data class OnDeviceCrxIdentityProof(
+    val alias: String,
+    val publicKeyDer: ByteArray,
+    val extensionId: String,
+)
+
+internal class DefaultOnDevicePackagerKeyStoreAccess(
+    private val source: OnDevicePackagerKeyStoreSource,
+) {
+    constructor(store: AndroidKeystoreIdentityStore) : this(
+        AndroidOnDevicePackagerKeyStoreSource(store),
+    )
+
+    fun plannedCrxAlias(identitySha256: String): String =
+        withConversionKeyStoreBoundary { source.crxAlias(identitySha256) }
+
+    fun wrapperSignerSha256(): String = withConversionKeyStoreBoundary {
+        sha256Hex(source.wrapperIdentity().certificate.encoded)
+    }
+
+    fun existingWrapperSignerSha256(): String = withConversionKeyStoreBoundary {
+        sha256Hex(source.existingWrapperIdentity().certificate.encoded)
+    }
+
+    fun existingCrxIdentityProof(identitySha256: String): OnDeviceCrxIdentityProof =
+        withConversionKeyStoreBoundary {
+            source.existingCrxIdentity(identitySha256).toCrxIdentityProof()
+        }
+
+    fun createOrExistingCrxIdentityProof(identitySha256: String): OnDeviceCrxIdentityProof =
+        withConversionKeyStoreBoundary {
+            val identity = source.createCrxIdentityIfAbsent(identitySha256)
+                ?: source.existingCrxIdentity(identitySha256)
+            identity.toCrxIdentityProof()
+        }
+
+    fun existingCrxSigningKey(identitySha256: String): AndroidKeystoreCrxSigningKey =
+        withConversionKeyStoreBoundary {
+            source.existingCrxSigningKey(identitySha256)
+        }
+
+    fun wrapperSigningIdentity(): AndroidSigningIdentity =
+        withConversionKeyStoreBoundary(source::wrapperIdentity)
+
+    private fun AndroidSigningIdentity.toCrxIdentityProof(): OnDeviceCrxIdentityProof {
+        val publicKey = certificate.publicKey.encoded.copyOf()
+        return OnDeviceCrxIdentityProof(
+            alias = alias,
+            publicKeyDer = publicKey,
+            extensionId = Crx3.extensionId(publicKey),
+        )
+    }
+}
+
+private class AndroidOnDevicePackagerKeyStoreSource(
+    private val store: AndroidKeystoreIdentityStore,
+) : OnDevicePackagerKeyStoreSource {
+    override fun crxAlias(identitySha256: String) = store.crxAlias(identitySha256)
+    override fun wrapperIdentity() = store.wrapperIdentity()
+    override fun existingWrapperIdentity() = store.existingWrapperIdentity()
+    override fun createCrxIdentityIfAbsent(identitySha256: String) =
+        store.createCrxIdentityIfAbsent(identitySha256)
+    override fun existingCrxIdentity(identitySha256: String) =
+        store.existingCrxIdentity(identitySha256)
+    override fun existingCrxSigningKey(identitySha256: String) =
+        store.existingCrxSigningKey(identitySha256)
+}
+
 class UnreservedIdentityLease internal constructor(
     val identitySha256: String,
     val identity: OnDevicePackageIdentity,
@@ -135,6 +212,7 @@ class OnDeviceWrapperPackager(context: Context) {
         appPrivateTemporaryDirectory(workingDirectory.path),
     )
     private val identityStore = AndroidKeystoreIdentityStore()
+    private val keyStoreAccess = DefaultOnDevicePackagerKeyStoreAccess(identityStore)
     private val manifestPatcher = BinaryAndroidManifestPatcher()
     private val apkSigner = AndroidApkSigner()
     private val verifier = AndroidWrapperVerifier(
@@ -232,9 +310,7 @@ class OnDeviceWrapperPackager(context: Context) {
         require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
             "converted 신원만 CRX alias를 가집니다."
         }
-        return withConversionKeyStoreBoundary {
-            identityStore.crxAlias(identityKey.identitySha256)
-        }
+        return keyStoreAccess.plannedCrxAlias(identityKey.identitySha256)
     }
 
     internal fun identityKeyInspector(): ConversionIdentityKeyInspector =
@@ -289,9 +365,7 @@ class OnDeviceWrapperPackager(context: Context) {
         identityKey: InstallationIdentityKey,
         passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
     ): OnDevicePackageIdentity {
-        val wrapperSignerSha256 = withConversionKeyStoreBoundary {
-            sha256(identityStore.wrapperIdentity().certificate.encoded)
-        }
+        val wrapperSignerSha256 = keyStoreAccess.wrapperSignerSha256()
         return when (identityKey.mode) {
             InstallationIdentityMode.PASSTHROUGH,
             InstallationIdentityMode.PREPARED,
@@ -310,17 +384,15 @@ class OnDeviceWrapperPackager(context: Context) {
                 require(passthroughProof == null) {
                     "converted 신원에는 passthrough CRX3를 사용할 수 없습니다."
                 }
-                val (crxIdentity, publicKey, extensionId) = withConversionKeyStoreBoundary {
-                    val current = identityStore.existingCrxIdentity(identityKey.identitySha256)
-                    val currentPublicKey = current.certificate.publicKey.encoded.copyOf()
-                    Triple(current, currentPublicKey, Crx3.extensionId(currentPublicKey))
-                }
+                val crxProof = keyStoreAccess.existingCrxIdentityProof(
+                    identityKey.identitySha256,
+                )
                 OnDevicePackageIdentity(
-                    extensionId = extensionId,
-                    packageName = "dev.sixbridge.ext.$extensionId",
+                    extensionId = crxProof.extensionId,
+                    packageName = "dev.sixbridge.ext.${crxProof.extensionId}",
                     wrapperSignerSha256 = wrapperSignerSha256,
-                    crxKeyAlias = crxIdentity.alias,
-                    crxPublicKeyDer = publicKey,
+                    crxKeyAlias = crxProof.alias,
+                    crxPublicKeyDer = crxProof.publicKeyDer,
                 )
             }
         }
@@ -330,9 +402,7 @@ class OnDeviceWrapperPackager(context: Context) {
         reservation: ConversionIdentityLedger.Reservation,
         passthroughProof: dev.sixbridge.contract.crx.VerifiedCrx3?,
     ): OnDevicePackageIdentity {
-        val wrapperSignerSha256 = withConversionKeyStoreBoundary {
-            sha256(identityStore.existingWrapperIdentity().certificate.encoded)
-        }
+        val wrapperSignerSha256 = keyStoreAccess.existingWrapperSignerSha256()
         val current = when (reservation.identityKey.mode) {
             InstallationIdentityMode.PASSTHROUGH,
             InstallationIdentityMode.PREPARED,
@@ -351,17 +421,15 @@ class OnDeviceWrapperPackager(context: Context) {
                 require(passthroughProof == null) {
                     "converted 예약에는 passthrough CRX3를 사용할 수 없습니다."
                 }
-                val (crxIdentity, publicKey, extensionId) = withConversionKeyStoreBoundary {
-                    val current = identityStore.existingCrxIdentity(reservation.identitySha256)
-                    val currentPublicKey = current.certificate.publicKey.encoded.copyOf()
-                    Triple(current, currentPublicKey, Crx3.extensionId(currentPublicKey))
-                }
+                val crxProof = keyStoreAccess.existingCrxIdentityProof(
+                    reservation.identitySha256,
+                )
                 OnDevicePackageIdentity(
-                    extensionId = extensionId,
-                    packageName = "dev.sixbridge.ext.$extensionId",
+                    extensionId = crxProof.extensionId,
+                    packageName = "dev.sixbridge.ext.${crxProof.extensionId}",
                     wrapperSignerSha256 = wrapperSignerSha256,
-                    crxKeyAlias = crxIdentity.alias,
-                    crxPublicKeyDer = publicKey,
+                    crxKeyAlias = crxProof.alias,
+                    crxPublicKeyDer = crxProof.publicKeyDer,
                 )
             }
         }
@@ -387,21 +455,16 @@ class OnDeviceWrapperPackager(context: Context) {
         require(identityKey.mode == InstallationIdentityMode.CONVERTED) {
             "converted CreateNew 신원만 미예약 lease를 만들 수 있습니다."
         }
-        val wrapperSignerSha256 = withConversionKeyStoreBoundary {
-            sha256(identityStore.wrapperIdentity().certificate.encoded)
-        }
-        val (crxIdentity, publicKey, extensionId) = withConversionKeyStoreBoundary {
-            val current = identityStore.createCrxIdentityIfAbsent(identityKey.identitySha256)
-                ?: identityStore.existingCrxIdentity(identityKey.identitySha256)
-            val currentPublicKey = current.certificate.publicKey.encoded.copyOf()
-            Triple(current, currentPublicKey, Crx3.extensionId(currentPublicKey))
-        }
+        val wrapperSignerSha256 = keyStoreAccess.wrapperSignerSha256()
+        val crxProof = keyStoreAccess.createOrExistingCrxIdentityProof(
+            identityKey.identitySha256,
+        )
         val identity = OnDevicePackageIdentity(
-            extensionId = extensionId,
-            packageName = "dev.sixbridge.ext.$extensionId",
+            extensionId = crxProof.extensionId,
+            packageName = "dev.sixbridge.ext.${crxProof.extensionId}",
             wrapperSignerSha256 = wrapperSignerSha256,
-            crxKeyAlias = crxIdentity.alias,
-            crxPublicKeyDer = publicKey,
+            crxKeyAlias = crxProof.alias,
+            crxPublicKeyDer = crxProof.publicKeyDer,
         )
         testHooks?.afterUnreservedIdentityCreated?.invoke()
         return UnreservedIdentityLease(identityKey.identitySha256, identity, ownerToken)
@@ -516,11 +579,9 @@ class OnDeviceWrapperPackager(context: Context) {
                     Crx3Writer.create(
                         requireNotNull(request.canonicalSourceZip),
                         generatedCrx,
-                        withConversionKeyStoreBoundary {
-                            identityStore.existingCrxSigningKey(
-                                request.reservation.identitySha256,
-                            )
-                        },
+                        keyStoreAccess.existingCrxSigningKey(
+                            request.reservation.identitySha256,
+                        ),
                     )
                     generatedCrx
                 }
@@ -559,7 +620,7 @@ class OnDeviceWrapperPackager(context: Context) {
                 val signing = apkSigner.sign(
                     unsigned.toFile(),
                     signed.toFile(),
-                    withConversionKeyStoreBoundary { identityStore.wrapperIdentity() },
+                    keyStoreAccess.wrapperSigningIdentity(),
                 )
                 require(signing.signerCertificateSha256 == identity.wrapperSignerSha256) {
                     "wrapper signer가 사전 해석한 package identity와 일치하지 않습니다."

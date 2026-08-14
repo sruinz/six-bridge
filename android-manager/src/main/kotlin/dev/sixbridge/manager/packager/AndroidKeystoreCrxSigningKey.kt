@@ -3,19 +3,31 @@ package dev.sixbridge.manager.packager
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.manager.conversion.withConversionKeyStoreBoundary
 import java.io.InputStream
+import java.security.PrivateKey
 import java.security.Signature
 
-class AndroidKeystoreCrxSigningKey(
-    private val identity: AndroidSigningIdentity,
+class AndroidKeystoreCrxSigningKey private constructor(
+    private val privateKey: PrivateKey,
+    private val publicKeyDerSource: () -> ByteArray,
 ) : Crx3SigningKey {
+    constructor(identity: AndroidSigningIdentity) : this(
+        privateKey = identity.privateKey,
+        publicKeyDerSource = { identity.certificate.publicKey.encoded.copyOf() },
+    )
+
+    internal constructor(privateKey: PrivateKey, publicKeyDer: ByteArray) : this(
+        privateKey = privateKey,
+        publicKeyDerSource = { publicKeyDer.copyOf() },
+    )
+
     override fun publicKeyDer(): ByteArray = withConversionKeyStoreBoundary {
-        identity.certificate.publicKey.encoded.copyOf()
+        publicKeyDerSource()
     }
 
     override fun signSha256Rsa(payload: ByteArray): ByteArray =
         withConversionKeyStoreBoundary {
             Signature.getInstance("SHA256withRSA").run {
-                initSign(identity.privateKey)
+                initSign(privateKey)
                 update(payload)
                 sign()
             }
@@ -24,7 +36,7 @@ class AndroidKeystoreCrxSigningKey(
     override fun signSha256Rsa(payload: InputStream): ByteArray {
         val signature = withConversionKeyStoreBoundary {
             Signature.getInstance("SHA256withRSA").apply {
-                initSign(identity.privateKey)
+                initSign(privateKey)
             }
         }
         val buffer = ByteArray(64 * 1024)

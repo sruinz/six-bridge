@@ -10,10 +10,15 @@ import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.app.ReviewBundle
+import dev.sixbridge.manager.packager.AndroidKeystoreCrxSigningKey
+import dev.sixbridge.manager.packager.AndroidSigningIdentity
+import dev.sixbridge.manager.packager.DefaultOnDevicePackagerKeyStoreAccess
 import dev.sixbridge.manager.packager.OnDevicePackageIdentity
+import dev.sixbridge.manager.packager.OnDevicePackagerKeyStoreSource
 import dev.sixbridge.manager.wrapper.InstalledWrapper
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.PrivateKey
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -669,6 +674,79 @@ class OnDeviceConversionCoordinatorTest {
                 assertEquals(case.expected, failure.code, case.name)
             }
         }
+
+    @Test
+    fun `actual keystore 작업 실패는 default 경계를 거쳐 최종 KEYSTORE다`() = runTest {
+        data class Case(
+            val name: String,
+            val configure: Fixture.() -> Unit,
+        )
+
+        val cases = listOf(
+            Case("JCA initSign") {
+                useDefaultPackagePort = true
+                packageAction = {
+                    AndroidKeystoreCrxSigningKey(
+                        privateKey = incompatiblePrivateKey(),
+                        publicKeyDer = byteArrayOf(),
+                    ).signSha256Rsa("payload".encodeToByteArray())
+                }
+            },
+            Case("missing CRX alias") {
+                useDefaultIdentityPort = true
+                identityAction = {
+                    keyStoreAccess(
+                        existingCrxIdentity = { error("missing CRX alias") },
+                    ).existingCrxIdentityProof(IDENTITY_SHA)
+                }
+            },
+            Case("corrupt public-key proof") {
+                useDefaultIdentityPort = true
+                identityAction = {
+                    keyStoreAccess(
+                        existingCrxIdentity = { error("corrupt public-key proof") },
+                    ).existingCrxIdentityProof(IDENTITY_SHA)
+                }
+            },
+            Case("fallback missing CRX alias") {
+                useDefaultIdentityPort = true
+                identityAction = {
+                    keyStoreAccess(
+                        createCrxIdentityIfAbsent = { null },
+                        existingCrxIdentity = { error("fallback CRX alias missing") },
+                    ).createOrExistingCrxIdentityProof(IDENTITY_SHA)
+                }
+            },
+            Case("CRX key create") {
+                useDefaultIdentityPort = true
+                identityAction = {
+                    keyStoreAccess(
+                        createCrxIdentityIfAbsent = { error("CRX key create failed") },
+                    ).createOrExistingCrxIdentityProof(IDENTITY_SHA)
+                }
+            },
+        )
+
+        cases.forEach { case ->
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply(case.configure)
+            val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            val failure = assertIs<ConversionBuildResult.Failure>(
+                fixture.coordinator().build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    true,
+                    null,
+                ),
+            )
+
+            assertEquals(ConversionFailureCode.KEYSTORE, failure.code, case.name)
+        }
+    }
 
     @Test
     fun `blocked와 미확인 partial은 reserve 전에 차단한다`() = runTest {
@@ -1385,11 +1463,13 @@ class OnDeviceConversionCoordinatorTest {
         var installedWrapper: InstalledWrapper? = null
         var reserveFailure: Throwable? = null
         var identityFailure: Throwable? = null
+        var identityAction: (() -> Unit)? = null
         var identityAbortFailure: Throwable? = null
         var importFailuresRemaining = 0
         var packageFailuresRemaining = 0
         var optionalApprovals: Set<String> = emptySet()
         var packageFailure: Throwable? = null
+        var packageAction: (() -> Unit)? = null
         var bundleFailure: Throwable? = null
         var importFailure: Throwable? = null
         var useDefaultIdentityPort = false
@@ -1603,6 +1683,7 @@ class OnDeviceConversionCoordinatorTest {
                     ownerToken: String,
                 ): ResolvedPackageIdentity {
                     events += "identity"
+                    identityAction?.invoke()
                     identityFailure?.let { throw it }
                     return ResolvedPackageIdentity(
                         key = InstallationIdentityKey.create(
@@ -1664,6 +1745,7 @@ class OnDeviceConversionCoordinatorTest {
                     packageEntered?.complete(Unit)
                     try {
                         packageRelease?.await()
+                        packageAction?.invoke()
                         packageFailure?.let { throw it }
                         if (packageFailuresRemaining-- > 0) {
                             error("package failed")
@@ -1802,6 +1884,35 @@ class OnDeviceConversionCoordinatorTest {
         private val EXTENSION_ID = "a".repeat(32)
         private val PACKAGE = "dev.sixbridge.ext.$EXTENSION_ID"
         private val CLAIMED_TOKEN = "77777777-7777-4777-8777-777777777777"
+        private val IDENTITY_SHA = "1".repeat(64)
+
+        private fun incompatiblePrivateKey() = object : PrivateKey {
+            override fun getAlgorithm() = "EC"
+            override fun getFormat() = "PKCS#8"
+            override fun getEncoded() = byteArrayOf()
+        }
+
+        private fun keyStoreAccess(
+            createCrxIdentityIfAbsent: (String) -> AndroidSigningIdentity? = {
+                error("unexpected createCrxIdentityIfAbsent")
+            },
+            existingCrxIdentity: (String) -> AndroidSigningIdentity = {
+                error("unexpected existingCrxIdentity")
+            },
+        ) = DefaultOnDevicePackagerKeyStoreAccess(
+            object : OnDevicePackagerKeyStoreSource {
+                override fun crxAlias(identitySha256: String) = error("unexpected crxAlias")
+                override fun wrapperIdentity() = error("unexpected wrapperIdentity")
+                override fun existingWrapperIdentity() =
+                    error("unexpected existingWrapperIdentity")
+                override fun createCrxIdentityIfAbsent(identitySha256: String) =
+                    createCrxIdentityIfAbsent(identitySha256)
+                override fun existingCrxIdentity(identitySha256: String) =
+                    existingCrxIdentity(identitySha256)
+                override fun existingCrxSigningKey(identitySha256: String) =
+                    error("unexpected existingCrxSigningKey")
+            },
+        )
 
         private fun profile(versionCode: Long = 1) = BrowserProfile(
             browserPackage = "com.sec.android.app.sbrowser",
