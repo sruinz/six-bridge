@@ -400,7 +400,7 @@ class OnDeviceWrapperRequestTest {
             lifecycleUpdatedAtEpochMillis: Long,
         ): Int = error("unused")
 
-        override suspend fun deleteCleaningIdentity(
+        override suspend fun retireCleaningIdentity(
             identitySha256: String,
             provisionOwnerToken: String?,
             crxKeyAlias: String?,
@@ -409,6 +409,7 @@ class OnDeviceWrapperRequestTest {
             extensionId: String,
             packageName: String,
             wrapperSignerSha256: String,
+            lifecycleUpdatedAtEpochMillis: Long,
         ): Int = error("unused")
 
         override suspend fun updateForReservation(
@@ -417,6 +418,21 @@ class OnDeviceWrapperRequestTest {
             lastReservedVersionCode: Int,
             expectedLifecycleState: String,
             expectedProvisionOwnerToken: String?,
+        ): Int = error("unused")
+
+        override suspend fun reactivateRetiredForReservation(
+            identitySha256: String,
+            displayName: String,
+            expectedLastReservedVersionCode: Int,
+            lastReservedVersionCode: Int,
+            reservationOwnerToken: String,
+            expectedMode: String,
+            expectedExtensionId: String,
+            expectedPackageName: String,
+            expectedWrapperSignerSha256: String,
+            expectedCrxKeyAlias: String?,
+            expectedCrxPublicKeySha256: String?,
+            lifecycleUpdatedAtEpochMillis: Long,
         ): Int = error("unused")
 
         override suspend fun reserve(

@@ -242,18 +242,6 @@ class OnDeviceWrapperPackager(context: Context) {
 
             override fun inspect(identitySha256: String): ConversionIdentityKeyProof =
                 inspectIdentityKey(identitySha256)
-
-            override fun delete(
-                identitySha256: String,
-                expectedAlias: String,
-                expectedExtensionId: String,
-                expectedPublicKeySha256: String,
-            ): Boolean = deleteUnreservedIdentity(
-                identitySha256 = identitySha256,
-                expectedAlias = expectedAlias,
-                expectedExtensionId = expectedExtensionId,
-                expectedPublicKeySha256 = expectedPublicKeySha256,
-            )
         }
 
     @Synchronized

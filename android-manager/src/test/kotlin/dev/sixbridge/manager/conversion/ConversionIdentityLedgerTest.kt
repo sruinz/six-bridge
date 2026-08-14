@@ -1203,7 +1203,7 @@ class ConversionIdentityLedgerTest {
             }
         }
 
-        override suspend fun deleteCleaningIdentity(
+        override suspend fun retireCleaningIdentity(
             identitySha256: String,
             provisionOwnerToken: String?,
             crxKeyAlias: String?,
@@ -1212,6 +1212,7 @@ class ConversionIdentityLedgerTest {
             extensionId: String,
             packageName: String,
             wrapperSignerSha256: String,
+            lifecycleUpdatedAtEpochMillis: Long,
         ): Int = synchronized(rows) {
             val current = rows[identitySha256]
             if (current?.lifecycleState != ConversionIdentityLifecycleState.CLEANING.name ||
@@ -1225,7 +1226,11 @@ class ConversionIdentityLedgerTest {
             ) {
                 0
             } else {
-                rows.remove(identitySha256)
+                rows[identitySha256] = current.copy(
+                    lifecycleState = ConversionIdentityLifecycleState.RETIRED.name,
+                    provisionOwnerToken = null,
+                    lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
+                )
                 1
             }
         }
@@ -1247,6 +1252,44 @@ class ConversionIdentityLedgerTest {
                 rows[identitySha256] = current.copy(
                     displayName = displayName,
                     lastReservedVersionCode = lastReservedVersionCode,
+                )
+                1
+            }
+        }
+
+        override suspend fun reactivateRetiredForReservation(
+            identitySha256: String,
+            displayName: String,
+            expectedLastReservedVersionCode: Int,
+            lastReservedVersionCode: Int,
+            reservationOwnerToken: String,
+            expectedMode: String,
+            expectedExtensionId: String,
+            expectedPackageName: String,
+            expectedWrapperSignerSha256: String,
+            expectedCrxKeyAlias: String?,
+            expectedCrxPublicKeySha256: String?,
+            lifecycleUpdatedAtEpochMillis: Long,
+        ): Int = synchronized(rows) {
+            val current = rows[identitySha256]
+            if (current?.lifecycleState != ConversionIdentityLifecycleState.RETIRED.name ||
+                current.provisionOwnerToken != null ||
+                current.lastReservedVersionCode != expectedLastReservedVersionCode ||
+                current.mode != expectedMode ||
+                current.extensionId != expectedExtensionId ||
+                current.packageName != expectedPackageName ||
+                current.wrapperSignerSha256 != expectedWrapperSignerSha256 ||
+                current.crxKeyAlias != expectedCrxKeyAlias ||
+                current.crxPublicKeySha256 != expectedCrxPublicKeySha256
+            ) {
+                0
+            } else {
+                rows[identitySha256] = current.copy(
+                    displayName = displayName,
+                    lastReservedVersionCode = lastReservedVersionCode,
+                    lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                    provisionOwnerToken = reservationOwnerToken,
+                    lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
                 )
                 1
             }

@@ -43,19 +43,12 @@ internal interface ConversionIdentityKeyInspector {
     ): T
 
     fun inspect(identitySha256: String): ConversionIdentityKeyProof
-
-    fun delete(
-        identitySha256: String,
-        expectedAlias: String,
-        expectedExtensionId: String,
-        expectedPublicKeySha256: String,
-    ): Boolean
 }
 
 internal data class ConversionIdentityManagementHooks(
     val afterCleanupClaim: () -> Unit = {},
-    val afterAliasDeleted: () -> Unit = {},
-    val beforeRowDelete: () -> Unit = {},
+    val afterFinalProof: () -> Unit = {},
+    val beforeRowRetire: () -> Unit = {},
 )
 
 class ConversionIdentityManagement internal constructor(
@@ -105,6 +98,11 @@ class ConversionIdentityManagement internal constructor(
         requireSha256(identitySha256, "이전 버전 identity")
         val current = dao.get(identitySha256)
             ?: return@withLock ConversionIdentityCleanupResult.NothingOwned
+        if (current.lifecycleState == ConversionIdentityLifecycleState.RETIRED.name &&
+            current.provisionOwnerToken == null
+        ) {
+            return@withLock ConversionIdentityCleanupResult.NothingOwned
+        }
         if (current.provisionOwnerToken != null ||
             current.lifecycleState !in setOf(
                 ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
@@ -225,7 +223,7 @@ class ConversionIdentityManagement internal constructor(
         }
         val mode = enumValueOrNull<InstallationIdentityMode>(current.mode)
             ?: return blocked("CLEANING identity mode가 손상되었습니다.")
-        val inspectedKey = when (mode) {
+        when (mode) {
             InstallationIdentityMode.CONVERTED -> {
                 val alias = current.crxKeyAlias
                     ?.takeIf(String::isNotBlank)
@@ -234,7 +232,7 @@ class ConversionIdentityManagement internal constructor(
                     ?.takeIf(CLEANUP_SHA256::matches)
                     ?: return blocked("CLEANING converted identity 공개 키 proof가 없습니다.")
                 when (val inspected = keyInspector.inspect(current.identitySha256)) {
-                    ConversionIdentityKeyProof.Absent -> null
+                    ConversionIdentityKeyProof.Absent -> Unit
                     is ConversionIdentityKeyProof.Unreadable -> return blocked(inspected.reason)
                     is ConversionIdentityKeyProof.Verified -> {
                         if (inspected.alias != alias ||
@@ -243,7 +241,6 @@ class ConversionIdentityManagement internal constructor(
                         ) {
                             return blocked("CLEANING converted identity key binding이 일치하지 않습니다.")
                         }
-                        inspected
                     }
                 }
             }
@@ -253,34 +250,21 @@ class ConversionIdentityManagement internal constructor(
                 if (current.crxKeyAlias != null || current.crxPublicKeySha256 != null) {
                     return blocked("CLEANING 외부 서명 identity key proof가 손상되었습니다.")
                 }
-                null
             }
         }
         val boundary = readExternalBoundary(current)
         if (boundary is CleanupBoundary.Blocked) return blocked(boundary.reason)
-        if (mode == InstallationIdentityMode.CONVERTED) {
-            if (inspectedKey != null) {
-                val deleted = runCatching {
-                    keyInspector.delete(
-                        identitySha256 = current.identitySha256,
-                        expectedAlias = inspectedKey.alias,
-                        expectedExtensionId = inspectedKey.extensionId,
-                        expectedPublicKeySha256 = inspectedKey.publicKeySha256,
-                    )
-                }.getOrElse { return blocked("CLEANING alias 삭제 proof를 확인할 수 없습니다.") }
-                if (!deleted) return blocked("CLEANING alias를 삭제하지 못했습니다.")
-            }
-            hooks.afterAliasDeleted()
-        }
-        hooks.beforeRowDelete()
-        val deleted = dao.deleteClaimedIdentity(
+        hooks.afterFinalProof()
+        hooks.beforeRowRetire()
+        val retired = dao.retireClaimedIdentity(
             expected = current,
             observedBundleProof = (boundary as CleanupBoundary.Allowed).bundleProof,
+            lifecycleUpdatedAtEpochMillis = now(),
         )
-        return if (deleted) {
+        return if (retired) {
             ConversionIdentityCleanupResult.Removed
         } else {
-            blocked("CLEANING identity row를 삭제하지 못했습니다.")
+            blocked("CLEANING identity를 안전하게 retire하지 못했습니다.")
         }
     }
 

@@ -9,6 +9,7 @@ internal enum class ConversionIdentityLifecycleState {
     ACTIVE,
     LEGACY_UNKNOWN,
     CLEANING,
+    RETIRED,
 }
 
 @Entity(

@@ -404,6 +404,40 @@ class ConversionWorkStoreTest {
         }
 
     @Test
+    fun `external identity는 실패 release와 job discard 뒤 재예약해도 version high watermark를 넘긴다`() =
+        runTest {
+            val work = store()
+            val ledger = ConversionIdentityLedger(identityDao)
+            val identityKey = InstallationIdentityKey.create(
+                logicalSourceIdentity = LogicalSourceIdentity.projectMarker("1".repeat(32)),
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            )
+            val request = ConversionIdentityReservation(
+                identityKey = identityKey,
+                displayName = "External identity",
+                packageBinding = ConversionPackageBinding(
+                    extensionId = "c".repeat(32),
+                    packageName = "dev.sixbridge.ext.${"c".repeat(32)}",
+                    wrapperSignerSha256 = "d".repeat(64),
+                    crxKeyAlias = null,
+                    crxPublicKeySha256 = null,
+                ),
+                installedVersionCode = null,
+            )
+            val firstJob = work.create(artifact("first external".encodeToByteArray()))
+            val first = ledger.reserve(request, firstJob.token)
+            assertEquals(1, first.versionCode)
+            assertTrue(ledger.releaseFailedAttempt(firstJob.token))
+            assertTrue(work.discard(firstJob.token))
+
+            val secondJob = work.create(artifact("second external".encodeToByteArray()))
+            val second = ledger.reserve(request, secondJob.token)
+
+            assertEquals(2, second.versionCode)
+        }
+
+    @Test
     fun `DISCARDING claim은 stale BUILDING bundle publish를 차단한다`() = runTest {
         val buildStore = readyToBuildStore()
         val token = requireNotNull(dao.get()).token
@@ -1818,13 +1852,6 @@ class ConversionWorkStoreTest {
 
             override fun inspect(identitySha256: String): ConversionIdentityKeyProof =
                 error("passthrough identity cleanup은 key inspector를 호출하지 않아야 합니다.")
-
-            override fun delete(
-                identitySha256: String,
-                expectedAlias: String,
-                expectedExtensionId: String,
-                expectedPublicKeySha256: String,
-            ): Boolean = error("passthrough identity cleanup은 key를 삭제하지 않아야 합니다.")
         },
         currentTimeMillis = { now },
     )
@@ -2237,7 +2264,7 @@ class ConversionWorkStoreTest {
             )
             return 1
         }
-        override suspend fun deleteCleaningIdentity(
+        override suspend fun retireCleaningIdentity(
             identitySha256: String,
             provisionOwnerToken: String?,
             crxKeyAlias: String?,
@@ -2246,6 +2273,7 @@ class ConversionWorkStoreTest {
             extensionId: String,
             packageName: String,
             wrapperSignerSha256: String,
+            lifecycleUpdatedAtEpochMillis: Long,
         ): Int {
             val current = identities[identitySha256]
             if (current?.lifecycleState != ConversionIdentityLifecycleState.CLEANING.name ||
@@ -2259,7 +2287,11 @@ class ConversionWorkStoreTest {
             ) {
                 return 0
             }
-            identities.remove(identitySha256)
+            identities[identitySha256] = current.copy(
+                lifecycleState = ConversionIdentityLifecycleState.RETIRED.name,
+                provisionOwnerToken = null,
+                lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
+            )
             return 1
         }
         override suspend fun updateForReservation(
@@ -2279,6 +2311,42 @@ class ConversionWorkStoreTest {
             identities[identitySha256] = current.copy(
                 displayName = displayName,
                 lastReservedVersionCode = lastReservedVersionCode,
+            )
+            return 1
+        }
+        override suspend fun reactivateRetiredForReservation(
+            identitySha256: String,
+            displayName: String,
+            expectedLastReservedVersionCode: Int,
+            lastReservedVersionCode: Int,
+            reservationOwnerToken: String,
+            expectedMode: String,
+            expectedExtensionId: String,
+            expectedPackageName: String,
+            expectedWrapperSignerSha256: String,
+            expectedCrxKeyAlias: String?,
+            expectedCrxPublicKeySha256: String?,
+            lifecycleUpdatedAtEpochMillis: Long,
+        ): Int {
+            val current = identities[identitySha256]
+            if (current?.lifecycleState != ConversionIdentityLifecycleState.RETIRED.name ||
+                current.provisionOwnerToken != null ||
+                current.lastReservedVersionCode != expectedLastReservedVersionCode ||
+                current.mode != expectedMode ||
+                current.extensionId != expectedExtensionId ||
+                current.packageName != expectedPackageName ||
+                current.wrapperSignerSha256 != expectedWrapperSignerSha256 ||
+                current.crxKeyAlias != expectedCrxKeyAlias ||
+                current.crxPublicKeySha256 != expectedCrxPublicKeySha256
+            ) {
+                return 0
+            }
+            identities[identitySha256] = current.copy(
+                displayName = displayName,
+                lastReservedVersionCode = lastReservedVersionCode,
+                lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisionOwnerToken = reservationOwnerToken,
+                lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
             )
             return 1
         }

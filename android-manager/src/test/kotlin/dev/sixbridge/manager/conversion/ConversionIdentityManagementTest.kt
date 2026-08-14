@@ -143,7 +143,7 @@ class ConversionIdentityManagementTest {
     }
 
     @Test
-    fun `PASSTHROUGH와 PREPARED는 null alias proof를 확인하고 Keystore 없이 row만 제거한다`() = runTest {
+    fun `PASSTHROUGH와 PREPARED는 Keystore 없이 high watermark row를 retire한다`() = runTest {
         val passthrough = externalIdentity(
             identitySha256 = "a".repeat(64),
             ownerToken = JOB_ONE,
@@ -166,10 +166,9 @@ class ConversionIdentityManagementTest {
             management().discardIdentityOwner(JOB_TWO),
         )
 
-        assertNull(dao.get(passthrough.identitySha256))
-        assertNull(dao.get(prepared.identitySha256))
+        assertRetired(passthrough)
+        assertRetired(prepared)
         assertEquals(0, keys.inspectCalls)
-        assertEquals(0, keys.deleteCalls)
     }
 
     @Test
@@ -220,14 +219,14 @@ class ConversionIdentityManagementTest {
         assertTrue(keys.contains(target.identitySha256))
 
         assertTrue(management().recoverIdentityCleanup())
-        assertNull(dao.get(target.identitySha256))
-        assertFalse(keys.contains(target.identitySha256))
+        assertRetired(target)
+        assertTrue(keys.contains(target.identitySha256))
         assertEquals(other, dao.get(other.identitySha256))
         assertTrue(keys.contains(other.identitySha256))
     }
 
     @Test
-    fun `alias 삭제 직후 crash는 CLEANING row만 남기고 startup이 row delete를 재개한다`() = runTest {
+    fun `final proof 직후 crash는 CLEANING key를 남기고 startup이 retire를 재개한다`() = runTest {
         val target = convertedIdentity(identitySha256 = "2a".repeat(32), ownerToken = JOB_ONE)
         dao.insert(target)
         keys.add(keyProof(target))
@@ -235,19 +234,20 @@ class ConversionIdentityManagementTest {
         assertFailsWith<IllegalStateException> {
             management(
                 hooks = ConversionIdentityManagementHooks(
-                    afterAliasDeleted = { error("simulated crash after alias delete") },
+                    afterFinalProof = { error("simulated crash after final proof") },
                 ),
             ).discardIdentityOwner(JOB_ONE)
         }
         assertEquals(ConversionIdentityLifecycleState.CLEANING.name, dao.get(target.identitySha256)?.lifecycleState)
-        assertFalse(keys.contains(target.identitySha256))
+        assertTrue(keys.contains(target.identitySha256))
 
         assertTrue(management().recoverIdentityCleanup())
-        assertNull(dao.get(target.identitySha256))
+        assertRetired(target)
+        assertTrue(keys.contains(target.identitySha256))
     }
 
     @Test
-    fun `row delete 직전 crash는 alias absent CLEANING을 idempotent하게 마무리한다`() = runTest {
+    fun `row retire 직전 crash는 CLEANING key를 보존하고 idempotent하게 마무리한다`() = runTest {
         val target = convertedIdentity(identitySha256 = "3a".repeat(32), ownerToken = JOB_ONE)
         dao.insert(target)
         keys.add(keyProof(target))
@@ -255,19 +255,20 @@ class ConversionIdentityManagementTest {
         assertFailsWith<IllegalStateException> {
             management(
                 hooks = ConversionIdentityManagementHooks(
-                    beforeRowDelete = { error("simulated crash before row delete") },
+                    beforeRowRetire = { error("simulated crash before row retire") },
                 ),
             ).discardIdentityOwner(JOB_ONE)
         }
         assertNotNull(dao.get(target.identitySha256))
-        assertFalse(keys.contains(target.identitySha256))
+        assertTrue(keys.contains(target.identitySha256))
 
         assertTrue(management().recoverIdentityCleanup())
-        assertNull(dao.get(target.identitySha256))
+        assertRetired(target)
+        assertTrue(keys.contains(target.identitySha256))
     }
 
     @Test
-    fun `v4 converted legacy는 exact alias public key를 CLEANING CAS에 저장한 뒤 삭제한다`() = runTest {
+    fun `v4 converted legacy는 exact public key를 CLEANING CAS에 저장한 뒤 retire한다`() = runTest {
         val legacy = convertedIdentity(
             identitySha256 = "4a".repeat(32),
             ownerToken = null,
@@ -290,7 +291,13 @@ class ConversionIdentityManagementTest {
         assertEquals(proof.publicKeySha256, cleaning.crxPublicKeySha256)
         assertTrue(keys.contains(legacy.identitySha256))
         assertTrue(management().recoverIdentityCleanup())
-        assertNull(dao.get(legacy.identitySha256))
+        val retired = assertRetired(legacy)
+        assertEquals(proof.publicKeySha256, retired.crxPublicKeySha256)
+        assertTrue(keys.contains(legacy.identitySha256))
+        assertEquals(
+            ConversionIdentityCleanupResult.NothingOwned,
+            management().discardLegacyUnknown(legacy.identitySha256),
+        )
     }
 
     @Test
@@ -310,6 +317,83 @@ class ConversionIdentityManagementTest {
         assertTrue(keys.contains(target.identitySha256))
         assertEquals(2, bundleProofs.readCalls)
     }
+
+    @Test
+    fun `두 번째 proof 직후 exact wrapper가 설치되어도 converted key를 영구 삭제하지 않는다`() =
+        runTest {
+            val target = convertedIdentity(identitySha256 = "5b".repeat(32), ownerToken = JOB_ONE)
+            dao.insert(target)
+            keys.add(keyProof(target))
+            bundleProofs.afterRead = { readCount ->
+                if (readCount == 2) installed.current = installed(target)
+            }
+
+            management().discardIdentityOwner(JOB_ONE)
+
+            assertNotNull(installed.current)
+            assertNotNull(dao.get(target.identitySha256))
+            assertTrue(keys.contains(target.identitySha256))
+        }
+
+    @Test
+    fun `두 번째 proof 직후 BUNDLE_READY 전이는 CLEANING row와 converted key를 모두 보존한다`() =
+        runTest {
+            val target = convertedIdentity(identitySha256 = "5c".repeat(32), ownerToken = JOB_ONE)
+            dao.insert(target)
+            keys.add(keyProof(target))
+            bundleProofs.afterRead = { readCount ->
+                if (readCount == 2) {
+                    setBundleReadyJob(
+                        JOB_TWO,
+                        VerifiedIdentityProof(
+                            packageName = "dev.sixbridge.ext.${"c".repeat(32)}",
+                            extensionId = "c".repeat(32),
+                            wrapperSignerSha256 = SIGNER,
+                            versionCode = 9,
+                        ),
+                    )
+                }
+            }
+
+            val result = management().discardIdentityOwner(JOB_ONE)
+
+            assertIs<ConversionIdentityCleanupResult.Blocked>(result)
+            assertEquals(
+                ConversionIdentityLifecycleState.CLEANING.name,
+                dao.get(target.identitySha256)?.lifecycleState,
+            )
+            assertTrue(keys.contains(target.identitySha256))
+        }
+
+    @Test
+    fun `real Room은 RETIRED external high watermark를 다음 PROVISIONAL owner에게 원자적으로 잇는다`() =
+        runTest {
+            val target = externalIdentity(
+                identitySha256 = "5d".repeat(32),
+                ownerToken = JOB_ONE,
+                mode = InstallationIdentityMode.PASSTHROUGH,
+            )
+            dao.insert(target)
+            assertEquals(
+                ConversionIdentityCleanupResult.Removed,
+                management().discardIdentityOwner(JOB_ONE),
+            )
+
+            val reserved = dao.reserve(
+                requested = target.copy(displayName = "Reactivated external"),
+                installedVersionCode = null,
+                readyOwnerToken = null,
+                reservationOwnerToken = JOB_TWO,
+                createdAtEpochMillis = 2345L,
+                crxPublicKeySha256 = null,
+            )
+
+            assertEquals(5, reserved.lastReservedVersionCode)
+            assertEquals(ConversionIdentityLifecycleState.PROVISIONAL.name, reserved.lifecycleState)
+            assertEquals(JOB_TWO, reserved.provisionOwnerToken)
+            assertEquals(reserved, dao.get(target.identitySha256))
+            assertEquals(5, dao.getLease(target.identitySha256)?.reservedVersionCode)
+        }
 
     @Test
     fun `legacy 목록은 exact command fields만 lifecycle 순서로 반환한다`() = runTest {
@@ -362,6 +446,15 @@ class ConversionIdentityManagementTest {
         currentTimeMillis = { 1234L },
         hooks = hooks,
     )
+
+    private suspend fun assertRetired(
+        original: ConversionIdentityEntity,
+    ): ConversionIdentityEntity = requireNotNull(dao.get(original.identitySha256)).also { retired ->
+        assertEquals(ConversionIdentityLifecycleState.RETIRED.name, retired.lifecycleState)
+        assertNull(retired.provisionOwnerToken)
+        assertEquals(original.lastReservedVersionCode, retired.lastReservedVersionCode)
+        assertEquals(original.crxKeyAlias, retired.crxKeyAlias)
+    }
 
     private suspend fun setBundleReadyJob(
         ownerToken: String,
@@ -494,6 +587,7 @@ class ConversionIdentityManagementTest {
     private class FakeCurrentBundleReadyProofReader : CurrentBundleReadyProofReader {
         var current: CurrentBundleReadyProof = CurrentBundleReadyProof.Absent
         private val queued = ArrayDeque<CurrentBundleReadyProof>()
+        var afterRead: suspend (Int) -> Unit = {}
         var readCalls = 0
             private set
 
@@ -503,15 +597,15 @@ class ConversionIdentityManagementTest {
 
         override suspend fun read(): CurrentBundleReadyProof {
             readCalls += 1
-            return if (queued.isEmpty()) current else queued.removeFirst()
+            val result = if (queued.isEmpty()) current else queued.removeFirst()
+            afterRead(readCalls)
+            return result
         }
     }
 
     private class FakeConversionIdentityKeyInspector : ConversionIdentityKeyInspector {
         private val proofs = linkedMapOf<String, ConversionIdentityKeyProof.Verified>()
         var inspectCalls = 0
-            private set
-        var deleteCalls = 0
             private set
         val size: Int
             get() = proofs.size
@@ -532,22 +626,6 @@ class ConversionIdentityManagementTest {
             return proofs[identitySha256] ?: ConversionIdentityKeyProof.Absent
         }
 
-        override fun delete(
-            identitySha256: String,
-            expectedAlias: String,
-            expectedExtensionId: String,
-            expectedPublicKeySha256: String,
-        ): Boolean {
-            deleteCalls += 1
-            val current = proofs[identitySha256] ?: return true
-            require(
-                current.alias == expectedAlias &&
-                    current.extensionId == expectedExtensionId &&
-                    current.publicKeySha256 == expectedPublicKeySha256,
-            )
-            proofs.remove(identitySha256)
-            return true
-        }
     }
 
     private companion object {

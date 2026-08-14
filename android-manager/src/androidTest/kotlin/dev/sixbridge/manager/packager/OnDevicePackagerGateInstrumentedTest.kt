@@ -772,7 +772,7 @@ class OnDevicePackagerGateInstrumentedTest {
     }
 
     @Test
-    fun identityCleanupInspectorRequiresExactAliasExtensionAndPublicKeyProof() = runBlocking {
+    fun identityCleanupInspectorReadsExactProofWithoutDeletingAliases() = runBlocking {
         val firstKey = InstallationIdentityKey.create(
             LogicalSourceIdentity.projectMarker(UUID.randomUUID().toString().replace("-", "")),
             profileMajorVersion = 28,
@@ -805,26 +805,18 @@ class OnDevicePackagerGateInstrumentedTest {
                 proof,
             )
 
-            assertThrows(IllegalArgumentException::class.java) {
-                inspector.delete(
-                    identitySha256 = firstKey.identitySha256,
-                    expectedAlias = firstAlias,
-                    expectedExtensionId = other.identity.extensionId,
-                    expectedPublicKeySha256 = firstPublicKeySha256,
-                )
-            }
-            assertTrue(keyStore.containsAlias(firstAlias))
-            assertTrue(keyStore.containsAlias(otherAlias))
-
-            assertTrue(
-                inspector.delete(
-                    identitySha256 = firstKey.identitySha256,
-                    expectedAlias = firstAlias,
-                    expectedExtensionId = first.identity.extensionId,
-                    expectedPublicKeySha256 = firstPublicKeySha256,
+            assertEquals(
+                ConversionIdentityKeyProof.Verified(
+                    alias = otherAlias,
+                    extensionId = other.identity.extensionId,
+                    publicKeySha256 = otherPublicKeySha256,
                 ),
+                inspector.withIdentityLock(otherKey.identitySha256) {
+                    inspector.inspect(otherKey.identitySha256)
+                },
             )
-            assertFalse(keyStore.containsAlias(firstAlias))
+
+            assertTrue(keyStore.containsAlias(firstAlias))
             assertTrue(keyStore.containsAlias(otherAlias))
         } finally {
             packager.deleteUnreservedIdentity(

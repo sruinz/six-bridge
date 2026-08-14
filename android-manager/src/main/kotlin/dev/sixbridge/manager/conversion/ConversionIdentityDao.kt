@@ -164,7 +164,10 @@ interface ConversionIdentityDao {
 
     @Query(
         """
-        DELETE FROM conversion_identities
+        UPDATE conversion_identities
+        SET lifecycleState = 'RETIRED',
+            provisionOwnerToken = NULL,
+            lifecycleUpdatedAtEpochMillis = :lifecycleUpdatedAtEpochMillis
         WHERE identitySha256 = :identitySha256
           AND lifecycleState = 'CLEANING'
           AND (
@@ -185,7 +188,7 @@ interface ConversionIdentityDao {
           AND wrapperSignerSha256 = :wrapperSignerSha256
         """,
     )
-    suspend fun deleteCleaningIdentity(
+    suspend fun retireCleaningIdentity(
         identitySha256: String,
         provisionOwnerToken: String?,
         crxKeyAlias: String?,
@@ -194,6 +197,7 @@ interface ConversionIdentityDao {
         extensionId: String,
         packageName: String,
         wrapperSignerSha256: String,
+        lifecycleUpdatedAtEpochMillis: Long,
     ): Int
 
     @Transaction
@@ -222,9 +226,10 @@ interface ConversionIdentityDao {
     }
 
     @Transaction
-    suspend fun deleteClaimedIdentity(
+    suspend fun retireClaimedIdentity(
         expected: ConversionIdentityEntity,
         observedBundleProof: CurrentBundleReadyProof,
+        lifecycleUpdatedAtEpochMillis: Long,
     ): Boolean {
         if (getLease(expected.identitySha256) != null || !jobMatches(observedBundleProof)) {
             return false
@@ -234,7 +239,7 @@ interface ConversionIdentityDao {
         ) {
             return false
         }
-        return deleteCleaningIdentity(
+        return retireCleaningIdentity(
             identitySha256 = expected.identitySha256,
             provisionOwnerToken = expected.provisionOwnerToken,
             crxKeyAlias = expected.crxKeyAlias,
@@ -243,6 +248,7 @@ interface ConversionIdentityDao {
             extensionId = expected.extensionId,
             packageName = expected.packageName,
             wrapperSignerSha256 = expected.wrapperSignerSha256,
+            lifecycleUpdatedAtEpochMillis = lifecycleUpdatedAtEpochMillis,
         ) == 1
     }
 
@@ -338,6 +344,47 @@ interface ConversionIdentityDao {
         expectedProvisionOwnerToken: String?,
     ): Int
 
+    @Query(
+        """
+        UPDATE conversion_identities
+        SET displayName = :displayName,
+            lastReservedVersionCode = :lastReservedVersionCode,
+            lifecycleState = 'PROVISIONAL',
+            provisionOwnerToken = :reservationOwnerToken,
+            lifecycleUpdatedAtEpochMillis = :lifecycleUpdatedAtEpochMillis
+        WHERE identitySha256 = :identitySha256
+          AND lifecycleState = 'RETIRED'
+          AND provisionOwnerToken IS NULL
+          AND lastReservedVersionCode = :expectedLastReservedVersionCode
+          AND mode = :expectedMode
+          AND extensionId = :expectedExtensionId
+          AND packageName = :expectedPackageName
+          AND wrapperSignerSha256 = :expectedWrapperSignerSha256
+          AND (
+            (:expectedCrxKeyAlias IS NULL AND crxKeyAlias IS NULL)
+            OR crxKeyAlias = :expectedCrxKeyAlias
+          )
+          AND (
+            (:expectedCrxPublicKeySha256 IS NULL AND crxPublicKeySha256 IS NULL)
+            OR crxPublicKeySha256 = :expectedCrxPublicKeySha256
+          )
+        """,
+    )
+    suspend fun reactivateRetiredForReservation(
+        identitySha256: String,
+        displayName: String,
+        expectedLastReservedVersionCode: Int,
+        lastReservedVersionCode: Int,
+        reservationOwnerToken: String,
+        expectedMode: String,
+        expectedExtensionId: String,
+        expectedPackageName: String,
+        expectedWrapperSignerSha256: String,
+        expectedCrxKeyAlias: String?,
+        expectedCrxPublicKeySha256: String?,
+        lifecycleUpdatedAtEpochMillis: Long,
+    ): Int
+
     @Transaction
     suspend fun reserve(
         requested: ConversionIdentityEntity,
@@ -369,6 +416,11 @@ interface ConversionIdentityDao {
                     current.provisionOwnerToken == null,
                 ) {
                     "ACTIVE 설치 신원에 PROVISIONAL owner가 남아 있습니다."
+                }
+                ConversionIdentityLifecycleState.RETIRED.name -> require(
+                    current.provisionOwnerToken == null,
+                ) {
+                    "RETIRED 설치 신원에 owner가 남아 있습니다."
                 }
                 ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
                 ConversionIdentityLifecycleState.CLEANING.name,
@@ -428,6 +480,8 @@ interface ConversionIdentityDao {
         if (next > Int.MAX_VALUE) {
             throw IllegalStateException("versionCode 예약값이 범위를 초과했습니다.")
         }
+        val reactivatingRetired = current?.lifecycleState ==
+            ConversionIdentityLifecycleState.RETIRED.name
         val stored = if (current == null) {
             requested.copy(
                 lastReservedVersionCode = next.toInt(),
@@ -440,15 +494,46 @@ interface ConversionIdentityDao {
         } else {
             requested.copy(
                 lastReservedVersionCode = next.toInt(),
-                lifecycleState = current.lifecycleState,
-                provisionOwnerToken = current.provisionOwnerToken,
+                lifecycleState = if (reactivatingRetired) {
+                    ConversionIdentityLifecycleState.PROVISIONAL.name
+                } else {
+                    current.lifecycleState
+                },
+                provisionOwnerToken = if (reactivatingRetired) {
+                    reservationOwnerToken
+                } else {
+                    current.provisionOwnerToken
+                },
                 crxPublicKeySha256 = current.crxPublicKeySha256,
                 lastSuccessfulVersionCode = current.lastSuccessfulVersionCode,
-                lifecycleUpdatedAtEpochMillis = current.lifecycleUpdatedAtEpochMillis,
+                lifecycleUpdatedAtEpochMillis = if (reactivatingRetired) {
+                    createdAtEpochMillis
+                } else {
+                    current.lifecycleUpdatedAtEpochMillis
+                },
             )
         }
         if (current == null) {
             insert(stored)
+        } else if (reactivatingRetired) {
+            check(
+                reactivateRetiredForReservation(
+                    identitySha256 = stored.identitySha256,
+                    displayName = stored.displayName,
+                    expectedLastReservedVersionCode = current.lastReservedVersionCode,
+                    lastReservedVersionCode = stored.lastReservedVersionCode,
+                    reservationOwnerToken = reservationOwnerToken,
+                    expectedMode = current.mode,
+                    expectedExtensionId = current.extensionId,
+                    expectedPackageName = current.packageName,
+                    expectedWrapperSignerSha256 = current.wrapperSignerSha256,
+                    expectedCrxKeyAlias = current.crxKeyAlias,
+                    expectedCrxPublicKeySha256 = current.crxPublicKeySha256,
+                    lifecycleUpdatedAtEpochMillis = createdAtEpochMillis,
+                ) == 1,
+            ) {
+                "RETIRED 설치 신원 lifecycle이 바뀌어 재예약하지 못했습니다."
+            }
         } else {
             check(
                 updateForReservation(
@@ -601,6 +686,7 @@ interface ConversionIdentityDao {
             }
             ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
             ConversionIdentityLifecycleState.CLEANING.name,
+            ConversionIdentityLifecycleState.RETIRED.name,
             -> throw IllegalArgumentException(
                 "현재 lifecycle의 identity는 BUNDLE_READY로 commit할 수 없습니다.",
             )
