@@ -4988,7 +4988,7 @@ internal fun conversionFailureMessage(code: ConversionFailureCode): UserMessage 
     )
     ConversionFailureCode.PACKAGE -> UserMessage(
         UserMessageKind.CONVERSION_FAILURE,
-        "Android 확장 래퍼 생성에 실패했습니다. 입력을 다시 분석한 뒤 재시도해 주세요.",
+        "Android 확장 래퍼 생성에 실패했습니다. 같은 신원으로 변환을 다시 시도해 주세요.",
         RecoveryAction.RETRY,
     )
     ConversionFailureCode.IDENTITY_MISMATCH -> UserMessage(

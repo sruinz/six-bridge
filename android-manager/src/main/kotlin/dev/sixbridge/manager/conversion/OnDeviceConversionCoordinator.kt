@@ -281,26 +281,12 @@ internal class OnDeviceConversionCoordinator(
         var generated: GeneratedBundle? = null
         var building = false
         try {
-            val resolved = try {
-                identities.resolve(
-                    prepared,
-                    profile,
-                    identitySelection,
-                    token,
-                )
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: IllegalArgumentException) {
-                releaseFailedAttempt(token)
-                return@withLock ConversionBuildResult.Failure(
-                    ConversionFailureCode.IDENTITY_MISMATCH,
-                )
-            } catch (_: Throwable) {
-                releaseFailedAttempt(token)
-                return@withLock ConversionBuildResult.Failure(
-                    ConversionFailureCode.KEYSTORE,
-                )
-            }
+            val resolved = identities.resolve(
+                prepared,
+                profile,
+                identitySelection,
+                token,
+            )
             val installedWrapper = installed.find(resolved.identity.packageName)
             if (
                 installedWrapper != null &&
@@ -573,8 +559,10 @@ internal class OnDeviceConversionCoordinator(
     }
 
     private fun Throwable.toBuildFailureCode(): ConversionFailureCode = when (this) {
-        is java.io.IOException -> ConversionFailureCode.BUNDLE_IO
-        is IllegalArgumentException -> ConversionFailureCode.IDENTITY_MISMATCH
+        is ConversionIdentityException -> ConversionFailureCode.IDENTITY_MISMATCH
+        is ConversionKeyStoreException -> ConversionFailureCode.KEYSTORE
+        is ConversionPackageException -> ConversionFailureCode.PACKAGE
+        is ConversionBundleException -> ConversionFailureCode.BUNDLE_IO
         else -> ConversionFailureCode.PACKAGE
     }
 

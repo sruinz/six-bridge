@@ -532,6 +532,88 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
+    fun `raw IllegalArgumentException package validation 실패는 PACKAGE다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            packageFailure = IllegalArgumentException("package validation failed")
+        }
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            fixture.coordinator().begin(
+                OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+            ),
+        )
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            fixture.coordinator().build(
+                analysis.token,
+                analysis.requiredApprovals,
+                true,
+                null,
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.PACKAGE, failure.code)
+    }
+
+    @Test
+    fun `동일한 message도 명시된 domain type으로만 분류한다`() = runTest {
+        data class Case(
+            val expected: ConversionFailureCode,
+            val configure: Fixture.() -> Unit,
+        )
+
+        val cases = listOf(
+            Case(ConversionFailureCode.IDENTITY_MISMATCH) {
+                identityFailure = ConversionIdentityException(
+                    IllegalArgumentException("same failure"),
+                )
+            },
+            Case(ConversionFailureCode.KEYSTORE) {
+                identityFailure = ConversionKeyStoreException(
+                    IllegalArgumentException("same failure"),
+                )
+            },
+            Case(ConversionFailureCode.PACKAGE) {
+                packageFailure = ConversionPackageException(
+                    IllegalArgumentException("same failure"),
+                )
+            },
+            Case(ConversionFailureCode.BUNDLE_IO) {
+                bundleFailure = ConversionBundleException(
+                    IllegalArgumentException("same failure"),
+                )
+            },
+            Case(ConversionFailureCode.BUNDLE_IO) {
+                importFailure = ConversionBundleException(
+                    IllegalArgumentException("same failure"),
+                )
+            },
+            Case(ConversionFailureCode.PACKAGE) {
+                identityFailure = IllegalStateException("unclassified failure")
+            },
+        )
+
+        cases.forEach { case ->
+            val fixture = Fixture(temporaryFolder, mutableListOf()).apply(case.configure)
+            val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                fixture.coordinator().begin(
+                    OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                ),
+            )
+
+            val failure = assertIs<ConversionBuildResult.Failure>(
+                fixture.coordinator().build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    true,
+                    null,
+                ),
+            )
+
+            assertEquals(case.expected, failure.code, "expected=${case.expected}")
+        }
+    }
+
+    @Test
     fun `blocked와 미확인 partial은 reserve 전에 차단한다`() = runTest {
         val blocked = Fixture(temporaryFolder, mutableListOf()).apply {
             compatibilityStatus = CompatibilityStatus.BLOCKED
@@ -851,7 +933,9 @@ class OnDeviceConversionCoordinatorTest {
     fun `Keystore resolve 실패와 package 실패는 즉시 승인 단계와 빈 owner로 복구한다`() =
         runTest {
             val keystore = Fixture(temporaryFolder, mutableListOf()).apply {
-                identityFailure = IllegalStateException("keystore unavailable")
+                identityFailure = ConversionKeyStoreException(
+                    IllegalStateException("keystore unavailable"),
+                )
             }
             val keystoreAnalysis = assertIs<ConversionBeginResult.AnalysisReady>(
                 keystore.coordinator().begin(
@@ -1209,6 +1293,8 @@ class OnDeviceConversionCoordinatorTest {
         var packageFailuresRemaining = 0
         var optionalApprovals: Set<String> = emptySet()
         var packageFailure: Throwable? = null
+        var bundleFailure: Throwable? = null
+        var importFailure: Throwable? = null
         var preparedSourceSha256 = "4".repeat(64)
         var verifiedInputFailureCall: Int? = null
         private var verifiedInputCalls = 0
@@ -1491,6 +1577,7 @@ class OnDeviceConversionCoordinatorTest {
             bundles = object : ConversionBundlePort {
                 override fun publish(token: String, packaged: PackagedConversion): GeneratedBundle {
                     events += "publish"
+                    bundleFailure?.let { throw it }
                     return GeneratedBundle(token, generatedFile, "2".repeat(64), "$token.six")
                 }
 
@@ -1514,6 +1601,7 @@ class OnDeviceConversionCoordinatorTest {
             },
             imports = ConversionGeneratedImportPort {
                 events += "import"
+                importFailure?.let { throw it }
                 if (importFailuresRemaining-- > 0) {
                     null
                 } else {

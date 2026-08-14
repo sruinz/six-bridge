@@ -470,7 +470,7 @@ internal class DefaultConversionIdentityPort(
         profile: BrowserProfile,
         selection: InstallationIdentitySelection?,
         ownerToken: String,
-    ): ResolvedPackageIdentity {
+    ): ResolvedPackageIdentity = withConversionIdentityBoundary {
         when (prepared.identityMode) {
             InstallationIdentityMode.PASSTHROUGH ->
                 require(prepared.passthroughCrx != null && prepared.preparedCrx == null)
@@ -517,7 +517,7 @@ internal class DefaultConversionIdentityPort(
         displayName: String,
         installedVersionCode: Long?,
         ownerToken: String,
-    ): ReservedPackageIdentity {
+    ): ReservedPackageIdentity = withConversionIdentityBoundary {
         val publicKeySha = resolved.identity.crxPublicKeyDer?.let(::sha256)
         val reservation = ledger.reserve(
             ConversionIdentityReservation(
@@ -551,7 +551,7 @@ internal class DefaultConversionPackagePort(
         reservation: ReservedPackageIdentity,
         bound: BoundConversionSnapshot,
         token: String,
-    ): PackagedConversion {
+    ): PackagedConversion = withConversionPackageBoundary {
         val output = packager.outputFile(token)
         val source = bound.preparedCrx?.let { artifact ->
             packager.stageSource(token, artifact.length) {
@@ -577,7 +577,7 @@ internal class DefaultConversionPackagePort(
                     outputApk = output,
                 ),
             )
-            return result.toPackaged()
+            result.toPackaged()
         } finally {
             source.setWritable(true)
             source.delete()
@@ -598,7 +598,9 @@ internal class DefaultConversionBundlePort(
     private val store: GeneratedBundleStore,
 ) : ConversionBundlePort {
     override fun publish(token: String, packaged: PackagedConversion) =
-        store.publish(token, packaged.opaque as OnDeviceWrapperResult)
+        withConversionBundleBoundary {
+            store.publish(token, packaged.opaque as OnDeviceWrapperResult)
+        }
     override fun recover(token: String): GeneratedBundle? =
         runCatching { store.recover(token) }.getOrNull()
     override fun discard(token: String): Boolean = store.discard(token)
@@ -606,6 +608,15 @@ internal class DefaultConversionBundlePort(
         store.copyTo(token, output)
     override suspend fun createShareSnapshot(token: String): File? =
         store.createShareSnapshot(token)
+}
+
+internal class DefaultConversionGeneratedImportPort(
+    private val delegate: ConversionGeneratedImportPort,
+) : ConversionGeneratedImportPort {
+    override suspend fun importGenerated(generated: GeneratedBundle) =
+        withConversionBundleBoundary {
+            delegate.importGenerated(generated)
+        }
 }
 
 private fun sha256(bytes: ByteArray): String =

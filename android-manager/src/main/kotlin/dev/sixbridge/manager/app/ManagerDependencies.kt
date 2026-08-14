@@ -18,6 +18,7 @@ import dev.sixbridge.manager.conversion.ConversionProfilePort
 import dev.sixbridge.manager.conversion.ConversionWorkStore
 import dev.sixbridge.manager.conversion.CurrentBundleIdentityProofParser
 import dev.sixbridge.manager.conversion.DefaultConversionBundlePort
+import dev.sixbridge.manager.conversion.DefaultConversionGeneratedImportPort
 import dev.sixbridge.manager.conversion.DefaultConversionIdentityPort
 import dev.sixbridge.manager.conversion.DefaultConversionPackagePort
 import dev.sixbridge.manager.conversion.DefaultConversionRuntime
@@ -186,19 +187,21 @@ class ManagerDependencies private constructor(
                     packager,
                 ),
                 bundles = DefaultConversionBundlePort(generatedBundles),
-                imports = ConversionGeneratedImportPort { generated ->
-                    when (val imported = importer.importGenerated(generated)) {
-                        is ImportResult.Failure -> null
-                        is ImportResult.Success -> {
-                            if (retainedImports.save(imported.value)) {
-                                imported.value.toReview()
-                            } else {
-                                importer.discard(imported.value.token)
-                                null
+                imports = DefaultConversionGeneratedImportPort(
+                    ConversionGeneratedImportPort { generated ->
+                        when (val imported = importer.importGenerated(generated)) {
+                            is ImportResult.Failure -> null
+                            is ImportResult.Success -> {
+                                if (retainedImports.save(imported.value)) {
+                                    imported.value.toReview()
+                                } else {
+                                    importer.discard(imported.value.token)
+                                    null
+                                }
                             }
                         }
-                    }
-                },
+                    },
+                ),
                 analysisCacheCleaner = analysisCacheCleaner::clean,
                 onAnalysisCacheCleanupWarning = { result ->
                     Log.w(

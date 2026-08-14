@@ -3346,6 +3346,18 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `새 신원 선택 안내는 identity mismatch에만 사용한다`() {
+        val identity = conversionFailureMessage(ConversionFailureCode.IDENTITY_MISMATCH)
+        val packageFailure = conversionFailureMessage(ConversionFailureCode.PACKAGE)
+
+        assertTrue(identity.text.contains("새 변환 신원"))
+        assertEquals(RecoveryAction.NONE, identity.recoveryAction)
+        assertFalse(packageFailure.text.contains("새 변환 신원"))
+        assertTrue(packageFailure.text.contains("같은 신원"))
+        assertEquals(RecoveryAction.RETRY, packageFailure.recoveryAction)
+    }
+
+    @Test
     fun `Chrome URL 분석 성공은 token만 저장하고 분석 route로 이동한다`() =
         runTest(dispatcher.scheduler) {
             val repository = FakeManagerRepository().apply {
