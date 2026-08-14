@@ -12,7 +12,8 @@ class DesktopDistributionMetadataTest {
 
         assertEquals("SIX Bridge", properties.getProperty("name"))
         assertEquals("dev.sixbridge.desktop", properties.getProperty("applicationId"))
-        assertEquals("0.1.0", properties.getProperty("version"))
+        assertEquals("0.1.1", properties.getProperty("version"))
+        assertEquals("0.1.1", DesktopApplicationMetadata.VERSION)
         assertEquals("13.0", properties.getProperty("minimumMacOs"))
     }
 

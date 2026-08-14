@@ -63,7 +63,20 @@ class PortableResolvedDraftTest {
             val androidAsset = SixDraft.read(platformDraftAsset)
 
             assertContentEquals(androidAsset.payload.source, desktop.payload.source)
-            assertContentEquals(androidAsset.payload.draftJson, desktop.payload.draftJson)
+            assertEquals(
+                androidAsset.payload.draft.schemaVersion,
+                desktop.payload.draft.schemaVersion,
+            )
+            assertEquals(
+                androidAsset.payload.draft.adapterVersions,
+                desktop.payload.draft.adapterVersions,
+            )
+            assertEquals(
+                androidAsset.payload.draft.sourceIdentity,
+                desktop.payload.draft.sourceIdentity,
+            )
+            assertEquals("0.1.0-SNAPSHOT", androidAsset.payload.draft.coreVersion)
+            assertEquals("0.1.1-SNAPSHOT", desktop.payload.draft.coreVersion)
             assertContentEquals(androidAsset.payload.inputJson, desktop.payload.inputJson)
             assertContentEquals(
                 androidAsset.payload.conversionPlanJson,
@@ -168,7 +181,20 @@ class PortableResolvedDraftTest {
                 verified.payload.compatibilityAfter.adapterDecisions,
             )
             assertContentEquals(androidAsset.payload.source, verified.payload.source)
-            assertContentEquals(androidAsset.payload.draftJson, verified.payload.draftJson)
+            assertEquals(
+                androidAsset.payload.draft.schemaVersion,
+                verified.payload.draft.schemaVersion,
+            )
+            assertEquals(
+                androidAsset.payload.draft.adapterVersions,
+                verified.payload.draft.adapterVersions,
+            )
+            assertEquals(
+                androidAsset.payload.draft.sourceIdentity,
+                verified.payload.draft.sourceIdentity,
+            )
+            assertEquals("0.1.0-SNAPSHOT", androidAsset.payload.draft.coreVersion)
+            assertEquals("0.1.1-SNAPSHOT", verified.payload.draft.coreVersion)
             assertContentEquals(androidAsset.payload.inputJson, verified.payload.inputJson)
             assertContentEquals(
                 androidAsset.payload.conversionPlanJson,

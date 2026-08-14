@@ -131,6 +131,28 @@ class SixBridgeServiceTest {
     }
 
     @Test
+    fun `생성 SixDraft는 v0_1_1 core version을 기록한다`() {
+        val workspace = Files.createTempDirectory("six-draft-core-version-workspace")
+        val source = source("six-draft-core-version-source", "Core version")
+        val output = Files.createDirectory(workspace.resolve("drafts"))
+            .resolve("core-version.sixdraft")
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val service = SixBridgeService(
+            workspaceRoot = workspace,
+            draftSigningIdentityProvider = DraftSigningIdentityProvider { pair },
+        )
+
+        val result = service.draft(
+            input = source.toString(),
+            profile = supportedProfile(),
+            outputDraft = output,
+            projectIdentity = "c".repeat(32),
+        )
+
+        assertEquals("0.1.1-SNAPSHOT", SixDraft.read(result.draft).payload.draft.coreVersion)
+    }
+
+    @Test
     fun `draft 분석은 logical identity 요구를 보고한다`() {
         val workspace = Files.createTempDirectory("six-draft-analysis-workspace")
         val source = source("six-draft-analysis-source", "Markerless draft")

@@ -4,7 +4,7 @@ set -euo pipefail
 readonly ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 readonly REQUIRED_SERIAL='192.0.2.10:44085'
 readonly MAX_DRAFT_SIZE=268435456
-readonly EXPECTED_MANAGER_VERSION_CODE=1
+readonly EXPECTED_MANAGER_VERSION_CODE=2
 readonly CLI="${SIXBRIDGE_CLI:-${ROOT_DIR}/cli/build/install/sixbridge/bin/sixbridge}"
 readonly EVIDENCE_ROOT="${SIXBRIDGE_EVIDENCE_ROOT:-${ROOT_DIR}/.local/evidence}"
 
@@ -181,7 +181,7 @@ case "$1" in
       if [ "$2" = path ] && [ "$3" = --user ] && [ "$4" = 0 ] && [ "$5" = dev.sixbridge.manager ]; then
         printf 'package:/data/user/0/dev.sixbridge.manager\n'
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = --user ] && [ "$5" = 0 ] && [ "$6" = --show-versioncode ] && [ "$7" = dev.sixbridge.manager ]; then
-        printf 'package:dev.sixbridge.manager versionCode:%s\n' "${SIXBRIDGE_TEST_MANAGER_VERSION:-1}"
+        printf 'package:dev.sixbridge.manager versionCode:%s\n' "${SIXBRIDGE_TEST_MANAGER_VERSION:-2}"
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = --user ] && [ "$5" = 0 ] && [ "$6" = "$SIXBRIDGE_TEST_EXPECTED_PACKAGE" ]; then
         [ "${SIXBRIDGE_TEST_MISSING_WRAPPER:-0}" = 1 ] || printf 'package:%s\n' "$SIXBRIDGE_TEST_EXPECTED_PACKAGE"
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = -U ] && [ "$5" = --user ] && [ "$6" = 0 ] && [ "$7" = dev.sixbridge.manager ]; then
@@ -235,7 +235,7 @@ EOF
     expect_self_test_failure empty-expected-name --draft "$valid_draft" --serial "$REQUIRED_SERIAL" --expected-name '' --expected-package "$expected_package"
     expect_self_test_failure empty-expected-package --draft "$valid_draft" --serial "$REQUIRED_SERIAL" --expected-name '스마트 컨텍스트 메뉴' --expected-package ''
     mkdir -p "$fixture/evidence/version-mismatch" "$fixture/evidence/missing-wrapper"
-    if SIXBRIDGE_CLI="$fixture/bin/sixbridge" SIXBRIDGE_EVIDENCE_ROOT="$fixture/evidence/version-mismatch" SIXBRIDGE_GATE_SKIP_CONFIRMATIONS=1 SIXBRIDGE_DEVICE_DRAFT_PATH='/sdcard/Download/valid.sixdraft' SIXBRIDGE_TEST_ADB_LOG="$fixture/adb.log" SIXBRIDGE_TEST_CLI_LOG="$fixture/cli.log" SIXBRIDGE_TEST_EXPECTED_PACKAGE="$expected_package" SIXBRIDGE_TEST_MANAGER_VERSION=2 SIXBRIDGE_TEST_DRAFT_SHA256="$(sha256_file "$valid_draft")" PATH="$fixture/bin:$PATH" "$0" --draft "$valid_draft" --serial "$REQUIRED_SERIAL" --expected-name '스마트 컨텍스트 메뉴' --expected-package "$expected_package" >/dev/null 2>&1; then
+    if SIXBRIDGE_CLI="$fixture/bin/sixbridge" SIXBRIDGE_EVIDENCE_ROOT="$fixture/evidence/version-mismatch" SIXBRIDGE_GATE_SKIP_CONFIRMATIONS=1 SIXBRIDGE_DEVICE_DRAFT_PATH='/sdcard/Download/valid.sixdraft' SIXBRIDGE_TEST_ADB_LOG="$fixture/adb.log" SIXBRIDGE_TEST_CLI_LOG="$fixture/cli.log" SIXBRIDGE_TEST_EXPECTED_PACKAGE="$expected_package" SIXBRIDGE_TEST_MANAGER_VERSION=1 SIXBRIDGE_TEST_DRAFT_SHA256="$(sha256_file "$valid_draft")" PATH="$fixture/bin:$PATH" "$0" --draft "$valid_draft" --serial "$REQUIRED_SERIAL" --expected-name '스마트 컨텍스트 메뉴' --expected-package "$expected_package" >/dev/null 2>&1; then
         fail 'manager versionCode 불일치가 성공했습니다.'
     fi
     if SIXBRIDGE_CLI="$fixture/bin/sixbridge" SIXBRIDGE_EVIDENCE_ROOT="$fixture/evidence/missing-wrapper" SIXBRIDGE_GATE_SKIP_CONFIRMATIONS=1 SIXBRIDGE_DEVICE_DRAFT_PATH='/sdcard/Download/valid.sixdraft' SIXBRIDGE_TEST_ADB_LOG="$fixture/adb.log" SIXBRIDGE_TEST_CLI_LOG="$fixture/cli.log" SIXBRIDGE_TEST_EXPECTED_PACKAGE="$expected_package" SIXBRIDGE_TEST_MISSING_WRAPPER=1 SIXBRIDGE_TEST_DRAFT_SHA256="$(sha256_file "$valid_draft")" PATH="$fixture/bin:$PATH" "$0" --draft "$valid_draft" --serial "$REQUIRED_SERIAL" --expected-name '스마트 컨텍스트 메뉴' --expected-package "$expected_package" >/dev/null 2>&1; then

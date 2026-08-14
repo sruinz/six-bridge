@@ -88,6 +88,14 @@ class SixBridgeCommandTest {
     }
 
     @Test
+    fun `version option reports the v0_1_1 development version`() {
+        val result = execute("--version")
+
+        assertEquals(0, result.exitCode, result.error)
+        assertEquals("SIX Bridge 0.1.1-SNAPSHOT\n", result.output)
+    }
+
+    @Test
     fun `probe option 누락 중복 unknown은 exit 2이고 stdout을 남기지 않는다`() {
         listOf(
             arrayOf("probe", "generate"),

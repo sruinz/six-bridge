@@ -55,8 +55,8 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi)
             packageName = "SIX Bridge"
             // jpackage는 macOS app-version의 첫 숫자 0을 거부한다.
-            // product metadata 0.1.0과 native package build version을 분리한다.
-            packageVersion = "1.0.0"
+            // product metadata 0.1.1과 native package build version을 분리한다.
+            packageVersion = "1.0.1"
             modules("java.net.http", "java.naming")
 
             macOS {

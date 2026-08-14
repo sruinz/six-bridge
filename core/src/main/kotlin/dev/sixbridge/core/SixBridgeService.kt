@@ -745,7 +745,7 @@ class SixBridgeService(
     }
 
     companion object {
-        private const val CORE_VERSION = "0.1.0-SNAPSHOT"
+        private const val CORE_VERSION = "0.1.1-SNAPSHOT"
     }
 
 }
