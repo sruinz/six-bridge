@@ -344,6 +344,9 @@ class OnDeviceWrapperRequestTest {
         override suspend fun findByExtensionId(extensionId: String): ConversionIdentityEntity? = null
         override suspend fun findByPackageName(packageName: String): ConversionIdentityEntity? = null
         override suspend fun findByCrxKeyAlias(crxKeyAlias: String): ConversionIdentityEntity? = null
+        override suspend fun findByProvisionOwnerToken(
+            ownerToken: String,
+        ): ConversionIdentityEntity? = null
         override suspend fun insert(entity: ConversionIdentityEntity) = error("unused")
         override suspend fun update(entity: ConversionIdentityEntity) = error("unused")
         override suspend fun getLease(identitySha256: String): ConversionIdentityLeaseEntity? = null
@@ -379,6 +382,14 @@ class OnDeviceWrapperRequestTest {
             state: String,
         ): Int = error("unused")
 
+        override suspend fun updateForReservation(
+            identitySha256: String,
+            displayName: String,
+            lastReservedVersionCode: Int,
+            expectedLifecycleState: String,
+            expectedProvisionOwnerToken: String?,
+        ): Int = error("unused")
+
         override suspend fun reserve(
             requested: ConversionIdentityEntity,
             installedVersionCode: Long?,
@@ -387,6 +398,12 @@ class OnDeviceWrapperRequestTest {
             createdAtEpochMillis: Long,
             crxPublicKeySha256: String?,
         ): ConversionIdentityEntity = requested.copy(lastReservedVersionCode = 1)
+
+        override suspend fun listByModeProfileAndLifecycle(
+            mode: String,
+            profileMajorVersion: Int,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
 
         override suspend fun listByModeAndProfile(
             mode: String,

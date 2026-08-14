@@ -481,6 +481,7 @@ internal class DefaultConversionIdentityPort(
             profile.majorVersion,
             prepared.identityMode,
             selection,
+            ownerToken,
         )
         if (prepared.identityMode == InstallationIdentityMode.PASSTHROUGH) {
             return ResolvedPackageIdentity(
@@ -534,8 +535,8 @@ internal class DefaultConversionIdentityPort(
         return ReservedPackageIdentity(resolved, reservation.versionCode, reservation)
     }
 
-    override suspend fun abort(ownerToken: String) {
-        ledger.abortByOwnerToken(ownerToken, packager)
+    override suspend fun releaseFailedAttempt(ownerToken: String) {
+        ledger.releaseFailedAttempt(ownerToken, packager)
     }
 }
 

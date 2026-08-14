@@ -41,7 +41,7 @@ class ConversionIdentityLedgerTest {
     }
 
     @Test
-    fun `RESERVED와 PACKAGING abort는 owner token으로 lease만 결정적으로 제거한다`() =
+    fun `RESERVED와 PACKAGING 실패 release는 owner token으로 lease만 결정적으로 제거한다`() =
         runTest {
             val dao = FakeConversionIdentityDao()
             val ledger = ConversionIdentityLedger(dao)
@@ -51,12 +51,12 @@ class ConversionIdentityLedgerTest {
                 ownerToken = JOB_ONE,
             )
 
-            assertTrue(!ledger.abortReservationByOwnerToken(jobToken(99)))
+            assertTrue(!ledger.releaseFailedAttempt(jobToken(99)))
             assertEquals("RESERVED", dao.getLease(firstKey.identitySha256)?.state)
-            assertTrue(ledger.abortReservationByOwnerToken(JOB_ONE))
+            assertTrue(ledger.releaseFailedAttempt(JOB_ONE))
             assertNull(dao.getLease(firstKey.identitySha256))
             assertTrue(dao.get(firstKey.identitySha256) != null)
-            assertTrue(!ledger.abortReservationByOwnerToken(JOB_ONE))
+            assertTrue(!ledger.releaseFailedAttempt(JOB_ONE))
 
             val secondKey = InstallationIdentityKey.create(
                 LogicalSourceIdentity.storeExtensionId("c".repeat(32)),
@@ -75,7 +75,7 @@ class ConversionIdentityLedgerTest {
                 packagingState = "PACKAGING:11111111-1111-4111-8111-111111111111",
             )
 
-            assertTrue(ledger.abortReservationByOwnerToken(JOB_TWO))
+            assertTrue(ledger.releaseFailedAttempt(JOB_TWO))
             assertNull(dao.getLease(secondKey.identitySha256))
             assertTrue(dao.get(secondKey.identitySha256) != null)
         }
@@ -112,7 +112,7 @@ class ConversionIdentityLedgerTest {
             assertEquals(signedCrxId, lease.extensionId)
             assertNull(lease.crxKeyAlias)
             assertNull(lease.crxPublicKeySha256)
-            assertTrue(ledger.abortReservationByOwnerToken(JOB_ONE))
+            assertTrue(ledger.releaseFailedAttempt(JOB_ONE))
         }
 
     @Test
@@ -138,7 +138,7 @@ class ConversionIdentityLedgerTest {
     }
 
     @Test
-    fun `미예약 abort는 packager 없이 lease를 버리지 않는다`() = runTest {
+    fun `미예약 실패 release는 packager 없이 lease를 버리지 않는다`() = runTest {
         val dao = FakeConversionIdentityDao()
         val ledger = ConversionIdentityLedger(dao)
         val key = stableKey()
@@ -158,7 +158,7 @@ class ConversionIdentityLedgerTest {
         )
 
         assertFailsWith<IllegalArgumentException> {
-            ledger.abortReservationByOwnerToken(JOB_ONE)
+            ledger.releaseFailedAttempt(JOB_ONE)
         }
         assertEquals("PENDING", dao.getLease(key.identitySha256)?.state)
     }
@@ -378,16 +378,16 @@ class ConversionIdentityLedgerTest {
     }
 
     @Test
-    fun `완료한 연속 예약은 versionCode를 중복하거나 재사용하지 않는다`() =
+    fun `같은 job의 연속 실패 release는 versionCode를 중복하거나 재사용하지 않는다`() =
         runTest {
             val ledger = ledger()
             val key = passthroughKey()
 
-            val values = (1..8).map { index ->
+            val values = (1..8).map {
                 reserveAndRelease(
                     ledger,
                     reservation(key, binding = bindingFor(key)),
-                    jobToken(index),
+                    JOB_ONE,
                 ).versionCode
             }
 
@@ -397,7 +397,7 @@ class ConversionIdentityLedgerTest {
                 reserveAndRelease(
                     ledger,
                     reservation(key, binding = bindingFor(key)),
-                    jobToken(9),
+                    JOB_ONE,
                 ).versionCode,
             )
         }
@@ -422,7 +422,7 @@ class ConversionIdentityLedgerTest {
                     binding = bindingFor(key),
                     installedVersionCode = Int.MAX_VALUE.toLong(),
                 ),
-                ownerToken = JOB_TWO,
+                ownerToken = JOB_ONE,
             )
         }
     }
@@ -442,6 +442,7 @@ class ConversionIdentityLedgerTest {
                 profileMajorVersion = 30,
                 mode = InstallationIdentityMode.CONVERTED,
                 selection = InstallationIdentitySelection.CreateNew,
+                ownerToken = JOB_ONE,
             )
             val binding = bindingFor(key)
 
@@ -461,19 +462,189 @@ class ConversionIdentityLedgerTest {
         }
 
     @Test
+    fun `같은 job의 CreateNew 재시도는 실패 version을 넘기고 PROVISIONAL key를 재사용한다`() =
+        runTest {
+            val localIdentities = ArrayDeque(
+                listOf(
+                    UUID.fromString("11111111-2222-4333-8444-555555555555"),
+                    UUID.fromString("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+                ),
+            )
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(
+                dao = dao,
+                localIdentityFactory = { localIdentities.removeFirst() },
+            )
+
+            val firstKey = resolveSelectionForOwner(
+                ledger = ledger,
+                logicalSourceIdentity = null,
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.CONVERTED,
+                selection = InstallationIdentitySelection.CreateNew,
+                ownerToken = JOB_ONE,
+            )
+            val firstBinding = bindingFor(firstKey)
+            val first = ledger.reserve(
+                reservation(firstKey, binding = firstBinding),
+                ownerToken = JOB_ONE,
+            )
+            dao.claimForPackaging(
+                requested = entity(firstKey, firstBinding),
+                versionCode = first.versionCode,
+                ownerToken = JOB_ONE,
+                crxPublicKeySha256 = firstBinding.crxPublicKeySha256,
+                packagingState = "PACKAGING:11111111-1111-4111-8111-111111111111",
+            )
+            assertTrue(releaseFailedAttemptForTests(ledger, JOB_ONE))
+
+            val secondKey = resolveSelectionForOwner(
+                ledger = ledger,
+                logicalSourceIdentity = null,
+                profileMajorVersion = 30,
+                mode = InstallationIdentityMode.CONVERTED,
+                selection = InstallationIdentitySelection.CreateNew,
+                ownerToken = JOB_ONE,
+            )
+            val secondBinding = bindingFor(secondKey)
+            val second = ledger.reserve(
+                reservation(secondKey, binding = secondBinding),
+                ownerToken = JOB_ONE,
+            )
+
+            assertEquals(first.identityKey, second.identityKey)
+            assertEquals(first.extensionId, second.extensionId)
+            assertEquals(first.crxKeyAlias, second.crxKeyAlias)
+            assertEquals(1, first.versionCode)
+            assertEquals(2, second.versionCode)
+            assertEquals(1, dao.rowCount())
+            assertTrue(releaseFailedAttemptForTests(ledger, JOB_ONE))
+        }
+
+    @Test
+    fun `다른 job의 CreateNew는 다른 PROVISIONAL identity를 소유한다`() = runTest {
+        val localIdentities = ArrayDeque(
+            listOf(
+                UUID.fromString("11111111-2222-4333-8444-555555555555"),
+                UUID.fromString("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+            ),
+        )
+        val dao = FakeConversionIdentityDao()
+        val ledger = ConversionIdentityLedger(
+            dao = dao,
+            localIdentityFactory = { localIdentities.removeFirst() },
+        )
+
+        val first = resolveSelectionForOwner(
+            ledger,
+            null,
+            30,
+            InstallationIdentityMode.CONVERTED,
+            InstallationIdentitySelection.CreateNew,
+            JOB_ONE,
+        )
+        ledger.reserve(reservation(first), JOB_ONE)
+        assertTrue(releaseFailedAttemptForTests(ledger, JOB_ONE))
+        val second = resolveSelectionForOwner(
+            ledger,
+            null,
+            30,
+            InstallationIdentityMode.CONVERTED,
+            InstallationIdentitySelection.CreateNew,
+            JOB_TWO,
+        )
+        ledger.reserve(reservation(second), JOB_TWO)
+
+        assertNotEquals(first, second)
+        assertEquals(2, dao.rowCount())
+        assertEquals(JOB_ONE, dao.get(first.identitySha256)?.provisionOwnerToken)
+        assertEquals(JOB_TWO, dao.get(second.identitySha256)?.provisionOwnerToken)
+        assertTrue(releaseFailedAttemptForTests(ledger, JOB_TWO))
+    }
+
+    @Test
+    fun `PROVISIONAL owner는 UseExisting과 다른 source 또는 profile로 선택을 바꿀 수 없다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(
+                dao = dao,
+                localIdentityFactory = {
+                    UUID.fromString("11111111-2222-4333-8444-555555555555")
+                },
+            )
+            val provisional = resolveSelectionForOwner(
+                ledger,
+                null,
+                30,
+                InstallationIdentityMode.CONVERTED,
+                InstallationIdentitySelection.CreateNew,
+                JOB_ONE,
+            )
+            ledger.reserve(reservation(provisional), JOB_ONE)
+            assertTrue(releaseFailedAttemptForTests(ledger, JOB_ONE))
+            val active = InstallationIdentityKey.create(
+                LogicalSourceIdentity.projectMarker("2".repeat(32)),
+                30,
+                InstallationIdentityMode.CONVERTED,
+            )
+            dao.insert(entity(active, bindingFor(active)))
+
+            assertFailsWith<IllegalArgumentException> {
+                resolveSelectionForOwner(
+                    ledger,
+                    null,
+                    30,
+                    InstallationIdentityMode.CONVERTED,
+                    InstallationIdentitySelection.UseExisting(active.identitySha256),
+                    JOB_ONE,
+                )
+            }
+            assertFailsWith<IllegalArgumentException> {
+                resolveSelectionForOwner(
+                    ledger,
+                    LogicalSourceIdentity.projectMarker("3".repeat(32)),
+                    30,
+                    InstallationIdentityMode.CONVERTED,
+                    null,
+                    JOB_ONE,
+                )
+            }
+            assertFailsWith<IllegalArgumentException> {
+                resolveSelectionForOwner(
+                    ledger,
+                    null,
+                    31,
+                    InstallationIdentityMode.CONVERTED,
+                    InstallationIdentitySelection.CreateNew,
+                    JOB_ONE,
+                )
+            }
+            assertEquals(
+                ConversionIdentityLifecycleState.PROVISIONAL.name,
+                dao.get(provisional.identitySha256)?.lifecycleState,
+            )
+        }
+
+    @Test
     fun `UseExisting은 canonical hash를 재검증하고 같은 converted key를 package 단계에 돌려준다`() =
         runTest {
             val dao = FakeConversionIdentityDao()
             val ledger = ConversionIdentityLedger(dao)
             val original = stableKey()
             val binding = bindingFor(original)
-            reserveAndRelease(ledger, reservation(original, binding = binding), JOB_ONE)
+            dao.insert(
+                entity(original, binding).copy(
+                    lastReservedVersionCode = 1,
+                    lastSuccessfulVersionCode = 1,
+                ),
+            )
 
             val selected = ledger.resolveSelection(
                 logicalSourceIdentity = null,
                 profileMajorVersion = 30,
                 mode = InstallationIdentityMode.CONVERTED,
                 selection = InstallationIdentitySelection.UseExisting(original.identitySha256),
+                ownerToken = JOB_TWO,
             )
             val reserved = reserveAndRelease(
                 ledger,
@@ -512,6 +683,7 @@ class ConversionIdentityLedgerTest {
                 30,
                 InstallationIdentityMode.CONVERTED,
                 InstallationIdentitySelection.UseExisting("f".repeat(64)),
+                JOB_ONE,
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -520,6 +692,7 @@ class ConversionIdentityLedgerTest {
                 31,
                 InstallationIdentityMode.CONVERTED,
                 InstallationIdentitySelection.UseExisting(converted.identitySha256),
+                JOB_ONE,
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -528,6 +701,7 @@ class ConversionIdentityLedgerTest {
                 30,
                 InstallationIdentityMode.CONVERTED,
                 InstallationIdentitySelection.UseExisting(passthrough.identitySha256),
+                JOB_ONE,
             )
         }
     }
@@ -596,30 +770,44 @@ class ConversionIdentityLedgerTest {
     }
 
     @Test
-    fun `기존 후보는 같은 profile의 converted만 노출한다`() = runTest {
-        val ledger = ledger()
+    fun `기존 후보는 같은 profile의 ACTIVE converted만 노출한다`() = runTest {
+        val dao = FakeConversionIdentityDao()
+        val ledger = ConversionIdentityLedger(dao)
         val selected = stableKey()
-        reserveAndRelease(ledger, reservation(selected), JOB_ONE)
+        dao.insert(entity(selected, bindingFor(selected)))
+        val provisional = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker("2".repeat(32)),
+            30,
+            InstallationIdentityMode.CONVERTED,
+        )
+        dao.insert(
+            entity(provisional, bindingFor(provisional)).copy(
+                lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisionOwnerToken = JOB_ONE,
+            ),
+        )
+        val legacy = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker("3".repeat(32)),
+            30,
+            InstallationIdentityMode.CONVERTED,
+        )
+        dao.insert(
+            entity(legacy, bindingFor(legacy)).copy(
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+            ),
+        )
         val passthrough = InstallationIdentityKey.create(
             LogicalSourceIdentity.storeExtensionId("b".repeat(32)),
             30,
             InstallationIdentityMode.PASSTHROUGH,
         )
-        reserveAndRelease(
-            ledger,
-            reservation(passthrough, binding = bindingFor(passthrough)),
-            JOB_TWO,
-        )
+        dao.insert(entity(passthrough, bindingFor(passthrough)))
         val other = InstallationIdentityKey.create(
-            LogicalSourceIdentity.projectMarker("3".repeat(32)),
+            LogicalSourceIdentity.projectMarker("4".repeat(32)),
             31,
             InstallationIdentityMode.CONVERTED,
         )
-        reserveAndRelease(
-            ledger,
-            reservation(other, binding = bindingFor(other)),
-            jobToken(3),
-        )
+        dao.insert(entity(other, bindingFor(other)))
 
         val targets = ledger.listExistingTargets(30)
 
@@ -628,7 +816,119 @@ class ConversionIdentityLedgerTest {
         assertTrue(targets.single().displayName.isNotBlank())
     }
 
+    @Test
+    fun `UseExisting은 PROVISIONAL과 LEGACY_UNKNOWN 대상을 거부한다`() = runTest {
+        val dao = FakeConversionIdentityDao()
+        val ledger = ConversionIdentityLedger(dao)
+        val provisional = stableKey()
+        dao.insert(
+            entity(provisional, bindingFor(provisional)).copy(
+                lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
+                provisionOwnerToken = JOB_ONE,
+            ),
+        )
+        val legacy = InstallationIdentityKey.create(
+            LogicalSourceIdentity.projectMarker("2".repeat(32)),
+            30,
+            InstallationIdentityMode.CONVERTED,
+        )
+        dao.insert(
+            entity(legacy, bindingFor(legacy)).copy(
+                lifecycleState = ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+            ),
+        )
+
+        listOf(provisional, legacy).forEach { inactive ->
+            assertFailsWith<IllegalArgumentException> {
+                resolveSelectionForOwner(
+                    ledger,
+                    null,
+                    30,
+                    InstallationIdentityMode.CONVERTED,
+                    InstallationIdentitySelection.UseExisting(inactive.identitySha256),
+                    JOB_TWO,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `reserve는 다른 owner의 PROVISIONAL과 inactive lifecycle을 거부한다`() = runTest {
+        listOf(
+            ConversionIdentityLifecycleState.PROVISIONAL to JOB_ONE,
+            ConversionIdentityLifecycleState.LEGACY_UNKNOWN to null,
+            ConversionIdentityLifecycleState.CLEANING to null,
+        ).forEachIndexed { index, (state, provisionOwnerToken) ->
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(dao)
+            val key = InstallationIdentityKey.create(
+                LogicalSourceIdentity.projectMarker((index + 5).toString().repeat(32)),
+                30,
+                InstallationIdentityMode.CONVERTED,
+            )
+            dao.insert(
+                entity(key, bindingFor(key)).copy(
+                    lifecycleState = state.name,
+                    provisionOwnerToken = provisionOwnerToken,
+                ),
+            )
+
+            assertFailsWith<IllegalArgumentException> {
+                ledger.reserve(reservation(key), JOB_TWO)
+            }
+            assertNull(dao.getLease(key.identitySha256))
+        }
+    }
+
+    @Test
+    fun `ACTIVE 업데이트 실패는 key와 성공 version을 보존하고 reserved version만 증가시킨다`() =
+        runTest {
+            val dao = FakeConversionIdentityDao()
+            val ledger = ConversionIdentityLedger(dao)
+            val key = stableKey()
+            val active = entity(key, bindingFor(key)).copy(
+                lastReservedVersionCode = 7,
+                lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+                provisionOwnerToken = null,
+                lastSuccessfulVersionCode = 6,
+                lifecycleUpdatedAtEpochMillis = 1234,
+            )
+            dao.insert(active)
+
+            val reserved = ledger.reserve(reservation(key), JOB_TWO)
+            assertTrue(releaseFailedAttemptForTests(ledger, JOB_TWO))
+
+            val stored = requireNotNull(dao.get(key.identitySha256))
+            assertEquals(key.identitySha256, stored.identitySha256)
+            assertEquals(8, reserved.versionCode)
+            assertEquals(8, stored.lastReservedVersionCode)
+            assertEquals(ConversionIdentityLifecycleState.ACTIVE.name, stored.lifecycleState)
+            assertNull(stored.provisionOwnerToken)
+            assertEquals(6, stored.lastSuccessfulVersionCode)
+            assertEquals(1234, stored.lifecycleUpdatedAtEpochMillis)
+        }
+
     private fun ledger() = ConversionIdentityLedger(FakeConversionIdentityDao())
+
+    private suspend fun resolveSelectionForOwner(
+        ledger: ConversionIdentityLedger,
+        logicalSourceIdentity: LogicalSourceIdentity?,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+        selection: InstallationIdentitySelection?,
+        ownerToken: String,
+    ): InstallationIdentityKey = ledger.resolveSelection(
+        logicalSourceIdentity,
+        profileMajorVersion,
+        mode,
+        selection,
+        ownerToken,
+    )
+
+    private suspend fun releaseFailedAttemptForTests(
+        ledger: ConversionIdentityLedger,
+        ownerToken: String,
+    ): Boolean = ledger.releaseFailedAttempt(ownerToken)
 
     private suspend fun reserveAndRelease(
         ledger: ConversionIdentityLedger,
@@ -636,7 +936,7 @@ class ConversionIdentityLedgerTest {
         ownerToken: String,
     ): ConversionIdentityLedger.Reservation {
         val reservation = ledger.reserve(request, ownerToken)
-        assertTrue(ledger.abortReservationByOwnerToken(ownerToken))
+        assertTrue(ledger.releaseFailedAttempt(ownerToken))
         return reservation
     }
 
@@ -746,6 +1046,11 @@ class ConversionIdentityLedgerTest {
         override suspend fun findByCrxKeyAlias(crxKeyAlias: String): ConversionIdentityEntity? =
             synchronized(rows) { rows.values.firstOrNull { it.crxKeyAlias == crxKeyAlias } }
 
+        override suspend fun findByProvisionOwnerToken(ownerToken: String): ConversionIdentityEntity? =
+            synchronized(rows) {
+                rows.values.singleOrNull { it.provisionOwnerToken == ownerToken }
+            }
+
         override suspend fun insert(entity: ConversionIdentityEntity) {
             synchronized(rows) {
                 check(rows.putIfAbsent(entity.identitySha256, entity) == null)
@@ -845,6 +1150,28 @@ class ConversionIdentityLedgerTest {
             }
         }
 
+        override suspend fun updateForReservation(
+            identitySha256: String,
+            displayName: String,
+            lastReservedVersionCode: Int,
+            expectedLifecycleState: String,
+            expectedProvisionOwnerToken: String?,
+        ): Int = synchronized(rows) {
+            val current = rows[identitySha256]
+            if (
+                current?.lifecycleState != expectedLifecycleState ||
+                current.provisionOwnerToken != expectedProvisionOwnerToken
+            ) {
+                0
+            } else {
+                rows[identitySha256] = current.copy(
+                    displayName = displayName,
+                    lastReservedVersionCode = lastReservedVersionCode,
+                )
+                1
+            }
+        }
+
         override suspend fun reserve(
             requested: ConversionIdentityEntity,
             installedVersionCode: Long?,
@@ -866,6 +1193,14 @@ class ConversionIdentityLedgerTest {
                     lifecycleUpdatedAtEpochMillis = requested.lifecycleUpdatedAtEpochMillis,
                 ) ==
                     requested.copy(lastReservedVersionCode = 0))
+                require(current.crxPublicKeySha256 == crxPublicKeySha256)
+                when (current.lifecycleState) {
+                    ConversionIdentityLifecycleState.PROVISIONAL.name ->
+                        require(current.provisionOwnerToken == reservationOwnerToken)
+                    ConversionIdentityLifecycleState.ACTIVE.name ->
+                        require(current.provisionOwnerToken == null)
+                    else -> throw IllegalArgumentException("inactive lifecycle")
+                }
             }
             require(rows.values.none {
                 it.identitySha256 != requested.identitySha256 &&
@@ -881,6 +1216,10 @@ class ConversionIdentityLedgerTest {
             )
             check(next <= Int.MAX_VALUE)
             val stored = if (current == null) {
+                require(rows.values.none {
+                    it.provisionOwnerToken != null &&
+                        it.provisionOwnerToken == reservationOwnerToken
+                })
                 requested.copy(
                     lastReservedVersionCode = next.toInt(),
                     lifecycleState = ConversionIdentityLifecycleState.PROVISIONAL.name,
@@ -936,6 +1275,18 @@ class ConversionIdentityLedgerTest {
             leases[requested.identitySha256] = lease.copy(state = packagingState)
         }
 
+        override suspend fun listByModeProfileAndLifecycle(
+            mode: String,
+            profileMajorVersion: Int,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = synchronized(rows) {
+            rows.values.filter {
+                it.mode == mode &&
+                    it.profileMajorVersion == profileMajorVersion &&
+                    it.lifecycleState == lifecycleState
+            }.sortedBy(ConversionIdentityEntity::identitySha256)
+        }
+
         override suspend fun listByModeAndProfile(
             mode: String,
             profileMajorVersion: Int,
@@ -948,6 +1299,8 @@ class ConversionIdentityLedgerTest {
         fun force(entity: ConversionIdentityEntity) {
             synchronized(rows) { rows[entity.identitySha256] = entity }
         }
+
+        fun rowCount(): Int = synchronized(rows) { rows.size }
     }
 
     private companion object {

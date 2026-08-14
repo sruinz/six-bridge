@@ -20,6 +20,9 @@ interface ConversionIdentityDao {
     @Query("SELECT * FROM conversion_identities WHERE crxKeyAlias = :crxKeyAlias LIMIT 1")
     suspend fun findByCrxKeyAlias(crxKeyAlias: String): ConversionIdentityEntity?
 
+    @Query("SELECT * FROM conversion_identities WHERE provisionOwnerToken = :ownerToken LIMIT 1")
+    suspend fun findByProvisionOwnerToken(ownerToken: String): ConversionIdentityEntity?
+
     @Insert
     suspend fun insert(entity: ConversionIdentityEntity)
 
@@ -142,6 +145,21 @@ interface ConversionIdentityDao {
     @Query(
         """
         SELECT * FROM conversion_identities
+        WHERE mode = :mode
+          AND profileMajorVersion = :profileMajorVersion
+          AND lifecycleState = :lifecycleState
+        ORDER BY displayName COLLATE NOCASE, identitySha256
+        """,
+    )
+    suspend fun listByModeProfileAndLifecycle(
+        mode: String,
+        profileMajorVersion: Int,
+        lifecycleState: String,
+    ): List<ConversionIdentityEntity>
+
+    @Query(
+        """
+        SELECT * FROM conversion_identities
         WHERE mode = :mode AND profileMajorVersion = :profileMajorVersion
         ORDER BY displayName COLLATE NOCASE, identitySha256
         """,
@@ -150,6 +168,27 @@ interface ConversionIdentityDao {
         mode: String,
         profileMajorVersion: Int,
     ): List<ConversionIdentityEntity>
+
+    @Query(
+        """
+        UPDATE conversion_identities
+        SET displayName = :displayName,
+            lastReservedVersionCode = :lastReservedVersionCode
+        WHERE identitySha256 = :identitySha256
+          AND lifecycleState = :expectedLifecycleState
+          AND (
+            (:expectedProvisionOwnerToken IS NULL AND provisionOwnerToken IS NULL)
+            OR provisionOwnerToken = :expectedProvisionOwnerToken
+          )
+        """,
+    )
+    suspend fun updateForReservation(
+        identitySha256: String,
+        displayName: String,
+        lastReservedVersionCode: Int,
+        expectedLifecycleState: String,
+        expectedProvisionOwnerToken: String?,
+    ): Int
 
     @Transaction
     suspend fun reserve(
@@ -167,7 +206,30 @@ interface ConversionIdentityDao {
             "설치본 versionCode 다음 값을 예약할 수 없습니다."
         }
         val current = get(requested.identitySha256)
-        if (current != null) requireIdentityFieldsMatch(current, requested)
+        if (current != null) {
+            requireIdentityFieldsMatch(current, requested)
+            require(current.crxPublicKeySha256 == crxPublicKeySha256) {
+                "CRX 공개 키 proof가 기존 대상과 일치하지 않습니다."
+            }
+            when (current.lifecycleState) {
+                ConversionIdentityLifecycleState.PROVISIONAL.name -> require(
+                    current.provisionOwnerToken == reservationOwnerToken,
+                ) {
+                    "PROVISIONAL 설치 신원은 소유 job만 재시도할 수 있습니다."
+                }
+                ConversionIdentityLifecycleState.ACTIVE.name -> require(
+                    current.provisionOwnerToken == null,
+                ) {
+                    "ACTIVE 설치 신원에 PROVISIONAL owner가 남아 있습니다."
+                }
+                ConversionIdentityLifecycleState.LEGACY_UNKNOWN.name,
+                ConversionIdentityLifecycleState.CLEANING.name,
+                -> throw IllegalArgumentException(
+                    "현재 lifecycle의 설치 신원은 package version을 예약할 수 없습니다.",
+                )
+                else -> throw IllegalArgumentException("설치 신원 lifecycle이 손상되었습니다.")
+            }
+        }
         val lease = getLease(requested.identitySha256)
         if (current == null && requested.mode == InstallationIdentityMode.CONVERTED.name) {
             require(readyOwnerToken != null) {
@@ -240,7 +302,17 @@ interface ConversionIdentityDao {
         if (current == null) {
             insert(stored)
         } else {
-            update(stored)
+            check(
+                updateForReservation(
+                    identitySha256 = stored.identitySha256,
+                    displayName = stored.displayName,
+                    lastReservedVersionCode = stored.lastReservedVersionCode,
+                    expectedLifecycleState = current.lifecycleState,
+                    expectedProvisionOwnerToken = current.provisionOwnerToken,
+                ) == 1,
+            ) {
+                "설치 신원 lifecycle이 바뀌어 version 예약을 완료하지 못했습니다."
+            }
         }
         if (lease == null) {
             insertLease(

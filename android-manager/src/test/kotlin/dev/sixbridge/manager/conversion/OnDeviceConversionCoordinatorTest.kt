@@ -1445,7 +1445,7 @@ class OnDeviceConversionCoordinatorTest {
                     )
                 }
 
-                override suspend fun abort(ownerToken: String) {
+                override suspend fun releaseFailedAttempt(ownerToken: String) {
                     events += "abort"
                     abortedOwnerTokens += ownerToken
                     identityAbortFailure?.let { throw it }

@@ -95,8 +95,20 @@ class ConversionIdentityLedger(
         profileMajorVersion: Int,
         mode: InstallationIdentityMode,
         selection: InstallationIdentitySelection?,
+        ownerToken: String,
     ): InstallationIdentityKey {
+        requireOwnerToken(ownerToken)
         require(profileMajorVersion > 0) { "프로필 주 버전이 올바르지 않습니다." }
+        dao.findByProvisionOwnerToken(ownerToken)?.let { provisional ->
+            return restoreOwnedProvisionalSelection(
+                provisional = provisional,
+                logicalSourceIdentity = logicalSourceIdentity,
+                profileMajorVersion = profileMajorVersion,
+                mode = mode,
+                selection = selection,
+                ownerToken = ownerToken,
+            )
+        }
         return when {
             logicalSourceIdentity != null -> {
                 require(selection == null) {
@@ -125,16 +137,13 @@ class ConversionIdentityLedger(
                 requireLowerHexSha256(selection.identitySha256, "기존 대상 identity")
                 val current = dao.get(selection.identitySha256)
                     ?: throw IllegalArgumentException("선택한 기존 대상을 찾을 수 없습니다.")
-                val restored = runCatching {
-                    InstallationIdentityKey.restore(
-                        logicalSourceIdentity = current.logicalSourceIdentity,
-                        profileMajorVersion = current.profileMajorVersion,
-                        mode = current.mode,
-                        identitySha256 = current.identitySha256,
-                    )
-                }.getOrElse {
-                    throw IllegalArgumentException("선택한 기존 대상 신원이 손상되었습니다.")
+                require(
+                    current.lifecycleState == ConversionIdentityLifecycleState.ACTIVE.name &&
+                        current.provisionOwnerToken == null,
+                ) {
+                    "ACTIVE 상태의 기존 대상만 선택할 수 있습니다."
                 }
+                val restored = restoreIdentityKey(current, "선택한 기존 대상")
                 require(restored.mode == InstallationIdentityMode.CONVERTED) {
                     "passthrough 신원은 불안정 ZIP 대상이 될 수 없습니다."
                 }
@@ -147,6 +156,66 @@ class ConversionIdentityLedger(
                 "안정적 신원이 없는 ZIP은 CreateNew 또는 UseExisting 선택이 필요합니다.",
             )
         }
+    }
+
+    private fun restoreOwnedProvisionalSelection(
+        provisional: ConversionIdentityEntity,
+        logicalSourceIdentity: LogicalSourceIdentity?,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+        selection: InstallationIdentitySelection?,
+        ownerToken: String,
+    ): InstallationIdentityKey {
+        require(
+            provisional.lifecycleState == ConversionIdentityLifecycleState.PROVISIONAL.name &&
+                provisional.provisionOwnerToken == ownerToken,
+        ) {
+            "job owner의 PROVISIONAL 설치 신원이 손상되었습니다."
+        }
+        val restored = restoreIdentityKey(provisional, "job owner의 PROVISIONAL 대상")
+        require(
+            restored.profileMajorVersion == profileMajorVersion && restored.mode == mode,
+        ) {
+            "기존 PROVISIONAL 설치 신원과 같은 profile과 mode로만 재시도할 수 있습니다."
+        }
+        when {
+            logicalSourceIdentity != null -> {
+                require(selection == null) {
+                    "안정적 신원과 수동 대상 선택을 함께 사용할 수 없습니다."
+                }
+                require(restored.logicalSourceIdentity == logicalSourceIdentity) {
+                    "PROVISIONAL 설치 신원의 논리 원본을 바꿀 수 없습니다."
+                }
+            }
+            selection == InstallationIdentitySelection.CreateNew -> {
+                require(mode == InstallationIdentityMode.CONVERTED) {
+                    "불안정 ZIP은 converted 신원으로만 만들 수 있습니다."
+                }
+                require(
+                    restored.logicalSourceIdentity.canonicalValue.startsWith("local-"),
+                ) {
+                    "CreateNew 재시도 대상이 local 신원이 아닙니다."
+                }
+            }
+            else -> throw IllegalArgumentException(
+                "PROVISIONAL 설치 신원을 남긴 채 다른 대상을 선택할 수 없습니다.",
+            )
+        }
+        return restored
+    }
+
+    private fun restoreIdentityKey(
+        entity: ConversionIdentityEntity,
+        label: String,
+    ): InstallationIdentityKey = runCatching {
+        InstallationIdentityKey.restore(
+            logicalSourceIdentity = entity.logicalSourceIdentity,
+            profileMajorVersion = entity.profileMajorVersion,
+            mode = entity.mode,
+            identitySha256 = entity.identitySha256,
+        )
+    }.getOrElse {
+        throw IllegalArgumentException("$label 신원이 손상되었습니다.")
     }
 
     suspend fun reserve(
@@ -528,16 +597,25 @@ class ConversionIdentityLedger(
         }
     }
 
+    suspend fun releaseFailedAttempt(
+        ownerToken: String,
+        packager: OnDeviceWrapperPackager,
+    ): Boolean = releaseFailedAttemptInternal(ownerToken, packager)
+
+    internal suspend fun releaseFailedAttempt(
+        ownerToken: String,
+    ): Boolean = releaseFailedAttemptInternal(ownerToken, null)
+
     suspend fun abortByOwnerToken(
         ownerToken: String,
         packager: OnDeviceWrapperPackager,
-    ): Boolean = abortByOwnerTokenInternal(ownerToken, packager)
+    ): Boolean = releaseFailedAttempt(ownerToken, packager)
 
     internal suspend fun abortReservationByOwnerToken(
         ownerToken: String,
-    ): Boolean = abortByOwnerTokenInternal(ownerToken, null)
+    ): Boolean = releaseFailedAttempt(ownerToken)
 
-    private suspend fun abortByOwnerTokenInternal(
+    private suspend fun releaseFailedAttemptInternal(
         ownerToken: String,
         packager: OnDeviceWrapperPackager?,
     ): Boolean = reserveMutex.withLock {
@@ -672,9 +750,10 @@ class ConversionIdentityLedger(
         profileMajorVersion: Int,
     ): List<ExistingConversionTarget> {
         require(profileMajorVersion > 0) { "프로필 주 버전이 올바르지 않습니다." }
-        return dao.listByModeAndProfile(
+        return dao.listByModeProfileAndLifecycle(
             mode = InstallationIdentityMode.CONVERTED.name,
             profileMajorVersion = profileMajorVersion,
+            lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
         ).map { entity ->
             ExistingConversionTarget(
                 identitySha256 = entity.identitySha256,
@@ -951,9 +1030,9 @@ class ConversionIdentityLedger(
         suspend fun abort(ownerToken: String) {
             when (val binding = packager) {
                 is OwnerLifecyclePackager.Full ->
-                    ledger.abortByOwnerToken(ownerToken, binding.packager)
+                    ledger.releaseFailedAttempt(ownerToken, binding.packager)
                 OwnerLifecyclePackager.ReservationTests ->
-                    ledger.abortReservationByOwnerToken(ownerToken)
+                    ledger.releaseFailedAttempt(ownerToken)
             }
         }
 

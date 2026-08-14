@@ -1494,7 +1494,7 @@ class ConversionWorkStoreTest {
             ): ReservedPackageIdentity =
                 error("discard test에서 identity reserve는 사용하지 않습니다.")
 
-            override suspend fun abort(ownerToken: String) = Unit
+            override suspend fun releaseFailedAttempt(ownerToken: String) = Unit
         },
         installed = ConversionInstalledPort {
             error("discard test에서 installed 조회는 사용하지 않습니다.")
@@ -1628,6 +1628,8 @@ class ConversionWorkStoreTest {
             identities.values.firstOrNull { it.packageName == packageName }
         override suspend fun findByCrxKeyAlias(crxKeyAlias: String) =
             identities.values.firstOrNull { it.crxKeyAlias == crxKeyAlias }
+        override suspend fun findByProvisionOwnerToken(ownerToken: String) =
+            identities.values.singleOrNull { it.provisionOwnerToken == ownerToken }
         override suspend fun insert(entity: ConversionIdentityEntity) {
             identities[entity.identitySha256] = entity
         }
@@ -1682,6 +1684,31 @@ class ConversionWorkStoreTest {
             }
             return 1
         }
+        override suspend fun updateForReservation(
+            identitySha256: String,
+            displayName: String,
+            lastReservedVersionCode: Int,
+            expectedLifecycleState: String,
+            expectedProvisionOwnerToken: String?,
+        ): Int {
+            val current = identities[identitySha256]
+            if (
+                current?.lifecycleState != expectedLifecycleState ||
+                current.provisionOwnerToken != expectedProvisionOwnerToken
+            ) {
+                return 0
+            }
+            identities[identitySha256] = current.copy(
+                displayName = displayName,
+                lastReservedVersionCode = lastReservedVersionCode,
+            )
+            return 1
+        }
+        override suspend fun listByModeProfileAndLifecycle(
+            mode: String,
+            profileMajorVersion: Int,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
         override suspend fun listByModeAndProfile(
             mode: String,
             profileMajorVersion: Int,

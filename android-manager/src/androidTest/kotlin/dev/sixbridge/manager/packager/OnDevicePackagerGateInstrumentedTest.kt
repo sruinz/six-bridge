@@ -122,13 +122,13 @@ class OnDevicePackagerGateInstrumentedTest {
             assertTrue(generated.file.isFile)
             assertEquals(claimed.ownerToken, generated.token)
             assertTrue(
-                claimed.ledger.abortByOwnerToken(claimed.ownerToken, packager),
+                claimed.ledger.releaseFailedAttempt(claimed.ownerToken, packager),
             )
             assertFalse(packaged.outputApk.exists())
             assertTrue(generated.file.isFile)
         } finally {
             runCatching {
-                claimed.ledger.abortByOwnerToken(claimed.ownerToken, packager)
+                claimed.ledger.releaseFailedAttempt(claimed.ownerToken, packager)
             }
             GeneratedBundleStore(context).discard(claimed.ownerToken)
             claimed.database.close()
@@ -482,7 +482,7 @@ class OnDevicePackagerGateInstrumentedTest {
             assertTrue(
                 runBlocking {
                     ConversionIdentityLedger(claimed.database.conversionIdentityDao())
-                        .abortByOwnerToken(claimed.ownerToken, restartedPackager)
+                        .releaseFailedAttempt(claimed.ownerToken, restartedPackager)
                 },
             )
             assertFalse(output.exists())
@@ -744,7 +744,7 @@ class OnDevicePackagerGateInstrumentedTest {
             val restartedLedger = ConversionIdentityLedger(database.conversionIdentityDao())
             assertTrue(
                 runBlocking {
-                    restartedLedger.abortByOwnerToken(
+                    restartedLedger.releaseFailedAttempt(
                         jobToken,
                         OnDeviceWrapperPackager(context),
                     )
@@ -759,7 +759,7 @@ class OnDevicePackagerGateInstrumentedTest {
             )
             assertFalse(
                 runBlocking {
-                    restartedLedger.abortByOwnerToken(
+                    restartedLedger.releaseFailedAttempt(
                         jobToken,
                         OnDeviceWrapperPackager(context),
                     )
@@ -806,7 +806,7 @@ class OnDevicePackagerGateInstrumentedTest {
             assertTrue(keyCreated.await(5, TimeUnit.SECONDS))
             val aborting = async(Dispatchers.Default) {
                 ConversionIdentityLedger(database.conversionIdentityDao())
-                    .abortByOwnerToken(jobToken, OnDeviceWrapperPackager(context))
+                    .releaseFailedAttempt(jobToken, OnDeviceWrapperPackager(context))
             }
             delay(100)
             assertFalse(aborting.isCompleted)
@@ -875,7 +875,7 @@ class OnDevicePackagerGateInstrumentedTest {
             val restartedPackager = OnDeviceWrapperPackager(context)
             assertTrue(
                 runBlocking {
-                    restartedLedger.abortByOwnerToken(
+                    restartedLedger.releaseFailedAttempt(
                         jobToken,
                         restartedPackager,
                     )
@@ -933,7 +933,7 @@ class OnDevicePackagerGateInstrumentedTest {
 
                 assertTrue(
                     runBlocking {
-                        ConversionIdentityLedger(dao).abortByOwnerToken(
+                        ConversionIdentityLedger(dao).releaseFailedAttempt(
                             claimed.ownerToken,
                             OnDeviceWrapperPackager(context),
                         )
@@ -1149,6 +1149,7 @@ class OnDevicePackagerGateInstrumentedTest {
                     profileMajorVersion = CONVERTED_KEY.profileMajorVersion,
                     mode = InstallationIdentityMode.CONVERTED,
                     selection = null,
+                    ownerToken = jobToken,
                 )
                 val existing = database.conversionIdentityDao().get(selected.identitySha256)
                 val lease = if (existing == null) {
@@ -1230,6 +1231,7 @@ class OnDevicePackagerGateInstrumentedTest {
                     profileMajorVersion = identityKey.profileMajorVersion,
                     mode = mode,
                     selection = null,
+                    ownerToken = jobToken,
                 )
                 val reserved = ledger.reserve(
                     ConversionIdentityReservation(
