@@ -23,6 +23,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -590,6 +591,9 @@ class OnDeviceConversionCoordinatorTest {
             Case(ConversionFailureCode.PACKAGE) {
                 identityFailure = IllegalStateException("unclassified failure")
             },
+            Case(ConversionFailureCode.PACKAGE) {
+                identityFailure = IllegalArgumentException("same failure")
+            },
         )
 
         cases.forEach { case ->
@@ -612,6 +616,59 @@ class OnDeviceConversionCoordinatorTest {
             assertEquals(case.expected, failure.code, "expected=${case.expected}")
         }
     }
+
+    @Test
+    fun `actual default boundary의 raw 동일 message는 최종 domain code로 매핑된다`() =
+        runTest {
+            data class Case(
+                val name: String,
+                val expected: ConversionFailureCode,
+                val configure: Fixture.() -> Unit,
+            )
+
+            val cases = listOf(
+                Case("identity resolve", ConversionFailureCode.IDENTITY_MISMATCH) {
+                    useDefaultIdentityPort = true
+                    identityFailure = IllegalArgumentException("same failure")
+                },
+                Case("identity reserve", ConversionFailureCode.IDENTITY_MISMATCH) {
+                    useDefaultIdentityPort = true
+                    reserveFailure = IllegalArgumentException("same failure")
+                },
+                Case("package", ConversionFailureCode.PACKAGE) {
+                    useDefaultPackagePort = true
+                    packageFailure = IllegalArgumentException("same failure")
+                },
+                Case("bundle publish", ConversionFailureCode.BUNDLE_IO) {
+                    useDefaultBundlePort = true
+                    bundleFailure = IllegalArgumentException("same failure")
+                },
+                Case("bundle import", ConversionFailureCode.BUNDLE_IO) {
+                    useDefaultGeneratedImportPort = true
+                    importFailure = IllegalArgumentException("same failure")
+                },
+            )
+
+            cases.forEach { case ->
+                val fixture = Fixture(temporaryFolder, mutableListOf()).apply(case.configure)
+                val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                    fixture.coordinator().begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    ),
+                )
+
+                val failure = assertIs<ConversionBuildResult.Failure>(
+                    fixture.coordinator().build(
+                        analysis.token,
+                        analysis.requiredApprovals,
+                        true,
+                        null,
+                    ),
+                )
+
+                assertEquals(case.expected, failure.code, case.name)
+            }
+        }
 
     @Test
     fun `blocked와 미확인 partial은 reserve 전에 차단한다`() = runTest {
@@ -858,6 +915,46 @@ class OnDeviceConversionCoordinatorTest {
             assertEquals(ConversionJobStage.BUNDLE_READY, fixture.stage)
             assertTrue(!fixture.normalRestoreDestroyedBuilding)
         }
+
+    @Test
+    fun `BUILDING resume import bundle 실패는 recovered artifact를 보존한다`() = runTest {
+        val cause = IllegalStateException("resume import failed")
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            restoredStage = ConversionJobStage.BUILDING
+            useDefaultGeneratedImportPort = true
+            importFailure = cause
+        }
+        val recovered = requireNotNull(fixture.recoveredGenerated)
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            fixture.coordinator().build(fixture.token, emptySet(), true, null),
+        )
+
+        assertEquals(ConversionFailureCode.BUNDLE_IO, failure.code)
+        assertSame(recovered, failure.generated)
+        assertTrue(fixture.abortedOwnerTokens.isEmpty())
+        assertTrue(fixture.discardedBundleTokens.isEmpty())
+        assertTrue(fixture.discardedTokens.isEmpty())
+    }
+
+    @Test
+    fun `BUILDING resume import cancellation은 동일 instance를 재전파한다`() = runTest {
+        val cancellation = CancellationException("resume import cancelled")
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            restoredStage = ConversionJobStage.BUILDING
+            useDefaultGeneratedImportPort = true
+            importFailure = cancellation
+        }
+
+        val thrown = assertFailsWith<CancellationException> {
+            fixture.coordinator().build(fixture.token, emptySet(), true, null)
+        }
+
+        assertSame(cancellation, thrown)
+        assertTrue(fixture.abortedOwnerTokens.isEmpty())
+        assertTrue(fixture.discardedBundleTokens.isEmpty())
+        assertTrue(fixture.discardedTokens.isEmpty())
+    }
 
     @Test
     fun `import 실패 직후 analyze와 재생성 build도 BUILDING generated를 조정한다`() =
@@ -1295,6 +1392,10 @@ class OnDeviceConversionCoordinatorTest {
         var packageFailure: Throwable? = null
         var bundleFailure: Throwable? = null
         var importFailure: Throwable? = null
+        var useDefaultIdentityPort = false
+        var useDefaultPackagePort = false
+        var useDefaultBundlePort = false
+        var useDefaultGeneratedImportPort = false
         var preparedSourceSha256 = "4".repeat(64)
         var verifiedInputFailureCall: Int? = null
         private var verifiedInputCalls = 0
@@ -1539,6 +1640,12 @@ class OnDeviceConversionCoordinatorTest {
                     ownerAborted = true
                     activeOwner = null
                 }
+            }.let { delegate ->
+                if (useDefaultIdentityPort) {
+                    DefaultConversionIdentityPort(delegate)
+                } else {
+                    delegate
+                }
             },
             installed = ConversionInstalledPort {
                 events += "installed"
@@ -1573,6 +1680,12 @@ class OnDeviceConversionCoordinatorTest {
                         concurrentPackages -= 1
                     }
                 }
+            }.let { delegate ->
+                if (useDefaultPackagePort) {
+                    DefaultConversionPackagePort(delegate)
+                } else {
+                    delegate
+                }
             },
             bundles = object : ConversionBundlePort {
                 override fun publish(token: String, packaged: PackagedConversion): GeneratedBundle {
@@ -1598,6 +1711,12 @@ class OnDeviceConversionCoordinatorTest {
                     generatedFile.inputStream().use { it.copyTo(output) }
                     return "2".repeat(64)
                 }
+            }.let { delegate ->
+                if (useDefaultBundlePort) {
+                    DefaultConversionBundlePort(delegate)
+                } else {
+                    delegate
+                }
             },
             imports = ConversionGeneratedImportPort {
                 events += "import"
@@ -1619,6 +1738,12 @@ class OnDeviceConversionCoordinatorTest {
                         status = ContractCompatibilityStatus.PARTIAL,
                         issues = emptyList(),
                     )
+                }
+            }.let { delegate ->
+                if (useDefaultGeneratedImportPort) {
+                    DefaultConversionGeneratedImportPort(delegate)
+                } else {
+                    delegate
                 }
             },
             analysisCacheCleaner = analysisCacheCleaner,

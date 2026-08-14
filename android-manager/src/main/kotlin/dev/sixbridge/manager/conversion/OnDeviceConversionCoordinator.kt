@@ -443,8 +443,13 @@ internal class OnDeviceConversionCoordinator(
         val generated = bundles.recover(job.token)
         if (generated != null) {
             if (!importReview) return RestoredConversion.GeneratedPending(generated)
-            val review = imports.importGenerated(generated)
-                ?: return RestoredConversion.GeneratedPending(generated)
+            val review = try {
+                imports.importGenerated(generated)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: ConversionBundleException) {
+                return RestoredConversion.GeneratedPending(generated)
+            } ?: return RestoredConversion.GeneratedPending(generated)
             work.markBundleReady(job.token, generated.file, generated.sha256)
             return RestoredConversion.BundleReady(review, generated)
         }

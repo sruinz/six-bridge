@@ -456,6 +456,46 @@ internal class DefaultConversionRuntime(
 }
 
 internal class DefaultConversionIdentityPort(
+    private val delegate: ConversionIdentityPort,
+) : ConversionIdentityPort {
+    constructor(
+        ledger: ConversionIdentityLedger,
+        packager: OnDeviceWrapperPackager,
+        reconcileLegacyIdentities: suspend () -> Unit = {},
+    ) : this(
+        LedgerConversionIdentityPort(
+            ledger,
+            packager,
+            reconcileLegacyIdentities,
+        ),
+    )
+
+    override suspend fun existingTargets(profileMajorVersion: Int) =
+        delegate.existingTargets(profileMajorVersion)
+
+    override suspend fun resolve(
+        prepared: PreparedConversionSnapshot,
+        profile: BrowserProfile,
+        selection: InstallationIdentitySelection?,
+        ownerToken: String,
+    ) = withConversionIdentityBoundary {
+        delegate.resolve(prepared, profile, selection, ownerToken)
+    }
+
+    override suspend fun reserve(
+        resolved: ResolvedPackageIdentity,
+        displayName: String,
+        installedVersionCode: Long?,
+        ownerToken: String,
+    ) = withConversionIdentityBoundary {
+        delegate.reserve(resolved, displayName, installedVersionCode, ownerToken)
+    }
+
+    override suspend fun releaseFailedAttempt(ownerToken: String) =
+        delegate.releaseFailedAttempt(ownerToken)
+}
+
+private class LedgerConversionIdentityPort(
     private val ledger: ConversionIdentityLedger,
     private val packager: OnDeviceWrapperPackager,
     private val reconcileLegacyIdentities: suspend () -> Unit = {},
@@ -470,7 +510,7 @@ internal class DefaultConversionIdentityPort(
         profile: BrowserProfile,
         selection: InstallationIdentitySelection?,
         ownerToken: String,
-    ): ResolvedPackageIdentity = withConversionIdentityBoundary {
+    ): ResolvedPackageIdentity {
         when (prepared.identityMode) {
             InstallationIdentityMode.PASSTHROUGH ->
                 require(prepared.passthroughCrx != null && prepared.preparedCrx == null)
@@ -517,7 +557,7 @@ internal class DefaultConversionIdentityPort(
         displayName: String,
         installedVersionCode: Long?,
         ownerToken: String,
-    ): ReservedPackageIdentity = withConversionIdentityBoundary {
+    ): ReservedPackageIdentity {
         val publicKeySha = resolved.identity.crxPublicKeyDer?.let(::sha256)
         val reservation = ledger.reserve(
             ConversionIdentityReservation(
@@ -544,6 +584,23 @@ internal class DefaultConversionIdentityPort(
 }
 
 internal class DefaultConversionPackagePort(
+    private val delegate: ConversionPackagePort,
+) : ConversionPackagePort {
+    constructor(
+        ledger: ConversionIdentityLedger,
+        packager: OnDeviceWrapperPackager,
+    ) : this(OnDeviceConversionPackagePort(ledger, packager))
+
+    override suspend fun packageWrapper(
+        reservation: ReservedPackageIdentity,
+        bound: BoundConversionSnapshot,
+        token: String,
+    ) = withConversionPackageBoundary {
+        delegate.packageWrapper(reservation, bound, token)
+    }
+}
+
+private class OnDeviceConversionPackagePort(
     private val ledger: ConversionIdentityLedger,
     private val packager: OnDeviceWrapperPackager,
 ) : ConversionPackagePort {
@@ -551,7 +608,7 @@ internal class DefaultConversionPackagePort(
         reservation: ReservedPackageIdentity,
         bound: BoundConversionSnapshot,
         token: String,
-    ): PackagedConversion = withConversionPackageBoundary {
+    ): PackagedConversion {
         val output = packager.outputFile(token)
         val source = bound.preparedCrx?.let { artifact ->
             packager.stageSource(token, artifact.length) {
@@ -563,7 +620,7 @@ internal class DefaultConversionPackagePort(
         )
         val isCrxSource =
             bound.passthroughCrx != null || bound.preparedCrx != null
-        try {
+        return try {
             val result = packager.packageWrapper(
                 ledger,
                 OnDeviceWrapperPathRequest(
@@ -595,14 +652,31 @@ internal class DefaultConversionPackagePort(
 }
 
 internal class DefaultConversionBundlePort(
+    private val delegate: ConversionBundlePort,
+) : ConversionBundlePort {
+    constructor(store: GeneratedBundleStore) : this(
+        GeneratedBundleStoreConversionPort(store),
+    )
+
+    override fun publish(token: String, packaged: PackagedConversion) =
+        withConversionBundleBoundary {
+            delegate.publish(token, packaged)
+        }
+    override fun recover(token: String): GeneratedBundle? =
+        runCatching { delegate.recover(token) }.getOrNull()
+    override fun discard(token: String): Boolean = delegate.discard(token)
+    override fun copyTo(token: String, output: java.io.OutputStream): String =
+        delegate.copyTo(token, output)
+    override suspend fun createShareSnapshot(token: String): File? =
+        delegate.createShareSnapshot(token)
+}
+
+private class GeneratedBundleStoreConversionPort(
     private val store: GeneratedBundleStore,
 ) : ConversionBundlePort {
     override fun publish(token: String, packaged: PackagedConversion) =
-        withConversionBundleBoundary {
-            store.publish(token, packaged.opaque as OnDeviceWrapperResult)
-        }
-    override fun recover(token: String): GeneratedBundle? =
-        runCatching { store.recover(token) }.getOrNull()
+        store.publish(token, packaged.opaque as OnDeviceWrapperResult)
+    override fun recover(token: String): GeneratedBundle? = store.recover(token)
     override fun discard(token: String): Boolean = store.discard(token)
     override fun copyTo(token: String, output: java.io.OutputStream): String =
         store.copyTo(token, output)
