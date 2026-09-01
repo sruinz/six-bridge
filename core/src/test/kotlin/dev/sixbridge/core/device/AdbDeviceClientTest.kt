@@ -10,6 +10,7 @@ import dev.sixbridge.core.wrapper.ExternalToolException
 import dev.sixbridge.core.wrapper.ProcessRunner
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
 import java.security.KeyPairGenerator
@@ -366,13 +367,31 @@ class AdbDeviceClientTest {
         )
         val localRoot = Files.createTempDirectory("six-verify-build-local")
         val wrapperPath = Files.createTempFile("six-verify-build", ".apk")
+        val compatibility = CompatibilityReport(
+            status = CompatibilityStatus.COMPATIBLE,
+            manifestVersion = 3,
+            extensionName = "Build verify",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = emptyList(),
+            sourceSha256 = "c".repeat(64),
+            browserProfileSha256 = "d".repeat(64),
+        )
+        val contract = SixBundle.toContractV6(
+            compatibility,
+            "c".repeat(64),
+            "e".repeat(64),
+            null,
+        )
         val wrapper = WrapperApkBuilder(sdk, localRoot).build(
             WrapperBuildRequest(
                 packed.extensionId,
                 "Build verify",
                 packed.bytes,
                 wrapperPath,
-                "0".repeat(64),
+                CompatibilityApkBinding.canonicalSha256(contract),
             ),
         )
         val descriptor = ExtensionDescriptor(
@@ -386,7 +405,9 @@ class AdbDeviceClientTest {
             wrapperVersionCode = wrapper.versionCode,
             signerSha256 = wrapper.signerSha256,
         )
-        val bundle = bundle(wrapperPath, descriptor)
+        val bundle = Files.createTempFile("six-verify-build", ".six").also {
+            SixBundle.write(it, wrapperPath, descriptor, contract)
+        }
         val crx = Files.createTempFile("six-verify-build", ".crx")
             .also { it.writeBytes(packed.bytes) }
 
@@ -394,6 +415,16 @@ class AdbDeviceClientTest {
 
         assertEquals(packed.extensionId, result.extensionId)
         assertEquals(wrapper.packageName, result.wrapperPackage)
+
+        val downgraded = bundle(wrapperPath, descriptor)
+        assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(downgraded, crx, wrapperPath)
+        }
+        val fixture = adbFixture()
+        assertFailsWith<IllegalArgumentException> {
+            AdbDeviceClient(fixture.adb.toString()).install(downgraded, "serial-1")
+        }
+        assertFalse(Files.exists(fixture.log))
 
         val wrongCrx = Files.createTempFile("six-verify-build-wrong", ".crx")
             .also { it.writeBytes(packed.bytes + 1) }
