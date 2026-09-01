@@ -119,16 +119,17 @@ class BuildArtifactVerifier {
     internal fun verifyWrapper(
         apk: Path,
         contents: SixBundleContents,
-    ) = verifyWrapper(apk, contents.extension, contents)
+    ) {
+        verifyCompatibilityBinding(apk, contents)
+        verifyStructuralWrapper(apk, contents.extension)
+    }
 
-    internal fun verifyWrapper(
+    private fun verifyStructuralWrapper(
         apk: Path,
         descriptor: ExtensionDescriptor,
-        contents: SixBundleContents? = null,
     ) {
         val toolchain = AndroidToolchain.locate()
         verifyEmbeddedCrx(apk, descriptor)
-        contents?.let { verifyCompatibilityBinding(apk, it) }
         val badging = ProcessRunner.run(
             listOf(toolchain.aapt2.toString(), "dump", "badging", apk.toString()),
         ).stdout

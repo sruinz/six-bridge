@@ -42,14 +42,18 @@ data class ExtensionDescriptor(
     val signerSha256: String,
 )
 
-class SixBundleContents(
-    val wrapperApk: ByteArray,
+class SixBundleContents internal constructor(
+    wrapperApk: ByteArray,
     val extension: ExtensionDescriptor,
-    val compatibility: CompatibilityReport,
+    compatibility: CompatibilityReport,
     val compatibilitySchemaVersion: Int,
     val compatibilityCanonicalSha256: String,
     forcedCompatibility: ForcedCompatibilityProvenance?,
 ) {
+    private val stableWrapperApk = wrapperApk.copyOf()
+    val wrapperApk: ByteArray
+        get() = stableWrapperApk.copyOf()
+    val compatibility: CompatibilityReport = compatibility.deepImmutableCopy()
     val forcedCompatibility: ForcedCompatibilityProvenance? =
         forcedCompatibility.deepImmutableCopy()
 }

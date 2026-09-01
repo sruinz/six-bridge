@@ -102,7 +102,8 @@ class SixBridgeServiceTest {
     @Test
     fun `승인 없는 dynamic UNKNOWN build는 어떤 산출물도 만들지 않는다`() {
         val workspace = Files.createTempDirectory("six-build-dynamic-deny-workspace")
-        val source = source("six-build-dynamic-deny-source", "Dynamic deny")
+        val source = Files.createDirectory(workspace.resolve("source"))
+        val dist = Files.createDirectory(workspace.resolve("dist"))
         source.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
         source.resolve("manifest.json").writeText(
             """{"manifest_version":3,"name":"Dynamic deny","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
@@ -111,12 +112,15 @@ class SixBridgeServiceTest {
             error("강제 승인 거부 뒤 toolchain을 조회하면 안 됩니다.")
         }
 
-        assertFailsWith<SixBridgeUserInputException> {
-            service.build(source.toString(), supportedProfile())
+        val output = dist.resolve("dynamic.six")
+        val failure = assertFailsWith<dev.sixbridge.core.conversion.ConversionUnavailableException> {
+            service.build(source.toString(), supportedProfile(), output)
         }
+        assertTrue(failure.message.orEmpty().isNotBlank())
 
-        val dist = workspace.resolve("dist")
-        assertTrue(!Files.exists(dist) || Files.list(dist).use { paths -> paths.findAny().isEmpty })
+        assertTrue(!Files.exists(dist.resolve("dynamic.crx")))
+        assertTrue(!Files.exists(dist.resolve("dynamic-wrapper.apk")))
+        assertTrue(!Files.exists(output))
     }
 
     @Test

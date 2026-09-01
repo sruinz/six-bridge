@@ -55,6 +55,10 @@ class ConversionPreparationEngineTest {
             val prepared = engine.prepare(input, profile(), emptySet(), authorization = authorization)
             assertEquals(listOf("api_usage_dynamic"), prepared.forcedCompatibility?.issueCodes)
 
+            assertFailsWith<ConversionValidationException> {
+                engine.bindIdentity(prepared, profile(), keyPair().public.encoded)
+            }
+
             val bound = engine.bindIdentity(
                 prepared,
                 profile(),

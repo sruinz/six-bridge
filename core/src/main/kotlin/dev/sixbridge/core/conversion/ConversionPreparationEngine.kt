@@ -319,6 +319,13 @@ class ConversionPreparationEngine private constructor(
                 originalExtensionId = parsed.extensionId,
                 convertedExtensionId = parsed.extensionId,
             ).also(CompatibilityReport::validate)
+            requireStableReplan(
+                compatibility,
+                prepared.appliedAdapterIds,
+                false,
+                authorization,
+                prepared.forcedCompatibility,
+            )
             return bound(
                 sourceZip = parsed.zipBytes,
                 extensionId = parsed.extensionId,
@@ -563,6 +570,11 @@ class ConversionPreparationEngine private constructor(
         ) {
             throw ConversionValidationException(
                 "변환본 재계획에 미적용 adapter가 남았습니다.",
+            )
+        }
+        if (!transformed && verificationPlan.selectedAdapters.isNotEmpty()) {
+            throw ConversionValidationException(
+                "passthrough 재계획에 새 adapter가 생겼습니다.",
             )
         }
     }

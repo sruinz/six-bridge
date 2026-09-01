@@ -25,6 +25,22 @@ import kotlin.test.assertTrue
 
 class SixBundleTest {
     @Test
+    fun `읽은 bundle contents는 wrapper bytes와 compatibility collection을 방어 복사한다`() {
+        val wrapper = Files.createTempFile("immutable-wrapper", ".apk")
+        wrapper.writeBytes(byteArrayOf(1, 2, 3))
+        val output = Files.createTempFile("immutable", ".six")
+        val descriptor = ExtensionDescriptor("abcdefghijklmnopabcdefghijklmnop", "Immutable", "1", "ZIP", "a".repeat(64), sha256(wrapper.toFile().readBytes()), "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop", 1, "b".repeat(64))
+        SixBundle.write(output, wrapper, descriptor, CompatibilityReport(CompatibilityStatus.COMPATIBLE, 3, "Immutable", "1", declaredPermissions = setOf("storage"), usedApis = setOf("storage"), unsupportedApis = emptySet(), issues = emptyList(), sourceSha256 = "c".repeat(64), browserProfileSha256 = "d".repeat(64)))
+        val contents = SixBundle.read(output)
+        val bytes = contents.wrapperApk
+        bytes[0] = 9
+        assertContentEquals(byteArrayOf(1, 2, 3), contents.wrapperApk)
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (contents.compatibility.declaredPermissions as MutableSet<String>) += "tabs"
+        }
+    }
+    @Test
     fun `v6 mapper는 forced UNKNOWN provenance를 손실 없이 왕복한다`() {
         val report = compatibilityWithProofs().copy(
             status = CompatibilityStatus.UNKNOWN,
