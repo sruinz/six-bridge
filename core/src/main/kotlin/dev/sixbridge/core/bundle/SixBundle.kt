@@ -170,7 +170,7 @@ object SixBundle {
     private fun ForcedCompatibilityProvenance.toContract() = ContractForcedCompatibility(
         scope = scope.name,
         originalStatus = ContractCompatibilityStatus.valueOf(originalStatus.name),
-        issueCodes = issueCodes,
+        issueCodes = Collections.unmodifiableList(issueCodes.toList()),
     )
 
     private fun ContractBundleContents.toCore() = SixBundleContents(

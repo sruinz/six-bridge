@@ -86,6 +86,41 @@ class SixBundleContractTest {
     }
 
     @Test
+    fun `schema v6은 malformed forced provenance scalar와 필드 타입을 거부한다`() {
+        val value = validContents().compatibility.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            forcedCompatibility = ContractForcedCompatibility(
+                scope = "UNKNOWN_API_USAGE",
+                originalStatus = ContractCompatibilityStatus.UNKNOWN,
+                issueCodes = listOf("api_usage_dynamic"),
+            ),
+        )
+        val encoded = BundleJson.encodeCompatibility(value)
+
+        listOf(
+            encoded.replace("\"scope\":\"UNKNOWN_API_USAGE\",", ""),
+            encoded.replace(",\"originalStatus\":\"unknown\"", ""),
+            encoded.replace(",\"issueCodes\":[\"api_usage_dynamic\"]", ""),
+            encoded.replace(
+                "\"forcedCompatibility\":{\"scope\":\"UNKNOWN_API_USAGE\",\"originalStatus\":\"unknown\",\"issueCodes\":[\"api_usage_dynamic\"]}",
+                "\"forcedCompatibility\":true",
+            ),
+            encoded.replace(
+                "\"forcedCompatibility\":{\"scope\":\"UNKNOWN_API_USAGE\",\"originalStatus\":\"unknown\",\"issueCodes\":[\"api_usage_dynamic\"]}",
+                "\"forcedCompatibility\":[]",
+            ),
+            encoded.replace("\"scope\":\"UNKNOWN_API_USAGE\"", "\"scope\":true"),
+            encoded.replace("\"originalStatus\":\"unknown\"", "\"originalStatus\":true"),
+            encoded.replace("\"issueCodes\":[\"api_usage_dynamic\"]", "\"issueCodes\":true"),
+            encoded.replace("\"issueCodes\":[\"api_usage_dynamic\"]", "\"issueCodes\":[true]"),
+        ).forEach { malformed ->
+            assertFailsWith<IllegalArgumentException> { BundleJson.decodeCompatibility(malformed) }
+        }
+    }
+
+    @Test
     fun `schema v6은 forcedCompatibility key가 null이어도 필요하다`() {
         val value = validContents().compatibility.copy(schemaVersion = 6)
         val encoded = BundleJson.encodeCompatibility(value)
@@ -156,22 +191,32 @@ class SixBundleContractTest {
     }
 
     @Test
-    fun `v3부터 v5 compatibility는 forced provenance 없이 기존대로 decode한다`() {
-        val reports = listOf(
-            validContents().compatibility,
-            validContents().compatibility.copy(
-                schemaVersion = 4,
-                originalSourceSha256 = "e".repeat(64),
-                planSha256 = "f".repeat(64),
-            ),
-            validContents().compatibility.copy(schemaVersion = 5),
+    fun `v1부터 v5 fixed fixture는 forced provenance 없이 legacy 필드를 decode한다`() {
+        val reports = legacyCompatibilityFixtures().map(BundleJson::decodeCompatibility)
+
+        assertEquals(listOf(1, 2, 3, 4, 5), reports.map { it.schemaVersion })
+        assertEquals(ContractCompatibilityStatus.COMPATIBLE, reports[0].status)
+        assertEquals("automatic", reports[1].conversionState)
+        assertEquals("c".repeat(64), reports[2].sourceSha256)
+        assertEquals("e".repeat(64), reports[3].originalSourceSha256)
+        assertEquals(listOf("storage"), reports[4].verifiedApis)
+        reports.forEach { report ->
+            assertEquals(null, report.forcedCompatibility)
+        }
+    }
+
+    @Test
+    fun `v1부터 v5는 non-null forced provenance encode를 거부한다`() {
+        val forced = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
         )
 
-        reports.forEach { report ->
-            assertEquals(null, BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(report)).forcedCompatibility)
-        }
-        listOf(legacyCompatibility(1), legacyCompatibility(2)).forEach { fixture ->
-            assertEquals(null, BundleJson.decodeCompatibility(fixture).forcedCompatibility)
+        legacyCompatibilityFixtures().map(BundleJson::decodeCompatibility).forEach { report ->
+            assertFailsWith<IllegalArgumentException> {
+                BundleJson.encodeCompatibility(report.copy(forcedCompatibility = forced))
+            }
         }
     }
 
@@ -677,6 +722,14 @@ class SixBundleContractTest {
         } else {
             """{"schemaVersion":2,"status":"compatible","manifestKeyPresent":false,"declaredPermissions":[],"usedApis":[],"unsupportedApis":[],"issues":[],"conversionState":"passthrough","adapterDecisions":[]}"""
         }
+
+    private fun legacyCompatibilityFixtures() = listOf(
+        """{"schemaVersion":1,"status":"compatible","manifestVersion":3,"extensionName":"V1","extensionVersion":"1","manifestKeyPresent":false,"declaredPermissions":[],"usedApis":[],"unsupportedApis":[],"issues":[]}""",
+        """{"schemaVersion":2,"status":"compatible","manifestVersion":3,"extensionName":"V2","extensionVersion":"1","manifestKeyPresent":false,"declaredPermissions":[],"usedApis":[],"unsupportedApis":[],"issues":[],"conversionState":"automatic","adapterDecisions":[],"originalExtensionId":"abcdefghijklmnopabcdefghijklmnop","convertedExtensionId":"abcdefghijklmnopabcdefghijklmnop"}""",
+        """{"schemaVersion":3,"status":"partial","manifestVersion":3,"extensionName":"V3","extensionVersion":"1","manifestKeyPresent":false,"declaredPermissions":["storage"],"usedApis":["storage"],"unsupportedApis":[],"issues":[],"conversionState":"requires-approval","adapterDecisions":[],"sourceSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","browserProfileSha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}""",
+        """{"schemaVersion":4,"status":"partial","manifestVersion":3,"extensionName":"V4","extensionVersion":"1","manifestKeyPresent":false,"declaredPermissions":["storage"],"usedApis":["storage"],"unsupportedApis":[],"issues":[],"conversionState":"requires-approval","adapterDecisions":[],"sourceSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","browserProfileSha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","originalSourceSha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","planSha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}""",
+        """{"schemaVersion":5,"status":"compatible","manifestVersion":3,"extensionName":"V5","extensionVersion":"1","manifestKeyPresent":false,"declaredPermissions":["storage"],"usedApis":["storage"],"unsupportedApis":[],"issues":[],"conversionState":"automatic","adapterDecisions":[],"sourceSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","browserProfileSha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","verifiedApis":["storage"],"unverifiedApis":[],"unavailableApis":[]}""",
+    )
 
     private fun rawStoredZip(entries: List<Pair<String, ByteArray>>): ByteArray = ByteArrayOutputStream().also { output ->
         entries.forEach { (name, bytes) ->

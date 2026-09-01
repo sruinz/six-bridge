@@ -72,6 +72,34 @@ class SixBundleTest {
     }
 
     @Test
+    fun `v6 encode mapper는 Task 1 provenance issueCodes를 방어 복사한다`() {
+        val issueCodes = mutableListOf("api_usage_dynamic")
+        val contract = SixBundle.toContractV6(
+            compatibilityWithProofs().copy(
+                status = CompatibilityStatus.UNKNOWN,
+                issues = listOf(
+                    dev.sixbridge.core.compat.CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+                ),
+            ),
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+            forcedCompatibility = ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                issueCodes,
+            ),
+        )
+
+        issueCodes += "mutated"
+
+        assertEquals(listOf("api_usage_dynamic"), requireNotNull(contract.forcedCompatibility).issueCodes)
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (requireNotNull(contract.forcedCompatibility).issueCodes as MutableList<String>) += "mutated"
+        }
+    }
+
+    @Test
     fun `v6 decode mapper는 contract issueCodes의 변경을 공유하지 않는다`() {
         val issueCodes = mutableListOf("api_usage_dynamic")
         val contract = SixBundle.toContractV6(
