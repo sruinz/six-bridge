@@ -84,6 +84,13 @@ class BuildArtifactVerifierTest {
         val legacyDescriptor = descriptor.copy(wrapperSha256 = sha(Files.readAllBytes(legacyWrapper)))
         SixBundle.write(legacy, legacyWrapper, legacyDescriptor, contents.compatibility)
         BuildArtifactVerifier().verifyWrapper(legacyWrapper, SixBundle.read(legacy))
+
+        val downgraded = Files.createTempFile("six-v5-downgraded", ".six")
+        SixBundle.write(downgraded, wrapper, descriptor, contents.compatibility)
+        val downgradeError = assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(downgraded, Files.createTempFile("downgrade", ".crx").also { Files.write(it, crx.bytes) }, wrapper)
+        }
+        assertTrue("legacy wrapper APK" in downgradeError.message.orEmpty())
     }
 
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)

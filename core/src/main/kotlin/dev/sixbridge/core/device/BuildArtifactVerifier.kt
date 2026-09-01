@@ -227,6 +227,15 @@ class BuildArtifactVerifier {
             require(contents.forcedCompatibility == null) {
                 "legacy SixBundle은 forced compatibility provenance를 가질 수 없습니다."
             }
+            ZipFile(apk.toFile()).use { zip ->
+                require(
+                    zip.entries().asSequence().none {
+                        it.name == CompatibilityApkBinding.ENTRY_NAME
+                    },
+                ) {
+                    "legacy wrapper APK는 ${CompatibilityApkBinding.ENTRY_NAME} asset을 포함할 수 없습니다."
+                }
+            }
             return
         }
         require(contents.compatibilitySchemaVersion == 6) {
