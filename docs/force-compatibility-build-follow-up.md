@@ -1,5 +1,11 @@
 # 호환성 강제 생성 옵션 후속 작업
 
+> 상태: 이 초기 검토는 승인된
+> [v0.1.2 제한적 UNKNOWN 강제 변환 설계](superpowers/specs/2026-09-02-v0.1.2-forced-unknown-conversion-design.md)로
+> 구체화됐다. 충돌하는 내용은 v0.1.2 설계를 따른다. 특히 v0.1.2는
+> `api_usage_dynamic` 계열 `UNKNOWN`만 강제할 수 있으며 `BLOCKED`는 계속
+> 차단한다.
+
 ## 목적
 
 정적 분석 결과가 `UNKNOWN` 또는 `BLOCKED`이더라도 사용자가 확인된 위험을
