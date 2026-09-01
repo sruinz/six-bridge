@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
@@ -128,6 +129,7 @@ class ConversionPlannerTest {
         val plan = ConversionPlanner().plan(report, emptySet())
 
         assertTrue(ConversionPlan::class.java.isInterface)
+        assertEquals(null, plan.forcedCompatibility)
         assertFalse(
             ConversionPlan::class.java.methods.any {
                 it.name == "copy" || it.name.startsWith("component")
@@ -325,11 +327,13 @@ class ConversionPlannerTest {
     }
 
     @Test
-    fun `rejects blocked and unknown compatibility before planning`() {
-        listOf(
-            CompatibilityStatus.BLOCKED,
-            CompatibilityStatus.UNKNOWN,
-        ).forEach { status ->
+    fun `blocked는 거부하고 승인 없는 UNKNOWN은 강제 승인 오류로 거부한다`() {
+        mapOf(
+            CompatibilityStatus.BLOCKED to
+                ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
+            CompatibilityStatus.UNKNOWN to
+                ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+        ).forEach { (status, expectedFailure) ->
             val error = assertFailsWith<ConversionPlanningException> {
                 ConversionPlanner().plan(
                     reportWith(status = status),
@@ -338,11 +342,64 @@ class ConversionPlannerTest {
             }
 
             assertEquals(
-                ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
+                expectedFailure,
                 error.failure,
             )
             assertEquals(emptySet(), error.adapterIds)
         }
+    }
+
+    @Test
+    fun `명시 승인한 eligible UNKNOWN은 원상태 provenance로 계획한다`() {
+        val plan = ConversionPlanner().plan(
+            dynamicUnknownReport(),
+            emptySet(),
+            ConversionAuthorization.forceUnknownApiUsage(),
+        )
+
+        assertEquals(CompatibilityStatus.UNKNOWN, plan.report.status)
+        assertEquals(
+            ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            ),
+            plan.forcedCompatibility,
+        )
+        assertFalse(
+            plan.proofSha256 == ConversionPlanProof.digest(
+                plan.report,
+                plan.selectedAdapters,
+            ),
+        )
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (requireNotNull(plan.forcedCompatibility).issueCodes as MutableList<String>)
+                .clear()
+        }
+    }
+
+    @Test
+    fun `승인 없는 UNKNOWN과 정상 report의 불필요한 강제 승인을 거부한다`() {
+        val unknownError = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(dynamicUnknownReport(), emptySet())
+        }
+        val compatibleError = assertFailsWith<ConversionPlanningException> {
+            ConversionPlanner().plan(
+                reportWith(),
+                emptySet(),
+                ConversionAuthorization.forceUnknownApiUsage(),
+            )
+        }
+
+        assertEquals(
+            ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+            unknownError.failure,
+        )
+        assertEquals(
+            ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+            compatibleError.failure,
+        )
     }
 
     @Test
@@ -411,6 +468,14 @@ class ConversionPlannerTest {
         adapterDecisions = decisions.toList(),
         sourceSha256 = "a".repeat(64),
         browserProfileSha256 = "b".repeat(64),
+    )
+
+    private fun dynamicUnknownReport() = reportWith(
+        status = CompatibilityStatus.UNKNOWN,
+    ).copy(
+        issues = listOf(
+            CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+        ),
     )
 
     private fun decision(

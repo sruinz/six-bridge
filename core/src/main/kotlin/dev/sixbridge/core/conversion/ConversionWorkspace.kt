@@ -389,7 +389,11 @@ class ConversionWorkspace private constructor(
             "conversion plan browser profile provenance가 다릅니다."
         }
         check(
-            ConversionPlanProof.digest(report, plan.selectedAdapters) ==
+            ConversionPlanProof.digest(
+                report,
+                plan.selectedAdapters,
+                plan.forcedCompatibility,
+            ) ==
                 plan.proofSha256,
         ) {
             "conversion plan proof가 다릅니다."

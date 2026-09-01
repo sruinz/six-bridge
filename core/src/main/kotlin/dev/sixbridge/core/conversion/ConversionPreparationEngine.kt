@@ -426,6 +426,7 @@ class ConversionPreparationEngine private constructor(
             ConversionPlanningFailure.UNDETECTED_APPROVAL ->
                 throw InapplicableAdapterApprovalException(error.adapterIds)
             ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
+            ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
             ConversionPlanningFailure.NO_APPLICABLE_ADAPTER,
             -> throw ConversionUnavailableException()
         }

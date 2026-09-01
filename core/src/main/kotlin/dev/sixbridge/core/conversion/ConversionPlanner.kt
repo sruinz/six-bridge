@@ -11,19 +11,30 @@ class ConversionPlanner {
     fun plan(
         report: CompatibilityReport,
         approvedAdapterIds: Set<String>,
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): ConversionPlan {
         val immutableReport = report.deepImmutableCopy()
             .also(CompatibilityReport::validate)
-        val approvals = approvedAdapterIds.toSet()
-        if (
-            immutableReport.status == CompatibilityStatus.BLOCKED ||
-            immutableReport.status == CompatibilityStatus.UNKNOWN
-        ) {
+        if (immutableReport.status == CompatibilityStatus.BLOCKED) {
             throw ConversionPlanningException(
                 ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
                 emptySet(),
             )
         }
+        val forcedCompatibility = ForceCompatibilityPolicy.requireProvenance(
+            immutableReport,
+            authorization,
+        )
+        if (
+            immutableReport.status == CompatibilityStatus.UNKNOWN &&
+            forcedCompatibility == null
+        ) {
+            throw ConversionPlanningException(
+                ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+                emptySet(),
+            )
+        }
+        val approvals = approvedAdapterIds.toSet()
         requireNotNull(immutableReport.sourceSha256) {
             "분석 report에 source provenance가 없습니다."
         }
@@ -93,7 +104,9 @@ class ConversionPlanner {
             proofSha256 = ConversionPlanProof.digest(
                 immutableReport,
                 immutableSelected,
+                forcedCompatibility,
             ),
+            forcedCompatibility = forcedCompatibility,
         )
     }
 
@@ -101,6 +114,7 @@ class ConversionPlanner {
         override val report: CompatibilityReport,
         override val selectedAdapters: List<SelectedAdapter>,
         override val proofSha256: String,
+        override val forcedCompatibility: ForcedCompatibilityProvenance?,
     ) : ConversionPlan
 
     private class PlannedAdapter(
@@ -124,25 +138,39 @@ sealed interface ConversionPlan {
     val report: CompatibilityReport
     val selectedAdapters: List<SelectedAdapter>
     val proofSha256: String
+    val forcedCompatibility: ForcedCompatibilityProvenance?
 }
 
 internal object ConversionPlanProof {
     fun digestDecisions(
         report: CompatibilityReport,
         selectedAdapters: List<AdapterDecision>,
-    ): String = digestInternal(report, selectedAdapters)
+    ): String = digestInternal(report, selectedAdapters, null)
 
     fun digest(
         report: CompatibilityReport,
         selectedAdapters: List<SelectedAdapter>,
-    ): String = digestInternal(report, selectedAdapters.map(SelectedAdapter::toDecision))
+        forcedCompatibility: ForcedCompatibilityProvenance? = null,
+    ): String = digestInternal(
+        report,
+        selectedAdapters.map(SelectedAdapter::toDecision),
+        forcedCompatibility,
+    )
 
     private fun digestInternal(
         report: CompatibilityReport,
         selectedAdapters: List<AdapterDecision>,
+        forcedCompatibility: ForcedCompatibilityProvenance?,
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        digest.field("schema", "conversion-plan-proof-v2")
+        digest.field(
+            "schema",
+            if (forcedCompatibility == null) {
+                "conversion-plan-proof-v2"
+            } else {
+                "conversion-plan-proof-v3"
+            },
+        )
         digest.field("report.status", report.status.name)
         digest.nullableField(
             "report.manifestVersion",
@@ -200,6 +228,14 @@ internal object ConversionPlanProof {
         digest.count("selectedAdapters", selectedAdapters.size)
         selectedAdapters.forEachIndexed { index, selected ->
             digest.decision("selectedAdapters[$index]", selected)
+        }
+        forcedCompatibility?.let { forced ->
+            digest.field("authorization.scope", forced.scope.name)
+            digest.field(
+                "authorization.originalStatus",
+                forced.originalStatus.name,
+            )
+            digest.stringList("authorization.issueCodes", forced.issueCodes)
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
@@ -286,20 +322,3 @@ internal fun CompatibilityReport.deepImmutableCopy(): CompatibilityReport = copy
         },
     ),
 )
-
-enum class ConversionPlanningFailure {
-    INELIGIBLE_COMPATIBILITY_STATUS,
-    NO_APPLICABLE_ADAPTER,
-    MISSING_REQUIRED_APPROVAL,
-    UNKNOWN_APPROVAL,
-    UNDETECTED_APPROVAL,
-}
-
-class ConversionPlanningException(
-    val failure: ConversionPlanningFailure,
-    adapterIds: Set<String>,
-) : IllegalArgumentException(
-    "${failure.name}: ${adapterIds.sorted().joinToString(",")}",
-) {
-    val adapterIds: Set<String> = adapterIds.toSortedSet()
-}

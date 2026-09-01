@@ -1,5 +1,23 @@
 package dev.sixbridge.core.conversion
 
+enum class ConversionPlanningFailure {
+    INELIGIBLE_COMPATIBILITY_STATUS,
+    INVALID_COMPATIBILITY_AUTHORIZATION,
+    NO_APPLICABLE_ADAPTER,
+    MISSING_REQUIRED_APPROVAL,
+    UNKNOWN_APPROVAL,
+    UNDETECTED_APPROVAL,
+}
+
+class ConversionPlanningException(
+    val failure: ConversionPlanningFailure,
+    adapterIds: Set<String>,
+) : IllegalArgumentException(
+    "${failure.name}: ${adapterIds.sorted().joinToString(",")}",
+) {
+    val adapterIds: Set<String> = adapterIds.toSortedSet()
+}
+
 sealed class AdapterApprovalException(
     message: String,
     adapterIds: Set<String>,
