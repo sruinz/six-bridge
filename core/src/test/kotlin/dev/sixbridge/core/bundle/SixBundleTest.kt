@@ -25,6 +25,31 @@ import kotlin.test.assertTrue
 
 class SixBundleTest {
     @Test
+    fun `forced v6 bundle contents의 non-empty nested provenance와 decision은 불변이다`() {
+        val wrapper = Files.createTempFile("forced-immutable-wrapper", ".apk")
+        wrapper.writeBytes(byteArrayOf(1, 2, 3))
+        val descriptor = ExtensionDescriptor("abcdefghijklmnopabcdefghijklmnop", "Tiny", "1.0.0", "ZIP", "a".repeat(64), sha256(wrapper.toFile().readBytes()), "dev.sixbridge.ext.abcdefghijklmnopabcdefghijklmnop", 1, "b".repeat(64))
+        val report = compatibilityWithProofs().copy(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(dev.sixbridge.core.compat.CompatibilityIssue("api_usage_dynamic", "dynamic", true)),
+            adapterDecisions = listOf(AdapterDecision("test", 1, AdapterRisk.SAFE, AdapterDisposition.OPTIONAL_APPROVAL, false, listOf(SourceEvidence("test.js", 1, "evidence")), listOf("change"), listOf("limit"))),
+        )
+        val output = Files.createTempFile("forced-immutable", ".six")
+        SixBundle.write(output, wrapper, descriptor, SixBundle.toContractV6(report, "a".repeat(64), "b".repeat(64), ForcedCompatibilityProvenance(CompatibilityForceScope.UNKNOWN_API_USAGE, CompatibilityStatus.UNKNOWN, listOf("api_usage_dynamic"))))
+        val contents = SixBundle.read(output)
+        val decision = contents.compatibility.adapterDecisions.first()
+
+        listOf<() -> Unit>(
+            { (contents.compatibility.issues as MutableList<*>).clear() },
+            { (contents.compatibility.adapterDecisions as MutableList<*>).clear() },
+            { (decision.evidence as MutableList<*>).clear() },
+            { (decision.changes as MutableList<*>).clear() },
+            { (decision.remainingLimitations as MutableList<*>).clear() },
+            { (requireNotNull(contents.forcedCompatibility).issueCodes as MutableList<*>).clear() },
+        ).forEach { mutation -> assertFailsWith<UnsupportedOperationException> { mutation() } }
+    }
+
+    @Test
     fun `읽은 bundle contents는 wrapper bytes와 compatibility collection을 방어 복사한다`() {
         val wrapper = Files.createTempFile("immutable-wrapper", ".apk")
         wrapper.writeBytes(byteArrayOf(1, 2, 3))
