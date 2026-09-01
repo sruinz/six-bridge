@@ -180,6 +180,11 @@ CLI `build`의 APK 서명은 개발 검증용이다. 일반 사용자에게 설�
 래퍼 서명과 설치 승인은 Android 관리자가 담당한다. 변환 과정에서 source를
 다시 패킹하면 원본 Chrome 웹 스토어 확장 ID가 바뀔 수 있다.
 
+호환성 분석이 차단한 입력을 사용자가 위험을 확인한 뒤 강제로 생성하는 기능은
+현재 제공하지 않는다. 이 기능의 안전 경계와 완료 조건은
+[호환성 강제 생성 옵션 후속 작업](docs/force-compatibility-build-follow-up.md)에
+기록한다.
+
 ## 삼성 Add-ons 설정 진입점
 
 `action-popup-entry` version 2는 browser profile이 삼성 Add-ons 상세
