@@ -5,6 +5,7 @@ import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.SourceEvidence
 import dev.sixbridge.core.draft.DraftReplayResult
 import dev.sixbridge.core.draft.SixDraft
@@ -1120,6 +1121,195 @@ class SixBridgeCommandTest {
             SixDraft.read(output).payload.input.originalSourceSha256,
             field(result.output, "transformedSha256"),
         )
+        assertFalse("forcedCompatibility=" in result.output)
+        assertFalse("호환성을 보장하지 않습니다" in result.error)
+    }
+
+    @Test
+    fun `force 옵션은 draft build에만 속하고 정확한 이름과 위치만 허용한다`() {
+        val workspace = Files.createTempDirectory("six-cli-force-scope")
+        val source = dynamicUnknownFixture(workspace.resolve("source"))
+        val profile = writeProfile(workspace)
+
+        listOf(
+            arrayOf("--force-compatibility-unknown", "analyze"),
+            arrayOf("analyze", "--force-compatibility-unknown"),
+            arrayOf("draft", "--force"),
+            arrayOf("build", "--force"),
+        ).forEach { arguments ->
+            val result = execute(*arguments)
+            assertEquals(2, result.exitCode, arguments.joinToString(" "))
+            assertEquals("", result.output, arguments.joinToString(" "))
+        }
+
+        val analyze = execute(
+            "--workspace", workspace.toString(),
+            "analyze",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--force-compatibility-unknown",
+        )
+        assertEquals(2, analyze.exitCode, analyze.error)
+        assertEquals("", analyze.output)
+    }
+
+    @Test
+    fun `dynamic UNKNOWN draft는 명시 승인한 작업만 v4로 강제 생성한다`() {
+        val workspace = Files.createTempDirectory("six-cli-force-draft")
+        val source = dynamicUnknownFixture(workspace.resolve("source"))
+        val profile = writeProfile(workspace)
+        val deniedOutput = workspace.resolve("denied.sixdraft")
+        val forcedOutput = workspace.resolve("forced.sixdraft")
+
+        val denied = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--identity", projectIdentity,
+            "--output", deniedOutput.toString(),
+        )
+        assertEquals(2, denied.exitCode, denied.error)
+        assertEquals("", denied.output)
+        assertFalse(deniedOutput.exists())
+
+        val forced = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--force-compatibility-unknown",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--identity", projectIdentity,
+            "--output", forcedOutput.toString(),
+        )
+        assertEquals(0, forced.exitCode, forced.error)
+        val verified = SixDraft.read(forcedOutput)
+        assertEquals(4, verified.payload.draft.schemaVersion)
+        assertEquals(2, verified.payload.plan.schemaVersion)
+        val provenance = requireNotNull(verified.payload.plan.forcedCompatibility)
+        assertEquals(CompatibilityForceScope.UNKNOWN_API_USAGE, provenance.scope)
+        assertEquals("UNKNOWN", provenance.originalStatus.name)
+        assertEquals(listOf("api_usage_dynamic"), provenance.issueCodes)
+        assertForcedOutput(forced)
+    }
+
+    @Test
+    fun `dynamic UNKNOWN build는 명시 승인한 작업만 v6로 강제 생성한다`() {
+        val workspace = Files.createTempDirectory("six-cli-force-build")
+        val source = dynamicUnknownFixture(workspace.resolve("source"))
+        val profile = writeProfile(workspace)
+        val deniedOutput = workspace.resolve("denied.six")
+        val forcedOutput = workspace.resolve("forced.six")
+
+        val denied = execute(
+            "--workspace", workspace.toString(),
+            "build",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", deniedOutput.toString(),
+        )
+        assertEquals(2, denied.exitCode, denied.error)
+        assertEquals("", denied.output)
+        assertBuildOutputsAbsent(deniedOutput)
+
+        val forced = execute(
+            "--workspace", workspace.toString(),
+            "build",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", forcedOutput.toString(),
+            "--force-compatibility-unknown",
+        )
+        assertEquals(0, forced.exitCode, forced.error)
+        val bundle = SixBundle.read(forcedOutput)
+        assertEquals(6, bundle.compatibilitySchemaVersion)
+        assertEquals("UNKNOWN", bundle.compatibility.status.name)
+        assertEquals(CompatibilityForceScope.UNKNOWN_API_USAGE, bundle.forcedCompatibility?.scope)
+        assertEquals(listOf("api_usage_dynamic"), bundle.forcedCompatibility?.issueCodes)
+        assertEquals("unknown", field(forced.output, "compatibility"))
+        assertForcedOutput(forced)
+    }
+
+    @Test
+    fun `force 옵션은 compatible profile budget UNKNOWN과 BLOCKED를 우회하지 못한다`() {
+        val workspace = Files.createTempDirectory("six-cli-force-ineligible")
+        val normalProfile = writeProfile(workspace)
+        val futureProfile = workspace.resolve("future-profile.json").also { path ->
+            val decoded = BrowserProfileJson.decode(normalProfile.readText())
+            path.writeText(BrowserProfileJson.encode(decoded.copy(majorVersion = 31)))
+        }
+        val cases = listOf(
+            "compatible" to (compatibleFixture(workspace.resolve("compatible")) to normalProfile),
+            "profile-unknown" to
+                (compatibleFixture(workspace.resolve("profile-unknown")) to futureProfile),
+            "budget-unknown" to (budgetUnknownFixture(workspace.resolve("budget")) to normalProfile),
+            "blocked" to (blockedFixture(workspace.resolve("blocked")) to normalProfile),
+        )
+
+        cases.forEach { (name, inputAndProfile) ->
+            val (source, profile) = inputAndProfile
+            val draft = workspace.resolve("$name.sixdraft")
+            val draftResult = execute(
+                "--workspace", workspace.toString(),
+                "draft",
+                "--input", source.toString(),
+                "--profile", profile.toString(),
+                "--identity", projectIdentity,
+                "--output", draft.toString(),
+                "--force-compatibility-unknown",
+            )
+            assertEquals(2, draftResult.exitCode, "$name draft: ${draftResult.error}")
+            assertEquals("", draftResult.output, "$name draft")
+            assertFalse(draft.exists(), "$name draft")
+
+            val bundle = workspace.resolve("$name.six")
+            val buildResult = execute(
+                "--workspace", workspace.toString(),
+                "build",
+                "--input", source.toString(),
+                "--profile", profile.toString(),
+                "--output", bundle.toString(),
+                "--force-compatibility-unknown",
+            )
+            assertEquals(2, buildResult.exitCode, "$name build: ${buildResult.error}")
+            assertEquals("", buildResult.output, "$name build")
+            assertBuildOutputsAbsent(bundle, name)
+        }
+    }
+
+    @Test
+    fun `force 거부는 기존 draft와 build 산출물을 변경하지 않는다`() {
+        val workspace = Files.createTempDirectory("six-cli-force-sentinel")
+        val source = dynamicUnknownFixture(workspace.resolve("source"))
+        val profile = writeProfile(workspace)
+        val sentinel = "user-owned".encodeToByteArray()
+        val draft = workspace.resolve("existing.sixdraft").also { it.writeBytes(sentinel) }
+        val bundle = workspace.resolve("existing.six").also { it.writeBytes(sentinel) }
+        val crx = workspace.resolve("existing.crx").also { it.writeBytes(sentinel) }
+        val wrapper = workspace.resolve("existing-wrapper.apk").also { it.writeBytes(sentinel) }
+
+        val draftResult = execute(
+            "--workspace", workspace.toString(),
+            "draft",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--identity", projectIdentity,
+            "--output", draft.toString(),
+        )
+        assertEquals(2, draftResult.exitCode, draftResult.error)
+        assertContentEquals(sentinel, draft.readBytes())
+
+        val buildResult = execute(
+            "--workspace", workspace.toString(),
+            "build",
+            "--input", source.toString(),
+            "--profile", profile.toString(),
+            "--output", bundle.toString(),
+        )
+        assertEquals(2, buildResult.exitCode, buildResult.error)
+        listOf(bundle, crx, wrapper).forEach { output ->
+            assertContentEquals(sentinel, output.readBytes(), output.toString())
+        }
     }
 
     @Test
@@ -1539,6 +1729,61 @@ class SixBridgeCommandTest {
             applied = true,
         )
         assertTrue(bundle.exists())
+        assertFalse("forcedCompatibility=" in buildResult.output)
+        assertFalse("호환성을 보장하지 않습니다" in buildResult.error)
+    }
+
+    private fun assertForcedOutput(result: Execution) {
+        assertEquals(1, result.output.lineSequence().count { it == "forcedCompatibility=true" })
+        assertEquals(1, result.output.lineSequence().count { it == "originalCompatibility=unknown" })
+        assertEquals(
+            1,
+            result.output.lineSequence().count { it == "forcedIssueCodes=api_usage_dynamic" },
+        )
+        assertEquals(
+            listOf("경고: 강제 변환 결과는 삼성 인터넷 호환성을 보장하지 않습니다."),
+            result.error.lineSequence().filter(String::isNotBlank).toList(),
+        )
+    }
+
+    private fun assertBuildOutputsAbsent(bundle: Path, message: String = "") {
+        val basename = bundle.fileName.toString().removeSuffix(".six")
+        val parent = requireNotNull(bundle.parent)
+        listOf(
+            bundle,
+            parent.resolve("$basename.crx"),
+            parent.resolve("$basename-wrapper.apk"),
+        ).forEach { output -> assertFalse(output.exists(), "$message: $output") }
+    }
+
+    private fun compatibleFixture(source: Path): Path = source.also {
+        Files.createDirectory(it)
+        it.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Compatible","version":"1"}""",
+        )
+    }
+
+    private fun dynamicUnknownFixture(source: Path): Path = source.also {
+        Files.createDirectory(it)
+        it.resolve("content.js").writeText("chrome[namespace].storage.local.get('value');")
+        it.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Dynamic","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+    }
+
+    private fun budgetUnknownFixture(source: Path): Path = source.also {
+        Files.createDirectory(it)
+        val manifest = """{"manifest_version":3,"name":"Budget","version":"1"}"""
+        it.resolve("manifest.json").writeText(
+            manifest + " ".repeat(1024 * 1024 + 1 - manifest.length),
+        )
+    }
+
+    private fun blockedFixture(source: Path): Path = source.also {
+        Files.createDirectory(it)
+        it.resolve("manifest.json").writeText(
+            """{"manifest_version":2,"name":"Blocked","version":"1"}""",
+        )
     }
 
     private fun writeProbeEvidence(root: Path, mismatchProvenance: Boolean): Path {

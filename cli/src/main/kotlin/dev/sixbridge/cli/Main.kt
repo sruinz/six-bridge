@@ -5,6 +5,10 @@ import dev.sixbridge.core.SixBridgeUserInputException
 import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterApprovalException
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ConversionPlanningException
+import dev.sixbridge.core.conversion.ConversionUnavailableException
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.conversion.MissingAdapterApprovalException
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.InvalidCrxException
@@ -44,6 +48,8 @@ fun createCommandLine(
         when (error) {
             is MissingAdapterApprovalException -> 4
             is AdapterApprovalException,
+            is ConversionPlanningException,
+            is ConversionUnavailableException,
             is SixBridgeUserInputException,
             is UnsupportedInputException,
             is InvalidCrxException,
@@ -198,11 +204,22 @@ class DraftCommand : Callable<Int> {
     @Option(names = ["--approve-adapter"])
     var approvedAdapterIds: MutableSet<String> = linkedSetOf()
 
+    @Option(
+        names = ["--force-compatibility-unknown"],
+        description = ["api_usage_dynamic UNKNOWN의 위험을 확인하고 이 작업만 강제 변환"],
+    )
+    var forceCompatibilityUnknown: Boolean = false
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
         val profile = readProfile(profilePath)
+        val authorization = if (forceCompatibilityUnknown) {
+            ConversionAuthorization.forceUnknownApiUsage()
+        } else {
+            ConversionAuthorization.NONE
+        }
         val result = root.service().draft(
             input = input,
             profile = profile,
@@ -210,6 +227,7 @@ class DraftCommand : Callable<Int> {
             projectIdentity = projectIdentity,
             approvedAdapterIds = approvedAdapterIds,
             protectedInputs = listOf(profilePath),
+            authorization = authorization,
         )
         spec.commandLine().out.println(
             "conversion=${result.conversionState.name.lowercase()}",
@@ -218,6 +236,10 @@ class DraftCommand : Callable<Int> {
         spec.commandLine().out.println("sourceSha256=${result.sourceSha256}")
         spec.commandLine().out.println("transformedSha256=${result.transformedSha256}")
         spec.commandLine().out.println("draft=${result.draft}")
+        printForcedCompatibility(
+            spec,
+            SixDraft.read(result.draft).payload.plan.forcedCompatibility,
+        )
         return 0
     }
 }
@@ -337,18 +359,30 @@ class BuildCommand : Callable<Int> {
     @Option(names = ["--approve-adapter"])
     var approvedAdapterIds: MutableSet<String> = linkedSetOf()
 
+    @Option(
+        names = ["--force-compatibility-unknown"],
+        description = ["api_usage_dynamic UNKNOWN의 위험을 확인하고 이 작업만 강제 변환"],
+    )
+    var forceCompatibilityUnknown: Boolean = false
+
     @Spec
     lateinit var spec: CommandLine.Model.CommandSpec
 
     override fun call(): Int {
         val profile = readProfile(profilePath)
+        val authorization = if (forceCompatibilityUnknown) {
+            ConversionAuthorization.forceUnknownApiUsage()
+        } else {
+            ConversionAuthorization.NONE
+        }
         val result = root.service().build(
-            input,
-            profile,
-            output,
-            projectIdentity,
-            approvedAdapterIds,
-            listOf(profilePath),
+            input = input,
+            profile = profile,
+            outputBundle = output,
+            projectIdentity = projectIdentity,
+            approvedAdapterIds = approvedAdapterIds,
+            protectedInputs = listOf(profilePath),
+            authorization = authorization,
         )
         spec.commandLine().out.println(
             "conversion=${result.compatibility.conversionState.name.lowercase()}",
@@ -361,8 +395,24 @@ class BuildCommand : Callable<Int> {
         spec.commandLine().out.println("crx=${result.crx.toAbsolutePath()}")
         spec.commandLine().out.println("wrapper=${result.wrapperApk.toAbsolutePath()}")
         spec.commandLine().out.println("bundle=${result.bundle.toAbsolutePath()}")
+        printForcedCompatibility(spec, result.forcedCompatibility)
         return 0
     }
+}
+
+private fun printForcedCompatibility(
+    spec: CommandLine.Model.CommandSpec,
+    provenance: ForcedCompatibilityProvenance?,
+) {
+    provenance ?: return
+    spec.commandLine().out.println("forcedCompatibility=true")
+    spec.commandLine().out.println(
+        "originalCompatibility=${provenance.originalStatus.name.lowercase()}",
+    )
+    spec.commandLine().out.println("forcedIssueCodes=${provenance.issueCodes.joinToString(",")}")
+    spec.commandLine().err.println(
+        "경고: 강제 변환 결과는 삼성 인터넷 호환성을 보장하지 않습니다.",
+    )
 }
 
 private fun readProfile(path: Path) = try {
