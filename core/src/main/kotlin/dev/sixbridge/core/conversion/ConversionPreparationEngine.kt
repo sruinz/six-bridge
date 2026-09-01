@@ -1,7 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.contract.bundle.BundleJson
-import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.bundle.toContractV6
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
@@ -27,7 +27,8 @@ class PreparedConversion internal constructor(
     transformedSourceZip: ByteArray,
     val originalExtensionId: String?,
     val logicalSourceIdentity: LogicalSourceIdentityResult,
-    passthroughCrx: ByteArray?,
+    forcedCompatibility: ForcedCompatibilityProvenance? = null,
+    passthroughCrx: ByteArray? = null,
 ) {
     private val stableTransformedSourceZip = transformedSourceZip.copyOf()
     private val stablePassthroughCrx = passthroughCrx?.copyOf()
@@ -43,6 +44,8 @@ class PreparedConversion internal constructor(
     val appliedAdapterIds: Set<String> = Collections.unmodifiableSet(
         appliedAdapterIds.toSortedSet(),
     )
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        forcedCompatibility.deepImmutableCopy()
 
     val transformedSourceZip: ByteArray
         get() = stableTransformedSourceZip.copyOf()
@@ -137,6 +140,7 @@ class ConversionPreparationEngine private constructor(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): PreparedConversion {
         control.checkCancelled()
         val analysisOperation = PreparationAnalysisOperation(control)
@@ -164,11 +168,11 @@ class ConversionPreparationEngine private constructor(
         ).also(CompatibilityReport::validate)
         val originalExtensionId =
             input.expectedExtensionId ?: beforeRaw.manifestKeyExtensionId
-        val plan = plan(beforeRaw, approvals)
+        val plan = plan(beforeRaw, approvals, authorization)
         val proofPlan = if (before == beforeRaw) {
             plan
         } else {
-            plan(before, approvals).also {
+            plan(before, approvals, authorization).also {
                 check(
                     it.selectedAdapters.map(SelectedAdapter::toDecision) ==
                         plan.selectedAdapters.map(SelectedAdapter::toDecision),
@@ -211,7 +215,7 @@ class ConversionPreparationEngine private constructor(
             )
         }
         control.checkCancelled()
-        validateCompatibility(before, rawAfter)
+        validateCompatibility(before, rawAfter, authorization)
         val after = conversionReport(
             rawAfter = rawAfter,
             applied = applicationProof?.decisions.orEmpty(),
@@ -230,12 +234,19 @@ class ConversionPreparationEngine private constructor(
                 rawAfter.sourceSha256
             },
         ).also(CompatibilityReport::validate)
-        requireStableReplan(after, approvals, transformed)
+        requireStableReplan(
+            after,
+            approvals,
+            transformed,
+            authorization,
+            plan.forcedCompatibility,
+        )
         val reportSha256 = sha256(
             BundleJson.encodeCompatibility(
-                after.toContractV4(
+                after.toContractV6(
                     originalSourceSha256 = originalSourceSha256,
                     planSha256 = proofPlan.proofSha256,
+                    forcedCompatibility = plan.forcedCompatibility,
                 ),
             ).toByteArray(UTF_8),
         )
@@ -261,6 +272,7 @@ class ConversionPreparationEngine private constructor(
                     snapshot.sourceProjectIdentity,
                     before,
                 ),
+                forcedCompatibility = plan.forcedCompatibility,
                 passthroughCrx = passthrough,
             ),
         )
@@ -270,9 +282,25 @@ class ConversionPreparationEngine private constructor(
         prepared: PreparedConversion,
         profile: BrowserProfile,
         publicKeyDer: ByteArray?,
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): BoundConversion {
         require(profile.canonicalSha256() == prepared.browserProfileSha256) {
             "prepare와 bindIdentity의 browser profile provenance가 다릅니다."
+        }
+        val authorizedProvenance = try {
+            ForceCompatibilityPolicy.requireProvenance(
+                prepared.compatibilityBefore,
+                authorization,
+            )
+        } catch (_: ConversionPlanningException) {
+            throw ConversionValidationException(
+                "bindIdentity 승인 값이 준비된 강제 provenance와 일치하지 않습니다.",
+            )
+        }
+        if (authorizedProvenance != prepared.forcedCompatibility) {
+            throw ConversionValidationException(
+                "bindIdentity 승인 값이 준비된 강제 provenance와 일치하지 않습니다.",
+            )
         }
         val passthrough = prepared.passthroughCrx
         if (passthrough != null) {
@@ -285,7 +313,7 @@ class ConversionPreparationEngine private constructor(
             }
             val raw = analyzer.analyzeArchive(parsed.zipBytes, profile)
             requirePreparedProfile(prepared, raw)
-            validateCompatibility(prepared.compatibilityBefore, raw)
+            validateCompatibility(prepared.compatibilityBefore, raw, authorization)
             val compatibility = raw.copy(
                 conversionState = ConversionState.PASSTHROUGH,
                 originalExtensionId = parsed.extensionId,
@@ -295,6 +323,7 @@ class ConversionPreparationEngine private constructor(
                 sourceZip = parsed.zipBytes,
                 extensionId = parsed.extensionId,
                 compatibility = compatibility,
+                forcedCompatibility = prepared.forcedCompatibility,
                 passthroughCrx = passthrough,
             )
         }
@@ -313,7 +342,7 @@ class ConversionPreparationEngine private constructor(
         )
         val rawAfter = analyzer.analyzeArchive(sourceZip, profile)
         requirePreparedProfile(prepared, rawAfter)
-        validateCompatibility(prepared.compatibilityBefore, rawAfter)
+        validateCompatibility(prepared.compatibilityBefore, rawAfter, authorization)
         val applied = prepared.compatibilityAfter.adapterDecisions
             .filter(AdapterDecision::applied)
         val compatibility = conversionReport(
@@ -329,11 +358,14 @@ class ConversionPreparationEngine private constructor(
             compatibility,
             prepared.appliedAdapterIds,
             applied.isNotEmpty(),
+            authorization,
+            prepared.forcedCompatibility,
         )
         return bound(
             sourceZip = sourceZip,
             extensionId = Crx3.extensionId(publicKey),
             compatibility = compatibility,
+            forcedCompatibility = prepared.forcedCompatibility,
             passthroughCrx = null,
         )
     }
@@ -346,6 +378,7 @@ class ConversionPreparationEngine private constructor(
         sourceZip: ByteArray,
         extensionId: String,
         compatibility: CompatibilityReport,
+        forcedCompatibility: ForcedCompatibilityProvenance?,
         passthroughCrx: ByteArray?,
     ): BoundConversion {
         return BoundConversion(
@@ -353,6 +386,7 @@ class ConversionPreparationEngine private constructor(
             sourceSha256 = sha256(sourceZip),
             extensionId = extensionId,
             compatibility = compatibility,
+            forcedCompatibility = forcedCompatibility,
             passthroughCrx = passthroughCrx,
         )
     }
@@ -415,8 +449,9 @@ class ConversionPreparationEngine private constructor(
     private fun plan(
         report: CompatibilityReport,
         approvals: Set<String>,
+        authorization: ConversionAuthorization,
     ): ConversionPlan = try {
-        planner.plan(report, approvals)
+        planner.plan(report, approvals, authorization)
     } catch (error: ConversionPlanningException) {
         when (error.failure) {
             ConversionPlanningFailure.MISSING_REQUIRED_APPROVAL ->
@@ -450,18 +485,37 @@ class ConversionPreparationEngine private constructor(
     private fun validateCompatibility(
         before: CompatibilityReport,
         after: CompatibilityReport,
+        authorization: ConversionAuthorization,
     ) {
         if (statusRank(after.status) > statusRank(before.status)) {
             throw ConversionValidationException(
                 "변환 후 호환성 상태가 ${before.status}에서 ${after.status}로 악화되었습니다.",
             )
         }
-        if (after.issues.any { it.blocking }) {
+        val (beforeForced, afterForced) = try {
+            ForceCompatibilityPolicy.requireProvenance(before, authorization) to
+                ForceCompatibilityPolicy.requireProvenance(after, authorization)
+        } catch (_: ConversionPlanningException) {
+            throw ConversionValidationException(
+                "변환본 재분석이 강제 승인 정책을 만족하지 않습니다.",
+            )
+        }
+        if (beforeForced == null && after.issues.any { it.blocking }) {
             throw ConversionValidationException(
                 "변환본 재분석에서 blocking issue가 발견되었습니다.",
             )
         }
         val newUnsupported = after.unsupportedApis - before.unsupportedApis
+        if (beforeForced != null && !(
+                beforeForced == afterForced &&
+                    ForceCompatibilityPolicy.isEligible(after) &&
+                    newUnsupported.isEmpty()
+            )
+        ) {
+            throw ConversionValidationException(
+                "강제 변환 재분석이 원래 승인 범위와 다릅니다.",
+            )
+        }
         if (newUnsupported.isNotEmpty()) {
             throw ConversionValidationException(
                 "변환으로 새 unsupported API가 생겼습니다: ${newUnsupported.sorted()}",
@@ -495,8 +549,15 @@ class ConversionPreparationEngine private constructor(
         report: CompatibilityReport,
         approvals: Set<String>,
         transformed: Boolean,
+        authorization: ConversionAuthorization,
+        expectedForcedCompatibility: ForcedCompatibilityProvenance?,
     ) {
-        val verificationPlan = plan(report, approvals)
+        val verificationPlan = plan(report, approvals, authorization)
+        if (verificationPlan.forcedCompatibility != expectedForcedCompatibility) {
+            throw ConversionValidationException(
+                "변환본 재계획의 강제 provenance가 준비 결과와 다릅니다.",
+            )
+        }
         if (transformed &&
             verificationPlan.selectedAdapters.any { !it.applied }
         ) {

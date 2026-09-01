@@ -2,6 +2,7 @@ package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import java.util.Collections
 
 enum class CompatibilityForceScope {
     UNKNOWN_API_USAGE,
@@ -23,6 +24,15 @@ data class ForcedCompatibilityProvenance(
     val originalStatus: CompatibilityStatus,
     val issueCodes: List<String>,
 )
+
+internal fun ForcedCompatibilityProvenance?.deepImmutableCopy(): ForcedCompatibilityProvenance? =
+    this?.let {
+        ForcedCompatibilityProvenance(
+            scope = it.scope,
+            originalStatus = it.originalStatus,
+            issueCodes = Collections.unmodifiableList(it.issueCodes.toList()),
+        )
+    }
 
 object ForceCompatibilityPolicy {
     fun isEligible(report: CompatibilityReport): Boolean = runCatching {

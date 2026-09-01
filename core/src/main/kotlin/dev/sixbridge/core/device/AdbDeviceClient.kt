@@ -32,7 +32,7 @@ class AdbDeviceClient(
         val packageName = trustedPackage(contents)
         val apk = Files.createTempFile("sixbridge-install-", ".apk")
         apk.writeBytes(contents.wrapperApk)
-        BuildArtifactVerifier().verifyWrapper(apk, contents.extension)
+        BuildArtifactVerifier().verifyWrapper(apk, contents)
         val result = adb(serial, "install", "-r", apk.toString())
         require("Success" in result) { "ADB 설치 결과를 확인할 수 없습니다: $result" }
         return DeviceInstallResult(

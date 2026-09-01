@@ -2,7 +2,9 @@ package dev.sixbridge.core.device
 
 import dev.sixbridge.core.bundle.ExtensionDescriptor
 import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.bundle.SixBundleContents
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.ProcessRunner
 import java.nio.file.Files
@@ -46,7 +48,7 @@ class BuildArtifactVerifier {
         require(descriptor.wrapperPackage == expectedPackage) {
             "SixBundle wrapper package가 extension ID와 일치하지 않습니다."
         }
-        verifyWrapper(wrapperApk, descriptor)
+        verifyWrapper(wrapperApk, contents)
         return BuildVerificationResult(
             extensionId = descriptor.extensionId,
             wrapperPackage = descriptor.wrapperPackage,
@@ -116,10 +118,17 @@ class BuildArtifactVerifier {
 
     internal fun verifyWrapper(
         apk: Path,
+        contents: SixBundleContents,
+    ) = verifyWrapper(apk, contents.extension, contents)
+
+    internal fun verifyWrapper(
+        apk: Path,
         descriptor: ExtensionDescriptor,
+        contents: SixBundleContents? = null,
     ) {
         val toolchain = AndroidToolchain.locate()
         verifyEmbeddedCrx(apk, descriptor)
+        contents?.let { verifyCompatibilityBinding(apk, it) }
         val badging = ProcessRunner.run(
             listOf(toolchain.aapt2.toString(), "dump", "badging", apk.toString()),
         ).stdout
@@ -206,6 +215,37 @@ class BuildArtifactVerifier {
         }
         require(Crx3.parse(embedded).extensionId == descriptor.extensionId) {
             "wrapper APK embedded CRX ID가 descriptor와 일치하지 않습니다."
+        }
+    }
+
+    private fun verifyCompatibilityBinding(
+        apk: Path,
+        contents: SixBundleContents,
+    ) {
+        if (contents.compatibilitySchemaVersion in 1..5) {
+            require(contents.forcedCompatibility == null) {
+                "legacy SixBundle은 forced compatibility provenance를 가질 수 없습니다."
+            }
+            return
+        }
+        require(contents.compatibilitySchemaVersion == 6) {
+            "지원하지 않는 compatibility schema입니다."
+        }
+        val digest = ZipFile(apk.toFile()).use { zip ->
+            val matches = zip.entries().asSequence()
+                .filter { it.name == CompatibilityApkBinding.ENTRY_NAME }
+                .toList()
+            require(matches.size == 1 && !matches.single().isDirectory) {
+                "wrapper APK는 ${CompatibilityApkBinding.ENTRY_NAME} asset을 정확히 하나 포함해야 합니다."
+            }
+            zip.getInputStream(matches.single()).use { input ->
+                CompatibilityApkBinding.decode(
+                    input.readNBytes(CompatibilityApkBinding.ENCODED_SIZE + 1),
+                )
+            }
+        }
+        require(digest == contents.compatibilityCanonicalSha256) {
+            "wrapper APK compatibility digest가 SixBundle canonical report와 일치하지 않습니다."
         }
     }
 

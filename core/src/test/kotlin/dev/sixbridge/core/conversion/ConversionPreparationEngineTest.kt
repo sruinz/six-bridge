@@ -1,7 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.contract.bundle.BundleJson
-import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.bundle.toContractV6
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.crx.Crx3
@@ -34,6 +34,41 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 class ConversionPreparationEngineTest {
+    @Test
+    fun `dynamic UNKNOWN은 명시 승인과 동일한 재분석 issue에서만 prepare bind된다`() {
+        val source = Files.createTempDirectory("six-forced-prepare-").also { root ->
+            root.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Dynamic","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+            )
+            root.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        }
+        val input = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            ExtensionZip.createBytes(source, includeProjectMarker = true),
+        )
+        val authorization = ConversionAuthorization.forceUnknownApiUsage()
+
+        ConversionPreparationEngine().use { engine ->
+            assertFailsWith<ConversionUnavailableException> {
+                engine.prepare(input, profile(), emptySet())
+            }
+            val prepared = engine.prepare(input, profile(), emptySet(), authorization = authorization)
+            assertEquals(listOf("api_usage_dynamic"), prepared.forcedCompatibility?.issueCodes)
+
+            val bound = engine.bindIdentity(
+                prepared,
+                profile(),
+                keyPair().public.encoded,
+                authorization,
+            )
+            assertEquals(prepared.forcedCompatibility, bound.forcedCompatibility)
+            assertEquals(
+                dev.sixbridge.core.compat.CompatibilityStatus.UNKNOWN,
+                bound.compatibility.status,
+            )
+        }
+    }
+
     @Test
     fun `prepare 전체 분석 단계를 단조 순서로 한 번씩 전달한다`() {
         val stages = mutableListOf<AnalysisStage>()
@@ -139,6 +174,7 @@ class ConversionPreparationEngineTest {
                     "Platform Fixture",
                     crxFirst.bytes,
                     wrapperOutputs.resolve("first.apk"),
+                    "0".repeat(64),
                 ),
             )
             val wrapperSecond = wrapperBuilder.build(
@@ -147,6 +183,7 @@ class ConversionPreparationEngineTest {
                     "Platform Fixture",
                     crxSecond.bytes,
                     wrapperOutputs.resolve("second.apk"),
+                    "0".repeat(64),
                 ),
             )
             assertEquals(wrapperFirst.packageName, wrapperSecond.packageName)
@@ -183,7 +220,7 @@ class ConversionPreparationEngineTest {
     }
 
     @Test
-    fun `준비 report hash는 원본 hash와 plan hash를 포함한 schema v4 계약이다`() {
+    fun `준비 report hash는 원본 hash와 plan hash를 포함한 schema v6 계약이다`() {
         val prepared = ConversionPreparationEngine().use {
             it.prepare(
                 PortableExtensionInput.fromZip(
@@ -197,9 +234,10 @@ class ConversionPreparationEngineTest {
         val expected = MessageDigest.getInstance("SHA-256")
             .digest(
                 BundleJson.encodeCompatibility(
-                    prepared.compatibilityAfter.toContractV4(
+                    prepared.compatibilityAfter.toContractV6(
                         originalSourceSha256 = prepared.originalSourceSha256,
                         planSha256 = prepared.planSha256,
+                        forcedCompatibility = prepared.forcedCompatibility,
                     ),
                 ).toByteArray(),
             )

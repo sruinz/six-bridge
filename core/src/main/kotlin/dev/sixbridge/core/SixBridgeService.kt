@@ -7,6 +7,9 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.AdapterApprovalException
 import dev.sixbridge.core.conversion.ConversionPipeline
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
+import dev.sixbridge.core.conversion.deepImmutableCopy
 import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.CrxIdentityPolicy
@@ -36,6 +39,7 @@ import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.wrapper.AndroidToolchain
 import dev.sixbridge.core.wrapper.WrapperApkBuilder
 import dev.sixbridge.core.wrapper.WrapperBuildRequest
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import java.io.InputStream
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
@@ -45,7 +49,7 @@ import java.security.KeyPair
 import java.security.MessageDigest
 import java.util.ArrayDeque
 
-data class SixBuildResult(
+class SixBuildResult(
     val extensionId: String,
     val crx: Path,
     val wrapperApk: Path,
@@ -55,7 +59,11 @@ data class SixBuildResult(
     val adapterIds: List<String>,
     val sourceSha256: String,
     val transformedSha256: String,
-)
+    forcedCompatibility: ForcedCompatibilityProvenance?,
+) {
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        forcedCompatibility.deepImmutableCopy()
+}
 
 data class SixDraftResult(
     val draft: Path,
@@ -476,6 +484,7 @@ class SixBridgeService(
         projectIdentity: String? = null,
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): SixBuildResult {
         val resolved = inputResolver.resolve(input).copy(projectIdentity = projectIdentity)
         validateProjectIdentity(projectIdentity)
@@ -489,7 +498,7 @@ class SixBridgeService(
         )
         outputGuardHook()
         outputGuard.requireCurrent()
-        preflightAnalyze(resolved, profile, approvedAdapterIds)
+        preflightAnalyze(resolved, profile, approvedAdapterIds, authorization = authorization)
         outputGuard.requireCurrent()
         val targetGuard = outputGuard.captureTargets(outputs.all)
         return ConversionPipeline.create(
@@ -502,6 +511,7 @@ class SixBridgeService(
                 resolved,
                 profile,
                 approvedAdapterIds,
+                authorization = authorization,
             )
             targetGuard.requireCurrent()
             val compatibility = prepared.compatibilityAfter
@@ -514,6 +524,8 @@ class SixBridgeService(
                     extensionName = compatibility.extensionName ?: prepared.extensionId,
                     crxBytes = prepared.crxBytes,
                     outputApk = wrapperDraft,
+                    compatibilitySha256 = CompatibilityApkBinding
+                        .canonicalSha256(prepared.compatibilityContract),
                 ),
             )
             targetGuard.requireCurrent()
@@ -529,7 +541,12 @@ class SixBridgeService(
                 signerSha256 = wrapper.signerSha256,
             )
             val bundleDraft = prepared.artifactDirectory.resolve("bundle.six")
-            SixBundle.write(bundleDraft, wrapperDraft, descriptor, compatibility)
+            SixBundle.write(
+                bundleDraft,
+                wrapperDraft,
+                descriptor,
+                prepared.compatibilityContract,
+            )
             targetGuard.requireCurrent()
             SecureBuildPublisher.publish(
                 outputs = linkedMapOf(
@@ -567,6 +584,7 @@ class SixBridgeService(
                     prepared.compatibilityBefore.sourceSha256,
                 ),
                 transformedSha256 = requireNotNull(compatibility.sourceSha256),
+                forcedCompatibility = prepared.forcedCompatibility,
             )
         }
     }
@@ -680,6 +698,7 @@ class SixBridgeService(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): LogicalSourceIdentityResult =
         ConversionPipeline.create(
             localRoot,
@@ -692,6 +711,7 @@ class SixBridgeService(
                     profile,
                     approvedAdapterIds,
                     control,
+                    authorization,
                 ).logicalSourceIdentity
             }
         }

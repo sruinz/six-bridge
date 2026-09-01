@@ -7,6 +7,7 @@ class BoundConversion internal constructor(
     val sourceSha256: String,
     val extensionId: String,
     compatibility: CompatibilityReport,
+    forcedCompatibility: ForcedCompatibilityProvenance?,
     passthroughCrx: ByteArray?,
 ) {
     private val stableSourceZip = sourceZip.copyOf()
@@ -17,6 +18,8 @@ class BoundConversion internal constructor(
 
     val compatibility: CompatibilityReport =
         compatibility.deepImmutableCopy()
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        forcedCompatibility.deepImmutableCopy()
 
     val passthroughCrx: ByteArray?
         get() = stablePassthroughCrx?.copyOf()

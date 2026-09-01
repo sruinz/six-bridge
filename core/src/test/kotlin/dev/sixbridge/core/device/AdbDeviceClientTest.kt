@@ -225,6 +225,7 @@ class AdbDeviceClientTest {
                 "ADB wrapper",
                 packed.bytes,
                 output,
+                "0".repeat(64),
             ),
         )
         val base = ExtensionDescriptor(
@@ -299,6 +300,7 @@ class AdbDeviceClientTest {
                 "Contract wrapper",
                 packed.bytes,
                 validOutput,
+                "0".repeat(64),
             ),
         )
         val cases = listOf(
@@ -370,6 +372,7 @@ class AdbDeviceClientTest {
                 "Build verify",
                 packed.bytes,
                 wrapperPath,
+                "0".repeat(64),
             ),
         )
         val descriptor = ExtensionDescriptor(

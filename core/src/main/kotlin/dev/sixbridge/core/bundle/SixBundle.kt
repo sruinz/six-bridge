@@ -9,6 +9,7 @@ import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.bundle.ContractForcedCompatibility
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.contract.bundle.ContractSourceEvidence
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
@@ -19,6 +20,7 @@ import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
+import dev.sixbridge.core.conversion.deepImmutableCopy
 import dev.sixbridge.core.conversion.SourceEvidence
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -40,11 +42,17 @@ data class ExtensionDescriptor(
     val signerSha256: String,
 )
 
-data class SixBundleContents(
+class SixBundleContents(
     val wrapperApk: ByteArray,
     val extension: ExtensionDescriptor,
     val compatibility: CompatibilityReport,
-)
+    val compatibilitySchemaVersion: Int,
+    val compatibilityCanonicalSha256: String,
+    forcedCompatibility: ForcedCompatibilityProvenance?,
+) {
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        forcedCompatibility.deepImmutableCopy()
+}
 
 class InvalidSixBundleException(message: String, cause: Throwable? = null) :
     IllegalArgumentException(message, cause)
@@ -56,6 +64,20 @@ object SixBundle {
         extension: ExtensionDescriptor,
         compatibility: CompatibilityReport,
     ) {
+        write(
+            output,
+            wrapperApk,
+            extension,
+            compatibility.toContract(),
+        )
+    }
+
+    fun write(
+        output: Path,
+        wrapperApk: Path,
+        extension: ExtensionDescriptor,
+        compatibility: ContractCompatibilityReport,
+    ) {
         Files.createDirectories(output.toAbsolutePath().parent)
         Files.newOutputStream(output).use { stream ->
             SixBundleContract.write(
@@ -63,7 +85,7 @@ object SixBundle {
                 ContractBundleContents(
                     wrapperApk = wrapperApk.readBytes(),
                     extension = extension.toContract(),
-                    compatibility = compatibility.toContract(),
+                    compatibility = compatibility,
                 ),
             )
         }
@@ -187,6 +209,9 @@ object SixBundle {
             signerSha256 = extension.signerSha256,
         ),
         compatibility = compatibility.toCore(),
+        compatibilitySchemaVersion = compatibility.schemaVersion,
+        compatibilityCanonicalSha256 = CompatibilityApkBinding.canonicalSha256(compatibility),
+        forcedCompatibility = toCoreForcedCompatibility(compatibility.forcedCompatibility),
     )
 
     private fun ContractCompatibilityReport.toCore() = CompatibilityReport(
@@ -253,4 +278,15 @@ fun CompatibilityReport.toContractV4(
     this,
     originalSourceSha256,
     planSha256,
+)
+
+fun CompatibilityReport.toContractV6(
+    originalSourceSha256: String,
+    planSha256: String,
+    forcedCompatibility: ForcedCompatibilityProvenance?,
+): ContractCompatibilityReport = SixBundle.toContractV6(
+    this,
+    originalSourceSha256,
+    planSha256,
+    forcedCompatibility,
 )

@@ -52,6 +52,7 @@ class WrapperApkBuilderTest {
             extensionName = "Tiny",
             crxBytes = crx.bytes,
             outputApk = output,
+            compatibilitySha256 = "0".repeat(64),
         )
 
         val result = WrapperApkBuilder(sdk, localRoot).build(request)
@@ -84,6 +85,10 @@ class WrapperApkBuilderTest {
             assertTrue(apk.getEntry("classes.dex") != null)
             val embedded = apk.getInputStream(apk.getEntry("assets/extension.crx")).readBytes()
             assertTrue(embedded.contentEquals(crx.bytes))
+            val binding = apk.getInputStream(
+                requireNotNull(apk.getEntry("assets/sixbridge/compatibility.sha256")),
+            ).readBytes()
+            assertEquals("0".repeat(64), binding.decodeToString())
         }
     }
 
@@ -105,7 +110,7 @@ class WrapperApkBuilderTest {
             val output = outputRoot.resolve("wrapper.apk")
 
             val result = WrapperApkBuilder(sdk, localRoot).build(
-                WrapperBuildRequest(crx.extensionId, "Secure output", crx.bytes, output),
+                WrapperBuildRequest(crx.extensionId, "Secure output", crx.bytes, output, "0".repeat(64)),
             )
 
             assertEquals(output, result.outputApk)
@@ -128,10 +133,10 @@ class WrapperApkBuilderTest {
         val outputs = Files.createTempDirectory("six-wrapper-update-output")
 
         val first = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Update", crx.bytes, outputs.resolve("one.apk")),
+            WrapperBuildRequest(crx.extensionId, "Update", crx.bytes, outputs.resolve("one.apk"), "0".repeat(64)),
         )
         val second = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Update", crx.bytes, outputs.resolve("two.apk")),
+            WrapperBuildRequest(crx.extensionId, "Update", crx.bytes, outputs.resolve("two.apk"), "0".repeat(64)),
         )
 
         assertEquals(first.packageName, second.packageName)
@@ -167,12 +172,12 @@ class WrapperApkBuilderTest {
         val localRoot = Files.createTempDirectory("six-wrapper-corrupt-version-local")
         val builder = WrapperApkBuilder(sdk, localRoot)
         val output = Files.createTempFile("six-wrapper-corrupt-version", ".apk")
-        builder.build(WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output))
+        builder.build(WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output, "0".repeat(64)))
         localRoot.resolve("versions/${crx.extensionId}.txt").writeText("broken")
 
         assertFailsWith<IllegalArgumentException> {
             builder.build(
-                WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output),
+                WrapperBuildRequest(crx.extensionId, "Corrupt version", crx.bytes, output, "0".repeat(64)),
             )
         }
     }
@@ -191,12 +196,12 @@ class WrapperApkBuilderTest {
         val builder = WrapperApkBuilder(sdk, localRoot)
         val output = Files.createTempFile("six-wrapper-version-floor", ".apk")
         val first = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output),
+            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output, "0".repeat(64)),
         )
         Files.delete(localRoot.resolve("versions/${crx.extensionId}.txt"))
 
         val second = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output),
+            WrapperBuildRequest(crx.extensionId, "Version floor", crx.bytes, output, "0".repeat(64)),
         )
 
         assertEquals(first.versionCode + 1, second.versionCode)
@@ -215,15 +220,15 @@ class WrapperApkBuilderTest {
         val localRoot = Files.createTempDirectory("six-wrapper-version-rollback-local")
         val builder = WrapperApkBuilder(sdk, localRoot)
         val output = Files.createTempFile("six-wrapper-version-rollback", ".apk")
-        builder.build(WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output))
+        builder.build(WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output, "0".repeat(64)))
         localRoot.resolve("versions/${crx.extensionId}.txt").writeText("6")
         val seventh = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output),
+            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output, "0".repeat(64)),
         )
         localRoot.resolve("versions/${crx.extensionId}.txt").writeText("3")
 
         val next = builder.build(
-            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output),
+            WrapperBuildRequest(crx.extensionId, "Version rollback", crx.bytes, output, "0".repeat(64)),
         )
 
         assertEquals(7, seventh.versionCode)

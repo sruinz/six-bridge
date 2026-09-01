@@ -30,6 +30,7 @@ data class WrapperBuildRequest(
     val extensionName: String,
     val crxBytes: ByteArray,
     val outputApk: Path,
+    val compatibilitySha256: String,
 )
 
 data class WrapperBuildResult(
@@ -46,6 +47,9 @@ class WrapperApkBuilder(
     fun build(request: WrapperBuildRequest): WrapperBuildResult {
         require(EXTENSION_ID.matches(request.extensionId)) {
             "올바르지 않은 Chrome 확장 ID입니다: ${request.extensionId}"
+        }
+        require(COMPATIBILITY_SHA256.matches(request.compatibilitySha256)) {
+            "compatibility SHA-256 형식이 올바르지 않습니다."
         }
         val packageName = "dev.sixbridge.ext.${request.extensionId}"
         val versionStore = VersionStore(localRoot.resolve("versions"))
@@ -115,6 +119,7 @@ class WrapperApkBuilder(
                 baseApk = base,
                 classesDex = dex.resolve("classes.dex"),
                 crxBytes = request.crxBytes,
+                compatibilitySha256 = request.compatibilitySha256.encodeToByteArray(),
                 output = assembled,
             )
             val aligned = work.resolve("aligned.apk")
@@ -242,6 +247,7 @@ class WrapperApkBuilder(
         baseApk: Path,
         classesDex: Path,
         crxBytes: ByteArray,
+        compatibilitySha256: ByteArray,
         output: Path,
     ) {
         ZipOutputStream(Files.newOutputStream(output)).use { zipOut ->
@@ -265,6 +271,7 @@ class WrapperApkBuilder(
             }
             addEntry(zipOut, "classes.dex", classesDex.readBytes())
             addEntry(zipOut, "assets/extension.crx", crxBytes)
+            addEntry(zipOut, "assets/sixbridge/compatibility.sha256", compatibilitySha256)
         }
     }
 
@@ -326,6 +333,7 @@ class WrapperApkBuilder(
 
     companion object {
         private val EXTENSION_ID = Regex("[a-p]{32}")
+        private val COMPATIBILITY_SHA256 = Regex("[0-9a-f]{64}")
         private val SIGNER_SHA_REGEX =
             Regex("""Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F:]+)""")
         private val PACKAGE_BADGING =

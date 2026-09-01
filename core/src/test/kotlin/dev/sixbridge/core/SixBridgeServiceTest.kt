@@ -1,6 +1,12 @@
 package dev.sixbridge.core
 
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+import dev.sixbridge.core.device.BuildArtifactVerifier
 import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
 import dev.sixbridge.core.draft.SixDraft
@@ -25,6 +31,7 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import java.util.zip.ZipFile
 import java.util.concurrent.CancellationException
 import kotlin.io.path.writeText
 import kotlin.test.Test
@@ -37,6 +44,81 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class SixBridgeServiceTest {
+    @Test
+    fun `승인된 dynamic UNKNOWN build는 v6 provenance와 서명된 binding을 보존한다`() {
+        val toolchain = requireNotNull(AndroidToolchain.locateOrNull())
+        val workspace = Files.createTempDirectory("six-build-dynamic-approved-workspace")
+        val source = Files.createDirectory(workspace.resolve("source"))
+        source.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Dynamic approved","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+        val result = SixBridgeService(workspace) { toolchain }.build(
+            source.toString(), supportedProfile(), outputBundle = workspace.resolve("approved.six"),
+            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+        )
+        val bundle = SixBundle.read(result.bundle)
+        assertEquals(CompatibilityStatus.UNKNOWN, bundle.compatibility.status)
+        assertEquals(6, bundle.compatibilitySchemaVersion)
+        assertEquals(CompatibilityForceScope.UNKNOWN_API_USAGE, bundle.forcedCompatibility?.scope)
+        ZipFile(result.wrapperApk.toFile()).use { apk ->
+            assertEquals(
+                bundle.compatibilityCanonicalSha256,
+                apk.getInputStream(apk.getEntry(CompatibilityApkBinding.ENTRY_NAME)).readBytes().decodeToString(),
+            )
+        }
+        assertEquals(CompatibilityStatus.UNKNOWN, result.forcedCompatibility?.originalStatus)
+        assertEquals(listOf("api_usage_dynamic"), result.forcedCompatibility?.issueCodes)
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (requireNotNull(result.forcedCompatibility).issueCodes as MutableList<String>) += "mutated"
+        }
+
+        val tampered = workspace.resolve("tampered.six")
+        ZipFile(result.bundle.toFile()).use { zip ->
+            ZipOutputStream(Files.newOutputStream(tampered)).use { output ->
+                zip.entries().asSequence().forEach { entry ->
+                    output.putNextEntry(ZipEntry(entry.name).apply { time = 0L })
+                    val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                    output.write(
+                        if (entry.name == "compatibility.json") {
+                            bytes.decodeToString().replace(
+                                Regex("\\\"sourceSha256\\\":\\\"[0-9a-f]{64}\\\""),
+                                "\"sourceSha256\":\"f" + "0".repeat(63) + "\"",
+                            ).encodeToByteArray()
+                        } else bytes,
+                    )
+                    output.closeEntry()
+                }
+            }
+        }
+        assertEquals(6, SixBundle.read(tampered).compatibilitySchemaVersion)
+        val tamperError = assertFailsWith<IllegalArgumentException> {
+            BuildArtifactVerifier().verify(tampered, result.crx, result.wrapperApk)
+        }
+        assertTrue("compatibility digest" in tamperError.message.orEmpty())
+    }
+
+    @Test
+    fun `승인 없는 dynamic UNKNOWN build는 어떤 산출물도 만들지 않는다`() {
+        val workspace = Files.createTempDirectory("six-build-dynamic-deny-workspace")
+        val source = source("six-build-dynamic-deny-source", "Dynamic deny")
+        source.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Dynamic deny","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+        val service = SixBridgeService(workspace) {
+            error("강제 승인 거부 뒤 toolchain을 조회하면 안 됩니다.")
+        }
+
+        assertFailsWith<SixBridgeUserInputException> {
+            service.build(source.toString(), supportedProfile())
+        }
+
+        val dist = workspace.resolve("dist")
+        assertTrue(!Files.exists(dist) || Files.list(dist).use { paths -> paths.findAny().isEmpty })
+    }
+
     @Test
     fun `draft 단계 경계는 작업 전후에 취소를 확인한다`() {
         var checkpoints = 0

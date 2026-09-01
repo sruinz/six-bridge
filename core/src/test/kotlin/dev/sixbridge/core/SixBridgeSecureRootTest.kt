@@ -198,10 +198,12 @@ class SixBridgeSecureRootTest {
                 BrowserProfile::class.java,
                 Iterable::class.java,
                 dev.sixbridge.core.compat.AnalysisControl::class.java,
+                dev.sixbridge.core.conversion.ConversionAuthorization::class.java,
             ).apply { isAccessible = true }
             return try {
                 method.invoke(service, resolved, profile, emptyList<String>(),
                     dev.sixbridge.core.compat.AnalysisControl(),
+                    dev.sixbridge.core.conversion.ConversionAuthorization.NONE,
                 ) as LogicalSourceIdentityResult
             } catch (error: InvocationTargetException) {
                 throw error.targetException

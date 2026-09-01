@@ -472,8 +472,8 @@ class ConversionPipelineTest {
         }
         val canonicalHash = java.security.MessageDigest.getInstance("SHA-256")
             .digest(
-                dev.sixbridge.core.bundle.SixBundle
-                    .encodeCompatibility(result.compatibilityAfter)
+                dev.sixbridge.contract.bundle.BundleJson
+                    .encodeCompatibility(result.compatibilityContract)
                     .toByteArray(Charsets.UTF_8),
             )
             .joinToString("") { "%02x".format(it) }
@@ -744,8 +744,8 @@ class ConversionPipelineTest {
         }
         val expected = java.security.MessageDigest.getInstance("SHA-256")
             .digest(
-                dev.sixbridge.core.bundle.SixBundle
-                    .encodeCompatibility(result.compatibilityAfter)
+                dev.sixbridge.contract.bundle.BundleJson
+                    .encodeCompatibility(result.compatibilityContract)
                     .toByteArray(Charsets.UTF_8),
             )
             .joinToString("") { "%02x".format(it) }
@@ -963,6 +963,7 @@ class ConversionPipelineTest {
             profile: BrowserProfile,
             approvedAdapterIds: Iterable<String>,
             control: AnalysisControl,
+            authorization: ConversionAuthorization,
         ): PreparedConversion {
             operationCalls++
             observedControl = control
@@ -974,6 +975,7 @@ class ConversionPipelineTest {
             prepared: PreparedConversion,
             profile: BrowserProfile,
             publicKeyDer: ByteArray?,
+            authorization: ConversionAuthorization,
         ): BoundConversion = error("취소 전달 테스트에서 bindIdentity를 호출하면 안 됩니다.")
 
         override fun close() {

@@ -5,6 +5,8 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.StableExtensionAnalysis
 import dev.sixbridge.core.bundle.SixBundle
+import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.crx.ExtensionKeyManager
 import dev.sixbridge.core.input.ExtensionInputKind
@@ -35,12 +37,14 @@ internal interface ConversionPipelineEngine : AutoCloseable {
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl,
+        authorization: ConversionAuthorization,
     ): PreparedConversion
 
     fun bindIdentity(
         prepared: PreparedConversion,
         profile: BrowserProfile,
         publicKeyDer: ByteArray?,
+        authorization: ConversionAuthorization,
     ): BoundConversion
 }
 
@@ -68,18 +72,21 @@ private class DefaultConversionPipelineEngine(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl,
+        authorization: ConversionAuthorization,
     ): PreparedConversion = delegate.prepare(
         input,
         profile,
         approvedAdapterIds,
         control,
+        authorization,
     )
 
     override fun bindIdentity(
         prepared: PreparedConversion,
         profile: BrowserProfile,
         publicKeyDer: ByteArray?,
-    ): BoundConversion = delegate.bindIdentity(prepared, profile, publicKeyDer)
+        authorization: ConversionAuthorization,
+    ): BoundConversion = delegate.bindIdentity(prepared, profile, publicKeyDer, authorization)
 
     override fun close() = delegate.close()
 }
@@ -151,8 +158,9 @@ class ConversionPipeline private constructor(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): CompatibilityReport =
-        preflightPreparation(resolved, profile, approvedAdapterIds, control)
+        preflightPreparation(resolved, profile, approvedAdapterIds, control, authorization)
             .compatibilityBefore
 
     @JvmSynthetic
@@ -161,6 +169,7 @@ class ConversionPipeline private constructor(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): PreparedConversion {
         control.checkCancelled()
         val input = portableInput(resolved)
@@ -170,6 +179,7 @@ class ConversionPipeline private constructor(
             profile,
             approvedAdapterIds,
             control,
+            authorization,
         )
     }
 
@@ -178,6 +188,7 @@ class ConversionPipeline private constructor(
         profile: BrowserProfile,
         approvedAdapterIds: Iterable<String>,
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): ConversionPipelineResult {
         control.checkCancelled()
         val source = requireNotNull(resolved.sourceRoot) {
@@ -190,6 +201,7 @@ class ConversionPipeline private constructor(
             profile,
             approvedAdapterIds,
             control,
+            authorization,
         )
         val verifiedMarker = SourceProjectIdentityStore.readSourceMarker(
             source,
@@ -208,10 +220,16 @@ class ConversionPipeline private constructor(
             prepared = prepared,
             profile = profile,
             publicKeyDer = identity.keyPair?.public?.encoded,
+            authorization = authorization,
         )
-        val reportSha256 = sha256(
-            SixBundle.encodeCompatibility(bound.compatibility).toByteArray(UTF_8),
+        val compatibilityContract = SixBundle.toContractV6(
+            compatibility = bound.compatibility,
+            originalSourceSha256 = prepared.originalSourceSha256,
+            planSha256 = prepared.planSha256,
+            forcedCompatibility = bound.forcedCompatibility,
         )
+        val canonicalCompatibility = BundleJson.encodeCompatibility(compatibilityContract)
+        val reportSha256 = sha256(canonicalCompatibility.toByteArray(UTF_8))
         val crxBytes = if (bound.passthroughCrx != null) {
             requireNotNull(bound.passthroughCrx)
         } else {
@@ -228,6 +246,7 @@ class ConversionPipeline private constructor(
             sourceZip = bound.sourceZip,
             compatibilityBefore = prepared.compatibilityBefore,
             compatibilityAfter = bound.compatibility,
+            compatibilityContract = compatibilityContract,
             planSha256 = prepared.planSha256,
             reportSha256 = reportSha256,
             extensionId = bound.extensionId,
@@ -462,6 +481,8 @@ class ConversionPipelineResult private constructor(
     sourceZip: ByteArray,
     compatibilityBefore: CompatibilityReport,
     compatibilityAfter: CompatibilityReport,
+    @get:kotlin.jvm.JvmSynthetic
+    internal val compatibilityContract: ContractCompatibilityReport,
     val planSha256: String,
     val reportSha256: String,
     val extensionId: String,
@@ -479,6 +500,9 @@ class ConversionPipelineResult private constructor(
         compatibilityBefore.deepImmutableCopy()
     val compatibilityAfter: CompatibilityReport =
         compatibilityAfter.deepImmutableCopy()
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        SixBundle.toCoreForcedCompatibility(compatibilityContract.forcedCompatibility)
+            .deepImmutableCopy()
 
     val sourceZip: ByteArray
         get() = stableSourceZip.copyOf()
@@ -497,6 +521,7 @@ class ConversionPipelineResult private constructor(
             sourceZip: ByteArray,
             compatibilityBefore: CompatibilityReport,
             compatibilityAfter: CompatibilityReport,
+            compatibilityContract: ContractCompatibilityReport,
             planSha256: String,
             reportSha256: String,
             extensionId: String,
@@ -509,6 +534,7 @@ class ConversionPipelineResult private constructor(
             sourceZip,
             compatibilityBefore,
             compatibilityAfter,
+            compatibilityContract,
             planSha256,
             reportSha256,
             extensionId,
