@@ -403,6 +403,66 @@ class ConversionPlannerTest {
     }
 
     @Test
+    fun `force는 PARTIAL과 BLOCKED 및 혼합 blocking UNKNOWN을 거부한다`() {
+        val reports = listOf(
+            reportWith(status = CompatibilityStatus.PARTIAL) to
+                ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+            dynamicUnknownReport().copy(status = CompatibilityStatus.BLOCKED) to
+                ConversionPlanningFailure.INELIGIBLE_COMPATIBILITY_STATUS,
+            dynamicUnknownReport().copy(
+                issues = listOf(
+                    CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+                    CompatibilityIssue("browser_profile_unknown", "profile", true),
+                ),
+            ) to ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
+        )
+
+        reports.forEach { (report, expectedFailure) ->
+            val error = assertFailsWith<ConversionPlanningException> {
+                ConversionPlanner().plan(
+                    report,
+                    emptySet(),
+                    ConversionAuthorization.forceUnknownApiUsage(),
+                )
+            }
+
+            assertEquals(expectedFailure, error.failure)
+        }
+    }
+
+    @Test
+    fun `normal v2와 forced v3 proof를 exact SHA-256으로 고정한다`() {
+        val normal = ConversionPlanner().plan(reportWith(), emptySet())
+        val forced = ConversionPlanner().plan(
+            dynamicUnknownReport(),
+            emptySet(),
+            ConversionAuthorization.forceUnknownApiUsage(),
+        )
+
+        assertEquals(
+            "a2391b54b101fcf29a65a0ef049aaaa61535181d75e07ac628226547b93e3d99",
+            normal.proofSha256,
+        )
+        assertEquals(
+            "d30dd06e9d7d9c4ba62edac30f6a7e98352196eefe8be498611e08a1e7c04d39",
+            forced.proofSha256,
+        )
+        val provenance = requireNotNull(forced.forcedCompatibility)
+        listOf(
+            provenance.copy(originalStatus = CompatibilityStatus.PARTIAL),
+            provenance.copy(issueCodes = listOf("api_usage_dynamic", "another")),
+        ).forEach { altered ->
+            assertFalse(
+                forced.proofSha256 == ConversionPlanProof.digest(
+                    forced.report,
+                    forced.selectedAdapters,
+                    altered,
+                ),
+            )
+        }
+    }
+
+    @Test
     fun `plan proof is injective for collection boundaries`() {
         val twoValues = reportWith().copy(
             declaredPermissions = setOf("a", "b"),

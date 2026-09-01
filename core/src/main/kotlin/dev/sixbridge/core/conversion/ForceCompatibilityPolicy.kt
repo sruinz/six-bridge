@@ -45,6 +45,15 @@ object ForceCompatibilityPolicy {
         authorization: ConversionAuthorization,
     ): ForcedCompatibilityProvenance? {
         val scope = authorization.forceCompatibility ?: return null
+        return when (scope) {
+            CompatibilityForceScope.UNKNOWN_API_USAGE ->
+                requireUnknownApiUsageProvenance(report)
+        }
+    }
+
+    private fun requireUnknownApiUsageProvenance(
+        report: CompatibilityReport,
+    ): ForcedCompatibilityProvenance {
         if (!isEligible(report)) {
             throw ConversionPlanningException(
                 ConversionPlanningFailure.INVALID_COMPATIBILITY_AUTHORIZATION,
@@ -52,7 +61,7 @@ object ForceCompatibilityPolicy {
             )
         }
         return ForcedCompatibilityProvenance(
-            scope = scope,
+            scope = CompatibilityForceScope.UNKNOWN_API_USAGE,
             originalStatus = report.status,
             issueCodes = report.issues
                 .filter { it.blocking }

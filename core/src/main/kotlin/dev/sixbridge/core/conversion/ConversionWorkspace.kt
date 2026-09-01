@@ -376,9 +376,23 @@ class ConversionWorkspace private constructor(
     ) {
         val report = plan.report
         report.validate()
+        val forced = plan.forcedCompatibility
         check(
-            report.status == CompatibilityStatus.COMPATIBLE ||
-                report.status == CompatibilityStatus.PARTIAL,
+            (
+                report.status in setOf(
+                    CompatibilityStatus.COMPATIBLE,
+                    CompatibilityStatus.PARTIAL,
+                ) && forced == null
+            ) ||
+                (
+                    report.status == CompatibilityStatus.UNKNOWN &&
+                        forced != null &&
+                        ForceCompatibilityPolicy.isEligible(report) &&
+                        ForceCompatibilityPolicy.requireProvenance(
+                            report,
+                            ConversionAuthorization(forced.scope),
+                        ) == forced
+                ),
         ) {
             "변환 가능한 compatibility status가 아닙니다."
         }

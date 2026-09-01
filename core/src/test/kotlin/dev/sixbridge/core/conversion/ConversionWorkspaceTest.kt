@@ -1,6 +1,7 @@
 package dev.sixbridge.core.conversion
 
 import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import java.net.StandardProtocolFamily
@@ -30,6 +31,45 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class ConversionWorkspaceTest {
+    @Test
+    fun `실제 dynamic API UNKNOWN 강제 plan은 workspace 변환을 통과한다`() {
+        val source = Files.createTempDirectory("six-forced-dynamic-api-").also {
+            it.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"Dynamic","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+            )
+            it.resolve("content.js").writeText(
+                "chrome[namespace].sync.get('value');",
+            )
+        }
+        val profile = BrowserProfile(
+            browserPackage = "com.sec.android.app.sbrowser",
+            versionName = BrowserProfile.BASELINE_VERSION,
+            versionCode = 1_300_261_502,
+            majorVersion = BrowserProfile.SUPPORTED_MAJOR_VERSION,
+            supportedApis = BrowserProfile.POC_SUPPORTED_APIS,
+            wrapperContract = WrapperContract.complete(),
+            sourceApkSha256 = BrowserProfile.BASELINE_APK_SHA256,
+            sourceApkSignerSha256 = BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        )
+
+        ConversionWorkspace().use { workspace ->
+            val snapshot = workspace.snapshot(source, requireOwnerOnlyMarker = false)
+            val report = MobilePatternAnalyzer().analyzeArchive(
+                snapshot.sourceZip,
+                profile,
+            )
+            val plan = ConversionPlanner().plan(
+                report,
+                emptySet(),
+                ConversionAuthorization.forceUnknownApiUsage(),
+            )
+
+            assertEquals(CompatibilityStatus.UNKNOWN, report.status)
+            assertTrue(ForceCompatibilityPolicy.isEligible(report))
+            assertEquals(emptyList(), workspace.transform(snapshot, profile, plan))
+        }
+    }
+
     @Test
     fun `adapter proof rejects metadata replacement before final archive sealing`() {
         val source = Files.createTempDirectory("six-workspace-proof-source").also { root ->
