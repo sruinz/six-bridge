@@ -39,6 +39,14 @@ class SixBundleTest {
             @Suppress("UNCHECKED_CAST")
             (contents.compatibility.declaredPermissions as MutableSet<String>) += "tabs"
         }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (contents.compatibility.issues as MutableList<*>).clear()
+        }
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (contents.compatibility.adapterDecisions as MutableList<*>).clear()
+        }
     }
     @Test
     fun `v6 mapper는 forced UNKNOWN provenance를 손실 없이 왕복한다`() {

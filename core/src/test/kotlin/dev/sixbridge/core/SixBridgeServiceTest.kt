@@ -116,7 +116,10 @@ class SixBridgeServiceTest {
         val failure = assertFailsWith<dev.sixbridge.core.conversion.ConversionUnavailableException> {
             service.build(source.toString(), supportedProfile(), output)
         }
-        assertTrue(failure.message.orEmpty().isNotBlank())
+        assertEquals(
+            "안전하게 적용할 수 있는 모바일 변환 계획이 없습니다.",
+            failure.message,
+        )
 
         assertTrue(!Files.exists(dist.resolve("dynamic.crx")))
         assertTrue(!Files.exists(dist.resolve("dynamic-wrapper.apk")))
