@@ -187,8 +187,8 @@ object SixBundleContract {
     }
 
     fun write(output: OutputStream, contents: ContractBundleContents) {
-        require(contents.compatibility.schemaVersion in 3..5) {
-            "SixBundle writer는 compatibility schema v3 또는 v4만 기록합니다."
+        require(contents.compatibility.schemaVersion in 3..6) {
+            "SixBundle writer는 compatibility schema v3부터 v6만 기록합니다."
         }
         val extension = BundleJson.encodeExtension(contents.extension).encodeToByteArray()
         val compatibility = BundleJson.encodeCompatibility(contents.compatibility).encodeToByteArray()
@@ -211,8 +211,8 @@ object SixBundleContract {
         extension: ContractExtensionDescriptor,
         compatibility: ContractCompatibilityReport,
     ) {
-        require(compatibility.schemaVersion in 3..5) {
-            "SixBundle writer는 compatibility schema v3 또는 v4만 기록합니다."
+        require(compatibility.schemaVersion in 3..6) {
+            "SixBundle writer는 compatibility schema v3부터 v6만 기록합니다."
         }
         val extensionBytes = BundleJson.encodeExtension(extension).encodeToByteArray()
         val compatibilityBytes = BundleJson.encodeCompatibility(compatibility).encodeToByteArray()
@@ -538,11 +538,11 @@ object SixBundleContract {
             "compatibility extensionVersion이 descriptor와 일치하지 않습니다."
         }
         require(
-            compatibility.schemaVersion !in 3..5 ||
+            compatibility.schemaVersion !in 3..6 ||
                 compatibility.convertedExtensionId == null ||
                 compatibility.convertedExtensionId == extension.extensionId,
         ) {
-            "schema v3/v4 convertedExtensionId가 descriptor와 일치하지 않습니다."
+            "schema v3부터 v6 convertedExtensionId가 descriptor와 일치하지 않습니다."
         }
     }
 

@@ -1,11 +1,14 @@
 package dev.sixbridge.core.bundle
 
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.conversion.SourceEvidence
 import java.nio.file.Files
 import java.security.MessageDigest
@@ -21,6 +24,85 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class SixBundleTest {
+    @Test
+    fun `v6 mapper는 forced UNKNOWN provenance를 손실 없이 왕복한다`() {
+        val report = compatibilityWithProofs().copy(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(
+                dev.sixbridge.core.compat.CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+            ),
+        )
+        val forced = ForcedCompatibilityProvenance(
+            scope = CompatibilityForceScope.UNKNOWN_API_USAGE,
+            originalStatus = CompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        )
+
+        val contract = SixBundle.toContractV6(
+            report,
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+            forcedCompatibility = forced,
+        )
+
+        val decoded = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(contract))
+
+        assertEquals(6, decoded.schemaVersion)
+        assertEquals("a".repeat(64), decoded.originalSourceSha256)
+        assertEquals("b".repeat(64), decoded.planSha256)
+        assertEquals(forced, SixBundle.toCoreForcedCompatibility(decoded.forcedCompatibility))
+    }
+
+    @Test
+    fun `v6 mapper는 normal provenance null을 보존한다`() {
+        val contract = SixBundle.toContractV6(
+            compatibilityWithProofs(),
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+            forcedCompatibility = null,
+        )
+
+        val decoded = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(contract))
+
+        assertEquals(6, decoded.schemaVersion)
+        assertEquals("a".repeat(64), decoded.originalSourceSha256)
+        assertEquals("b".repeat(64), decoded.planSha256)
+        assertEquals(null, decoded.forcedCompatibility)
+        assertEquals(null, SixBundle.toCoreForcedCompatibility(decoded.forcedCompatibility))
+    }
+
+    @Test
+    fun `v6 decode mapper는 contract issueCodes의 변경을 공유하지 않는다`() {
+        val issueCodes = mutableListOf("api_usage_dynamic")
+        val contract = SixBundle.toContractV6(
+            compatibilityWithProofs().copy(
+                status = CompatibilityStatus.UNKNOWN,
+                issues = listOf(
+                    dev.sixbridge.core.compat.CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+                ),
+            ),
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+            forcedCompatibility = ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                issueCodes,
+            ),
+        )
+        val decoded = BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(contract))
+        val core = requireNotNull(SixBundle.toCoreForcedCompatibility(decoded.forcedCompatibility))
+
+        issueCodes += "mutated"
+        @Suppress("UNCHECKED_CAST")
+        (requireNotNull(decoded.forcedCompatibility).issueCodes as MutableList<String>) += "mutated"
+
+        assertEquals(listOf("api_usage_dynamic"), core.issueCodes)
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (core.issueCodes as MutableList<String>) += "mutated"
+        }
+    }
+
     @Test
     fun `writes and reads the fixed three-file bundle contract`() {
         val wrapper = Files.createTempFile("wrapper", ".apk")

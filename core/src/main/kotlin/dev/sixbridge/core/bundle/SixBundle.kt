@@ -6,6 +6,7 @@ import dev.sixbridge.contract.bundle.ContractBundleContents
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
 import dev.sixbridge.contract.bundle.ContractIssue
 import dev.sixbridge.contract.bundle.ContractSourceEvidence
 import dev.sixbridge.contract.bundle.SixBundleContract
@@ -15,13 +16,16 @@ import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
+import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.conversion.SourceEvidence
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Collections
 import kotlin.io.path.readBytes
 
 data class ExtensionDescriptor(
@@ -89,6 +93,28 @@ object SixBundle {
         planSha256 = planSha256,
     )
 
+    fun toContractV6(
+        compatibility: CompatibilityReport,
+        originalSourceSha256: String,
+        planSha256: String,
+        forcedCompatibility: ForcedCompatibilityProvenance?,
+    ): ContractCompatibilityReport = compatibility.toContract().copy(
+        schemaVersion = 6,
+        originalSourceSha256 = originalSourceSha256,
+        planSha256 = planSha256,
+        forcedCompatibility = forcedCompatibility?.toContract(),
+    )
+
+    fun toCoreForcedCompatibility(
+        forcedCompatibility: ContractForcedCompatibility?,
+    ): ForcedCompatibilityProvenance? = forcedCompatibility?.let {
+        ForcedCompatibilityProvenance(
+            scope = CompatibilityForceScope.valueOf(it.scope),
+            originalStatus = CompatibilityStatus.valueOf(it.originalStatus.name),
+            issueCodes = Collections.unmodifiableList(it.issueCodes.toList()),
+        )
+    }
+
     private fun ExtensionDescriptor.toContract() = ContractExtensionDescriptor(
         schemaVersion = 1,
         extensionId = extensionId,
@@ -140,6 +166,12 @@ object SixBundle {
         browserProfileSha256 = browserProfileSha256,
         )
     }
+
+    private fun ForcedCompatibilityProvenance.toContract() = ContractForcedCompatibility(
+        scope = scope.name,
+        originalStatus = ContractCompatibilityStatus.valueOf(originalStatus.name),
+        issueCodes = issueCodes,
+    )
 
     private fun ContractBundleContents.toCore() = SixBundleContents(
         wrapperApk = wrapperApk,

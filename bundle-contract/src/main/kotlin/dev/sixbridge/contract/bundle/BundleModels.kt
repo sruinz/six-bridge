@@ -9,6 +9,12 @@ enum class ContractCompatibilityStatus {
     UNKNOWN,
 }
 
+data class ContractForcedCompatibility(
+    val scope: String,
+    val originalStatus: ContractCompatibilityStatus,
+    val issueCodes: List<String>,
+)
+
 data class ContractExtensionDescriptor(
     val schemaVersion: Int,
     val extensionId: String,
@@ -45,6 +51,7 @@ data class ContractCompatibilityReport(
     val verifiedApis: List<String> = usedApis.filterNot(unsupportedApis::contains),
     val unverifiedApis: List<String> = emptyList(),
     val unavailableApis: List<String> = unsupportedApis,
+    val forcedCompatibility: ContractForcedCompatibility? = null,
 )
 
 data class ContractIssue(

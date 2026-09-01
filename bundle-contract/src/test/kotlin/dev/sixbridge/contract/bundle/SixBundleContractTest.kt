@@ -17,6 +17,165 @@ import kotlin.test.assertFailsWith
 
 class SixBundleContractTest {
     @Test
+    fun `schema v6 forced UNKNOWN을 strict round trip한다`() {
+        val value = validContents().compatibility.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            forcedCompatibility = ContractForcedCompatibility(
+                scope = "UNKNOWN_API_USAGE",
+                originalStatus = ContractCompatibilityStatus.UNKNOWN,
+                issueCodes = listOf("api_usage_dynamic"),
+            ),
+        )
+
+        assertEquals(value, BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(value)))
+    }
+
+    @Test
+    fun `schema v6은 모순된 forced provenance를 거부한다`() {
+        val forced = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        )
+        listOf(
+            validContents().compatibility.copy(
+                schemaVersion = 6,
+                status = ContractCompatibilityStatus.COMPATIBLE,
+                issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+                forcedCompatibility = forced,
+            ),
+            validContents().compatibility.copy(
+                schemaVersion = 6,
+                status = ContractCompatibilityStatus.UNKNOWN,
+                issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+                forcedCompatibility = forced.copy(issueCodes = emptyList()),
+            ),
+            validContents().compatibility.copy(
+                schemaVersion = 6,
+                status = ContractCompatibilityStatus.UNKNOWN,
+                issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+                forcedCompatibility = forced.copy(issueCodes = listOf("browser_profile_unknown")),
+            ),
+        ).forEach { value ->
+            assertFailsWith<IllegalArgumentException> { BundleJson.encodeCompatibility(value) }
+        }
+    }
+
+    @Test
+    fun `schema v6은 forcedCompatibility exact key set만 허용한다`() {
+        val value = validContents().compatibility.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            forcedCompatibility = ContractForcedCompatibility(
+                scope = "UNKNOWN_API_USAGE",
+                originalStatus = ContractCompatibilityStatus.UNKNOWN,
+                issueCodes = listOf("api_usage_dynamic"),
+            ),
+        )
+        val encoded = BundleJson.encodeCompatibility(value)
+
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(encoded.replace(
+                "\"forcedCompatibility\":{",
+                "\"forcedCompatibility\":{\"unexpected\":true,",
+            ))
+        }
+    }
+
+    @Test
+    fun `schema v6은 forcedCompatibility key가 null이어도 필요하다`() {
+        val value = validContents().compatibility.copy(schemaVersion = 6)
+        val encoded = BundleJson.encodeCompatibility(value)
+
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(encoded.replace(",\"forcedCompatibility\":null", ""))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            BundleJson.decodeCompatibility(encoded.dropLast(1) + ",\"unexpected\":true}")
+        }
+    }
+
+    @Test
+    fun `schema v6은 forced provenance의 허용 범위와 정규화를 강제한다`() {
+        val forced = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        )
+        val report = validContents().compatibility.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            forcedCompatibility = forced,
+        )
+
+        listOf(
+            report.copy(forcedCompatibility = forced.copy(scope = "BLOCKED_API_USAGE")),
+            report.copy(forcedCompatibility = forced.copy(originalStatus = ContractCompatibilityStatus.BLOCKED)),
+            report.copy(forcedCompatibility = forced.copy(issueCodes = listOf("z", "a"))),
+            report.copy(forcedCompatibility = forced.copy(issueCodes = listOf("api_usage_dynamic", "api_usage_dynamic"))),
+        ).forEach { malformed ->
+            assertFailsWith<IllegalArgumentException> { BundleJson.encodeCompatibility(malformed) }
+        }
+    }
+
+    @Test
+    fun `schema v6 forced provenance는 unavailable compatibility와 양립할 수 없다`() {
+        val forced = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        )
+        val report = validContents().compatibility.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            forcedCompatibility = forced,
+        )
+        val unavailableAdapter = ContractAdapterDecision(
+            id = "unavailable",
+            version = 1,
+            risk = "safe",
+            disposition = "unavailable",
+            applied = false,
+            evidence = emptyList(),
+            changes = emptyList(),
+            remainingLimitations = emptyList(),
+        )
+
+        listOf(
+            report.copy(unsupportedApis = listOf("downloads"), unavailableApis = listOf("downloads")),
+            report.copy(conversionState = "unavailable"),
+            report.copy(adapterDecisions = listOf(unavailableAdapter)),
+        ).forEach { unavailable ->
+            assertFailsWith<IllegalArgumentException> { BundleJson.encodeCompatibility(unavailable) }
+        }
+    }
+
+    @Test
+    fun `v3부터 v5 compatibility는 forced provenance 없이 기존대로 decode한다`() {
+        val reports = listOf(
+            validContents().compatibility,
+            validContents().compatibility.copy(
+                schemaVersion = 4,
+                originalSourceSha256 = "e".repeat(64),
+                planSha256 = "f".repeat(64),
+            ),
+            validContents().compatibility.copy(schemaVersion = 5),
+        )
+
+        reports.forEach { report ->
+            assertEquals(null, BundleJson.decodeCompatibility(BundleJson.encodeCompatibility(report)).forcedCompatibility)
+        }
+        listOf(legacyCompatibility(1), legacyCompatibility(2)).forEach { fixture ->
+            assertEquals(null, BundleJson.decodeCompatibility(fixture).forcedCompatibility)
+        }
+    }
+
+    @Test
     fun `bundle contract는 optional approval disposition을 허용하고 보존한다`() {
         val decision = ContractAdapterDecision(
             id = "popup-native-autofill-guard",
