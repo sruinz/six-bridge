@@ -10,21 +10,30 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Button
 import androidx.compose.material.Card
+import androidx.compose.material.Checkbox
 import androidx.compose.material.MaterialTheme
 import androidx.compose.material.OutlinedButton
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTag
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.SourceEvidence
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.desktop.app.DesktopConversionState
 
-fun canContinueToApproval(status: CompatibilityStatus): Boolean =
-    status == CompatibilityStatus.COMPATIBLE || status == CompatibilityStatus.PARTIAL
+fun canContinueToApproval(state: DesktopConversionState.AnalysisReady): Boolean =
+    state.session.report.status in setOf(
+        CompatibilityStatus.COMPATIBLE,
+        CompatibilityStatus.PARTIAL,
+    ) || (
+        state.forceCompatibilityConfirmed &&
+            ForceCompatibilityPolicy.isEligible(state.session.report)
+        )
 
 @Composable
 fun AnalysisStep(
@@ -84,6 +93,25 @@ fun AnalysisStep(
                 },
             )
         }
+        if (ForceCompatibilityPolicy.isEligible(report)) {
+            Card(Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = state.forceCompatibilityConfirmed,
+                        onCheckedChange = {
+                            onAction(DesktopAction.ForceCompatibilityConfirmationChanged(it))
+                        },
+                        modifier = Modifier.semantics {
+                            testTag = "analysis:force-compatibility"
+                        },
+                    )
+                    Text("호환성을 보장할 수 없음을 이해했으며 이 작업만 강제 변환합니다.")
+                }
+            }
+        }
         AnalysisSection("모바일 adapter 근거") {
             TaggedText(
                 "analysis:adapters",
@@ -99,7 +127,7 @@ fun AnalysisStep(
             OutlinedButton(onClick = { onAction(DesktopAction.Cancel) }) { Text("취소") }
             Button(
                 onClick = { onAction(DesktopAction.ContinueToApproval) },
-                enabled = canContinueToApproval(report.status),
+                enabled = canContinueToApproval(state),
                 modifier = Modifier.weight(1f).semantics { testTag = "analysis:continue" },
             ) {
                 Text("승인 단계로 계속")

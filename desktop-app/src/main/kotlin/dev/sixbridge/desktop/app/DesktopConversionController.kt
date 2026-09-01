@@ -3,6 +3,8 @@ package dev.sixbridge.desktop.app
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.desktop.conversion.DesktopAnalysisSession
 import dev.sixbridge.desktop.conversion.DesktopConversionEngine
@@ -69,6 +71,7 @@ sealed interface DesktopConversionState {
         val resolvedOptionalAdapters: Set<String> = emptySet(),
         val partialConfirmed: Boolean,
         val projectIdentity: String?,
+        val forceCompatibilityConfirmed: Boolean = false,
     ) : DesktopConversionState
 
     data class BuildingDraft(
@@ -180,6 +183,7 @@ class DesktopConversionController private constructor(
                                 resolvedOptionalAdapters = emptySet(),
                                 partialConfirmed = false,
                                 projectIdentity = null,
+                                forceCompatibilityConfirmed = false,
                             )
                         }
                     }
@@ -207,8 +211,18 @@ class DesktopConversionController private constructor(
     fun continueToApproval() {
         synchronized(lock) {
             val ready = approvalReady(_state.value) ?: return
-            if (ready.session.report.status !in setOf(CompatibilityStatus.COMPATIBLE, CompatibilityStatus.PARTIAL)) return
+            if (!isCompatibilityAuthorized(ready)) return
             _state.value = ready.copy(reviewStep = DesktopReviewStep.APPROVAL)
+        }
+    }
+
+    fun setForceCompatibilityConfirmed(confirmed: Boolean) {
+        synchronized(lock) {
+            val ready = approvalReady(_state.value) ?: return
+            _state.value = ready.copy(
+                forceCompatibilityConfirmed = confirmed &&
+                    ForceCompatibilityPolicy.isEligible(ready.session.report),
+            )
         }
     }
 
@@ -268,11 +282,21 @@ class DesktopConversionController private constructor(
 
     fun buildDraft() {
         val ready: DesktopConversionState.AnalysisReady
+        val consumedReady: DesktopConversionState.AnalysisReady
+        val authorization: ConversionAuthorization
         val operation = Operation()
         val nextGeneration: Long
         synchronized(lock) {
             ready = approvalReady(_state.value) ?: return
             if (ready.reviewStep != DesktopReviewStep.APPROVAL) return
+            if (!isCompatibilityAuthorized(ready)) {
+                _state.value = DesktopConversionState.Failed(
+                    DesktopFailureStage.APPROVAL,
+                    "이 분석 결과는 변환할 수 없습니다.",
+                    ready.copy(forceCompatibilityConfirmed = false),
+                )
+                return
+            }
             val allowedApprovals = ready.session.requiredApprovals + ready.session.optionalApprovals
             val approvalsReady = ready.selectedAdapters.containsAll(ready.session.requiredApprovals) &&
                 allowedApprovals.containsAll(ready.selectedAdapters) &&
@@ -300,8 +324,17 @@ class DesktopConversionController private constructor(
                 return
             }
             val projectIdentity = ready.projectIdentity.takeIf { requiresProjectIdentity }
+            authorization = if (
+                ready.forceCompatibilityConfirmed &&
+                ForceCompatibilityPolicy.isEligible(ready.session.report)
+            ) {
+                ConversionAuthorization.forceUnknownApiUsage()
+            } else {
+                ConversionAuthorization.NONE
+            }
+            consumedReady = ready.copy(forceCompatibilityConfirmed = false)
             nextGeneration = generation.incrementAndGet()
-            _state.value = DesktopConversionState.BuildingDraft(nextGeneration, ready)
+            _state.value = DesktopConversionState.BuildingDraft(nextGeneration, consumedReady)
             currentOperation = operation
             currentJob = scope.launch {
                 try {
@@ -312,6 +345,7 @@ class DesktopConversionController private constructor(
                                 ready.session,
                                 ready.selectedAdapters,
                                 projectIdentity,
+                                authorization,
                                 operation.control,
                             ).also(completedArtifact::set)
                         }
@@ -331,7 +365,7 @@ class DesktopConversionController private constructor(
                     throw error
                 } catch (error: Exception) {
                     if (!isExpectedFailure(error)) throw error
-                    failIfCurrent(nextGeneration, DesktopFailureStage.DRAFT, error, ready)
+                    failIfCurrent(nextGeneration, DesktopFailureStage.DRAFT, error, consumedReady)
                 } finally {
                     clearCurrent(nextGeneration, operation)
                 }
@@ -551,6 +585,16 @@ class DesktopConversionController private constructor(
         }
         else -> null
     }
+
+    private fun isCompatibilityAuthorized(
+        ready: DesktopConversionState.AnalysisReady,
+    ): Boolean = ready.session.report.status in setOf(
+        CompatibilityStatus.COMPATIBLE,
+        CompatibilityStatus.PARTIAL,
+    ) || (
+        ready.forceCompatibilityConfirmed &&
+            ForceCompatibilityPolicy.isEligible(ready.session.report)
+        )
 
     private fun tokenOf(state: DesktopConversionState?): String? = when (state) {
         is DesktopConversionState.AnalysisReady -> state.session.token

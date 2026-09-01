@@ -3,6 +3,8 @@ package dev.sixbridge.desktop.ui
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.onNodeWithTag
@@ -12,6 +14,8 @@ import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.desktop.app.DesktopConversionState
@@ -25,6 +29,31 @@ import kotlin.test.assertEquals
 
 @OptIn(ExperimentalTestApi::class)
 class DesktopResultStepTest {
+    @Test
+    fun `서명된 강제 provenance가 있는 결과에만 경고 card를 표시한다`() = runComposeUiTest {
+        setContent {
+            ResultStep(
+                draftReadyState().copy(
+                    artifact = draftReadyState().artifact.copy(
+                        forcedCompatibility = ForcedCompatibilityProvenance(
+                            CompatibilityForceScope.UNKNOWN_API_USAGE,
+                            CompatibilityStatus.UNKNOWN,
+                            listOf("api_usage_dynamic"),
+                        ),
+                    ),
+                ),
+                {},
+            )
+        }
+
+        onNodeWithTag("result:forced-compatibility")
+            .assertTextContains("강제 변환 · 원래 상태 UNKNOWN", substring = true)
+            .assertTextContains("issue: api_usage_dynamic", substring = true)
+            .assertTextContains("호환성은 보장되지 않습니다.", substring = true)
+
+        setContent { ResultStep(draftReadyState(), {}) }
+        onAllNodesWithTag("result:forced-compatibility").assertCountEquals(0)
+    }
     @Test
     fun `결과는 파일명 hash signer와 저장 동작을 표시한다`() = runComposeUiTest {
         setContent { ResultStep(draftReadyState(), {}) }

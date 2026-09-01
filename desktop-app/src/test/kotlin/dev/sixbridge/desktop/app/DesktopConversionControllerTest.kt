@@ -3,6 +3,7 @@ package dev.sixbridge.desktop.app
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisStage
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
+import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.profile.BrowserProfile
@@ -30,6 +31,60 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class DesktopConversionControllerTest {
+    @Test
+    fun `eligible UNKNOWN 확인은 build 시작 즉시 소멸하고 signed artifact에만 남는다`() {
+        val entered = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        Fixture(DesktopConversionEngineTestHooks(beforeDraft = {
+            entered.countDown()
+            check(proceed.await(10, TimeUnit.SECONDS))
+        })).use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.dynamicSource), profile)
+            val initial = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            assertEquals(CompatibilityStatus.UNKNOWN, initial.session.report.status)
+            assertFalse(initial.forceCompatibilityConfirmed)
+
+            controller.continueToApproval()
+            assertEquals(DesktopReviewStep.ANALYSIS, (controller.state.value as DesktopConversionState.AnalysisReady).reviewStep)
+            controller.setForceCompatibilityConfirmed(true)
+            controller.continueToApproval()
+            controller.buildDraft()
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            val building = controller.state.value as DesktopConversionState.BuildingDraft
+            assertFalse(building.previous.forceCompatibilityConfirmed)
+            proceed.countDown()
+
+            val ready = awaitState(controller) { it is DesktopConversionState.DraftReady }
+                as DesktopConversionState.DraftReady
+            assertEquals(listOf("api_usage_dynamic"), ready.artifact.forcedCompatibility?.issueCodes)
+            controller.close()
+        }
+        proceed.countDown()
+    }
+
+    @Test
+    fun `확인은 새 input과 취소에 재사용되지 않고 ineligible report에 주입되지 않는다`() {
+        Fixture().use { fixture ->
+            val controller = DesktopConversionController(fixture.engine)
+            controller.analyze(DesktopExtensionInput.Local(fixture.dynamicSource), profile)
+            awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+            controller.setForceCompatibilityConfirmed(true)
+            assertTrue((controller.state.value as DesktopConversionState.AnalysisReady).forceCompatibilityConfirmed)
+            controller.cancel()
+            assertIs<DesktopConversionState.Input>(controller.state.value)
+
+            controller.analyze(DesktopExtensionInput.Local(fixture.firstSource), profile)
+            val compatible = awaitState(controller) { it is DesktopConversionState.AnalysisReady }
+                as DesktopConversionState.AnalysisReady
+            assertFalse(compatible.forceCompatibilityConfirmed)
+            controller.setForceCompatibilityConfirmed(true)
+            assertFalse((controller.state.value as DesktopConversionState.AnalysisReady).forceCompatibilityConfirmed)
+            controller.close()
+        }
+    }
+
     @Test
     fun `선택적 adapter는 적용과 원본 유지 모두 유효한 결정이다`() {
         Fixture().use { fixture ->
@@ -511,6 +566,12 @@ class DesktopConversionControllerTest {
                 "<html><head></head><body><input type='email'></body></html>",
             )
             it.resolve("manifest.json").writeText("""{"manifest_version":3,"name":"popup","version":"1","action":{"default_popup":"popup.html"}}""")
+        }
+        val dynamicSource = Files.createDirectory(root.resolve("dynamic")).also {
+            it.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"dynamic","version":"1","content_scripts":[{"matches":["https://*/*"],"js":["content.js"]}]}""",
+            )
+            it.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
         }
 
         private fun source(name: String) = Files.createDirectory(root.resolve(name)).also {

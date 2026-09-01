@@ -2,6 +2,7 @@ package dev.sixbridge.desktop.probe
 
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.BrowserProfileJson
 import dev.sixbridge.desktop.conversion.DesktopConversionEngine
@@ -62,6 +63,7 @@ object DesktopProbeDraftBatch {
                             session = session,
                             approvedAdapterIds = session.requiredApprovals,
                             projectIdentity = identity,
+                            authorization = ConversionAuthorization.NONE,
                             control = AnalysisControl(),
                         )
                         saver.save(artifact, destination)

@@ -4,10 +4,15 @@ import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.v2.runComposeUiTest
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -30,6 +35,48 @@ import kotlin.test.assertEquals
 
 @OptIn(ExperimentalTestApi::class)
 class DesktopAnalysisStepTest {
+    @Test
+    fun `강제 가능 UNKNOWN은 작업별 확인 후에만 계속한다`() = runComposeUiTest {
+        var state by androidx.compose.runtime.mutableStateOf(
+            analysisState(CompatibilityStatus.UNKNOWN, eligibleForce = true),
+        )
+        val actions = mutableListOf<DesktopAction>()
+        setContent {
+            AnalysisStep(state) { action ->
+                actions += action
+                if (action is DesktopAction.ForceCompatibilityConfirmationChanged) {
+                    state = state.copy(forceCompatibilityConfirmed = action.confirmed)
+                }
+            }
+        }
+
+        onNodeWithText(
+            "호환성을 보장할 수 없음을 이해했으며 이 작업만 강제 변환합니다.",
+        ).assertExists()
+        onNodeWithTag("analysis:force-compatibility").performScrollTo().performClick()
+        onNodeWithTag("analysis:continue").assertIsEnabled()
+        runOnIdle {
+            assertEquals(
+                listOf<DesktopAction>(
+                    DesktopAction.ForceCompatibilityConfirmationChanged(true),
+                ),
+                actions,
+            )
+        }
+    }
+
+    @Test
+    fun `강제 불가 UNKNOWN과 BLOCKED에는 확인란을 노출하지 않는다`() = runComposeUiTest {
+        listOf(
+            analysisState(CompatibilityStatus.UNKNOWN),
+            analysisState(CompatibilityStatus.BLOCKED),
+        ).forEach { state ->
+            setContent { AnalysisStep(state, {}) }
+            onAllNodesWithTag("analysis:force-compatibility").assertCountEquals(0)
+            onNodeWithTag("analysis:continue").assertIsNotEnabled()
+        }
+    }
+
     @Test
     fun `blocked 분석은 사유와 근거를 노출하고 다음 단계를 차단한다`() = runComposeUiTest {
         setContent { DesktopApp(analysisState(CompatibilityStatus.BLOCKED), emptyList(), {}) }
@@ -93,7 +140,10 @@ class DesktopAnalysisStepTest {
         runOnIdle { assertEquals(listOf(DesktopAction.Back), actions) }
     }
 
-    private fun analysisState(status: CompatibilityStatus): DesktopConversionState.AnalysisReady {
+    private fun analysisState(
+        status: CompatibilityStatus,
+        eligibleForce: Boolean = false,
+    ): DesktopConversionState.AnalysisReady {
         val report = CompatibilityReport(
             status = status,
             manifestVersion = 3,
@@ -102,11 +152,17 @@ class DesktopAnalysisStepTest {
             originalExtensionId = "abcdefghijklmnopabcdefghijklmnop",
             declaredPermissions = setOf("storage", "contextMenus"),
             usedApis = setOf("chrome.storage", "chrome.contextMenus"),
-            unsupportedApis = setOf("nativeMessaging"),
+            unsupportedApis = if (eligibleForce) emptySet() else setOf("nativeMessaging"),
             verifiedApis = setOf("tabs.query"),
             unverifiedApis = setOf("userScripts.register"),
-            unavailableApis = setOf("nativeMessaging"),
-            issues = listOf(
+            unavailableApis = if (eligibleForce) emptySet() else setOf("nativeMessaging"),
+            issues = if (eligibleForce) listOf(
+                CompatibilityIssue(
+                    code = "api_usage_dynamic",
+                    message = "계산된 API namespace를 정적으로 확인할 수 없습니다.",
+                    blocking = true,
+                ),
+            ) else listOf(
                 CompatibilityIssue(
                     code = "unsupported-api",
                     message = "nativeMessaging은 지원하지 않습니다.",
@@ -125,6 +181,8 @@ class DesktopAnalysisStepTest {
                     remainingLimitations = emptyList(),
                 ),
             ),
+            sourceSha256 = if (eligibleForce) "a".repeat(64) else null,
+            browserProfileSha256 = if (eligibleForce) "b".repeat(64) else null,
         )
         return DesktopConversionState.AnalysisReady(
             session = DesktopAnalysisSession(

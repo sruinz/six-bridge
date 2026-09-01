@@ -32,6 +32,7 @@ import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.desktop.app.DesktopConversionState
 import java.security.SecureRandom
 
@@ -45,7 +46,14 @@ fun canBuildDraft(state: DesktopConversionState.AnalysisReady): Boolean {
     val partialReady = state.session.report.status != CompatibilityStatus.PARTIAL || state.partialConfirmed
     val identityReady = state.session.logicalSourceIdentity !is LogicalSourceIdentityResult.NeedsUserSelection ||
         state.projectIdentity?.matches(projectIdentityPattern) == true
-    return approvalsReady && partialReady && identityReady
+    val compatibilityReady = state.session.report.status in setOf(
+        CompatibilityStatus.COMPATIBLE,
+        CompatibilityStatus.PARTIAL,
+    ) || (
+        state.forceCompatibilityConfirmed &&
+            ForceCompatibilityPolicy.isEligible(state.session.report)
+        )
+    return approvalsReady && partialReady && identityReady && compatibilityReady
 }
 
 internal fun generateProjectIdentity(random: SecureRandom = SecureRandom()): String =

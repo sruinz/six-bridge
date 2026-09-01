@@ -32,6 +32,7 @@ sealed interface DesktopAction {
     data class AdapterToggled(val id: String) : DesktopAction
     data class OptionalAdapterChosen(val id: String, val apply: Boolean) : DesktopAction
     data class PartialConfirmationChanged(val confirmed: Boolean) : DesktopAction
+    data class ForceCompatibilityConfirmationChanged(val confirmed: Boolean) : DesktopAction
     data class ProjectIdentitySelected(val value: String) : DesktopAction
     data object BuildDraft : DesktopAction
     data class SaveDraft(val destination: Path) : DesktopAction

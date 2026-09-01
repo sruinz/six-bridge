@@ -3,6 +3,7 @@ package dev.sixbridge.desktop.conversion
 import dev.sixbridge.core.SixBridgeService
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.draft.DraftSignature
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
@@ -29,6 +30,75 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class DesktopConversionEngineTest {
+    @Test
+    fun `desktop engine은 typed authorization을 재검증하고 서명된 v4 provenance만 반환한다`() {
+        Fixture().use { fixture ->
+            val denied = fixture.engine.analyze(
+                DesktopExtensionInput.Local(fixture.dynamicSource),
+                profile,
+                AnalysisControl(),
+            )
+            assertEquals(CompatibilityStatus.UNKNOWN, denied.report.status)
+            assertFailsWith<DesktopConversionException> {
+                fixture.engine.buildDraft(
+                    denied,
+                    emptySet(),
+                    null,
+                    ConversionAuthorization.NONE,
+                    AnalysisControl(),
+                )
+            }
+            assertFalse(fixture.engine.release(denied.token))
+
+            val approved = fixture.engine.analyze(
+                DesktopExtensionInput.Local(fixture.dynamicSource),
+                profile,
+                AnalysisControl(),
+            )
+            val artifact = fixture.engine.buildDraft(
+                approved,
+                emptySet(),
+                null,
+                ConversionAuthorization.forceUnknownApiUsage(),
+                AnalysisControl(),
+            )
+            val verified = SixDraft.read(artifact.privateFile)
+            assertEquals(4, verified.payload.draft.schemaVersion)
+            assertEquals(2, verified.payload.plan.schemaVersion)
+            assertEquals(CompatibilityStatus.UNKNOWN, verified.payload.compatibilityBefore.status)
+            assertEquals(listOf("api_usage_dynamic"), artifact.forcedCompatibility?.issueCodes)
+            assertEquals(verified.payload.plan.forcedCompatibility, artifact.forcedCompatibility)
+            assertFailsWith<UnsupportedOperationException> {
+                (requireNotNull(artifact.forcedCompatibility).issueCodes as MutableList<String>) +=
+                    "forged"
+            }
+            assertTrue(fixture.engine.release(approved.token))
+        }
+    }
+
+    @Test
+    fun `불필요하거나 강제 불가한 authorization은 service 출력 전에 거부한다`() {
+        Fixture().use { fixture ->
+            listOf(fixture.source, fixture.blockedSource).forEach { source ->
+                val session = fixture.engine.analyze(
+                    DesktopExtensionInput.Local(source),
+                    profile,
+                    AnalysisControl(),
+                )
+                assertFailsWith<DesktopConversionException> {
+                    fixture.engine.buildDraft(
+                        session,
+                        emptySet(),
+                        null,
+                        ConversionAuthorization.forceUnknownApiUsage(),
+                        AnalysisControl(),
+                    )
+                }
+                assertFalse(fixture.engine.release(session.token))
+            }
+        }
+    }
+
     @Test
     fun `분석은 자동 adapter와 승인 adapter를 분리한다`() {
         Fixture().use { fixture ->
@@ -77,6 +147,9 @@ class DesktopConversionEngineTest {
             val artifact = fixture.engine.buildDraft(session, session.requiredApprovals, "b".repeat(32), AnalysisControl())
             val verified = SixDraft.read(artifact.privateFile)
             assertEquals(2, verified.payload.draft.schemaVersion)
+            assertEquals(1, verified.payload.plan.schemaVersion)
+            assertEquals(null, verified.payload.plan.forcedCompatibility)
+            assertEquals(null, artifact.forcedCompatibility)
             assertEquals(DraftSourceKind.ZIP, verified.payload.sourceKind)
             assertNotEquals("mutated", verified.payload.compatibilityBefore.extensionName)
             assertEquals(DraftSignature.sha256(Files.readAllBytes(artifact.privateFile)), artifact.sha256)
@@ -456,6 +529,12 @@ class DesktopConversionEngineTest {
         }
         val blockedSource = Files.createDirectory(hostAppData.resolve("blocked")).also { root ->
             root.resolve("manifest.json").writeText("""{"manifest_version":2,"name":"blocked","version":"1"}""")
+        }
+        val dynamicSource = Files.createDirectory(hostAppData.resolve("dynamic")).also { root ->
+            root.resolve("manifest.json").writeText(
+                """{"manifest_version":3,"name":"dynamic","version":"1","content_scripts":[{"matches":["https://*/*"],"js":["content.js"]}]}""",
+            )
+            root.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
         }
         fun sourceWithName(name: String) = Files.createTempDirectory(hostAppData, "name-").also { root ->
             root.resolve("manifest.json").writeText(

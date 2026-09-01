@@ -165,6 +165,8 @@ private fun launchDesktopApplication() = application {
                         controller.chooseOptionalAdapter(action.id, action.apply)
                     is DesktopAction.PartialConfirmationChanged ->
                         controller.setPartialConfirmed(action.confirmed)
+                    is DesktopAction.ForceCompatibilityConfirmationChanged ->
+                        controller.setForceCompatibilityConfirmed(action.confirmed)
                     is DesktopAction.ProjectIdentitySelected ->
                         controller.selectProjectIdentity(action.value)
                     DesktopAction.BuildDraft -> controller.buildDraft()

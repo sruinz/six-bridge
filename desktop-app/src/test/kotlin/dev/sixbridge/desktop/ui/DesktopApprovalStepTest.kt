@@ -13,6 +13,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.v2.runComposeUiTest
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
@@ -33,6 +34,35 @@ import kotlin.test.assertTrue
 
 @OptIn(ExperimentalTestApi::class)
 class DesktopApprovalStepTest {
+    @Test
+    fun `강제 가능 UNKNOWN은 확인과 기존 승인 gate를 모두 충족해야 한다`() {
+        val unconfirmed = approvalState(
+            status = CompatibilityStatus.UNKNOWN,
+            requiredApprovals = emptySet(),
+            forceEligible = true,
+            forceConfirmed = false,
+        )
+        val confirmed = unconfirmed.copy(forceCompatibilityConfirmed = true)
+
+        assertFalse(canBuildDraft(unconfirmed))
+        assertTrue(canBuildDraft(confirmed))
+    }
+
+    @Test
+    fun `다른 UNKNOWN과 BLOCKED에 확인값을 주입해도 생성할 수 없다`() {
+        listOf(CompatibilityStatus.UNKNOWN, CompatibilityStatus.BLOCKED).forEach { status ->
+            assertFalse(
+                canBuildDraft(
+                    approvalState(
+                        status = status,
+                        requiredApprovals = emptySet(),
+                        forceConfirmed = true,
+                    ),
+                ),
+            )
+        }
+    }
+
     @Test
     fun `선택적 adapter를 결정하기 전에는 draft를 만들 수 없다`() {
         val state = approvalState(
@@ -186,6 +216,8 @@ class DesktopApprovalStepTest {
         optionalApprovals: Set<String> = emptySet(),
         resolvedOptionalAdapters: Set<String> = emptySet(),
         partialConfirmed: Boolean = false,
+        forceEligible: Boolean = false,
+        forceConfirmed: Boolean = false,
     ): DesktopConversionState.AnalysisReady {
         val adapters = listOf(
             AdapterDecision(
@@ -239,8 +271,14 @@ class DesktopApprovalStepTest {
                     declaredPermissions = emptySet(),
                     usedApis = emptySet(),
                     unsupportedApis = emptySet(),
-                    issues = emptyList(),
+                    issues = if (forceEligible) {
+                        listOf(CompatibilityIssue("api_usage_dynamic", "dynamic", true))
+                    } else {
+                        emptyList()
+                    },
                     adapterDecisions = adapters,
+                    sourceSha256 = if (forceEligible) "a".repeat(64) else null,
+                    browserProfileSha256 = if (forceEligible) "b".repeat(64) else null,
                 ),
                 logicalSourceIdentity = identity,
                 selectedAutomaticAdapters = setOf("safe-entry"),
@@ -252,6 +290,7 @@ class DesktopApprovalStepTest {
             resolvedOptionalAdapters = resolvedOptionalAdapters,
             partialConfirmed = partialConfirmed,
             projectIdentity = null,
+            forceCompatibilityConfirmed = forceConfirmed,
         )
     }
 }

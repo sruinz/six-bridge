@@ -78,6 +78,22 @@ fun ResultStep(
                 }
             }
         }
+        artifact.forcedCompatibility?.let { forced ->
+            Card(
+                Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
+                    testTag = "result:forced-compatibility"
+                },
+            ) {
+                Column(
+                    Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("강제 변환 · 원래 상태 ${forced.originalStatus.name}")
+                    forced.issueCodes.sorted().forEach { Text("issue: $it") }
+                    Text("호환성은 보장되지 않습니다.")
+                }
+            }
+        }
         state.message?.let {
             Text(
                 it,

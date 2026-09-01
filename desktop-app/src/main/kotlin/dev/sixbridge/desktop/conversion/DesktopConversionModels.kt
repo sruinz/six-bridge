@@ -3,6 +3,7 @@ package dev.sixbridge.desktop.conversion
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.SecureConversionRoot
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.file.Files
 import java.nio.file.Path
@@ -32,6 +33,7 @@ data class DesktopDraftArtifact(
     val suggestedFileName: String,
     val sha256: String,
     val signerFingerprint: String,
+    val forcedCompatibility: ForcedCompatibilityProvenance? = null,
 )
 
 class DesktopConversionException(message: String, cause: Throwable? = null) :

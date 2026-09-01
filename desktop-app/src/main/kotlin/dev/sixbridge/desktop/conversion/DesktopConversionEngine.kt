@@ -4,6 +4,10 @@ import dev.sixbridge.core.SixBridgeService
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDisposition
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ConversionPlanningException
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.draft.DraftSignature
 import dev.sixbridge.core.draft.DraftSigningIdentityProvider
 import dev.sixbridge.core.draft.DraftSourceKind
@@ -53,7 +57,7 @@ class DesktopConversionEngine private constructor(
         val resolvedInput: ResolvedExtensionInput,
         val service: SixBridgeService,
         val profile: BrowserProfile,
-        val status: CompatibilityStatus,
+        val report: dev.sixbridge.core.compat.CompatibilityReport,
         val sourceSha256: String?,
         val extensionName: String?,
         val selectedAutomaticAdapters: Set<String>,
@@ -107,7 +111,7 @@ class DesktopConversionEngine private constructor(
                     .mapTo(sortedSetOf()) { it.id }.immutableSet(),
             )
             val context = DesktopSessionContext(
-                lease, resolvedInput, service, profileSnapshot, analysis.report.status,
+                lease, resolvedInput, service, profileSnapshot, analysis.report,
                 analysis.report.sourceSha256, analysis.report.extensionName,
                 session.selectedAutomaticAdapters, session.requiredApprovals,
                 session.optionalApprovals,
@@ -133,6 +137,7 @@ class DesktopConversionEngine private constructor(
         session: DesktopAnalysisSession,
         approvedAdapterIds: Set<String>,
         projectIdentity: String?,
+        authorization: ConversionAuthorization,
         control: AnalysisControl,
     ): DesktopDraftArtifact {
         val token = try {
@@ -146,7 +151,11 @@ class DesktopConversionEngine private constructor(
         return context.lock.withLock {
             try {
             validateSession(token, session)
-            validateBuildRequest(context, approvedAdapterIds)
+            val expectedForcedCompatibility = validateBuildRequest(
+                context,
+                approvedAdapterIds,
+                authorization,
+            )
             testHooks?.beforeDraft?.invoke()
             val suggestedFileName = suggestedFileName(context.extensionName)
             val output = context.lease.workspace.artifactRoot.resolve(suggestedFileName)
@@ -158,6 +167,7 @@ class DesktopConversionEngine private constructor(
                 approvedAdapterIds = approvedAdapterIds,
                 protectedInputs = emptyList(),
                 control = control,
+                authorization = authorization,
             )
             val verified = SixDraft.read(result.draft)
             val signerFingerprint = DraftSignature.fingerprint(
@@ -170,6 +180,7 @@ class DesktopConversionEngine private constructor(
                 result.draft,
                 verified,
                 signerFingerprint,
+                expectedForcedCompatibility,
             )
             val artifact = DesktopDraftArtifact(
                 token = token,
@@ -177,6 +188,7 @@ class DesktopConversionEngine private constructor(
                 suggestedFileName = suggestedFileName,
                 sha256 = DraftSignature.sha256(Files.readAllBytes(result.draft)),
                 signerFingerprint = signerFingerprint,
+                forcedCompatibility = verified.payload.plan.forcedCompatibility,
             )
             testHooks?.afterDraftCreation?.invoke(artifact)
             artifact
@@ -186,6 +198,19 @@ class DesktopConversionEngine private constructor(
             }
         }
     }
+
+    fun buildDraft(
+        session: DesktopAnalysisSession,
+        approvedAdapterIds: Set<String>,
+        projectIdentity: String?,
+        control: AnalysisControl,
+    ): DesktopDraftArtifact = buildDraft(
+        session,
+        approvedAdapterIds,
+        projectIdentity,
+        ConversionAuthorization.NONE,
+        control,
+    )
 
     fun release(token: String): Boolean {
         val canonical = try {
@@ -252,8 +277,17 @@ class DesktopConversionEngine private constructor(
     private fun validateBuildRequest(
         context: DesktopSessionContext,
         approvedAdapterIds: Set<String>,
-    ) {
-        if (context.status in setOf(CompatibilityStatus.BLOCKED, CompatibilityStatus.UNKNOWN)) {
+        authorization: ConversionAuthorization,
+    ): ForcedCompatibilityProvenance? {
+        val forcedCompatibility = try {
+            ForceCompatibilityPolicy.requireProvenance(context.report, authorization)
+        } catch (error: ConversionPlanningException) {
+            throw DesktopConversionException("강제 호환성 승인이 분석 결과와 일치하지 않습니다.", error)
+        }
+        if (
+            context.report.status == CompatibilityStatus.BLOCKED ||
+            context.report.status == CompatibilityStatus.UNKNOWN && forcedCompatibility == null
+        ) {
             throw DesktopConversionException("차단되었거나 알 수 없는 분석 결과는 draft로 만들 수 없습니다.")
         }
         if (!approvedAdapterIds.containsAll(context.requiredApprovals)) {
@@ -263,6 +297,7 @@ class DesktopConversionEngine private constructor(
         if (!allowedApprovals.containsAll(approvedAdapterIds)) {
             throw DesktopConversionException("분석 결과에 없는 adapter 승인이 포함되었습니다.")
         }
+        return forcedCompatibility
     }
 
     private fun verifyArtifact(
@@ -271,11 +306,14 @@ class DesktopConversionEngine private constructor(
         artifact: java.nio.file.Path,
         verified: dev.sixbridge.core.draft.VerifiedSixDraft,
         signerFingerprint: String,
+        expectedForcedCompatibility: ForcedCompatibilityProvenance?,
     ) {
         val payload = verified.payload
         if (
             resultSourceSha256 != context.sourceSha256 ||
-            payload.draft.schemaVersion != 2 ||
+            payload.draft.schemaVersion != (if (expectedForcedCompatibility == null) 2 else 4) ||
+            payload.plan.schemaVersion != (if (expectedForcedCompatibility == null) 1 else 2) ||
+            payload.plan.forcedCompatibility != expectedForcedCompatibility ||
             payload.sourceKind !in setOf(DraftSourceKind.ZIP, DraftSourceKind.CRX) ||
             verified.signerFingerprint != signerFingerprint ||
             !Files.isRegularFile(artifact)
