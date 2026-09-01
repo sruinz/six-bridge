@@ -2,6 +2,10 @@ package dev.sixbridge.core.draft
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionPlanProof
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.deepImmutableCopy
 import dev.sixbridge.core.input.ExtensionInputKind
 import java.util.Collections
@@ -46,6 +50,17 @@ class DraftMetadata private constructor(
             sourceIdentity = sourceIdentity,
         )
 
+        fun createV4(
+            coreVersion: String,
+            adapterVersions: Map<String, Int>,
+            sourceIdentity: String,
+        ): DraftMetadata = create(
+            schemaVersion = 4,
+            coreVersion = coreVersion,
+            adapterVersions = adapterVersions,
+            sourceIdentity = sourceIdentity,
+        )
+
         @JvmSynthetic
         internal fun decoded(
             schemaVersion: Int,
@@ -65,7 +80,7 @@ class DraftMetadata private constructor(
             adapterVersions: Map<String, Int>,
             sourceIdentity: String,
         ): DraftMetadata {
-            require(schemaVersion in 1..3) {
+            require(schemaVersion in 1..4) {
                 "지원하지 않는 draft schemaVersion입니다."
             }
             require(coreVersion.isNotBlank()) { "coreVersion은 비어 있을 수 없습니다." }
@@ -134,15 +149,19 @@ class DraftConversionPlan private constructor(
     val browserProfileSha256: String,
     val reportSha256: String,
     val planSha256: String,
+    forcedCompatibility: ForcedCompatibilityProvenance?,
 ) {
     val selectedAdapters: List<DraftSelectedAdapter> = Collections.unmodifiableList(
         selectedAdapters.map(DraftSelectedAdapter::copy),
     )
+    val forcedCompatibility: ForcedCompatibilityProvenance? =
+        forcedCompatibility.deepImmutableCopy()
 
     companion object {
         fun create(
             report: CompatibilityReport,
             selectedAdapters: List<DraftSelectedAdapter>,
+            forcedCompatibility: ForcedCompatibilityProvenance? = null,
         ): DraftConversionPlan {
             val immutable = report.deepImmutableCopy().also(CompatibilityReport::validate)
             val source = requireNotNull(immutable.sourceSha256) {
@@ -160,34 +179,57 @@ class DraftConversionPlan private constructor(
                     "선택한 어댑터가 report에 없습니다: ${selected.id}@${selected.version}"
                 }
             }
+            val canonicalForced = forcedCompatibility?.let { forced ->
+                val authorization = when (forced.scope) {
+                    CompatibilityForceScope.UNKNOWN_API_USAGE ->
+                        ConversionAuthorization.forceUnknownApiUsage()
+                }
+                ForceCompatibilityPolicy.requireProvenance(
+                    immutable,
+                    authorization,
+                ).also {
+                    require(it == forced) {
+                        "강제 호환성 provenance가 report와 일치하지 않습니다."
+                    }
+                }
+            }
             return DraftConversionPlan(
-                schemaVersion = 1,
+                schemaVersion = if (canonicalForced == null) 1 else 2,
                 selectedAdapters = selectedAdapters.sortedWith(
                     compareBy(DraftSelectedAdapter::id, DraftSelectedAdapter::version),
                 ),
                 reportSourceSha256 = source,
                 browserProfileSha256 = profile,
                 reportSha256 = SixDraftJson.compatibilitySha256(immutable),
-                planSha256 = ConversionPlanProof.digestDecisions(
-                    immutable,
-                    selectedDecisions,
-                ),
+                planSha256 = if (canonicalForced == null) {
+                    ConversionPlanProof.digestDecisions(immutable, selectedDecisions)
+                } else {
+                    ConversionPlanProof.digestDecisions(
+                        immutable,
+                        selectedDecisions,
+                        canonicalForced,
+                    )
+                },
+                forcedCompatibility = canonicalForced,
             )
         }
 
         internal fun decoded(
+            schemaVersion: Int,
             selectedAdapters: List<DraftSelectedAdapter>,
             reportSourceSha256: String,
             browserProfileSha256: String,
             reportSha256: String,
             planSha256: String,
+            forcedCompatibility: ForcedCompatibilityProvenance?,
         ): DraftConversionPlan = DraftConversionPlan(
-            schemaVersion = 1,
+            schemaVersion = schemaVersion,
             selectedAdapters = selectedAdapters,
             reportSourceSha256 = reportSourceSha256,
             browserProfileSha256 = browserProfileSha256,
             reportSha256 = reportSha256,
             planSha256 = planSha256,
+            forcedCompatibility = forcedCompatibility,
         )
     }
 }

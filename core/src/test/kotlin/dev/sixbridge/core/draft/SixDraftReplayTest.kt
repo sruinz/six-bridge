@@ -3,7 +3,11 @@ package dev.sixbridge.core.draft
 import com.google.common.jimfs.Configuration
 import com.google.common.jimfs.Jimfs
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
+import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
@@ -33,6 +37,169 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SixDraftReplayTest {
+    @Test
+    fun `v4 portable replay는 signed force만 복원한다`() {
+        val fixture = forcedPortableV4Fixture()
+
+        val replayed = assertIs<DraftReplayResult.Ready>(
+            SixDraftReplay().replay(
+                fixture.draft,
+                fixture.profile,
+                emptySet(),
+            ),
+        ).prepared
+
+        assertEquals(
+            fixture.draft.payload.plan.forcedCompatibility,
+            replayed.forcedCompatibility,
+        )
+        assertEquals(
+            fixture.draft.payload.expected.planSha256,
+            replayed.planSha256,
+        )
+        assertEquals(
+            fixture.draft.payload.expected.reportSha256,
+            replayed.reportSha256,
+        )
+        val identity = assertIs<LogicalSourceIdentityResult.Stable>(
+            replayed.logicalSourceIdentity,
+        )
+        assertEquals("project:forced-v4-replay", identity.value)
+        assertEquals(LogicalIdentityEvidence.SIGNED_DRAFT_METADATA, identity.evidence)
+    }
+
+    @Test
+    fun `v4 profile 변경은 signed force를 실행하지 않고 새 분석만 반환한다`() {
+        val fixture = forcedPortableV4Fixture()
+        val changed = fixture.profile.copy(versionCode = fixture.profile.versionCode + 1)
+
+        val result = assertIs<DraftReplayResult.ProfileChanged>(
+            SixDraftReplay().replay(fixture.draft, changed, emptySet()),
+        )
+
+        assertEquals(changed.canonicalSha256(), result.currentProfileSha256)
+        assertEquals(null, result.currentAnalysis.convertedExtensionId)
+    }
+
+    @Test
+    fun `signed force가 없는 UNKNOWN draft에 caller가 권한을 추가할 수 없다`() {
+        val fixture = forcedPortableV4Fixture()
+        val forced = fixture.draft.payload
+        val unsignedForcePayload = SixDraftPayload.create(
+            draft = DraftMetadata.createV2(
+                "test",
+                emptyMap(),
+                forced.draft.sourceIdentity,
+            ),
+            input = forced.input,
+            sourceKind = forced.sourceKind,
+            source = forced.source,
+            plan = DraftConversionPlan.create(
+                forced.compatibilityBefore,
+                emptyList(),
+            ),
+            compatibilityBefore = forced.compatibilityBefore,
+            compatibilityAfter = forced.compatibilityAfter,
+        )
+        val unsigned = SixDraft.read(
+            SixDraft.createBytes(unsignedForcePayload, ed25519()),
+        )
+
+        assertFailsWith<DraftReplayMismatchException> {
+            SixDraftReplay().replay(unsigned, fixture.profile, emptySet())
+        }
+    }
+
+    @Test
+    fun `v4 replay는 signed issue drift를 mismatch로 거부한다`() {
+        val fixture = forcedPortableV4Fixture()
+        val payload = fixture.draft.payload
+        val before = payload.compatibilityBefore.copy(
+            issues = payload.compatibilityBefore.issues.map { issue ->
+                if (issue.blocking) issue.copy(message = "signed issue drift") else issue
+            },
+        )
+        val after = payload.compatibilityAfter.copy(
+            issues = payload.compatibilityAfter.issues.map { issue ->
+                if (issue.blocking) issue.copy(message = "signed issue drift") else issue
+            },
+        )
+        val drifted = resignForcedPayload(payload, before, after)
+
+        assertFailsWith<DraftReplayMismatchException> {
+            SixDraftReplay().replay(drifted, fixture.profile, emptySet())
+        }
+    }
+
+    @Test
+    fun `v4 replay는 current unavailable API drift를 mismatch로 거부한다`() {
+        val profile = profile()
+        val sourceRoot = Files.createTempDirectory("six-draft-forced-unavailable-source")
+        sourceRoot.resolve("content.js").writeText(
+            "chrome[namespace].sync.get('value'); chrome.downloads.download({url});",
+        )
+        sourceRoot.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Forced unavailable drift",
+              "version": "1",
+              "permissions": ["downloads"],
+              "content_scripts": [{
+                "matches": ["<all_urls>"],
+                "js": ["content.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+        val source = ExtensionZip.createBytes(sourceRoot, includeProjectMarker = true)
+        val identity = "project:forced-unavailable-drift"
+        val input = PortableExtensionInput.fromZip(
+            ExtensionInputKind.ZIP,
+            source,
+            signedDraftSourceIdentity = identity,
+        )
+        val actual = ConversionPreparationEngine().use { it.analyze(input, profile) }
+        assertTrue(actual.unavailableApis.isNotEmpty())
+        val signed = actual.copy(
+            status = CompatibilityStatus.UNKNOWN,
+            unsupportedApis = emptySet(),
+            issues = listOf(
+                CompatibilityIssue("api_usage_dynamic", "signed dynamic API", true),
+            ),
+            conversionState = ConversionState.PASSTHROUGH,
+            adapterDecisions = emptyList(),
+            verifiedApis = actual.verifiedApis - actual.unavailableApis,
+            unavailableApis = emptySet(),
+        )
+        val forced = dev.sixbridge.core.conversion.ForceCompatibilityPolicy
+            .requireProvenance(
+                signed,
+                ConversionAuthorization.forceUnknownApiUsage(),
+            )
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV4("test", emptyMap(), identity),
+            input = DraftInputMetadata(
+                ExtensionInputKind.ZIP,
+                requireNotNull(signed.sourceSha256),
+                requireNotNull(signed.browserProfileSha256),
+                signed.originalExtensionId,
+                requireNotNull(signed.extensionVersion),
+                identity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(signed, emptyList(), forced),
+            compatibilityBefore = signed,
+            compatibilityAfter = signed,
+        )
+        val drifted = SixDraft.read(SixDraft.createBytes(payload, ed25519()))
+
+        assertFailsWith<DraftReplayMismatchException> {
+            SixDraftReplay().replay(drifted, profile, emptySet())
+        }
+    }
+
     @Test
     fun `portable draft replay는 두 adapter의 직접 변환과 같은 canonical 결과를 만든다`() {
         val profile = internalUrlProfile()
@@ -460,6 +627,87 @@ class SixDraftReplayTest {
         )
     }
 
+    private fun forcedPortableV4Fixture(): ForcedPortableFixture {
+        val profile = profile()
+        val sourceRoot = Files.createTempDirectory("six-draft-forced-v4-source")
+        sourceRoot.resolve("content.js").writeText(
+            "chrome[namespace].sync.get('value');",
+        )
+        sourceRoot.resolve("manifest.json").writeText(
+            """
+            {
+              "manifest_version": 3,
+              "name": "Forced v4 Replay",
+              "version": "1",
+              "content_scripts": [{
+                "matches": ["<all_urls>"],
+                "js": ["content.js"]
+              }]
+            }
+            """.trimIndent(),
+        )
+        val source = ExtensionZip.createBytes(sourceRoot, includeProjectMarker = true)
+        val identity = "project:forced-v4-replay"
+        val direct = ConversionPreparationEngine().use {
+            it.prepare(
+                PortableExtensionInput.fromZip(
+                    ExtensionInputKind.ZIP,
+                    source,
+                    signedDraftSourceIdentity = identity,
+                ),
+                profile,
+                emptySet(),
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            )
+        }
+        val forced = requireNotNull(direct.forcedCompatibility)
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV4("test", emptyMap(), identity),
+            input = DraftInputMetadata(
+                ExtensionInputKind.ZIP,
+                direct.originalSourceSha256,
+                direct.browserProfileSha256,
+                direct.originalExtensionId,
+                requireNotNull(direct.compatibilityBefore.extensionVersion),
+                identity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(
+                direct.compatibilityBefore,
+                emptyList(),
+                forced,
+            ),
+            compatibilityBefore = direct.compatibilityBefore,
+            compatibilityAfter = direct.compatibilityAfter,
+        )
+        return ForcedPortableFixture(
+            draft = SixDraft.read(SixDraft.createBytes(payload, ed25519())),
+            profile = profile,
+        )
+    }
+
+    private fun resignForcedPayload(
+        payload: SixDraftPayload,
+        before: dev.sixbridge.core.compat.CompatibilityReport,
+        after: dev.sixbridge.core.compat.CompatibilityReport,
+    ): VerifiedSixDraft {
+        val resigned = SixDraftPayload.create(
+            draft = payload.draft,
+            input = payload.input,
+            sourceKind = payload.sourceKind,
+            source = payload.source,
+            plan = DraftConversionPlan.create(
+                before,
+                payload.plan.selectedAdapters,
+                payload.plan.forcedCompatibility,
+            ),
+            compatibilityBefore = before,
+            compatibilityAfter = after,
+        )
+        return SixDraft.read(SixDraft.createBytes(resigned, ed25519()))
+    }
+
     private fun portableV2Draft(
         source: ByteArray,
         profile: BrowserProfile,
@@ -845,6 +1093,11 @@ class SixDraftReplayTest {
     private data class PortablePlatformFixture(
         val draft: VerifiedSixDraft,
         val direct: dev.sixbridge.core.conversion.PreparedConversion,
+    )
+
+    private data class ForcedPortableFixture(
+        val draft: VerifiedSixDraft,
+        val profile: BrowserProfile,
     )
 
     private data class LegacyCrxFixture(

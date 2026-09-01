@@ -2,6 +2,7 @@ package dev.sixbridge.core.draft
 
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.bundle.toContractV6
 import dev.sixbridge.core.compat.CompatibilityAnalyzer
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.AnalysisControl
@@ -10,6 +11,8 @@ import dev.sixbridge.core.conversion.ConversionTempTreeFactory
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.conversion.PreparedConversion
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.input.PortableExtensionInput
 import dev.sixbridge.core.profile.BrowserProfile
 import java.nio.charset.StandardCharsets.UTF_8
@@ -58,9 +61,15 @@ class SixDraftReplay {
     ): DraftReplayResult {
         control.checkCancelled()
         val payload = draft.payload
-        if (payload.draft.schemaVersion == 3) {
+        if (
+            payload.draft.schemaVersion == 3 ||
+            (
+                payload.draft.schemaVersion == 4 &&
+                    payload.sourceKind == DraftSourceKind.PREPARED_CRX
+            )
+        ) {
             throw LegacyDraftNotReplayableException(
-                "schema v3 prepared CRX draft는 replay 대상이 아닙니다.",
+                "prepared CRX draft는 replay 대상이 아닙니다.",
             )
         }
         if (payload.draft.schemaVersion == 1 &&
@@ -90,8 +99,15 @@ class SixDraftReplay {
                 )
             }
 
+            val authorization = authorizationFromSignedPlan(payload)
             val replayed = replayBoundary("signed draft 재실행에 실패했습니다.") {
-                engine.prepare(input, profile, approvedAdapterIds, control)
+                engine.prepare(
+                    input,
+                    profile,
+                    approvedAdapterIds,
+                    control,
+                    authorization,
+                )
             }
             control.checkCancelled()
             val prepared = normalizePrepared(payload, replayed)
@@ -102,7 +118,13 @@ class SixDraftReplay {
 
     private fun portableInput(payload: SixDraftPayload): PortableExtensionInput {
         val signedIdentity = payload.draft.sourceIdentity
-            .takeIf { payload.draft.schemaVersion == 2 }
+            .takeIf {
+                payload.draft.schemaVersion == 2 ||
+                    (
+                        payload.draft.schemaVersion == 4 &&
+                            payload.sourceKind != DraftSourceKind.PREPARED_CRX
+                        )
+            }
         return when (payload.sourceKind) {
             DraftSourceKind.ZIP -> PortableExtensionInput.fromZip(
                 kind = payload.input.inputKind,
@@ -126,20 +148,39 @@ class SixDraftReplay {
         payload: SixDraftPayload,
         prepared: PreparedConversion,
     ): PreparedConversion {
-        if (payload.draft.schemaVersion != 2) return prepared
+        if (
+            payload.draft.schemaVersion != 2 &&
+            !(
+                payload.draft.schemaVersion == 4 &&
+                    payload.sourceKind != DraftSourceKind.PREPARED_CRX
+                )
+        ) return prepared
         val before = prepared.compatibilityBefore.copy(
             originalExtensionId = payload.input.originalExtensionId,
         )
         val selected = prepared.compatibilityAfter.adapterDecisions
             .filter { it.applied }
             .map { DraftSelectedAdapter(it.id, it.version) }
-        val planSha256 = DraftConversionPlan.create(before, selected).planSha256
+        val replayedPlan = DraftConversionPlan.create(
+            before,
+            selected,
+            payload.plan.forcedCompatibility,
+        )
+        val planSha256 = replayedPlan.planSha256
         val reportSha256 = DraftSignature.sha256(
             BundleJson.encodeCompatibility(
-                prepared.compatibilityAfter.toContractV4(
-                    originalSourceSha256 = prepared.originalSourceSha256,
-                    planSha256 = planSha256,
-                ),
+                if (payload.draft.schemaVersion == 4) {
+                    prepared.compatibilityAfter.toContractV6(
+                        originalSourceSha256 = prepared.originalSourceSha256,
+                        planSha256 = planSha256,
+                        forcedCompatibility = replayedPlan.forcedCompatibility,
+                    )
+                } else {
+                    prepared.compatibilityAfter.toContractV4(
+                        originalSourceSha256 = prepared.originalSourceSha256,
+                        planSha256 = planSha256,
+                    )
+                },
             ).toByteArray(UTF_8),
         )
         return PreparedConversion(
@@ -153,6 +194,7 @@ class SixDraftReplay {
             transformedSourceZip = prepared.transformedSourceZip,
             originalExtensionId = prepared.originalExtensionId,
             logicalSourceIdentity = prepared.logicalSourceIdentity,
+            forcedCompatibility = prepared.forcedCompatibility,
             passthroughCrx = prepared.passthroughCrx,
         )
     }
@@ -175,6 +217,10 @@ class SixDraftReplay {
             2 -> identity is LogicalSourceIdentityResult.Stable &&
                 identity.evidence == LogicalIdentityEvidence.SIGNED_DRAFT_METADATA &&
                 identity.value == payload.draft.sourceIdentity
+            4 -> payload.sourceKind != DraftSourceKind.PREPARED_CRX &&
+                identity is LogicalSourceIdentityResult.Stable &&
+                identity.evidence == LogicalIdentityEvidence.SIGNED_DRAFT_METADATA &&
+                identity.value == payload.draft.sourceIdentity
             else -> false
         }
         val reportMatches = payload.draft.schemaVersion == 1 ||
@@ -195,6 +241,7 @@ class SixDraftReplay {
             expected.planSha256 != replayedPlanSha256 ||
             !reportMatches ||
             signedAdapters != replayedAdapters ||
+            prepared.forcedCompatibility != payload.plan.forcedCompatibility ||
             !identityMatches
         ) {
             throw DraftReplayMismatchException(
@@ -202,6 +249,14 @@ class SixDraftReplay {
                     "현재 코어 재실행과 다릅니다.",
             )
         }
+    }
+
+    private fun authorizationFromSignedPlan(
+        payload: SixDraftPayload,
+    ): ConversionAuthorization = when (payload.plan.forcedCompatibility?.scope) {
+        null -> ConversionAuthorization.NONE
+        CompatibilityForceScope.UNKNOWN_API_USAGE ->
+            ConversionAuthorization.forceUnknownApiUsage()
     }
 
     private inline fun <T> replayBoundary(
@@ -212,6 +267,8 @@ class SixDraftReplay {
     } catch (error: DraftReplayMismatchException) {
         throw error
     } catch (error: IllegalArgumentException) {
+        throw DraftReplayMismatchException("$message ${error.message}", error)
+    } catch (error: IllegalStateException) {
         throw DraftReplayMismatchException("$message ${error.message}", error)
     }
 }

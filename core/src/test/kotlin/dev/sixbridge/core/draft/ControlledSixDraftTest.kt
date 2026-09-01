@@ -4,9 +4,16 @@ import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.conversion.CompatibilityForceScope
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ConversionPreparationEngine
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.input.ExtensionInputKind
+import dev.sixbridge.core.input.ExtensionZip
+import dev.sixbridge.core.input.PortableExtensionInput
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -24,8 +31,60 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.io.path.writeText
 
 class ControlledSixDraftTest {
+    @Test
+    fun `schema v4 ZIP과 CRX는 controlled legacy이며 portable replay 가능하다`() {
+        listOf(DraftSourceKind.ZIP, DraftSourceKind.CRX).forEach { kind ->
+            val path = forcedPortableDraft(kind)
+
+            val controlled = SixDraft.readControlled(
+                path,
+                AnalysisControl(AnalysisSafetyPolicy.mobile),
+            )
+
+            val legacy = assertIs<ControlledSixDraft.Legacy>(controlled, kind.name)
+            assertEquals(kind, legacy.verified.payload.sourceKind)
+            assertIs<DraftReplayResult.Ready>(
+                SixDraftReplay().replay(
+                    legacy.verified,
+                    profile(),
+                    emptySet(),
+                ),
+                kind.name,
+            )
+        }
+    }
+
+    @Test
+    fun `schema v4 PREPARED_CRX는 controlled prepared이며 replay 대상이 아니다`() {
+        val fixture = preparedDraft(
+            sourceEntryBytes = 3 * 1024 * 1024,
+            forced = true,
+        )
+
+        val controlled = SixDraft.readControlled(
+            fixture.path,
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
+
+        val prepared = assertIs<ControlledSixDraft.Prepared>(controlled).verified
+        assertEquals(4, prepared.draft.schemaVersion)
+        assertEquals(2, prepared.plan.schemaVersion)
+        assertEquals(
+            CompatibilityForceScope.UNKNOWN_API_USAGE,
+            prepared.plan.forcedCompatibility?.scope,
+        )
+        assertFailsWith<LegacyDraftNotReplayableException> {
+            SixDraftReplay().replay(
+                SixDraft.read(fixture.path),
+                profile(),
+                emptySet(),
+            )
+        }
+    }
+
     @Test
     fun `schema v3 prepared CRX는 모바일 원본 예산을 넘어도 replay 없이 검증한다`() {
         val fixture = preparedDraft(sourceEntryBytes = 3 * 1024 * 1024)
@@ -62,6 +121,26 @@ class ControlledSixDraftTest {
         val source = zip(2 * 1024 * 1024 + 1)
         val payload = legacyPayload(source)
         val path = Files.createTempFile("six-legacy-budget-", ".six").also {
+            Files.write(it, SixDraft.createBytes(payload, ed25519()))
+        }
+
+        val controlled = SixDraft.readControlled(
+            path,
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
+
+        val exceeded = assertIs<ControlledSixDraft.BudgetExceeded>(controlled)
+        assertEquals(
+            dev.sixbridge.core.compat.AnalysisBudgetMetric.SINGLE_SOURCE_BYTES,
+            exceeded.exceeded.metric,
+        )
+    }
+
+    @Test
+    fun `schema v4 portable source 예산 초과도 전체 draft materialization 전에 결과로 반환한다`() {
+        val source = zip(2 * 1024 * 1024 + 1)
+        val payload = legacyPayload(source, forced = true)
+        val path = Files.createTempFile("six-v4-portable-budget-", ".six").also {
             Files.write(it, SixDraft.createBytes(payload, ed25519()))
         }
 
@@ -287,6 +366,7 @@ class ControlledSixDraftTest {
     private fun preparedDraft(
         sourceEntryBytes: Int,
         afterExtensionVersion: String = "1",
+        forced: Boolean = false,
     ): PreparedFixture {
         val sourceZip = zip(sourceEntryBytes)
         val crx = Crx3.packCanonicalZip(sourceZip, rsa()).bytes
@@ -298,15 +378,28 @@ class ControlledSixDraftTest {
             sourceSha256 = original,
             profileSha256 = profile,
             convertedExtensionId = null,
+            forced = forced,
         )
         val after = report(
             sourceSha256 = proof.zipSha256,
             profileSha256 = profile,
             convertedExtensionId = proof.extensionId,
             extensionVersion = afterExtensionVersion,
+            forced = forced,
         )
+        val forcedCompatibility = forced.takeIf { it }?.let {
+            ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            )
+        }
         val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV3("test", emptyMap(), identity),
+            draft = if (forcedCompatibility == null) {
+                DraftMetadata.createV3("test", emptyMap(), identity)
+            } else {
+                DraftMetadata.createV4("test", emptyMap(), identity)
+            },
             input = DraftInputMetadata(
                 inputKind = ExtensionInputKind.ZIP,
                 originalSourceSha256 = original,
@@ -317,7 +410,11 @@ class ControlledSixDraftTest {
             ),
             sourceKind = DraftSourceKind.PREPARED_CRX,
             source = crx,
-            plan = DraftConversionPlan.create(before, emptyList()),
+            plan = DraftConversionPlan.create(
+                before,
+                emptyList(),
+                forcedCompatibility,
+            ),
             compatibilityBefore = before,
             compatibilityAfter = after,
         )
@@ -334,7 +431,76 @@ class ControlledSixDraftTest {
         )
     }
 
-    private fun legacyPayload(source: ByteArray): SixDraftPayload {
+    private fun forcedPortableDraft(kind: DraftSourceKind): java.nio.file.Path {
+        val sourceRoot = Files.createTempDirectory("six-forced-portable-${kind.name.lowercase()}")
+        sourceRoot.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        sourceRoot.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Forced portable","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+        val identity = "project:forced-${kind.name.lowercase()}-controlled"
+        val source: ByteArray
+        val input: PortableExtensionInput
+        val inputKind: ExtensionInputKind
+        if (kind == DraftSourceKind.ZIP) {
+            source = ExtensionZip.createBytes(sourceRoot, includeProjectMarker = true)
+            input = PortableExtensionInput.fromZip(
+                ExtensionInputKind.ZIP,
+                source,
+                signedDraftSourceIdentity = identity,
+            )
+            inputKind = ExtensionInputKind.ZIP
+        } else {
+            val packed = Crx3.pack(sourceRoot, rsa())
+            source = packed.bytes
+            input = PortableExtensionInput.fromCrx(
+                ExtensionInputKind.CRX3,
+                source,
+                packed.extensionId,
+                signedDraftSourceIdentity = identity,
+            )
+            inputKind = ExtensionInputKind.CRX3
+        }
+        val prepared = ConversionPreparationEngine().use {
+            it.prepare(
+                input,
+                profile(),
+                emptySet(),
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            )
+        }
+        val forced = requireNotNull(prepared.forcedCompatibility)
+        val before = prepared.compatibilityBefore.copy(
+            originalExtensionId = prepared.originalExtensionId,
+        )
+        val payload = SixDraftPayload.create(
+            draft = DraftMetadata.createV4("test", emptyMap(), identity),
+            input = DraftInputMetadata(
+                inputKind,
+                prepared.originalSourceSha256,
+                prepared.browserProfileSha256,
+                prepared.originalExtensionId,
+                requireNotNull(prepared.compatibilityBefore.extensionVersion),
+                identity,
+            ),
+            sourceKind = kind,
+            source = source,
+            plan = DraftConversionPlan.create(
+                before,
+                emptyList(),
+                forced,
+            ),
+            compatibilityBefore = before,
+            compatibilityAfter = prepared.compatibilityAfter,
+        )
+        return Files.createTempFile("six-forced-portable-", ".sixdraft").also {
+            Files.write(it, SixDraft.createBytes(payload, ed25519()))
+        }
+    }
+
+    private fun legacyPayload(
+        source: ByteArray,
+        forced: Boolean = false,
+    ): SixDraftPayload {
         val profile = "9".repeat(64)
         val sourceSha = sha256(source)
         val identity = "project:fedcba9876543210fedcba9876543210"
@@ -342,9 +508,21 @@ class ControlledSixDraftTest {
             sourceSha256 = sourceSha,
             profileSha256 = profile,
             convertedExtensionId = null,
+            forced = forced,
         )
+        val forcedCompatibility = forced.takeIf { it }?.let {
+            ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            )
+        }
         return SixDraftPayload.create(
-            draft = DraftMetadata.createV2("test", emptyMap(), identity),
+            draft = if (forcedCompatibility == null) {
+                DraftMetadata.createV2("test", emptyMap(), identity)
+            } else {
+                DraftMetadata.createV4("test", emptyMap(), identity)
+            },
             input = DraftInputMetadata(
                 inputKind = ExtensionInputKind.ZIP,
                 originalSourceSha256 = sourceSha,
@@ -355,7 +533,11 @@ class ControlledSixDraftTest {
             ),
             sourceKind = DraftSourceKind.ZIP,
             source = source,
-            plan = DraftConversionPlan.create(report, emptyList()),
+            plan = DraftConversionPlan.create(
+                report,
+                emptyList(),
+                forcedCompatibility,
+            ),
             compatibilityBefore = report,
             compatibilityAfter = report,
         )
@@ -366,20 +548,37 @@ class ControlledSixDraftTest {
         profileSha256: String,
         convertedExtensionId: String?,
         extensionVersion: String = "1",
+        forced: Boolean = false,
     ) = CompatibilityReport(
-        status = CompatibilityStatus.COMPATIBLE,
+        status = if (forced) CompatibilityStatus.UNKNOWN else CompatibilityStatus.COMPATIBLE,
         manifestVersion = 3,
         extensionName = "Prepared",
         extensionVersion = extensionVersion,
         declaredPermissions = emptySet(),
         usedApis = emptySet(),
         unsupportedApis = emptySet(),
-        issues = emptyList(),
+        issues = if (forced) {
+            listOf(CompatibilityIssue("api_usage_dynamic", "dynamic", true))
+        } else {
+            emptyList()
+        },
         conversionState = ConversionState.PASSTHROUGH,
         originalExtensionId = null,
         convertedExtensionId = convertedExtensionId,
         sourceSha256 = sourceSha256,
         browserProfileSha256 = profileSha256,
+    )
+
+    private fun profile() = dev.sixbridge.core.profile.BrowserProfile(
+        browserPackage = "com.sec.android.app.sbrowser",
+        versionName = dev.sixbridge.core.profile.BrowserProfile.BASELINE_VERSION,
+        versionCode = 1_300_261_502,
+        majorVersion = dev.sixbridge.core.profile.BrowserProfile.SUPPORTED_MAJOR_VERSION,
+        supportedApis = dev.sixbridge.core.profile.BrowserProfile.POC_SUPPORTED_APIS,
+        wrapperContract = dev.sixbridge.core.profile.WrapperContract.complete(),
+        sourceApkSha256 = dev.sixbridge.core.profile.BrowserProfile.BASELINE_APK_SHA256,
+        sourceApkSignerSha256 = dev.sixbridge.core.profile.BrowserProfile.SAMSUNG_SIGNER_SHA256,
+        supportedFeatures = setOf("extension.options-page.user-accessible"),
     )
 
     private fun zip(sourceEntryBytes: Int): ByteArray =

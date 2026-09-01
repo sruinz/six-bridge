@@ -7,6 +7,8 @@ import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.conversion.SourceEvidence
 import dev.sixbridge.core.input.ExtensionInputKind
 import kotlinx.serialization.json.Json
@@ -88,14 +90,13 @@ internal object SixDraftJson {
         )
     }
 
-    fun encodePlan(value: DraftConversionPlan): ByteArray = encodeCanonicalObject(
-        "conversion-plan.json",
-        objectOf(
+    fun encodePlan(value: DraftConversionPlan): ByteArray {
+        val common = linkedMapOf<String, JsonElement>(
             "browserProfileSha256" to JsonPrimitive(value.browserProfileSha256),
             "planSha256" to JsonPrimitive(value.planSha256),
             "reportSha256" to JsonPrimitive(value.reportSha256),
             "reportSourceSha256" to JsonPrimitive(value.reportSourceSha256),
-            "schemaVersion" to JsonPrimitive(1),
+            "schemaVersion" to JsonPrimitive(value.schemaVersion),
             "selectedAdapters" to JsonArray(
                 value.selectedAdapters.map {
                     objectOf(
@@ -104,13 +105,32 @@ internal object SixDraftJson {
                     )
                 },
             ),
-        ),
-    )
+        )
+        if (value.schemaVersion == 2) {
+            common["forcedCompatibility"] = value.forcedCompatibility?.let { forced ->
+                objectOf(
+                    "issueCodes" to stringList(forced.issueCodes),
+                    "originalStatus" to JsonPrimitive(forced.originalStatus.name),
+                    "scope" to JsonPrimitive(forced.scope.name),
+                )
+            } ?: JsonNull
+        }
+        return encodeCanonicalObject(
+            "conversion-plan.json",
+            JsonObject(common.toSortedMap()),
+        )
+    }
 
     fun decodePlan(bytes: ByteArray): DraftConversionPlan {
         val value = parseCanonicalObject("conversion-plan.json", bytes)
-        value.requireKeys(PLAN_KEYS, "conversion-plan.json")
-        value.requireSchema("conversion-plan.json", 1)
+        val schemaVersion = value.getValue("schemaVersion").strictInt("schemaVersion")
+        require(schemaVersion in 1..2) {
+            "지원하지 않는 conversion-plan.json schemaVersion입니다."
+        }
+        value.requireKeys(
+            if (schemaVersion == 1) PLAN_V1_KEYS else PLAN_V2_KEYS,
+            "conversion-plan.json",
+        )
         val selected = value.getValue("selectedAdapters").jsonArray.map { element ->
             val selectedValue = element.jsonObject
             selectedValue.requireKeys(SELECTED_ADAPTER_KEYS, "selectedAdapter")
@@ -126,11 +146,17 @@ internal object SixDraftJson {
             "selectedAdapters는 중복될 수 없습니다."
         }
         return DraftConversionPlan.decoded(
+            schemaVersion = schemaVersion,
             selectedAdapters = selected,
             reportSourceSha256 = value.strictSha256("reportSourceSha256"),
             browserProfileSha256 = value.strictSha256("browserProfileSha256"),
             reportSha256 = value.strictSha256("reportSha256"),
             planSha256 = value.strictSha256("planSha256"),
+            forcedCompatibility = if (schemaVersion == 1) {
+                null
+            } else {
+                value.decodeForcedCompatibility()
+            },
         )
     }
 
@@ -257,13 +283,13 @@ internal object SixDraftJson {
                     value.transformedSourceSha256,
                 ),
             )
-            3 -> objectOf(
+            3, 4 -> objectOf(
                 "originalSourceSha256" to JsonPrimitive(
                     value.originalSourceSha256,
                 ),
                 "planSha256" to JsonPrimitive(value.planSha256),
                 "reportSha256" to JsonPrimitive(value.reportSha256),
-                "schemaVersion" to JsonPrimitive(3),
+                "schemaVersion" to JsonPrimitive(draftSchemaVersion),
                 "transformedSourceSha256" to JsonPrimitive(
                     value.transformedSourceSha256,
                 ),
@@ -305,9 +331,9 @@ internal object SixDraftJson {
                     planSha256 = value.strictSha256("planSha256"),
                 )
             }
-            3 -> {
+            3, 4 -> {
                 value.requireKeys(EXPECTED_V2_KEYS, "expected.json")
-                value.requireSchema("expected.json", 3)
+                value.requireSchema("expected.json", draftSchemaVersion)
                 DraftExpected(
                     originalSourceSha256 = value.strictSha256(
                         "originalSourceSha256",
@@ -587,7 +613,7 @@ internal object SixDraftJson {
 
     private fun JsonObject.supportedDraftSchema(): Int =
         getValue("schemaVersion").strictInt("schemaVersion").also {
-            require(it in 1..3) {
+            require(it in 1..4) {
                 "지원하지 않는 draft.json schemaVersion입니다."
             }
         }
@@ -650,6 +676,22 @@ internal object SixDraftJson {
             "$name 배열은 정렬되고 중복이 없어야 합니다."
         }
         return values.toSet()
+    }
+
+    private fun JsonObject.decodeForcedCompatibility(): ForcedCompatibilityProvenance? {
+        val element = getValue("forcedCompatibility")
+        if (element === JsonNull) return null
+        val value = element.jsonObject
+        value.requireKeys(FORCED_COMPATIBILITY_KEYS, "forcedCompatibility")
+        val issueCodes = value.strictStringList("issueCodes")
+        require(issueCodes == issueCodes.sorted() && issueCodes.distinct().size == issueCodes.size) {
+            "forcedCompatibility issueCodes는 정렬되고 중복이 없어야 합니다."
+        }
+        return ForcedCompatibilityProvenance(
+            scope = enumValueOf(value.strictString("scope")),
+            originalStatus = enumValueOf(value.strictString("originalStatus")),
+            issueCodes = java.util.Collections.unmodifiableList(issueCodes.toList()),
+        )
     }
 
     private fun JsonObject.canonicalBase64(name: String): ByteArray {
@@ -798,9 +840,13 @@ internal object SixDraftJson {
         "browserProfileSha256", "originalExtensionId",
         "originalExtensionVersion", "sourceIdentity",
     )
-    private val PLAN_KEYS = setOf(
+    private val PLAN_V1_KEYS = setOf(
         "schemaVersion", "selectedAdapters", "reportSourceSha256",
         "browserProfileSha256", "reportSha256", "planSha256",
+    )
+    private val PLAN_V2_KEYS = PLAN_V1_KEYS + "forcedCompatibility"
+    private val FORCED_COMPATIBILITY_KEYS = setOf(
+        "scope", "originalStatus", "issueCodes",
     )
     private val SELECTED_ADAPTER_KEYS = setOf("id", "version")
     private val EXPECTED_V1_KEYS = setOf(

@@ -182,6 +182,7 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): SixDraftResult {
         val resolved = runControlledDraftStage(control) {
             inputResolver.resolve(input)
@@ -194,6 +195,7 @@ class SixBridgeService(
             approvedAdapterIds = approvedAdapterIds,
             protectedInputs = protectedInputs,
             control = control,
+            authorization = authorization,
         )
     }
 
@@ -205,6 +207,7 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): SixDraftResult = draftResolved(
         resolved,
         profile,
@@ -213,6 +216,7 @@ class SixBridgeService(
         approvedAdapterIds,
         protectedInputs,
         control,
+        authorization,
     ) { target, payload, key, publicationGuard ->
         SixDraft.writeGuarded(target, payload, key, publicationGuard)
     }
@@ -226,6 +230,7 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String>,
         protectedInputs: Iterable<Path>,
         control: AnalysisControl,
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
         draftPublisher: GuardedDraftPublisher,
     ): SixDraftResult {
         control.checkCancelled()
@@ -248,6 +253,7 @@ class SixBridgeService(
                 profile,
                 approvedAdapterIds,
                 control,
+                authorization,
             )
         }
         val sourceIdentity = resolveDraftSourceIdentity(
@@ -267,6 +273,7 @@ class SixBridgeService(
                     profile,
                     approvedAdapterIds,
                     control,
+                    authorization,
                 )
             }
             check(prepared.logicalSourceIdentity == preflightIdentity) {
@@ -284,11 +291,19 @@ class SixBridgeService(
             val sourceKind = DraftSourceKind.PREPARED_CRX
             val source = prepared.crxBytes
             val payload = SixDraftPayload.create(
-                draft = DraftMetadata.createV3(
-                    coreVersion = CORE_VERSION,
-                    adapterVersions = applied.associate { it.id to it.version },
-                    sourceIdentity = sourceIdentity,
-                ),
+                draft = if (prepared.forcedCompatibility == null) {
+                    DraftMetadata.createV3(
+                        coreVersion = CORE_VERSION,
+                        adapterVersions = applied.associate { it.id to it.version },
+                        sourceIdentity = sourceIdentity,
+                    )
+                } else {
+                    DraftMetadata.createV4(
+                        coreVersion = CORE_VERSION,
+                        adapterVersions = applied.associate { it.id to it.version },
+                        sourceIdentity = sourceIdentity,
+                    )
+                },
                 input = DraftInputMetadata(
                     inputKind = draftInput.kind,
                     originalSourceSha256 = requireNotNull(
@@ -308,6 +323,7 @@ class SixBridgeService(
                 plan = DraftConversionPlan.create(
                     before,
                     applied.map { DraftSelectedAdapter(it.id, it.version) },
+                    prepared.forcedCompatibility,
                 ),
                 compatibilityBefore = before,
                 compatibilityAfter = after,
@@ -346,6 +362,7 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String> = emptyList(),
         protectedInputs: Iterable<Path> = emptyList(),
         control: AnalysisControl = AnalysisControl(),
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
     ): SixDraftResult = draftPortableResolved(
         resolved,
         profile,
@@ -354,6 +371,7 @@ class SixBridgeService(
         approvedAdapterIds,
         protectedInputs,
         control,
+        authorization,
     ) { target, payload, key, publicationGuard ->
         SixDraft.writeGuarded(target, payload, key, publicationGuard)
     }
@@ -367,6 +385,7 @@ class SixBridgeService(
         approvedAdapterIds: Iterable<String>,
         protectedInputs: Iterable<Path>,
         control: AnalysisControl,
+        authorization: ConversionAuthorization = ConversionAuthorization.NONE,
         draftPublisher: GuardedDraftPublisher,
     ): SixDraftResult {
         control.checkCancelled()
@@ -394,6 +413,7 @@ class SixBridgeService(
                     profile,
                     approvedAdapterIds,
                     control,
+                    authorization,
                 )
             }
             val sourceIdentity = resolveDraftSourceIdentity(
@@ -422,11 +442,19 @@ class SixBridgeService(
                     )
             }
             val payload = SixDraftPayload.create(
-                draft = DraftMetadata.createV2(
-                    coreVersion = CORE_VERSION,
-                    adapterVersions = applied.associate { it.id to it.version },
-                    sourceIdentity = sourceIdentity,
-                ),
+                draft = if (prepared.forcedCompatibility == null) {
+                    DraftMetadata.createV2(
+                        coreVersion = CORE_VERSION,
+                        adapterVersions = applied.associate { it.id to it.version },
+                        sourceIdentity = sourceIdentity,
+                    )
+                } else {
+                    DraftMetadata.createV4(
+                        coreVersion = CORE_VERSION,
+                        adapterVersions = applied.associate { it.id to it.version },
+                        sourceIdentity = sourceIdentity,
+                    )
+                },
                 input = DraftInputMetadata(
                     inputKind = draftInput.kind,
                     originalSourceSha256 = requireNotNull(before.sourceSha256),
@@ -444,6 +472,7 @@ class SixBridgeService(
                 plan = DraftConversionPlan.create(
                     before,
                     applied.map { DraftSelectedAdapter(it.id, it.version) },
+                    prepared.forcedCompatibility,
                 ),
                 compatibilityBefore = before,
                 compatibilityAfter = after,

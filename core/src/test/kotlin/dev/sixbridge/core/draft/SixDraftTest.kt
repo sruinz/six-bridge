@@ -2,12 +2,15 @@ package dev.sixbridge.core.draft
 
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.core.crx.Crx3
+import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDecision
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.AdapterRisk
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.bundle.toContractV4
 import dev.sixbridge.core.input.ExtensionInputKind
 import kotlinx.serialization.json.Json
@@ -38,6 +41,77 @@ import kotlin.test.assertTrue
 import kotlin.io.path.writeText
 
 class SixDraftTest {
+    @Test
+    fun `forced draft v4는 signed plan provenance를 strict하게 보존한다`() {
+        val payload = forcedV4Payload()
+
+        val verified = SixDraft.read(SixDraft.createBytes(payload, keyPair()))
+
+        assertEquals(4, verified.payload.draft.schemaVersion)
+        assertEquals(2, verified.payload.plan.schemaVersion)
+        assertEquals(
+            ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            ),
+            verified.payload.plan.forcedCompatibility,
+        )
+        val planJson = verified.payload.conversionPlanJson.decodeToString()
+        assertTrue("\"forcedCompatibility\":" in planJson)
+
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (requireNotNull(verified.payload.plan.forcedCompatibility).issueCodes as MutableList<String>) +=
+                "mutated"
+        }
+    }
+
+    @Test
+    fun `forced provenance 필드 변조는 기존 signature로 검증되지 않는다`() {
+        val bytes = SixDraft.createBytes(forcedV4Payload(), keyPair())
+        val mutations = listOf(
+            "\"scope\":\"UNKNOWN_API_USAGE\"" to
+                "\"scope\":\"OTHER_SCOPE\"",
+            "\"originalStatus\":\"UNKNOWN\"" to
+                "\"originalStatus\":\"BLOCKED\"",
+            "\"issueCodes\":[\"api_usage_dynamic\"]" to
+                "\"issueCodes\":[\"browser_profile_unknown\"]",
+        )
+
+        mutations.forEach { (old, new) ->
+            val entries = readEntries(bytes).toMutableMap()
+            val original = entries.getValue("conversion-plan.json").decodeToString()
+            require(old in original)
+            entries["conversion-plan.json"] = original.replace(old, new).encodeToByteArray()
+
+            assertFailsWith<InvalidSixDraftException>(old) {
+                SixDraft.read(storedArchive(entries))
+            }
+        }
+    }
+
+    @Test
+    fun `plan schema v2는 forcedCompatibility key를 null을 포함해 필수로 요구한다`() {
+        val payload = forcedV4Payload()
+        val encoded = payload.conversionPlanJson.decodeToString()
+        val missing = encoded.replace(
+            Regex("\\\"forcedCompatibility\\\":\\{[^}]+},"),
+            "",
+        ).encodeToByteArray()
+        val nullValue = encoded.replace(
+            Regex("\\\"forcedCompatibility\\\":\\{[^}]+}"),
+            "\"forcedCompatibility\":null",
+        ).encodeToByteArray()
+
+        assertFailsWith<IllegalArgumentException> {
+            SixDraftJson.decodePlan(missing)
+        }
+        val decodedNull = SixDraftJson.decodePlan(nullValue)
+        assertEquals(2, decodedNull.schemaVersion)
+        assertEquals(null, decodedNull.forcedCompatibility)
+    }
+
     @Test
     fun `선택적 승인만 있는 빈 plan은 원본 유지 draft로 검증된다`() {
         val source = "optional-original-source".encodeToByteArray()
@@ -858,6 +932,49 @@ class SixDraftTest {
             ),
             compatibilityBefore = before,
             compatibilityAfter = after,
+        )
+    }
+
+    private fun forcedV4Payload(): SixDraftPayload {
+        val source = "forced-v4-portable-source".encodeToByteArray()
+        val sourceSha256 = sha256(source)
+        val profileSha256 = "7".repeat(64)
+        val identity = "project:forced-v4-draft"
+        val before = CompatibilityReport(
+            status = CompatibilityStatus.UNKNOWN,
+            manifestVersion = 3,
+            extensionName = "Forced v4",
+            extensionVersion = "1",
+            declaredPermissions = emptySet(),
+            usedApis = emptySet(),
+            unsupportedApis = emptySet(),
+            issues = listOf(
+                CompatibilityIssue("api_usage_dynamic", "dynamic", true),
+            ),
+            conversionState = ConversionState.PASSTHROUGH,
+            sourceSha256 = sourceSha256,
+            browserProfileSha256 = profileSha256,
+        )
+        val forced = ForcedCompatibilityProvenance(
+            CompatibilityForceScope.UNKNOWN_API_USAGE,
+            CompatibilityStatus.UNKNOWN,
+            listOf("api_usage_dynamic"),
+        )
+        return SixDraftPayload.create(
+            draft = DraftMetadata.createV4("test", emptyMap(), identity),
+            input = DraftInputMetadata(
+                ExtensionInputKind.ZIP,
+                sourceSha256,
+                profileSha256,
+                null,
+                "1",
+                identity,
+            ),
+            sourceKind = DraftSourceKind.ZIP,
+            source = source,
+            plan = DraftConversionPlan.create(before, emptyList(), forced),
+            compatibilityBefore = before,
+            compatibilityAfter = before,
         )
     }
 

@@ -1,6 +1,7 @@
 package dev.sixbridge.core
 
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.crx.Crx3
 import dev.sixbridge.core.draft.DraftReplayResult
 import dev.sixbridge.core.draft.DraftSourceKind
@@ -19,8 +20,69 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.io.path.writeText
 
 class SixDraftCrxProvenanceTest {
+    @Test
+    fun `service forced CRX draft는 v4 signed provenance로 replay된다`() {
+        val fixture = dynamicCrx()
+        val workspace = Files.createTempDirectory("six-draft-forced-crx-workspace")
+        val input = workspace.resolve("input.crx")
+        val output = workspace.resolve("forced.sixdraft")
+        Files.write(input, fixture.crxBytes)
+
+        SixBridgeService(workspace).draft(
+            input = input.toString(),
+            profile = profile(),
+            outputDraft = output,
+            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+        )
+
+        val verified = SixDraft.read(output)
+        assertEquals(4, verified.payload.draft.schemaVersion)
+        assertEquals(DraftSourceKind.CRX, verified.payload.sourceKind)
+        assertEquals(
+            listOf("api_usage_dynamic"),
+            verified.payload.plan.forcedCompatibility?.issueCodes,
+        )
+        val replayed = SixDraftReplay().replay(
+            verified,
+            profile(),
+            emptySet(),
+        ) as DraftReplayResult.Ready
+        assertEquals(
+            verified.payload.plan.forcedCompatibility,
+            replayed.prepared.forcedCompatibility,
+        )
+    }
+
+    @Test
+    fun `service forced prepared draft는 v4 PREPARED_CRX로 발행한다`() {
+        val workspace = Files.createTempDirectory("six-draft-forced-prepared-workspace")
+        val source = Files.createDirectory(workspace.resolve("source"))
+        source.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Forced prepared","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+        val output = workspace.resolve("forced-prepared.sixdraft")
+        val resolved = dev.sixbridge.core.input.ExtensionInputResolver().resolve(
+            source.toString(),
+        )
+
+        SixBridgeService(workspace).draftResolved(
+            resolved = resolved,
+            profile = profile(),
+            outputDraft = output,
+            projectIdentity = "a".repeat(32),
+            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+        )
+
+        val verified = SixDraft.read(output)
+        assertEquals(4, verified.payload.draft.schemaVersion)
+        assertEquals(DraftSourceKind.PREPARED_CRX, verified.payload.sourceKind)
+        assertEquals(2, verified.payload.plan.schemaVersion)
+    }
+
     @Test
     fun `noncanonical passthrough CRX keeps signed payload provenance through draft replay`() {
         val fixture = noncanonicalCrx(converted = false)
@@ -140,6 +202,25 @@ class SixDraftCrxProvenanceTest {
 
         assertContentEquals(rawZip, parsed.zipBytes)
         assertTrue(parsed.signaturesVerified)
+        return CrxFixture(
+            crxBytes = packed.bytes,
+            extensionId = packed.extensionId,
+            rawPayloadSha256 = Crx3.verifiedPayloadSha256(packed.bytes),
+        )
+    }
+
+    private fun dynamicCrx(): CrxFixture {
+        val source = Files.createTempDirectory("six-draft-dynamic-crx-source")
+        source.resolve("content.js").writeText("chrome[namespace].sync.get('value');")
+        source.resolve("manifest.json").writeText(
+            """{"manifest_version":3,"name":"Dynamic CRX","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}""",
+        )
+        val packed = Crx3.pack(
+            source,
+            KeyPairGenerator.getInstance("RSA")
+                .apply { initialize(2048) }
+                .generateKeyPair(),
+        )
         return CrxFixture(
             crxBytes = packed.bytes,
             extensionId = packed.extensionId,

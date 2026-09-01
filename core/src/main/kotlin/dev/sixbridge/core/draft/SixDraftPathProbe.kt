@@ -136,7 +136,13 @@ internal object StrictDraftPathProbe {
     ): ControlledSixDraft {
         control.checkCancelled()
         val descriptor = sourceDescriptor(path, maximumBytes, control)
-        if (descriptor.schemaVersion <= 2) {
+        if (
+            descriptor.schemaVersion <= 2 ||
+            (
+                descriptor.schemaVersion == 4 &&
+                    descriptor.sourceKind != DraftSourceKind.PREPARED_CRX
+            )
+        ) {
             try {
                 AnalysisInputMaterializer.preflightArchiveRange(
                     path = path,
@@ -151,9 +157,15 @@ internal object StrictDraftPathProbe {
         }
         val inspected = inspect(path, maximumBytes, control)
         control.checkCancelled()
-        if (inspected.decoded.draft.schemaVersion == 3) {
+        if (
+            inspected.decoded.draft.schemaVersion == 3 ||
+            (
+                inspected.decoded.draft.schemaVersion == 4 &&
+                    inspected.sourceKind == DraftSourceKind.PREPARED_CRX
+                )
+        ) {
             val proof = requireNotNull(inspected.sourceProof) {
-                "schema v3 prepared CRX proof가 없습니다."
+                "prepared CRX proof가 없습니다."
             }
             return ControlledSixDraft.Prepared(
                 VerifiedPreparedSixDraft(
@@ -344,6 +356,7 @@ internal object StrictDraftPathProbe {
                 sourceOffset = sourceEntry.dataOffset,
                 sourceLength = sourceEntry.uncompressedSize,
                 sourceProof = sourceProof,
+                sourceKind = sourceKind,
             )
         }
     }
@@ -538,13 +551,19 @@ internal object StrictDraftPathProbe {
         val draft = SixDraftJson.decodeDraft(
             decodeMetadata(channel, draftEntry, control),
         )
-        val kind = if (source.name == DraftSourceKind.ZIP.entryName) {
+        val sourceKind = when (source.name) {
+            DraftSourceKind.ZIP.entryName -> DraftSourceKind.ZIP
+            DraftSourceKind.PREPARED_CRX.entryName -> DraftSourceKind.PREPARED_CRX
+            else -> DraftSourceKind.CRX
+        }
+        val kind = if (sourceKind == DraftSourceKind.ZIP) {
             AnalysisArchiveKind.ZIP
         } else {
             AnalysisArchiveKind.CRX3
         }
         SourceDescriptor(
             schemaVersion = draft.schemaVersion,
+            sourceKind = sourceKind,
             archiveKind = kind,
             sourceOffset = source.dataOffset,
             sourceLength = source.uncompressedSize,
@@ -572,6 +591,7 @@ internal object StrictDraftPathProbe {
 
     private data class SourceDescriptor(
         val schemaVersion: Int,
+        val sourceKind: DraftSourceKind,
         val archiveKind: AnalysisArchiveKind,
         val sourceOffset: Long,
         val sourceLength: Long,
@@ -588,6 +608,7 @@ internal object StrictDraftPathProbe {
         val sourceOffset: Long,
         val sourceLength: Long,
         val sourceProof: VerifiedCrx3?,
+        val sourceKind: DraftSourceKind,
     )
 }
 

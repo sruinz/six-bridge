@@ -147,6 +147,12 @@ internal object ConversionPlanProof {
         selectedAdapters: List<AdapterDecision>,
     ): String = digestInternal(report, selectedAdapters, null)
 
+    fun digestDecisions(
+        report: CompatibilityReport,
+        selectedAdapters: List<AdapterDecision>,
+        forcedCompatibility: ForcedCompatibilityProvenance,
+    ): String = digestInternal(report, selectedAdapters, forcedCompatibility)
+
     fun digest(
         report: CompatibilityReport,
         selectedAdapters: List<SelectedAdapter>,

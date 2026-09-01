@@ -3,12 +3,16 @@ package dev.sixbridge.core.draft
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.core.bundle.toContractV4
+import dev.sixbridge.core.bundle.toContractV6
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.conversion.PublicationGuard
 import dev.sixbridge.core.conversion.SecureBuildPublisher
 import dev.sixbridge.core.conversion.WorkspaceAccessState
 import dev.sixbridge.core.conversion.WorkspacePermissionPolicy
 import dev.sixbridge.core.conversion.deepImmutableCopy
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -277,6 +281,15 @@ class SixDraftPayload private constructor(
                         ),
                     ).toByteArray(UTF_8),
                 )
+                4 -> DraftSignature.sha256(
+                    BundleJson.encodeCompatibility(
+                        after.toContractV6(
+                            originalSourceSha256 = input.originalSourceSha256,
+                            planSha256 = plan.planSha256,
+                            forcedCompatibility = plan.forcedCompatibility,
+                        ),
+                    ).toByteArray(UTF_8),
+                )
                 else -> error("지원하지 않는 draft schemaVersion입니다.")
             }
             return DraftExpected(
@@ -323,6 +336,33 @@ class SixDraftPayload private constructor(
                 before,
                 after,
             )
+            4 -> {
+                require(plan.schemaVersion == 2 && plan.forcedCompatibility != null) {
+                    "schema v4에는 강제 승인이 포함된 plan schema v2가 필요합니다."
+                }
+                if (sourceKind == DraftSourceKind.PREPARED_CRX) {
+                    validateV3Semantics(
+                        draft,
+                        input,
+                        sourceKind,
+                        sourceEvidence,
+                        plan,
+                        before,
+                        after,
+                    )
+                } else {
+                    validateV2Semantics(
+                        draft,
+                        input,
+                        sourceKind,
+                        sourceEvidence,
+                        plan,
+                        before,
+                        after,
+                    )
+                }
+                requireForcedSemantics(plan, before, after)
+            }
             else -> error("지원하지 않는 draft schemaVersion입니다.")
         }
 
@@ -337,6 +377,9 @@ class SixDraftPayload private constructor(
         ) {
             before.validate()
             after.validate()
+            require(plan.schemaVersion == 1 && plan.forcedCompatibility == null) {
+                "schema v1은 conversion plan schema v1이 필요합니다."
+            }
             require(draft.sourceIdentity == input.sourceIdentity) {
                 "draft와 input sourceIdentity가 일치하지 않습니다."
             }
@@ -455,6 +498,16 @@ class SixDraftPayload private constructor(
         ) {
             before.validate()
             after.validate()
+            require(
+                (draft.schemaVersion == 2 &&
+                    plan.schemaVersion == 1 &&
+                    plan.forcedCompatibility == null) ||
+                    (draft.schemaVersion == 4 &&
+                        plan.schemaVersion == 2 &&
+                        plan.forcedCompatibility != null),
+            ) {
+                "portable draft와 conversion plan schema가 일치하지 않습니다."
+            }
             require(draft.sourceIdentity == input.sourceIdentity) {
                 "draft와 input sourceIdentity가 일치하지 않습니다."
             }
@@ -496,11 +549,18 @@ class SixDraftPayload private constructor(
                 }
             }
             require(
-                plan.planSha256 ==
+                plan.planSha256 == if (plan.forcedCompatibility == null) {
                     dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
                         before,
                         selectedDecisions,
-                    ),
+                    )
+                } else {
+                    dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
+                        before,
+                        selectedDecisions,
+                        plan.forcedCompatibility,
+                    )
+                },
             ) {
                 "변환 계획 proof가 보고서와 일치하지 않습니다."
             }
@@ -611,6 +671,16 @@ class SixDraftPayload private constructor(
         ) {
             before.validate()
             after.validate()
+            require(
+                (draft.schemaVersion == 3 &&
+                    plan.schemaVersion == 1 &&
+                    plan.forcedCompatibility == null) ||
+                    (draft.schemaVersion == 4 &&
+                        plan.schemaVersion == 2 &&
+                        plan.forcedCompatibility != null),
+            ) {
+                "prepared draft와 conversion plan schema가 일치하지 않습니다."
+            }
             require(sourceKind == DraftSourceKind.PREPARED_CRX) {
                 "schema v3에는 prepared.crx가 필요합니다."
             }
@@ -655,11 +725,18 @@ class SixDraftPayload private constructor(
                 }
             }
             require(
-                plan.planSha256 ==
+                plan.planSha256 == if (plan.forcedCompatibility == null) {
                     dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
                         before,
                         selectedDecisions,
-                    ),
+                    )
+                } else {
+                    dev.sixbridge.core.conversion.ConversionPlanProof.digestDecisions(
+                        before,
+                        selectedDecisions,
+                        plan.forcedCompatibility,
+                    )
+                },
             ) {
                 "schema v3 변환 계획 proof가 일치하지 않습니다."
             }
@@ -685,6 +762,24 @@ class SixDraftPayload private constructor(
             }
             require(after.conversionState == expectedState) {
                 "schema v3 conversionState가 계획과 다릅니다."
+            }
+        }
+
+        private fun requireForcedSemantics(
+            plan: DraftConversionPlan,
+            before: dev.sixbridge.core.compat.CompatibilityReport,
+            after: dev.sixbridge.core.compat.CompatibilityReport,
+        ) {
+            val forced = requireNotNull(plan.forcedCompatibility)
+            val authorization = when (forced.scope) {
+                CompatibilityForceScope.UNKNOWN_API_USAGE ->
+                    ConversionAuthorization.forceUnknownApiUsage()
+            }
+            require(
+                ForceCompatibilityPolicy.requireProvenance(before, authorization) == forced &&
+                    ForceCompatibilityPolicy.requireProvenance(after, authorization) == forced,
+            ) {
+                "schema v4 강제 provenance가 서명된 report와 일치하지 않습니다."
             }
         }
 
