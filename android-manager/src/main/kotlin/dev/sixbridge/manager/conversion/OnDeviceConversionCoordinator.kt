@@ -1,5 +1,7 @@
 package dev.sixbridge.manager.conversion
 
+import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -337,6 +339,19 @@ internal class OnDeviceConversionCoordinator(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
             }
+            if (!bound.matchesAuthorizedCompatibility(
+                    analysis.report,
+                    authorization,
+                    forcedCompatibility,
+                    prepared.originalSourceSha256,
+                    prepared.planSha256,
+                )
+            ) {
+                releaseFailedAttempt(token)
+                return@withLock ConversionBuildResult.Failure(
+                    ConversionFailureCode.TRANSFORM_MISMATCH,
+                )
+            }
             val reservation = identities.reserve(
                 resolved,
                 prepared.descriptorName,
@@ -569,6 +584,39 @@ internal class OnDeviceConversionCoordinator(
         CompatibilityStatus.UNKNOWN -> ConversionFailureCode.UNKNOWN
         else -> null
     }
+
+    private fun BoundConversionSnapshot.matchesAuthorizedCompatibility(
+        analyzed: dev.sixbridge.core.compat.CompatibilityReport,
+        authorization: ConversionAuthorization,
+        expectedForced: dev.sixbridge.core.conversion.ForcedCompatibilityProvenance?,
+        expectedOriginalSourceSha256: String,
+        expectedPlanSha256: String,
+    ): Boolean = runCatching {
+        BundleJson.validateCompatibility(compatibility)
+        require(compatibility.schemaVersion == 6)
+        val bound = SixBundle.toCoreCompatibility(compatibility)
+        require(bound.status == analyzed.status)
+        require(bound.manifestVersion == analyzed.manifestVersion)
+        require(bound.extensionName == analyzed.extensionName)
+        require(bound.extensionVersion == analyzed.extensionVersion)
+        require(bound.declaredPermissions == analyzed.declaredPermissions)
+        require(bound.usedApis == analyzed.usedApis)
+        require(bound.issues == analyzed.issues)
+        require(bound.verifiedApis == analyzed.verifiedApis)
+        require(bound.unverifiedApis == analyzed.unverifiedApis)
+        require(bound.unavailableApis == analyzed.unavailableApis)
+        require(bound.browserProfileSha256 == analyzed.browserProfileSha256)
+        require(compatibility.originalSourceSha256 == expectedOriginalSourceSha256)
+        require(compatibility.planSha256 == expectedPlanSha256)
+        require(
+            ForceCompatibilityPolicy.requireProvenance(bound, authorization) ==
+                expectedForced,
+        )
+        require(
+            SixBundle.toCoreForcedCompatibility(compatibility.forcedCompatibility) ==
+                expectedForced,
+        )
+    }.isSuccess
 
     private fun Throwable.toInputFailureCode(): ConversionFailureCode = when (this) {
         is OnDeviceInputException -> when (code) {

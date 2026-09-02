@@ -7,6 +7,7 @@ import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
@@ -100,6 +101,75 @@ class OnDeviceConversionCoordinatorTest {
             fixture.runtimeAuthorizations,
         )
     }
+
+    @Test
+    fun `forced bind가 schema v4 force null을 반환하면 output side effect 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+            boundSchemaVersion = 4
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.TRANSFORM_MISMATCH, failure.code)
+        assertTrue(
+            fixture.events.none {
+                it in setOf("reserve", "building", "package", "publish")
+            },
+        )
+    }
+
+    @Test
+    fun `forced bind의 source issue unverified report drift는 reserve 전에 거부한다`() =
+        runTest {
+            listOf<(Fixture) -> Unit>(
+                { it.boundOriginalSourceSha256 = "6".repeat(64) },
+                { it.boundIssueMessage = "changed dynamic API" },
+                { it.boundUnverifiedApis = setOf("runtime.dynamic") },
+            ).forEach { drift ->
+                val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+                    compatibilityStatus = CompatibilityStatus.UNKNOWN
+                    eligibleUnknown = true
+                    drift(this)
+                }
+                val coordinator = fixture.coordinator()
+                val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+                    coordinator.begin(
+                        OnDeviceInputRequest.ChromeStore("https://example.invalid"),
+                    ),
+                )
+
+                val failure = assertIs<ConversionBuildResult.Failure>(
+                    coordinator.build(
+                        analysis.token,
+                        analysis.requiredApprovals,
+                        partialConfirmed = false,
+                        identitySelection = null,
+                        authorization = ConversionAuthorization.forceUnknownApiUsage(),
+                    ),
+                )
+
+                assertEquals(ConversionFailureCode.TRANSFORM_MISMATCH, failure.code)
+                assertTrue(
+                    fixture.events.none {
+                        it in setOf("reserve", "building", "package", "publish")
+                    },
+                )
+            }
+        }
 
     @Test
     fun `불필요한 typed 승인은 output side effect 전에 거부한다`() = runTest {
@@ -1598,6 +1668,10 @@ class OnDeviceConversionCoordinatorTest {
         var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
         var eligibleUnknown = false
+        var boundSchemaVersion = 6
+        var boundOriginalSourceSha256 = "4".repeat(64)
+        var boundIssueMessage: String? = null
+        var boundUnverifiedApis: Set<String>? = null
         var preparedIssueMessage: String? = null
         val runtimeAuthorizations = mutableListOf<ConversionAuthorization>()
         var analysisBlockingEntered: CountDownLatch? = null
@@ -1832,7 +1906,7 @@ class OnDeviceConversionCoordinatorTest {
                     identity: OnDevicePackageIdentity,
                 ): BoundConversionSnapshot {
                     events += "bind"
-                    return bound(profile)
+                    return bound(profile, ConversionAuthorization.NONE)
                 }
 
                 override fun bind(
@@ -1843,7 +1917,7 @@ class OnDeviceConversionCoordinatorTest {
                 ): BoundConversionSnapshot {
                     runtimeAuthorizations += authorization
                     events += "bind"
-                    return bound(profile)
+                    return bound(profile, authorization)
                 }
             },
             identities = object : ConversionIdentityPort {
@@ -2058,10 +2132,20 @@ class OnDeviceConversionCoordinatorTest {
         )
         }
 
-        private fun bound(profile: BrowserProfile) = BoundConversionSnapshot(
+        private fun bound(
+            profile: BrowserProfile,
+            authorization: ConversionAuthorization,
+        ) = BoundConversionSnapshot(
             sourceZip = "zip".encodeToByteArray(),
             passthroughCrx = "crx".encodeToByteArray(),
-            compatibility = contractReport(profile),
+            compatibility = contractReport(
+                report(profile),
+                authorization,
+                boundSchemaVersion,
+                boundOriginalSourceSha256,
+                boundIssueMessage,
+                boundUnverifiedApis,
+            ),
             extensionId = EXTENSION_ID,
             sourceKind = "CRX3",
         )
@@ -2147,27 +2231,38 @@ class OnDeviceConversionCoordinatorTest {
             browserProfileSha256 = profile.canonicalSha256(),
         )
 
-        private fun contractReport(profile: BrowserProfile) = ContractCompatibilityReport(
-            schemaVersion = 4,
-            status = ContractCompatibilityStatus.PARTIAL,
-            manifestVersion = 3,
-            extensionName = "Example",
-            extensionVersion = "1.0",
-            manifestKeyPresent = false,
-            manifestKeyExtensionId = null,
-            declaredPermissions = emptyList(),
-            usedApis = emptyList(),
-            unsupportedApis = emptyList(),
-            issues = emptyList(),
-            conversionState = "passthrough",
-            adapterDecisions = emptyList(),
-            originalExtensionId = EXTENSION_ID,
-            convertedExtensionId = EXTENSION_ID,
-            sourceSha256 = "4".repeat(64),
-            browserProfileSha256 = profile.canonicalSha256(),
-            originalSourceSha256 = "4".repeat(64),
-            planSha256 = "5".repeat(64),
-        )
+        private fun contractReport(
+            analyzed: CompatibilityReport,
+            authorization: ConversionAuthorization,
+            schemaVersion: Int,
+            originalSourceSha256: String,
+            issueMessage: String?,
+            unverifiedApis: Set<String>?,
+        ): ContractCompatibilityReport {
+            val report = analyzed.copy(
+                originalExtensionId = EXTENSION_ID,
+                convertedExtensionId = EXTENSION_ID,
+                issues = issueMessage?.let { message ->
+                    analyzed.issues.map { it.copy(message = message) }
+                } ?: analyzed.issues,
+                unverifiedApis = unverifiedApis ?: analyzed.unverifiedApis,
+            )
+            val forced = ForceCompatibilityPolicy.requireProvenance(report, authorization)
+            val contract = SixBundle.toContractV6(
+                report,
+                originalSourceSha256,
+                "5".repeat(64),
+                forced,
+            )
+            return if (schemaVersion == 6) {
+                contract
+            } else {
+                contract.copy(
+                    schemaVersion = schemaVersion,
+                    forcedCompatibility = null,
+                )
+            }
+        }
 
         private fun packageIdentity() = OnDevicePackageIdentity(
             extensionId = EXTENSION_ID,

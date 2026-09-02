@@ -1,6 +1,7 @@
 package dev.sixbridge.manager.conversion
 
 import dev.sixbridge.core.compat.AnalysisControl
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -1922,12 +1923,30 @@ class ConversionWorkStoreTest {
             ): PreparedConversionSnapshot =
                 error("discard test에서 prepare는 사용하지 않습니다.")
 
+            override fun prepare(
+                input: File,
+                kind: OnDeviceInputKind,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+                approvedAdapterIds: Set<String>,
+                control: AnalysisControl,
+                authorization: ConversionAuthorization,
+            ): PreparedConversionSnapshot =
+                error("discard test에서 typed prepare는 사용하지 않습니다.")
+
             override fun bind(
                 prepared: PreparedConversionSnapshot,
                 profile: dev.sixbridge.core.profile.BrowserProfile,
                 identity: dev.sixbridge.manager.packager.OnDevicePackageIdentity,
             ): BoundConversionSnapshot =
                 error("discard test에서 bind는 사용하지 않습니다.")
+
+            override fun bind(
+                prepared: PreparedConversionSnapshot,
+                profile: dev.sixbridge.core.profile.BrowserProfile,
+                identity: dev.sixbridge.manager.packager.OnDevicePackageIdentity,
+                authorization: ConversionAuthorization,
+            ): BoundConversionSnapshot =
+                error("discard test에서 typed bind는 사용하지 않습니다.")
         },
         identities = object : ConversionIdentityPort {
             override suspend fun existingTargets(

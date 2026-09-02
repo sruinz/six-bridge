@@ -3656,7 +3656,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `generated forced 결과는 자동 설치하지 않고 새 설치 확인을 요구한다`() =
+    fun `generated forced 결과는 실제 Review action에서 새 확인 후 한 번만 설치한다`() =
         runTest(dispatcher.scheduler) {
             val forcedReview = forcedReview()
             val repository = FakeManagerRepository().apply {
@@ -3677,6 +3677,7 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
             advanceUntilIdle()
 
             assertEquals(ManagerRoute.Review(forcedReview.token), viewModel.state.value.route)
@@ -3686,7 +3687,7 @@ class ManagerViewModelTest {
             assertFalse(ready.installEnabled)
 
             viewModel.accept(ManagerAction.ConfirmForcedInstall)
-            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
             advanceUntilIdle()
             assertEquals(1, repository.installRequests)
             assertTrue(repository.lastForceCompatibilityConfirmed)
@@ -3695,6 +3696,41 @@ class ManagerViewModelTest {
                     viewModel.state.value.importState,
                 ).forceCompatibilityConfirmed,
             )
+            viewModel.accept(ManagerAction.PrepareReviewedInstall)
+            advanceUntilIdle()
+            assertEquals(1, repository.installRequests)
+        }
+
+    @Test
+    fun `profile 또는 report drift 실패는 stale 강제 분석을 복원해 두 번째 build하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            listOf(
+                ConversionFailureCode.PROFILE_CHANGED,
+                ConversionFailureCode.TRANSFORM_MISMATCH,
+            ).forEach { failureCode ->
+                val repository = FakeManagerRepository().apply {
+                    conversionBeginResult = forcedConversionAnalysis()
+                    conversionBuildResult = ConversionBuildResult.Failure(failureCode)
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.OpenConversionInput)
+                viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+                viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.ConfirmConversionForce)
+                viewModel.accept(ManagerAction.BuildConversion)
+                advanceUntilIdle()
+
+                val failed = assertIs<ConversionUiState.Failed>(
+                    viewModel.state.value.conversionState,
+                )
+                assertEquals(failureCode, failed.code)
+                viewModel.accept(ManagerAction.ConfirmConversionForce)
+                viewModel.accept(ManagerAction.BuildConversion)
+                advanceUntilIdle()
+                assertEquals(1, repository.conversionBuildRequests.size)
+            }
         }
 
     @Test

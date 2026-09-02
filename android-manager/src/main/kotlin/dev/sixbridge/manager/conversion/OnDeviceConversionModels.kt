@@ -292,13 +292,7 @@ internal interface ConversionRuntimePort {
         approvedAdapterIds: Set<String>,
         control: AnalysisControl,
         authorization: ConversionAuthorization,
-    ): PreparedConversionSnapshot = prepare(
-        input,
-        kind,
-        profile,
-        approvedAdapterIds,
-        control,
-    )
+    ): PreparedConversionSnapshot
 
     fun bind(
         prepared: PreparedConversionSnapshot,
@@ -311,7 +305,7 @@ internal interface ConversionRuntimePort {
         profile: BrowserProfile,
         identity: OnDevicePackageIdentity,
         authorization: ConversionAuthorization,
-    ): BoundConversionSnapshot = bind(prepared, profile, identity)
+    ): BoundConversionSnapshot
 }
 
 internal interface ConversionIdentityPort {

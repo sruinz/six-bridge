@@ -816,6 +816,21 @@ class ManagerViewModel(
                             generated = result.generated,
                             failureCode = result.code,
                         )
+                    } else if (result.code in setOf(
+                            ConversionFailureCode.PROFILE_CHANGED,
+                            ConversionFailureCode.TRANSFORM_MISMATCH,
+                        )
+                    ) {
+                        mutableState.update {
+                            it.copy(
+                                route = ManagerRoute.ConversionAnalysis(ready.token),
+                                conversionState = ConversionUiState.Failed(
+                                    ready.token,
+                                    result.code,
+                                ),
+                                message = conversionFailureMessage(result.code),
+                            )
+                        }
                     } else {
                         mutableState.update {
                             it.copy(
@@ -1947,7 +1962,6 @@ class ManagerViewModel(
     private fun prepareReviewedInstall() {
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
         if (mutableState.value.route != ManagerRoute.Review(ready.review.token)) return
-        if (generatedInstallOwnerToken != null) return
         installReviewedBundle()
     }
 
@@ -5059,7 +5073,7 @@ internal fun conversionFailureMessage(code: ConversionFailureCode): UserMessage 
     )
     ConversionFailureCode.PROFILE_CHANGED -> UserMessage(
         UserMessageKind.CONVERSION_FAILURE,
-        "삼성 인터넷 프로필이 달라져 분석을 새로 실행했습니다. 승인 내용을 다시 검토해 주세요.",
+        "삼성 인터넷 프로필이 달라져 현재 승인을 폐기했습니다. 취소 후 다시 분석해 주세요.",
         RecoveryAction.NONE,
     )
     ConversionFailureCode.BLOCKED -> UserMessage(
