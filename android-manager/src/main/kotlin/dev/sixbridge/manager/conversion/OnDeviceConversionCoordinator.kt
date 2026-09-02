@@ -229,13 +229,6 @@ internal class OnDeviceConversionCoordinator(
         }
         val profileSha256 = profile.canonicalSha256()
         if (job.profileSha256 != profileSha256) {
-            runCatching {
-                work.refreshAwaitingApproval(
-                    token,
-                    requireNotNull(job.profileSha256),
-                    profileSha256,
-                )
-            }
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.PROFILE_CHANGED)
         }
         val forcedCompatibility = try {

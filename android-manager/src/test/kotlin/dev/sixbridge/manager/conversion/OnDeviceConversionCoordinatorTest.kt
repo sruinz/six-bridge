@@ -151,6 +151,8 @@ class OnDeviceConversionCoordinatorTest {
                         OnDeviceInputRequest.ChromeStore("https://example.invalid"),
                     ),
                 )
+                val originalJob = fixture.jobSnapshot()
+                fixture.events.clear()
 
                 val failure = assertIs<ConversionBuildResult.Failure>(
                     coordinator.build(
@@ -163,9 +165,15 @@ class OnDeviceConversionCoordinatorTest {
                 )
 
                 assertEquals(ConversionFailureCode.TRANSFORM_MISMATCH, failure.code)
+                assertEquals(originalJob, fixture.jobSnapshot())
                 assertTrue(
                     fixture.events.none {
-                        it in setOf("reserve", "building", "package", "publish")
+                        it in setOf(
+                            "refresh-awaiting",
+                            "building",
+                            "bundle-ready-job-commit",
+                            "reset-awaiting",
+                        )
                     },
                 )
             }
@@ -557,26 +565,62 @@ class OnDeviceConversionCoordinatorTest {
     }
 
     @Test
-    fun `profile 변경은 새 분석을 저장하고 재승인을 요구한다`() = runTest {
-        val fixture = Fixture(temporaryFolder, mutableListOf())
+    fun `profile 변경 build는 job을 바꾸지 않고 같은 stale 승인을 계속 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+        }
         val coordinator = fixture.coordinator()
         val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
             coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
         )
+        val originalJob = fixture.jobSnapshot()
+        fixture.events.clear()
         fixture.currentProfile = profile(versionCode = 2)
 
-        val changed = assertIs<ConversionBuildResult.Failure>(
-            coordinator.build(
-                analysis.token,
-                analysis.requiredApprovals,
-                partialConfirmed = true,
-                identitySelection = null,
+        val first = coordinator.build(
+            analysis.token,
+            analysis.requiredApprovals,
+            partialConfirmed = false,
+            identitySelection = null,
+            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+        )
+        val afterFirst = fixture.jobSnapshot()
+        val second = coordinator.build(
+            analysis.token,
+            analysis.requiredApprovals,
+            partialConfirmed = false,
+            identitySelection = null,
+            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+        )
+        val afterSecond = fixture.jobSnapshot()
+
+        assertEquals(
+            listOf(
+                originalJob,
+                originalJob,
+                ConversionFailureCode.PROFILE_CHANGED,
+                ConversionFailureCode.PROFILE_CHANGED,
+                emptyList<String>(),
+            ),
+            listOf(
+                afterFirst,
+                afterSecond,
+                (first as? ConversionBuildResult.Failure)?.code,
+                (second as? ConversionBuildResult.Failure)?.code,
+                fixture.events.filter {
+                    it in setOf(
+                        "refresh-awaiting",
+                        "reserve",
+                        "building",
+                        "bundle-ready-job-commit",
+                        "package",
+                        "publish",
+                        "import",
+                    )
+                },
             ),
         )
-
-        assertEquals(ConversionFailureCode.PROFILE_CHANGED, changed.code)
-        assertTrue("refresh-awaiting" in fixture.events)
-        assertTrue("reserve" !in fixture.events)
     }
 
     @Test
@@ -2092,6 +2136,8 @@ class OnDeviceConversionCoordinatorTest {
             profileSha256 = storedProfile,
             bundleSha256 = null,
         )
+
+        fun jobSnapshot(): RestoredConversionJob = job()
 
         private fun analysis(profile: BrowserProfile) = ConversionAnalysisSnapshot(
             report = report(profile),
