@@ -89,11 +89,11 @@ class SixBridgeCommandTest {
     }
 
     @Test
-    fun `version option reports the v0_1_1 development version`() {
+    fun `version option reports the v0_1_2 development version`() {
         val result = execute("--version")
 
         assertEquals(0, result.exitCode, result.error)
-        assertEquals("SIX Bridge 0.1.1-SNAPSHOT\n", result.output)
+        assertEquals("SIX Bridge 0.1.2-SNAPSHOT\n", result.output)
     }
 
     @Test

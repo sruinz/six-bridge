@@ -4,7 +4,7 @@ set -euo pipefail
 readonly ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 readonly REQUIRED_SERIAL='192.0.2.10:44085'
 readonly MAX_DRAFT_SIZE=268435456
-readonly EXPECTED_MANAGER_VERSION_CODE=2
+readonly EXPECTED_MANAGER_VERSION_CODE=3
 readonly CLI="${SIXBRIDGE_CLI:-${ROOT_DIR}/cli/build/install/sixbridge/bin/sixbridge}"
 readonly EVIDENCE_ROOT="${SIXBRIDGE_EVIDENCE_ROOT:-${ROOT_DIR}/.local/evidence}"
 
@@ -181,7 +181,7 @@ case "$1" in
       if [ "$2" = path ] && [ "$3" = --user ] && [ "$4" = 0 ] && [ "$5" = dev.sixbridge.manager ]; then
         printf 'package:/data/user/0/dev.sixbridge.manager\n'
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = --user ] && [ "$5" = 0 ] && [ "$6" = --show-versioncode ] && [ "$7" = dev.sixbridge.manager ]; then
-        printf 'package:dev.sixbridge.manager versionCode:%s\n' "${SIXBRIDGE_TEST_MANAGER_VERSION:-2}"
+        printf 'package:dev.sixbridge.manager versionCode:%s\n' "${SIXBRIDGE_TEST_MANAGER_VERSION:-3}"
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = --user ] && [ "$5" = 0 ] && [ "$6" = "$SIXBRIDGE_TEST_EXPECTED_PACKAGE" ]; then
         [ "${SIXBRIDGE_TEST_MISSING_WRAPPER:-0}" = 1 ] || printf 'package:%s\n' "$SIXBRIDGE_TEST_EXPECTED_PACKAGE"
       elif [ "$2" = list ] && [ "$3" = packages ] && [ "$4" = -U ] && [ "$5" = --user ] && [ "$6" = 0 ] && [ "$7" = dev.sixbridge.manager ]; then

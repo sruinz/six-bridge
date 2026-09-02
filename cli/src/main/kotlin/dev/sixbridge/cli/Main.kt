@@ -63,7 +63,7 @@ fun createCommandLine(
 @Command(
     name = "sixbridge",
     mixinStandardHelpOptions = true,
-    version = ["SIX Bridge 0.1.1-SNAPSHOT"],
+    version = ["SIX Bridge 0.1.2-SNAPSHOT"],
     description = ["Chrome/Edge 확장을 삼성 인터넷 개발 확장 래퍼로 변환합니다."],
     subcommands = [
         ProfileCommand::class,

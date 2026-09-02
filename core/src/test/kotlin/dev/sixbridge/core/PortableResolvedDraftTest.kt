@@ -76,7 +76,7 @@ class PortableResolvedDraftTest {
                 desktop.payload.draft.sourceIdentity,
             )
             assertEquals("0.1.0-SNAPSHOT", androidAsset.payload.draft.coreVersion)
-            assertEquals("0.1.1-SNAPSHOT", desktop.payload.draft.coreVersion)
+            assertEquals("0.1.2-SNAPSHOT", desktop.payload.draft.coreVersion)
             assertContentEquals(androidAsset.payload.inputJson, desktop.payload.inputJson)
             assertContentEquals(
                 androidAsset.payload.conversionPlanJson,
@@ -194,7 +194,7 @@ class PortableResolvedDraftTest {
                 verified.payload.draft.sourceIdentity,
             )
             assertEquals("0.1.0-SNAPSHOT", androidAsset.payload.draft.coreVersion)
-            assertEquals("0.1.1-SNAPSHOT", verified.payload.draft.coreVersion)
+            assertEquals("0.1.2-SNAPSHOT", verified.payload.draft.coreVersion)
             assertContentEquals(androidAsset.payload.inputJson, verified.payload.inputJson)
             assertContentEquals(
                 androidAsset.payload.conversionPlanJson,
