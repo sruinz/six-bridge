@@ -18,6 +18,10 @@ macOS native package version `1.0.2`를 기록합니다. 변경 내용은
 - `RELEASE-NOTES-KO.md`
 
 소스와 배포 스크립트는 [Apache-2.0](../LICENSE)으로 제공합니다.
+공개 게시 대상은 [GitHub `sruinz/six-bridge`](https://github.com/sruinz/six-bridge)
+저장소만입니다. 게시 스크립트는 `github` remote의 fetch·push URL이
+정확히 `https://github.com/sruinz/six-bridge.git`인지 검증하며, 로컬 Git
+서버용 `origin`은 공개 release 게시 대상으로 사용하지 않습니다.
 
 ## Android 관리자 APK
 
@@ -116,8 +120,8 @@ bash scripts/android-manager-distribution.test.sh
   내보내기, 삼성 인터넷 Add-ons 활성화·실행을 확인합니다.
 - macOS에서 DMG mount·복사와 미서명·미공증 Gatekeeper 경고가 이
   문서의 안내와 일치하는지 확인합니다.
-- 원격 `main` push, annotated `v0.1.2` tag, Git 서버 Release 첨부는
-  별도의 명시적 승인 후에만 진행합니다.
+- 공개 GitHub의 `main` push, annotated `v0.1.2` tag, GitHub Release
+  첨부는 별도의 명시적 승인 후에만 진행합니다.
 
 자동 검증 통과를 key 백업, 실기기 작동, Gatekeeper 확인 또는 원격
 게시 승인의 대체로 간주하지 마세요.

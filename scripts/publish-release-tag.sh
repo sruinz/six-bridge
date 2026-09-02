@@ -105,6 +105,8 @@ release_bind_project_root "${ROOT_DIR}" || exit 1
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
 readonly RELEASE_DIRECTORY="${RELEASE_CONTAINER}/v0.1.2"
 readonly RELEASE_TAG='v0.1.2'
+readonly RELEASE_REMOTE_NAME='github'
+readonly RELEASE_REMOTE_URL='https://github.com/sruinz/six-bridge.git'
 SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER=''
 SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=''
 SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=''
@@ -335,8 +337,49 @@ release_current_branch() {
     }
 }
 
-release_clean_main_at_origin() {
-    local status head_commit origin_commit
+release_require_public_github_remote() {
+    local raw_fetch_url raw_push_url effective_fetch_url effective_push_url status
+    if ! raw_fetch_url=$(release_git config --get-all \
+        "remote.${RELEASE_REMOTE_NAME}.url" 2>&1); then
+        release_fail '공개 GitHub remote를 읽지 못했습니다.'
+        return 1
+    fi
+    [[ "${raw_fetch_url}" = "${RELEASE_REMOTE_URL}" ]] || {
+        release_fail '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.'
+        return 1
+    }
+    if raw_push_url=$(release_git config --get-all \
+        "remote.${RELEASE_REMOTE_NAME}.pushurl" 2>&1); then
+        [[ "${raw_push_url}" = "${RELEASE_REMOTE_URL}" ]] || {
+            release_fail '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.'
+            return 1
+        }
+    else
+        status=$?
+        [[ "${status}" = 1 ]] || {
+            release_fail '공개 GitHub remote를 읽지 못했습니다.'
+            return 1
+        }
+    fi
+    if ! effective_fetch_url=$(release_git remote get-url --all \
+        "${RELEASE_REMOTE_NAME}" 2>&1); then
+        release_fail '공개 GitHub remote를 읽지 못했습니다.'
+        return 1
+    fi
+    if ! effective_push_url=$(release_git remote get-url --push --all \
+        "${RELEASE_REMOTE_NAME}" 2>&1); then
+        release_fail '공개 GitHub remote를 읽지 못했습니다.'
+        return 1
+    fi
+    [[ "${effective_fetch_url}" = "${RELEASE_REMOTE_URL}" &&
+       "${effective_push_url}" = "${RELEASE_REMOTE_URL}" ]] || {
+        release_fail '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.'
+        return 1
+    }
+}
+
+release_clean_main_at_public_github() {
+    local status head_commit github_commit
     release_current_branch || return 1
     status=$(release_git status --porcelain=v1 --untracked-files=all 2>&1) || {
         release_fail 'git worktree 상태를 읽지 못했습니다.'
@@ -346,17 +389,19 @@ release_clean_main_at_origin() {
         release_fail 'worktree가 깨끗하지 않습니다.'
         return 1
     }
-    if ! release_git fetch --quiet origin main --tags; then
-        release_fail 'origin main/tag 정보를 가져오지 못했습니다.'
+    release_require_public_github_remote || return 1
+    if ! release_git fetch --quiet "${RELEASE_REMOTE_URL}" \
+        'refs/heads/main:refs/remotes/github/main' --tags; then
+        release_fail '공개 GitHub main/tag 정보를 가져오지 못했습니다.'
         return 1
     fi
     head_commit=$(release_git rev-parse HEAD 2>&1) || return 1
-    origin_commit=$(release_git rev-parse refs/remotes/origin/main 2>&1) || {
-        release_fail 'origin/main commit을 읽지 못했습니다.'
+    github_commit=$(release_git rev-parse refs/remotes/github/main 2>&1) || {
+        release_fail '공개 GitHub main commit을 읽지 못했습니다.'
         return 1
     }
-    [[ "${head_commit}" = "${origin_commit}" ]] || {
-        release_fail 'main과 origin/main commit이 다릅니다.'
+    [[ "${head_commit}" = "${github_commit}" ]] || {
+        release_fail 'main과 공개 GitHub main commit이 다릅니다.'
         return 1
     }
     [[ "${head_commit}" =~ ^[0-9a-f]{40}$ ]] || {
@@ -367,8 +412,16 @@ release_clean_main_at_origin() {
 }
 
 release_require_absent_tag() {
-    ! release_git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1 || {
+    local status
+    if release_git ls-remote --exit-code --tags "${RELEASE_REMOTE_URL}" \
+        "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
         release_fail 'remote tag가 이미 있습니다.'
+        return 1
+    else
+        status=$?
+    fi
+    [[ "${status}" = 2 ]] || {
+        release_fail '공개 GitHub remote tag 정보를 확인하지 못했습니다.'
         return 1
     }
     ! release_git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}" || {
@@ -421,7 +474,7 @@ release_preflight() {
     local head_commit signer
     SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=''
     SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=''
-    head_commit=$(release_clean_main_at_origin) || return 1
+    head_commit=$(release_clean_main_at_public_github) || return 1
     release_require_absent_tag || return 1
     release_require_tagger_identity || return 1
     release_verify_artifacts "${head_commit}" || return 1
@@ -492,12 +545,16 @@ tag_oid=$(release_verify_created_tag "${verified_commit}") || exit 1
 if declare -F release_before_tag_push >/dev/null; then
     release_before_tag_push "${tag_oid}" "${verified_commit}" || exit 1
 fi
-release_git push origin "${tag_oid}:refs/tags/${RELEASE_TAG}" || {
+release_require_public_github_remote || {
+    release_fail '공개 GitHub 게시 전 검증이 실패했습니다. local tag 상태를 확인하세요.'
+    exit 1
+}
+release_git push "${RELEASE_REMOTE_URL}" "${tag_oid}:refs/tags/${RELEASE_TAG}" || {
     release_fail 'tag push에 실패했습니다. local tag 상태를 확인하세요.'
     exit 1
 }
 
-printf 'v0.1.2 annotated tag를 origin에 게시했습니다.\n'
+printf 'v0.1.2 annotated tag를 공개 GitHub에 게시했습니다.\n'
 printf '수동 Releases 화면에서 다음 정확히 다섯 파일을 첨부하세요:\n'
 for file in "${SIXBRIDGE_RELEASE_FILES[@]}"; do
     printf '%s\n' "${file}"
