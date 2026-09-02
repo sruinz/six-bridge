@@ -135,6 +135,14 @@ fun HomeScreen(
                                 ManagerAction.RetryRecovery
                             },
                         )
+                        RecoveryAction.RETRY_INSTALL_APK_CLEANUP ->
+                            message.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.RetryInstallApkCleanup(it))
+                            }
+                        RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP ->
+                            message.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.ConfirmInstallApkCleanup(it))
+                            }
                         RecoveryAction.CHECK_INSTALL_STATUS ->
                             onAction(ManagerAction.ConfirmSystemInstallStatus)
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)

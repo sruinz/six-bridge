@@ -182,6 +182,14 @@ fun ReviewScreen(
                         RecoveryAction.SELECT_ANOTHER_FILE,
                         -> onAddSix()
                         RecoveryAction.RETRY -> onAction(ManagerAction.RetryRecovery)
+                        RecoveryAction.RETRY_INSTALL_APK_CLEANUP ->
+                            currentMessage.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.RetryInstallApkCleanup(it))
+                            }
+                        RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP ->
+                            currentMessage.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.ConfirmInstallApkCleanup(it))
+                            }
                         RecoveryAction.CHECK_INSTALL_STATUS ->
                             onAction(ManagerAction.ConfirmSystemInstallStatus)
                         RecoveryAction.NONE -> onAction(ManagerAction.DismissMessage)

@@ -69,6 +69,14 @@ fun ConversionInputScreen(
                             onAction(ManagerAction.OpenConversionFilePicker)
                         RecoveryAction.RETRY ->
                             onAction(ManagerAction.AnalyzeConversionUrl)
+                        RecoveryAction.RETRY_INSTALL_APK_CLEANUP ->
+                            message.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.RetryInstallApkCleanup(it))
+                            }
+                        RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP ->
+                            message.installApkCleanupReceipt?.let {
+                                onAction(ManagerAction.ConfirmInstallApkCleanup(it))
+                            }
                         else -> onAction(ManagerAction.DismissMessage)
                     }
                 },

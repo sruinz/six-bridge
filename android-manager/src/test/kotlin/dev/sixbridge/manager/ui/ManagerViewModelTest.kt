@@ -4152,7 +4152,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `APK copy cleanup 실패는 owner 폐기 뒤에도 명시한다`() =
+    fun `owner 없는 APK cleanup 실패 action은 receipt 없이 메시지를 만들지 않는다`() =
         runTest(dispatcher.scheduler) {
             val viewModel = ManagerViewModel(FakeManagerRepository(), SavedStateHandle())
             advanceUntilIdle()
@@ -4163,13 +4163,9 @@ class ManagerViewModelTest {
             )
             viewModel.accept(failure)
 
-            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
-            assertTrue(viewModel.state.value.message?.text?.contains("직접 삭제") == true)
-            viewModel.accept(ManagerAction.DismissMessage)
-            viewModel.accept(failure)
             assertNull(viewModel.state.value.message)
             viewModel.accept(failure.copy(launchId = 12))
-            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            assertNull(viewModel.state.value.message)
         }
 
     @Test
@@ -4257,10 +4253,20 @@ class ManagerViewModelTest {
 
             assertEquals(1, copied)
             assertEquals(0, deleted)
-            assertIs<InstallApkDocumentTransactionState.Terminal>(
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
                 viewModel.installApkDocumentTransaction.value,
             )
             assertIs<InstallState.AwaitingManualInstall>(repository.installFlow.value)
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(terminal.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(terminal.key))
+            assertFalse(savedState.contains(ManagerViewModel.INSTALL_APK_TRANSACTION_TOKEN_KEY))
+            assertFalse(savedState.contains(ManagerViewModel.INSTALL_APK_TRANSACTION_OWNER_KEY))
+            assertFalse(savedState.contains(ManagerViewModel.INSTALL_APK_TRANSACTION_LAUNCH_KEY))
+            assertFalse(savedState.contains(ManagerViewModel.INSTALL_APK_TRANSACTION_DESTINATION_KEY))
+            assertFalse(savedState.contains(ManagerViewModel.INSTALL_APK_TRANSACTION_PHASE_KEY))
+            val recreated = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            assertEquals(StartupRecoveryUiState.READY, recreated.state.value.startupRecoveryState)
         }
 
     @Test
@@ -4326,6 +4332,56 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             assertEquals(1, copies)
             assertEquals(0, deletes)
+        }
+
+    @Test
+    fun `runtime APK 저장 cleanup 실패는 exact receipt 경고를 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+                saveInstallApkDocument = { _, _ ->
+                    GeneratedDocumentSaveResult.Failure(cleanupFailed = true)
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+
+            assertTrue(
+                viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/failed"),
+            )
+            assertTrue(
+                viewModel.startInstallApkDocumentTransaction(effect, "content://apk/failed"),
+            )
+            advanceUntilIdle()
+
+            val message = requireNotNull(viewModel.state.value.message)
+            assertEquals(RecoveryAction.RETRY_INSTALL_APK_CLEANUP, message.recoveryAction)
+            assertEquals("content://apk/failed", message.installApkCleanupReceipt?.destination)
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED,
+                assertIs<InstallApkDocumentTransactionState.Terminal>(
+                    viewModel.installApkDocumentTransaction.value,
+                ).phase,
+            )
         }
 
     @Test
@@ -4435,7 +4491,7 @@ class ManagerViewModelTest {
             val viewModel = ManagerViewModel(
                 FakeManagerRepository().apply {
                     restoreResult = ManagerRestoreResult(review = review)
-                    installFlow.value = InstallState.PreparingApkExport(review.token)
+                    installFlow.value = InstallState.Idle
                 },
                 SavedStateHandle(malformed + mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token)),
                 deleteInstallApkDocument = { deletes += 1; true },
@@ -4530,10 +4586,121 @@ class ManagerViewModelTest {
         runTest(dispatcher.scheduler) {
             val review = review(ContractCompatibilityStatus.COMPATIBLE)
             var deletes = 0
+            val savedState = SavedStateHandle(
+                apkTransactionJournal(review.token, "CLEANUP_FAILED") +
+                    mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+            )
             val viewModel = ManagerViewModel(
                 FakeManagerRepository().apply {
                     restoreResult = ManagerRestoreResult(review = review)
                     installFlow.value = InstallState.Idle
+                },
+                savedState,
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            val receipt = requireNotNull(
+                viewModel.state.value.message?.installApkCleanupReceipt,
+            )
+            val ownerGenerationBefore =
+                savedState.get<Long>(ManagerViewModel.DOCUMENT_OWNER_GENERATION_KEY)
+            viewModel.accept(ManagerAction.RetryInstallApkCleanup(receipt))
+            viewModel.accept(ManagerAction.RetryInstallApkCleanup(receipt))
+            advanceUntilIdle()
+            assertEquals(1, deletes)
+            assertEquals(
+                ownerGenerationBefore,
+                savedState.get<Long>(ManagerViewModel.DOCUMENT_OWNER_GENERATION_KEY),
+            )
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
+                assertIs<InstallApkDocumentTransactionState.Terminal>(
+                    viewModel.installApkDocumentTransaction.value,
+                ).phase,
+            )
+        }
+
+    @Test
+    fun `복원 cleanup 재삭제 진행 journal은 자동 삭제 없이 경고로 돌아간다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.Idle
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "CLEANUP_RETRY_IN_FLIGHT") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(
+                RecoveryAction.RETRY_INSTALL_APK_CLEANUP,
+                viewModel.state.value.message?.recoveryAction,
+            )
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED,
+                assertIs<InstallApkDocumentTransactionState.Terminal>(
+                    viewModel.installApkDocumentTransaction.value,
+                ).phase,
+            )
+        }
+
+    @Test
+    fun `APK cleanup 재삭제 실패 뒤 exact 수동 삭제 확인만 receipt를 해소한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.PreparingApkExport(review.token)
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "CLEANUP_FAILED") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; false },
+            )
+            advanceUntilIdle()
+            val receipt = requireNotNull(
+                viewModel.state.value.message?.installApkCleanupReceipt,
+            )
+
+            viewModel.accept(ManagerAction.RetryInstallApkCleanup(receipt))
+            advanceUntilIdle()
+            assertEquals(1, deletes)
+            assertEquals(
+                RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP,
+                viewModel.state.value.message?.recoveryAction,
+            )
+            viewModel.accept(ManagerAction.ConfirmInstallApkCleanup(receipt))
+            assertEquals(1, deletes)
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
+                assertIs<InstallApkDocumentTransactionState.Terminal>(
+                    viewModel.installApkDocumentTransaction.value,
+                ).phase,
+            )
+        }
+
+    @Test
+    fun `stale receipt와 generic Retry는 APK cleanup 파일을 건드리지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.PreparingApkExport(review.token)
                 },
                 SavedStateHandle(
                     apkTransactionJournal(review.token, "CLEANUP_FAILED") +
@@ -4542,9 +4709,25 @@ class ManagerViewModelTest {
                 deleteInstallApkDocument = { deletes += 1; true },
             )
             advanceUntilIdle()
+            val receipt = requireNotNull(
+                viewModel.state.value.message?.installApkCleanupReceipt,
+            )
+
+            viewModel.accept(ManagerAction.RetryRecovery)
+            viewModel.accept(
+                ManagerAction.RetryInstallApkCleanup(
+                    receipt.copy(destination = "content://apk/other"),
+                ),
+            )
+            advanceUntilIdle()
 
             assertEquals(0, deletes)
-            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED,
+                assertIs<InstallApkDocumentTransactionState.Terminal>(
+                    viewModel.installApkDocumentTransaction.value,
+                ).phase,
+            )
         }
 
     @Test

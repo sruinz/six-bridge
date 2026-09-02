@@ -224,6 +224,8 @@ enum class RecoveryAction {
     CONFIRM_PARTIAL,
     OPEN_SETTINGS,
     RETRY,
+    RETRY_INSTALL_APK_CLEANUP,
+    CONFIRM_INSTALL_APK_CLEANUP,
     CHECK_INSTALL_STATUS,
 }
 
@@ -262,6 +264,14 @@ data class UserMessage(
     val kind: UserMessageKind,
     val text: String,
     val recoveryAction: RecoveryAction,
+    val installApkCleanupReceipt: InstallApkCleanupReceipt? = null,
+)
+
+data class InstallApkCleanupReceipt(
+    val importToken: String,
+    val ownerGeneration: Long,
+    val launchId: Long,
+    val destination: String,
 )
 
 data class ManagerUiState(
@@ -378,6 +388,8 @@ sealed interface ManagerAction {
     data object ReturnedToForeground : ManagerAction
     data object DismissMessage : ManagerAction
     data object RetryRecovery : ManagerAction
+    data class RetryInstallApkCleanup(val receipt: InstallApkCleanupReceipt) : ManagerAction
+    data class ConfirmInstallApkCleanup(val receipt: InstallApkCleanupReceipt) : ManagerAction
     data class LaunchSucceeded(val effect: ManagerEffect.LaunchIntent) : ManagerAction
     data class LaunchFailed(val effect: ManagerEffect.LaunchIntent) : ManagerAction
 }
@@ -401,6 +413,7 @@ internal enum class InstallApkDocumentTransactionPhase {
     CLEANUP_PENDING,
     CLEANED,
     CLEANUP_FAILED,
+    CLEANUP_RETRY_IN_FLIGHT,
     COMMITTED,
     COMMITTED_HANDOFF_PENDING,
     CLEANED_HANDOFF_PENDING,
