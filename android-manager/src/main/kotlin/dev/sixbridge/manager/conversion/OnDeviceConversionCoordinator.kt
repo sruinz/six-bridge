@@ -219,7 +219,11 @@ internal class OnDeviceConversionCoordinator(
             ?.takeIf { it.challenge == challenge }
         val proofRecord = approval?.forceProof?.let { forceProofs[it.nonce] }
             ?.takeIf { it.challenge.challenge == challenge }
-        val current = challengeRecord ?: proofRecord?.challenge ?: return@synchronized null
+        val current = when {
+            approval == null -> challengeRecord
+            proofRecord != null -> proofRecord.challenge
+            else -> null
+        } ?: return@synchronized null
         forceChallenges.remove(challenge.token, current)
         forceProofs.entries.removeIf { it.value.challenge.challenge.token == challenge.token }
         if (!reissue) return@synchronized null

@@ -2076,6 +2076,7 @@ class OnDeviceConversionCoordinatorTest {
         val freshChallenge = requireNotNull(
             coordinator.revokeForce(challenge, oldApproval, reissue = true),
         )
+        assertNull(coordinator.revokeForce(freshChallenge, oldApproval, reissue = true))
         fixture.events.clear()
         val rejected = assertIs<ConversionBuildResult.Failure>(coordinator.build(
             analysis.token, analysis.requiredApprovals, false, null, oldApproval,

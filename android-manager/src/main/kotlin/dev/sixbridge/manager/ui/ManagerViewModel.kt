@@ -371,7 +371,7 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
-        revokeConversionCapability(reissue = false)
+        revokeConversionCapability(reissue = false, invalidateOperation = false)
         updateConversionAnalysis {
             it.copy(forceChallenge = null, forceApproval = null)
         }
@@ -715,6 +715,7 @@ class ManagerViewModel(
 
     private fun beginConversion(request: OnDeviceInputRequest) {
         if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
+        revokeConversionCapability(reissue = false, invalidateOperation = false)
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
@@ -803,10 +804,52 @@ class ManagerViewModel(
         }
     }
 
-    private fun revokeConversionCapability(reissue: Boolean): ConversionForceChallenge? {
-        val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return null
-        val challenge = ready.forceChallenge ?: return null
-        return repository.revokeConversionForce(challenge, ready.forceApproval, reissue)
+    private fun revokeConversionCapability(
+        reissue: Boolean,
+        invalidateOperation: Boolean = true,
+    ): ConversionForceChallenge? {
+        val conversion = mutableState.value.conversionState
+        val ready = when (conversion) {
+            is ConversionUiState.AnalysisReady -> conversion
+            is ConversionUiState.Building -> conversion.previous
+            else -> null
+        }
+        val approval = when (conversion) {
+            is ConversionUiState.AnalysisReady -> conversion.forceApproval
+            is ConversionUiState.Building -> conversion.forceApproval
+            else -> null
+        }
+        val fresh = ready?.forceChallenge?.let { challenge ->
+            repository.revokeConversionForce(challenge, approval, reissue)
+        }
+        if (ready != null) {
+            mutableState.update { current ->
+                when (val currentConversion = current.conversionState) {
+                    is ConversionUiState.AnalysisReady -> if (currentConversion.token != ready.token) {
+                        current
+                    } else current.copy(conversionState = currentConversion.copy(
+                        forceChallenge = fresh,
+                        forceApproval = null,
+                    ))
+                    is ConversionUiState.Building -> if (currentConversion.token != ready.token) {
+                        current
+                    } else current.copy(conversionState = currentConversion.copy(
+                        previous = currentConversion.previous.copy(
+                            forceChallenge = fresh,
+                            forceApproval = null,
+                        ),
+                        forceApproval = dev.sixbridge.manager.conversion.OnDeviceConversionApproval.NONE,
+                    ))
+                    else -> current
+                }
+            }
+        }
+        if (!reissue && invalidateOperation) {
+            routeOperation?.cancel()
+            routeOperation = null
+            operationGeneration += 1
+        }
+        return fresh
     }
 
     private fun buildConversion() {
@@ -821,7 +864,7 @@ class ManagerViewModel(
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionAnalysis(ready.token),
-                conversionState = ConversionUiState.Building(ready.token, consumedReady),
+                conversionState = ConversionUiState.Building(ready.token, consumedReady, approval),
                 message = null,
             )
         }
@@ -870,7 +913,33 @@ class ManagerViewModel(
                             )
                         }
                     } else if (ready.forceApproval != null) {
-                        when (val refreshed = repository.analyzeConversion(ready.token)) {
+                        val refreshed = try {
+                            repository.analyzeConversion(ready.token)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (_: Exception) {
+                            ConversionBeginResult.Failure(result.code, ready.token)
+                        }
+                        val currentBuilding =
+                            mutableState.value.conversionState as? ConversionUiState.Building
+                        val stillOwned = generation == operationGeneration &&
+                            mutableState.value.route == ManagerRoute.ConversionAnalysis(ready.token) &&
+                            currentBuilding?.token == ready.token &&
+                            currentBuilding.previous == consumedReady &&
+                            currentBuilding.forceApproval == approval
+                        if (!stillOwned) {
+                            (refreshed as? ConversionBeginResult.AnalysisReady)
+                                ?.forceChallenge
+                                ?.let {
+                                    repository.revokeConversionForce(
+                                        it,
+                                        approval = null,
+                                        reissue = false,
+                                    )
+                                }
+                            return@launch
+                        }
+                        when (refreshed) {
                             is ConversionBeginResult.AnalysisReady -> {
                                 showConversionAnalysis(refreshed)
                                 mutableState.update {
@@ -1176,6 +1245,7 @@ class ManagerViewModel(
 
     private fun cleanupConversion(destination: ManagerRoute) {
         if (mutableState.value.conversionCleanupPending) return
+        revokeConversionCapability(reissue = false, invalidateOperation = false)
         val stateBeforeCancel = mutableState.value.conversionState
         if (stateBeforeCancel is ConversionUiState.ResultReady &&
             (stateBeforeCancel.cleanupPending ||
@@ -2203,6 +2273,7 @@ class ManagerViewModel(
     }
 
     private fun cancelReview() {
+        revokeConversionCapability(reissue = false, invalidateOperation = false)
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
@@ -2350,6 +2421,7 @@ class ManagerViewModel(
 
     private fun openReport(packageName: String) {
         if (mutableState.value.installed.none { it.packageName == packageName }) return
+        revokeConversionCapability(reissue = false)
         mutableState.update {
             it.copy(
                 route = ManagerRoute.Report(packageName),

@@ -10142,6 +10142,83 @@ class ManagerViewModelTest {
             browserProfileSha256 = "c".repeat(64),
         )
 
+    @Test
+    fun `forced reanalysis late result does not replace Home`() =
+        runTest(dispatcher.scheduler) {
+            val deferred = CompletableDeferred<ConversionBeginResult>()
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                conversionBuildResult = ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+                conversionAnalyzeDeferred = deferred
+                ignoreConversionAnalyzeCancellation = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+            viewModel.accept(ManagerAction.BuildConversion)
+            testScheduler.runCurrent()
+            viewModel.accept(ManagerAction.ReturnHome)
+            deferred.complete(forcedConversionAnalysis().copy(
+                forceChallenge = ConversionForceChallenge(TOKEN, "late"),
+            ))
+            advanceUntilIdle()
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertTrue(repository.conversionForceRevocations.any { it.nonce == "late" })
+            assertTrue(repository.conversionForceRevocationApprovals.any { it != null })
+        }
+
+    @Test
+    fun `forced reanalysis exception never leaves Building`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                conversionBuildResult = ConversionBuildResult.Failure(ConversionFailureCode.KEYSTORE)
+                conversionAnalyzeFailure = IOException("reanalyze failed")
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+            assertIs<ConversionUiState.Failed>(viewModel.state.value.conversionState)
+        }
+
+    @Test
+    fun `Cancel and OpenReport synchronously revoke forced approval`() =
+        runTest(dispatcher.scheduler) {
+            suspend fun ready(repository: FakeManagerRepository): ManagerViewModel {
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.OpenConversionInput)
+                viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+                viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.ConfirmConversionForce)
+                return viewModel
+            }
+
+            val cancelRepository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+            }
+            ready(cancelRepository).accept(ManagerAction.CancelConversion)
+            assertEquals(1, cancelRepository.conversionForceRevocations.size)
+
+            val reportRepository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                catalogFlow.tryEmit(listOf(catalogRecord()))
+            }
+            ready(reportRepository).accept(ManagerAction.OpenReport(PACKAGE))
+            assertEquals(1, reportRepository.conversionForceRevocations.size)
+        }
+
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
         const val SECOND_TOKEN = "22222222-2222-2222-2222-222222222222"
@@ -10210,8 +10287,12 @@ private class FakeManagerRepository : ManagerRepository {
     )
     val conversionForceRequests = mutableListOf<ConversionForceRequest>()
     val conversionForceRevocations = mutableListOf<ConversionForceChallenge>()
+    val conversionForceRevocationApprovals = mutableListOf<OnDeviceConversionApproval?>()
     var conversionChallengeSequence = 0
     var conversionAnalyzeRequests = 0
+    var conversionAnalyzeDeferred: CompletableDeferred<ConversionBeginResult>? = null
+    var conversionAnalyzeFailure: IOException? = null
+    var ignoreConversionAnalyzeCancellation = false
     val conversionBeginResults = mutableListOf<ConversionBeginResult>()
     var suspendFirstConversionBegin = false
     var ignoreFirstConversionBeginCancellation = false
@@ -10395,6 +10476,7 @@ private class FakeManagerRepository : ManagerRepository {
         reissue: Boolean,
     ): ConversionForceChallenge? {
         conversionForceRevocations += challenge
+        conversionForceRevocationApprovals += approval
         return if (reissue) {
             ConversionForceChallenge(challenge.token, "reissued-${++conversionChallengeSequence}")
         } else {
@@ -10404,6 +10486,14 @@ private class FakeManagerRepository : ManagerRepository {
 
     override suspend fun analyzeConversion(token: String): ConversionBeginResult {
         conversionAnalyzeRequests += 1
+        conversionAnalyzeFailure?.let { throw it }
+        conversionAnalyzeDeferred?.let {
+            return if (ignoreConversionAnalyzeCancellation) {
+                withContext(NonCancellable) { it.await() }
+            } else {
+                it.await()
+            }
+        }
         return when (val result = conversionBeginResult) {
             is ConversionBeginResult.AnalysisReady -> result.copy(
                 forceChallenge = result.forceChallenge?.copy(

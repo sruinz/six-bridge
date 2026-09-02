@@ -194,6 +194,7 @@ sealed interface ConversionUiState {
     data class Building(
         val token: String,
         val previous: AnalysisReady,
+        val forceApproval: OnDeviceConversionApproval = OnDeviceConversionApproval.NONE,
     ) : ConversionUiState
 
     data class ResultReady(
