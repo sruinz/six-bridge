@@ -331,6 +331,8 @@ class ConversionDocumentIoTest {
                 source = File("/retained/$TOKEN/wrapper.apk"),
                 expectedSha256 = "a".repeat(64),
                 suggestedFileName = "smart-context-wrapper.apk",
+                ownerGeneration = 1,
+                launchId = 1,
             )
             val destination = uri("system-install-recreated")
             val source = InstallApkExportDocumentHandoff().apply {
@@ -362,6 +364,8 @@ class ConversionDocumentIoTest {
                 source = File("/retained/$TOKEN/wrapper.apk"),
                 expectedSha256 = "a".repeat(64),
                 suggestedFileName = "first-wrapper.apk",
+                ownerGeneration = 2,
+                launchId = 2,
             )
             val second = first.copy(
                 importToken = SECOND_TOKEN,

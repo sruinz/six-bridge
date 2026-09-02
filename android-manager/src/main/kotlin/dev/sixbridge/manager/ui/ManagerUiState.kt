@@ -347,14 +347,14 @@ sealed interface ManagerAction {
     open class SystemInstallApkCreated(
         open val importToken: String,
         open val uri: Uri?,
-        open val ownerGeneration: Long = 0,
-        open val launchId: Long = 0,
+        open val ownerGeneration: Long,
+        open val launchId: Long,
     ) : ManagerAction
     data class InstallApkCreated(
         override val importToken: String,
         override val uri: Uri?,
-        override val ownerGeneration: Long = 0,
-        override val launchId: Long = 0,
+        override val ownerGeneration: Long,
+        override val launchId: Long,
     ) : SystemInstallApkCreated(importToken, uri, ownerGeneration, launchId)
     data object ConfirmManualInstallStatus : ManagerAction
     @Deprecated("ConfirmManualInstallStatus를 사용합니다.")
@@ -389,6 +389,33 @@ enum class LaunchDestination {
     FILE_MANAGER,
 }
 
+internal data class InstallApkDocumentTransactionKey(
+    val importToken: String,
+    val ownerGeneration: Long,
+    val launchId: Long,
+    val destination: String,
+)
+
+internal enum class InstallApkDocumentTransactionPhase {
+    COPY_IN_FLIGHT,
+    CLEANUP_PENDING,
+    CLEANED,
+    CLEANUP_FAILED,
+    COMMITTED,
+}
+
+internal sealed interface InstallApkDocumentTransactionState {
+    data object Idle : InstallApkDocumentTransactionState
+    data class Running(
+        val key: InstallApkDocumentTransactionKey,
+        val phase: InstallApkDocumentTransactionPhase,
+    ) : InstallApkDocumentTransactionState
+    data class Terminal(
+        val key: InstallApkDocumentTransactionKey,
+        val phase: InstallApkDocumentTransactionPhase,
+    ) : InstallApkDocumentTransactionState
+}
+
 sealed interface ManagerEffect {
     data class PickSixDocument(
         val ownerGeneration: Long,
@@ -421,8 +448,8 @@ sealed interface ManagerEffect {
         open val source: File,
         open val expectedSha256: String,
         open val suggestedFileName: String,
-        open val ownerGeneration: Long = 0,
-        open val launchId: Long = 0,
+        open val ownerGeneration: Long,
+        open val launchId: Long,
     ) : ManagerEffect {
         open fun copy(
             importToken: String = this.importToken,
@@ -464,8 +491,8 @@ sealed interface ManagerEffect {
         override val source: File,
         override val expectedSha256: String,
         override val suggestedFileName: String,
-        override val ownerGeneration: Long = 0,
-        override val launchId: Long = 0,
+        override val ownerGeneration: Long,
+        override val launchId: Long,
     ) : CreateSystemInstallApkDocument(
         importToken,
         source,

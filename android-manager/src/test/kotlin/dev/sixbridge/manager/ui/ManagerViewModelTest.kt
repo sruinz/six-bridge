@@ -2138,7 +2138,7 @@ class ManagerViewModelTest {
                 viewModel.effects.first(),
             )
 
-            viewModel.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, null))
+            viewModel.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, null, 0, 0))
             viewModel.accept(
                 ManagerAction.InstallApkCreated(
                     TOKEN,
@@ -2391,7 +2391,9 @@ class ManagerViewModelTest {
                 launchId = effect.launchId,
             )
             assertTrue(recreated.ownsSystemInstallApkDocument(activityRestoredEffect))
-            recreated.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, unitTestUri()))
+            recreated.accept(
+                ManagerAction.InstallApkCreated(SECOND_TOKEN, unitTestUri(), 0, 0),
+            )
             recreated.accept(
                 ManagerAction.InstallApkCreated(
                     TOKEN,
@@ -4028,7 +4030,7 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.ReturnHome)
             repository.completeInstallApkExport()
             advanceUntilIdle()
-            viewModel.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
+            viewModel.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri(), 0, 0))
             advanceUntilIdle()
 
             assertNull(savedState.get<String>("pending_system_apk_token"))
@@ -4171,6 +4173,284 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `ReturnHome은 production APK copy owner flow를 즉시 폐기한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            assertNotNull(viewModel.installApkDocumentOwner.value)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+
+            assertNull(viewModel.installApkDocumentOwner.value)
+        }
+
+    @Test
+    fun `APK URI callback은 ViewModel transaction journal 뒤 copy와 mark를 완료한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val savedState = SavedStateHandle(
+                mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
+            )
+            var copied = 0
+            val viewModel = ManagerViewModel(
+                repository,
+                savedState,
+                saveInstallApkDocument = { _, _ ->
+                    copied += 1
+                    GeneratedDocumentSaveResult.Success
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+
+            assertTrue(
+                viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/one"),
+            )
+            assertEquals(TOKEN, savedState.get<String>("install_apk_transaction_token"))
+            advanceUntilIdle()
+
+            assertEquals(1, copied)
+            assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertIs<InstallState.AwaitingManualInstall>(repository.installFlow.value)
+        }
+
+    @Test
+    fun `owner 폐기 뒤 도착한 APK URI는 exact destination만 정리하고 mark하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val deleted = mutableListOf<String>()
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+                deleteInstallApkDocument = { deleted += it; true },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(ManagerAction.ReturnHome)
+
+            assertTrue(
+                viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/stale"),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf("content://apk/stale"), deleted)
+            assertFalse(repository.installFlow.value is InstallState.AwaitingManualInstall)
+        }
+
+    @Test
+    fun `복원 APK transaction은 exact Preparing에서만 URI를 정리한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            val deleted = mutableListOf<String>()
+            val savedState = SavedStateHandle(
+                apkTransactionJournal(review.token, "COPY_IN_FLIGHT") +
+                    mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = review)
+                installFlow.value = InstallState.PreparingApkExport(review.token)
+            }
+
+            val viewModel = ManagerViewModel(
+                repository,
+                savedState,
+                deleteInstallApkDocument = { deleted += it; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf("content://apk/restored"), deleted)
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertEquals(InstallApkDocumentTransactionPhase.CLEANED, terminal.phase)
+        }
+
+    @Test
+    fun `복원 APK transaction의 repo state 불일치는 차단하고 URI를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.Idle
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "COPY_IN_FLIGHT") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+        }
+
+    @Test
+    fun `COMMITTED journal과 Preparing 불일치는 APK를 삭제하지 않고 복구를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.PreparingApkExport(review.token)
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "COMMITTED") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+        }
+
+    @Test
+    fun `CLEANED journal은 repo 상태와 무관하게 재삭제하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.Idle
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "CLEANED") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertEquals(InstallApkDocumentTransactionPhase.CLEANED, terminal.phase)
+        }
+
+    @Test
+    fun `복원 CLEANUP_FAILED journal은 삭제 없이 durable 경고를 다시 표시한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.Idle
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "CLEANUP_FAILED") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+        }
+
+    @Test
+    fun `늦은 cleanup 실패 경고는 현재 APK document owner를 폐기하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val current = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+
+            viewModel.accept(ManagerAction.InstallApkCleanupFailed(1, 999))
+
+            assertTrue(viewModel.ownsSystemInstallApkDocument(current))
+        }
+
+    @Test
     fun `startup export owner 불일치는 복원된 pending APK effect를 폐기한다`() =
         runTest(dispatcher.scheduler) {
             val source = File("/retained/$TOKEN/wrapper.apk")
@@ -4199,6 +4479,8 @@ class ManagerViewModelTest {
                 source = source,
                 expectedSha256 = "a".repeat(64),
                 suggestedFileName = "wrapper.apk",
+                ownerGeneration = 0,
+                launchId = 0,
             )
             assertFalse(viewModel.ownsSystemInstallApkDocument(stale))
         }
@@ -10564,6 +10846,17 @@ class ManagerViewModelTest {
         packageName = PACKAGE,
         extensionId = EXTENSION_ID,
         wrapperSignerSha256 = "f".repeat(64),
+    )
+
+    private fun apkTransactionJournal(
+        token: String,
+        phase: String,
+    ): Map<String, Any> = mapOf(
+        "install_apk_transaction_token" to token,
+        "install_apk_transaction_owner" to 7L,
+        "install_apk_transaction_launch" to 11L,
+        "install_apk_transaction_destination" to "content://apk/restored",
+        "install_apk_transaction_phase" to phase,
     )
 
     private fun review(

@@ -53,10 +53,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -76,6 +79,13 @@ class ManagerViewModel(
     ) -> GeneratedDocumentSaveResult = { _, _, _ ->
         GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
     },
+    private val saveInstallApkDocument: suspend (
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ) -> GeneratedDocumentSaveResult = { _, _ ->
+        GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
+    },
+    private val deleteInstallApkDocument: suspend (String) -> Boolean = { false },
     private val afterGeneratedInstallCleanupTransitionPersisted: () -> Unit = {},
     private val afterGeneratedReviewCleanupCompleted: () -> Unit = {},
     private val afterGeneratedCleanupCompletionStep: (
@@ -118,6 +128,17 @@ class ManagerViewModel(
     )
     internal val installApkDocumentOwner: StateFlow<DocumentLaunchIdentity?> =
         mutableInstallApkDocumentOwner.asStateFlow()
+    private val mutableInstallApkDocumentTransaction = MutableStateFlow<
+        InstallApkDocumentTransactionState
+    >(InstallApkDocumentTransactionState.Idle)
+    internal val installApkDocumentTransaction:
+        StateFlow<InstallApkDocumentTransactionState> =
+        mutableInstallApkDocumentTransaction.asStateFlow()
+    private var installApkDocumentTransactionJob: Job? = null
+    private val installApkDocumentIoMutex = Mutex()
+    private var installApkTransactionRestoreInvalid = false
+    private var restoredInstallApkDocumentTransaction =
+        restoreInstallApkDocumentTransaction()
     private val reportedInstallApkCleanupFailures = mutableSetOf<DocumentLaunchIdentity>()
     private var operationGeneration = 0L
     private var launchGeneration = 0L
@@ -183,6 +204,10 @@ class ManagerViewModel(
     }
 
     fun accept(action: ManagerAction) {
+        if (action is ManagerAction.InstallApkCleanupFailed) {
+            showInstallApkCleanupFailure(action)
+            return
+        }
         if (generatedCleanupRestoreInvalid) {
             showGeneratedCleanupRestoreBlocked()
             return
@@ -319,23 +344,7 @@ class ManagerViewModel(
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             is ManagerAction.InstallApkCreated ->
                 acceptInstallApkCreated(action)
-            is ManagerAction.InstallApkCleanupFailed -> {
-                val identity = DocumentLaunchIdentity(
-                    action.ownerGeneration,
-                    action.launchId,
-                )
-                if (reportedInstallApkCleanupFailures.add(identity)) {
-                    mutableState.update {
-                        it.copy(
-                            message = UserMessage(
-                                UserMessageKind.INSTALL_FAILED,
-                                "APK 저장 취소 후 부분 파일을 삭제하지 못했습니다. 파일 앱에서 직접 삭제해 주세요.",
-                                RecoveryAction.NONE,
-                            ),
-                        )
-                    }
-                }
-            }
+            is ManagerAction.InstallApkCleanupFailed -> Unit
             is ManagerAction.SystemInstallApkCreated ->
                 acceptInstallApkCreated(action)
             ManagerAction.ConfirmManualInstallStatus -> confirmManualInstallStatus()
@@ -347,6 +356,7 @@ class ManagerViewModel(
             is ManagerAction.OpenReport -> openReport(action.packageName)
             ManagerAction.ReturnHome -> {
                 revokeConversionCapability(reissue = false)
+                clearPendingSystemInstallApkDocument()
                 mutableState.update { it.copy(
                     route = ManagerRoute.Home,
                     reportInstallSupportStatus = null,
@@ -1100,6 +1110,11 @@ class ManagerViewModel(
                             UserMessageKind.CONVERSION_SAVED,
                             "변환된 .six 파일을 안전하게 저장했습니다.",
                             RecoveryAction.NONE,
+                        )
+                        GeneratedDocumentSaveResult.OwnershipRejected -> UserMessage(
+                            UserMessageKind.CONVERSION_SAVE_FAILED,
+                            "파일 저장 소유권을 확인하지 못했습니다.",
+                            RecoveryAction.RETRY,
                         )
                         is GeneratedDocumentSaveResult.Failure ->
                             if (saveResult.cleanupFailed) {
@@ -2375,6 +2390,7 @@ class ManagerViewModel(
         val reviewPackageName = ready.review.packageName
         val reviewSessionId = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
         val generatedOwner = generatedInstallOwnerToken
+        clearPendingSystemInstallApkDocument()
         revokeConversionCapability(reissue = false, invalidateOperation = false)
         pendingReviewDiscards += reviewToken
         ownedReviewToken = null
@@ -4106,11 +4122,16 @@ class ManagerViewModel(
             showStartupRecoveryBlocked()
             return
         }
+        if (installApkTransactionRestoreInvalid) {
+            showStartupRecoveryBlocked()
+            return
+        }
         deferredInitialTerminals = null
         val installState = repository.installState.value
         mutableState.update {
             it.copy(startupRecoveryState = StartupRecoveryUiState.READY)
         }
+        if (!recoverInstallApkDocumentTransaction(installState)) return
         val readyReview =
             (mutableState.value.importState as? ImportUiState.ReviewReady)
                 ?.review
@@ -4130,6 +4151,8 @@ class ManagerViewModel(
         if (ownsPreparingExport) {
             val startupGeneration = operationGeneration
             val startupGeneratedOwner = generatedInstallOwnerToken
+            val startupPending = pendingSystemInstallApkDocument
+            val startupPendingRecovery = pendingRecovery
             val export = repository.installApkExport(reviewToken)
             val stillOwnsStartupExport = startupGeneration == operationGeneration &&
                 startupGeneratedOwner == generatedInstallOwnerToken &&
@@ -4156,8 +4179,13 @@ class ManagerViewModel(
                 }
             }
             if (!stillOwnsStartupExport) {
-                clearPendingSystemInstallApkDocument()
-                if (pendingRecovery is PendingRecovery.SystemInstallApk) pendingRecovery = null
+                clearPendingSystemInstallApkDocument(startupPending)
+                if (pendingRecovery == startupPendingRecovery &&
+                    (startupPendingRecovery as? PendingRecovery.SystemInstallApk)
+                        ?.effect == startupPending
+                ) {
+                    pendingRecovery = null
+                }
             }
             pendingSystemInstallApkDocument
                 ?.takeIf { it.importToken == reviewToken }
@@ -4195,6 +4223,280 @@ class ManagerViewModel(
         (mutableState.value.importState as? ImportUiState.ReviewReady)
             ?.let(::isCurrentInstallReviewOwner) == true
 
+    internal fun beginInstallApkDocumentTransaction(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ): Boolean {
+        if (destination.isBlank() || effect.ownerGeneration <= 0L || effect.launchId <= 0L) {
+            return false
+        }
+        val key = InstallApkDocumentTransactionKey(
+            importToken = effect.importToken,
+            ownerGeneration = effect.ownerGeneration,
+            launchId = effect.launchId,
+            destination = destination,
+        )
+        if (installApkDocumentTransactionJob?.isActive == true) return false
+        persistInstallApkDocumentTransaction(key, InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT)
+        mutableInstallApkDocumentTransaction.value = InstallApkDocumentTransactionState.Running(
+            key,
+            InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT,
+        )
+        installApkDocumentTransactionJob = viewModelScope.launch {
+            installApkDocumentIoMutex.withLock {
+                val result = if (ownsSystemInstallApkDocument(effect)) {
+                    saveInstallApkDocumentWhileOwned(effect, destination)
+                } else {
+                    GeneratedDocumentSaveResult.OwnershipRejected
+                }
+                finishInstallApkDocumentTransaction(effect, key, result)
+            }
+        }
+        return true
+    }
+
+    internal fun discardRejectedInstallApkDocumentDestination(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ) {
+        if (destination.isBlank()) return
+        viewModelScope.launch {
+            val deleted = installApkDocumentIoMutex.withLock {
+                withContext(NonCancellable) { deleteInstallApkDocument(destination) }
+            }
+            if (!deleted) {
+                showInstallApkCleanupFailure(
+                    ManagerAction.InstallApkCleanupFailed(
+                        effect.ownerGeneration,
+                        effect.launchId,
+                    ),
+                )
+            }
+        }
+    }
+
+    internal fun acknowledgeInstallApkDocumentTerminal(
+        key: InstallApkDocumentTransactionKey,
+    ): Boolean {
+        val terminal = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Terminal ?: return false
+        if (terminal.key != key) return false
+        mutableInstallApkDocumentTransaction.value = InstallApkDocumentTransactionState.Idle
+        if (terminal.phase != InstallApkDocumentTransactionPhase.CLEANUP_FAILED) {
+            clearInstallApkDocumentTransactionJournal(key)
+        }
+        return true
+    }
+
+    private suspend fun saveInstallApkDocumentWhileOwned(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ): GeneratedDocumentSaveResult = kotlinx.coroutines.coroutineScope {
+        val completion = CompletableDeferred<GeneratedDocumentSaveResult>()
+        val saveJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            val result = saveInstallApkDocument(effect, destination)
+            withContext(NonCancellable) { completion.complete(result) }
+        }
+        val guard = launch {
+            installApkDocumentOwner.first { it != effect.identity() }
+            saveJob.cancel()
+        }
+        try {
+            withContext(NonCancellable) {
+                saveJob.join()
+                if (completion.isCompleted) completion.await()
+                else GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false)
+            }
+        } finally {
+            guard.cancel()
+        }
+    }
+
+    private suspend fun finishInstallApkDocumentTransaction(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        key: InstallApkDocumentTransactionKey,
+        result: GeneratedDocumentSaveResult,
+    ) {
+        var phase = when (result) {
+            GeneratedDocumentSaveResult.Success -> {
+                if (ownsSystemInstallApkDocument(effect) &&
+                    repository.markInstallApkExported(effect.importToken)
+                ) {
+                    clearPendingSystemInstallApkDocument()
+                    pendingRecovery = null
+                    showManualInstallUi()
+                    InstallApkDocumentTransactionPhase.COMMITTED
+                } else cleanupInstallApkTransactionDestination(key)
+            }
+            GeneratedDocumentSaveResult.OwnershipRejected ->
+                cleanupInstallApkTransactionDestination(key)
+            is GeneratedDocumentSaveResult.Cancelled -> if (result.cleanupFailed) {
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED
+            } else InstallApkDocumentTransactionPhase.CLEANED
+            is GeneratedDocumentSaveResult.Failure -> if (result.cleanupFailed) {
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED
+            } else InstallApkDocumentTransactionPhase.CLEANED
+        }
+        if (phase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED) {
+            showInstallApkCleanupFailure(
+                ManagerAction.InstallApkCleanupFailed(key.ownerGeneration, key.launchId),
+            )
+        }
+        val current = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Running
+        if (current?.key != key) return
+        persistInstallApkDocumentTransaction(key, phase)
+        mutableInstallApkDocumentTransaction.value =
+            InstallApkDocumentTransactionState.Terminal(key, phase)
+    }
+
+    private suspend fun cleanupInstallApkTransactionDestination(
+        key: InstallApkDocumentTransactionKey,
+    ): InstallApkDocumentTransactionPhase {
+        persistInstallApkDocumentTransaction(
+            key,
+            InstallApkDocumentTransactionPhase.CLEANUP_PENDING,
+        )
+        return withContext(NonCancellable) {
+            if (deleteInstallApkDocument(key.destination)) {
+                InstallApkDocumentTransactionPhase.CLEANED
+            } else {
+                InstallApkDocumentTransactionPhase.CLEANUP_FAILED
+            }
+        }
+    }
+
+    private fun persistInstallApkDocumentTransaction(
+        key: InstallApkDocumentTransactionKey,
+        phase: InstallApkDocumentTransactionPhase,
+    ) {
+        savedStateHandle[INSTALL_APK_TRANSACTION_TOKEN_KEY] = key.importToken
+        savedStateHandle[INSTALL_APK_TRANSACTION_OWNER_KEY] = key.ownerGeneration
+        savedStateHandle[INSTALL_APK_TRANSACTION_LAUNCH_KEY] = key.launchId
+        savedStateHandle[INSTALL_APK_TRANSACTION_DESTINATION_KEY] = key.destination
+        savedStateHandle[INSTALL_APK_TRANSACTION_PHASE_KEY] = phase.name
+    }
+
+    private fun restoreInstallApkDocumentTransaction():
+        Pair<InstallApkDocumentTransactionKey, InstallApkDocumentTransactionPhase>? {
+        val hasAny = listOf(
+            INSTALL_APK_TRANSACTION_TOKEN_KEY,
+            INSTALL_APK_TRANSACTION_OWNER_KEY,
+            INSTALL_APK_TRANSACTION_LAUNCH_KEY,
+            INSTALL_APK_TRANSACTION_DESTINATION_KEY,
+            INSTALL_APK_TRANSACTION_PHASE_KEY,
+        ).any(savedStateHandle::contains)
+        fun invalid(): Pair<InstallApkDocumentTransactionKey,
+            InstallApkDocumentTransactionPhase>? {
+            if (hasAny) installApkTransactionRestoreInvalid = true
+            return null
+        }
+        val token = savedStateHandle.get<String>(INSTALL_APK_TRANSACTION_TOKEN_KEY)
+            ?: return invalid()
+        val owner = savedStateHandle.get<Long>(INSTALL_APK_TRANSACTION_OWNER_KEY)
+            ?: return invalid()
+        val launch = savedStateHandle.get<Long>(INSTALL_APK_TRANSACTION_LAUNCH_KEY)
+            ?: return invalid()
+        val destination =
+            savedStateHandle.get<String>(INSTALL_APK_TRANSACTION_DESTINATION_KEY)
+                ?: return invalid()
+        val phase = savedStateHandle.get<String>(INSTALL_APK_TRANSACTION_PHASE_KEY)
+            ?.let { runCatching { InstallApkDocumentTransactionPhase.valueOf(it) }.getOrNull() }
+            ?: return invalid()
+        if (owner <= 0L || launch <= 0L || destination.isBlank()) return invalid()
+        return InstallApkDocumentTransactionKey(token, owner, launch, destination) to phase
+    }
+
+    private fun recoverInstallApkDocumentTransaction(installState: InstallState): Boolean {
+        val restored = restoredInstallApkDocumentTransaction ?: return true
+        restoredInstallApkDocumentTransaction = null
+        val (key, phase) = restored
+        when {
+            installState is InstallState.AwaitingManualInstall &&
+                installState.importToken == key.importToken -> {
+                persistInstallApkDocumentTransaction(
+                    key,
+                    InstallApkDocumentTransactionPhase.COMMITTED,
+                )
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(
+                        key,
+                        InstallApkDocumentTransactionPhase.COMMITTED,
+                    )
+                return true
+            }
+            phase == InstallApkDocumentTransactionPhase.CLEANED ||
+                phase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED -> {
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(key, phase)
+                if (phase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED) {
+                    showInstallApkCleanupFailure(
+                        ManagerAction.InstallApkCleanupFailed(
+                            key.ownerGeneration,
+                            key.launchId,
+                        ),
+                    )
+                }
+                return true
+            }
+            phase in setOf(
+                InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT,
+                InstallApkDocumentTransactionPhase.CLEANUP_PENDING,
+            ) &&
+                installState is InstallState.PreparingApkExport &&
+                installState.importToken == key.importToken -> {
+                persistInstallApkDocumentTransaction(
+                    key,
+                    InstallApkDocumentTransactionPhase.CLEANUP_PENDING,
+                )
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Running(
+                        key,
+                        InstallApkDocumentTransactionPhase.CLEANUP_PENDING,
+                    )
+                installApkDocumentTransactionJob = viewModelScope.launch {
+                    val recoveredPhase = installApkDocumentIoMutex.withLock {
+                        cleanupInstallApkTransactionDestination(key)
+                    }
+                    if (recoveredPhase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED) {
+                        showInstallApkCleanupFailure(
+                            ManagerAction.InstallApkCleanupFailed(
+                                key.ownerGeneration,
+                                key.launchId,
+                            ),
+                        )
+                    }
+                    val current = mutableInstallApkDocumentTransaction.value as?
+                        InstallApkDocumentTransactionState.Running
+                    if (current?.key == key) {
+                        persistInstallApkDocumentTransaction(key, recoveredPhase)
+                        mutableInstallApkDocumentTransaction.value =
+                            InstallApkDocumentTransactionState.Terminal(key, recoveredPhase)
+                    }
+                }
+                return true
+            }
+        }
+        installApkTransactionRestoreInvalid = true
+        showStartupRecoveryBlocked()
+        return false
+    }
+
+    private fun clearInstallApkDocumentTransactionJournal(
+        key: InstallApkDocumentTransactionKey,
+    ) {
+        if (savedStateHandle.get<String>(INSTALL_APK_TRANSACTION_TOKEN_KEY) != key.importToken ||
+            savedStateHandle.get<Long>(INSTALL_APK_TRANSACTION_OWNER_KEY) != key.ownerGeneration ||
+            savedStateHandle.get<Long>(INSTALL_APK_TRANSACTION_LAUNCH_KEY) != key.launchId ||
+            savedStateHandle.get<String>(INSTALL_APK_TRANSACTION_DESTINATION_KEY) != key.destination
+        ) return
+        savedStateHandle[INSTALL_APK_TRANSACTION_TOKEN_KEY] = null
+        savedStateHandle[INSTALL_APK_TRANSACTION_OWNER_KEY] = null
+        savedStateHandle[INSTALL_APK_TRANSACTION_LAUNCH_KEY] = null
+        savedStateHandle[INSTALL_APK_TRANSACTION_DESTINATION_KEY] = null
+        savedStateHandle[INSTALL_APK_TRANSACTION_PHASE_KEY] = null
+    }
+
     private fun ManagerEffect.CreateSystemInstallApkDocument.identity() =
         DocumentLaunchIdentity(ownerGeneration, launchId)
 
@@ -4212,6 +4514,7 @@ class ManagerViewModel(
     }
 
     private fun clearPendingSystemInstallApkDocument() {
+        val cleared = pendingSystemInstallApkDocument
         mutableInstallApkDocumentOwner.value = null
         pendingSystemInstallApkDocument = null
         savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = null
@@ -4220,6 +4523,33 @@ class ManagerViewModel(
         savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = null
         savedStateHandle[PENDING_SYSTEM_APK_OWNER_GENERATION_KEY] = null
         savedStateHandle[PENDING_SYSTEM_APK_LAUNCH_ID_KEY] = null
+        if ((pendingRecovery as? PendingRecovery.SystemInstallApk)?.effect == cleared) {
+            pendingRecovery = null
+        }
+    }
+
+    private fun clearPendingSystemInstallApkDocument(
+        expected: ManagerEffect.CreateInstallApkDocument?,
+    ) {
+        if (expected != null && pendingSystemInstallApkDocument == expected) {
+            clearPendingSystemInstallApkDocument()
+        }
+    }
+
+    private fun showInstallApkCleanupFailure(
+        action: ManagerAction.InstallApkCleanupFailed,
+    ) {
+        val identity = DocumentLaunchIdentity(action.ownerGeneration, action.launchId)
+        if (!reportedInstallApkCleanupFailures.add(identity)) return
+        mutableState.update {
+            it.copy(
+                message = UserMessage(
+                    UserMessageKind.INSTALL_FAILED,
+                    "APK 저장 취소 후 부분 파일을 삭제하지 못했습니다. 파일 앱에서 직접 삭제해 주세요.",
+                    RecoveryAction.NONE,
+                ),
+            )
+        }
     }
 
     private fun restorePendingSystemInstallApkDocument():
@@ -4246,6 +4576,7 @@ class ManagerViewModel(
                 ?: return rejectIncomplete()
         val launchId = savedStateHandle.get<Long>(PENDING_SYSTEM_APK_LAUNCH_ID_KEY)
             ?: return rejectIncomplete()
+        if (ownerGeneration <= 0L || launchId <= 0L) return rejectIncomplete()
         return ManagerEffect.CreateInstallApkDocument(
             importToken = token,
             source = File(source),
@@ -4446,6 +4777,7 @@ class ManagerViewModel(
             is GeneratedDocumentSaveResult.Cancelled -> completedSave.cleanupFailed
             is GeneratedDocumentSaveResult.Failure -> completedSave.cleanupFailed
             GeneratedDocumentSaveResult.Success,
+            GeneratedDocumentSaveResult.OwnershipRejected,
             null,
             -> false
         }
@@ -5221,6 +5553,12 @@ class ManagerViewModel(
         const val PENDING_SYSTEM_APK_OWNER_GENERATION_KEY =
             "pending_system_apk_owner_generation"
         const val PENDING_SYSTEM_APK_LAUNCH_ID_KEY = "pending_system_apk_launch_id"
+        const val INSTALL_APK_TRANSACTION_TOKEN_KEY = "install_apk_transaction_token"
+        const val INSTALL_APK_TRANSACTION_OWNER_KEY = "install_apk_transaction_owner"
+        const val INSTALL_APK_TRANSACTION_LAUNCH_KEY = "install_apk_transaction_launch"
+        const val INSTALL_APK_TRANSACTION_DESTINATION_KEY =
+            "install_apk_transaction_destination"
+        const val INSTALL_APK_TRANSACTION_PHASE_KEY = "install_apk_transaction_phase"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",

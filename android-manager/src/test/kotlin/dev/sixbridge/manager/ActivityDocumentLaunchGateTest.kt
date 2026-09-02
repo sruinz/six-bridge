@@ -3,6 +3,7 @@ package dev.sixbridge.manager
 import android.net.Uri
 import android.os.Bundle
 import dev.sixbridge.manager.ui.ManagerEffect
+import dev.sixbridge.manager.install.InstallState
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -91,6 +92,8 @@ class ActivityDocumentLaunchGateTest {
             source = File("/retained/11111111-1111-1111-1111-111111111111/wrapper.apk"),
             expectedSha256 = "a".repeat(64),
             suggestedFileName = "smart-context-wrapper.apk",
+            ownerGeneration = 1,
+            launchId = 1,
         )
         val destination = Uri.parse("content://documents/export.apk")
         val handoff = InstallApkExportDocumentHandoff().apply {
@@ -109,12 +112,53 @@ class ActivityDocumentLaunchGateTest {
     }
 
     @Test
+    fun `copy 중 recreation은 삭제될 destination을 재사용하지 않고 취소 completion으로 전환한다`() {
+        val effect = ManagerEffect.CreateInstallApkDocument(
+            importToken = "11111111-1111-1111-1111-111111111111",
+            source = File("/retained/wrapper.apk"),
+            expectedSha256 = "a".repeat(64),
+            suggestedFileName = "wrapper.apk",
+            ownerGeneration = 21,
+            launchId = 22,
+        )
+        val handoff = InstallApkExportDocumentHandoff().apply {
+            begin(effect)
+            selectDestination(Uri.parse("content://documents/interrupted.apk"))
+        }
+
+        val restored = InstallApkExportDocumentHandoff.restore(
+            Bundle().also(handoff::save),
+        )
+        val interrupted = restored.cancelRestoredCopy()
+
+        assertEquals(effect, interrupted?.pending?.effect)
+        assertNull(interrupted?.action?.uri)
+        assertNull(restored.pending?.destination)
+    }
+
+    @Test
+    fun `APK handoff는 non-positive document identity 복원을 거부한다`() {
+        val saved = Bundle().apply {
+            putString("pending_system_apk_token", "11111111-1111-1111-1111-111111111111")
+            putString("pending_system_apk_source", "/retained/wrapper.apk")
+            putString("pending_system_apk_sha256", "a".repeat(64))
+            putString("pending_system_apk_name", "wrapper.apk")
+            putLong("pending_system_apk_owner", 0)
+            putLong("pending_system_apk_launch_id", -1)
+        }
+
+        assertNull(InstallApkExportDocumentHandoff.restore(saved).pending)
+    }
+
+    @Test
     fun `APK export handoff는 SHA 확인 성공 결과를 exact owner에게 전달한 뒤 acknowledge한다`() {
         val effect = ManagerEffect.CreateInstallApkDocument(
             importToken = "11111111-1111-1111-1111-111111111111",
             source = File("/retained/11111111-1111-1111-1111-111111111111/wrapper.apk"),
             expectedSha256 = "b".repeat(64),
             suggestedFileName = "확장-1.0.0-aaaaaa.apk",
+            ownerGeneration = 2,
+            launchId = 2,
         )
         val destination = Uri.parse("content://documents/export.apk")
         val handoff = InstallApkExportDocumentHandoff().apply {
@@ -224,6 +268,132 @@ class ActivityDocumentLaunchGateTest {
         assertEquals(
             GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true),
             result.await(),
+        )
+    }
+
+    @Test
+    fun `Activity parent 취소에서도 cleanup 실패 callback을 완료한다`() = runTest {
+        val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(31, 32)
+        val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+        val started = CompletableDeferred<Unit>()
+        val failureReported = CompletableDeferred<Unit>()
+
+        val attempt = async {
+            saveInstallApkExportDocumentWhileOwned(
+                owners = owners,
+                expected = expected,
+                onCleanupFailed = { failureReported.complete(Unit) },
+            ) {
+                started.complete(Unit)
+                try {
+                    CompletableDeferred<Unit>().await()
+                    error("parent 취소가 전달되어야 합니다.")
+                } catch (_: CancellationException) {
+                    GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true)
+                }
+            }
+        }
+        started.await()
+        attempt.cancel()
+
+        failureReported.await()
+    }
+
+    @Test
+    fun `일반 save failure cleanup 실패도 exact callback으로 보고한다`() = runTest {
+        val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(33, 34)
+        val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+        var failures = 0
+
+        val result = saveInstallApkExportDocumentWhileOwned(
+            owners = owners,
+            expected = expected,
+            onCleanupFailed = { failures += 1 },
+        ) {
+            GeneratedDocumentSaveResult.Failure(cleanupFailed = true)
+        }
+
+        assertEquals(GeneratedDocumentSaveResult.Failure(true), result)
+        assertEquals(1, failures)
+    }
+
+    @Test
+    fun `mutex 대기 중 owner를 잃은 copy는 ownership rejected를 보존한다`() = runTest {
+        val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(35, 36)
+        val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(null)
+        var copies = 0
+
+        val result = saveInstallApkExportDocumentWhileOwned(owners, expected) {
+            copies += 1
+            GeneratedDocumentSaveResult.Success
+        }
+
+        assertEquals(GeneratedDocumentSaveResult.OwnershipRejected, result)
+        assertEquals(0, copies)
+    }
+
+    @Test
+    fun `recreation은 old cleanup이 삭제한 같은 URI를 다시 삭제하거나 재사용하지 않는다`() =
+        runTest {
+            val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(37, 38)
+            val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+            val destination = Uri.parse("content://documents/config-cleaned.apk")
+            val result = saveInstallApkExportDocumentWhileOwned(
+                owners = owners,
+                expected = expected,
+                destination = destination,
+            ) {
+                GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false)
+            }
+            var duplicateDeletes = 0
+
+            val cleaned = deleteInstallApkDestinationSerialized(expected, destination) {
+                duplicateDeletes += 1
+                false
+            }
+
+            assertEquals(GeneratedDocumentSaveResult.Cancelled(false), result)
+            assertEquals(true, cleaned)
+            assertEquals(0, duplicateDeletes)
+
+            var newAttemptDeletes = 0
+            assertEquals(
+                false,
+                deleteInstallApkDestinationSerialized(
+                    expected.copy(launchId = 39),
+                    destination,
+                ) {
+                    newAttemptDeletes += 1
+                    false
+                },
+            )
+            assertEquals(1, newAttemptDeletes)
+        }
+
+    @Test
+    fun `committed APK의 stale Activity bundle은 destination을 삭제하지 않는다`() {
+        val effect = ManagerEffect.CreateInstallApkDocument(
+            importToken = "11111111-1111-1111-1111-111111111111",
+            source = File("/retained/wrapper.apk"),
+            expectedSha256 = "a".repeat(64),
+            suggestedFileName = "wrapper.apk",
+            ownerGeneration = 40,
+            launchId = 41,
+        )
+
+        assertEquals(
+            false,
+            shouldCleanupRestoredInstallApk(
+                InstallState.AwaitingManualInstall(effect.importToken),
+                effect,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldCleanupRestoredInstallApk(
+                InstallState.PreparingApkExport(effect.importToken),
+                effect,
+            ),
         )
     }
 
