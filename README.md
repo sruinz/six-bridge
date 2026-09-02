@@ -80,7 +80,10 @@ Android의 출처 허용 설정과 시스템 설치 승인 화면을 직접 확�
 
 - `compatible`: 검토 뒤 설치할 수 있다.
 - `partial`: 제한 사항을 확인하는 추가 동의 뒤 설치할 수 있다.
-- `blocked`, `unknown`: 설치할 수 없다.
+- `blocked`: 설치할 수 없다.
+- `unknown`: 기본적으로 설치할 수 없다. 다만 v0.1.2에서 서명된 강제
+  provenance와 중앙 정책 검증을 모두 통과한 `api_usage_dynamic` 전용
+  SixBundle은 사용자가 가져오기와 설치 위험을 각각 확인한 뒤 시험할 수 있다.
 - 업데이트: 같은 package·같은 signer·더 높은 versionCode만 허용한다.
 - 제거: 표준 Android 제거 화면을 사용하고 실제 package를 다시 확인한다.
 - Add-ons: 공개 `internet://extension`으로 삼성 인터넷의 전체 Add-ons
@@ -180,10 +183,14 @@ CLI `build`의 APK 서명은 개발 검증용이다. 일반 사용자에게 설�
 래퍼 서명과 설치 승인은 Android 관리자가 담당한다. 변환 과정에서 source를
 다시 패킹하면 원본 Chrome 웹 스토어 확장 ID가 바뀔 수 있다.
 
-호환성 분석이 차단한 입력을 사용자가 위험을 확인한 뒤 강제로 생성하는 기능은
-현재 제공하지 않는다. 이 기능의 안전 경계와 완료 조건은
-[호환성 강제 생성 옵션 후속 작업](docs/force-compatibility-build-follow-up.md)에
-기록한다.
+v0.1.2는 원래 상태가 `UNKNOWN`이고 blocking issue가 정확히
+`api_usage_dynamic`뿐인 입력을 현재 작업의 명시적 위험 승인으로 강제 생성할
+수 있다. CLI 옵션은 일반 `--force`가 아닌 정확히
+`--force-compatibility-unknown`이다. 결과는 원래 `UNKNOWN`, issue와 미검증
+API를 보존하며 호환성을 보증하지 않는다. 다른 `UNKNOWN`, 모든 `BLOCKED`와
+구조·서명·경로·identity 실패는 계속 차단한다. 세부 계약은
+[제한적 UNKNOWN 강제 변환 설계](docs/superpowers/specs/2026-09-02-v0.1.2-forced-unknown-conversion-design.md)와
+[구현 완료 기록](docs/force-compatibility-build-follow-up.md)에 정리되어 있다.
 
 ## 삼성 Add-ons 설정 진입점
 
@@ -327,9 +334,9 @@ Windows x86-64 MSI 구성과 owner-only ACL 코드는 포함되어 있으나,
 ## 공개 배포
 
 SIX Bridge 소스는 [Apache-2.0](LICENSE)으로 제공됩니다. 현재 권장 배포인
-[v0.1.1 다운로드](https://github.com/sruinz/six-bridge/releases/tag/v0.1.1)는 Android
+[v0.1.2 다운로드](https://github.com/sruinz/six-bridge/releases/tag/v0.1.2)는 Android
 관리자 APK와 macOS 미서명·미공증 preview DMG를 제공합니다.
 설치 경고와 검증 절차는 [한글 배포 안내](docs/RELEASE_KO.md),
-변경 내용은 [v0.1.1 릴리스 노트](docs/releases/v0.1.1-ko.md)를 확인하세요.
-이전 배포 내용은 [v0.1.0 역사 릴리스 노트](docs/releases/v0.1.0-ko.md)에
-보존되어 있습니다.
+변경 내용은 [v0.1.2 릴리스 노트](docs/releases/v0.1.2-ko.md)를 확인하세요.
+이전 배포 내용은 [v0.1.1 역사 릴리스 노트](docs/releases/v0.1.1-ko.md)와
+[v0.1.0 역사 릴리스 노트](docs/releases/v0.1.0-ko.md)에 보존되어 있습니다.

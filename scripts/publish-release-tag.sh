@@ -103,8 +103,8 @@ exec 7<&-
 release_bind_project_root "${ROOT_DIR}" || exit 1
 
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
-readonly RELEASE_DIRECTORY="${RELEASE_CONTAINER}/v0.1.1"
-readonly RELEASE_TAG='v0.1.1'
+readonly RELEASE_DIRECTORY="${RELEASE_CONTAINER}/v0.1.2"
+readonly RELEASE_TAG='v0.1.2'
 SIXBRIDGE_PUBLISH_ARTIFACT_SIGNER=''
 SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT=''
 SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER=''
@@ -457,7 +457,7 @@ release_verify_created_tag() {
     printf '%s\n' "${tag_oid}"
 }
 
-[[ "$#" = 1 ]] || { release_fail '사용법: publish-release-tag.sh 0.1.1'; exit 1; }
+[[ "$#" = 1 ]] || { release_fail '사용법: publish-release-tag.sh 0.1.2'; exit 1; }
 release_require_version "$1" || exit 1
 create_publish_transient_root || exit 1
 
@@ -465,9 +465,9 @@ release_preflight || exit 1
 head_commit=${SIXBRIDGE_PUBLISH_PREFLIGHT_COMMIT}
 signer=${SIXBRIDGE_PUBLISH_PREFLIGHT_SIGNER}
 
-printf '계속하려면 v0.1.1 KEY BACKUP COMPLETE를 입력하세요: '
+printf '계속하려면 v0.1.2 KEY BACKUP COMPLETE를 입력하세요: '
 IFS= read -r confirmation || { release_fail '백업 확인 입력을 읽지 못했습니다.'; exit 1; }
-[[ "${confirmation}" = 'v0.1.1 KEY BACKUP COMPLETE' ]] || {
+[[ "${confirmation}" = 'v0.1.2 KEY BACKUP COMPLETE' ]] || {
     release_fail '백업 확인 문구가 일치하지 않습니다.'
     exit 1
 }
@@ -487,7 +487,7 @@ trap - EXIT HUP INT TERM
 if declare -F release_before_tag_creation >/dev/null; then
     release_before_tag_creation "${verified_commit}" || exit 1
 fi
-release_git tag -a "${RELEASE_TAG}" "${verified_commit}" -m 'SIX Bridge v0.1.1' || exit 1
+release_git tag -a "${RELEASE_TAG}" "${verified_commit}" -m 'SIX Bridge v0.1.2' || exit 1
 tag_oid=$(release_verify_created_tag "${verified_commit}") || exit 1
 if declare -F release_before_tag_push >/dev/null; then
     release_before_tag_push "${tag_oid}" "${verified_commit}" || exit 1
@@ -497,10 +497,10 @@ release_git push origin "${tag_oid}:refs/tags/${RELEASE_TAG}" || {
     exit 1
 }
 
-printf 'v0.1.1 annotated tag를 origin에 게시했습니다.\n'
+printf 'v0.1.2 annotated tag를 origin에 게시했습니다.\n'
 printf '수동 Releases 화면에서 다음 정확히 다섯 파일을 첨부하세요:\n'
 for file in "${SIXBRIDGE_RELEASE_FILES[@]}"; do
     printf '%s\n' "${file}"
 done
 printf 'Android signer SHA-256: %s\n' "${signer}"
-printf '경고: macOS DMG는 v0.1.1에서 미서명·미공증입니다.\n'
+printf '경고: macOS DMG는 v0.1.2에서 미서명·미공증입니다.\n'

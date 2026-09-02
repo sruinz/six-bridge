@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Shared fail-closed verification primitives for the v0.1.1 release scripts.
+# Shared fail-closed verification primitives for the v0.1.2 release scripts.
 # This file is sourced by prepare-release.sh and publish-release-tag.sh.
 
-readonly SIXBRIDGE_RELEASE_VERSION='0.1.1'
-readonly SIXBRIDGE_ANDROID_FILE='SIX-Bridge-Manager-0.1.1-android.apk'
-readonly SIXBRIDGE_MACOS_FILE='SIX-Bridge-0.1.1-macos-unsigned.dmg'
+readonly SIXBRIDGE_RELEASE_VERSION='0.1.2'
+readonly SIXBRIDGE_ANDROID_FILE='SIX-Bridge-Manager-0.1.2-android.apk'
+readonly SIXBRIDGE_MACOS_FILE='SIX-Bridge-0.1.2-macos-unsigned.dmg'
 readonly SIXBRIDGE_RELEASE_FILES=(
     "${SIXBRIDGE_ANDROID_FILE}"
     "${SIXBRIDGE_MACOS_FILE}"
@@ -1067,7 +1067,7 @@ release_verify_apk() {
     release_assert_file_identity "${snapshot}" "${snapshot_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
     release_assert_file_identity "${apk}" "${artifact_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
     release_assert_stage_identity "${stage_root}" "${container}" "${stage_identity}" "${container_identity}" || { release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true; return 1; }
-    [[ "${version_code}" = '2' ]] || {
+    [[ "${version_code}" = '3' ]] || {
         release_remove_verification_snapshot "${snapshot_dir}" "${snapshot_dir_identity}" || true
         release_fail 'APK versionCode가 계약과 다릅니다.'
         return 1
@@ -2175,12 +2175,12 @@ release_verify_dmg() {
         release_fail 'DMG bundle ID가 계약과 다릅니다.'
         return 1
     fi
-    if [[ "${package_version}" != '1.0.1' ]]; then
+    if [[ "${package_version}" != '1.0.2' ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG package version이 계약과 다릅니다.'
         return 1
     fi
-    if [[ "${native_version}" != '1.0.1' ]]; then
+    if [[ "${native_version}" != '1.0.2' ]]; then
         release_dmg_cleanup "${mountpoint}" "${snapshot_dir}" 1 || true
         release_fail 'DMG native package version이 계약과 다릅니다.'
         return 1
@@ -2466,9 +2466,9 @@ release_write_metadata() {
         --arg signer "${signer}" \
         --arg android_sha "${android_sha}" \
         --arg macos_sha "${macos_sha}" \
-        '{schemaVersion: 1, productVersion: "0.1.1", gitCommit: $git_commit,
-          android: {file: "SIX-Bridge-Manager-0.1.1-android.apk", applicationId: "dev.sixbridge.manager", versionName: "0.1.1", versionCode: 2, signerSha256: $signer, sha256: $android_sha},
-          macos: {file: "SIX-Bridge-0.1.1-macos-unsigned.dmg", bundleId: "dev.sixbridge.desktop", productVersion: "0.1.1", nativePackageVersion: "1.0.1", minimumSystemVersion: "13.0", signed: false, notarized: false, sha256: $macos_sha}}' >"${temp_file}"; then
+        '{schemaVersion: 1, productVersion: "0.1.2", gitCommit: $git_commit,
+          android: {file: "SIX-Bridge-Manager-0.1.2-android.apk", applicationId: "dev.sixbridge.manager", versionName: "0.1.2", versionCode: 3, signerSha256: $signer, sha256: $android_sha},
+          macos: {file: "SIX-Bridge-0.1.2-macos-unsigned.dmg", bundleId: "dev.sixbridge.desktop", productVersion: "0.1.2", nativePackageVersion: "1.0.2", minimumSystemVersion: "13.0", signed: false, notarized: false, sha256: $macos_sha}}' >"${temp_file}"; then
         /bin/rm -f "${temp_file}"
         release_fail 'release metadata를 만들지 못했습니다.'
         return 1
@@ -2537,19 +2537,19 @@ release_verify_metadata() {
     if ! raw_output=$("${jq}" -er --arg signer "${expected_signer}" '
       type == "object" and
       (keys | sort) == ["android", "gitCommit", "macos", "productVersion", "schemaVersion"] and
-      .schemaVersion == 1 and .productVersion == "0.1.1" and
+      .schemaVersion == 1 and .productVersion == "0.1.2" and
       (.gitCommit | test("^[0-9a-f]{40}$")) and
       (.android | type == "object" and
         (keys | sort) == ["applicationId", "file", "sha256", "signerSha256", "versionCode", "versionName"] and
-        .file == "SIX-Bridge-Manager-0.1.1-android.apk" and
-        .applicationId == "dev.sixbridge.manager" and .versionName == "0.1.1" and
-        .versionCode == 2 and .signerSha256 == $signer and
+        .file == "SIX-Bridge-Manager-0.1.2-android.apk" and
+        .applicationId == "dev.sixbridge.manager" and .versionName == "0.1.2" and
+        .versionCode == 3 and .signerSha256 == $signer and
         (.sha256 | test("^[0-9a-f]{64}$"))) and
       (.macos | type == "object" and
         (keys | sort) == ["bundleId", "file", "minimumSystemVersion", "nativePackageVersion", "notarized", "productVersion", "sha256", "signed"] and
-        .file == "SIX-Bridge-0.1.1-macos-unsigned.dmg" and
-        .bundleId == "dev.sixbridge.desktop" and .productVersion == "0.1.1" and
-        .nativePackageVersion == "1.0.1" and .minimumSystemVersion == "13.0" and
+        .file == "SIX-Bridge-0.1.2-macos-unsigned.dmg" and
+        .bundleId == "dev.sixbridge.desktop" and .productVersion == "0.1.2" and
+        .nativePackageVersion == "1.0.2" and .minimumSystemVersion == "13.0" and
         .signed == false and .notarized == false and
         (.sha256 | test("^[0-9a-f]{64}$"))
       )

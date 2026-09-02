@@ -136,13 +136,13 @@ exec 7<&-
 release_bind_project_root "${ROOT_DIR}" || exit 1
 
 readonly KEYSTORE="${ROOT_DIR}/.local/keystore/six-bridge-manager-release.p12"
-readonly RELEASE_NOTES="${ROOT_DIR}/docs/releases/v0.1.1-ko.md"
+readonly RELEASE_NOTES="${ROOT_DIR}/docs/releases/v0.1.2-ko.md"
 readonly RELEASE_CONTAINER="${ROOT_DIR}/.local/releases"
-readonly FINAL_DIR="${RELEASE_CONTAINER}/v0.1.1"
-readonly LOCK_DIR="${RELEASE_CONTAINER}/.sixbridge-v0.1.1.lock"
+readonly FINAL_DIR="${RELEASE_CONTAINER}/v0.1.2"
+readonly LOCK_DIR="${RELEASE_CONTAINER}/.sixbridge-v0.1.2.lock"
 readonly PUBLISH_HELPER_SOURCE="${ROOT_DIR}/scripts/release-atomic-publish.pl"
 readonly ANDROID_OUTPUT="${ROOT_DIR}/android-manager/build/outputs/apk/release/android-manager-release.apk"
-readonly DMG_OUTPUT="${ROOT_DIR}/desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.1.dmg"
+readonly DMG_OUTPUT="${ROOT_DIR}/desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.2.dmg"
 
 STAGE_DIR=''
 STAGE_IDENTITY=''
@@ -766,7 +766,7 @@ publish_verified_snapshot() {
     local source_leaf final_leaf apk_identity dmg_identity sums_identity metadata_identity notes_identity status source_device source_inode source_size source_links source_digest source_fd_identity
     source_leaf=${PUBLISH_DIR##*/}
     final_leaf=${FINAL_DIR##*/}
-    [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.1 ]] || {
+    [[ "${source_leaf}" = .sixbridge-release-publish.* && "${final_leaf}" = v0.1.2 ]] || {
         release_fail 'atomic publish helper path가 올바르지 않습니다.'
         return 1
     }

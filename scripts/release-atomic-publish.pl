@@ -7,8 +7,8 @@ use Fcntl qw(O_DIRECTORY O_RDONLY O_NOFOLLOW);
 use constant O_CLOEXEC => 0x01000000;
 
 my @files = (
-    'SIX-Bridge-Manager-0.1.1-android.apk',
-    'SIX-Bridge-0.1.1-macos-unsigned.dmg',
+    'SIX-Bridge-Manager-0.1.2-android.apk',
+    'SIX-Bridge-0.1.2-macos-unsigned.dmg',
     'SHA256SUMS',
     'RELEASE-METADATA.json',
     'RELEASE-NOTES-KO.md',

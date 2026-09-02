@@ -1,18 +1,18 @@
-# SIX Bridge v0.1.1 공개 배포 안내
+# SIX Bridge v0.1.2 공개 배포 안내
 
 ## 배포 범위
 
-SIX Bridge v0.1.1은 사용자가 직접 개발했거나 적법한 변환 권한을 가진 Chrome/Edge 확장을 삼성 인터넷 30.x에서 시험하기 위한 로컬 도구의 preview 배포입니다.
+SIX Bridge v0.1.2는 사용자가 직접 개발했거나 적법한 변환 권한을 가진 Chrome/Edge 확장을 삼성 인터넷 30.x에서 시험하기 위한 로컬 도구의 preview 배포입니다.
 분석·변환 내용과 생성 결과를 원격 분석 서버에 업로드하지 않습니다. 프로젝트는 제3자 확장이나 사용자의 변환 결과를 배포하지 않습니다.
 
-배포 metadata는 제품 버전 `0.1.1`, Android versionCode `2`,
-macOS native package version `1.0.1`을 기록합니다. 변경 내용은
-[v0.1.1 릴리스 노트](releases/v0.1.1-ko.md)에서 확인하세요.
+배포 metadata는 제품 버전 `0.1.2`, Android versionCode `3`,
+macOS native package version `1.0.2`를 기록합니다. 변경 내용은
+[v0.1.2 릴리스 노트](releases/v0.1.2-ko.md)에서 확인하세요.
 
 공개 산출물은 다음 다섯 파일입니다.
 
-- `SIX-Bridge-Manager-0.1.1-android.apk`
-- `SIX-Bridge-0.1.1-macos-unsigned.dmg`
+- `SIX-Bridge-Manager-0.1.2-android.apk`
+- `SIX-Bridge-0.1.2-macos-unsigned.dmg`
 - `SHA256SUMS`
 - `RELEASE-METADATA.json`
 - `RELEASE-NOTES-KO.md`
@@ -21,7 +21,7 @@ macOS native package version `1.0.1`을 기록합니다. 변경 내용은
 
 ## Android 관리자 APK
 
-`SIX-Bridge-Manager-0.1.1-android.apk`는 Android 관리자 앱입니다. Android
+`SIX-Bridge-Manager-0.1.2-android.apk`는 Android 관리자 앱입니다. Android
 시스템 설치 화면에서 출처 허용과 설치 승인을 사용자가 직접 확인해야 하며,
 처음 설치할 때 **Google Play Protect**가 아직 인식하지 못한 개발자 앱이라는
 경고를 표시할 수 있습니다. 이 경고는 서명된 APK가 즉시 안전하다는 보증이
@@ -32,9 +32,32 @@ macOS native package version `1.0.1`을 기록합니다. 변경 내용은
 설치를 Android 시스템 화면에서 승인합니다. 삼성 인터넷 Add-ons의 활성화
 상태와 실제 동작은 별도로 확인해야 합니다.
 
+같은 application ID `dev.sixbridge.manager`와 기존 release signer를 유지하고
+Android versionCode만 `3`으로 올린 업데이트입니다. Google Play로 배포할
+때는 기존 앱의 새 업데이트 release 업로드와 검토가 필요하지만, 로컬 직접
+설치에는 Play Console 업로드가 필요하지 않습니다.
+
+## 제한적 UNKNOWN 강제 변환
+
+원래 상태가 `UNKNOWN`이고 blocking issue가 정확히 `api_usage_dynamic`뿐인
+안전 분류 입력은 사용자가 현재 작업의 위험을 명시적으로 확인한 경우에만
+강제 변환할 수 있습니다. CLI 옵션은 정확히
+`--force-compatibility-unknown`이며 기본값은 항상 거부입니다. 확인은 현재
+작업에서 한 번만 소비되고 다른 입력이나 작업에 재사용되지 않습니다.
+
+강제 결과는 원래 `UNKNOWN`, issue, 미검증 API와 서명된 provenance를
+보존하며 `COMPATIBLE` 또는 `PARTIAL`로 바꾸지 않습니다. 다른 `UNKNOWN`, 모든
+`BLOCKED`, profile 미검증, 분석 예산 초과, unavailable API·adapter와
+구조·서명·경로·identity 오류는 우회할 수 없습니다. Android 가져오기 후
+실제 설치에는 별도의 작업별 확인을 다시 요구합니다.
+
+제품 릴리스에는 사용자 `.six`, `.sixdraft`, CRX, 특정 확장 소스·바이너리·
+변환 결과와 key를 포함하지 않습니다. 저장소의 일반화된 fixture와 검증
+script는 제품 검증 자료이지 특정 확장 데이터 배포물이 아닙니다.
+
 ## macOS preview DMG
 
-`SIX-Bridge-0.1.1-macos-unsigned.dmg`는 **미서명·미공증** preview입니다.
+`SIX-Bridge-0.1.2-macos-unsigned.dmg`는 **미서명·미공증** preview입니다.
 따라서 macOS Gatekeeper가 개발자를 확인할 수 없다는 경고를 표시할 수
 있습니다. 이 파일은 Apple Developer ID 서명이나 Apple 공증을 받지 않았으며,
 Gatekeeper를 자동으로 우회하거나 시스템 보안 설정을 변경하지 않습니다.
@@ -55,8 +78,8 @@ DMG를 연 뒤 `SIX Bridge.app`을 `Applications` 링크로 끌어 놓으세요.
 예를 들어 다음 명령으로 확인할 수 있습니다.
 
 ```sh
-shasum -a 256 SIX-Bridge-Manager-0.1.1-android.apk
-shasum -a 256 SIX-Bridge-0.1.1-macos-unsigned.dmg
+shasum -a 256 SIX-Bridge-Manager-0.1.2-android.apk
+shasum -a 256 SIX-Bridge-0.1.2-macos-unsigned.dmg
 ```
 
 값이 다르거나 metadata의 제품 버전·signer 정보가 기대와 다르면 설치하거나
@@ -80,7 +103,7 @@ bash scripts/android-manager-distribution.test.sh
 
 `./scripts/verify.sh`는 기존 Android·desktop·core 검증과 위 release 회귀를
 함께 실행합니다. 이 자동 검증은 실제 release key를 생성하거나,
-`.local/releases/v0.1.1/`을 게시하거나, 원격 branch·tag·Release를
+`.local/releases/v0.1.2/`을 게시하거나, 원격 branch·tag·Release를
 변경하지 않습니다.
 
 ## 자동 검증 이후 수동 gate
@@ -93,7 +116,7 @@ bash scripts/android-manager-distribution.test.sh
   내보내기, 삼성 인터넷 Add-ons 활성화·실행을 확인합니다.
 - macOS에서 DMG mount·복사와 미서명·미공증 Gatekeeper 경고가 이
   문서의 안내와 일치하는지 확인합니다.
-- 원격 `main` push, annotated `v0.1.1` tag, Git 서버 Release 첨부는
+- 원격 `main` push, annotated `v0.1.2` tag, Git 서버 Release 첨부는
   별도의 명시적 승인 후에만 진행합니다.
 
 자동 검증 통과를 key 백업, 실기기 작동, Gatekeeper 확인 또는 원격
