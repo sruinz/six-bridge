@@ -137,6 +137,7 @@ class ManagerViewModel(
     private var installApkDocumentTransactionJob: Job? = null
     private val installApkDocumentIoMutex = Mutex()
     private var installApkTransactionRestoreInvalid = false
+    private var cleanupReceiptOnlyStartupBlock = false
     private var restoredInstallApkDocumentTransaction =
         restoreInstallApkDocumentTransaction()
     private var operationGeneration = 0L
@@ -4425,8 +4426,34 @@ class ManagerViewModel(
                 InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
             )
         ) return false
+        val completedPhase = terminal.phase
+        val currentEffect = pendingSystemInstallApkDocument?.takeIf {
+            it.importToken == key.importToken &&
+                it.ownerGeneration == key.ownerGeneration &&
+                it.launchId == key.launchId
+        }
         mutableInstallApkDocumentTransaction.value = InstallApkDocumentTransactionState.Idle
         clearInstallApkDocumentTransactionJournal(key)
+        if (completedPhase in setOf(
+                InstallApkDocumentTransactionPhase.CLEANED_HANDOFF_PENDING,
+                InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
+            )
+        ) {
+            currentEffect?.let { completeSystemInstallApkDocument(it, null) }
+        }
+        if (completedPhase ==
+            InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING &&
+            cleanupReceiptOnlyStartupBlock &&
+            !generatedCleanupRestoreInvalid &&
+            !generatedTerminalHandoffRestoreInvalid &&
+            !installApkTransactionRestoreInvalid
+        ) {
+            cleanupReceiptOnlyStartupBlock = false
+            mutableState.update {
+                it.copy(startupRecoveryState = StartupRecoveryUiState.INITIALIZING)
+            }
+            viewModelScope.launch { markStartupRecoveryReady() }
+        }
         return true
     }
 
@@ -4603,6 +4630,7 @@ class ManagerViewModel(
                 InstallApkDocumentTransactionPhase.CLEANUP_FAILED,
                 InstallApkDocumentTransactionPhase.CLEANUP_RETRY_IN_FLIGHT,
             ) -> {
+                cleanupReceiptOnlyStartupBlock = true
                 val failedPhase = InstallApkDocumentTransactionPhase.CLEANUP_FAILED
                 persistInstallApkDocumentTransaction(key, failedPhase)
                 mutableInstallApkDocumentTransaction.value =

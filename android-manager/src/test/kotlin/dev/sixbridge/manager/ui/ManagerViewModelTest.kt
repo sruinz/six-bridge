@@ -4357,6 +4357,7 @@ class ManagerViewModelTest {
                 saveInstallApkDocument = { _, _ ->
                     GeneratedDocumentSaveResult.Failure(cleanupFailed = true)
                 },
+                deleteInstallApkDocument = { true },
             )
             advanceUntilIdle()
             viewModel.accept(ManagerAction.InstallReviewedBundle)
@@ -4382,6 +4383,64 @@ class ManagerViewModelTest {
                     viewModel.installApkDocumentTransaction.value,
                 ).phase,
             )
+            val receipt = requireNotNull(message.installApkCleanupReceipt)
+            viewModel.accept(ManagerAction.RetryInstallApkCleanup(receipt))
+            advanceUntilIdle()
+            val resolved = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertEquals(
+                InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
+                resolved.phase,
+            )
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(resolved.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(resolved.key))
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
+    fun `현재 owner의 APK 저장 실패 terminal ACK는 재시도 메시지를 복원한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+                saveInstallApkDocument = { _, _ ->
+                    GeneratedDocumentSaveResult.Failure(cleanupFailed = false)
+                },
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+            assertTrue(viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/fail"))
+            assertTrue(viewModel.startInstallApkDocumentTransaction(effect, "content://apk/fail"))
+            advanceUntilIdle()
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(terminal.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(terminal.key))
+
+            assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+            assertEquals(UserMessageKind.LAUNCH_FAILED, viewModel.state.value.message?.kind)
         }
 
     @Test
@@ -4425,6 +4484,13 @@ class ManagerViewModelTest {
 
             assertEquals(listOf("content://apk/stale"), deleted)
             assertFalse(repository.installFlow.value is InstallState.AwaitingManualInstall)
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(terminal.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(terminal.key))
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertFalse(viewModel.state.value.message?.recoveryAction == RecoveryAction.RETRY)
         }
 
     @Test
@@ -4620,6 +4686,47 @@ class ManagerViewModelTest {
                 assertIs<InstallApkDocumentTransactionState.Terminal>(
                     viewModel.installApkDocumentTransaction.value,
                 ).phase,
+            )
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(terminal.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(terminal.key))
+            advanceUntilIdle()
+            assertEquals(StartupRecoveryUiState.READY, viewModel.state.value.startupRecoveryState)
+        }
+
+    @Test
+    fun `cleanup receipt 외 복구 차단이 있으면 ACK 뒤에도 startup을 해제하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.Idle
+                },
+                SavedStateHandle(
+                    apkTransactionJournal(review.token, "CLEANUP_FAILED") +
+                        mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token),
+                ),
+                deleteInstallApkDocument = { true },
+            )
+            advanceUntilIdle()
+            val receipt = requireNotNull(viewModel.state.value.message?.installApkCleanupReceipt)
+            viewModel.preserveUnattributedInstallApkDocument("content://apk/unrelated")
+            viewModel.accept(ManagerAction.RetryInstallApkCleanup(receipt))
+            advanceUntilIdle()
+            val terminal = assertIs<InstallApkDocumentTransactionState.Terminal>(
+                viewModel.installApkDocumentTransaction.value,
+            )
+
+            assertTrue(viewModel.prepareInstallApkDocumentTerminalHandoff(terminal.key))
+            assertTrue(viewModel.acknowledgeInstallApkDocumentTerminal(terminal.key))
+            advanceUntilIdle()
+
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
             )
         }
 
