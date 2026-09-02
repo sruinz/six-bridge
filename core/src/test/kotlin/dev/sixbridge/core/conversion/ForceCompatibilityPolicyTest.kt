@@ -1,5 +1,7 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
@@ -71,6 +73,32 @@ class ForceCompatibilityPolicyTest {
                 listOf("api_usage_dynamic"),
             ),
             provenance,
+        )
+    }
+
+    @Test
+    fun `서명 APK에 결합된 v6 report만 contract provenance를 복원한다`() {
+        val source = report(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(CompatibilityIssue("api_usage_dynamic", "dynamic", true)),
+        )
+        val provenance = ForceCompatibilityPolicy.requireProvenance(
+            source,
+            ConversionAuthorization.forceUnknownApiUsage(),
+        )
+        val contract = SixBundle.toContractV6(
+            source,
+            originalSourceSha256 = "c".repeat(64),
+            planSha256 = "d".repeat(64),
+            forcedCompatibility = provenance,
+        )
+
+        assertEquals(
+            provenance,
+            ForceCompatibilityPolicy.requireBoundContractProvenance(
+                contract,
+                CompatibilityApkBinding.canonicalSha256(contract),
+            ),
         )
     }
 

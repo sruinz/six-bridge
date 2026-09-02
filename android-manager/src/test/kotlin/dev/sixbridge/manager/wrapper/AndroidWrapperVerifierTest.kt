@@ -3,6 +3,9 @@ package dev.sixbridge.manager.wrapper
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
+import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -66,6 +69,55 @@ class AndroidWrapperVerifierTest {
         )
 
         assertIs<WrapperVerificationResult.Success>(result)
+    }
+
+    @Test
+    fun `v6 forced report는 서명 APK canonical binding이 일치할 때만 검증한다`() {
+        val fixture = fixture()
+        val report = fixture.report.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(ContractIssue("api_usage_dynamic", "dynamic", true)),
+            unverifiedApis = listOf("runtime.computed"),
+            originalSourceSha256 = "4".repeat(64),
+            planSha256 = "5".repeat(64),
+            forcedCompatibility = ContractForcedCompatibility(
+                "UNKNOWN_API_USAGE",
+                ContractCompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            ),
+        )
+        val digest = CompatibilityApkBinding.canonicalSha256(report)
+
+        val success = verifier(
+            fixture.facts.copy(compatibilityCanonicalSha256 = digest),
+        ).verify(fixture.wrapperFile, fixture.descriptor, report)
+        val mismatch = verifier(
+            fixture.facts.copy(compatibilityCanonicalSha256 = "0".repeat(64)),
+        ).verify(fixture.wrapperFile, fixture.descriptor, report)
+
+        assertEquals(
+            digest,
+            assertIs<WrapperVerificationResult.Success>(success)
+                .value.compatibilityCanonicalSha256,
+        )
+        assertEquals(
+            ImportFailureCode.REPORT_PROOF_INVALID,
+            assertIs<WrapperVerificationResult.Failure>(mismatch).reason.code,
+        )
+    }
+
+    @Test
+    fun `legacy report에 v6 binding asset을 남기면 downgrade로 거부한다`() {
+        val fixture = fixture()
+        val result = verifier(
+            fixture.facts.copy(compatibilityCanonicalSha256 = "0".repeat(64)),
+        ).verify(fixture.wrapperFile, fixture.descriptor, fixture.report)
+
+        assertEquals(
+            ImportFailureCode.REPORT_PROOF_INVALID,
+            assertIs<WrapperVerificationResult.Failure>(result).reason.code,
+        )
     }
 
     @Test

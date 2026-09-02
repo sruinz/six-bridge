@@ -6,7 +6,10 @@ import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
 import dev.sixbridge.manager.app.ReviewBundle
@@ -43,6 +46,108 @@ import org.junit.rules.TemporaryFolder
 class OnDeviceConversionCoordinatorTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `eligible UNKNOWN은 typed 승인 없이는 output side effect 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.events.none { it in setOf("prepare", "identity", "bind", "reserve", "building", "package", "publish") })
+    }
+
+    @Test
+    fun `eligible UNKNOWN typed 승인은 재분석부터 bind까지 같은 provenance를 사용한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        assertIs<ConversionBuildResult.BundleReady>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+        )
+
+        assertEquals(
+            listOf(
+                ConversionAuthorization.forceUnknownApiUsage(),
+                ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+            fixture.runtimeAuthorizations,
+        )
+    }
+
+    @Test
+    fun `불필요한 typed 승인은 output side effect 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf())
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = true,
+                identitySelection = null,
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.events.none { it in setOf("prepare", "identity", "bind", "reserve", "building", "package", "publish") })
+    }
+
+    @Test
+    fun `승인 뒤 issue drift는 output side effect 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+            preparedIssueMessage = "changed dynamic API"
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.TRANSFORM_MISMATCH, failure.code)
+        assertTrue(fixture.events.none { it in setOf("identity", "bind", "reserve", "building", "package", "publish") })
+    }
 
     @Test
     fun `begin은 reclaim acquire create release 뒤에만 분석한다`() = runTest {
@@ -287,9 +392,9 @@ class OnDeviceConversionCoordinatorTest {
                 "prepare",
                 "identity",
                 "installed",
+                "bind",
                 "reserve",
                 "building",
-                "bind",
                 "package",
                 "publish",
                 "import",
@@ -1492,6 +1597,9 @@ class OnDeviceConversionCoordinatorTest {
         val releasedTokens = mutableListOf<String>()
         var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
+        var eligibleUnknown = false
+        var preparedIssueMessage: String? = null
+        val runtimeAuthorizations = mutableListOf<ConversionAuthorization>()
         var analysisBlockingEntered: CountDownLatch? = null
         var analysisBlockingGate: CountDownLatch? = null
         var analysisPolicy: AnalysisSafetyPolicy? = null
@@ -1705,11 +1813,35 @@ class OnDeviceConversionCoordinatorTest {
                     return prepared(profile)
                 }
 
+                override fun prepare(
+                    input: File,
+                    kind: OnDeviceInputKind,
+                    profile: BrowserProfile,
+                    approvedAdapterIds: Set<String>,
+                    control: AnalysisControl,
+                    authorization: ConversionAuthorization,
+                ): PreparedConversionSnapshot {
+                    runtimeAuthorizations += authorization
+                    events += "prepare"
+                    return prepared(profile, authorization)
+                }
+
                 override fun bind(
                     prepared: PreparedConversionSnapshot,
                     profile: BrowserProfile,
                     identity: OnDevicePackageIdentity,
                 ): BoundConversionSnapshot {
+                    events += "bind"
+                    return bound(profile)
+                }
+
+                override fun bind(
+                    prepared: PreparedConversionSnapshot,
+                    profile: BrowserProfile,
+                    identity: OnDevicePackageIdentity,
+                    authorization: ConversionAuthorization,
+                ): BoundConversionSnapshot {
+                    runtimeAuthorizations += authorization
                     events += "bind"
                     return bound(profile)
                 }
@@ -1888,7 +2020,7 @@ class OnDeviceConversionCoordinatorTest {
         )
 
         private fun analysis(profile: BrowserProfile) = ConversionAnalysisSnapshot(
-            report = coreReport(profile, compatibilityStatus),
+            report = report(profile),
             selectedAutomaticAdapters = emptySet(),
             requiredApprovals = setOf("adapter"),
             optionalApprovals = optionalApprovals,
@@ -1896,10 +2028,19 @@ class OnDeviceConversionCoordinatorTest {
             identityMode = analysisIdentityMode,
         )
 
-        private fun prepared(profile: BrowserProfile) = PreparedConversionSnapshot(
-            reportBefore = coreReport(profile, compatibilityStatus).copy(
+        private fun prepared(
+            profile: BrowserProfile,
+            authorization: ConversionAuthorization = ConversionAuthorization.NONE,
+        ): PreparedConversionSnapshot {
+            val report = report(profile).let { current ->
+                preparedIssueMessage?.let { message ->
+                    current.copy(issues = current.issues.map { it.copy(message = message) })
+                } ?: current
+            }.copy(
                 sourceSha256 = preparedSourceSha256,
-            ),
+            )
+            return PreparedConversionSnapshot(
+            reportBefore = report,
             originalSourceSha256 = "4".repeat(64),
             planSha256 = "5".repeat(64),
             transformedSourceZip = "zip".encodeToByteArray(),
@@ -1910,7 +2051,12 @@ class OnDeviceConversionCoordinatorTest {
             descriptorVersion = "1.0",
             sourceKind = "CRX3",
             opaque = Unit,
+            forcedCompatibility = ForceCompatibilityPolicy.requireProvenance(
+                report,
+                authorization,
+            ),
         )
+        }
 
         private fun bound(profile: BrowserProfile) = BoundConversionSnapshot(
             sourceZip = "zip".encodeToByteArray(),
@@ -1919,6 +2065,23 @@ class OnDeviceConversionCoordinatorTest {
             extensionId = EXTENSION_ID,
             sourceKind = "CRX3",
         )
+
+        private fun report(profile: BrowserProfile): CompatibilityReport =
+            coreReport(profile, compatibilityStatus).let { base ->
+                if (compatibilityStatus == CompatibilityStatus.UNKNOWN && eligibleUnknown) {
+                    base.copy(
+                        issues = listOf(
+                            CompatibilityIssue(
+                                code = "api_usage_dynamic",
+                                message = "dynamic API",
+                                blocking = true,
+                            ),
+                        ),
+                    )
+                } else {
+                    base
+                }
+            }
     }
 
     companion object {

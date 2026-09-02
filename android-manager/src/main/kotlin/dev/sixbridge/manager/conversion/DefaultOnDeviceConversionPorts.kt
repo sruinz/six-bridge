@@ -10,6 +10,8 @@ import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.AdapterDisposition
 import dev.sixbridge.core.conversion.ConversionPreparationEngine
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.core.conversion.LogicalIdentityEvidence
 import dev.sixbridge.core.conversion.LogicalSourceIdentityResult
 import dev.sixbridge.core.conversion.PreparedConversion
@@ -177,6 +179,7 @@ internal class DefaultConversionRuntime(
         profile,
         approvedAdapterIds,
         AnalysisControl(),
+        ConversionAuthorization.NONE,
     )
 
     override fun prepare(
@@ -185,6 +188,22 @@ internal class DefaultConversionRuntime(
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
         control: AnalysisControl,
+    ): PreparedConversionSnapshot = prepare(
+        input,
+        kind,
+        profile,
+        approvedAdapterIds,
+        control,
+        ConversionAuthorization.NONE,
+    )
+
+    override fun prepare(
+        input: File,
+        kind: OnDeviceInputKind,
+        profile: BrowserProfile,
+        approvedAdapterIds: Set<String>,
+        control: AnalysisControl,
+        authorization: ConversionAuthorization,
     ): PreparedConversionSnapshot {
         var sourceKind = kind.name
         val prepared = if (kind == OnDeviceInputKind.SIX_DRAFT) {
@@ -193,7 +212,13 @@ internal class DefaultConversionRuntime(
                 throw AnalysisBudgetExceededException(controlled.exceeded)
             }
             if (controlled is ControlledSixDraft.Prepared) {
-                return preparedSnapshot(controlled.verified, profile, approvedAdapterIds, control)
+                return preparedSnapshot(
+                    controlled.verified,
+                    profile,
+                    approvedAdapterIds,
+                    control,
+                    authorization,
+                )
             }
             val draft = (controlled as ControlledSixDraft.Legacy).verified
             sourceKind = when (draft.payload.sourceKind) {
@@ -220,6 +245,7 @@ internal class DefaultConversionRuntime(
                         profile,
                         approvedAdapterIds,
                         control,
+                        authorization,
                     )
                 }
             }
@@ -230,8 +256,17 @@ internal class DefaultConversionRuntime(
                     profile,
                     approvedAdapterIds,
                     control,
+                    authorization,
                 )
             }
+        }
+        require(
+            ForceCompatibilityPolicy.requireProvenance(
+                prepared.compatibilityBefore,
+                authorization,
+            ) == prepared.forcedCompatibility,
+        ) {
+            "강제 승인 값이 준비 결과 provenance와 다릅니다."
         }
         val after = prepared.compatibilityAfter
         val inputKind = ExtensionInputKind.valueOf(sourceKind)
@@ -257,6 +292,7 @@ internal class DefaultConversionRuntime(
             descriptorVersion = requireNotNull(after.extensionVersion),
             sourceKind = sourceKind,
             opaque = prepared,
+            forcedCompatibility = prepared.forcedCompatibility,
         )
     }
 
@@ -264,6 +300,18 @@ internal class DefaultConversionRuntime(
         prepared: PreparedConversionSnapshot,
         profile: BrowserProfile,
         identity: OnDevicePackageIdentity,
+    ): BoundConversionSnapshot = bind(
+        prepared,
+        profile,
+        identity,
+        ConversionAuthorization.NONE,
+    )
+
+    override fun bind(
+        prepared: PreparedConversionSnapshot,
+        profile: BrowserProfile,
+        identity: OnDevicePackageIdentity,
+        authorization: ConversionAuthorization,
     ): BoundConversionSnapshot {
         if (prepared.identityMode == InstallationIdentityMode.PREPARED) {
             val verified = prepared.opaque as VerifiedPreparedSixDraft
@@ -279,13 +327,22 @@ internal class DefaultConversionRuntime(
             ) {
                 "prepared CRX proof와 package identity가 다릅니다."
             }
+            require(
+                ForceCompatibilityPolicy.requireProvenance(
+                    prepared.reportBefore,
+                    authorization,
+                ) == verified.plan.forcedCompatibility,
+            ) {
+                "prepared draft 강제 승인 값이 signed plan과 다릅니다."
+            }
             return BoundConversionSnapshot(
                 sourceZip = ByteArray(0),
                 passthroughCrx = null,
-                compatibility = SixBundle.toContractV4(
+                compatibility = SixBundle.toContractV6(
                     verified.compatibilityAfter,
                     verified.expected.originalSourceSha256,
                     verified.expected.planSha256,
+                    verified.plan.forcedCompatibility,
                 ),
                 extensionId = identity.extensionId,
                 sourceKind = verified.input.inputKind.name,
@@ -298,15 +355,17 @@ internal class DefaultConversionRuntime(
                 prepared.opaque as PreparedConversion,
                 profile,
                 identity.crxPublicKeyDer,
+                authorization,
             )
         }
         return BoundConversionSnapshot(
             sourceZip = bound.sourceZip,
             passthroughCrx = bound.passthroughCrx,
-            compatibility = SixBundle.toContractV4(
+            compatibility = SixBundle.toContractV6(
                 bound.compatibility,
                 prepared.originalSourceSha256,
                 prepared.planSha256,
+                bound.forcedCompatibility,
             ),
             extensionId = bound.extensionId,
             sourceKind = prepared.sourceKind,
@@ -318,6 +377,7 @@ internal class DefaultConversionRuntime(
         profile: BrowserProfile,
         approvedAdapterIds: Set<String>,
         control: AnalysisControl,
+        authorization: ConversionAuthorization,
     ): PreparedConversionSnapshot {
         require(verified.input.browserProfileSha256 == profile.canonicalSha256()) {
             "prepared draft profile proof가 현재 profile과 다릅니다."
@@ -327,6 +387,14 @@ internal class DefaultConversionRuntime(
                 verified.plan.selectedAdapters.mapTo(sortedSetOf()) { it.id },
         ) {
             "prepared draft approvals가 signed plan과 다릅니다."
+        }
+        require(
+            ForceCompatibilityPolicy.requireProvenance(
+                verified.compatibilityBefore,
+                authorization,
+            ) == verified.plan.forcedCompatibility,
+        ) {
+            "prepared draft 강제 승인 값이 signed plan과 다릅니다."
         }
         return PreparedConversionSnapshot(
             reportBefore = verified.compatibilityBefore,
@@ -344,6 +412,7 @@ internal class DefaultConversionRuntime(
             opaque = verified,
             preparedCrx = verified.preparedCrx,
             control = control,
+            forcedCompatibility = verified.plan.forcedCompatibility,
         )
     }
 
@@ -396,7 +465,7 @@ internal class DefaultConversionRuntime(
     ): PortableExtensionInput {
         val payload = draft.payload
         val signedIdentity = payload.draft.sourceIdentity
-            .takeIf { payload.draft.schemaVersion == 2 }
+            .takeIf { payload.draft.schemaVersion in setOf(2, 4) }
         return when (payload.sourceKind) {
             dev.sixbridge.core.draft.DraftSourceKind.ZIP ->
                 PortableExtensionInput.fromZip(

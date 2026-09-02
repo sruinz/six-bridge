@@ -43,6 +43,21 @@ class ConversionWorkStoreTest {
     private lateinit var sourceRoot: File
     private lateinit var dao: FakeConversionJobDao
     private lateinit var identityDao: FakeOwnerIdentityDao
+
+    @Test
+    fun `강제 변환 승인은 Room schema와 job entity에 저장하지 않는다`() {
+        val databaseSource = requireNotNull(sequenceOf(
+            File("android-manager/src/main/kotlin/dev/sixbridge/manager/catalog/ManagerDatabase.kt"),
+            File("src/main/kotlin/dev/sixbridge/manager/catalog/ManagerDatabase.kt"),
+        ).firstOrNull(File::isFile))
+
+        assertTrue(databaseSource.readText().contains("version = 5"))
+        assertFalse(
+            ConversionJobEntity::class.java.declaredFields.any {
+                it.name.contains("force", ignoreCase = true)
+            },
+        )
+    }
     private lateinit var committedOutputCleaner: FakeCommittedOutputCleaner
     private var now = 1_800_000_000_000L
     private var tokenSequence = 0

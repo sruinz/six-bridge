@@ -141,6 +141,10 @@ object SixBundle {
         )
     }
 
+    fun toCoreCompatibility(
+        compatibility: ContractCompatibilityReport,
+    ): CompatibilityReport = compatibility.toCore()
+
     private fun ExtensionDescriptor.toContract() = ContractExtensionDescriptor(
         schemaVersion = 1,
         extensionId = extensionId,

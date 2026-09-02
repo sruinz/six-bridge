@@ -4,6 +4,8 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.input.ExtensionInputKind
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.draft.VerifiedPreparedCrxArtifact
@@ -127,6 +129,7 @@ internal data class PreparedConversionSnapshot(
     val opaque: Any,
     val preparedCrx: VerifiedPreparedCrxArtifact? = null,
     val control: AnalysisControl? = null,
+    val forcedCompatibility: ForcedCompatibilityProvenance? = null,
 )
 
 internal fun installationIdentityMode(
@@ -282,11 +285,33 @@ internal interface ConversionRuntimePort {
         approvedAdapterIds,
     )
 
+    fun prepare(
+        input: File,
+        kind: OnDeviceInputKind,
+        profile: BrowserProfile,
+        approvedAdapterIds: Set<String>,
+        control: AnalysisControl,
+        authorization: ConversionAuthorization,
+    ): PreparedConversionSnapshot = prepare(
+        input,
+        kind,
+        profile,
+        approvedAdapterIds,
+        control,
+    )
+
     fun bind(
         prepared: PreparedConversionSnapshot,
         profile: BrowserProfile,
         identity: OnDevicePackageIdentity,
     ): BoundConversionSnapshot
+
+    fun bind(
+        prepared: PreparedConversionSnapshot,
+        profile: BrowserProfile,
+        identity: OnDevicePackageIdentity,
+        authorization: ConversionAuthorization,
+    ): BoundConversionSnapshot = bind(prepared, profile, identity)
 }
 
 internal interface ConversionIdentityPort {
@@ -338,6 +363,18 @@ internal interface ConversionCoordinatorPort {
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
     ): ConversionBuildResult
+    suspend fun build(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        authorization: ConversionAuthorization,
+    ): ConversionBuildResult = build(
+        token,
+        approvedAdapterIds,
+        partialConfirmed,
+        identitySelection,
+    )
     suspend fun restore(importReview: Boolean = true): RestoredConversion?
     suspend fun discard(token: String): Boolean
     fun copyGenerated(token: String, output: OutputStream): String?

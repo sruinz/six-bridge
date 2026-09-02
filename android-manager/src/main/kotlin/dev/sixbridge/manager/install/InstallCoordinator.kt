@@ -45,6 +45,7 @@ class InstallCoordinator(
     suspend fun request(
         bundle: ImportedBundle,
         partialConfirmed: Boolean,
+        forceCompatibilityConfirmed: Boolean = false,
     ): InstallState = mutex.withLock {
         when (val final = pendingStore.finalReceiptSnapshot()) {
             is RecoveryRecordSnapshot.Present -> {
@@ -110,6 +111,18 @@ class InstallCoordinator(
             }
 
             is InstallDecision.Allowed -> {
+                if (decision.requiresForcedCompatibilityConfirmation &&
+                    !forceCompatibilityConfirmed
+                ) {
+                    finishUnclaimed(
+                        bundle,
+                        InstallState.Failed(
+                            code = "FORCED_COMPATIBILITY_CONFIRMATION_REQUIRED",
+                            message = "강제 변환 결과의 설치 확인이 필요합니다.",
+                        ),
+                    )
+                    return@withLock mutableState.value
+                }
                 if (decision.requiresPartialConfirmation && !partialConfirmed) {
                     finishUnclaimed(
                         bundle,

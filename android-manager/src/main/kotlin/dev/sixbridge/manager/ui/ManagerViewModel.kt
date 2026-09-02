@@ -5,6 +5,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
 import dev.sixbridge.manager.app.ManagerRestoreResult
@@ -246,6 +248,13 @@ class ManagerViewModel(
             ManagerAction.ConfirmConversionPartial -> updateConversionAnalysis {
                 it.copy(partialConfirmed = true)
             }
+            ManagerAction.ConfirmConversionForce -> updateConversionAnalysis {
+                if (ForceCompatibilityPolicy.isEligible(it.report)) {
+                    it.copy(forceCompatibilityConfirmed = true)
+                } else {
+                    it
+                }
+            }
             ManagerAction.SelectNewConversionIdentity -> updateConversionAnalysis {
                 it.selectIdentity(InstallationIdentitySelection.CreateNew)
             }
@@ -284,6 +293,7 @@ class ManagerViewModel(
             is ManagerAction.GeneratedCleanupDestinationPresented ->
                 acknowledgeGeneratedCleanupDestination(action.token)
             ManagerAction.ConfirmPartial -> confirmPartial()
+            ManagerAction.ConfirmForcedInstall -> confirmForcedInstall()
             ManagerAction.PrepareReviewedInstall -> prepareReviewedInstall()
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             is ManagerAction.InstallApkCreated ->
@@ -353,6 +363,7 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
+        updateConversionAnalysis { it.copy(forceCompatibilityConfirmed = false) }
         invalidatePendingDocumentLaunches()
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
@@ -763,10 +774,16 @@ class ManagerViewModel(
         if (!ready.canBuild || routeOperation?.isActive == true) return
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
+        val authorization = if (ready.forceCompatibilityConfirmed) {
+            ConversionAuthorization.forceUnknownApiUsage()
+        } else {
+            ConversionAuthorization.NONE
+        }
+        val consumedReady = ready.copy(forceCompatibilityConfirmed = false)
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionAnalysis(ready.token),
-                conversionState = ConversionUiState.Building(ready.token, ready),
+                conversionState = ConversionUiState.Building(ready.token, consumedReady),
                 message = null,
             )
         }
@@ -778,6 +795,7 @@ class ManagerViewModel(
                     approvedAdapterIds = ready.selectedAdapters,
                     partialConfirmed = ready.partialConfirmed,
                     identitySelection = ready.identitySelection,
+                    authorization = authorization,
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -802,7 +820,7 @@ class ManagerViewModel(
                         mutableState.update {
                             it.copy(
                                 route = ManagerRoute.ConversionAnalysis(ready.token),
-                                conversionState = ready,
+                                conversionState = consumedReady,
                                 message = conversionFailureMessage(result.code),
                             )
                         }
@@ -832,6 +850,11 @@ class ManagerViewModel(
         savedStateHandle[INSTALL_OWNER_CONVERSION_TOKEN_KEY] = result.token
         mutableState.update {
             it.copy(
+                route = if (review.forcedCompatibility != null) {
+                    ManagerRoute.Review(review.token)
+                } else {
+                    it.route
+                },
                 conversionState = result.copy(installOwnerActive = true),
                 importState = ImportUiState.ReviewReady(
                     review = review,
@@ -840,7 +863,7 @@ class ManagerViewModel(
                 message = null,
             )
         }
-        installReviewedBundle()
+        if (review.forcedCompatibility == null) installReviewedBundle()
     }
 
     private fun requestGeneratedSave() {
@@ -1906,6 +1929,21 @@ class ManagerViewModel(
         mutableState.update { it.copy(importState = ready.copy(partialConfirmed = true), message = null) }
     }
 
+    private fun confirmForcedInstall() {
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        if (ready.review.status != ContractCompatibilityStatus.UNKNOWN ||
+            ready.review.forcedCompatibility == null
+        ) {
+            return
+        }
+        mutableState.update {
+            it.copy(
+                importState = ready.copy(forceCompatibilityConfirmed = true),
+                message = null,
+            )
+        }
+    }
+
     private fun prepareReviewedInstall() {
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
         if (mutableState.value.route != ManagerRoute.Review(ready.review.token)) return
@@ -1940,6 +1978,14 @@ class ManagerViewModel(
         if (installJob?.isActive == true) return
         val generation = operationGeneration
         val reviewToken = ready.review.token
+        val partialConfirmed = ready.partialConfirmed
+        val forceCompatibilityConfirmed = ready.forceCompatibilityConfirmed
+        mutableState.update {
+            it.copy(
+                importState = ready.copy(forceCompatibilityConfirmed = false),
+                message = null,
+            )
+        }
         installJob = viewModelScope.launch {
             val manualOwnerToken = when (val state = repository.installState.value) {
                 is InstallState.PreparingApkExport -> state.importToken
@@ -1971,7 +2017,15 @@ class ManagerViewModel(
                     return@launch
                 }
             }
-            val attemptResult = repository.install(ready.review, ready.partialConfirmed)
+            val attemptResult = if (ready.review.forcedCompatibility == null) {
+                repository.install(ready.review, partialConfirmed)
+            } else {
+                repository.install(
+                    ready.review,
+                    partialConfirmed,
+                    forceCompatibilityConfirmed,
+                )
+            }
             if (generation != operationGeneration) return@launch
             val generatedOwner = generatedInstallOwnerToken
             val stillOwnsAttempt = ownedReviewToken == reviewToken &&

@@ -8,6 +8,7 @@ import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
 import dev.sixbridge.manager.GeneratedDocumentSaveResult
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
@@ -45,6 +46,8 @@ import dev.sixbridge.manager.navigation.FileManagerNavigator
 import dev.sixbridge.manager.uninstall.UninstallOutcome
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
@@ -3518,6 +3521,180 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(1, repository.conversionBuildRequests.size)
+        }
+
+    @Test
+    fun `강제 생성 확인은 build 클릭 즉시 소비되고 실패 뒤 재사용되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                conversionBuildResult =
+                    ConversionBuildResult.Failure(ConversionFailureCode.PACKAGE)
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+            assertTrue(
+                assertIs<ConversionUiState.AnalysisReady>(
+                    viewModel.state.value.conversionState,
+                ).forceCompatibilityConfirmed,
+            )
+            viewModel.accept(ManagerAction.BuildConversion)
+            assertFalse(
+                assertIs<ConversionUiState.Building>(
+                    viewModel.state.value.conversionState,
+                ).previous.forceCompatibilityConfirmed,
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                ConversionAuthorization.forceUnknownApiUsage(),
+                repository.conversionBuildRequests.single().authorization,
+            )
+            assertFalse(
+                assertIs<ConversionUiState.AnalysisReady>(
+                    viewModel.state.value.conversionState,
+                ).forceCompatibilityConfirmed,
+            )
+        }
+
+    @Test
+    fun `강제 생성 확인은 process recreation에서 복원되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "analysis",
+                ),
+            )
+            val firstRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.Analysis(forcedConversionAnalysis())
+            }
+            val first = ManagerViewModel(firstRepository, savedState)
+            advanceUntilIdle()
+            first.accept(ManagerAction.ConfirmConversionForce)
+            assertTrue(
+                assertIs<ConversionUiState.AnalysisReady>(
+                    first.state.value.conversionState,
+                ).forceCompatibilityConfirmed,
+            )
+
+            val recreatedRepository = FakeManagerRepository().apply {
+                restoredConversion = RestoredConversion.Analysis(forcedConversionAnalysis())
+            }
+            val recreated = ManagerViewModel(recreatedRepository, savedState)
+            advanceUntilIdle()
+
+            assertFalse(
+                assertIs<ConversionUiState.AnalysisReady>(
+                    recreated.state.value.conversionState,
+                ).forceCompatibilityConfirmed,
+            )
+        }
+
+    @Test
+    fun `강제 생성 확인은 새 import 시작 즉시 소멸한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+
+            viewModel.startImport {
+                ManagerImportResult.Failure(
+                    ImportFailure(ImportFailureCode.SOURCE_UNREADABLE),
+                )
+            }
+
+            assertFalse(
+                assertIs<ConversionUiState.AnalysisReady>(
+                    viewModel.state.value.conversionState,
+                ).forceCompatibilityConfirmed,
+            )
+            advanceUntilIdle()
+        }
+
+    @Test
+    fun `강제 설치 확인은 process recreation에서 복원되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val review = forcedReview()
+            val firstRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = review)
+            }
+            val first = ManagerViewModel(firstRepository, savedState)
+            advanceUntilIdle()
+            first.accept(ManagerAction.ConfirmForcedInstall)
+            assertTrue(
+                assertIs<ImportUiState.ReviewReady>(
+                    first.state.value.importState,
+                ).forceCompatibilityConfirmed,
+            )
+
+            val recreatedRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = review)
+            }
+            val recreated = ManagerViewModel(recreatedRepository, savedState)
+            advanceUntilIdle()
+
+            assertFalse(
+                assertIs<ImportUiState.ReviewReady>(
+                    recreated.state.value.importState,
+                ).forceCompatibilityConfirmed,
+            )
+        }
+
+    @Test
+    fun `generated forced 결과는 자동 설치하지 않고 새 설치 확인을 요구한다`() =
+        runTest(dispatcher.scheduler) {
+            val forcedReview = forcedReview()
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                conversionBuildResult = ConversionBuildResult.BundleReady(
+                    forcedReview,
+                    generatedBundle(),
+                )
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+            viewModel.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Review(forcedReview.token), viewModel.state.value.route)
+            assertEquals(0, repository.installRequests)
+            val ready = assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+            assertFalse(ready.forceCompatibilityConfirmed)
+            assertFalse(ready.installEnabled)
+
+            viewModel.accept(ManagerAction.ConfirmForcedInstall)
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            assertEquals(1, repository.installRequests)
+            assertTrue(repository.lastForceCompatibilityConfirmed)
+            assertFalse(
+                assertIs<ImportUiState.ReviewReady>(
+                    viewModel.state.value.importState,
+                ).forceCompatibilityConfirmed,
+            )
         }
 
     @Test
@@ -9765,6 +9942,23 @@ class ManagerViewModelTest {
         identityRequirement = IdentityRequirement.Stable("0123456789ab"),
     )
 
+    private fun forcedConversionAnalysis() = conversionAnalysis().copy(
+        report = conversionAnalysis().report.copy(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(
+                CompatibilityIssue(
+                    code = "api_usage_dynamic",
+                    message = "dynamic API",
+                    blocking = true,
+                ),
+            ),
+            unverifiedApis = setOf("scripting"),
+            sourceSha256 = "a".repeat(64),
+            browserProfileSha256 = conversionAnalysis().profile.canonicalSha256(),
+            conversionState = ConversionState.REQUIRES_APPROVAL,
+        ),
+    )
+
     private fun existingTarget() = ExistingConversionTarget(
         identitySha256 = "e".repeat(64),
         displayName = "기존 대상",
@@ -9798,6 +9992,16 @@ class ManagerViewModelTest {
         version = "1.0",
         status = status,
         issues = emptyList(),
+    )
+
+    private fun forcedReview() = review(ContractCompatibilityStatus.UNKNOWN).copy(
+        issues = listOf(ContractIssue("api_usage_dynamic", "dynamic API", true)),
+        unverifiedApis = listOf("scripting"),
+        forcedCompatibility = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        ),
     )
 
     private fun catalogRecord(
@@ -9881,6 +10085,7 @@ private class FakeManagerRepository : ManagerRepository {
     var cancelInstallRequests = 0
     val cancelInstallArguments = mutableListOf<Pair<String, Int?>>()
     var lastPartialConfirmed = false
+    var lastForceCompatibilityConfirmed = false
     var resumeRequests = 0
     var reconcileRequests = 0
     var legacyIdentities = emptyList<LegacyConversionIdentity>()
@@ -10062,6 +10267,32 @@ private class FakeManagerRepository : ManagerRepository {
             approvedAdapterIds,
             partialConfirmed,
             identitySelection,
+            ConversionAuthorization.NONE,
+        )
+        if (index == 0 && suspendFirstConversionBuild) {
+            if (ignoreFirstConversionBuildCancellation) {
+                withContext(NonCancellable) { firstConversionBuildGate.first() }
+            } else {
+                firstConversionBuildGate.first()
+            }
+        }
+        return conversionBuildResult
+    }
+
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        authorization: ConversionAuthorization,
+    ): ConversionBuildResult {
+        val index = conversionBuildRequests.size
+        conversionBuildRequests += ConversionBuildRequest(
+            token,
+            approvedAdapterIds,
+            partialConfirmed,
+            identitySelection,
+            authorization,
         )
         if (index == 0 && suspendFirstConversionBuild) {
             if (ignoreFirstConversionBuildCancellation) {
@@ -10155,6 +10386,15 @@ private class FakeManagerRepository : ManagerRepository {
         } finally {
             lifecycleEvents += "install:end"
         }
+    }
+
+    override suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+        forceCompatibilityConfirmed: Boolean,
+    ): InstallState {
+        lastForceCompatibilityConfirmed = forceCompatibilityConfirmed
+        return install(review, partialConfirmed)
     }
 
     override suspend fun installApkExport(
@@ -10473,6 +10713,7 @@ private data class ConversionBuildRequest(
     val approvedAdapterIds: Set<String>,
     val partialConfirmed: Boolean,
     val identitySelection: InstallationIdentitySelection?,
+    val authorization: ConversionAuthorization = ConversionAuthorization.NONE,
 )
 
 private fun unitTestUri(): Uri {

@@ -3,6 +3,8 @@ package dev.sixbridge.manager.conversion
 import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ConversionAuthorization
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
@@ -147,6 +149,20 @@ internal class OnDeviceConversionCoordinator(
         approvedAdapterIds: Set<String>,
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
+    ): ConversionBuildResult = build(
+        token,
+        approvedAdapterIds,
+        partialConfirmed,
+        identitySelection,
+        ConversionAuthorization.NONE,
+    )
+
+    override suspend fun build(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        authorization: ConversionAuthorization,
     ): ConversionBuildResult = buildMutex.withLock {
         var job = work.restoreBuildAware()
             ?: return@withLock ConversionBuildResult.Failure(
@@ -220,8 +236,15 @@ internal class OnDeviceConversionCoordinator(
             }
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.PROFILE_CHANGED)
         }
-        analysis.report.toBlockingFailure()?.let {
-            return@withLock ConversionBuildResult.Failure(it)
+        val forcedCompatibility = try {
+            ForceCompatibilityPolicy.requireProvenance(analysis.report, authorization)
+        } catch (_: Throwable) {
+            return@withLock ConversionBuildResult.Failure(ConversionFailureCode.UNKNOWN)
+        }
+        analysis.report.toBlockingFailure()?.let { failure ->
+            if (failure != ConversionFailureCode.UNKNOWN || forcedCompatibility == null) {
+                return@withLock ConversionBuildResult.Failure(failure)
+            }
         }
         val allowedApprovals = analysis.requiredApprovals + analysis.optionalApprovals
         if (!approvedAdapterIds.containsAll(analysis.requiredApprovals) ||
@@ -247,6 +270,7 @@ internal class OnDeviceConversionCoordinator(
                     profile,
                     approvedAdapterIds,
                     control,
+                    authorization,
                 )
             }
         } catch (error: CancellationException) {
@@ -261,9 +285,9 @@ internal class OnDeviceConversionCoordinator(
             )
         }
         if (
-            prepared.reportBefore.browserProfileSha256 != profileSha256 ||
-            prepared.reportBefore.sourceSha256 != analysis.report.sourceSha256 ||
-            prepared.identityMode != analysis.identityMode
+            prepared.reportBefore != analysis.report ||
+            prepared.identityMode != analysis.identityMode ||
+            prepared.forcedCompatibility != forcedCompatibility
         ) {
             return@withLock ConversionBuildResult.Failure(
                 ConversionFailureCode.TRANSFORM_MISMATCH,
@@ -301,6 +325,18 @@ internal class OnDeviceConversionCoordinator(
                     ConversionFailureCode.IDENTITY_MISMATCH,
                 )
             }
+            val bound = runtime.bind(
+                prepared,
+                profile,
+                resolved.identity,
+                authorization,
+            )
+            if (bound.extensionId != resolved.identity.extensionId) {
+                releaseFailedAttempt(token)
+                return@withLock ConversionBuildResult.Failure(
+                    ConversionFailureCode.IDENTITY_MISMATCH,
+                )
+            }
             val reservation = identities.reserve(
                 resolved,
                 prepared.descriptorName,
@@ -309,13 +345,6 @@ internal class OnDeviceConversionCoordinator(
             )
             work.markBuilding(token, approvedAdapterIds, profileSha256)
             building = true
-            val bound = runtime.bind(prepared, profile, resolved.identity)
-            if (bound.extensionId != resolved.identity.extensionId) {
-                recoverFailedBuild(token, profileSha256)
-                return@withLock ConversionBuildResult.Failure(
-                    ConversionFailureCode.IDENTITY_MISMATCH,
-                )
-            }
             val packaged = packages.packageWrapper(reservation, bound, token)
             generated = bundles.publish(token, packaged)
             val review = imports.importGenerated(generated)

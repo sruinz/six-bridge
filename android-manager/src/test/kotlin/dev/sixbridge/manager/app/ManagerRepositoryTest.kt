@@ -7,6 +7,7 @@ import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.catalog.CatalogIdentity
 import dev.sixbridge.manager.catalog.CatalogRecord
@@ -691,6 +692,27 @@ class ManagerRepositoryTest {
 
         bundle.wrapperFile.writeText("changed")
         assertNull(RetainedImportStore(root, verifier).load(TOKEN))
+    }
+
+    @Test
+    fun `retained import는 schema v6 binding proof를 보존하고 다시 검증한다`() {
+        val root = temporaryFolder.newFolder("imports-v6")
+        val bundle = importedBundle(root, reportSchemaVersion = 6)
+        var verificationCalls = 0
+        val verifier = { _: File, _: ContractExtensionDescriptor, _: ContractCompatibilityReport ->
+            verificationCalls += 1
+            WrapperVerificationResult.Success(bundle.verifiedApk)
+        }
+        RetainedImportStore(root, verifier).save(bundle)
+
+        val restored = assertNotNull(RetainedImportStore(root, verifier).load(TOKEN))
+
+        assertEquals(1, verificationCalls)
+        assertEquals(6, restored.report.schemaVersion)
+        assertEquals(
+            CompatibilityApkBinding.canonicalSha256(restored.report),
+            restored.verifiedApk.compatibilityCanonicalSha256,
+        )
     }
 
     @Test
@@ -4002,6 +4024,7 @@ class ManagerRepositoryTest {
         token: String = TOKEN,
         originalExtensionId: String = EXTENSION_ID,
         wrapperSha256: String? = null,
+        reportSchemaVersion: Int = 3,
     ): ImportedBundle {
         val directory = File(root, token).apply { mkdir() }
         val wrapper = File(directory, "wrapper.apk").apply { writeText("verified apk") }
@@ -4019,7 +4042,7 @@ class ManagerRepositoryTest {
             signerSha256 = "a".repeat(64),
         )
         val report = ContractCompatibilityReport(
-            schemaVersion = 3,
+            schemaVersion = reportSchemaVersion,
             status = ContractCompatibilityStatus.COMPATIBLE,
             manifestVersion = 3,
             extensionName = "Example",
@@ -4036,6 +4059,8 @@ class ManagerRepositoryTest {
             convertedExtensionId = EXTENSION_ID,
             sourceSha256 = "d".repeat(64),
             browserProfileSha256 = "e".repeat(64),
+            originalSourceSha256 = "d".repeat(64).takeIf { reportSchemaVersion == 6 },
+            planSha256 = "f".repeat(64).takeIf { reportSchemaVersion == 6 },
         )
         val verified = VerifiedWrapperApk(
             packageName = PACKAGE,
@@ -4051,6 +4076,11 @@ class ManagerRepositoryTest {
                 zipOffset = 0,
                 zipLength = 0,
             ),
+            compatibilityCanonicalSha256 = if (reportSchemaVersion == 6) {
+                CompatibilityApkBinding.canonicalSha256(report)
+            } else {
+                null
+            },
         )
         return ImportedBundle(token, descriptor, report, verified, wrapper, hash)
     }

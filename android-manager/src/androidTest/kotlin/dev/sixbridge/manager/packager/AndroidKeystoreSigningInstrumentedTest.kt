@@ -212,7 +212,13 @@ class AndroidKeystoreSigningInstrumentedTest {
         )
         return File(work, "unsigned.apk").also { output ->
             AlignedApkAssembler(work.toPath()).assemble(
-                ApkAssemblyRequest(template, patchedManifest, crxBytes, output),
+                ApkAssemblyRequest(
+                    template,
+                    patchedManifest,
+                    crxBytes,
+                    "1".repeat(64).encodeToByteArray(),
+                    output,
+                ),
             )
         }
     }

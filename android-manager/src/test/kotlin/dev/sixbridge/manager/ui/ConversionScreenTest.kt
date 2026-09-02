@@ -2,6 +2,7 @@ package dev.sixbridge.manager.ui
 
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.compat.CompatibilityIssue
 import dev.sixbridge.core.conversion.ConversionState
 import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
@@ -86,6 +87,27 @@ class ConversionScreenTest {
     }
 
     @Test
+    fun `dynamic UNKNOWN은 작업별 확인 후에만 build할 수 있다`() {
+        val ready = analysis(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(CompatibilityIssue("api_usage_dynamic", "dynamic API", true)),
+        )
+
+        assertFalse(ready.canBuild)
+        assertTrue(ready.copy(forceCompatibilityConfirmed = true).canBuild)
+    }
+
+    @Test
+    fun `강제 불가 UNKNOWN은 확인 값을 주어도 build할 수 없다`() {
+        val ready = analysis(
+            status = CompatibilityStatus.UNKNOWN,
+            issues = listOf(CompatibilityIssue("browser_profile_unknown", "profile", true)),
+        )
+
+        assertFalse(ready.copy(forceCompatibilityConfirmed = true).canBuild)
+    }
+
+    @Test
     fun `draft signer는 원문을 보존하고 일반 입력은 signer가 없다`() {
         val fingerprint = "a".repeat(64)
 
@@ -125,6 +147,7 @@ class ConversionScreenTest {
         status: CompatibilityStatus = CompatibilityStatus.COMPATIBLE,
         requiredApprovals: Set<String> = emptySet(),
         optionalApprovals: Set<String> = emptySet(),
+        issues: List<CompatibilityIssue> = emptyList(),
         identityRequirement: IdentityRequirement =
             IdentityRequirement.Stable("0123456789ab"),
     ) = ConversionUiState.AnalysisReady(
@@ -137,8 +160,10 @@ class ConversionScreenTest {
             declaredPermissions = setOf("storage"),
             usedApis = setOf("tabs"),
             unsupportedApis = emptySet(),
-            issues = emptyList(),
+            issues = issues,
             conversionState = ConversionState.REQUIRES_APPROVAL,
+            sourceSha256 = "a".repeat(64),
+            browserProfileSha256 = "b".repeat(64),
         ),
         selectedAutomaticAdapters = emptySet(),
         requiredApprovals = requiredApprovals,

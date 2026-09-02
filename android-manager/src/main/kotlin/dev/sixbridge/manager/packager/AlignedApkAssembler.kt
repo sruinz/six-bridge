@@ -1,5 +1,7 @@
 package dev.sixbridge.manager.packager
 
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.OutputStream
@@ -17,6 +19,7 @@ data class ApkAssemblyRequest(
     val templateApk: File,
     val manifestBytes: ByteArray,
     val crxBytes: ByteArray,
+    val compatibilityBinding: ByteArray,
     val outputApk: File,
 )
 
@@ -24,6 +27,7 @@ data class ApkAssemblyPathRequest(
     val templateApk: File,
     val manifestBytes: ByteArray,
     val crxFile: File,
+    val compatibilityBinding: ByteArray,
     val outputApk: File,
 )
 
@@ -39,6 +43,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
             templateFile = request.templateApk,
             manifest = request.manifestBytes,
             crx = PreparedEntry.bytes("assets/extension.crx", request.crxBytes),
+            compatibilityBinding = request.compatibilityBinding,
             outputFile = request.outputApk,
         )
     }
@@ -55,6 +60,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
             templateFile = request.templateApk,
             manifest = request.manifestBytes,
             crx = PreparedEntry.path("assets/extension.crx", crx, state, crc32),
+            compatibilityBinding = request.compatibilityBinding,
             outputFile = request.outputApk,
         )
         state.verify(crx)
@@ -64,6 +70,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
         templateFile: File,
         manifest: ByteArray,
         crx: PreparedEntry,
+        compatibilityBinding: ByteArray,
         outputFile: File,
     ) {
         val template = templateFile.toPath().toAbsolutePath().normalize()
@@ -77,6 +84,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
         require(manifest.isNotEmpty() && manifest.size.toLong() <= MAX_ENTRY_SIZE) { "AndroidManifest.xml 크기가 올바르지 않습니다." }
         require(crx.size in 1..MAX_CRX_SIZE) { "CRX3 크기가 올바르지 않습니다." }
+        CompatibilityApkBinding.decode(compatibilityBinding)
 
         val templateEntries = ApkZipStructureVerifier.templateEntries(template.toFile())
         val byName = templateEntries.associateBy { it.fact.name }
@@ -88,6 +96,10 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
             PreparedEntry.template("classes.dex", byName.getValue("classes.dex")),
             PreparedEntry.template("resources.arsc", byName.getValue("resources.arsc")),
             crx,
+            PreparedEntry.bytes(
+                CompatibilityApkBinding.ENTRY_NAME,
+                compatibilityBinding.copyOf(),
+            ),
         )
         require(byName.getValue("resources.arsc").fact.method == STORED) { "template resources.arsc는 STORED여야 합니다." }
         prepared.forEach { entry -> require(entry.size in 1L..MAX_ENTRY_SIZE) { "래퍼 APK entry 크기가 올바르지 않습니다: ${entry.name}" } }
@@ -273,7 +285,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
     private fun verifyAssembly(apk: File, expectedCrxSize: Long) {
         val facts = ApkZipStructureVerifier.inspect(apk)
-        require(facts.map { it.name } == REQUIRED_ENTRY_NAMES && facts.all { it.method == STORED }) { "래퍼 APK entry 계약이 올바르지 않습니다." }
+        require(facts.map { it.name } == OUTPUT_ENTRY_NAMES && facts.all { it.method == STORED }) { "래퍼 APK entry 계약이 올바르지 않습니다." }
         require(facts.all { it.dataOffset % 4L == 0L }) { "래퍼 APK entry가 4-byte 정렬되지 않았습니다." }
         require(facts.single { it.name == "assets/extension.crx" }.size == expectedCrxSize) { "래퍼 APK CRX3 크기가 올바르지 않습니다." }
     }
@@ -377,6 +389,7 @@ class AlignedApkAssembler(trustedOutputDirectory: Path) {
 
     private companion object {
         val REQUIRED_ENTRY_NAMES = listOf("AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/extension.crx")
+        val OUTPUT_ENTRY_NAMES = REQUIRED_ENTRY_NAMES + CompatibilityApkBinding.ENTRY_NAME
         const val MAX_CRX_SIZE = 129L * 1024L * 1024L + 12L
         const val MAX_ENTRY_SIZE = MAX_CRX_SIZE
         const val MAX_OUTPUT_SIZE = 256L * 1024L * 1024L

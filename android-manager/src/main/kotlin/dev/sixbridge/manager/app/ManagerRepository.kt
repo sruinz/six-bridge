@@ -8,6 +8,7 @@ import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
 import dev.sixbridge.manager.catalog.CatalogRecord
 import dev.sixbridge.manager.catalog.CatalogReconciler
 import dev.sixbridge.manager.catalog.CatalogIdentity
@@ -24,6 +25,7 @@ import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.conversion.VerifiedIdentityProof
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.manager.icon.CatalogIconEnricher
 import dev.sixbridge.manager.icon.IconPersistenceResult
 import dev.sixbridge.manager.importer.BundleImportService
@@ -110,6 +112,8 @@ data class ReviewBundle(
     val adapterDecisions: List<ContractAdapterDecision> = emptyList(),
     val signerSha256: String = "",
     val wrapperVersionCode: Int = 0,
+    val unverifiedApis: List<String> = emptyList(),
+    val forcedCompatibility: ContractForcedCompatibility? = null,
 )
 
 data class InstallApkExport(
@@ -194,11 +198,28 @@ interface ManagerRepository {
     ): ConversionBuildResult = ConversionBuildResult.Failure(
         dev.sixbridge.manager.conversion.ConversionFailureCode.INPUT_INVALID,
     )
+    suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        authorization: ConversionAuthorization,
+    ): ConversionBuildResult = approveConversion(
+        token,
+        approvedAdapterIds,
+        partialConfirmed,
+        identitySelection,
+    )
     suspend fun restoreConversion(importReview: Boolean = true): RestoredConversion? = null
     suspend fun discardConversion(token: String): Boolean = false
     fun copyGeneratedConversion(token: String, output: OutputStream): String? = null
     suspend fun createGeneratedShareSnapshot(token: String): File? = null
     suspend fun install(review: ReviewBundle, partialConfirmed: Boolean): InstallState
+    suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+        forceCompatibilityConfirmed: Boolean,
+    ): InstallState = install(review, partialConfirmed)
     suspend fun installApkExport(
         importToken: String,
     ): InstallApkExport? = null
@@ -434,6 +455,22 @@ internal class DefaultManagerRepository(
         "온디바이스 변환 coordinator가 구성되지 않았습니다."
     }.build(token, approvedAdapterIds, partialConfirmed, identitySelection)
 
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        authorization: ConversionAuthorization,
+    ): ConversionBuildResult = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.build(
+        token,
+        approvedAdapterIds,
+        partialConfirmed,
+        identitySelection,
+        authorization,
+    )
+
     override suspend fun restoreConversion(importReview: Boolean): RestoredConversion? =
         conversionCoordinator?.restore(importReview)
 
@@ -479,11 +516,21 @@ internal class DefaultManagerRepository(
     override suspend fun install(
         review: ReviewBundle,
         partialConfirmed: Boolean,
+    ): InstallState = install(review, partialConfirmed, false)
+
+    override suspend fun install(
+        review: ReviewBundle,
+        partialConfirmed: Boolean,
+        forceCompatibilityConfirmed: Boolean,
     ): InstallState {
         val bundle = withContext(ioDispatcher) { retainedImports.load(review.token) }
             ?: return InstallState.Idle
         val requestState = when (
-            val result = systemInstallCoordinator.request(bundle, partialConfirmed)
+            val result = systemInstallCoordinator.request(
+                bundle,
+                partialConfirmed,
+                forceCompatibilityConfirmed,
+            )
         ) {
             is SystemInstallRequestResult.ExportRequired -> result.state
             is SystemInstallRequestResult.Failed -> {
@@ -1220,7 +1267,7 @@ internal class RetainedImportStore(
         } catch (error: Exception) {
             throw RetainedImportTransientException(error)
         }
-        if (report.schemaVersion !in 3..5 ||
+        if (report.schemaVersion !in 3..6 ||
             report.convertedExtensionId != descriptor.extensionId ||
             report.extensionName != descriptor.name ||
             report.extensionVersion != descriptor.version ||
@@ -1401,4 +1448,8 @@ internal fun ImportedBundle.toReview() = ReviewBundle(
     adapterDecisions = report.adapterDecisions,
     signerSha256 = descriptor.signerSha256,
     wrapperVersionCode = descriptor.wrapperVersionCode,
+    unverifiedApis = report.unverifiedApis.toList(),
+    forcedCompatibility = report.forcedCompatibility?.let { forced ->
+        forced.copy(issueCodes = forced.issueCodes.toList())
+    },
 )

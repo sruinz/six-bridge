@@ -1502,7 +1502,7 @@ class OnDevicePackagerGateInstrumentedTest {
         conversionState: String,
         originalExtensionId: String,
     ) = ContractCompatibilityReport(
-        schemaVersion = 4,
+        schemaVersion = 6,
         status = ContractCompatibilityStatus.PARTIAL,
         manifestVersion = 3,
         extensionName = "SIX Bridge On-Device Gate",

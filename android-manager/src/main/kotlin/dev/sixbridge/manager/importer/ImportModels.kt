@@ -3,6 +3,7 @@ package dev.sixbridge.manager.importer
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
 import dev.sixbridge.contract.crx.VerifiedCrx3
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import java.io.File
 
 data class ImportedBundle(
@@ -22,6 +23,8 @@ data class VerifiedWrapperApk(
     val extensionId: String,
     val providerAuthority: String,
     val crx: VerifiedCrx3,
+    val compatibilityCanonicalSha256: String? = null,
+    val forcedCompatibility: ForcedCompatibilityProvenance? = null,
 )
 
 enum class ImportFailureCode {

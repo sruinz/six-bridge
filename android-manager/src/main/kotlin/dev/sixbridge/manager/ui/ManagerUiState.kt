@@ -13,6 +13,7 @@ import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import java.io.File
@@ -82,15 +83,16 @@ sealed interface ImportUiState {
     data object Importing : ImportUiState
     data class ReviewReady(
         val review: ReviewBundle,
-        val partialConfirmed: Boolean,
+        val partialConfirmed: Boolean = false,
+        val forceCompatibilityConfirmed: Boolean = false,
     ) : ImportUiState {
         val installEnabled: Boolean
             get() = when (review.status) {
                 ContractCompatibilityStatus.COMPATIBLE -> true
                 ContractCompatibilityStatus.PARTIAL -> partialConfirmed
-                ContractCompatibilityStatus.BLOCKED,
-                ContractCompatibilityStatus.UNKNOWN,
-                -> false
+                ContractCompatibilityStatus.UNKNOWN ->
+                    review.forcedCompatibility != null && forceCompatibilityConfirmed
+                ContractCompatibilityStatus.BLOCKED -> false
             }
     }
 }
@@ -110,16 +112,20 @@ sealed interface ConversionUiState {
         val selectedAdapters: Set<String> = emptySet(),
         val resolvedOptionalAdapters: Set<String> = emptySet(),
         val partialConfirmed: Boolean = false,
+        val forceCompatibilityConfirmed: Boolean = false,
         val identitySelection: InstallationIdentitySelection? = null,
         val existingIdentityConfirmed: Boolean = false,
         val profileChanged: Boolean = false,
         val draftSignerFingerprint: String? = null,
     ) : ConversionUiState {
         val canBuild: Boolean
-            get() = report.status in setOf(
-                CompatibilityStatus.COMPATIBLE,
-                CompatibilityStatus.PARTIAL,
-            ) &&
+            get() = (
+                report.status in setOf(
+                    CompatibilityStatus.COMPATIBLE,
+                    CompatibilityStatus.PARTIAL,
+                ) ||
+                    forceCompatibilityConfirmed && ForceCompatibilityPolicy.isEligible(report)
+                ) &&
                 selectedAdapters.containsAll(requiredApprovals) &&
                 (requiredApprovals + optionalApprovals).containsAll(selectedAdapters) &&
                 resolvedOptionalAdapters.containsAll(optionalApprovals) &&
@@ -292,6 +298,7 @@ sealed interface ManagerAction {
         val apply: Boolean,
     ) : ManagerAction
     data object ConfirmConversionPartial : ManagerAction
+    data object ConfirmConversionForce : ManagerAction
     data object SelectNewConversionIdentity : ManagerAction
     data class SelectExistingConversionIdentity(val identitySha256: String) : ManagerAction
     data object ConfirmExistingConversionIdentity : ManagerAction
@@ -318,6 +325,7 @@ sealed interface ManagerAction {
     data object RetryGeneratedCleanup : ManagerAction
     data class GeneratedCleanupDestinationPresented(val token: String) : ManagerAction
     data object ConfirmPartial : ManagerAction
+    data object ConfirmForcedInstall : ManagerAction
     data object PrepareReviewedInstall : ManagerAction
     data object InstallReviewedBundle : ManagerAction
     @Deprecated("InstallApkCreated를 사용합니다.")

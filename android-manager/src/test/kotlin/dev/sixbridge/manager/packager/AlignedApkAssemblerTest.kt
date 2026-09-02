@@ -2,6 +2,7 @@ package dev.sixbridge.manager.packager
 
 import dev.sixbridge.contract.crx.Crx3SigningKey
 import dev.sixbridge.contract.crx.Crx3Writer
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
@@ -33,7 +34,7 @@ class AlignedApkAssemblerTest {
     private val crxBytes by lazy { validCrx() }
 
     @Test
-    fun `래퍼 APK는 네 entry를 결정적으로 조립하고 모두 4 byte 정렬한다`() {
+    fun `래퍼 APK는 v6 binding을 포함한 다섯 entry를 결정적으로 조립한다`() {
         val first = File(work, "first.apk")
         val second = File(work, "second.apk")
 
@@ -43,9 +44,21 @@ class AlignedApkAssemblerTest {
         assertContentEquals(first.readBytes(), second.readBytes())
         val facts = ApkZipStructureVerifier.inspect(first)
         assertEquals(
-            listOf("AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/extension.crx"),
+            listOf(
+                "AndroidManifest.xml",
+                "classes.dex",
+                "resources.arsc",
+                "assets/extension.crx",
+                CompatibilityApkBinding.ENTRY_NAME,
+            ),
             facts.map { it.name },
         )
+        ZipFile(first).use { zip ->
+            assertContentEquals(
+                "1".repeat(64).encodeToByteArray(),
+                zip.getInputStream(zip.getEntry(CompatibilityApkBinding.ENTRY_NAME)).readBytes(),
+            )
+        }
         assertTrue(facts.all { it.method == ZipEntry.STORED })
         facts.forEach { entry ->
             assertEquals(0L, entry.dataOffset % 4L, entry.name)
@@ -93,7 +106,13 @@ class AlignedApkAssemblerTest {
 
         assertFailsWith<IllegalArgumentException> {
             assembler().assemble(
-                ApkAssemblyPathRequest(template, manifestBytes, tooLarge, output),
+                ApkAssemblyPathRequest(
+                    template,
+                    manifestBytes,
+                    tooLarge,
+                    "1".repeat(64).encodeToByteArray(),
+                    output,
+                ),
             )
         }
         assertTrue(!output.exists())
@@ -164,7 +183,15 @@ class AlignedApkAssemblerTest {
         RandomAccessFile(maximumCrx, "rw").use { it.setLength(MAX_CRX_BYTES.toLong()) }
 
         assertFailsWith<IllegalArgumentException> {
-            assembler().assemble(ApkAssemblyPathRequest(template, oversizedManifest, maximumCrx, output))
+            assembler().assemble(
+                ApkAssemblyPathRequest(
+                    template,
+                    oversizedManifest,
+                    maximumCrx,
+                    "1".repeat(64).encodeToByteArray(),
+                    output,
+                ),
+            )
         }
         assertEquals("keep", output.readText())
         assertTrue(work.listFiles().orEmpty().none { it.name.startsWith(".size-boundary.apk.") })
@@ -192,6 +219,7 @@ class AlignedApkAssemblerTest {
         templateApk = source,
         manifestBytes = manifestBytes,
         crxBytes = crxBytes,
+        compatibilityBinding = "1".repeat(64).encodeToByteArray(),
         outputApk = output,
     )
 

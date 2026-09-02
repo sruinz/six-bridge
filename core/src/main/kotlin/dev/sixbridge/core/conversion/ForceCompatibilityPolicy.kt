@@ -1,5 +1,9 @@
 package dev.sixbridge.core.conversion
 
+import dev.sixbridge.contract.bundle.BundleJson
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+import dev.sixbridge.contract.bundle.ContractCompatibilityReport
+import dev.sixbridge.core.bundle.SixBundle
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import java.util.Collections
@@ -61,6 +65,45 @@ object ForceCompatibilityPolicy {
         }
     }
 
+    fun requireBoundContractProvenance(
+        report: ContractCompatibilityReport,
+        embeddedCanonicalSha256: String,
+    ): ForcedCompatibilityProvenance? {
+        BundleJson.validateCompatibility(report)
+        require(report.schemaVersion == 6) {
+            "서명된 compatibility binding은 schema v6에서만 허용됩니다."
+        }
+        require(SHA256.matches(embeddedCanonicalSha256)) {
+            "compatibility binding SHA-256이 올바르지 않습니다."
+        }
+        require(
+            embeddedCanonicalSha256 == CompatibilityApkBinding.canonicalSha256(report),
+        ) {
+            "compatibility report와 서명된 binding이 일치하지 않습니다."
+        }
+        val contractForced = report.forcedCompatibility ?: return null
+        val authorization = when (
+            CompatibilityForceScope.valueOf(contractForced.scope)
+        ) {
+            CompatibilityForceScope.UNKNOWN_API_USAGE ->
+                ConversionAuthorization.forceUnknownApiUsage()
+        }
+        val provenance = requireNotNull(
+            requireProvenance(
+                SixBundle.toCoreCompatibility(report),
+                authorization,
+            ),
+        )
+        require(
+            provenance.scope.name == contractForced.scope &&
+                provenance.originalStatus.name == contractForced.originalStatus.name &&
+                provenance.issueCodes == contractForced.issueCodes,
+        ) {
+            "compatibility force provenance가 중앙 정책 결과와 다릅니다."
+        }
+        return provenance.deepImmutableCopy()
+    }
+
     private fun requireUnknownApiUsageProvenance(
         report: CompatibilityReport,
     ): ForcedCompatibilityProvenance {
@@ -80,4 +123,6 @@ object ForceCompatibilityPolicy {
                 .sorted(),
         )
     }
+
+    private val SHA256 = Regex("[0-9a-f]{64}")
 }

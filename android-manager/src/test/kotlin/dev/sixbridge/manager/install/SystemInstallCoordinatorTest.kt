@@ -5,6 +5,10 @@ import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
+import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.importer.ImportedBundle
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
@@ -28,6 +32,28 @@ import org.robolectric.RobolectricTestRunner
 class SystemInstallCoordinatorTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `forced UNKNOWN은 별도 확인 전 export 상태를 만들지 않는다`() = runTest {
+        val fixture = fixture()
+        val forced = forcedUnknownBundle()
+
+        val result = fixture.coordinator.request(
+            forced,
+            partialConfirmed = false,
+            forceCompatibilityConfirmed = false,
+        )
+
+        assertIs<SystemInstallRequestResult.Failed>(result)
+        assertEquals(RecoveryRecordSnapshot.Absent, fixture.handoffStore.snapshot())
+        assertEquals(
+            InstallState.Failed(
+                "FORCED_COMPATIBILITY_CONFIRMATION_REQUIRED",
+                "강제 변환 결과의 설치 확인이 필요합니다.",
+            ),
+            fixture.coordinator.state.value,
+        )
+    }
 
     @Test
     fun `정상 요청은 installer launch 없이 export required를 반환한다`() = runTest {
@@ -587,6 +613,34 @@ class SystemInstallCoordinatorTest {
             verifiedApk = verified,
             wrapperFile = wrapper,
             wrapperSha256 = WRAPPER_SHA,
+        )
+    }
+
+    private fun forcedUnknownBundle(): ImportedBundle {
+        val base = importedBundle()
+        val report = base.report.copy(
+            schemaVersion = 6,
+            status = ContractCompatibilityStatus.UNKNOWN,
+            issues = listOf(
+                ContractIssue("api_usage_dynamic", "dynamic API", blocking = true),
+            ),
+            unverifiedApis = listOf("scripting"),
+            originalSourceSha256 = "a".repeat(64),
+            planSha256 = "b".repeat(64),
+            forcedCompatibility = ContractForcedCompatibility(
+                scope = "UNKNOWN_API_USAGE",
+                originalStatus = ContractCompatibilityStatus.UNKNOWN,
+                issueCodes = listOf("api_usage_dynamic"),
+            ),
+        )
+        val digest = CompatibilityApkBinding.canonicalSha256(report)
+        return base.copy(
+            report = report,
+            verifiedApk = base.verifiedApk.copy(
+                compatibilityCanonicalSha256 = digest,
+                forcedCompatibility = ForceCompatibilityPolicy
+                    .requireBoundContractProvenance(report, digest),
+            ),
         )
     }
 

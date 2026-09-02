@@ -5,7 +5,11 @@ import dev.sixbridge.core.compat.AnalysisControl
 import dev.sixbridge.core.compat.AnalysisSafetyPolicy
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.compat.CompatibilityReport
+import dev.sixbridge.core.compat.CompatibilityIssue
+import dev.sixbridge.core.conversion.CompatibilityForceScope
+import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ConversionState
+import dev.sixbridge.core.conversion.ForcedCompatibilityProvenance
 import dev.sixbridge.core.conversion.PreparedConversion
 import dev.sixbridge.core.crx.KeyPairCrx3SigningKey
 import dev.sixbridge.core.draft.DraftConversionPlan
@@ -29,6 +33,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -252,6 +257,38 @@ class DefaultConversionRuntimeTest {
     }
 
     @Test
+    fun `schema v4 prepared draft는 signed provenance와 현재 typed 승인이 같을 때만 bind한다`() {
+        val input = preparedDraftFile(forced = true)
+        val runtime = DefaultConversionRuntime()
+        val authorization = ConversionAuthorization.forceUnknownApiUsage()
+        val prepared = runtime.prepare(
+            input,
+            OnDeviceInputKind.SIX_DRAFT,
+            profile(),
+            emptySet(),
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+            authorization,
+        )
+        val proof = assertNotNull(prepared.preparedCrx).proof
+        val identity = OnDevicePackageIdentity(
+            extensionId = proof.extensionId,
+            packageName = "dev.sixbridge.ext.${proof.extensionId}",
+            wrapperSignerSha256 = "a".repeat(64),
+            crxKeyAlias = null,
+            crxPublicKeyDer = null,
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            runtime.bind(prepared, profile(), identity, ConversionAuthorization.NONE)
+        }
+        val bound = runtime.bind(prepared, profile(), identity, authorization)
+
+        assertEquals(6, bound.compatibility.schemaVersion)
+        assertEquals("UNKNOWN_API_USAGE", bound.compatibility.forcedCompatibility?.scope)
+        assertEquals(prepared.forcedCompatibility, SixDraft.read(input.toPath()).payload.plan.forcedCompatibility)
+    }
+
+    @Test
     fun `SixDraft 분석은 검증된 signer fingerprint를 UI snapshot까지 유지한다`() {
         val input = preparedDraftFile()
         val expected = SixDraft.read(input.toPath()).signerFingerprint
@@ -294,7 +331,7 @@ class DefaultConversionRuntimeTest {
             }
     }
 
-    private fun preparedDraftFile(): File {
+    private fun preparedDraftFile(forced: Boolean = false): File {
         val sourceZip = ByteArrayOutputStream().use { bytes ->
             ZipOutputStream(bytes).use { output ->
                 stored(
@@ -317,11 +354,22 @@ class DefaultConversionRuntimeTest {
         val proof = dev.sixbridge.contract.crx.Crx3Verifier.verify(crx)
         val profileSha = profile().canonicalSha256()
         val originalSha = "8".repeat(64)
-        val before = compatibility(originalSha, profileSha, null)
-        val after = compatibility(proof.zipSha256, profileSha, proof.extensionId)
+        val before = compatibility(originalSha, profileSha, null, forced)
+        val after = compatibility(proof.zipSha256, profileSha, proof.extensionId, forced)
         val identity = "project:0123456789abcdef0123456789abcdef"
+        val forcedCompatibility = forced.takeIf { it }?.let {
+            ForcedCompatibilityProvenance(
+                CompatibilityForceScope.UNKNOWN_API_USAGE,
+                CompatibilityStatus.UNKNOWN,
+                listOf("api_usage_dynamic"),
+            )
+        }
         val payload = SixDraftPayload.create(
-            draft = DraftMetadata.createV3("test", emptyMap(), identity),
+            draft = if (forcedCompatibility == null) {
+                DraftMetadata.createV3("test", emptyMap(), identity)
+            } else {
+                DraftMetadata.createV4("test", emptyMap(), identity)
+            },
             input = DraftInputMetadata(
                 inputKind = ExtensionInputKind.ZIP,
                 originalSourceSha256 = originalSha,
@@ -332,7 +380,7 @@ class DefaultConversionRuntimeTest {
             ),
             sourceKind = DraftSourceKind.PREPARED_CRX,
             source = crx,
-            plan = DraftConversionPlan.create(before, emptyList()),
+            plan = DraftConversionPlan.create(before, emptyList(), forcedCompatibility),
             compatibilityBefore = before,
             compatibilityAfter = after,
         )
@@ -346,15 +394,20 @@ class DefaultConversionRuntimeTest {
         sourceSha: String,
         profileSha: String,
         convertedId: String?,
+        forced: Boolean = false,
     ) = CompatibilityReport(
-        status = CompatibilityStatus.COMPATIBLE,
+        status = if (forced) CompatibilityStatus.UNKNOWN else CompatibilityStatus.COMPATIBLE,
         manifestVersion = 3,
         extensionName = "Prepared",
         extensionVersion = "1",
         declaredPermissions = emptySet(),
         usedApis = emptySet(),
         unsupportedApis = emptySet(),
-        issues = emptyList(),
+        issues = if (forced) {
+            listOf(CompatibilityIssue("api_usage_dynamic", "dynamic API", true))
+        } else {
+            emptyList()
+        },
         conversionState = ConversionState.PASSTHROUGH,
         originalExtensionId = null,
         convertedExtensionId = convertedId,

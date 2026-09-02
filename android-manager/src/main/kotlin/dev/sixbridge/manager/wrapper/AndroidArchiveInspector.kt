@@ -3,6 +3,7 @@ package dev.sixbridge.manager.wrapper
 import android.content.pm.PackageManager
 import android.os.Build
 import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import java.io.ByteArrayOutputStream
@@ -78,6 +79,7 @@ class AndroidArchiveInspector(
             activities = manifest.activities,
             providers = manifest.providers,
             crxBytes = archive.crxBytes,
+            compatibilityCanonicalSha256 = archive.compatibilityCanonicalSha256,
         )
     }
 
@@ -110,6 +112,8 @@ class AndroidArchiveInspector(
 internal object ApkArchiveEntries {
     private const val MANIFEST_ENTRY = "AndroidManifest.xml"
     private const val EMBEDDED_CRX_ENTRY = "assets/extension.crx"
+    private const val COMPATIBILITY_BINDING_ENTRY =
+        "assets/sixbridge/compatibility.sha256"
     private const val MAX_MANIFEST_SIZE = 4L * 1024 * 1024
     private const val MAX_ENTRY_COUNT = 64
     private const val MAX_TOTAL_UNCOMPRESSED_SIZE = 144L * 1024 * 1024
@@ -118,6 +122,7 @@ internal object ApkArchiveEntries {
     data class Contents(
         val manifestBytes: ByteArray,
         val crxBytes: ByteArray,
+        val compatibilityCanonicalSha256: String?,
     )
 
     fun preflight(apk: File): Contents = preflightInternal(apk, null)
@@ -138,6 +143,7 @@ internal object ApkArchiveEntries {
                 var totalUncompressed = 0L
                 var manifest: ZipEntry? = null
                 var crx: ZipEntry? = null
+                var compatibilityBinding: ZipEntry? = null
                 entries.forEach { entry ->
                     val canonicalName = canonicalPath(entry.name)
                     if (canonicalName == null ||
@@ -179,6 +185,7 @@ internal object ApkArchiveEntries {
                     when (canonicalName) {
                         MANIFEST_ENTRY -> manifest = entry
                         EMBEDDED_CRX_ENTRY -> crx = entry
+                        COMPATIBILITY_BINDING_ENTRY -> compatibilityBinding = entry
                     }
                 }
                 val manifestEntry = manifest ?: invalid(ImportFailureCode.ARCHIVE_INVALID)
@@ -213,6 +220,16 @@ internal object ApkArchiveEntries {
                             ImportFailureCode.CRX_TOO_LARGE,
                         )
                         ByteArray(0)
+                    },
+                    compatibilityCanonicalSha256 = compatibilityBinding?.let { entry ->
+                        CompatibilityApkBinding.decode(
+                            readBounded(
+                                zip,
+                                entry,
+                                CompatibilityApkBinding.ENCODED_SIZE.toLong(),
+                                ImportFailureCode.ARCHIVE_INVALID,
+                            ),
+                        )
                     },
                 )
             }

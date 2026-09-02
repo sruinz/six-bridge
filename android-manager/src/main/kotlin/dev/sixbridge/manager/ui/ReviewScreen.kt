@@ -142,6 +142,33 @@ fun ReviewScreen(
                 Text(text = stringResource(R.string.review_partial_notice))
             }
         }
+        if (review.status == ContractCompatibilityStatus.UNKNOWN &&
+            review.forcedCompatibility != null
+        ) {
+            SectionCard(stringResource(R.string.review_forced_title)) {
+                Text(stringResource(R.string.review_forced_warning))
+                Text("issue: ${review.forcedCompatibility.issueCodes.joinToString()}")
+                TextList(review.unverifiedApis)
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = !ready.forceCompatibilityConfirmed) {
+                        onAction(ManagerAction.ConfirmForcedInstall)
+                    }
+                    .testTag("review:force-compatibility"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Checkbox(
+                    checked = ready.forceCompatibilityConfirmed,
+                    onCheckedChange = { checked ->
+                        if (checked) onAction(ManagerAction.ConfirmForcedInstall)
+                    },
+                )
+                Text(stringResource(R.string.review_forced_confirm))
+            }
+        }
         InstallProgress(ownedInstallState)
         message?.let { currentMessage ->
             MessageCard(

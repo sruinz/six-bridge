@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sixbridge.contract.bundle.SixBundleContract
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
 import dev.sixbridge.core.input.ExtensionZip
 import dev.sixbridge.core.profile.BrowserProfile
 import dev.sixbridge.core.profile.WrapperContract
@@ -291,7 +292,11 @@ class OnDeviceConversionFlowInstrumentedTest {
         val extension = contents.extension
         val compatibility = contents.compatibility
 
-        assertEquals(4, compatibility.schemaVersion)
+        assertEquals(6, compatibility.schemaVersion)
+        assertEquals(
+            CompatibilityApkBinding.canonicalSha256(compatibility),
+            wrapperFacts.compatibilityCanonicalSha256,
+        )
         assertEquals(extension.extensionId, review.extensionId)
         assertEquals(extension.wrapperPackage, review.packageName)
         assertEquals(extension.signerSha256, review.signerSha256)

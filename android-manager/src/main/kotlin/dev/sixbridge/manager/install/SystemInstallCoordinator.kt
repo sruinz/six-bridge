@@ -70,6 +70,7 @@ class SystemInstallCoordinator(
     suspend fun request(
         bundle: ImportedBundle,
         partialConfirmed: Boolean,
+        forceCompatibilityConfirmed: Boolean = false,
     ): SystemInstallRequestResult = mutex.withLock {
         val legacyRecoveryEmpty = when (val snapshot = pendingStore.recoveryStoreSnapshot()) {
             is RecoveryStoreSnapshot.Valid ->
@@ -82,7 +83,6 @@ class SystemInstallCoordinator(
         if (handoffStore.snapshot() != RecoveryRecordSnapshot.Absent || !legacyRecoveryEmpty) {
             return@withLock failed(recoveryWriteFailed())
         }
-        mutableState.value = InstallState.PreparingApkExport(bundle.token)
         val installed = try {
             installedWrappers.find(bundle.verifiedApk.packageName)
         } catch (error: CancellationException) {
@@ -111,6 +111,16 @@ class SystemInstallCoordinator(
                 return@withLock failed(failure)
             }
             is InstallDecision.Allowed -> {
+                if (decision.requiresForcedCompatibilityConfirmation &&
+                    !forceCompatibilityConfirmed
+                ) {
+                    return@withLock failed(
+                        InstallState.Failed(
+                            "FORCED_COMPATIBILITY_CONFIRMATION_REQUIRED",
+                            "강제 변환 결과의 설치 확인이 필요합니다.",
+                        ),
+                    )
+                }
                 if (decision.requiresPartialConfirmation && !partialConfirmed) {
                     return@withLock failed(
                         InstallState.Failed(

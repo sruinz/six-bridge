@@ -3,6 +3,10 @@ package dev.sixbridge.manager.install
 import dev.sixbridge.contract.bundle.ContractAdapterDecision
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
+import dev.sixbridge.contract.bundle.ContractForcedCompatibility
+import dev.sixbridge.contract.bundle.ContractIssue
+import dev.sixbridge.contract.bundle.CompatibilityApkBinding
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
 import dev.sixbridge.manager.wrapper.InstalledWrapper
@@ -56,6 +60,39 @@ class InstallPolicyTest {
         assertEquals(
             InstallDecision.Denied(InstallDenial.UNKNOWN_COMPATIBILITY),
             policy.decide(report(ContractCompatibilityStatus.UNKNOWN), candidate, installed()),
+        )
+    }
+
+    @Test
+    fun `검증된 v6 dynamic UNKNOWN은 별도 설치 확인을 요구한다`() {
+        val report = forcedUnknownReport()
+        val verified = candidate.copy(
+            compatibilityCanonicalSha256 = CompatibilityApkBinding.canonicalSha256(report),
+            forcedCompatibility = ForceCompatibilityPolicy.requireBoundContractProvenance(
+                report,
+                CompatibilityApkBinding.canonicalSha256(report),
+            ),
+        )
+
+        assertEquals(
+            InstallDecision.Allowed(
+                operation = InstallOperation.INSTALL,
+                requiresPartialConfirmation = false,
+                requiresForcedCompatibilityConfirmation = true,
+            ),
+            policy.decide(report, verified, installed = null),
+        )
+    }
+
+    @Test
+    fun `binding 없는 forced UNKNOWN과 BLOCKED는 계속 거부한다`() {
+        assertEquals(
+            InstallDecision.Denied(InstallDenial.REPORT_PROOF_INVALID),
+            policy.decide(forcedUnknownReport(), candidate, installed = null),
+        )
+        assertEquals(
+            InstallDecision.Denied(InstallDenial.BLOCKED_COMPATIBILITY),
+            policy.decide(report(ContractCompatibilityStatus.BLOCKED), candidate, installed = null),
         )
     }
 
@@ -151,6 +188,17 @@ class InstallPolicyTest {
         convertedExtensionId = EXTENSION_ID,
         sourceSha256 = "c".repeat(64),
         browserProfileSha256 = "d".repeat(64),
+    )
+
+    private fun forcedUnknownReport() = report(ContractCompatibilityStatus.UNKNOWN).copy(
+        schemaVersion = 6,
+        issues = listOf(ContractIssue("api_usage_dynamic", "dynamic API", blocking = true)),
+        unverifiedApis = listOf("runtime.computed"),
+        forcedCompatibility = ContractForcedCompatibility(
+            scope = "UNKNOWN_API_USAGE",
+            originalStatus = ContractCompatibilityStatus.UNKNOWN,
+            issueCodes = listOf("api_usage_dynamic"),
+        ),
     )
 
     private companion object {

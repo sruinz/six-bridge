@@ -2,12 +2,14 @@ package dev.sixbridge.manager.wrapper
 
 import dev.sixbridge.contract.bundle.ContractCompatibilityReport
 import dev.sixbridge.contract.bundle.ContractExtensionDescriptor
+import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.SixBundleContract
 import dev.sixbridge.contract.crx.Crx3Verifier
 import dev.sixbridge.contract.crx.VerifiedCrx3
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
 import dev.sixbridge.manager.importer.VerifiedWrapperApk
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import java.io.File
 import java.io.FileInputStream
 import java.nio.file.Files
@@ -100,6 +102,9 @@ class AndroidWrapperVerifier(
         if (report.schemaVersion !in SUPPORTED_REPORT_SCHEMAS) {
             return failure(ImportFailureCode.REPORT_SCHEMA_UNSUPPORTED)
         }
+        if (runCatching { BundleJson.validateCompatibility(report) }.isFailure) {
+            return failure(ImportFailureCode.REPORT_PROOF_INVALID)
+        }
         if (report.convertedExtensionId != descriptor.extensionId ||
             report.extensionName != descriptor.name ||
             report.extensionVersion != descriptor.version
@@ -115,6 +120,20 @@ class AndroidWrapperVerifier(
         ) {
             return failure(ImportFailureCode.REPORT_PROOF_INVALID)
         }
+        val forcedCompatibility = if (report.schemaVersion == 6) {
+            val binding = facts.compatibilityCanonicalSha256
+                ?: return failure(ImportFailureCode.REPORT_PROOF_INVALID)
+            runCatching {
+                ForceCompatibilityPolicy.requireBoundContractProvenance(report, binding)
+            }.getOrElse {
+                return failure(ImportFailureCode.REPORT_PROOF_INVALID)
+            }
+        } else {
+            if (facts.compatibilityCanonicalSha256 != null) {
+                return failure(ImportFailureCode.REPORT_PROOF_INVALID)
+            }
+            null
+        }
         return WrapperVerificationResult.Success(
             VerifiedWrapperApk(
                 packageName = facts.packageName,
@@ -124,6 +143,8 @@ class AndroidWrapperVerifier(
                 extensionId = descriptor.extensionId,
                 providerAuthority = provider.authority,
                 crx = crx,
+                compatibilityCanonicalSha256 = facts.compatibilityCanonicalSha256,
+                forcedCompatibility = forcedCompatibility,
             ),
         )
     }
@@ -226,7 +247,7 @@ class AndroidWrapperVerifier(
     )
 
     private companion object {
-        val SUPPORTED_REPORT_SCHEMAS = setOf(3, 4, 5)
+        val SUPPORTED_REPORT_SCHEMAS = setOf(3, 4, 5, 6)
         const val EXTENSION_ID_METADATA = "extension-id"
         const val DISCOVERY_ACTIVITY = "dev.sixbridge.runtime.SixDiscoveryActivity"
         const val EXTENSION_PROVIDER = "dev.sixbridge.runtime.ExtensionProvider"

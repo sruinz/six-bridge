@@ -19,6 +19,7 @@ data class ArchiveFacts(
     val activities: List<ArchiveActivity>,
     val providers: List<ArchiveProvider>,
     val crxBytes: ByteArray,
+    val compatibilityCanonicalSha256: String? = null,
 )
 
 data class ArchiveActivity(

@@ -27,6 +27,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import dev.sixbridge.core.compat.CompatibilityStatus
+import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.manager.R
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
@@ -175,6 +176,18 @@ private fun AnalysisReadyContent(
             Text(stringResource(R.string.conversion_confirm_partial))
         }
     }
+    if (ForceCompatibilityPolicy.isEligible(ready.report)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = ready.forceCompatibilityConfirmed,
+                onCheckedChange = { checked ->
+                    if (checked) onAction(ManagerAction.ConfirmConversionForce)
+                },
+                modifier = Modifier.testTag("conversion:force-compatibility"),
+            )
+            Text(stringResource(R.string.conversion_force_compatibility_notice))
+        }
+    }
     when (val requirement = ready.identityRequirement) {
         is IdentityRequirement.Stable -> SectionCard(
             stringResource(R.string.conversion_identity),
@@ -187,7 +200,7 @@ private fun AnalysisReadyContent(
     if (ready.report.status in setOf(
             CompatibilityStatus.COMPATIBLE,
             CompatibilityStatus.PARTIAL,
-        )
+        ) || ForceCompatibilityPolicy.isEligible(ready.report)
     ) {
         Button(
             onClick = { onAction(ManagerAction.BuildConversion) },

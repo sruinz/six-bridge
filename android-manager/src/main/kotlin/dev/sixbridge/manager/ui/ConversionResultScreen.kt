@@ -38,6 +38,12 @@ fun ConversionResultScreen(
                 Text("versionCode: ${review.wrapperVersionCode}")
                 Text(stringResource(R.string.conversion_status_summary, review.status.name))
             }
+            if (review.forcedCompatibility != null) {
+                SectionCard(stringResource(R.string.review_forced_title)) {
+                    Text(stringResource(R.string.review_forced_warning))
+                    Text("issue: ${review.forcedCompatibility.issueCodes.joinToString()}")
+                }
+            }
         } ?: Text(stringResource(R.string.conversion_result_import_pending))
         SectionCard(stringResource(R.string.conversion_generated_bundle)) {
             Text(ready.generated.suggestedFileName)

@@ -474,7 +474,7 @@ class OnDeviceWrapperRequestTest {
         extensionId: String,
         sourceSha256: String,
     ) = ContractCompatibilityReport(
-        schemaVersion = 4,
+        schemaVersion = 6,
         status = ContractCompatibilityStatus.PARTIAL,
         manifestVersion = 3,
         extensionName = "SIX 테스트",
