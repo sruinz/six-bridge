@@ -2635,6 +2635,37 @@ class ManagerViewModel(
     }
 
     private fun retryRecovery() {
+        val cleanupFailure = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Terminal
+        if (cleanupFailure?.phase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED) {
+            installApkDocumentTransactionJob = viewModelScope.launch {
+                val phase = installApkDocumentIoMutex.withLock {
+                    cleanupInstallApkTransactionDestination(cleanupFailure.key)
+                }
+                if (phase == InstallApkDocumentTransactionPhase.CLEANED) {
+                    val resolved = InstallApkDocumentTransactionPhase
+                        .CLEANUP_RESOLVED_HANDOFF_PENDING
+                    persistInstallApkDocumentTransaction(cleanupFailure.key, resolved)
+                    mutableInstallApkDocumentTransaction.value =
+                        InstallApkDocumentTransactionState.Terminal(
+                            cleanupFailure.key,
+                            resolved,
+                        )
+                    mutableState.update { it.copy(message = null) }
+                } else {
+                    persistInstallApkDocumentTransaction(cleanupFailure.key, phase)
+                    mutableInstallApkDocumentTransaction.value =
+                        InstallApkDocumentTransactionState.Terminal(cleanupFailure.key, phase)
+                    showInstallApkCleanupFailure(
+                        ManagerAction.InstallApkCleanupFailed(
+                            cleanupFailure.key.ownerGeneration,
+                            cleanupFailure.key.launchId,
+                        ),
+                    )
+                }
+            }
+            return
+        }
         val recovery = pendingRecovery ?: return
         pendingRecovery = null
         invalidateUninstallAttempt()
@@ -4258,6 +4289,25 @@ class ManagerViewModel(
             key,
             InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT,
         )
+        return true
+    }
+
+    internal fun startInstallApkDocumentTransaction(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ): Boolean {
+        val key = InstallApkDocumentTransactionKey(
+            effect.importToken,
+            effect.ownerGeneration,
+            effect.launchId,
+            destination,
+        )
+        val claimed = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Running ?: return false
+        if (claimed.key != key || claimed.phase !=
+            InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT ||
+            installApkDocumentTransactionJob?.isActive == true
+        ) return false
         installApkDocumentTransactionJob = viewModelScope.launch {
             val recovered = state.first {
                 it.startupRecoveryState != StartupRecoveryUiState.INITIALIZING
@@ -4286,6 +4336,32 @@ class ManagerViewModel(
         return true
     }
 
+    internal fun blockClaimedInstallApkDocumentTransaction(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        destination: String,
+    ): Boolean {
+        val key = InstallApkDocumentTransactionKey(
+            effect.importToken,
+            effect.ownerGeneration,
+            effect.launchId,
+            destination,
+        )
+        val claimed = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Running ?: return false
+        if (claimed.key != key || installApkDocumentTransactionJob?.isActive == true) return false
+        persistInstallApkDocumentTransaction(
+            key,
+            InstallApkDocumentTransactionPhase.RECOVERY_BLOCKED,
+        )
+        mutableInstallApkDocumentTransaction.value =
+            InstallApkDocumentTransactionState.Terminal(
+                key,
+                InstallApkDocumentTransactionPhase.RECOVERY_BLOCKED,
+            )
+        showStartupRecoveryBlocked()
+        return true
+    }
+
     internal fun preserveUnattributedInstallApkDocument(destination: String) {
         if (destination.isBlank()) return
         if (!savedStateHandle.contains(INSTALL_APK_UNATTRIBUTED_DESTINATION_KEY)) {
@@ -4309,7 +4385,36 @@ class ManagerViewModel(
         val terminal = mutableInstallApkDocumentTransaction.value as?
             InstallApkDocumentTransactionState.Terminal ?: return false
         if (terminal.key != key) return false
+        if (terminal.phase !in setOf(
+                InstallApkDocumentTransactionPhase.COMMITTED_HANDOFF_PENDING,
+                InstallApkDocumentTransactionPhase.CLEANED_HANDOFF_PENDING,
+                InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING,
+            )
+        ) return false
         mutableInstallApkDocumentTransaction.value = InstallApkDocumentTransactionState.Idle
+        clearInstallApkDocumentTransactionJournal(key)
+        return true
+    }
+
+    internal fun prepareInstallApkDocumentTerminalHandoff(
+        key: InstallApkDocumentTransactionKey,
+    ): Boolean {
+        val terminal = mutableInstallApkDocumentTransaction.value as?
+            InstallApkDocumentTransactionState.Terminal ?: return false
+        if (terminal.key != key) return false
+        val phase = when (terminal.phase) {
+            InstallApkDocumentTransactionPhase.COMMITTED ->
+                InstallApkDocumentTransactionPhase.COMMITTED_HANDOFF_PENDING
+            InstallApkDocumentTransactionPhase.CLEANED ->
+                InstallApkDocumentTransactionPhase.CLEANED_HANDOFF_PENDING
+            InstallApkDocumentTransactionPhase.COMMITTED_HANDOFF_PENDING,
+            InstallApkDocumentTransactionPhase.CLEANED_HANDOFF_PENDING -> terminal.phase
+            InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING -> terminal.phase
+            else -> return false
+        }
+        persistInstallApkDocumentTransaction(key, phase)
+        mutableInstallApkDocumentTransaction.value =
+            InstallApkDocumentTransactionState.Terminal(key, phase)
         return true
     }
 
@@ -4453,6 +4558,13 @@ class ManagerViewModel(
                     )
                 return true
             }
+            phase == InstallApkDocumentTransactionPhase.COMMITTED_HANDOFF_PENDING &&
+                installState is InstallState.AwaitingManualInstall &&
+                installState.importToken == key.importToken -> {
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(key, phase)
+                return true
+            }
             phase == InstallApkDocumentTransactionPhase.CLEANUP_FAILED -> {
                 mutableInstallApkDocumentTransaction.value =
                     InstallApkDocumentTransactionState.Terminal(key, phase)
@@ -4470,6 +4582,18 @@ class ManagerViewModel(
             phase == InstallApkDocumentTransactionPhase.CLEANED &&
                 installState is InstallState.PreparingApkExport &&
                 installState.importToken == key.importToken -> {
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(key, phase)
+                return true
+            }
+            phase == InstallApkDocumentTransactionPhase.CLEANED_HANDOFF_PENDING &&
+                installState is InstallState.PreparingApkExport &&
+                installState.importToken == key.importToken -> {
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(key, phase)
+                return true
+            }
+            phase == InstallApkDocumentTransactionPhase.CLEANUP_RESOLVED_HANDOFF_PENDING -> {
                 mutableInstallApkDocumentTransaction.value =
                     InstallApkDocumentTransactionState.Terminal(key, phase)
                 return true
@@ -4593,7 +4717,7 @@ class ManagerViewModel(
                 message = UserMessage(
                     UserMessageKind.INSTALL_FAILED,
                     "APK 저장 취소 후 부분 파일을 삭제하지 못했습니다. 파일 앱에서 직접 삭제해 주세요.",
-                    RecoveryAction.NONE,
+                    RecoveryAction.RETRY,
                 ),
             )
         }

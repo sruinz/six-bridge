@@ -129,13 +129,31 @@ class MainActivity : ComponentActivity() {
                 receipt.effect,
                 uri.toString(),
             )
-            if (!accepted || !installApkExportHandoff.consumeLaunchReceipt(receipt)) {
+            if (!accepted) {
                 managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
                 return@registerForActivityResult
             }
-            if (installApkExportHandoff.selectDestination(receipt, uri) == null) {
-                managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
+            if (!installApkExportHandoff.consumeLaunchReceipt(receipt)) {
+                managerViewModel.blockClaimedInstallApkDocumentTransaction(
+                    receipt.effect,
+                    uri.toString(),
+                )
+                return@registerForActivityResult
             }
+            if (installApkExportHandoff.selectDestination(receipt, uri) == null) {
+                managerViewModel.blockClaimedInstallApkDocumentTransaction(
+                    receipt.effect,
+                    uri.toString(),
+                )
+                return@registerForActivityResult
+            }
+            if (!managerViewModel.startInstallApkDocumentTransaction(
+                receipt.effect,
+                uri.toString(),
+            )) managerViewModel.blockClaimedInstallApkDocumentTransaction(
+                receipt.effect,
+                uri.toString(),
+            )
         }
     }
 
@@ -314,6 +332,10 @@ class MainActivity : ComponentActivity() {
                                     .CLEANUP_FAILED,
                                 dev.sixbridge.manager.ui.InstallApkDocumentTransactionPhase
                                     .RECOVERY_BLOCKED,
+                            )
+                        ) return@collect
+                        if (!managerViewModel.prepareInstallApkDocumentTerminalHandoff(
+                                terminal.key,
                             )
                         ) return@collect
                         val completion = installApkExportHandoff.completeTransaction(terminal.key)

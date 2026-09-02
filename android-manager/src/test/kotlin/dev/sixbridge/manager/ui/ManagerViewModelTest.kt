@@ -4247,6 +4247,11 @@ class ManagerViewModelTest {
             assertFalse(
                 viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/one"),
             )
+            assertEquals(0, copied)
+            assertEquals(0, deleted)
+            assertTrue(
+                viewModel.startInstallApkDocumentTransaction(effect, "content://apk/one"),
+            )
             assertEquals(TOKEN, savedState.get<String>("install_apk_transaction_token"))
             advanceUntilIdle()
 
@@ -4307,6 +4312,12 @@ class ManagerViewModelTest {
                     "content://apk/initializing",
                 ),
             )
+            assertTrue(
+                viewModel.startInstallApkDocumentTransaction(
+                    effect,
+                    "content://apk/initializing",
+                ),
+            )
             testScheduler.runCurrent()
             assertEquals(0, copies)
             assertEquals(0, deletes)
@@ -4350,6 +4361,9 @@ class ManagerViewModelTest {
 
             assertTrue(
                 viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/stale"),
+            )
+            assertTrue(
+                viewModel.startInstallApkDocumentTransaction(effect, "content://apk/stale"),
             )
             advanceUntilIdle()
 
