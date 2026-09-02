@@ -2587,7 +2587,7 @@ class ManagerRepositoryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun `cleanup 실패는 coordinator부터 ViewModel까지 review token 소유권을 유지한다`() {
+    fun `cleanup 실패는 install 권한을 복원하지 않고 retained cleanup만 차단한다`() {
         val dispatcher = StandardTestDispatcher()
         Dispatchers.setMain(dispatcher)
         try {
@@ -2669,8 +2669,8 @@ class ManagerRepositoryTest {
                 viewModel.accept(ManagerAction.CancelReview)
                 advanceUntilIdle()
 
-                assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-                assertEquals(TOKEN, savedState.get<String>("review_token"))
+                assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+                assertNull(savedState.get<String>("review_token"))
                 assertEquals(1, pendingStore.discardAttempts)
                 assertTrue(File(root, TOKEN).exists())
 

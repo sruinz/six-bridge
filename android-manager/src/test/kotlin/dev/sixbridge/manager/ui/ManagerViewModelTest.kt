@@ -2876,7 +2876,7 @@ class ManagerViewModelTest {
         }
 
     @Test
-    fun `오래 걸린 이전 import 결과가 새 route를 덮지 않는다`() = runTest(dispatcher.scheduler) {
+    fun `review가 아닌 import 진행 중 CancelReview는 소유 route를 바꾸지 않는다`() = runTest(dispatcher.scheduler) {
         val repository = FakeManagerRepository().apply {
             importResult = ManagerImportResult.Success(review(ContractCompatibilityStatus.COMPATIBLE))
             suspendImport = true
@@ -2891,9 +2891,9 @@ class ManagerViewModelTest {
         repository.completeImport()
         advanceUntilIdle()
 
-        assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-        assertEquals(ImportUiState.Idle, viewModel.state.value.importState)
-        assertEquals(listOf(TOKEN), repository.discardedTokens)
+        assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
+        assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState)
+        assertTrue(repository.discardedTokens.isEmpty())
     }
 
     @Test
@@ -2943,7 +2943,11 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.CancelReview)
             repository.completeImport()
             advanceUntilIdle()
-            assertEquals(listOf(TOKEN, SECOND_TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(
+                SECOND_TOKEN,
+                assertIs<ImportUiState.ReviewReady>(viewModel.state.value.importState).review.token,
+            )
         }
 
     @Test
@@ -3190,12 +3194,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertTrue(repository.discardedTokens.isEmpty())
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(savedState.get<String>("review_token"))
 
-            repository.restoreResult = ManagerRestoreResult(
-                review = review(ContractCompatibilityStatus.COMPATIBLE),
-            )
+            repository.restoreResult = ManagerRestoreResult()
             var importCalls = 0
             val recreated = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
@@ -3207,9 +3209,9 @@ class ManagerViewModelTest {
             }
             advanceUntilIdle()
 
-            assertEquals(0, importCalls)
-            assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertEquals(1, importCalls)
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), recreated.state.value.route)
+            assertEquals(SECOND_TOKEN, savedState.get<String>("review_token"))
         }
 
     @Test
@@ -3228,12 +3230,10 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.CancelReview)
             advanceUntilIdle()
             assertEquals(listOf(TOKEN), repository.discardAttempts)
-            assertEquals(ManagerRoute.Review(TOKEN), viewModel.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(savedState.get<String>("review_token"))
 
-            repository.restoreResult = ManagerRestoreResult(
-                review = review(ContractCompatibilityStatus.COMPATIBLE),
-            )
+            repository.restoreResult = ManagerRestoreResult()
             var blockedImportCalls = 0
             val recreated = ManagerViewModel(repository, savedState)
             advanceUntilIdle()
@@ -3244,9 +3244,9 @@ class ManagerViewModelTest {
                 )
             }
             advanceUntilIdle()
-            assertEquals(0, blockedImportCalls)
-            assertEquals(ManagerRoute.Review(TOKEN), recreated.state.value.route)
-            assertEquals(TOKEN, savedState.get<String>("review_token"))
+            assertEquals(1, blockedImportCalls)
+            assertEquals(ManagerRoute.Review(SECOND_TOKEN), recreated.state.value.route)
+            assertEquals(SECOND_TOKEN, savedState.get<String>("review_token"))
 
             repository.discardReviewResult = true
             repository.importResult = ManagerImportResult.Success(
@@ -3255,8 +3255,8 @@ class ManagerViewModelTest {
             recreated.startImport(repository::nextImport)
             advanceUntilIdle()
 
-            assertEquals(listOf(TOKEN, TOKEN, TOKEN), repository.discardAttempts)
-            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(listOf(TOKEN, SECOND_TOKEN), repository.discardAttempts)
+            assertEquals(listOf(SECOND_TOKEN), repository.discardedTokens)
             assertEquals(
                 SECOND_TOKEN,
                 assertIs<ImportUiState.ReviewReady>(recreated.state.value.importState).review.token,
@@ -3752,6 +3752,100 @@ class ManagerViewModelTest {
             viewModel.accept(ManagerAction.PrepareReviewedInstall)
             advanceUntilIdle()
             assertEquals(1, repository.installRequests)
+        }
+
+    @Test
+    fun `imported forced review 취소 직후 stale 확인과 설치는 side effect가 없다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(forcedReview())
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmForcedInstall)
+
+            viewModel.accept(ManagerAction.CancelReview)
+            viewModel.accept(ManagerAction.ReturnHome)
+            viewModel.accept(ManagerAction.ConfirmForcedInstall)
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+
+            assertEquals(0, repository.installRequests)
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertEquals(ImportUiState.Idle, viewModel.state.value.importState)
+            assertNull(savedState.get<String>(ManagerViewModel.REVIEW_TOKEN_KEY))
+            assertNull(savedState.get<Int>(ManagerViewModel.INSTALL_SESSION_ID_KEY))
+        }
+
+    @Test
+    fun `review 취소는 이전 manual owner와 현재 review 폐기 owner를 분리한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(forcedReview())
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            repository.installFlow.value = InstallState.AwaitingManualInstall(SECOND_TOKEN)
+
+            viewModel.accept(ManagerAction.CancelReview)
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf<Pair<String, Int?>>(SECOND_TOKEN to null),
+                repository.cancelInstallArguments,
+            )
+            assertEquals(listOf(TOKEN), repository.discardedTokens)
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `generated forced review 재생성 뒤 다시 진입해 새 확인으로 설치한다`() =
+        runTest(dispatcher.scheduler) {
+            val forcedReview = forcedReview()
+            val generated = generatedBundle()
+            val savedState = SavedStateHandle()
+            val firstRepository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                conversionBuildResult = ConversionBuildResult.BundleReady(forcedReview, generated)
+            }
+            val first = ManagerViewModel(firstRepository, savedState)
+            advanceUntilIdle()
+            first.accept(ManagerAction.OpenConversionInput)
+            first.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            first.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            first.accept(ManagerAction.ConfirmConversionForce)
+            first.accept(ManagerAction.BuildConversion)
+            advanceUntilIdle()
+            first.accept(ManagerAction.PrepareGeneratedInstall)
+            assertEquals(ManagerRoute.Review(forcedReview.token), first.state.value.route)
+
+            val restoredRepository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = forcedReview)
+                restoredConversion = RestoredConversion.BundleReady(forcedReview, generated)
+            }
+            val restored = ManagerViewModel(restoredRepository, savedState)
+            advanceUntilIdle()
+            val result = assertIs<ConversionUiState.ResultReady>(
+                restored.state.value.conversionState,
+            )
+            assertFalse(result.installOwnerActive)
+            assertEquals(ManagerRoute.ConversionResult(generated.token), restored.state.value.route)
+
+            restored.accept(ManagerAction.PrepareGeneratedInstall)
+            val ready = assertIs<ImportUiState.ReviewReady>(restored.state.value.importState)
+            assertFalse(ready.forceCompatibilityConfirmed)
+            assertEquals(ManagerRoute.Review(forcedReview.token), restored.state.value.route)
+            restored.accept(ManagerAction.ConfirmForcedInstall)
+            restored.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            assertEquals(1, restoredRepository.installRequests)
         }
 
     @Test
@@ -10143,7 +10237,7 @@ class ManagerViewModelTest {
         )
 
     @Test
-    fun `forced reanalysis late result does not replace Home`() =
+    fun `forced reanalysis 중 ReturnHome은 Building 소유권을 바꾸지 않는다`() =
         runTest(dispatcher.scheduler) {
             val deferred = CompletableDeferred<ConversionBeginResult>()
             val repository = FakeManagerRepository().apply {
@@ -10166,9 +10260,63 @@ class ManagerViewModelTest {
                 forceChallenge = ConversionForceChallenge(TOKEN, "late"),
             ))
             advanceUntilIdle()
+            assertEquals(ManagerRoute.ConversionAnalysis(TOKEN), viewModel.state.value.route)
+            val ready = assertIs<ConversionUiState.AnalysisReady>(
+                viewModel.state.value.conversionState,
+            )
+            assertEquals("late", ready.forceChallenge?.nonce)
+            assertFalse(repository.conversionForceRevocations.any { it.nonce == "late" })
+        }
+
+    @Test
+    fun `Building 중 route replacement는 모두 no-op이고 정식 취소 뒤 새 변환이 가능하다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                conversionBeginResult = forcedConversionAnalysis()
+                suspendFirstConversionBuild = true
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+            viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.ConfirmConversionForce)
+            viewModel.accept(ManagerAction.BuildConversion)
+            testScheduler.runCurrent()
+            val ownedState = viewModel.state.value
+            val revocations = repository.conversionForceRevocations.size
+
+            listOf(
+                ManagerAction.ReturnHome,
+                ManagerAction.OpenReport(PACKAGE),
+                ManagerAction.OpenConversionIdentityManagement,
+                ManagerAction.OpenConversionInput,
+                ManagerAction.OpenSixFilePicker,
+                ManagerAction.OpenDraftFilePicker,
+                ManagerAction.OpenConversionFilePicker,
+                ManagerAction.CancelReview,
+                ManagerAction.FinishConversion,
+            ).forEach(viewModel::accept)
+            var importCalled = false
+            viewModel.startImport {
+                importCalled = true
+                ManagerImportResult.Failure(ImportFailure(ImportFailureCode.SOURCE_UNREADABLE))
+            }
+            testScheduler.runCurrent()
+
+            assertEquals(ownedState, viewModel.state.value)
+            assertFalse(importCalled)
+            assertEquals(revocations, repository.conversionForceRevocations.size)
+            assertEquals(TOKEN, savedState.get<String>(ManagerViewModel.CONVERSION_TOKEN_KEY))
+
+            viewModel.accept(ManagerAction.CancelConversion)
+            advanceUntilIdle()
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
-            assertTrue(repository.conversionForceRevocations.any { it.nonce == "late" })
-            assertTrue(repository.conversionForceRevocationApprovals.any { it != null })
+            assertEquals(ConversionUiState.Idle, viewModel.state.value.conversionState)
+            viewModel.accept(ManagerAction.OpenConversionInput)
+            assertEquals(ManagerRoute.ConversionInput, viewModel.state.value.route)
         }
 
     @Test

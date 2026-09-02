@@ -197,6 +197,11 @@ class ManagerViewModel(
         ) {
             return
         }
+        if (mutableState.value.conversionState is ConversionUiState.Building &&
+            action.blocksWhileConversionBuildOwnsRoute()
+        ) {
+            return
+        }
         if (!acknowledgeNormalOutcome(action)) return
         if (mutableState.value.startupRecoveryState == StartupRecoveryUiState.READY &&
             action != ManagerAction.RetryRecovery &&
@@ -371,6 +376,7 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
+        if (mutableState.value.conversionState is ConversionUiState.Building) return
         revokeConversionCapability(reissue = false, invalidateOperation = false)
         updateConversionAnalysis {
             it.copy(forceChallenge = null, forceApproval = null)
@@ -714,7 +720,9 @@ class ManagerViewModel(
     }
 
     private fun beginConversion(request: OnDeviceInputRequest) {
-        if (mutableState.value.conversionState == ConversionUiState.Acquiring) return
+        if (mutableState.value.conversionState == ConversionUiState.Acquiring ||
+            mutableState.value.conversionState is ConversionUiState.Building
+        ) return
         revokeConversionCapability(reissue = false, invalidateOperation = false)
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
@@ -1891,12 +1899,20 @@ class ManagerViewModel(
             is RestoredConversion.Analysis -> {
                 if (persistOwners) showConversionAnalysis(restored.value)
             }
-            is RestoredConversion.BundleReady ->
+            is RestoredConversion.BundleReady -> {
+                val review = if (importReview) retainedReview ?: restored.review else retainedReview
+                if (review?.forcedCompatibility != null &&
+                    generatedInstallOwnerToken == restored.generated.token
+                ) {
+                    clearGeneratedInstallOwner()
+                    clearSavedReviewAndSession()
+                }
                 showConversionResult(
-                    review = if (importReview) retainedReview ?: restored.review else retainedReview,
+                    review = review,
                     generated = restored.generated,
                     persistOwners = persistOwners,
                 )
+            }
             is RestoredConversion.GeneratedPending ->
                 showConversionResult(
                     review = retainedReview,
@@ -2071,6 +2087,7 @@ class ManagerViewModel(
 
     private fun confirmForcedInstall() {
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        if (!isCurrentInstallReviewOwner(ready)) return
         if (ready.review.status != ContractCompatibilityStatus.UNKNOWN ||
             ready.review.forcedCompatibility == null
         ) {
@@ -2092,6 +2109,7 @@ class ManagerViewModel(
 
     private fun installReviewedBundle() {
         val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        if (!isCurrentInstallReviewOwner(ready)) return
         if (!ready.installEnabled) {
             val message = when (ready.review.status) {
                 ContractCompatibilityStatus.BLOCKED -> UserMessage(
@@ -2117,6 +2135,7 @@ class ManagerViewModel(
         if (installJob?.isActive == true) return
         val generation = operationGeneration
         val reviewToken = ready.review.token
+        val attemptGeneratedOwner = generatedInstallOwnerToken
         val partialConfirmed = ready.partialConfirmed
         val forceCompatibilityConfirmed = ready.forceCompatibilityConfirmed
         mutableState.update {
@@ -2144,7 +2163,9 @@ class ManagerViewModel(
                 }
                 if (!cleaned ||
                     generation != operationGeneration ||
-                    !isCurrentReviewOwner(reviewToken)
+                    generatedInstallOwnerToken != attemptGeneratedOwner ||
+                    (mutableState.value.importState as? ImportUiState.ReviewReady)
+                        ?.let(::isCurrentInstallReviewOwner) != true
                 ) {
                     if (generation == operationGeneration &&
                         isCurrentReviewOwner(reviewToken)
@@ -2156,6 +2177,11 @@ class ManagerViewModel(
                     return@launch
                 }
             }
+            if (generation != operationGeneration ||
+                generatedInstallOwnerToken != attemptGeneratedOwner ||
+                (mutableState.value.importState as? ImportUiState.ReviewReady)
+                    ?.let(::isCurrentInstallReviewOwner) != true
+            ) return@launch
             val attemptResult = if (ready.review.forcedCompatibility == null) {
                 repository.install(ready.review, partialConfirmed)
             } else {
@@ -2166,17 +2192,10 @@ class ManagerViewModel(
                 )
             }
             if (generation != operationGeneration) return@launch
-            val generatedOwner = generatedInstallOwnerToken
-            val stillOwnsAttempt = ownedReviewToken == reviewToken &&
-                savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == reviewToken &&
-                if (generatedOwner == null) {
-                    mutableState.value.route == ManagerRoute.Review(reviewToken)
-                } else {
-                    val result =
-                        mutableState.value.conversionState as? ConversionUiState.ResultReady
-                    result?.token == generatedOwner && result.review?.token == reviewToken
-                }
-            val export = repository.installApkExport(reviewToken)
+            val stillOwnsAttempt = generatedInstallOwnerToken == attemptGeneratedOwner &&
+                (mutableState.value.importState as? ImportUiState.ReviewReady)
+                    ?.let(::isCurrentInstallReviewOwner) == true
+            val export = if (stillOwnsAttempt) repository.installApkExport(reviewToken) else null
             if (export != null && stillOwnsAttempt) {
                 val effect = ManagerEffect.CreateInstallApkDocument(
                     importToken = export.importToken,
@@ -2273,8 +2292,34 @@ class ManagerViewModel(
     }
 
     private fun cancelReview() {
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        val reviewToken = ready.review.token
+        if (mutableState.value.route != ManagerRoute.Review(reviewToken) ||
+            ownedReviewToken != reviewToken ||
+            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != reviewToken
+        ) return
+        val reviewPackageName = ready.review.packageName
+        val reviewSessionId = savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY)
+        val generatedOwner = generatedInstallOwnerToken
         revokeConversionCapability(reissue = false, invalidateOperation = false)
-        moveOwnedReviewToPendingDiscard()
+        pendingReviewDiscards += reviewToken
+        ownedReviewToken = null
+        savedStateHandle[REVIEW_TOKEN_KEY] = null
+        savedStateHandle[INSTALL_SESSION_ID_KEY] = null
+        clearGeneratedInstallOwner()
+        mutableState.update {
+            val result = it.conversionState as? ConversionUiState.ResultReady
+            it.copy(
+                route = ManagerRoute.Home,
+                importState = ImportUiState.Idle,
+                conversionState = if (generatedOwner != null && result?.token == generatedOwner) {
+                    result.copy(installOwnerActive = false)
+                } else {
+                    it.conversionState
+                },
+                message = null,
+            )
+        }
         val supersededInstall = detachInstallJob()
         supersededInstall?.cancel()
         val ticket = replaceRouteOperation()
@@ -2287,28 +2332,28 @@ class ManagerViewModel(
                 completePendingNormalHandoffForNewWork()
             } else {
                 try {
-                    cancelInstallForRoute(generation, suppressTerminalOnSuccess = true)
+                    cancelInstallForRoute(
+                        generation = generation,
+                        suppressTerminalOnSuccess = true,
+                        expectedReviewTokenOverride = reviewToken,
+                        expectedSessionIdOverride = reviewSessionId,
+                        detachedReviewPackageName = reviewPackageName,
+                        detachedGeneratedOwnerToken = generatedOwner,
+                    )
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: Exception) {
                     return@enqueueRouteCleanup false
                 }
             }
-            if (cleaned &&
-                generation == operationGeneration
-            ) {
-                if (!discardPendingReviews()) return@enqueueRouteCleanup false
+            if (!cleaned) return@enqueueRouteCleanup false
+            val discarded = reviewToken !in pendingReviewDiscards ||
+                repository.discardReview(reviewToken)
+            if (discarded) pendingReviewDiscards.remove(reviewToken)
+            if (cleaned && discarded && generation == operationGeneration) {
                 completedReplacementCleanupGeneration = generation
-                clearSavedReviewAndSession()
-                mutableState.update {
-                    it.copy(
-                        route = ManagerRoute.Home,
-                        importState = ImportUiState.Idle,
-                        message = null,
-                    )
-                }
             }
-            cleaned
+            discarded
         }
     }
 
@@ -2562,6 +2607,24 @@ class ManagerViewModel(
         ManagerAction.OpenConversionFilePicker,
         is ManagerAction.ConversionFileSelected,
         ManagerAction.AnalyzeConversionUrl,
+        -> true
+        else -> false
+    }
+
+    private fun ManagerAction.blocksWhileConversionBuildOwnsRoute(): Boolean = when (this) {
+        ManagerAction.ReturnHome,
+        is ManagerAction.OpenReport,
+        ManagerAction.OpenConversionIdentityManagement,
+        ManagerAction.OpenConversionInput,
+        ManagerAction.OpenSixFilePicker,
+        ManagerAction.OpenDraftFilePicker,
+        ManagerAction.OpenConversionFilePicker,
+        is ManagerAction.ImportSelected,
+        is ManagerAction.DraftFileSelected,
+        is ManagerAction.ConversionFileSelected,
+        ManagerAction.AnalyzeConversionUrl,
+        ManagerAction.CancelReview,
+        ManagerAction.FinishConversion,
         -> true
         else -> false
     }
@@ -2901,6 +2964,10 @@ class ManagerViewModel(
     private suspend fun cancelInstallForRoute(
         generation: Long,
         suppressTerminalOnSuccess: Boolean,
+        expectedReviewTokenOverride: String? = null,
+        expectedSessionIdOverride: Int? = null,
+        detachedReviewPackageName: String? = null,
+        detachedGeneratedOwnerToken: String? = null,
     ): Boolean {
         val previous = repository.installState.value
         val persistedManualOwner = when (previous) {
@@ -2908,7 +2975,7 @@ class ManagerViewModel(
             is InstallState.AwaitingManualInstall -> previous.importToken
             else -> null
         }
-        val expectedReviewToken = persistedManualOwner ?: ownedReviewToken
+        val expectedReviewToken = persistedManualOwner ?: expectedReviewTokenOverride ?: ownedReviewToken
             ?: savedStateHandle.get<String>(REVIEW_TOKEN_KEY)
         val replacingActiveInstall =
             persistedManualOwner != null ||
@@ -2920,13 +2987,24 @@ class ManagerViewModel(
         if (expectedReviewToken == null) {
             return !replacingActiveInstall
         }
+        val expectedSessionId = if (persistedManualOwner != null &&
+            persistedManualOwner != expectedReviewTokenOverride
+        ) {
+            null
+        } else {
+            expectedSessionIdOverride ?: savedStateHandle[INSTALL_SESSION_ID_KEY]
+        }
         val resolution = reconcileInstallCancellation(
             generation = generation,
             suppressTerminalOnSuccess = suppressTerminalOnSuccess,
             expectedReviewToken = expectedReviewToken,
-            expectedSessionId = savedStateHandle[INSTALL_SESSION_ID_KEY],
+            expectedSessionId = expectedSessionId,
             onOwnerSessionAssigned = { sessionId ->
-                if (sessionId < 0 ||
+                if (sessionId < 0) {
+                    false
+                } else if (detachedReviewPackageName != null) {
+                    true
+                } else if (
                     ownedReviewToken != expectedReviewToken ||
                     savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != expectedReviewToken
                 ) {
@@ -2939,26 +3017,40 @@ class ManagerViewModel(
         )
         return when (resolution) {
             InstallCancellationResolution.Cleaned -> true
-            is InstallCancellationResolution.OwnedTerminal -> when (resolution.state) {
-                InstallState.Cancelled -> {
-                    val generatedOwner = generatedInstallOwnerToken
-                    val applied = applyInstallTerminal(
-                        installState = resolution.state,
-                        expectedReviewToken = expectedReviewToken,
-                        expectedSessionId = resolution.sessionId,
+            is InstallCancellationResolution.OwnedTerminal -> {
+                if (detachedGeneratedOwnerToken != null ||
+                    expectedReviewTokenOverride != null &&
+                    expectedReviewToken != expectedReviewTokenOverride
+                ) {
+                    return completeTerminalReceipt(
+                        expectedReviewToken,
+                        resolution.sessionId,
+                        resolution.state,
                     )
-                    if (applied && generatedOwner == null) {
-                        pendingReviewDiscards.remove(expectedReviewToken)
-                    }
-                    applied
                 }
-                else -> {
-                    applyInstallTerminal(
-                        installState = resolution.state,
-                        expectedReviewToken = expectedReviewToken,
-                        expectedSessionId = resolution.sessionId,
-                    )
-                    false
+                when (resolution.state) {
+                    InstallState.Cancelled -> {
+                        val generatedOwner = generatedInstallOwnerToken
+                        val applied = applyInstallTerminal(
+                            installState = resolution.state,
+                            expectedReviewToken = expectedReviewToken,
+                            expectedSessionId = resolution.sessionId,
+                            detachedReviewPackageName = detachedReviewPackageName,
+                        )
+                        if (applied && generatedOwner == null) {
+                            pendingReviewDiscards.remove(expectedReviewToken)
+                        }
+                        applied
+                    }
+                    else -> {
+                        applyInstallTerminal(
+                            installState = resolution.state,
+                            expectedReviewToken = expectedReviewToken,
+                            expectedSessionId = resolution.sessionId,
+                            detachedReviewPackageName = detachedReviewPackageName,
+                        )
+                        false
+                    }
                 }
             }
             InstallCancellationResolution.Failed -> false
@@ -3258,6 +3350,7 @@ class ManagerViewModel(
         installState: InstallState,
         expectedReviewToken: String,
         expectedSessionId: Int?,
+        detachedReviewPackageName: String? = null,
     ): Boolean {
         val generatedOwner = generatedInstallOwnerToken
         if (generatedOwner != null) {
@@ -3280,7 +3373,8 @@ class ManagerViewModel(
             sessionId = expectedSessionId,
             packageName = when (installState) {
                 is InstallState.Installed -> installState.packageName
-                else -> (mutableState.value.importState as? ImportUiState.ReviewReady)
+                else -> detachedReviewPackageName
+                    ?: (mutableState.value.importState as? ImportUiState.ReviewReady)
                     ?.review
                     ?.packageName
                     ?: return false
@@ -4898,6 +4992,28 @@ class ManagerViewModel(
             savedStateHandle.get<String>(REVIEW_TOKEN_KEY) == importToken
     }
 
+    private fun isCurrentInstallReviewOwner(ready: ImportUiState.ReviewReady): Boolean {
+        val reviewToken = ready.review.token
+        if (ownedReviewToken != reviewToken ||
+            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != reviewToken
+        ) return false
+        val generatedToken = generatedInstallOwnerToken
+        if (generatedToken == null) {
+            return mutableState.value.route == ManagerRoute.Review(reviewToken)
+        }
+        val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
+            ?: return false
+        if (!result.installOwnerActive ||
+            result.token != generatedToken ||
+            result.review?.token != reviewToken
+        ) return false
+        return if (ready.review.forcedCompatibility == null) {
+            mutableState.value.route == ManagerRoute.ConversionResult(generatedToken)
+        } else {
+            mutableState.value.route == ManagerRoute.Review(reviewToken)
+        }
+    }
+
     private fun isInstallPermissionOwnerCurrent(
         reviewToken: String,
         generatedToken: String?,
@@ -4905,24 +5021,9 @@ class ManagerViewModel(
         val ready =
             mutableState.value.importState as? ImportUiState.ReviewReady
                 ?: return false
-        if (ready.review.token != reviewToken ||
-            ownedReviewToken != reviewToken ||
-            savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != reviewToken
-        ) {
-            return false
-        }
-        if (generatedToken == null) {
-            return generatedInstallOwnerToken == null &&
-                mutableState.value.route == ManagerRoute.Review(reviewToken)
-        }
-        val result =
-            mutableState.value.conversionState as? ConversionUiState.ResultReady
-                ?: return false
-        return generatedInstallOwnerToken == generatedToken &&
-            result.installOwnerActive &&
-            result.token == generatedToken &&
-            result.review?.token == reviewToken &&
-            mutableState.value.route == ManagerRoute.ConversionResult(generatedToken)
+        return ready.review.token == reviewToken &&
+            generatedInstallOwnerToken == generatedToken &&
+            isCurrentInstallReviewOwner(ready)
     }
 
     companion object {
