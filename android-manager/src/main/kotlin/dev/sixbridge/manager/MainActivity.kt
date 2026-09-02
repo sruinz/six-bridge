@@ -105,8 +105,13 @@ class MainActivity : ComponentActivity() {
     private val createInstallApkExportDocument = registerForActivityResult(
         ActivityResultContracts.CreateDocument(APK_MIME_TYPE),
     ) { uri ->
+        val receipt = installApkExportHandoff.consumeLaunchReceipt()
+        if (receipt == null) {
+            uri?.let { managerViewModel.preserveUnattributedInstallApkDocument(it.toString()) }
+            return@registerForActivityResult
+        }
         if (uri == null) {
-            installApkExportHandoff.cancelSelection()?.let { completion ->
+            installApkExportHandoff.cancelSelection(receipt)?.let { completion ->
                 if (managerViewModel.ownsSystemInstallApkDocument(
                         completion.pending.effect,
                     )
@@ -117,22 +122,18 @@ class MainActivity : ComponentActivity() {
                     ?.let(::launchInstallApkExportPicker)
             }
         } else {
-            installApkExportHandoff.selectDestination(uri)
-            installApkExportHandoff.pending?.let { pending ->
+            val selected = installApkExportHandoff.selectDestination(receipt, uri)
+            if (selected == null) {
+                managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
+                return@registerForActivityResult
+            }
+            selected.let { pending ->
                 val accepted = managerViewModel.beginInstallApkDocumentTransaction(
                     pending.effect,
                     uri.toString(),
                 )
                 if (!accepted) {
-                    val cleanupScheduled =
-                        managerViewModel.discardRejectedInstallApkDocumentDestination(
-                        pending.effect,
-                        uri.toString(),
-                    )
-                    if (cleanupScheduled) {
-                        installApkExportHandoff.clear(pending)
-                            ?.let(::launchInstallApkExportPicker)
-                    }
+                    managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
                 }
             }
         }
@@ -144,6 +145,7 @@ class MainActivity : ComponentActivity() {
                 ?.let(::launchInstallApkExportPicker)
             return
         }
+        if (!installApkExportHandoff.markLaunched(pending)) return
         createInstallApkExportDocument.launch(pending.effect.suggestedFileName)
     }
 
@@ -307,12 +309,18 @@ class MainActivity : ComponentActivity() {
                     managerViewModel.installApkDocumentTransaction.collect { transaction ->
                         val terminal = transaction as?
                             InstallApkDocumentTransactionState.Terminal ?: return@collect
-                        if (managerViewModel.acknowledgeInstallApkDocumentTerminal(
-                                terminal.key,
-                            )
-                        ) {
-                            installApkExportHandoff.completeTransaction(terminal.key)
-                                ?.let(::launchInstallApkExportPicker)
+                        if (terminal.phase ==
+                            dev.sixbridge.manager.ui.InstallApkDocumentTransactionPhase
+                                .CLEANUP_FAILED
+                        ) return@collect
+                        val completion = installApkExportHandoff.completeTransaction(terminal.key)
+                        if (completion.matched) {
+                            if (managerViewModel.acknowledgeInstallApkDocumentTerminal(
+                                    terminal.key,
+                                )
+                            ) completion.launchNext?.let(::launchInstallApkExportPicker)
+                        } else {
+                            managerViewModel.blockInstallApkDocumentRecovery(terminal.key)
                         }
                     }
                 }
@@ -438,17 +446,26 @@ internal data class PendingInstallApkExportDocument(
 internal data class InstallApkExportDocumentCompletion(
     val pending: PendingInstallApkExportDocument,
     val action: ManagerAction.InstallApkCreated,
-    val saveResult: GeneratedDocumentSaveResult? = null,
 )
 
 internal class InstallApkExportDocumentHandoff(
     pending: PendingInstallApkExportDocument? = null,
     queued: PendingInstallApkExportDocument? = null,
+    launched: PendingInstallApkExportDocument? = null,
 ) {
     var pending: PendingInstallApkExportDocument? = pending
         private set
     var queued: PendingInstallApkExportDocument? = queued
         private set
+    private var launched: PendingInstallApkExportDocument? = launched
+
+    fun markLaunched(expected: PendingInstallApkExportDocument): Boolean {
+        if (pending != expected || launched != null) return false
+        launched = expected
+        return true
+    }
+
+    fun consumeLaunchReceipt(): PendingInstallApkExportDocument? = launched.also { launched = null }
 
     fun begin(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
@@ -462,57 +479,29 @@ internal class InstallApkExportDocumentHandoff(
         return next
     }
 
-    fun selectDestination(destination: Uri) {
-        pending = pending?.copy(destination = destination)
+    fun selectDestination(
+        receipt: PendingInstallApkExportDocument,
+        destination: Uri,
+    ): PendingInstallApkExportDocument? {
+        if (pending != receipt) return null
+        return receipt.copy(destination = destination).also { pending = it }
     }
 
-    fun cancelSelection(): InstallApkExportDocumentCompletion? {
-        val exact = pending ?: return null
-        return InstallApkExportDocumentCompletion(
-            pending = exact,
-            action = ManagerAction.InstallApkCreated(
-                importToken = exact.effect.importToken,
-                uri = null,
-                ownerGeneration = exact.effect.ownerGeneration,
-                launchId = exact.effect.launchId,
-            ),
-        )
-    }
+    fun selectDestination(destination: Uri) { pending = pending?.copy(destination = destination) }
 
-    fun cancelRestoredCopy(): InstallApkExportDocumentCompletion? {
-        val exact = pending?.takeIf { it.destination != null } ?: return null
-        val completion = InstallApkExportDocumentCompletion(
-            pending = exact,
-            action = ManagerAction.InstallApkCreated(
-                importToken = exact.effect.importToken,
-                uri = null,
-                ownerGeneration = exact.effect.ownerGeneration,
-                launchId = exact.effect.launchId,
-            ),
-        )
-        pending = queued
-        queued = null
-        return completion
-    }
-
-    suspend fun prepareCompletion(
-        copy: suspend (PendingInstallApkExportDocument) ->
-            GeneratedDocumentSaveResult,
+    fun cancelSelection(
+        receipt: PendingInstallApkExportDocument? = pending,
     ): InstallApkExportDocumentCompletion? {
-        val exact = pending?.takeIf { it.destination != null } ?: return null
-        val result = copy(exact)
-        if (pending != exact) return null
+        val exact = pending ?: return null
+        if (receipt != exact) return null
         return InstallApkExportDocumentCompletion(
             pending = exact,
             action = ManagerAction.InstallApkCreated(
                 importToken = exact.effect.importToken,
-                uri = exact.destination.takeIf {
-                    result == GeneratedDocumentSaveResult.Success
-                },
+                uri = null,
                 ownerGeneration = exact.effect.ownerGeneration,
                 launchId = exact.effect.launchId,
             ),
-            saveResult = result,
         )
     }
 
@@ -536,16 +525,17 @@ internal class InstallApkExportDocumentHandoff(
 
     fun completeTransaction(
         key: dev.sixbridge.manager.ui.InstallApkDocumentTransactionKey,
-    ): PendingInstallApkExportDocument? {
-        val exact = pending ?: return null
+    ): InstallApkHandoffCompletion {
+        val exact = pending ?: return InstallApkHandoffCompletion(false, null)
         if (exact.effect.importToken != key.importToken ||
             exact.effect.ownerGeneration != key.ownerGeneration ||
             exact.effect.launchId != key.launchId ||
             exact.destination?.toString() != key.destination
-        ) return null
+        ) return InstallApkHandoffCompletion(false, null)
         pending = queued
         queued = null
-        return pending
+        launched = null
+        return InstallApkHandoffCompletion(true, pending)
     }
 
     fun save(outState: Bundle) {
@@ -634,10 +624,27 @@ internal class InstallApkExportDocumentHandoff(
                     destination = destination,
                 ),
                 queued = queued,
+                launched = if (destination == null) {
+                    PendingInstallApkExportDocument(
+                        effect = ManagerEffect.CreateInstallApkDocument(
+                            importToken = token,
+                            source = File(source),
+                            expectedSha256 = sha256,
+                            suggestedFileName = name,
+                            ownerGeneration = ownerGeneration,
+                            launchId = launchId,
+                        ),
+                    )
+                } else null,
             )
         }
     }
 }
+
+internal data class InstallApkHandoffCompletion(
+    val matched: Boolean,
+    val launchNext: PendingInstallApkExportDocument?,
+)
 
 internal data class PendingActivityDocumentLaunch(
     val token: String?,
@@ -819,120 +826,6 @@ internal suspend fun writeGeneratedDocument(
         }
     }
 }
-
-internal suspend fun saveInstallApkExportDocumentWhileOwned(
-    owners: StateFlow<DocumentLaunchIdentity?>,
-    expected: DocumentLaunchIdentity,
-    onCleanupFailed: () -> Unit = {},
-    destination: Uri? = null,
-    save: suspend () -> GeneratedDocumentSaveResult,
-): GeneratedDocumentSaveResult {
-    return installApkExportCopyMutex.withLock {
-        if (owners.value != expected) {
-            return@withLock GeneratedDocumentSaveResult.OwnershipRejected
-        }
-        coroutineScope {
-        val completion = CompletableDeferred<GeneratedDocumentSaveResult>()
-        val saveJob = launch(start = CoroutineStart.UNDISPATCHED) {
-            val result = save()
-            withContext(NonCancellable) { completion.complete(result) }
-        }
-        val ownerGuard = launch(start = CoroutineStart.UNDISPATCHED) {
-            owners.first { it != expected }
-            saveJob.cancel()
-        }
-        try {
-            val result = withContext(NonCancellable) {
-                saveJob.join()
-                completion.await()
-            }
-            if (result.cleanupFailed()) {
-                withContext(NonCancellable) { onCleanupFailed() }
-            } else if (result != GeneratedDocumentSaveResult.Success &&
-                result != GeneratedDocumentSaveResult.OwnershipRejected &&
-                destination != null
-            ) {
-                cleanedInstallApkDestinations += InstallApkDestinationIdentity(
-                    expected,
-                    destination.toString(),
-                )
-                if (cleanedInstallApkDestinations.size > 16) {
-                    cleanedInstallApkDestinations.iterator().let { oldest ->
-                        oldest.next()
-                        oldest.remove()
-                    }
-                }
-            }
-            result
-        } finally {
-            ownerGuard.cancel()
-        }
-        }
-    }
-}
-
-private fun GeneratedDocumentSaveResult.cleanupFailed(): Boolean = when (this) {
-    GeneratedDocumentSaveResult.Success -> false
-    GeneratedDocumentSaveResult.OwnershipRejected -> false
-    is GeneratedDocumentSaveResult.Cancelled -> cleanupFailed
-    is GeneratedDocumentSaveResult.Failure -> cleanupFailed
-}
-
-internal sealed interface InstallApkExportFinalizeResult {
-    data object Accepted : InstallApkExportFinalizeResult
-    data object RejectedWithoutDestination : InstallApkExportFinalizeResult
-    data object StaleDestinationDeleted : InstallApkExportFinalizeResult
-    data object StaleDestinationCleanupFailed : InstallApkExportFinalizeResult
-}
-
-internal suspend fun finalizeInstallApkExportDocument(
-    destination: Uri?,
-    accept: () -> Boolean,
-    delete: suspend (Uri) -> Boolean,
-): InstallApkExportFinalizeResult {
-    if (accept()) return InstallApkExportFinalizeResult.Accepted
-    if (destination == null) return InstallApkExportFinalizeResult.RejectedWithoutDestination
-    return withContext(NonCancellable) {
-        if (delete(destination)) {
-            InstallApkExportFinalizeResult.StaleDestinationDeleted
-        } else {
-            InstallApkExportFinalizeResult.StaleDestinationCleanupFailed
-        }
-    }
-}
-
-private val installApkExportCopyMutex = Mutex()
-private data class InstallApkDestinationIdentity(
-    val document: DocumentLaunchIdentity,
-    val uri: String,
-)
-
-private val cleanedInstallApkDestinations =
-    mutableSetOf<InstallApkDestinationIdentity>()
-
-internal suspend fun deleteInstallApkDestinationSerialized(
-    document: DocumentLaunchIdentity,
-    destination: Uri,
-    delete: suspend () -> Boolean,
-): Boolean = installApkExportCopyMutex.withLock {
-    if (cleanedInstallApkDestinations.remove(
-            InstallApkDestinationIdentity(document, destination.toString()),
-        )
-    ) {
-        true
-    } else {
-        withContext(NonCancellable) { delete() }
-    }
-}
-
-private fun ManagerEffect.CreateSystemInstallApkDocument.identity() =
-    DocumentLaunchIdentity(ownerGeneration, launchId)
-
-internal fun shouldCleanupRestoredInstallApk(
-    installState: InstallState,
-    effect: ManagerEffect.CreateSystemInstallApkDocument,
-): Boolean = (installState as? InstallState.AwaitingManualInstall)?.importToken !=
-    effect.importToken
 
 private class GeneratedDocumentOpenException : IllegalStateException()
 

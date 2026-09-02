@@ -4247,12 +4247,6 @@ class ManagerViewModelTest {
             assertFalse(
                 viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/one"),
             )
-            assertFalse(
-                viewModel.discardRejectedInstallApkDocumentDestination(
-                    effect,
-                    "content://apk/one",
-                ),
-            )
             assertEquals(TOKEN, savedState.get<String>("install_apk_transaction_token"))
             advanceUntilIdle()
 
@@ -4262,6 +4256,65 @@ class ManagerViewModelTest {
                 viewModel.installApkDocumentTransaction.value,
             )
             assertIs<InstallState.AwaitingManualInstall>(repository.installFlow.value)
+        }
+
+    @Test
+    fun `startup INITIALIZING 중 APK callback은 복원 완료 전 copy나 삭제를 시작하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            val source = File("/retained/${review.token}/wrapper.apk")
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to review.token,
+                    "pending_system_apk_token" to review.token,
+                    "pending_system_apk_source" to source.path,
+                    "pending_system_apk_sha256" to "a".repeat(64),
+                    "pending_system_apk_name" to "wrapper.apk",
+                    "pending_system_apk_owner_generation" to 7L,
+                    "pending_system_apk_launch_id" to 11L,
+                    "document_owner_generation" to 7L,
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = review)
+                installFlow.value = InstallState.PreparingApkExport(review.token)
+                suspendInitialize = true
+            }
+            var copies = 0
+            var deletes = 0
+            val viewModel = ManagerViewModel(
+                repository,
+                savedState,
+                saveInstallApkDocument = { _, _ ->
+                    copies += 1
+                    GeneratedDocumentSaveResult.Success
+                },
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            testScheduler.runCurrent()
+            val effect = ManagerEffect.CreateInstallApkDocument(
+                review.token,
+                source,
+                "a".repeat(64),
+                "wrapper.apk",
+                7L,
+                11L,
+            )
+
+            assertTrue(
+                viewModel.beginInstallApkDocumentTransaction(
+                    effect,
+                    "content://apk/initializing",
+                ),
+            )
+            testScheduler.runCurrent()
+            assertEquals(0, copies)
+            assertEquals(0, deletes)
+
+            repository.completeInitialize()
+            advanceUntilIdle()
+            assertEquals(1, copies)
+            assertEquals(0, deletes)
         }
 
     @Test
@@ -4351,6 +4404,57 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(0, deletes)
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+        }
+
+    @Test
+    fun `잘못된 타입과 빈 token의 APK transaction journal은 crash 없이 복구를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            val review = review(ContractCompatibilityStatus.COMPATIBLE)
+            var deletes = 0
+            val malformed = apkTransactionJournal("", "COPY_IN_FLIGHT").toMutableMap().apply {
+                put(ManagerViewModel.INSTALL_APK_TRANSACTION_OWNER_KEY, "잘못된 타입")
+            }
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(review = review)
+                    installFlow.value = InstallState.PreparingApkExport(review.token)
+                },
+                SavedStateHandle(malformed + mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to review.token)),
+                deleteInstallApkDocument = { deletes += 1; true },
+            )
+            advanceUntilIdle()
+
+            assertEquals(0, deletes)
+            assertEquals(
+                StartupRecoveryUiState.RECOVERY_BLOCKED,
+                viewModel.state.value.startupRecoveryState,
+            )
+        }
+
+    @Test
+    fun `귀속할 수 없는 APK URI receipt는 process recreation 뒤에도 복구를 차단한다`() =
+        runTest(dispatcher.scheduler) {
+            val saved = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    ManagerViewModel.INSTALL_APK_UNATTRIBUTED_DESTINATION_KEY to
+                        "content://apk/unattributed",
+                ),
+            )
+            val viewModel = ManagerViewModel(
+                FakeManagerRepository().apply {
+                    restoreResult = ManagerRestoreResult(
+                        review = review(ContractCompatibilityStatus.COMPATIBLE),
+                    )
+                },
+                saved,
+            )
+            advanceUntilIdle()
+
             assertEquals(
                 StartupRecoveryUiState.RECOVERY_BLOCKED,
                 viewModel.state.value.startupRecoveryState,
