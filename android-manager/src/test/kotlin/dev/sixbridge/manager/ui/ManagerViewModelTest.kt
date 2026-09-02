@@ -2048,7 +2048,7 @@ class ManagerViewModelTest {
     @Test
     fun `검토 설치는 항상 APK 문서 생성 effect를 발행하고 명시 확인에서만 조정한다`() =
         runTest(dispatcher.scheduler) {
-            val source = File("/retained/$TOKEN/wrapper.apk")
+            val source = File("/retained/$SECOND_TOKEN/wrapper.apk")
             val repository = FakeManagerRepository().apply {
                 restoreResult = ManagerRestoreResult(
                     review = review(ContractCompatibilityStatus.COMPATIBLE).copy(
@@ -3946,6 +3946,64 @@ class ManagerViewModelTest {
             assertNull(savedState.get<String>("pending_system_apk_token"))
             assertTrue(repository.installApkExportedTokens.isEmpty())
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `install APK export suspend 중 route 이탈은 늦은 terminal도 적용하지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.Failed("PACKAGE_WRITE", "late")
+                suspendInstallApkExport = true
+            }
+            val viewModel = ManagerViewModel(repository, SavedStateHandle())
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            testScheduler.runCurrent()
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            repository.completeInstallApkExport()
+            advanceUntilIdle()
+
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+            assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `startup export owner 불일치는 복원된 pending APK effect를 폐기한다`() =
+        runTest(dispatcher.scheduler) {
+            val source = File("/retained/$TOKEN/wrapper.apk")
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN,
+                    "pending_system_apk_token" to SECOND_TOKEN,
+                    "pending_system_apk_source" to source.path,
+                    "pending_system_apk_sha256" to "a".repeat(64),
+                    "pending_system_apk_name" to "wrapper.apk",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installFlow.value = InstallState.PreparingApkExport(TOKEN)
+            }
+
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertNull(savedState.get<String>("pending_system_apk_token"))
+            val stale = ManagerEffect.CreateInstallApkDocument(
+                importToken = SECOND_TOKEN,
+                source = source,
+                expectedSha256 = "a".repeat(64),
+                suggestedFileName = "wrapper.apk",
+            )
+            assertFalse(viewModel.ownsSystemInstallApkDocument(stale))
         }
 
     @Test

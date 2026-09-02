@@ -2237,7 +2237,7 @@ class ManagerViewModel(
                 enqueueEffect(effect)
                 return@launch
             }
-            if (attemptResult.isTerminalState() && stillOwnsAttempt) {
+            if (attemptResult.isTerminalState() && stillOwnsExport) {
                 val applied = applyObservedInstallTerminal(attemptResult)
                 if (!applied &&
                     attemptResult is InstallState.Failed &&
@@ -4020,6 +4020,15 @@ class ManagerViewModel(
     }
 
     private fun showStartupRecoveryBlocked() {
+        val pendingApk = pendingSystemInstallApkDocument
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady
+        if (pendingApk != null && ready != null &&
+            (pendingApk.importToken != ready.review.token ||
+                !isCurrentInstallReviewOwner(ready))
+        ) {
+            clearPendingSystemInstallApkDocument()
+            if (pendingRecovery is PendingRecovery.SystemInstallApk) pendingRecovery = null
+        }
         mutableState.update {
             it.copy(
                 startupRecoveryState = StartupRecoveryUiState.RECOVERY_BLOCKED,
@@ -4060,11 +4069,15 @@ class ManagerViewModel(
             is InstallState.PreparingApkExport -> installState.importToken
             else -> null
         }
-        if (preparingExportToken == reviewToken &&
+        if (pendingSystemInstallApkDocument?.importToken?.let { it != reviewToken } == true) {
+            clearPendingSystemInstallApkDocument()
+            if (pendingRecovery is PendingRecovery.SystemInstallApk) pendingRecovery = null
+        }
+        val ownsPreparingExport = preparingExportToken == reviewToken &&
             reviewToken != null &&
             (mutableState.value.importState as? ImportUiState.ReviewReady)
                 ?.let(::isCurrentInstallReviewOwner) == true
-        ) {
+        if (ownsPreparingExport) {
             val export = repository.installApkExport(reviewToken)
             if ((mutableState.value.importState as? ImportUiState.ReviewReady)
                     ?.let(::isCurrentInstallReviewOwner) == true
@@ -4099,6 +4112,9 @@ class ManagerViewModel(
                         )
                     }
                 }
+        } else if (preparingExportToken == reviewToken && reviewToken != null) {
+            clearPendingSystemInstallApkDocument()
+            if (pendingRecovery is PendingRecovery.SystemInstallApk) pendingRecovery = null
         }
         if (installState is InstallState.AwaitingManualInstall &&
             readyReview?.token == installState.importToken &&
