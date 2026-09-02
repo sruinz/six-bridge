@@ -1,5 +1,6 @@
 package dev.sixbridge.manager.ui
 
+import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -103,9 +104,21 @@ class ManagerViewModel(
     private var pendingGeneratedShareHandoff: PendingGeneratedShareHandoff? = null
     private var generatedShareHandoffSequence = 0L
     private var installJob: Job? = null
+    private var documentOwnerGeneration =
+        savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
+    private var documentLaunchSequence =
+        savedStateHandle.get<Long>(DOCUMENT_LAUNCH_SEQUENCE_KEY) ?: 0L
     private var pendingSystemInstallApkDocument:
         ManagerEffect.CreateInstallApkDocument? =
         restorePendingSystemInstallApkDocument()
+    private val mutableInstallApkDocumentOwner = MutableStateFlow(
+        pendingSystemInstallApkDocument?.takeIf {
+            it.ownerGeneration == documentOwnerGeneration
+        }?.identity(),
+    )
+    internal val installApkDocumentOwner: StateFlow<DocumentLaunchIdentity?> =
+        mutableInstallApkDocumentOwner.asStateFlow()
+    private val reportedInstallApkCleanupFailures = mutableSetOf<DocumentLaunchIdentity>()
     private var operationGeneration = 0L
     private var launchGeneration = 0L
     private var uninstallGeneration = 0L
@@ -139,10 +152,6 @@ class ManagerViewModel(
     private var intermediateGeneratedCleanupRestorePending = false
     private var generatedCleanupJob: Job? = null
     private var quarantinedGeneratedCleanupJob: Job? = null
-    private var documentOwnerGeneration =
-        savedStateHandle.get<Long>(DOCUMENT_OWNER_GENERATION_KEY) ?: 0L
-    private var documentLaunchSequence =
-        savedStateHandle.get<Long>(DOCUMENT_LAUNCH_SEQUENCE_KEY) ?: 0L
     private var pendingSixPicker = restorePendingSixPicker()
     private var pendingDraftPicker = restorePendingDraftPicker()
     private var pendingConversionPicker = restorePendingConversionPicker()
@@ -310,6 +319,23 @@ class ManagerViewModel(
             ManagerAction.InstallReviewedBundle -> installReviewedBundle()
             is ManagerAction.InstallApkCreated ->
                 acceptInstallApkCreated(action)
+            is ManagerAction.InstallApkCleanupFailed -> {
+                val identity = DocumentLaunchIdentity(
+                    action.ownerGeneration,
+                    action.launchId,
+                )
+                if (reportedInstallApkCleanupFailures.add(identity)) {
+                    mutableState.update {
+                        it.copy(
+                            message = UserMessage(
+                                UserMessageKind.INSTALL_FAILED,
+                                "APK 저장 취소 후 부분 파일을 삭제하지 못했습니다. 파일 앱에서 직접 삭제해 주세요.",
+                                RecoveryAction.NONE,
+                            ),
+                        )
+                    }
+                }
+            }
             is ManagerAction.SystemInstallApkCreated ->
                 acceptInstallApkCreated(action)
             ManagerAction.ConfirmManualInstallStatus -> confirmManualInstallStatus()
@@ -2222,6 +2248,7 @@ class ManagerViewModel(
                 (mutableState.value.importState as? ImportUiState.ReviewReady)
                     ?.let(::isCurrentInstallReviewOwner) == true
             if (export != null && stillOwnsExport) {
+                val launch = newDocumentLaunch()
                 val effect = ManagerEffect.CreateInstallApkDocument(
                     importToken = export.importToken,
                     source = export.source,
@@ -2232,6 +2259,8 @@ class ManagerViewModel(
                         extensionId = export.extensionId,
                         wrapperVersionCode = ready.review.wrapperVersionCode,
                     ),
+                    ownerGeneration = launch.ownerGeneration,
+                    launchId = launch.launchId,
                 )
                 setPendingSystemInstallApkDocument(effect)
                 enqueueEffect(effect)
@@ -2251,14 +2280,17 @@ class ManagerViewModel(
 
     private fun acceptInstallApkCreated(
         action: ManagerAction.SystemInstallApkCreated,
-    ) {
+    ): Boolean {
         val pending = pendingSystemInstallApkDocument
             ?.takeIf {
                 it.importToken == action.importToken &&
+                    it.ownerGeneration == action.ownerGeneration &&
+                    it.launchId == action.launchId &&
+                    it.ownerGeneration == documentOwnerGeneration &&
                     (mutableState.value.importState as? ImportUiState.ReviewReady)
                         ?.let(::isCurrentInstallReviewOwner) == true
             }
-            ?: return
+            ?: return false
         if (action.uri == null) {
             pendingRecovery = PendingRecovery.SystemInstallApk(pending)
             mutableState.update {
@@ -2270,7 +2302,7 @@ class ManagerViewModel(
                     ),
                 )
             }
-            return
+            return true
         }
         if (!repository.markInstallApkExported(action.importToken)) {
             pendingRecovery = PendingRecovery.SystemInstallApk(pending)
@@ -2283,12 +2315,25 @@ class ManagerViewModel(
                     ),
                 )
             }
-            return
+            return true
         }
         clearPendingSystemInstallApkDocument()
         pendingRecovery = null
         showManualInstallUi()
+        return true
     }
+
+    internal fun completeSystemInstallApkDocument(
+        effect: ManagerEffect.CreateSystemInstallApkDocument,
+        uri: Uri?,
+    ): Boolean = acceptInstallApkCreated(
+        ManagerAction.InstallApkCreated(
+            importToken = effect.importToken,
+            uri = uri,
+            ownerGeneration = effect.ownerGeneration,
+            launchId = effect.launchId,
+        ),
+    )
 
     private fun confirmManualInstallStatus() {
         val manual = mutableState.value.installState as? InstallState.AwaitingManualInstall
@@ -2594,8 +2639,13 @@ class ManagerViewModel(
                 enqueueEffect(retriedEffect)
             }
             is PendingRecovery.SystemInstallApk -> {
-                setPendingSystemInstallApkDocument(recovery.effect)
-                enqueueEffect(recovery.effect)
+                val launch = newDocumentLaunch()
+                val effect = recovery.effect.copy(
+                    ownerGeneration = launch.ownerGeneration,
+                    launchId = launch.launchId,
+                )
+                setPendingSystemInstallApkDocument(effect)
+                enqueueEffect(effect)
             }
         }
     }
@@ -4078,11 +4128,16 @@ class ManagerViewModel(
             (mutableState.value.importState as? ImportUiState.ReviewReady)
                 ?.let(::isCurrentInstallReviewOwner) == true
         if (ownsPreparingExport) {
+            val startupGeneration = operationGeneration
+            val startupGeneratedOwner = generatedInstallOwnerToken
             val export = repository.installApkExport(reviewToken)
-            if ((mutableState.value.importState as? ImportUiState.ReviewReady)
+            val stillOwnsStartupExport = startupGeneration == operationGeneration &&
+                startupGeneratedOwner == generatedInstallOwnerToken &&
+                (mutableState.value.importState as? ImportUiState.ReviewReady)
                     ?.let(::isCurrentInstallReviewOwner) == true
-            ) {
+            if (stillOwnsStartupExport) {
                 export?.let {
+                    val launch = newDocumentLaunch()
                     setPendingSystemInstallApkDocument(
                         ManagerEffect.CreateInstallApkDocument(
                             importToken = it.importToken,
@@ -4094,9 +4149,15 @@ class ManagerViewModel(
                                 extensionId = it.extensionId,
                                 wrapperVersionCode = readyReview.wrapperVersionCode,
                             ),
+                            ownerGeneration = launch.ownerGeneration,
+                            launchId = launch.launchId,
                         ),
                     )
                 }
+            }
+            if (!stillOwnsStartupExport) {
+                clearPendingSystemInstallApkDocument()
+                if (pendingRecovery is PendingRecovery.SystemInstallApk) pendingRecovery = null
             }
             pendingSystemInstallApkDocument
                 ?.takeIf { it.importToken == reviewToken }
@@ -4130,8 +4191,12 @@ class ManagerViewModel(
     internal fun ownsSystemInstallApkDocument(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
     ): Boolean = pendingSystemInstallApkDocument == effect &&
+        effect.ownerGeneration == documentOwnerGeneration &&
         (mutableState.value.importState as? ImportUiState.ReviewReady)
             ?.let(::isCurrentInstallReviewOwner) == true
+
+    private fun ManagerEffect.CreateSystemInstallApkDocument.identity() =
+        DocumentLaunchIdentity(ownerGeneration, launchId)
 
     private fun setPendingSystemInstallApkDocument(
         effect: ManagerEffect.CreateInstallApkDocument,
@@ -4141,31 +4206,53 @@ class ManagerViewModel(
         savedStateHandle[PENDING_SYSTEM_APK_SOURCE_KEY] = effect.source.path
         savedStateHandle[PENDING_SYSTEM_APK_SHA256_KEY] = effect.expectedSha256
         savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = effect.suggestedFileName
+        savedStateHandle[PENDING_SYSTEM_APK_OWNER_GENERATION_KEY] = effect.ownerGeneration
+        savedStateHandle[PENDING_SYSTEM_APK_LAUNCH_ID_KEY] = effect.launchId
+        mutableInstallApkDocumentOwner.value = effect.identity()
     }
 
     private fun clearPendingSystemInstallApkDocument() {
+        mutableInstallApkDocumentOwner.value = null
         pendingSystemInstallApkDocument = null
         savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = null
         savedStateHandle[PENDING_SYSTEM_APK_SOURCE_KEY] = null
         savedStateHandle[PENDING_SYSTEM_APK_SHA256_KEY] = null
         savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = null
+        savedStateHandle[PENDING_SYSTEM_APK_OWNER_GENERATION_KEY] = null
+        savedStateHandle[PENDING_SYSTEM_APK_LAUNCH_ID_KEY] = null
     }
 
     private fun restorePendingSystemInstallApkDocument():
         ManagerEffect.CreateInstallApkDocument? {
+        fun rejectIncomplete(): ManagerEffect.CreateInstallApkDocument? {
+            savedStateHandle[PENDING_SYSTEM_APK_TOKEN_KEY] = null
+            savedStateHandle[PENDING_SYSTEM_APK_SOURCE_KEY] = null
+            savedStateHandle[PENDING_SYSTEM_APK_SHA256_KEY] = null
+            savedStateHandle[PENDING_SYSTEM_APK_NAME_KEY] = null
+            savedStateHandle[PENDING_SYSTEM_APK_OWNER_GENERATION_KEY] = null
+            savedStateHandle[PENDING_SYSTEM_APK_LAUNCH_ID_KEY] = null
+            return null
+        }
         val token = savedStateHandle.get<String>(PENDING_SYSTEM_APK_TOKEN_KEY)
             ?: return null
         val source = savedStateHandle.get<String>(PENDING_SYSTEM_APK_SOURCE_KEY)
-            ?: return null
+            ?: return rejectIncomplete()
         val sha256 = savedStateHandle.get<String>(PENDING_SYSTEM_APK_SHA256_KEY)
-            ?: return null
+            ?: return rejectIncomplete()
         val name = savedStateHandle.get<String>(PENDING_SYSTEM_APK_NAME_KEY)
-            ?: return null
+            ?: return rejectIncomplete()
+        val ownerGeneration =
+            savedStateHandle.get<Long>(PENDING_SYSTEM_APK_OWNER_GENERATION_KEY)
+                ?: return rejectIncomplete()
+        val launchId = savedStateHandle.get<Long>(PENDING_SYSTEM_APK_LAUNCH_ID_KEY)
+            ?: return rejectIncomplete()
         return ManagerEffect.CreateInstallApkDocument(
             importToken = token,
             source = File(source),
             expectedSha256 = sha256,
             suggestedFileName = name,
+            ownerGeneration = ownerGeneration,
+            launchId = launchId,
         )
     }
 
@@ -5011,7 +5098,11 @@ class ManagerViewModel(
             }
             is ManagerEffect.CreateInstallApkDocument -> {
                 val pending = pendingSystemInstallApkDocument ?: return false
-                return pending == effect && isCurrentReviewOwner(effect.importToken)
+                val ready = mutableState.value.importState as? ImportUiState.ReviewReady
+                    ?: return false
+                return pending == effect &&
+                    effect.ownerGeneration == documentOwnerGeneration &&
+                    isCurrentInstallReviewOwner(ready)
             }
             is ManagerEffect.CreateSystemInstallApkDocument -> return false
             is ManagerEffect.ShareGeneratedBundle -> {
@@ -5127,6 +5218,9 @@ class ManagerViewModel(
         const val PENDING_SYSTEM_APK_SOURCE_KEY = "pending_system_apk_source"
         const val PENDING_SYSTEM_APK_SHA256_KEY = "pending_system_apk_sha256"
         const val PENDING_SYSTEM_APK_NAME_KEY = "pending_system_apk_name"
+        const val PENDING_SYSTEM_APK_OWNER_GENERATION_KEY =
+            "pending_system_apk_owner_generation"
+        const val PENDING_SYSTEM_APK_LAUNCH_ID_KEY = "pending_system_apk_launch_id"
         private val CLEANUP_RETRYABLE_FAILURES = setOf(
             "CLEANUP_FAILED",
             "ABANDON_FAILED",

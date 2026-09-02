@@ -350,7 +350,7 @@ class ConversionDocumentIoTest {
             assertEquals(destination, recreated.pending?.destination)
             assertEquals(TOKEN, exactCompletion.action.importToken)
             assertEquals(destination, exactCompletion.action.uri)
-            assertTrue(recreated.acknowledge(exactCompletion))
+            assertNull(recreated.acknowledge(exactCompletion))
             assertNull(recreated.pending)
         }
 
@@ -392,7 +392,7 @@ class ConversionDocumentIoTest {
             assertNotNull(stale)
             handoff.begin(second)
 
-            assertFalse(handoff.acknowledge(requireNotNull(stale)))
+            assertEquals(second, handoff.acknowledge(requireNotNull(stale))?.effect)
             assertEquals(second, handoff.pending?.effect)
         }
 

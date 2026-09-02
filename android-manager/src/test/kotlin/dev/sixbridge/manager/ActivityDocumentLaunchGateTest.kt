@@ -4,6 +4,16 @@ import android.net.Uri
 import android.os.Bundle
 import dev.sixbridge.manager.ui.ManagerEffect
 import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlin.test.assertFalse
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNull
@@ -123,7 +133,175 @@ class ActivityDocumentLaunchGateTest {
         assertEquals(effect.importToken, exact.action.importToken)
         assertEquals(destination, exact.action.uri)
         assertEquals(effect, handoff.pending?.effect)
-        kotlin.test.assertTrue(handoff.acknowledge(exact))
+        assertNull(handoff.acknowledge(exact))
         assertNull(handoff.pending)
+    }
+
+    @Test
+    fun `APK picker active A는 보존하고 latest queued C만 다음 launch로 승격한다`() {
+        fun effect(launchId: Long) = ManagerEffect.CreateInstallApkDocument(
+            importToken = "11111111-1111-1111-1111-111111111111",
+            source = File("/retained/wrapper-$launchId.apk"),
+            expectedSha256 = "a".repeat(64),
+            suggestedFileName = "wrapper-$launchId.apk",
+            ownerGeneration = launchId,
+            launchId = launchId,
+        )
+        val first = effect(1)
+        val second = effect(2)
+        val latest = effect(3)
+        val handoff = InstallApkExportDocumentHandoff()
+
+        assertEquals(first, handoff.begin(first)?.effect)
+        assertNull(handoff.begin(second))
+        assertNull(handoff.begin(latest))
+        val restored = InstallApkExportDocumentHandoff.restore(
+            Bundle().also(handoff::save),
+        )
+        val completion = restored.cancelSelection()
+
+        assertEquals(latest, restored.acknowledge(requireNotNull(completion))?.effect)
+        assertEquals(latest, restored.pending?.effect)
+        assertNull(restored.queued)
+    }
+
+    @Test
+    fun `APK copy 중 owner generation 변경은 copy를 취소하고 cleanup 결과를 기다린다`() =
+        runTest {
+            val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(7, 11)
+            val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+            val started = CompletableDeferred<Unit>()
+            val cleaned = CompletableDeferred<Unit>()
+
+            val result = async {
+                saveInstallApkExportDocumentWhileOwned(
+                    owners = owners,
+                    expected = expected,
+                ) {
+                    started.complete(Unit)
+                    try {
+                        CompletableDeferred<Unit>().await()
+                        error("owner가 바뀌면 copy가 취소되어야 합니다.")
+                    } catch (_: CancellationException) {
+                        cleaned.complete(Unit)
+                        GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false)
+                    }
+                }
+            }
+            started.await()
+            owners.value = dev.sixbridge.manager.ui.DocumentLaunchIdentity(8, 12)
+
+            assertEquals(
+                GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false),
+                result.await(),
+            )
+            cleaned.await()
+        }
+
+    @Test
+    fun `APK copy 취소 cleanup 실패 결과를 숨기지 않는다`() = runTest {
+        val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(9, 13)
+        val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+        val started = CompletableDeferred<Unit>()
+
+        val result = async {
+            saveInstallApkExportDocumentWhileOwned(
+                owners = owners,
+                expected = expected,
+            ) {
+                started.complete(Unit)
+                try {
+                    CompletableDeferred<Unit>().await()
+                    error("owner가 바뀌면 copy가 취소되어야 합니다.")
+                } catch (_: CancellationException) {
+                    GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true)
+                }
+            }
+        }
+        started.await()
+        owners.value = null
+
+        assertEquals(
+            GeneratedDocumentSaveResult.Cancelled(cleanupFailed = true),
+            result.await(),
+        )
+    }
+
+    @Test
+    fun `APK 저장 성공 직후 owner를 잃으면 이번 destination만 삭제한다`() = runTest {
+        val destination = Uri.parse("content://documents/stale-success.apk")
+        var accepted = 0
+        val deleted = mutableListOf<Uri>()
+
+        val result = finalizeInstallApkExportDocument(
+            destination = destination,
+            accept = {
+                accepted += 1
+                false
+            },
+            delete = {
+                deleted += it
+                true
+            },
+        )
+
+        assertEquals(InstallApkExportFinalizeResult.StaleDestinationDeleted, result)
+        assertEquals(1, accepted)
+        assertEquals(listOf(destination), deleted)
+    }
+
+    @Test
+    fun `stale APK destination 삭제 실패는 exact cleanup failure를 반환한다`() = runTest {
+        val destination = Uri.parse("content://documents/stale-cleanup-failed.apk")
+
+        val result = finalizeInstallApkExportDocument(
+            destination = destination,
+            accept = { false },
+            delete = { false },
+        )
+
+        assertEquals(InstallApkExportFinalizeResult.StaleDestinationCleanupFailed, result)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `recreation copy는 이전 같은 destination cleanup이 끝난 뒤 시작한다`() = runTest {
+        val expected = dev.sixbridge.manager.ui.DocumentLaunchIdentity(10, 14)
+        val owners = MutableStateFlow<dev.sixbridge.manager.ui.DocumentLaunchIdentity?>(expected)
+        val firstStarted = CompletableDeferred<Unit>()
+        val allowCleanup = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
+
+        val first = async {
+            saveInstallApkExportDocumentWhileOwned(owners, expected) {
+                firstStarted.complete(Unit)
+                try {
+                    CompletableDeferred<Unit>().await()
+                    error("owner 폐기 시 취소되어야 합니다.")
+                } catch (_: CancellationException) {
+                    withContext(NonCancellable) { allowCleanup.await() }
+                    GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false)
+                }
+            }
+        }
+        firstStarted.await()
+        owners.value = null
+        runCurrent()
+        owners.value = expected
+        val second = async {
+            saveInstallApkExportDocumentWhileOwned(owners, expected) {
+                secondStarted.complete(Unit)
+                GeneratedDocumentSaveResult.Success
+            }
+        }
+        runCurrent()
+
+        assertFalse(secondStarted.isCompleted)
+        allowCleanup.complete(Unit)
+        assertEquals(
+            GeneratedDocumentSaveResult.Cancelled(cleanupFailed = false),
+            first.await(),
+        )
+        assertEquals(GeneratedDocumentSaveResult.Success, second.await())
     }
 }

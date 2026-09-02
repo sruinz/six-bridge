@@ -2093,6 +2093,8 @@ class ManagerViewModelTest {
                 ManagerAction.InstallApkCreated(
                     importToken = TOKEN,
                     uri = unitTestUri(),
+                    ownerGeneration = effect.ownerGeneration,
+                    launchId = effect.launchId,
                 ),
             )
             assertEquals(listOf(TOKEN), repository.installApkExportedTokens)
@@ -2132,13 +2134,83 @@ class ManagerViewModelTest {
             advanceUntilIdle()
             viewModel.accept(ManagerAction.InstallReviewedBundle)
             advanceUntilIdle()
-            assertIs<ManagerEffect.CreateInstallApkDocument>(viewModel.effects.first())
+            val effect = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
 
             viewModel.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, null))
-            viewModel.accept(ManagerAction.InstallApkCreated(TOKEN, null))
+            viewModel.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    null,
+                    effect.ownerGeneration,
+                    effect.launchId,
+                ),
+            )
 
             assertTrue(repository.installApkExportedTokens.isEmpty())
             assertEquals(RecoveryAction.RETRY, viewModel.state.value.message?.recoveryAction)
+        }
+
+    @Test
+    fun `APK picker retry는 새 launch ID를 만들고 이전 callback을 거부한다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(
+                    review = review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val viewModel = ManagerViewModel(
+                repository,
+                SavedStateHandle(mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN)),
+            )
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+            val first = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+            viewModel.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    null,
+                    first.ownerGeneration,
+                    first.launchId,
+                ),
+            )
+            viewModel.accept(ManagerAction.RetryRecovery)
+            val second = assertIs<ManagerEffect.CreateInstallApkDocument>(
+                viewModel.effects.first(),
+            )
+
+            assertTrue(first.launchId != second.launchId)
+            viewModel.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    unitTestUri(),
+                    first.ownerGeneration,
+                    first.launchId,
+                ),
+            )
+            assertTrue(repository.installApkExportedTokens.isEmpty())
+            viewModel.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    unitTestUri(),
+                    second.ownerGeneration,
+                    second.launchId,
+                ),
+            )
+            assertEquals(listOf(TOKEN), repository.installApkExportedTokens)
         }
 
     @Test
@@ -2315,11 +2387,27 @@ class ManagerViewModelTest {
                 source = effect.source,
                 expectedSha256 = effect.expectedSha256,
                 suggestedFileName = effect.suggestedFileName,
+                ownerGeneration = effect.ownerGeneration,
+                launchId = effect.launchId,
             )
             assertTrue(recreated.ownsSystemInstallApkDocument(activityRestoredEffect))
             recreated.accept(ManagerAction.InstallApkCreated(SECOND_TOKEN, unitTestUri()))
-            recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
-            recreated.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
+            recreated.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    unitTestUri(),
+                    effect.ownerGeneration,
+                    effect.launchId,
+                ),
+            )
+            recreated.accept(
+                ManagerAction.InstallApkCreated(
+                    TOKEN,
+                    unitTestUri(),
+                    effect.ownerGeneration,
+                    effect.launchId,
+                ),
+            )
             advanceUntilIdle()
 
             assertEquals(TOKEN, effect.importToken)
@@ -3971,6 +4059,115 @@ class ManagerViewModelTest {
 
             assertEquals(ManagerRoute.Home, viewModel.state.value.route)
             assertNull(viewModel.state.value.message)
+        }
+
+    @Test
+    fun `queued APK effect는 saved generated owner drift 뒤 전달되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+            val savedState = SavedStateHandle()
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            advanceUntilIdle()
+
+            savedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            val effects = mutableListOf<ManagerEffect>()
+            backgroundScope.launch { viewModel.effects.collect(effects::add) }
+            testScheduler.runCurrent()
+
+            assertTrue(effects.isEmpty())
+        }
+
+    @Test
+    fun `startup APK export는 같은 generated review owner ABA 뒤 복원되지 않는다`() =
+        runTest(dispatcher.scheduler) {
+            val review = forcedReview()
+            val generated = generatedBundle()
+            val failed = InstallState.Failed("PACKAGE_WRITE", "late")
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to review.token,
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to review.token,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = review)
+                restoredConversion = RestoredConversion.BundleReady(review, generated)
+                installFlow.value = InstallState.PreparingApkExport(review.token)
+                installApkExport = InstallApkExport(
+                    importToken = review.token,
+                    source = File("/retained/${review.token}/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+                suspendInstallApkExport = true
+                terminalOwnerProofConfigured = true
+                terminalOwnerImportToken = review.token
+                terminalOwnerPackageName = review.packageName
+                terminalOwnerState = failed
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            testScheduler.runCurrent()
+            assertEquals(1, repository.installApkExportRequests)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            repository.installFlow.value = failed
+            advanceUntilIdle()
+            assertEquals(ManagerRoute.ConversionResult(generated.token), viewModel.state.value.route)
+            viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+            assertEquals(ManagerRoute.Review(review.token), viewModel.state.value.route)
+            repository.completeInstallApkExport()
+            advanceUntilIdle()
+
+            assertNull(savedState.get<String>("pending_system_apk_token"))
+            assertFalse(
+                assertIs<ImportUiState.ReviewReady>(
+                    viewModel.state.value.importState,
+                ).forceCompatibilityConfirmed,
+            )
+        }
+
+    @Test
+    fun `APK copy cleanup 실패는 owner 폐기 뒤에도 명시한다`() =
+        runTest(dispatcher.scheduler) {
+            val viewModel = ManagerViewModel(FakeManagerRepository(), SavedStateHandle())
+            advanceUntilIdle()
+
+            val failure = ManagerAction.InstallApkCleanupFailed(
+                ownerGeneration = 7,
+                launchId = 11,
+            )
+            viewModel.accept(failure)
+
+            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
+            assertTrue(viewModel.state.value.message?.text?.contains("직접 삭제") == true)
+            viewModel.accept(ManagerAction.DismissMessage)
+            viewModel.accept(failure)
+            assertNull(viewModel.state.value.message)
+            viewModel.accept(failure.copy(launchId = 12))
+            assertEquals(UserMessageKind.INSTALL_FAILED, viewModel.state.value.message?.kind)
         }
 
     @Test

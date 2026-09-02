@@ -20,6 +20,11 @@ import dev.sixbridge.manager.install.InstallState
 import dev.sixbridge.manager.install.SamsungInternetSupportStatus
 import java.io.File
 
+internal data class DocumentLaunchIdentity(
+    val ownerGeneration: Long,
+    val launchId: Long,
+)
+
 sealed interface ManagerRoute {
     data object Home : ManagerRoute
     data object ConversionInput : ManagerRoute
@@ -342,17 +347,26 @@ sealed interface ManagerAction {
     open class SystemInstallApkCreated(
         open val importToken: String,
         open val uri: Uri?,
+        open val ownerGeneration: Long = 0,
+        open val launchId: Long = 0,
     ) : ManagerAction
     data class InstallApkCreated(
         override val importToken: String,
         override val uri: Uri?,
-    ) : SystemInstallApkCreated(importToken, uri)
+        override val ownerGeneration: Long = 0,
+        override val launchId: Long = 0,
+    ) : SystemInstallApkCreated(importToken, uri, ownerGeneration, launchId)
     data object ConfirmManualInstallStatus : ManagerAction
     @Deprecated("ConfirmManualInstallStatus를 사용합니다.")
     data object ConfirmSystemInstallStatus : ManagerAction
     data class ContinueInstallAfterNotificationPermission(
         val reviewToken: String,
         val generatedToken: String? = null,
+    ) : ManagerAction
+
+    data class InstallApkCleanupFailed(
+        val ownerGeneration: Long,
+        val launchId: Long,
     ) : ManagerAction
     data object CancelReview : ManagerAction
     data class Remove(val packageName: String) : ManagerAction
@@ -407,17 +421,23 @@ sealed interface ManagerEffect {
         open val source: File,
         open val expectedSha256: String,
         open val suggestedFileName: String,
+        open val ownerGeneration: Long = 0,
+        open val launchId: Long = 0,
     ) : ManagerEffect {
         open fun copy(
             importToken: String = this.importToken,
             source: File = this.source,
             expectedSha256: String = this.expectedSha256,
             suggestedFileName: String = this.suggestedFileName,
+            ownerGeneration: Long = this.ownerGeneration,
+            launchId: Long = this.launchId,
         ): CreateSystemInstallApkDocument = CreateSystemInstallApkDocument(
             importToken,
             source,
             expectedSha256,
             suggestedFileName,
+            ownerGeneration,
+            launchId,
         )
 
         override fun equals(other: Any?): Boolean =
@@ -425,13 +445,17 @@ sealed interface ManagerEffect {
                 importToken == other.importToken &&
                 source == other.source &&
                 expectedSha256 == other.expectedSha256 &&
-                suggestedFileName == other.suggestedFileName
+                suggestedFileName == other.suggestedFileName &&
+                ownerGeneration == other.ownerGeneration &&
+                launchId == other.launchId
 
         override fun hashCode(): Int {
             var result = importToken.hashCode()
             result = 31 * result + source.hashCode()
             result = 31 * result + expectedSha256.hashCode()
-            return 31 * result + suggestedFileName.hashCode()
+            result = 31 * result + suggestedFileName.hashCode()
+            result = 31 * result + ownerGeneration.hashCode()
+            return 31 * result + launchId.hashCode()
         }
     }
 
@@ -440,22 +464,30 @@ sealed interface ManagerEffect {
         override val source: File,
         override val expectedSha256: String,
         override val suggestedFileName: String,
+        override val ownerGeneration: Long = 0,
+        override val launchId: Long = 0,
     ) : CreateSystemInstallApkDocument(
         importToken,
         source,
         expectedSha256,
         suggestedFileName,
+        ownerGeneration,
+        launchId,
     ) {
         override fun copy(
             importToken: String,
             source: File,
             expectedSha256: String,
             suggestedFileName: String,
+            ownerGeneration: Long,
+            launchId: Long,
         ): CreateInstallApkDocument = CreateInstallApkDocument(
             importToken,
             source,
             expectedSha256,
             suggestedFileName,
+            ownerGeneration,
+            launchId,
         )
     }
 
