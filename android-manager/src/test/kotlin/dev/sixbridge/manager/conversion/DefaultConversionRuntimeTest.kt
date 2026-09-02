@@ -43,6 +43,56 @@ class DefaultConversionRuntimeTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `Android runtime은 store CRX의 analyze와 강제 prepare에 같은 검증 ID를 사용한다`() {
+        val sourceZip = ByteArrayOutputStream().use { bytes ->
+            ZipOutputStream(bytes).use { output ->
+                output.putNextEntry(ZipEntry("manifest.json"))
+                output.write(
+                    """{"manifest_version":3,"name":"Dynamic","version":"1","content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}"""
+                        .encodeToByteArray(),
+                )
+                output.closeEntry()
+                output.putNextEntry(ZipEntry("content.js"))
+                output.write("chrome[namespace].sync.get('value');".encodeToByteArray())
+                output.closeEntry()
+            }
+            bytes.toByteArray()
+        }
+        val keyPair = KeyPairGenerator.getInstance("RSA")
+            .apply { initialize(2048) }
+            .generateKeyPair()
+        val packed = Crx3Writer.create(sourceZip, KeyPairCrx3SigningKey(keyPair))
+        val input = temporaryFolder.newFile("dynamic-store.crx").apply {
+            writeBytes(packed.bytes)
+        }
+        val runtime = DefaultConversionRuntime()
+
+        val analysis = runtime.analyze(
+            input,
+            OnDeviceInputKind.CHROME_WEB_STORE,
+            profile(),
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+        )
+        val prepared = runtime.prepare(
+            input,
+            OnDeviceInputKind.CHROME_WEB_STORE,
+            profile(),
+            emptySet(),
+            AnalysisControl(AnalysisSafetyPolicy.mobile),
+            ConversionAuthorization.forceUnknownApiUsage(),
+        )
+
+        assertEquals(CompatibilityStatus.UNKNOWN, analysis.report.status)
+        assertEquals(packed.extensionId, analysis.report.originalExtensionId)
+        assertEquals(packed.extensionId, prepared.reportBefore.originalExtensionId)
+        assertEquals(analysis.report, prepared.reportBefore)
+        assertEquals(
+            listOf("api_usage_dynamic"),
+            assertNotNull(prepared.forcedCompatibility).issueCodes,
+        )
+    }
+
+    @Test
     fun `Android runtime은 일반 ZIP의 analyze와 prepare에 같은 canonical proof를 사용한다`() {
         val input = temporaryFolder.newFile("noncanonical.zip").apply {
             outputStream().use { bytes ->

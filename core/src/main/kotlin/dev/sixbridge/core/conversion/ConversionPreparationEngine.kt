@@ -163,11 +163,11 @@ class ConversionPreparationEngine private constructor(
         requireCrxManifestBinding(input, beforeRaw)
         val originalSourceSha256 =
             input.verifiedCrxPayloadSha256 ?: snapshot.sourceSha256
-        val before = beforeRaw.copy(
-            sourceSha256 = originalSourceSha256,
-        ).also(CompatibilityReport::validate)
-        val originalExtensionId =
-            input.expectedExtensionId ?: beforeRaw.manifestKeyExtensionId
+        val before = retainAnalyzedOriginalExtensionId(
+            beforeRaw.copy(sourceSha256 = originalSourceSha256),
+            input.expectedExtensionId,
+        )
+        val originalExtensionId = before.originalExtensionId
         val plan = plan(beforeRaw, approvals, authorization)
         val proofPlan = if (before == beforeRaw) {
             plan
