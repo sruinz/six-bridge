@@ -4262,7 +4262,18 @@ class ManagerViewModel(
             val recovered = state.first {
                 it.startupRecoveryState != StartupRecoveryUiState.INITIALIZING
             }
-            if (recovered.startupRecoveryState != StartupRecoveryUiState.READY) return@launch
+            if (recovered.startupRecoveryState != StartupRecoveryUiState.READY) {
+                persistInstallApkDocumentTransaction(
+                    key,
+                    InstallApkDocumentTransactionPhase.RECOVERY_BLOCKED,
+                )
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(
+                        key,
+                        InstallApkDocumentTransactionPhase.RECOVERY_BLOCKED,
+                    )
+                return@launch
+            }
             installApkDocumentIoMutex.withLock {
                 val result = if (ownsSystemInstallApkDocument(effect)) {
                     saveInstallApkDocumentWhileOwned(effect, destination)
@@ -4277,7 +4288,9 @@ class ManagerViewModel(
 
     internal fun preserveUnattributedInstallApkDocument(destination: String) {
         if (destination.isBlank()) return
-        savedStateHandle[INSTALL_APK_UNATTRIBUTED_DESTINATION_KEY] = destination
+        if (!savedStateHandle.contains(INSTALL_APK_UNATTRIBUTED_DESTINATION_KEY)) {
+            savedStateHandle[INSTALL_APK_UNATTRIBUTED_DESTINATION_KEY] = destination
+        }
         installApkTransactionRestoreInvalid = true
         showStartupRecoveryBlocked()
     }
@@ -4462,6 +4475,12 @@ class ManagerViewModel(
                 return true
             }
             phase == InstallApkDocumentTransactionPhase.CLEANED -> {
+                mutableInstallApkDocumentTransaction.value =
+                    InstallApkDocumentTransactionState.Terminal(key, phase)
+                showStartupRecoveryBlocked()
+                return false
+            }
+            phase == InstallApkDocumentTransactionPhase.RECOVERY_BLOCKED -> {
                 mutableInstallApkDocumentTransaction.value =
                     InstallApkDocumentTransactionState.Terminal(key, phase)
                 showStartupRecoveryBlocked()

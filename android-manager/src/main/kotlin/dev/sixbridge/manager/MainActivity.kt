@@ -105,12 +105,15 @@ class MainActivity : ComponentActivity() {
     private val createInstallApkExportDocument = registerForActivityResult(
         ActivityResultContracts.CreateDocument(APK_MIME_TYPE),
     ) { uri ->
-        val receipt = installApkExportHandoff.consumeLaunchReceipt()
+        val receipt = installApkExportHandoff.peekLaunchReceipt()
         if (receipt == null) {
             uri?.let { managerViewModel.preserveUnattributedInstallApkDocument(it.toString()) }
             return@registerForActivityResult
         }
         if (uri == null) {
+            if (!installApkExportHandoff.consumeLaunchReceipt(receipt)) {
+                return@registerForActivityResult
+            }
             installApkExportHandoff.cancelSelection(receipt)?.let { completion ->
                 if (managerViewModel.ownsSystemInstallApkDocument(
                         completion.pending.effect,
@@ -122,19 +125,16 @@ class MainActivity : ComponentActivity() {
                     ?.let(::launchInstallApkExportPicker)
             }
         } else {
-            val selected = installApkExportHandoff.selectDestination(receipt, uri)
-            if (selected == null) {
+            val accepted = managerViewModel.beginInstallApkDocumentTransaction(
+                receipt.effect,
+                uri.toString(),
+            )
+            if (!accepted || !installApkExportHandoff.consumeLaunchReceipt(receipt)) {
                 managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
                 return@registerForActivityResult
             }
-            selected.let { pending ->
-                val accepted = managerViewModel.beginInstallApkDocumentTransaction(
-                    pending.effect,
-                    uri.toString(),
-                )
-                if (!accepted) {
-                    managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
-                }
+            if (installApkExportHandoff.selectDestination(receipt, uri) == null) {
+                managerViewModel.preserveUnattributedInstallApkDocument(uri.toString())
             }
         }
     }
@@ -309,9 +309,12 @@ class MainActivity : ComponentActivity() {
                     managerViewModel.installApkDocumentTransaction.collect { transaction ->
                         val terminal = transaction as?
                             InstallApkDocumentTransactionState.Terminal ?: return@collect
-                        if (terminal.phase ==
-                            dev.sixbridge.manager.ui.InstallApkDocumentTransactionPhase
-                                .CLEANUP_FAILED
+                        if (terminal.phase in setOf(
+                                dev.sixbridge.manager.ui.InstallApkDocumentTransactionPhase
+                                    .CLEANUP_FAILED,
+                                dev.sixbridge.manager.ui.InstallApkDocumentTransactionPhase
+                                    .RECOVERY_BLOCKED,
+                            )
                         ) return@collect
                         val completion = installApkExportHandoff.completeTransaction(terminal.key)
                         if (completion.matched) {
@@ -465,7 +468,13 @@ internal class InstallApkExportDocumentHandoff(
         return true
     }
 
-    fun consumeLaunchReceipt(): PendingInstallApkExportDocument? = launched.also { launched = null }
+    fun peekLaunchReceipt(): PendingInstallApkExportDocument? = launched
+
+    fun consumeLaunchReceipt(expected: PendingInstallApkExportDocument): Boolean {
+        if (launched != expected) return false
+        launched = null
+        return true
+    }
 
     fun begin(
         effect: ManagerEffect.CreateSystemInstallApkDocument,

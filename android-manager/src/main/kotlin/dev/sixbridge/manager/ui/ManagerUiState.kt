@@ -402,6 +402,7 @@ internal enum class InstallApkDocumentTransactionPhase {
     CLEANED,
     CLEANUP_FAILED,
     COMMITTED,
+    RECOVERY_BLOCKED,
 }
 
 internal sealed interface InstallApkDocumentTransactionState {

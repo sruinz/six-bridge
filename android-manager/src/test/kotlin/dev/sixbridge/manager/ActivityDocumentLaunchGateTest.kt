@@ -168,8 +168,10 @@ class ActivityDocumentLaunchGateTest {
 
         assertEquals(true, handoff.markLaunched(pending))
         assertEquals(false, handoff.markLaunched(pending))
-        assertEquals(pending, handoff.consumeLaunchReceipt())
-        assertNull(handoff.consumeLaunchReceipt())
+        assertEquals(pending, handoff.peekLaunchReceipt())
+        assertEquals(true, handoff.consumeLaunchReceipt(pending))
+        assertNull(handoff.peekLaunchReceipt())
+        assertEquals(false, handoff.consumeLaunchReceipt(pending))
     }
 
     @Test
