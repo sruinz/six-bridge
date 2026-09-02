@@ -214,6 +214,16 @@ interface ManagerRepository {
         approvedAdapterIds: Set<String>,
         identitySelection: InstallationIdentitySelection?,
     ): OnDeviceConversionApproval? = null
+    fun revokeConversionForce(
+        challenge: ConversionForceChallenge,
+        approval: OnDeviceConversionApproval?,
+        reissue: Boolean,
+    ): ConversionForceChallenge? = null
+    suspend fun analyzeConversion(token: String): ConversionBeginResult =
+        ConversionBeginResult.Failure(
+            dev.sixbridge.manager.conversion.ConversionFailureCode.INPUT_INVALID,
+            token,
+        )
     suspend fun approveConversion(
         token: String,
         approvedAdapterIds: Set<String>,
@@ -491,6 +501,19 @@ internal class DefaultManagerRepository(
     ): OnDeviceConversionApproval? = requireNotNull(conversionCoordinator) {
         "온디바이스 변환 coordinator가 구성되지 않았습니다."
     }.authorizeForce(challenge, approvedAdapterIds, identitySelection)
+
+    override fun revokeConversionForce(
+        challenge: ConversionForceChallenge,
+        approval: OnDeviceConversionApproval?,
+        reissue: Boolean,
+    ): ConversionForceChallenge? = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.revokeForce(challenge, approval, reissue)
+
+    override suspend fun analyzeConversion(token: String): ConversionBeginResult =
+        requireNotNull(conversionCoordinator) {
+            "온디바이스 변환 coordinator가 구성되지 않았습니다."
+        }.analyze(token)
 
     override suspend fun approveConversion(
         token: String,

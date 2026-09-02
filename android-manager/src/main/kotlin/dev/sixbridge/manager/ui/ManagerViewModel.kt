@@ -20,6 +20,7 @@ import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionForceChallenge
 import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
@@ -238,16 +239,19 @@ class ManagerViewModel(
             ManagerAction.OpenConversionFilePicker -> requestConversionFilePicker()
             is ManagerAction.ConversionFileSelected -> acceptConversionFileResult(action)
             ManagerAction.AnalyzeConversionUrl -> analyzeConversionUrl()
-            is ManagerAction.ToggleConversionAdapter -> updateConversionAnalysis {
+            is ManagerAction.ToggleConversionAdapter -> updateConversionSelection {
                 it.toggleAdapter(action.id)
             }
-            is ManagerAction.ChooseOptionalConversionAdapter -> updateConversionAnalysis {
+            is ManagerAction.ChooseOptionalConversionAdapter -> updateConversionSelection {
                 it.chooseOptionalAdapter(action.id, action.apply)
             }
             ManagerAction.ConfirmConversionPartial -> updateConversionAnalysis {
                 it.copy(partialConfirmed = true)
             }
             ManagerAction.ConfirmConversionForce -> updateConversionAnalysis {
+                if (mutableState.value.route != ManagerRoute.ConversionAnalysis(it.token)) {
+                    return@updateConversionAnalysis it
+                }
                 val challenge = it.forceChallenge
                     ?.takeIf { _ -> ForceCompatibilityPolicy.isEligible(it.report) }
                     ?: return@updateConversionAnalysis it
@@ -258,10 +262,10 @@ class ManagerViewModel(
                 ) ?: return@updateConversionAnalysis it
                 it.copy(forceApproval = approval)
             }
-            ManagerAction.SelectNewConversionIdentity -> updateConversionAnalysis {
+            ManagerAction.SelectNewConversionIdentity -> updateConversionSelection {
                 it.selectIdentity(InstallationIdentitySelection.CreateNew)
             }
-            is ManagerAction.SelectExistingConversionIdentity -> updateConversionAnalysis {
+            is ManagerAction.SelectExistingConversionIdentity -> updateConversionSelection {
                 it.selectIdentity(
                     InstallationIdentitySelection.UseExisting(action.identitySha256),
                 )
@@ -310,15 +314,16 @@ class ManagerViewModel(
             ManagerAction.CancelReview -> cancelReview()
             is ManagerAction.Remove -> remove(action.packageName)
             is ManagerAction.OpenReport -> openReport(action.packageName)
-            ManagerAction.ReturnHome -> mutableState.update {
-                it.copy(
+            ManagerAction.ReturnHome -> {
+                revokeConversionCapability(reissue = false)
+                mutableState.update { it.copy(
                     route = ManagerRoute.Home,
                     reportInstallSupportStatus = null,
                     conversionIdentityManagementState =
                         it.conversionIdentityManagementState.copy(
                             pendingCleanupIdentitySha256 = null,
                         ),
-                )
+                ) }
             }
             ManagerAction.OpenSamsungAddOns -> openSamsungAddOns()
             ManagerAction.OpenFileManager -> openFileManager()
@@ -366,7 +371,10 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
-        updateConversionAnalysis { it.copy(forceApproval = null) }
+        revokeConversionCapability(reissue = false)
+        updateConversionAnalysis {
+            it.copy(forceChallenge = null, forceApproval = null)
+        }
         invalidatePendingDocumentLaunches()
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
@@ -439,6 +447,7 @@ class ManagerViewModel(
             }
             return
         }
+        revokeConversionCapability(reissue = false)
         if (mutableState.value.conversionState is ConversionUiState.ResultReady) {
             cleanupConversion(ManagerRoute.ConversionInput)
             return
@@ -455,6 +464,7 @@ class ManagerViewModel(
     }
 
     private fun openConversionIdentityManagement() {
+        revokeConversionCapability(reissue = false)
         val current = mutableState.value
         if (identityManagementJob?.isActive == true) {
             mutableState.update {
@@ -772,8 +782,36 @@ class ManagerViewModel(
         mutableState.update { it.copy(conversionState = transform(ready), message = null) }
     }
 
+    private fun updateConversionSelection(
+        transform: (ConversionUiState.AnalysisReady) -> ConversionUiState.AnalysisReady,
+    ) {
+        val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return
+        if (mutableState.value.route != ManagerRoute.ConversionAnalysis(ready.token)) return
+        val changed = transform(ready)
+        if (changed == ready) return
+        val fresh = ready.forceChallenge?.let {
+            repository.revokeConversionForce(it, ready.forceApproval, reissue = true)
+        }
+        mutableState.update {
+            it.copy(
+                conversionState = changed.copy(
+                    forceChallenge = fresh,
+                    forceApproval = null,
+                ),
+                message = null,
+            )
+        }
+    }
+
+    private fun revokeConversionCapability(reissue: Boolean): ConversionForceChallenge? {
+        val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return null
+        val challenge = ready.forceChallenge ?: return null
+        return repository.revokeConversionForce(challenge, ready.forceApproval, reissue)
+    }
+
     private fun buildConversion() {
         val ready = mutableState.value.conversionState as? ConversionUiState.AnalysisReady ?: return
+        if (mutableState.value.route != ManagerRoute.ConversionAnalysis(ready.token)) return
         if (!ready.canBuild || routeOperation?.isActive == true) return
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
@@ -831,14 +869,31 @@ class ManagerViewModel(
                                 message = conversionFailureMessage(result.code),
                             )
                         }
-                    } else {
-                        mutableState.update {
-                            it.copy(
-                                route = ManagerRoute.ConversionAnalysis(ready.token),
-                                conversionState = consumedReady,
-                                message = conversionFailureMessage(result.code),
-                            )
+                    } else if (ready.forceApproval != null) {
+                        when (val refreshed = repository.analyzeConversion(ready.token)) {
+                            is ConversionBeginResult.AnalysisReady -> {
+                                showConversionAnalysis(refreshed)
+                                mutableState.update {
+                                    it.copy(message = conversionFailureMessage(result.code))
+                                }
+                            }
+                            is ConversionBeginResult.Failure -> mutableState.update {
+                                it.copy(
+                                    route = ManagerRoute.ConversionAnalysis(ready.token),
+                                    conversionState = ConversionUiState.Failed(
+                                        ready.token,
+                                        refreshed.code,
+                                    ),
+                                    message = conversionFailureMessage(refreshed.code),
+                                )
+                            }
                         }
+                    } else {
+                        mutableState.update { it.copy(
+                            route = ManagerRoute.ConversionAnalysis(ready.token),
+                            conversionState = consumedReady,
+                            message = conversionFailureMessage(result.code),
+                        ) }
                     }
                 }
             }

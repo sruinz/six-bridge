@@ -123,7 +123,7 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 
-    suspend fun analyze(token: String): ConversionBeginResult = buildMutex.withLock {
+    override suspend fun analyze(token: String): ConversionBeginResult = buildMutex.withLock {
         val job = work.restoreBuildAware()
             ?: return@withLock ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         if (job.token != token) {
@@ -192,6 +192,9 @@ internal class OnDeviceConversionCoordinator(
         val current = forceChallenges[challenge.token]
             ?.takeIf { it.challenge == challenge }
             ?: return@synchronized null
+        if (!current.accepts(approvedAdapterIds, identitySelection)) {
+            return@synchronized null
+        }
         forceChallenges.remove(challenge.token)
         forceProofs.entries.removeIf {
             it.value.challenge.challenge.token == challenge.token
@@ -205,6 +208,26 @@ internal class OnDeviceConversionCoordinator(
         OnDeviceConversionApproval(
             forceProof = proof,
         )
+    }
+
+    override fun revokeForce(
+        challenge: ConversionForceChallenge,
+        approval: OnDeviceConversionApproval?,
+        reissue: Boolean,
+    ): ConversionForceChallenge? = synchronized(forceCapabilityLock) {
+        val challengeRecord = forceChallenges[challenge.token]
+            ?.takeIf { it.challenge == challenge }
+        val proofRecord = approval?.forceProof?.let { forceProofs[it.nonce] }
+            ?.takeIf { it.challenge.challenge == challenge }
+        val current = challengeRecord ?: proofRecord?.challenge ?: return@synchronized null
+        forceChallenges.remove(challenge.token, current)
+        forceProofs.entries.removeIf { it.value.challenge.challenge.token == challenge.token }
+        if (!reissue) return@synchronized null
+        val fresh = current.copy(
+            challenge = ConversionForceChallenge(challenge.token, UUID.randomUUID().toString()),
+        )
+        forceChallenges[challenge.token] = fresh
+        fresh.challenge
     }
 
     override suspend fun build(
@@ -290,6 +313,7 @@ internal class OnDeviceConversionCoordinator(
             analysis,
             approvedAdapterIds,
             identitySelection,
+            currentIdentityRequirementSnapshot(analysis, profile.majorVersion),
         ) ?: false
         if (presentedProof != null && !proofMatches) {
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.UNKNOWN)
@@ -676,7 +700,7 @@ internal class OnDeviceConversionCoordinator(
                 optionalApprovals = analysis.optionalApprovals.toSet(),
                 logicalSourceIdentity = analysis.logicalSourceIdentity,
                 identityMode = analysis.identityMode,
-                identityRequirementBinding = identityRequirement.bindingValue(),
+                identityRequirementSnapshot = identityRequirement.snapshot(),
                 profileMajorVersion = profileMajorVersion,
             )
         }
@@ -696,6 +720,7 @@ internal class OnDeviceConversionCoordinator(
         analysis: ConversionAnalysisSnapshot,
         approvedAdapterIds: Set<String>,
         identitySelection: InstallationIdentitySelection?,
+        currentIdentityRequirement: IdentityRequirementSnapshot,
     ): Boolean = challenge.challenge.token == job.token &&
         challenge.inputKind == job.inputKind &&
         challenge.inputSha256 == job.inputSha256 &&
@@ -709,24 +734,27 @@ internal class OnDeviceConversionCoordinator(
         challenge.logicalSourceIdentity == analysis.logicalSourceIdentity &&
         challenge.identityMode == analysis.identityMode &&
         challenge.profileMajorVersion == profileMajorVersion &&
-        challenge.identityRequirementBinding ==
-            analysis.identityRequirementBinding(profileMajorVersion) &&
+        challenge.identityRequirementSnapshot == currentIdentityRequirement &&
         this.approvedAdapterIds == approvedAdapterIds &&
         this.identitySelection == identitySelection
 
-    private fun ConversionAnalysisSnapshot.identityRequirementBinding(
+    private suspend fun currentIdentityRequirementSnapshot(
+        analysis: ConversionAnalysisSnapshot,
         profileMajorVersion: Int,
-    ): String = logicalSourceIdentity?.let {
-        "stable:" + InstallationIdentityKey.create(
+    ): IdentityRequirementSnapshot = analysis.logicalSourceIdentity?.let {
+        IdentityRequirementSnapshot.Stable(InstallationIdentityKey.create(
             it,
             profileMajorVersion,
-            identityMode,
-        ).identitySha256.take(12)
-    } ?: "user-selection-required"
+            analysis.identityMode,
+        ).identitySha256.take(12))
+    } ?: IdentityRequirementSnapshot.UserSelectionRequired(
+        identities.existingTargets(profileMajorVersion).canonicalTargets(),
+    )
 
-    private fun IdentityRequirement.bindingValue(): String = when (this) {
-        is IdentityRequirement.Stable -> "stable:$identityKeyPreview"
-        is IdentityRequirement.UserSelectionRequired -> "user-selection-required"
+    private fun IdentityRequirement.snapshot(): IdentityRequirementSnapshot = when (this) {
+        is IdentityRequirement.Stable -> IdentityRequirementSnapshot.Stable(identityKeyPreview)
+        is IdentityRequirement.UserSelectionRequired ->
+            IdentityRequirementSnapshot.UserSelectionRequired(existingTargets.canonicalTargets())
     }
 
     private fun invalidateForceCapabilities(token: String) {
@@ -840,9 +868,62 @@ private data class ForceChallengeRecord(
     val optionalApprovals: Set<String>,
     val logicalSourceIdentity: LogicalSourceIdentity?,
     val identityMode: InstallationIdentityMode,
-    val identityRequirementBinding: String,
+    val identityRequirementSnapshot: IdentityRequirementSnapshot,
     val profileMajorVersion: Int,
+) {
+    fun accepts(
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): Boolean {
+        val allowed = requiredApprovals + optionalApprovals
+        if (!approvedAdapterIds.containsAll(requiredApprovals) ||
+            !allowed.containsAll(approvedAdapterIds)
+        ) return false
+        return when (val requirement = identityRequirementSnapshot) {
+            is IdentityRequirementSnapshot.Stable -> identitySelection == null
+            is IdentityRequirementSnapshot.UserSelectionRequired -> when (identitySelection) {
+                InstallationIdentitySelection.CreateNew -> true
+                is InstallationIdentitySelection.UseExisting ->
+                    requirement.targets.any { it.identitySha256 == identitySelection.identitySha256 }
+                null -> false
+            }
+        }
+    }
+}
+
+private sealed interface IdentityRequirementSnapshot {
+    data class Stable(val identityKeyPreview: String) : IdentityRequirementSnapshot
+    data class UserSelectionRequired(
+        val targets: List<ExistingTargetSnapshot>,
+    ) : IdentityRequirementSnapshot
+}
+
+private data class ExistingTargetSnapshot(
+    val identitySha256: String,
+    val displayName: String,
+    val extensionId: String,
+    val packageName: String,
+    val wrapperSignerSha256: String,
 )
+
+private fun List<ExistingConversionTarget>.canonicalTargets(): List<ExistingTargetSnapshot> =
+    map {
+        ExistingTargetSnapshot(
+            it.identitySha256,
+            it.displayName,
+            it.extensionId,
+            it.packageName,
+            it.wrapperSignerSha256,
+        )
+    }.sortedWith(
+        compareBy<ExistingTargetSnapshot>(
+            { it.identitySha256 },
+            { it.displayName },
+            { it.extensionId },
+            { it.packageName },
+            { it.wrapperSignerSha256 },
+        ),
+    ).toList()
 
 private data class ForceProofRecord(
     val challenge: ForceChallengeRecord,

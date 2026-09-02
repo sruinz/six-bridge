@@ -10209,6 +10209,9 @@ private class FakeManagerRepository : ManagerRepository {
         forceProof = ConversionForceProof("proof"),
     )
     val conversionForceRequests = mutableListOf<ConversionForceRequest>()
+    val conversionForceRevocations = mutableListOf<ConversionForceChallenge>()
+    var conversionChallengeSequence = 0
+    var conversionAnalyzeRequests = 0
     val conversionBeginResults = mutableListOf<ConversionBeginResult>()
     var suspendFirstConversionBegin = false
     var ignoreFirstConversionBeginCancellation = false
@@ -10384,6 +10387,31 @@ private class FakeManagerRepository : ManagerRepository {
             identitySelection,
         )
         return conversionForceApproval
+    }
+
+    override fun revokeConversionForce(
+        challenge: ConversionForceChallenge,
+        approval: OnDeviceConversionApproval?,
+        reissue: Boolean,
+    ): ConversionForceChallenge? {
+        conversionForceRevocations += challenge
+        return if (reissue) {
+            ConversionForceChallenge(challenge.token, "reissued-${++conversionChallengeSequence}")
+        } else {
+            null
+        }
+    }
+
+    override suspend fun analyzeConversion(token: String): ConversionBeginResult {
+        conversionAnalyzeRequests += 1
+        return when (val result = conversionBeginResult) {
+            is ConversionBeginResult.AnalysisReady -> result.copy(
+                forceChallenge = result.forceChallenge?.copy(
+                    nonce = "reanalyzed-${++conversionChallengeSequence}",
+                ),
+            )
+            is ConversionBeginResult.Failure -> result
+        }
     }
 
     override suspend fun approveConversion(

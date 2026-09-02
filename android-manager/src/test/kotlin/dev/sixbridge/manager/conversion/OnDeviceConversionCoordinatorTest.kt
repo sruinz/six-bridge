@@ -2018,6 +2018,79 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue(fixture.coordinator().discard(fixture.token))
     }
 
+    @Test
+    fun `identity snapshot drift before prepare`() = runTest {
+        val target = ExistingConversionTarget(
+            "a".repeat(64), "original", EXTENSION_ID, PACKAGE, "b".repeat(64),
+        )
+        val fixture = forcedFixture().apply {
+            logicalIdentity = null
+            existingTargets = listOf(target)
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = coordinator.beginAnalysis()
+        val challenge = requireNotNull(analysis.forceChallenge)
+        assertNull(coordinator.authorizeForce(challenge, analysis.requiredApprovals, null))
+        assertNull(coordinator.authorizeForce(
+            challenge, analysis.requiredApprovals,
+            InstallationIdentitySelection.UseExisting("c".repeat(64)),
+        ))
+        val selection = InstallationIdentitySelection.UseExisting(target.identitySha256)
+        val approval = coordinator.forceApproval(analysis, identitySelection = selection)
+        fixture.existingTargets = listOf(target.copy(displayName = "changed"))
+        fixture.events.clear()
+        val failure = assertIs<ConversionBuildResult.Failure>(coordinator.build(
+            analysis.token, analysis.requiredApprovals, false, selection, approval,
+        ))
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `stable CreateNew and markerless null do not issue proof`() = runTest {
+        val stable = forcedFixture()
+        val stableCoordinator = stable.coordinator()
+        val stableAnalysis = stableCoordinator.beginAnalysis()
+        assertNull(stableCoordinator.authorizeForce(
+            requireNotNull(stableAnalysis.forceChallenge), stableAnalysis.requiredApprovals,
+            InstallationIdentitySelection.CreateNew,
+        ))
+        val markerless = forcedFixture().apply { logicalIdentity = null }
+        val markerlessCoordinator = markerless.coordinator()
+        val markerlessAnalysis = markerlessCoordinator.beginAnalysis()
+        assertNull(markerlessCoordinator.authorizeForce(
+            requireNotNull(markerlessAnalysis.forceChallenge), markerlessAnalysis.requiredApprovals,
+            null,
+        ))
+        assertTrue(stable.buildSideEffects().isEmpty())
+        assertTrue(markerless.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `selection change revokes old proof and reissues a fresh challenge`() = runTest {
+        val fixture = forcedFixture()
+        val coordinator = fixture.coordinator()
+        val analysis = coordinator.beginAnalysis()
+        val challenge = requireNotNull(analysis.forceChallenge)
+        val oldApproval = coordinator.forceApproval(analysis)
+        val freshChallenge = requireNotNull(
+            coordinator.revokeForce(challenge, oldApproval, reissue = true),
+        )
+        fixture.events.clear()
+        val rejected = assertIs<ConversionBuildResult.Failure>(coordinator.build(
+            analysis.token, analysis.requiredApprovals, false, null, oldApproval,
+        ))
+        assertEquals(ConversionFailureCode.UNKNOWN, rejected.code)
+        assertTrue(fixture.buildSideEffects().isEmpty())
+
+        val freshApproval = requireNotNull(
+            coordinator.authorizeForce(freshChallenge, analysis.requiredApprovals, null),
+        )
+        assertIs<ConversionBuildResult.BundleReady>(coordinator.build(
+            analysis.token, analysis.requiredApprovals, false, null, freshApproval,
+        ))
+    }
+
     private fun forcedFixture() = Fixture(temporaryFolder, mutableListOf()).apply {
         compatibilityStatus = CompatibilityStatus.UNKNOWN
         eligibleUnknown = true
@@ -2082,6 +2155,7 @@ class OnDeviceConversionCoordinatorTest {
         var analysisCancellationObserved = false
         var logicalIdentity: LogicalSourceIdentity? =
             LogicalSourceIdentity.storeExtensionId(EXTENSION_ID)
+        var existingTargets: List<ExistingConversionTarget> = emptyList()
         var analysisIdentityMode = InstallationIdentityMode.PASSTHROUGH
         var preparedIdentityMode = InstallationIdentityMode.PASSTHROUGH
         var preparedPassthroughCrx: ByteArray? = "crx".encodeToByteArray()
@@ -2324,7 +2398,10 @@ class OnDeviceConversionCoordinatorTest {
                 }
             },
             identities = object : ConversionIdentityPort {
-                override suspend fun existingTargets(profileMajorVersion: Int) = emptyList<ExistingConversionTarget>()
+                override suspend fun existingTargets(profileMajorVersion: Int): List<ExistingConversionTarget> {
+                    events += "existing-targets"
+                    return existingTargets
+                }
 
                 override suspend fun resolve(
                     prepared: PreparedConversionSnapshot,

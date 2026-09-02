@@ -391,6 +391,13 @@ internal interface ConversionCoordinatorPort {
         approvedAdapterIds: Set<String>,
         identitySelection: InstallationIdentitySelection?,
     ): OnDeviceConversionApproval? = null
+    fun revokeForce(
+        challenge: ConversionForceChallenge,
+        approval: OnDeviceConversionApproval?,
+        reissue: Boolean,
+    ): ConversionForceChallenge? = null
+    suspend fun analyze(token: String): ConversionBeginResult =
+        ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID, token)
     suspend fun build(
         token: String,
         approvedAdapterIds: Set<String>,
