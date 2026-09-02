@@ -100,6 +100,15 @@ internal fun MessageCard(
     }
 }
 
+internal fun installApkCleanupRecoveryAction(message: UserMessage): ManagerAction? =
+    when (message.recoveryAction) {
+        RecoveryAction.RETRY_INSTALL_APK_CLEANUP ->
+            message.installApkCleanupReceipt?.let(ManagerAction::RetryInstallApkCleanup)
+        RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP ->
+            message.installApkCleanupReceipt?.let(ManagerAction::ConfirmInstallApkCleanup)
+        else -> null
+    }
+
 @Composable
 internal fun CompatibilityStatusText(status: ContractCompatibilityStatus) {
     Text(

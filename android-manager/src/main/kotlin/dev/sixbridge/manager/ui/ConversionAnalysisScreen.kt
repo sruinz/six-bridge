@@ -63,7 +63,11 @@ fun ConversionAnalysisScreen(
         message?.let {
             MessageCard(
                 message = it,
-                onRecovery = { onAction(ManagerAction.DismissMessage) },
+                onRecovery = {
+                    onAction(
+                        installApkCleanupRecoveryAction(it) ?: ManagerAction.DismissMessage,
+                    )
+                },
                 onDismiss = { onAction(ManagerAction.DismissMessage) },
             )
         }

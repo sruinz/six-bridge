@@ -12,6 +12,8 @@ import dev.sixbridge.manager.conversion.ConversionForceProof
 import dev.sixbridge.manager.conversion.OnDeviceConversionApproval
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.junit.Test
 
@@ -145,6 +147,43 @@ class ConversionScreenTest {
         assertFalse("conversion-input" in message.text)
     }
 
+    @Test
+    fun `ConversionResult cleanup 메시지는 exact 재삭제 action으로 dispatch한다`() {
+        val receipt = cleanupReceipt()
+        val message = UserMessage(
+            UserMessageKind.INSTALL_FAILED,
+            "부분 APK 정리 실패",
+            RecoveryAction.RETRY_INSTALL_APK_CLEANUP,
+            receipt,
+        )
+
+        assertEquals(
+            receipt,
+            assertIs<ManagerAction.RetryInstallApkCleanup>(
+                installApkCleanupRecoveryAction(message),
+            ).receipt,
+        )
+    }
+
+    @Test
+    fun `ConversionAnalysis cleanup 메시지는 exact 확인 action으로 dispatch한다`() {
+        val receipt = cleanupReceipt()
+        val message = UserMessage(
+            UserMessageKind.INSTALL_FAILED,
+            "부분 APK 직접 정리",
+            RecoveryAction.CONFIRM_INSTALL_APK_CLEANUP,
+            receipt,
+        )
+
+        assertEquals(
+            receipt,
+            assertIs<ManagerAction.ConfirmInstallApkCleanup>(
+                installApkCleanupRecoveryAction(message),
+            ).receipt,
+        )
+        assertNull(installApkCleanupRecoveryAction(message.copy(installApkCleanupReceipt = null)))
+    }
+
     private fun analysis(
         status: CompatibilityStatus = CompatibilityStatus.COMPATIBLE,
         requiredApprovals: Set<String> = emptySet(),
@@ -179,5 +218,12 @@ class ConversionScreenTest {
 
     private fun forceApproval() = OnDeviceConversionApproval(
         forceProof = ConversionForceProof("proof"),
+    )
+
+    private fun cleanupReceipt() = InstallApkCleanupReceipt(
+        TOKEN,
+        ownerGeneration = 7,
+        launchId = 9,
+        destination = "content://apk/partial",
     )
 }

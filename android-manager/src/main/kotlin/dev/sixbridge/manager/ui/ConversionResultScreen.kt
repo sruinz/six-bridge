@@ -50,7 +50,7 @@ fun ConversionResultScreen(
             Text("SHA-256: ${ready.generated.sha256}")
         }
         message?.let {
-            val recoveryAction = resultRecoveryAction(it)
+            val recoveryAction = installApkCleanupRecoveryAction(it) ?: resultRecoveryAction(it)
             MessageCard(
                 message = if (recoveryAction == null) {
                     it.copy(recoveryAction = RecoveryAction.NONE)
