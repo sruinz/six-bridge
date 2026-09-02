@@ -26,6 +26,25 @@ sealed interface IdentityRequirement {
     ) : IdentityRequirement
 }
 
+data class ConversionForceChallenge(
+    val token: String,
+    val nonce: String,
+)
+
+data class ConversionForceProof(
+    val nonce: String,
+)
+
+data class OnDeviceConversionApproval(
+    val forceProof: ConversionForceProof?,
+) {
+    companion object {
+        val NONE = OnDeviceConversionApproval(
+            forceProof = null,
+        )
+    }
+}
+
 enum class ConversionFailureCode {
     URL,
     NETWORK,
@@ -55,6 +74,7 @@ sealed interface ConversionBeginResult {
         val requiredApprovals: Set<String>,
         val optionalApprovals: Set<String> = emptySet(),
         val identityRequirement: IdentityRequirement,
+        val forceChallenge: ConversionForceChallenge? = null,
         val profileChanged: Boolean = false,
         val draftSignerFingerprint: String? = null,
     ) : ConversionBeginResult
@@ -363,11 +383,22 @@ internal interface ConversionCoordinatorPort {
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
         authorization: ConversionAuthorization,
-    ): ConversionBuildResult = build(
-        token,
-        approvedAdapterIds,
-        partialConfirmed,
-        identitySelection,
+    ): ConversionBuildResult = ConversionBuildResult.Failure(
+        ConversionFailureCode.UNKNOWN,
+    )
+    fun authorizeForce(
+        challenge: ConversionForceChallenge,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): OnDeviceConversionApproval? = null
+    suspend fun build(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        approval: OnDeviceConversionApproval,
+    ): ConversionBuildResult = ConversionBuildResult.Failure(
+        ConversionFailureCode.UNKNOWN,
     )
     suspend fun restore(importReview: Boolean = true): RestoredConversion?
     suspend fun discard(token: String): Boolean

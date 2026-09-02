@@ -24,6 +24,8 @@ import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCleanupCancellationException
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionForceChallenge
+import dev.sixbridge.manager.conversion.ConversionForceProof
 import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.GeneratedBundle
@@ -32,6 +34,7 @@ import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.InstallationIdentityMode
 import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
+import dev.sixbridge.manager.conversion.OnDeviceConversionApproval
 import dev.sixbridge.manager.conversion.RestoredConversion
 import dev.sixbridge.manager.importer.ImportFailure
 import dev.sixbridge.manager.importer.ImportFailureCode
@@ -3553,9 +3556,10 @@ class ManagerViewModelTest {
             advanceUntilIdle()
 
             assertEquals(
-                ConversionAuthorization.forceUnknownApiUsage(),
-                repository.conversionBuildRequests.single().authorization,
+                repository.conversionForceApproval,
+                repository.conversionBuildRequests.single().approval,
             )
+            assertEquals(1, repository.conversionForceRequests.size)
             assertFalse(
                 assertIs<ConversionUiState.AnalysisReady>(
                     viewModel.state.value.conversionState,
@@ -3595,6 +3599,55 @@ class ManagerViewModelTest {
                     recreated.state.value.conversionState,
                 ).forceCompatibilityConfirmed,
             )
+            assertTrue(savedState.keys().none { "force" in it.lowercase() })
+        }
+
+    @Test
+    fun `강제 생성 확인 뒤 adapter와 identity 선택을 바꾸면 proof가 즉시 소멸한다`() =
+        runTest(dispatcher.scheduler) {
+            val target = existingTarget()
+            val cases = listOf(
+                forcedConversionAnalysis().copy(requiredApprovals = setOf("adapter")) to
+                    ManagerAction.ToggleConversionAdapter("adapter"),
+                forcedConversionAnalysis().copy(optionalApprovals = setOf("optional")) to
+                    ManagerAction.ChooseOptionalConversionAdapter("optional", true),
+                forcedConversionAnalysis().copy(
+                    identityRequirement = IdentityRequirement.UserSelectionRequired(
+                        listOf(target),
+                    ),
+                ) to ManagerAction.SelectNewConversionIdentity,
+                forcedConversionAnalysis().copy(
+                    identityRequirement = IdentityRequirement.UserSelectionRequired(
+                        listOf(target),
+                    ),
+                ) to ManagerAction.SelectExistingConversionIdentity(target.identitySha256),
+            )
+
+            cases.forEach { (analysis, mutation) ->
+                val repository = FakeManagerRepository().apply {
+                    conversionBeginResult = analysis
+                }
+                val viewModel = ManagerViewModel(repository, SavedStateHandle())
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.OpenConversionInput)
+                viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+                viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.ConfirmConversionForce)
+                assertTrue(
+                    assertIs<ConversionUiState.AnalysisReady>(
+                        viewModel.state.value.conversionState,
+                    ).forceCompatibilityConfirmed,
+                )
+
+                viewModel.accept(mutation)
+
+                assertFalse(
+                    assertIs<ConversionUiState.AnalysisReady>(
+                        viewModel.state.value.conversionState,
+                    ).forceCompatibilityConfirmed,
+                )
+            }
         }
 
     @Test
@@ -9993,6 +10046,7 @@ class ManagerViewModelTest {
             browserProfileSha256 = conversionAnalysis().profile.canonicalSha256(),
             conversionState = ConversionState.REQUIRES_APPROVAL,
         ),
+        forceChallenge = ConversionForceChallenge(TOKEN, "challenge"),
     )
 
     private fun existingTarget() = ExistingConversionTarget(
@@ -10151,6 +10205,10 @@ private class FakeManagerRepository : ManagerRepository {
     var beginConversionDeferred: CompletableDeferred<ConversionBeginResult>? = null
     var conversionBuildResult: ConversionBuildResult =
         ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
+    var conversionForceApproval = OnDeviceConversionApproval(
+        forceProof = ConversionForceProof("proof"),
+    )
+    val conversionForceRequests = mutableListOf<ConversionForceRequest>()
     val conversionBeginResults = mutableListOf<ConversionBeginResult>()
     var suspendFirstConversionBegin = false
     var ignoreFirstConversionBeginCancellation = false
@@ -10304,6 +10362,44 @@ private class FakeManagerRepository : ManagerRepository {
             partialConfirmed,
             identitySelection,
             ConversionAuthorization.NONE,
+        )
+        if (index == 0 && suspendFirstConversionBuild) {
+            if (ignoreFirstConversionBuildCancellation) {
+                withContext(NonCancellable) { firstConversionBuildGate.first() }
+            } else {
+                firstConversionBuildGate.first()
+            }
+        }
+        return conversionBuildResult
+    }
+
+    override fun authorizeConversionForce(
+        challenge: ConversionForceChallenge,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): OnDeviceConversionApproval {
+        conversionForceRequests += ConversionForceRequest(
+            challenge,
+            approvedAdapterIds,
+            identitySelection,
+        )
+        return conversionForceApproval
+    }
+
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        approval: OnDeviceConversionApproval,
+    ): ConversionBuildResult {
+        val index = conversionBuildRequests.size
+        conversionBuildRequests += ConversionBuildRequest(
+            token = token,
+            approvedAdapterIds = approvedAdapterIds,
+            partialConfirmed = partialConfirmed,
+            identitySelection = identitySelection,
+            approval = approval,
         )
         if (index == 0 && suspendFirstConversionBuild) {
             if (ignoreFirstConversionBuildCancellation) {
@@ -10750,6 +10846,13 @@ private data class ConversionBuildRequest(
     val partialConfirmed: Boolean,
     val identitySelection: InstallationIdentitySelection?,
     val authorization: ConversionAuthorization = ConversionAuthorization.NONE,
+    val approval: OnDeviceConversionApproval = OnDeviceConversionApproval.NONE,
+)
+
+private data class ConversionForceRequest(
+    val challenge: ConversionForceChallenge,
+    val approvedAdapterIds: Set<String>,
+    val identitySelection: InstallationIdentitySelection?,
 )
 
 private fun unitTestUri(): Uri {

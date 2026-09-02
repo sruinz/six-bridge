@@ -8,6 +8,8 @@ import dev.sixbridge.manager.conversion.ConversionFailureCode
 import dev.sixbridge.manager.conversion.ExistingConversionTarget
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.ConversionForceProof
+import dev.sixbridge.manager.conversion.OnDeviceConversionApproval
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -94,7 +96,7 @@ class ConversionScreenTest {
         )
 
         assertFalse(ready.canBuild)
-        assertTrue(ready.copy(forceCompatibilityConfirmed = true).canBuild)
+        assertTrue(ready.copy(forceApproval = forceApproval()).canBuild)
     }
 
     @Test
@@ -104,7 +106,7 @@ class ConversionScreenTest {
             issues = listOf(CompatibilityIssue("browser_profile_unknown", "profile", true)),
         )
 
-        assertFalse(ready.copy(forceCompatibilityConfirmed = true).canBuild)
+        assertFalse(ready.copy(forceApproval = forceApproval()).canBuild)
     }
 
     @Test
@@ -174,4 +176,8 @@ class ConversionScreenTest {
     private companion object {
         const val TOKEN = "11111111-1111-1111-1111-111111111111"
     }
+
+    private fun forceApproval() = OnDeviceConversionApproval(
+        forceProof = ConversionForceProof("proof"),
+    )
 }

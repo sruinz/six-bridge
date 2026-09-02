@@ -9,7 +9,9 @@ import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import java.io.File
 import java.io.OutputStream
+import java.security.MessageDigest
 import java.util.concurrent.CancellationException
+import java.util.UUID
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -36,6 +38,9 @@ internal class OnDeviceConversionCoordinator(
     private val buildMutex = Mutex()
     private val startupCacheCleanupMutex = Mutex()
     private var startupCacheCleanupAttempted = false
+    private val forceCapabilityLock = Any()
+    private val forceChallenges = mutableMapOf<String, ForceChallengeRecord>()
+    private val forceProofs = mutableMapOf<String, ForceProofRecord>()
 
     override suspend fun begin(request: OnDeviceInputRequest): ConversionBeginResult {
         val reclaimed = try {
@@ -95,7 +100,9 @@ internal class OnDeviceConversionCoordinator(
                     claimedToken,
                 )
             }
-            analyzeJob(requireNotNull(createdJob), markAwaiting = true)
+            buildMutex.withLock {
+                analyzeJob(requireNotNull(createdJob), markAwaiting = true)
+            }
         } catch (error: CancellationException) {
             val claimedCancellation =
                 claimedCreateCancellation
@@ -116,14 +123,14 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 
-    suspend fun analyze(token: String): ConversionBeginResult {
+    suspend fun analyze(token: String): ConversionBeginResult = buildMutex.withLock {
         val job = work.restoreBuildAware()
-            ?: return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            ?: return@withLock ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         if (job.token != token) {
-            return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            return@withLock ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
         if (job.stage == ConversionJobStage.BUILDING) {
-            return when (val reconciled = reconcileBuilding(job)) {
+            return@withLock when (val reconciled = reconcileBuilding(job)) {
                 is RestoredConversion.Analysis -> reconciled.value
                 is RestoredConversion.GeneratedPending ->
                     ConversionBeginResult.Failure(ConversionFailureCode.BUNDLE_IO, job.token)
@@ -138,9 +145,9 @@ internal class OnDeviceConversionCoordinator(
             }
         }
         if (job.stage == ConversionJobStage.BUNDLE_READY) {
-            return ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
+            return@withLock ConversionBeginResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
-        return analyzeJob(
+        analyzeJob(
             job,
             markAwaiting = job.stage == ConversionJobStage.INPUT_READY,
         )
@@ -165,6 +172,47 @@ internal class OnDeviceConversionCoordinator(
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
         authorization: ConversionAuthorization,
+    ): ConversionBuildResult = if (authorization.forceCompatibility == null) {
+        build(
+            token,
+            approvedAdapterIds,
+            partialConfirmed,
+            identitySelection,
+            OnDeviceConversionApproval.NONE,
+        )
+    } else {
+        ConversionBuildResult.Failure(ConversionFailureCode.UNKNOWN)
+    }
+
+    override fun authorizeForce(
+        challenge: ConversionForceChallenge,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): OnDeviceConversionApproval? = synchronized(forceCapabilityLock) {
+        val current = forceChallenges[challenge.token]
+            ?.takeIf { it.challenge == challenge }
+            ?: return@synchronized null
+        forceChallenges.remove(challenge.token)
+        forceProofs.entries.removeIf {
+            it.value.challenge.challenge.token == challenge.token
+        }
+        val proof = ConversionForceProof(UUID.randomUUID().toString())
+        forceProofs[proof.nonce] = ForceProofRecord(
+            challenge = current,
+            approvedAdapterIds = approvedAdapterIds.toSet(),
+            identitySelection = identitySelection,
+        )
+        OnDeviceConversionApproval(
+            forceProof = proof,
+        )
+    }
+
+    override suspend fun build(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        approval: OnDeviceConversionApproval,
     ): ConversionBuildResult = buildMutex.withLock {
         var job = work.restoreBuildAware()
             ?: return@withLock ConversionBuildResult.Failure(
@@ -203,6 +251,10 @@ internal class OnDeviceConversionCoordinator(
         if (job.token != token || job.stage != ConversionJobStage.AWAITING_APPROVAL) {
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.INPUT_INVALID)
         }
+        val presentedProof = approval.forceProof?.let(::takeForceProof)
+        if (approval.forceProof != null && presentedProof == null) {
+            return@withLock ConversionBuildResult.Failure(ConversionFailureCode.UNKNOWN)
+        }
         val profile = when (val snapshot = profiles.load()) {
             is SamsungProfileSnapshot.Supported -> snapshot.profile
             SamsungProfileSnapshot.Missing ->
@@ -230,6 +282,22 @@ internal class OnDeviceConversionCoordinator(
         val profileSha256 = profile.canonicalSha256()
         if (job.profileSha256 != profileSha256) {
             return@withLock ConversionBuildResult.Failure(ConversionFailureCode.PROFILE_CHANGED)
+        }
+        val proofMatches = presentedProof?.matches(
+            job,
+            profileSha256,
+            profile.majorVersion,
+            analysis,
+            approvedAdapterIds,
+            identitySelection,
+        ) ?: false
+        if (presentedProof != null && !proofMatches) {
+            return@withLock ConversionBuildResult.Failure(ConversionFailureCode.UNKNOWN)
+        }
+        val authorization = if (presentedProof != null) {
+            ConversionAuthorization.forceUnknownApiUsage()
+        } else {
+            ConversionAuthorization.NONE
         }
         val forcedCompatibility = try {
             ForceCompatibilityPolicy.requireProvenance(analysis.report, authorization)
@@ -402,10 +470,11 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 
-    override suspend fun discard(token: String): Boolean {
+    override suspend fun discard(token: String): Boolean = buildMutex.withLock {
+        invalidateForceCapabilities(token)
         val workDiscarded = work.discard(token)
-        if (!workDiscarded) return false
-        return bundles.discard(token)
+        if (!workDiscarded) return@withLock false
+        bundles.discard(token)
     }
 
     override fun copyGenerated(token: String, output: OutputStream): String? =
@@ -456,6 +525,7 @@ internal class OnDeviceConversionCoordinator(
 
     private suspend fun discardInterrupted(token: String): RestoredConversion =
         withContext(NonCancellable) {
+            invalidateForceCapabilities(token)
             val workDiscarded = try {
                 work.discard(token)
             } catch (_: Exception) {
@@ -505,6 +575,7 @@ internal class OnDeviceConversionCoordinator(
         job: RestoredConversionJob,
         markAwaiting: Boolean,
     ): ConversionBeginResult {
+        invalidateForceCapabilities(job.token)
         val profile = when (val snapshot = profiles.load()) {
             is SamsungProfileSnapshot.Supported -> snapshot.profile
             SamsungProfileSnapshot.Missing ->
@@ -538,6 +609,9 @@ internal class OnDeviceConversionCoordinator(
             return ConversionBeginResult.Failure(ConversionFailureCode.BLOCKED, job.token)
         }
         val profileSha256 = profile.canonicalSha256()
+        if (analysis.report.browserProfileSha256 != profileSha256) {
+            return ConversionBeginResult.Failure(ConversionFailureCode.PROFILE_CHANGED, job.token)
+        }
         if (markAwaiting) {
             work.markAwaitingApproval(job.token, profileSha256)
         } else if (job.profileSha256 != profileSha256) {
@@ -558,6 +632,13 @@ internal class OnDeviceConversionCoordinator(
         } ?: IdentityRequirement.UserSelectionRequired(
             identities.existingTargets(profile.majorVersion),
         )
+        val forceChallenge = issueForceChallenge(
+            job,
+            profileSha256,
+            analysis,
+            identityRequirement,
+            profile.majorVersion,
+        )
         return ConversionBeginResult.AnalysisReady(
             token = job.token,
             profile = profile,
@@ -566,9 +647,93 @@ internal class OnDeviceConversionCoordinator(
             requiredApprovals = analysis.requiredApprovals,
             optionalApprovals = analysis.optionalApprovals,
             identityRequirement = identityRequirement,
+            forceChallenge = forceChallenge,
             profileChanged = analysis.profileChanged,
             draftSignerFingerprint = analysis.draftSignerFingerprint,
         )
+    }
+
+    private fun issueForceChallenge(
+        job: RestoredConversionJob,
+        profileSha256: String,
+        analysis: ConversionAnalysisSnapshot,
+        identityRequirement: IdentityRequirement,
+        profileMajorVersion: Int,
+    ): ConversionForceChallenge? {
+        if (!ForceCompatibilityPolicy.isEligible(analysis.report)) return null
+        val challenge = ConversionForceChallenge(job.token, UUID.randomUUID().toString())
+        synchronized(forceCapabilityLock) {
+            forceChallenges[job.token] = ForceChallengeRecord(
+                challenge = challenge,
+                inputKind = job.inputKind,
+                inputSha256 = job.inputSha256,
+                sourceSha256 = requireNotNull(analysis.report.sourceSha256),
+                profileSha256 = profileSha256,
+                reportProfileSha256 = requireNotNull(analysis.report.browserProfileSha256),
+                reportSha256 = analysis.report.forceCanonicalSha256(),
+                selectedAutomaticAdapters = analysis.selectedAutomaticAdapters.toSet(),
+                requiredApprovals = analysis.requiredApprovals.toSet(),
+                optionalApprovals = analysis.optionalApprovals.toSet(),
+                logicalSourceIdentity = analysis.logicalSourceIdentity,
+                identityMode = analysis.identityMode,
+                identityRequirementBinding = identityRequirement.bindingValue(),
+                profileMajorVersion = profileMajorVersion,
+            )
+        }
+        return challenge
+    }
+
+    private fun takeForceProof(
+        proof: ConversionForceProof,
+    ): ForceProofRecord? = synchronized(forceCapabilityLock) {
+        forceProofs.remove(proof.nonce)
+    }
+
+    private fun ForceProofRecord.matches(
+        job: RestoredConversionJob,
+        profileSha256: String,
+        profileMajorVersion: Int,
+        analysis: ConversionAnalysisSnapshot,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): Boolean = challenge.challenge.token == job.token &&
+        challenge.inputKind == job.inputKind &&
+        challenge.inputSha256 == job.inputSha256 &&
+        challenge.sourceSha256 == analysis.report.sourceSha256 &&
+        challenge.profileSha256 == profileSha256 &&
+        challenge.reportProfileSha256 == analysis.report.browserProfileSha256 &&
+        challenge.reportSha256 == analysis.report.forceCanonicalSha256() &&
+        challenge.selectedAutomaticAdapters == analysis.selectedAutomaticAdapters &&
+        challenge.requiredApprovals == analysis.requiredApprovals &&
+        challenge.optionalApprovals == analysis.optionalApprovals &&
+        challenge.logicalSourceIdentity == analysis.logicalSourceIdentity &&
+        challenge.identityMode == analysis.identityMode &&
+        challenge.profileMajorVersion == profileMajorVersion &&
+        challenge.identityRequirementBinding ==
+            analysis.identityRequirementBinding(profileMajorVersion) &&
+        this.approvedAdapterIds == approvedAdapterIds &&
+        this.identitySelection == identitySelection
+
+    private fun ConversionAnalysisSnapshot.identityRequirementBinding(
+        profileMajorVersion: Int,
+    ): String = logicalSourceIdentity?.let {
+        "stable:" + InstallationIdentityKey.create(
+            it,
+            profileMajorVersion,
+            identityMode,
+        ).identitySha256.take(12)
+    } ?: "user-selection-required"
+
+    private fun IdentityRequirement.bindingValue(): String = when (this) {
+        is IdentityRequirement.Stable -> "stable:$identityKeyPreview"
+        is IdentityRequirement.UserSelectionRequired -> "user-selection-required"
+    }
+
+    private fun invalidateForceCapabilities(token: String) {
+        synchronized(forceCapabilityLock) {
+            forceChallenges.remove(token)
+            forceProofs.entries.removeIf { it.value.challenge.challenge.token == token }
+        }
     }
 
     private fun dev.sixbridge.core.compat.CompatibilityReport.toBlockingFailure():
@@ -661,3 +826,31 @@ internal class OnDeviceConversionCoordinator(
         }
     }
 }
+
+private data class ForceChallengeRecord(
+    val challenge: ConversionForceChallenge,
+    val inputKind: OnDeviceInputKind,
+    val inputSha256: String,
+    val sourceSha256: String,
+    val profileSha256: String,
+    val reportProfileSha256: String,
+    val reportSha256: String,
+    val selectedAutomaticAdapters: Set<String>,
+    val requiredApprovals: Set<String>,
+    val optionalApprovals: Set<String>,
+    val logicalSourceIdentity: LogicalSourceIdentity?,
+    val identityMode: InstallationIdentityMode,
+    val identityRequirementBinding: String,
+    val profileMajorVersion: Int,
+)
+
+private data class ForceProofRecord(
+    val challenge: ForceChallengeRecord,
+    val approvedAdapterIds: Set<String>,
+    val identitySelection: InstallationIdentitySelection?,
+)
+
+private fun dev.sixbridge.core.compat.CompatibilityReport.forceCanonicalSha256(): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(SixBundle.encodeCompatibility(this).encodeToByteArray())
+        .joinToString("") { "%02x".format(it) }

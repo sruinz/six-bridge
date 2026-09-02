@@ -10,7 +10,9 @@ import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.IdentityRequirement
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
 import dev.sixbridge.manager.conversion.ConversionFailureCode
+import dev.sixbridge.manager.conversion.ConversionForceChallenge
 import dev.sixbridge.manager.conversion.LegacyConversionIdentity
+import dev.sixbridge.manager.conversion.OnDeviceConversionApproval
 import dev.sixbridge.core.compat.CompatibilityReport
 import dev.sixbridge.core.compat.CompatibilityStatus
 import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
@@ -109,15 +111,19 @@ sealed interface ConversionUiState {
         val requiredApprovals: Set<String>,
         val optionalApprovals: Set<String> = emptySet(),
         val identityRequirement: IdentityRequirement,
+        val forceChallenge: ConversionForceChallenge? = null,
         val selectedAdapters: Set<String> = emptySet(),
         val resolvedOptionalAdapters: Set<String> = emptySet(),
         val partialConfirmed: Boolean = false,
-        val forceCompatibilityConfirmed: Boolean = false,
+        val forceApproval: OnDeviceConversionApproval? = null,
         val identitySelection: InstallationIdentitySelection? = null,
         val existingIdentityConfirmed: Boolean = false,
         val profileChanged: Boolean = false,
         val draftSignerFingerprint: String? = null,
     ) : ConversionUiState {
+        val forceCompatibilityConfirmed: Boolean
+            get() = forceApproval != null
+
         val canBuild: Boolean
             get() = (
                 report.status in setOf(
@@ -140,6 +146,7 @@ sealed interface ConversionUiState {
                 } else {
                     selectedAdapters + id
                 },
+                forceApproval = null,
             )
         }
 
@@ -152,6 +159,7 @@ sealed interface ConversionUiState {
                     selectedAdapters - id
                 },
                 resolvedOptionalAdapters = resolvedOptionalAdapters + id,
+                forceApproval = null,
             )
         }
 
@@ -169,6 +177,7 @@ sealed interface ConversionUiState {
             return copy(
                 identitySelection = selection,
                 existingIdentityConfirmed = false,
+                forceApproval = null,
             )
         }
 

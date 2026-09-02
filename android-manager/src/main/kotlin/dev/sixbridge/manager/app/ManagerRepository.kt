@@ -18,8 +18,10 @@ import dev.sixbridge.manager.cleanup.StartupCleanup
 import dev.sixbridge.manager.conversion.ConversionBeginResult
 import dev.sixbridge.manager.conversion.ConversionBuildResult
 import dev.sixbridge.manager.conversion.ConversionCoordinatorPort
+import dev.sixbridge.manager.conversion.ConversionForceChallenge
 import dev.sixbridge.manager.conversion.GeneratedBundle
 import dev.sixbridge.manager.conversion.InstallationIdentitySelection
+import dev.sixbridge.manager.conversion.OnDeviceConversionApproval
 import dev.sixbridge.manager.conversion.ConversionIdentityCleanupResult
 import dev.sixbridge.manager.conversion.LegacyConversionIdentity
 import dev.sixbridge.manager.conversion.OnDeviceInputRequest
@@ -204,11 +206,22 @@ interface ManagerRepository {
         partialConfirmed: Boolean,
         identitySelection: InstallationIdentitySelection?,
         authorization: ConversionAuthorization,
-    ): ConversionBuildResult = approveConversion(
-        token,
-        approvedAdapterIds,
-        partialConfirmed,
-        identitySelection,
+    ): ConversionBuildResult = ConversionBuildResult.Failure(
+        dev.sixbridge.manager.conversion.ConversionFailureCode.UNKNOWN,
+    )
+    fun authorizeConversionForce(
+        challenge: ConversionForceChallenge,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): OnDeviceConversionApproval? = null
+    suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        approval: OnDeviceConversionApproval,
+    ): ConversionBuildResult = ConversionBuildResult.Failure(
+        dev.sixbridge.manager.conversion.ConversionFailureCode.UNKNOWN,
     )
     suspend fun restoreConversion(importReview: Boolean = true): RestoredConversion? = null
     suspend fun discardConversion(token: String): Boolean = false
@@ -469,6 +482,30 @@ internal class DefaultManagerRepository(
         partialConfirmed,
         identitySelection,
         authorization,
+    )
+
+    override fun authorizeConversionForce(
+        challenge: ConversionForceChallenge,
+        approvedAdapterIds: Set<String>,
+        identitySelection: InstallationIdentitySelection?,
+    ): OnDeviceConversionApproval? = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.authorizeForce(challenge, approvedAdapterIds, identitySelection)
+
+    override suspend fun approveConversion(
+        token: String,
+        approvedAdapterIds: Set<String>,
+        partialConfirmed: Boolean,
+        identitySelection: InstallationIdentitySelection?,
+        approval: OnDeviceConversionApproval,
+    ): ConversionBuildResult = requireNotNull(conversionCoordinator) {
+        "온디바이스 변환 coordinator가 구성되지 않았습니다."
+    }.build(
+        token,
+        approvedAdapterIds,
+        partialConfirmed,
+        identitySelection,
+        approval,
     )
 
     override suspend fun restoreConversion(importReview: Boolean): RestoredConversion? =

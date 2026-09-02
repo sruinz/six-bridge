@@ -5,7 +5,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.sixbridge.contract.bundle.BundleJson
 import dev.sixbridge.contract.bundle.ContractCompatibilityStatus
-import dev.sixbridge.core.conversion.ConversionAuthorization
 import dev.sixbridge.core.conversion.ForceCompatibilityPolicy
 import dev.sixbridge.manager.app.ManagerImportResult
 import dev.sixbridge.manager.app.ManagerRepository
@@ -249,11 +248,15 @@ class ManagerViewModel(
                 it.copy(partialConfirmed = true)
             }
             ManagerAction.ConfirmConversionForce -> updateConversionAnalysis {
-                if (ForceCompatibilityPolicy.isEligible(it.report)) {
-                    it.copy(forceCompatibilityConfirmed = true)
-                } else {
-                    it
-                }
+                val challenge = it.forceChallenge
+                    ?.takeIf { _ -> ForceCompatibilityPolicy.isEligible(it.report) }
+                    ?: return@updateConversionAnalysis it
+                val approval = repository.authorizeConversionForce(
+                    challenge,
+                    it.selectedAdapters,
+                    it.identitySelection,
+                ) ?: return@updateConversionAnalysis it
+                it.copy(forceApproval = approval)
             }
             ManagerAction.SelectNewConversionIdentity -> updateConversionAnalysis {
                 it.selectIdentity(InstallationIdentitySelection.CreateNew)
@@ -363,7 +366,7 @@ class ManagerViewModel(
 
     internal fun startImport(importOperation: suspend () -> ManagerImportResult) {
         if (mutableState.value.startupRecoveryState != StartupRecoveryUiState.READY) return
-        updateConversionAnalysis { it.copy(forceCompatibilityConfirmed = false) }
+        updateConversionAnalysis { it.copy(forceApproval = null) }
         invalidatePendingDocumentLaunches()
         moveOwnedReviewToPendingDiscard()
         val supersededInstall = detachInstallJob()
@@ -774,12 +777,9 @@ class ManagerViewModel(
         if (!ready.canBuild || routeOperation?.isActive == true) return
         val ticket = replaceRouteOperation()
         val generation = ticket.generation
-        val authorization = if (ready.forceCompatibilityConfirmed) {
-            ConversionAuthorization.forceUnknownApiUsage()
-        } else {
-            ConversionAuthorization.NONE
-        }
-        val consumedReady = ready.copy(forceCompatibilityConfirmed = false)
+        val approval = ready.forceApproval
+            ?: dev.sixbridge.manager.conversion.OnDeviceConversionApproval.NONE
+        val consumedReady = ready.copy(forceApproval = null)
         mutableState.update {
             it.copy(
                 route = ManagerRoute.ConversionAnalysis(ready.token),
@@ -795,7 +795,7 @@ class ManagerViewModel(
                     approvedAdapterIds = ready.selectedAdapters,
                     partialConfirmed = ready.partialConfirmed,
                     identitySelection = ready.identitySelection,
-                    authorization = authorization,
+                    approval = approval,
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -5031,6 +5031,7 @@ private fun ConversionBeginResult.AnalysisReady.toUiState() =
         requiredApprovals = requiredApprovals,
         optionalApprovals = optionalApprovals,
         identityRequirement = identityRequirement,
+        forceChallenge = forceChallenge,
         profileChanged = profileChanged,
         draftSignerFingerprint = draftSignerFingerprint,
     )

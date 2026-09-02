@@ -31,6 +31,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -82,6 +83,7 @@ class OnDeviceConversionCoordinatorTest {
         val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
             coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
         )
+        val approval = coordinator.forceApproval(analysis)
 
         assertIs<ConversionBuildResult.BundleReady>(
             coordinator.build(
@@ -89,7 +91,7 @@ class OnDeviceConversionCoordinatorTest {
                 analysis.requiredApprovals,
                 partialConfirmed = false,
                 identitySelection = null,
-                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+                approval = approval,
             ),
         )
 
@@ -113,14 +115,14 @@ class OnDeviceConversionCoordinatorTest {
         val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
             coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
         )
-
+        val approval = coordinator.forceApproval(analysis)
         val failure = assertIs<ConversionBuildResult.Failure>(
             coordinator.build(
                 analysis.token,
                 analysis.requiredApprovals,
                 partialConfirmed = false,
                 identitySelection = null,
-                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+                approval = approval,
             ),
         )
 
@@ -152,6 +154,7 @@ class OnDeviceConversionCoordinatorTest {
                     ),
                 )
                 val originalJob = fixture.jobSnapshot()
+                val approval = coordinator.forceApproval(analysis)
                 fixture.events.clear()
 
                 val failure = assertIs<ConversionBuildResult.Failure>(
@@ -160,7 +163,7 @@ class OnDeviceConversionCoordinatorTest {
                         analysis.requiredApprovals,
                         partialConfirmed = false,
                         identitySelection = null,
-                        authorization = ConversionAuthorization.forceUnknownApiUsage(),
+                        approval = approval,
                     ),
                 )
 
@@ -212,6 +215,7 @@ class OnDeviceConversionCoordinatorTest {
         val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
             coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
         )
+        val approval = coordinator.forceApproval(analysis)
 
         val failure = assertIs<ConversionBuildResult.Failure>(
             coordinator.build(
@@ -219,7 +223,7 @@ class OnDeviceConversionCoordinatorTest {
                 analysis.requiredApprovals,
                 partialConfirmed = false,
                 identitySelection = null,
-                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+                approval = approval,
             ),
         )
 
@@ -575,6 +579,7 @@ class OnDeviceConversionCoordinatorTest {
             coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
         )
         val originalJob = fixture.jobSnapshot()
+        val approval = coordinator.forceApproval(analysis)
         fixture.events.clear()
         fixture.currentProfile = profile(versionCode = 2)
 
@@ -583,7 +588,7 @@ class OnDeviceConversionCoordinatorTest {
             analysis.requiredApprovals,
             partialConfirmed = false,
             identitySelection = null,
-            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            approval = approval,
         )
         val afterFirst = fixture.jobSnapshot()
         val second = coordinator.build(
@@ -591,7 +596,7 @@ class OnDeviceConversionCoordinatorTest {
             analysis.requiredApprovals,
             partialConfirmed = false,
             identitySelection = null,
-            authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            approval = approval,
         )
         val afterSecond = fixture.jobSnapshot()
 
@@ -600,7 +605,7 @@ class OnDeviceConversionCoordinatorTest {
                 originalJob,
                 originalJob,
                 ConversionFailureCode.PROFILE_CHANGED,
-                ConversionFailureCode.PROFILE_CHANGED,
+                ConversionFailureCode.UNKNOWN,
                 emptyList<String>(),
             ),
             listOf(
@@ -622,6 +627,332 @@ class OnDeviceConversionCoordinatorTest {
             ),
         )
     }
+
+    @Test
+    fun `profile A typed 승인은 explicit analyze B 뒤 output 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+        }
+        val coordinator = fixture.coordinator()
+        val profileA = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+        val staleApproval = coordinator.forceApproval(profileA)
+        fixture.currentProfile = profile(versionCode = 2)
+        val profileB = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.analyze(profileA.token),
+        )
+        fixture.events.clear()
+
+        val result = coordinator.build(
+            profileB.token,
+            profileB.requiredApprovals,
+            partialConfirmed = false,
+            identitySelection = null,
+            approval = staleApproval,
+        )
+
+        assertEquals(
+            listOf(ConversionFailureCode.UNKNOWN, emptyList<String>()),
+            listOf(
+                (result as? ConversionBuildResult.Failure)?.code,
+                fixture.events.filter {
+                    it in setOf(
+                        "prepare",
+                        "identity",
+                        "reserve",
+                        "building",
+                        "package",
+                        "publish",
+                        "import",
+                    )
+                },
+            ),
+        )
+
+        val freshApproval = coordinator.forceApproval(profileB)
+        assertIs<ConversionBuildResult.BundleReady>(
+            coordinator.build(
+                profileB.token,
+                profileB.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+                approval = freshApproval,
+            ),
+        )
+    }
+
+    @Test
+    fun `Android raw typed force는 proof 없이 output 전에 거부한다`() = runTest {
+        val fixture = Fixture(temporaryFolder, mutableListOf()).apply {
+            compatibilityStatus = CompatibilityStatus.UNKNOWN
+            eligibleUnknown = true
+        }
+        val coordinator = fixture.coordinator()
+        val analysis = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+        fixture.events.clear()
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                partialConfirmed = false,
+                identitySelection = null,
+                authorization = ConversionAuthorization.forceUnknownApiUsage(),
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.events.isEmpty())
+    }
+
+    @Test
+    fun `같은 profile explicit 재분석도 이전 proof를 무효화한다`() = runTest {
+        val fixture = forcedFixture()
+        val coordinator = fixture.coordinator()
+        val first = coordinator.beginAnalysis()
+        val stale = coordinator.forceApproval(first)
+        val refreshed = assertIs<ConversionBeginResult.AnalysisReady>(
+            coordinator.analyze(first.token),
+        )
+        fixture.events.clear()
+
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            coordinator.build(
+                refreshed.token,
+                refreshed.requiredApprovals,
+                false,
+                null,
+                stale,
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `proof는 report source API adapter identity drift에서 첫 제시 즉시 소비된다`() =
+        runTest {
+            val mutations = listOf<(Fixture) -> Unit>(
+                { it.analysisIssueMessage = "changed" },
+                { it.analysisSourceSha256 = "8".repeat(64) },
+                { it.jobInputSha256 = "9".repeat(64) },
+                { it.analysisUnverifiedApis = setOf("runtime.other") },
+                { it.selectedAutomaticAdapters = setOf("automatic") },
+                { it.requiredApprovals = setOf("other-required") },
+                { it.optionalApprovals = setOf("other-optional") },
+                { it.logicalIdentity = null },
+                { it.analysisIdentityMode = InstallationIdentityMode.CONVERTED },
+            )
+            mutations.forEach { mutate ->
+                val fixture = forcedFixture()
+                val coordinator = fixture.coordinator()
+                val analysis = coordinator.beginAnalysis()
+                val approval = coordinator.forceApproval(analysis)
+                mutate(fixture)
+                val expectedJob = fixture.jobSnapshot()
+                fixture.events.clear()
+
+                val first = assertIs<ConversionBuildResult.Failure>(
+                    coordinator.build(
+                        analysis.token,
+                        analysis.requiredApprovals,
+                        false,
+                        null,
+                        approval,
+                    ),
+                )
+                val second = assertIs<ConversionBuildResult.Failure>(
+                    coordinator.build(
+                        analysis.token,
+                        analysis.requiredApprovals,
+                        false,
+                        null,
+                        approval,
+                    ),
+                )
+
+                assertEquals(ConversionFailureCode.UNKNOWN, first.code)
+                assertEquals(ConversionFailureCode.UNKNOWN, second.code)
+                assertEquals(expectedJob, fixture.jobSnapshot())
+                assertTrue(fixture.buildSideEffects().isEmpty())
+            }
+        }
+
+    @Test
+    fun `adapter와 identity selection이 proof와 다르면 prepare 전에 거부한다`() = runTest {
+        val adapterFixture = forcedFixture().apply {
+            optionalApprovals = setOf("optional")
+        }
+        val adapterCoordinator = adapterFixture.coordinator()
+        val adapterAnalysis = adapterCoordinator.beginAnalysis()
+        val adapterProof = adapterCoordinator.forceApproval(adapterAnalysis)
+        adapterFixture.events.clear()
+
+        val adapterFailure = assertIs<ConversionBuildResult.Failure>(
+            adapterCoordinator.build(
+                adapterAnalysis.token,
+                adapterAnalysis.requiredApprovals + adapterAnalysis.optionalApprovals,
+                false,
+                null,
+                adapterProof,
+            ),
+        )
+        assertEquals(ConversionFailureCode.UNKNOWN, adapterFailure.code)
+        assertTrue(adapterFixture.buildSideEffects().isEmpty())
+
+        val identityFixture = forcedFixture().apply { logicalIdentity = null }
+        val identityCoordinator = identityFixture.coordinator()
+        val identityAnalysis = identityCoordinator.beginAnalysis()
+        val identityProof = identityCoordinator.forceApproval(
+            identityAnalysis,
+            identitySelection = InstallationIdentitySelection.CreateNew,
+        )
+        identityFixture.events.clear()
+
+        val identityFailure = assertIs<ConversionBuildResult.Failure>(
+            identityCoordinator.build(
+                identityAnalysis.token,
+                identityAnalysis.requiredApprovals,
+                false,
+                null,
+                identityProof,
+            ),
+        )
+        assertEquals(ConversionFailureCode.UNKNOWN, identityFailure.code)
+        assertTrue(identityFixture.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `challenge와 proof는 각각 한 번만 사용할 수 있다`() = runTest {
+        val fixture = forcedFixture().apply { packageFailuresRemaining = 1 }
+        val coordinator = fixture.coordinator()
+        val analysis = coordinator.beginAnalysis()
+        val challenge = requireNotNull(analysis.forceChallenge)
+        val approval = requireNotNull(
+            coordinator.authorizeForce(challenge, analysis.requiredApprovals, null),
+        )
+
+        assertNull(coordinator.authorizeForce(challenge, analysis.requiredApprovals, null))
+        assertEquals(
+            ConversionFailureCode.PACKAGE,
+            assertIs<ConversionBuildResult.Failure>(
+                coordinator.build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    false,
+                    null,
+                    approval,
+                ),
+            ).code,
+        )
+        fixture.events.clear()
+
+        assertEquals(
+            ConversionFailureCode.UNKNOWN,
+            assertIs<ConversionBuildResult.Failure>(
+                coordinator.build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    false,
+                    null,
+                    approval,
+                ),
+            ).code,
+        )
+        assertTrue(fixture.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `process recreation은 이전 coordinator proof를 복원하지 않는다`() = runTest {
+        val fixture = forcedFixture()
+        val first = fixture.coordinator()
+        val analysis = first.beginAnalysis()
+        val approval = first.forceApproval(analysis)
+        fixture.events.clear()
+
+        val recreated = fixture.coordinator()
+        val failure = assertIs<ConversionBuildResult.Failure>(
+            recreated.build(
+                analysis.token,
+                analysis.requiredApprovals,
+                false,
+                null,
+                approval,
+            ),
+        )
+
+        assertEquals(ConversionFailureCode.UNKNOWN, failure.code)
+        assertTrue(fixture.buildSideEffects().isEmpty())
+    }
+
+    @Test
+    fun `explicit analyze와 confirm race는 이전 challenge를 되살리지 않는다`() = runBlocking {
+        val fixture = forcedFixture()
+        val coordinator = fixture.coordinator()
+        val initial = coordinator.beginAnalysis()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        fixture.analysisBlockingEntered = entered
+        fixture.analysisBlockingGate = release
+
+        val reanalysis = async(Dispatchers.Default) { coordinator.analyze(initial.token) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        assertNull(
+            coordinator.authorizeForce(
+                requireNotNull(initial.forceChallenge),
+                initial.requiredApprovals,
+                null,
+            ),
+        )
+        release.countDown()
+
+        val refreshed = assertIs<ConversionBeginResult.AnalysisReady>(reanalysis.await())
+        assertNotNull(
+            coordinator.authorizeForce(
+                requireNotNull(refreshed.forceChallenge),
+                refreshed.requiredApprovals,
+                null,
+            ),
+        )
+        Unit
+    }
+
+    @Test
+    fun `build와 analyze race는 package 완료까지 직렬화하고 side effect를 한 번만 낸다`() =
+        runBlocking {
+            val fixture = forcedFixture().apply {
+                packageEntered = CompletableDeferred()
+                packageRelease = CompletableDeferred()
+            }
+            val coordinator = fixture.coordinator()
+            val analysis = coordinator.beginAnalysis()
+            val approval = coordinator.forceApproval(analysis)
+            val build = async(Dispatchers.Default) {
+                coordinator.build(
+                    analysis.token,
+                    analysis.requiredApprovals,
+                    false,
+                    null,
+                    approval,
+                )
+            }
+            requireNotNull(fixture.packageEntered).await()
+            val analysisEntered = CountDownLatch(1)
+            fixture.analysisBlockingEntered = analysisEntered
+            val reanalysis = async(Dispatchers.Default) { coordinator.analyze(analysis.token) }
+
+            assertFalse(analysisEntered.await(100, TimeUnit.MILLISECONDS))
+            requireNotNull(fixture.packageRelease).complete(Unit)
+
+            assertIs<ConversionBuildResult.BundleReady>(build.await())
+            assertIs<ConversionBeginResult.Failure>(reanalysis.await())
+            assertEquals(1, fixture.events.count { it == "package" })
+        }
 
     @Test
     fun `analysis와 prepared identity mode 양방향 불일치는 reserve 전에 거부한다`() =
@@ -1687,6 +2018,28 @@ class OnDeviceConversionCoordinatorTest {
         assertTrue(fixture.coordinator().discard(fixture.token))
     }
 
+    private fun forcedFixture() = Fixture(temporaryFolder, mutableListOf()).apply {
+        compatibilityStatus = CompatibilityStatus.UNKNOWN
+        eligibleUnknown = true
+    }
+
+    private suspend fun OnDeviceConversionCoordinator.beginAnalysis() =
+        assertIs<ConversionBeginResult.AnalysisReady>(
+            begin(OnDeviceInputRequest.ChromeStore("https://example.invalid")),
+        )
+
+    private fun OnDeviceConversionCoordinator.forceApproval(
+        analysis: ConversionBeginResult.AnalysisReady,
+        approvedAdapterIds: Set<String> = analysis.requiredApprovals,
+        identitySelection: InstallationIdentitySelection? = null,
+    ): OnDeviceConversionApproval = requireNotNull(
+        authorizeForce(
+            requireNotNull(analysis.forceChallenge),
+            approvedAdapterIds,
+            identitySelection,
+        ),
+    )
+
     private class Fixture(
         folder: TemporaryFolder,
         val events: MutableList<String>,
@@ -1712,6 +2065,11 @@ class OnDeviceConversionCoordinatorTest {
         var workCreateFailure: Throwable? = null
         var compatibilityStatus = CompatibilityStatus.PARTIAL
         var eligibleUnknown = false
+        var analysisIssueMessage: String? = null
+        var jobInputSha256 = "1".repeat(64)
+        var analysisSourceSha256 = "4".repeat(64)
+        var analysisUnverifiedApis: Set<String>? = null
+        var selectedAutomaticAdapters: Set<String> = emptySet()
         var boundSchemaVersion = 6
         var boundOriginalSourceSha256 = "4".repeat(64)
         var boundIssueMessage: String? = null
@@ -1735,6 +2093,7 @@ class OnDeviceConversionCoordinatorTest {
         var importFailuresRemaining = 0
         var packageFailuresRemaining = 0
         var optionalApprovals: Set<String> = emptySet()
+        var requiredApprovals: Set<String> = setOf("adapter")
         var packageFailure: Throwable? = null
         var packageAction: (() -> Unit)? = null
         var bundleFailure: Throwable? = null
@@ -2126,7 +2485,7 @@ class OnDeviceConversionCoordinatorTest {
         private fun job() = RestoredConversionJob(
             token = token,
             inputKind = OnDeviceInputKind.CRX3,
-            inputSha256 = "1".repeat(64),
+            inputSha256 = jobInputSha256,
             stage = restoredStage ?: if (exposeAwaitingWhilePackaging && concurrentPackages > 0) {
                 ConversionJobStage.AWAITING_APPROVAL
             } else {
@@ -2139,10 +2498,25 @@ class OnDeviceConversionCoordinatorTest {
 
         fun jobSnapshot(): RestoredConversionJob = job()
 
+        fun buildSideEffects(): List<String> = events.filter {
+            it in setOf(
+                "prepare",
+                "identity",
+                "installed",
+                "bind",
+                "reserve",
+                "building",
+                "package",
+                "publish",
+                "import",
+                "bundle-ready-job-commit",
+            )
+        }
+
         private fun analysis(profile: BrowserProfile) = ConversionAnalysisSnapshot(
             report = report(profile),
-            selectedAutomaticAdapters = emptySet(),
-            requiredApprovals = setOf("adapter"),
+            selectedAutomaticAdapters = selectedAutomaticAdapters,
+            requiredApprovals = requiredApprovals,
             optionalApprovals = optionalApprovals,
             logicalSourceIdentity = logicalIdentity,
             identityMode = analysisIdentityMode,
@@ -2211,6 +2585,14 @@ class OnDeviceConversionCoordinatorTest {
                 } else {
                     base
                 }
+            }.let { report ->
+                report.copy(
+                    sourceSha256 = analysisSourceSha256,
+                    unverifiedApis = analysisUnverifiedApis ?: report.unverifiedApis,
+                    issues = analysisIssueMessage?.let { message ->
+                        report.issues.map { it.copy(message = message) }
+                    } ?: report.issues,
+                )
             }
     }
 
