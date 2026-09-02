@@ -4224,6 +4224,7 @@ class ManagerViewModelTest {
                 mapOf(ManagerViewModel.REVIEW_TOKEN_KEY to TOKEN),
             )
             var copied = 0
+            var deleted = 0
             val viewModel = ManagerViewModel(
                 repository,
                 savedState,
@@ -4231,6 +4232,7 @@ class ManagerViewModelTest {
                     copied += 1
                     GeneratedDocumentSaveResult.Success
                 },
+                deleteInstallApkDocument = { deleted += 1; true },
             )
             advanceUntilIdle()
             viewModel.accept(ManagerAction.InstallReviewedBundle)
@@ -4242,10 +4244,20 @@ class ManagerViewModelTest {
             assertTrue(
                 viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/one"),
             )
+            assertFalse(
+                viewModel.beginInstallApkDocumentTransaction(effect, "content://apk/one"),
+            )
+            assertFalse(
+                viewModel.discardRejectedInstallApkDocumentDestination(
+                    effect,
+                    "content://apk/one",
+                ),
+            )
             assertEquals(TOKEN, savedState.get<String>("install_apk_transaction_token"))
             advanceUntilIdle()
 
             assertEquals(1, copied)
+            assertEquals(0, deleted)
             assertIs<InstallApkDocumentTransactionState.Terminal>(
                 viewModel.installApkDocumentTransaction.value,
             )

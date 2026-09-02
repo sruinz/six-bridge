@@ -4236,6 +4236,12 @@ class ManagerViewModel(
             launchId = effect.launchId,
             destination = destination,
         )
+        val currentKey = when (val current = mutableInstallApkDocumentTransaction.value) {
+            is InstallApkDocumentTransactionState.Running -> current.key
+            is InstallApkDocumentTransactionState.Terminal -> current.key
+            InstallApkDocumentTransactionState.Idle -> null
+        }
+        if (currentKey == key) return false
         if (installApkDocumentTransactionJob?.isActive == true) return false
         persistInstallApkDocumentTransaction(key, InstallApkDocumentTransactionPhase.COPY_IN_FLIGHT)
         mutableInstallApkDocumentTransaction.value = InstallApkDocumentTransactionState.Running(
@@ -4258,8 +4264,20 @@ class ManagerViewModel(
     internal fun discardRejectedInstallApkDocumentDestination(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
         destination: String,
-    ) {
-        if (destination.isBlank()) return
+    ): Boolean {
+        if (destination.isBlank()) return false
+        val rejectedKey = InstallApkDocumentTransactionKey(
+            effect.importToken,
+            effect.ownerGeneration,
+            effect.launchId,
+            destination,
+        )
+        val currentKey = when (val current = mutableInstallApkDocumentTransaction.value) {
+            is InstallApkDocumentTransactionState.Running -> current.key
+            is InstallApkDocumentTransactionState.Terminal -> current.key
+            InstallApkDocumentTransactionState.Idle -> null
+        }
+        if (currentKey == rejectedKey) return false
         viewModelScope.launch {
             val deleted = installApkDocumentIoMutex.withLock {
                 withContext(NonCancellable) { deleteInstallApkDocument(destination) }
@@ -4273,6 +4291,7 @@ class ManagerViewModel(
                 )
             }
         }
+        return true
     }
 
     internal fun acknowledgeInstallApkDocumentTerminal(

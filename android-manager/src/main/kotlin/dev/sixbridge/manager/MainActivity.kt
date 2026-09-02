@@ -124,12 +124,15 @@ class MainActivity : ComponentActivity() {
                     uri.toString(),
                 )
                 if (!accepted) {
-                    managerViewModel.discardRejectedInstallApkDocumentDestination(
+                    val cleanupScheduled =
+                        managerViewModel.discardRejectedInstallApkDocumentDestination(
                         pending.effect,
                         uri.toString(),
                     )
-                    installApkExportHandoff.clear(pending)
-                        ?.let(::launchInstallApkExportPicker)
+                    if (cleanupScheduled) {
+                        installApkExportHandoff.clear(pending)
+                            ?.let(::launchInstallApkExportPicker)
+                    }
                 }
             }
         }
