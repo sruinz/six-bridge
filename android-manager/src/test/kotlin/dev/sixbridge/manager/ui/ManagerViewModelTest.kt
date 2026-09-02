@@ -3849,6 +3849,157 @@ class ManagerViewModelTest {
         }
 
     @Test
+    fun `generated와 imported install owner는 saved G 불일치에서 모두 거부한다`() =
+        runTest(dispatcher.scheduler) {
+            listOf<String?>(null, SECOND_TOKEN).forEach { staleSavedOwner ->
+                val forcedReview = forcedReview()
+                val repository = FakeManagerRepository().apply {
+                    conversionBeginResult = forcedConversionAnalysis()
+                    conversionBuildResult = ConversionBuildResult.BundleReady(
+                        forcedReview,
+                        generatedBundle(),
+                    )
+                }
+                val savedState = SavedStateHandle()
+                val viewModel = ManagerViewModel(repository, savedState)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.OpenConversionInput)
+                viewModel.accept(ManagerAction.ConversionUrlChanged("https://example.test"))
+                viewModel.accept(ManagerAction.AnalyzeConversionUrl)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.ConfirmConversionForce)
+                viewModel.accept(ManagerAction.BuildConversion)
+                advanceUntilIdle()
+                viewModel.accept(ManagerAction.PrepareGeneratedInstall)
+                savedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = staleSavedOwner
+
+                viewModel.accept(ManagerAction.ConfirmForcedInstall)
+                viewModel.accept(ManagerAction.InstallReviewedBundle)
+                viewModel.accept(
+                    ManagerAction.ContinueInstallAfterNotificationPermission(
+                        forcedReview.token,
+                        generatedBundle().token,
+                    ),
+                )
+                advanceUntilIdle()
+
+                assertFalse(
+                    assertIs<ImportUiState.ReviewReady>(
+                        viewModel.state.value.importState,
+                    ).forceCompatibilityConfirmed,
+                )
+                assertEquals(0, repository.installRequests)
+            }
+
+            val importedRepository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+            }
+            val importedSavedState = SavedStateHandle()
+            val imported = ManagerViewModel(importedRepository, importedSavedState)
+            advanceUntilIdle()
+            imported.startImport(importedRepository::nextImport)
+            advanceUntilIdle()
+            importedSavedState[ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY] = SECOND_TOKEN
+            imported.accept(ManagerAction.InstallReviewedBundle)
+            imported.accept(
+                ManagerAction.ContinueInstallAfterNotificationPermission(TOKEN, null),
+            )
+            advanceUntilIdle()
+            assertEquals(0, importedRepository.installRequests)
+        }
+
+    @Test
+    fun `install APK export suspend 중 route 이탈은 effect와 callback을 폐기한다`() =
+        runTest(dispatcher.scheduler) {
+            val savedState = SavedStateHandle()
+            val repository = FakeManagerRepository().apply {
+                importResult = ManagerImportResult.Success(
+                    review(ContractCompatibilityStatus.COMPATIBLE),
+                )
+                installResult = InstallState.PreparingApkExport(TOKEN)
+                installApkExport = InstallApkExport(
+                    importToken = TOKEN,
+                    source = File("/retained/$TOKEN/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+                suspendInstallApkExport = true
+            }
+            val viewModel = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+            viewModel.startImport(repository::nextImport)
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallReviewedBundle)
+            testScheduler.runCurrent()
+            assertEquals(1, repository.installApkExportRequests)
+
+            viewModel.accept(ManagerAction.ReturnHome)
+            repository.completeInstallApkExport()
+            advanceUntilIdle()
+            viewModel.accept(ManagerAction.InstallApkCreated(TOKEN, unitTestUri()))
+            advanceUntilIdle()
+
+            assertNull(savedState.get<String>("pending_system_apk_token"))
+            assertTrue(repository.installApkExportedTokens.isEmpty())
+            assertEquals(ManagerRoute.Home, viewModel.state.value.route)
+        }
+
+    @Test
+    fun `forced generated 설치가 시작된 재생성은 exact G R owner를 보존한다`() =
+        runTest(dispatcher.scheduler) {
+            val forcedReview = forcedReview()
+            val generated = generatedBundle()
+            val savedState = SavedStateHandle(
+                mapOf(
+                    ManagerViewModel.REVIEW_TOKEN_KEY to forcedReview.token,
+                    ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.RESULT_OWNER_CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.RESULT_OWNER_REVIEW_TOKEN_KEY to forcedReview.token,
+                    ManagerViewModel.CONVERSION_TOKEN_KEY to generated.token,
+                    ManagerViewModel.CONVERSION_ROUTE_KEY to "result",
+                ),
+            )
+            val repository = FakeManagerRepository().apply {
+                restoreResult = ManagerRestoreResult(review = forcedReview)
+                restoredConversion = RestoredConversion.BundleReady(forcedReview, generated)
+                installFlow.value = InstallState.PreparingApkExport(forcedReview.token)
+                installApkExport = InstallApkExport(
+                    importToken = forcedReview.token,
+                    source = File("/retained/${forcedReview.token}/wrapper.apk"),
+                    expectedSha256 = "a".repeat(64),
+                    extensionName = "확장",
+                    extensionVersion = "1.0",
+                    extensionId = EXTENSION_ID,
+                )
+            }
+
+            val restored = ManagerViewModel(repository, savedState)
+            advanceUntilIdle()
+
+            assertEquals(generated.token, savedState.get<String>(
+                ManagerViewModel.INSTALL_OWNER_CONVERSION_TOKEN_KEY,
+            ))
+            assertEquals(forcedReview.token, savedState.get<String>(
+                ManagerViewModel.REVIEW_TOKEN_KEY,
+            ))
+            assertEquals(ManagerRoute.Review(forcedReview.token), restored.state.value.route)
+            assertTrue(
+                assertIs<ConversionUiState.ResultReady>(
+                    restored.state.value.conversionState,
+                ).installOwnerActive,
+            )
+            assertFalse(
+                assertIs<ImportUiState.ReviewReady>(
+                    restored.state.value.importState,
+                ).forceCompatibilityConfirmed,
+            )
+        }
+
+    @Test
     fun `profile 또는 report drift 실패는 stale 강제 분석을 복원해 두 번째 build하지 않는다`() =
         runTest(dispatcher.scheduler) {
             listOf(
@@ -10410,6 +10561,8 @@ private class FakeManagerRepository : ManagerRepository {
     var legacyCleanupResult: ConversionIdentityCleanupResult =
         ConversionIdentityCleanupResult.NothingOwned
     var installApkExport: InstallApkExport? = null
+    var suspendInstallApkExport = false
+    var installApkExportRequests = 0
     val installApkExportedTokens = mutableListOf<String>()
     var reconcileManualCalls = 0
     var manualSystemInstallResult: InstallState? = null
@@ -10512,6 +10665,7 @@ private class FakeManagerRepository : ManagerRepository {
     var ignoreImportCancellation = false
     private val importGate = MutableSharedFlow<Unit>()
     private val installGate = MutableSharedFlow<Unit>()
+    private val installApkExportGate = MutableSharedFlow<Unit>()
     private val cancelInstallGate = MutableSharedFlow<Unit>()
     private val initializeGate = MutableSharedFlow<Unit>()
     private val firstConversionBeginGate = MutableSharedFlow<Unit>()
@@ -10797,8 +10951,15 @@ private class FakeManagerRepository : ManagerRepository {
 
     override suspend fun installApkExport(
         importToken: String,
-    ): InstallApkExport? =
-        installApkExport?.takeIf { it.importToken == importToken }
+    ): InstallApkExport? {
+        installApkExportRequests += 1
+        if (suspendInstallApkExport) installApkExportGate.first()
+        return installApkExport?.takeIf { it.importToken == importToken }
+    }
+
+    suspend fun completeInstallApkExport() {
+        installApkExportGate.emit(Unit)
+    }
 
     override fun markInstallApkExported(importToken: String): Boolean {
         installApkExportedTokens += importToken

@@ -1901,9 +1901,15 @@ class ManagerViewModel(
             }
             is RestoredConversion.BundleReady -> {
                 val review = if (importReview) retainedReview ?: restored.review else retainedReview
-                if (review?.forcedCompatibility != null &&
+                val forcedOwnerMatches = review?.forcedCompatibility != null &&
                     generatedInstallOwnerToken == restored.generated.token
-                ) {
+                val installNotStarted = repository.installState.value == InstallState.Idle &&
+                    savedStateHandle.get<Int>(INSTALL_SESSION_ID_KEY) == null &&
+                    pendingSystemInstallApkDocument == null &&
+                    pendingNormalHandoff == null &&
+                    pendingGeneratedCleanup == null &&
+                    pendingGeneratedTerminalHandoff == null
+                if (forcedOwnerMatches && installNotStarted) {
                     clearGeneratedInstallOwner()
                     clearSavedReviewAndSession()
                 }
@@ -1912,6 +1918,21 @@ class ManagerViewModel(
                     generated = restored.generated,
                     persistOwners = persistOwners,
                 )
+                if (forcedOwnerMatches && !installNotStarted) {
+                    mutableState.update {
+                        val result = it.conversionState as? ConversionUiState.ResultReady
+                        it.copy(
+                            route = ManagerRoute.Review(review.token),
+                            conversionState = result?.copy(installOwnerActive = true)
+                                ?: it.conversionState,
+                            importState = ImportUiState.ReviewReady(
+                                review = review,
+                                partialConfirmed = false,
+                                forceCompatibilityConfirmed = false,
+                            ),
+                        )
+                    }
+                }
             }
             is RestoredConversion.GeneratedPending ->
                 showConversionResult(
@@ -2196,7 +2217,11 @@ class ManagerViewModel(
                 (mutableState.value.importState as? ImportUiState.ReviewReady)
                     ?.let(::isCurrentInstallReviewOwner) == true
             val export = if (stillOwnsAttempt) repository.installApkExport(reviewToken) else null
-            if (export != null && stillOwnsAttempt) {
+            val stillOwnsExport = generation == operationGeneration &&
+                generatedInstallOwnerToken == attemptGeneratedOwner &&
+                (mutableState.value.importState as? ImportUiState.ReviewReady)
+                    ?.let(::isCurrentInstallReviewOwner) == true
+            if (export != null && stillOwnsExport) {
                 val effect = ManagerEffect.CreateInstallApkDocument(
                     importToken = export.importToken,
                     source = export.source,
@@ -2230,7 +2255,8 @@ class ManagerViewModel(
         val pending = pendingSystemInstallApkDocument
             ?.takeIf {
                 it.importToken == action.importToken &&
-                    isCurrentReviewOwner(action.importToken)
+                    (mutableState.value.importState as? ImportUiState.ReviewReady)
+                        ?.let(::isCurrentInstallReviewOwner) == true
             }
             ?: return
         if (action.uri == null) {
@@ -2267,7 +2293,10 @@ class ManagerViewModel(
     private fun confirmManualInstallStatus() {
         val manual = mutableState.value.installState as? InstallState.AwaitingManualInstall
             ?: return
-        if (!isCurrentReviewOwner(manual.importToken)) return
+        val ready = mutableState.value.importState as? ImportUiState.ReviewReady ?: return
+        if (ready.review.token != manual.importToken ||
+            !isCurrentInstallReviewOwner(ready)
+        ) return
         viewModelScope.launch {
             repository.reconcileManualInstall(manual.importToken)
         }
@@ -4033,24 +4062,29 @@ class ManagerViewModel(
         }
         if (preparingExportToken == reviewToken &&
             reviewToken != null &&
-            isCurrentReviewOwner(reviewToken)
+            (mutableState.value.importState as? ImportUiState.ReviewReady)
+                ?.let(::isCurrentInstallReviewOwner) == true
         ) {
-            repository.installApkExport(reviewToken)
-                ?.let { export ->
+            val export = repository.installApkExport(reviewToken)
+            if ((mutableState.value.importState as? ImportUiState.ReviewReady)
+                    ?.let(::isCurrentInstallReviewOwner) == true
+            ) {
+                export?.let {
                     setPendingSystemInstallApkDocument(
                         ManagerEffect.CreateInstallApkDocument(
-                            importToken = export.importToken,
-                            source = export.source,
-                            expectedSha256 = export.expectedSha256,
+                            importToken = it.importToken,
+                            source = it.source,
+                            expectedSha256 = it.expectedSha256,
                             suggestedFileName = suggestedWrapperApkName(
-                                extensionName = export.extensionName,
-                                extensionVersion = export.extensionVersion,
-                                extensionId = export.extensionId,
+                                extensionName = it.extensionName,
+                                extensionVersion = it.extensionVersion,
+                                extensionId = it.extensionId,
                                 wrapperVersionCode = readyReview.wrapperVersionCode,
                             ),
                         ),
                     )
                 }
+            }
             pendingSystemInstallApkDocument
                 ?.takeIf { it.importToken == reviewToken }
                 ?.let { effect ->
@@ -4067,7 +4101,9 @@ class ManagerViewModel(
                 }
         }
         if (installState is InstallState.AwaitingManualInstall &&
-            isCurrentReviewOwner(installState.importToken)
+            readyReview?.token == installState.importToken &&
+            (mutableState.value.importState as? ImportUiState.ReviewReady)
+                ?.let(::isCurrentInstallReviewOwner) == true
         ) {
             clearPendingSystemInstallApkDocument()
             showManualInstallUi()
@@ -4078,7 +4114,8 @@ class ManagerViewModel(
     internal fun ownsSystemInstallApkDocument(
         effect: ManagerEffect.CreateSystemInstallApkDocument,
     ): Boolean = pendingSystemInstallApkDocument == effect &&
-        isCurrentReviewOwner(effect.importToken)
+        (mutableState.value.importState as? ImportUiState.ReviewReady)
+            ?.let(::isCurrentInstallReviewOwner) == true
 
     private fun setPendingSystemInstallApkDocument(
         effect: ManagerEffect.CreateInstallApkDocument,
@@ -4998,9 +5035,13 @@ class ManagerViewModel(
             savedStateHandle.get<String>(REVIEW_TOKEN_KEY) != reviewToken
         ) return false
         val generatedToken = generatedInstallOwnerToken
+        val savedGeneratedToken =
+            savedStateHandle.get<String>(INSTALL_OWNER_CONVERSION_TOKEN_KEY)
         if (generatedToken == null) {
-            return mutableState.value.route == ManagerRoute.Review(reviewToken)
+            return savedGeneratedToken == null &&
+                mutableState.value.route == ManagerRoute.Review(reviewToken)
         }
+        if (savedGeneratedToken != generatedToken) return false
         val result = mutableState.value.conversionState as? ConversionUiState.ResultReady
             ?: return false
         if (!result.installOwnerActive ||
