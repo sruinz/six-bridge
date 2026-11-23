@@ -455,6 +455,17 @@ class OnDeviceWrapperRequestTest {
             profileMajorVersion: Int,
         ): List<ConversionIdentityEntity> = emptyList()
 
+        override suspend fun listByModeAndLifecycle(
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
+
+        override suspend fun listByLogicalSourceModeAndLifecycle(
+            logicalSourceIdentity: String,
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
+
         override suspend fun claimForPackaging(
             requested: ConversionIdentityEntity,
             versionCode: Int,

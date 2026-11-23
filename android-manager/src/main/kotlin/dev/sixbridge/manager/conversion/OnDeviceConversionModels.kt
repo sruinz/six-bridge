@@ -330,6 +330,15 @@ internal interface ConversionRuntimePort {
 
 internal interface ConversionIdentityPort {
     suspend fun existingTargets(profileMajorVersion: Int): List<ExistingConversionTarget>
+    suspend fun resolveStableIdentityKey(
+        logicalSourceIdentity: LogicalSourceIdentity,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+    ): InstallationIdentityKey = InstallationIdentityKey.create(
+        logicalSourceIdentity,
+        profileMajorVersion,
+        mode,
+    )
     suspend fun resolve(
         prepared: PreparedConversionSnapshot,
         profile: BrowserProfile,

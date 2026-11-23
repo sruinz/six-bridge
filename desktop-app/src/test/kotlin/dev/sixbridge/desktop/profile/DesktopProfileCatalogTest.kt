@@ -80,10 +80,10 @@ class DesktopProfileCatalogTest {
     }
 
     @Test
-    fun `기본 profile은 최신 내장 30점0점2점61이다`() {
+    fun `기본 profile은 최신 내장 31점0점0점81이다`() {
         val catalog = catalog()
 
-        assertEquals("30.0.2.61", catalog.default().profile?.versionName)
+        assertEquals("31.0.0.81", catalog.default().profile?.versionName)
         assertTrue(
             catalog.default().profile?.supportedFeatures?.contains(
                 "browser.internal-url.extensions-root",

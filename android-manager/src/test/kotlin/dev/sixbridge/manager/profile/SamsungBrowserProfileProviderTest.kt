@@ -72,14 +72,33 @@ class SamsungBrowserProfileProviderTest {
     }
 
     @Test
-    fun `major 31은 archive를 읽지 않고 Unknown이다`(): Unit = runBlocking {
+    fun `지원하지 않는 major 32는 archive를 읽지 않고 Unknown이다`(): Unit = runBlocking {
         val archive = CountingArchive("base.apk", completeApk())
         val result = provider(
-            found(versionName = "31.0.0.1", baseApk = archive),
+            found(versionName = "32.0.0.1", baseApk = archive),
         ).load()
 
         assertIs<SamsungBrowserProfileResult.Unknown>(result)
         assertEquals(0, archive.openCount)
+    }
+
+    @Test
+    fun `정상 Samsung 31 x 설치 profile은 Supported이다`(): Unit = runBlocking {
+        val cache = MemoryCache()
+        val result = provider(
+            found(
+                versionName = "31.0.0.82",
+                versionCode = 1_310_082_502L,
+                baseApk = archive("base.apk", completeApk(BrowserProfile.BASELINE_31_APIS)),
+            ),
+            cache,
+        ).load()
+
+        val supported = assertIs<SamsungBrowserProfileResult.Supported>(result)
+
+        assertEquals("com.sec.android.app.sbrowser", supported.profile.browserPackage)
+        assertEquals(31, supported.profile.majorVersion)
+        assertEquals(ProfileSupport.SUPPORTED, supported.profile.support)
     }
 
     @Test
@@ -427,7 +446,8 @@ class SamsungBrowserProfileProviderTest {
         splitApks = splitApks,
     )
 
-    private fun completeApk() = apk()
+    private fun completeApk(apis: Set<String> = BrowserProfile.BASELINE_APIS) =
+        apk(terrace = baselineNamespaces(apis))
 
     private fun apk(
         dex: String = COMPLETE_MARKERS,
@@ -449,8 +469,8 @@ class SamsungBrowserProfileProviderTest {
         return output.toByteArray()
     }
 
-    private fun baselineNamespaces(): String = buildString {
-        BrowserProfile.BASELINE_APIS.sorted().forEach {
+    private fun baselineNamespaces(apis: Set<String> = BrowserProfile.BASELINE_APIS): String = buildString {
+        apis.sorted().forEach {
             append("""{"namespace":"$it"}""")
         }
     }

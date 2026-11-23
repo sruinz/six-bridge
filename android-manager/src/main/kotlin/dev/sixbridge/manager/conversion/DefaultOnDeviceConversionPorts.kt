@@ -547,6 +547,14 @@ internal class DefaultConversionIdentityPort(
     override suspend fun existingTargets(profileMajorVersion: Int) =
         delegate.existingTargets(profileMajorVersion)
 
+    override suspend fun resolveStableIdentityKey(
+        logicalSourceIdentity: LogicalSourceIdentity,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+    ) = withConversionIdentityBoundary {
+        delegate.resolveStableIdentityKey(logicalSourceIdentity, profileMajorVersion, mode)
+    }
+
     override suspend fun resolve(
         prepared: PreparedConversionSnapshot,
         profile: BrowserProfile,
@@ -579,12 +587,22 @@ private class LedgerConversionIdentityPort(
         return ledger.listExistingTargets(profileMajorVersion)
     }
 
+    override suspend fun resolveStableIdentityKey(
+        logicalSourceIdentity: LogicalSourceIdentity,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+    ): InstallationIdentityKey {
+        reconcileLegacyIdentities()
+        return ledger.resolveStableIdentityKey(logicalSourceIdentity, profileMajorVersion, mode)
+    }
+
     override suspend fun resolve(
         prepared: PreparedConversionSnapshot,
         profile: BrowserProfile,
         selection: InstallationIdentitySelection?,
         ownerToken: String,
     ): ResolvedPackageIdentity {
+        reconcileLegacyIdentities()
         when (prepared.identityMode) {
             InstallationIdentityMode.PASSTHROUGH ->
                 require(prepared.passthroughCrx != null && prepared.preparedCrx == null)

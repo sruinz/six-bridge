@@ -78,14 +78,16 @@ class BrowserProfile(
     )
 
     val isSupportedBaseline: Boolean
-        get() = majorVersion == SUPPORTED_MAJOR_VERSION &&
-            wrapperContract.isComplete &&
-            sourceApkSignerSha256 == SAMSUNG_SIGNER_SHA256 &&
-            profileDifferences.isEmpty() &&
-            (
-                versionName != BASELINE_VERSION ||
-                    sourceApkSha256 == BASELINE_APK_SHA256
-                )
+        get() {
+            val baseline = baselineForMajor(majorVersion) ?: return false
+            return wrapperContract.isComplete &&
+                sourceApkSignerSha256 == SAMSUNG_SIGNER_SHA256 &&
+                profileDifferences.isEmpty() &&
+                (
+                    versionName != baseline.versionName ||
+                        sourceApkSha256 == baseline.apkSha256
+                    )
+        }
 
     val support: ProfileSupport
         get() = if (isSupportedBaseline) ProfileSupport.SUPPORTED else ProfileSupport.UNKNOWN
@@ -236,11 +238,21 @@ class BrowserProfile(
             "profileDifferences=$profileDifferences, supportedFeatures=$supportedFeatures, " +
             "unavailableFeatures=$unavailableFeatures, apiCapabilities=$apiCapabilities)"
 
+    data class MajorBaseline(
+        val majorVersion: Int,
+        val versionName: String,
+        val apkSha256: String,
+        val apis: Set<String>,
+    )
+
     companion object {
         const val SUPPORTED_MAJOR_VERSION = 30
         const val BASELINE_VERSION = "30.0.2.61"
         const val BASELINE_APK_SHA256 =
             "6fad5501a3f9823c7dd9fafdfe1204f7246e487c8dea9c192426c07c8c48c981"
+        const val BASELINE_31_VERSION = "31.0.0.81"
+        const val BASELINE_31_APK_SHA256 =
+            "7e0a2d9b02f6fc4f0d86aab894d6741a644cb17027415a2f94d4e8e6fba4e396"
         const val SAMSUNG_SIGNER_SHA256 =
             "34df0e7a9f1cf1892e45c056b4973cd81ccf148a4050d11aea4ac5a65f900a42"
 
@@ -315,5 +327,98 @@ class BrowserProfile(
             "webstorePrivate",
             "windows",
         )
+
+        val BASELINE_31_APIS = setOf(
+            "action",
+            "alarms",
+            "app",
+            "app.runtime",
+            "appstoreService",
+            "automation",
+            "bookmarks",
+            "browserAction",
+            "browsingData",
+            "clientService",
+            "clipboard",
+            "commands",
+            "contentSettings",
+            "contextMenus",
+            "cookies",
+            "debugger",
+            "declarativeContent",
+            "declarativeNetRequest",
+            "declarativeWebRequest",
+            "dom",
+            "downloads",
+            "downloadsInternal",
+            "events",
+            "extension",
+            "extensionTypes",
+            "feedbackPrivate",
+            "fileHandlers",
+            "gcm",
+            "history",
+            "i18n",
+            "iconVariants",
+            "identity",
+            "idle",
+            "idltest",
+            "inputMethodPrivate",
+            "instanceID",
+            "management",
+            "notifications",
+            "offscreen",
+            "pageAction",
+            "permissions",
+            "power",
+            "privacy",
+            "protocolHandlers",
+            "proxy",
+            "readingList",
+            "runtime",
+            "scripting",
+            "scriptsInternal",
+            "search",
+            "sidePanel",
+            "storage",
+            "system.network",
+            "tabGroups",
+            "tabs",
+            "test",
+            "topSites",
+            "trans",
+            "tts",
+            "ttsEngine",
+            "types",
+            "userScripts",
+            "webAuthenticationProxy",
+            "webNavigation",
+            "webRequest",
+            "webRequestInternal",
+            "webViewRequest",
+            "webstorePrivate",
+            "windows",
+        )
+
+        val MAJOR_BASELINES: Map<Int, MajorBaseline> = mapOf(
+            30 to MajorBaseline(
+                majorVersion = 30,
+                versionName = BASELINE_VERSION,
+                apkSha256 = BASELINE_APK_SHA256,
+                apis = BASELINE_APIS,
+            ),
+            31 to MajorBaseline(
+                majorVersion = 31,
+                versionName = BASELINE_31_VERSION,
+                apkSha256 = BASELINE_31_APK_SHA256,
+                apis = BASELINE_31_APIS,
+            ),
+        )
+
+        val SUPPORTED_MAJOR_VERSIONS: Set<Int> = MAJOR_BASELINES.keys
+
+        fun baselineForMajor(majorVersion: Int): MajorBaseline? = MAJOR_BASELINES[majorVersion]
+
+        fun isSupportedMajorVersion(majorVersion: Int): Boolean = majorVersion in MAJOR_BASELINES
     }
 }

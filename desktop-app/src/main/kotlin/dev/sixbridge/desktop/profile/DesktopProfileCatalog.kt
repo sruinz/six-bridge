@@ -537,6 +537,7 @@ class DesktopProfileCatalog private constructor(
         private val BUILT_IN_RESOURCES = listOf(
             "profiles/builtin/sbrowser-30.0.0.67.json",
             "profiles/builtin/sbrowser-30.0.2.61.json",
+            "profiles/builtin/sbrowser-31.0.0.81.json",
         )
         private val SIGNED_RECORD_FIELDS = setOf(
             "schemaVersion", "trust", "profileSha256", "envelopeBase64",

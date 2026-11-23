@@ -39,12 +39,14 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
         }
         val expectedInstallationSha256 = installationApkSetSha256(archiveHashes)
         val oracle = inspectArchives(listOf(base) + splits)
+        val installedMajor = packageInfo.versionName.orEmpty().substringBefore('.').toIntOrNull()
+        val baseline = installedMajor?.let(BrowserProfile::baselineForMajor)
         val expectedSupport = (
             packageInfo.packageName == SAMSUNG_BROWSER_PACKAGE &&
                 signerSha256 == listOf(BrowserProfile.SAMSUNG_SIGNER_SHA256) &&
-                packageInfo.versionName.orEmpty().substringBefore('.').toIntOrNull() == 30 &&
+                baseline != null &&
                 oracle.wrapperContractComplete &&
-                oracle.namespaces == BrowserProfile.BASELINE_APIS
+                oracle.namespaces == baseline.apis
             )
 
         assertTrue(
@@ -62,7 +64,7 @@ class AndroidSamsungBrowserProfileInstrumentedTest {
         assertEquals(SAMSUNG_BROWSER_PACKAGE, packageInfo.packageName)
         assertEquals(1, signerSha256.size)
         assertEquals(BrowserProfile.SAMSUNG_SIGNER_SHA256, signerSha256.single())
-        assertEquals(30, packageInfo.versionName.orEmpty().substringBefore('.').toInt())
+        assertTrue(BrowserProfile.isSupportedMajorVersion(requireNotNull(installedMajor)))
         assertEquals(SAMSUNG_BROWSER_PACKAGE, profile.browserPackage)
         assertEquals(packageInfo.versionName, profile.versionName)
         assertEquals(packageInfo.longVersionCode, profile.versionCode)

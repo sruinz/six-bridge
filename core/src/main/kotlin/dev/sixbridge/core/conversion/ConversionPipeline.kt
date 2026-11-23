@@ -613,15 +613,11 @@ internal class CrxIdentityPolicy private constructor(
                     originalCrxZip = originalParsed.zipBytes,
                 )
             }
-            val identity = ExtensionKeyManager.storeConversionIdentity(
-                originalParsed.extensionId,
-                profileMajorVersion,
-            )
             val keyManager = ExtensionKeyManager(
                 requireNotNull(localRoot.parent),
                 localRoot.resolve("keystore/crx"),
             )
-            val key = keyManager.getOrCreateStoreConversionKey(
+            val (identity, key) = keyManager.getOrCreateStoreConversionIdentityKey(
                 originalParsed.extensionId,
                 profileMajorVersion,
             )

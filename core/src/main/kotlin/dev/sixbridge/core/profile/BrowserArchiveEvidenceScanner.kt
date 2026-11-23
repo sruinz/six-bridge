@@ -148,17 +148,17 @@ class BrowserArchiveEvidenceScanner private constructor(
             ?: scan.versionCode
             ?: 0L
         val majorVersion = versionName.substringBefore('.').toIntOrNull() ?: 0
-        val compareNamespaces = (
-            majorVersion == BrowserProfile.SUPPORTED_MAJOR_VERSION &&
-                (
-                    versionName != BrowserProfile.BASELINE_VERSION ||
-                        evidence.splitApks.isNotEmpty()
-                    )
-            )
-        val differences = if (compareNamespaces) {
+        val baseline = BrowserProfile.baselineForMajor(majorVersion)
+        val differences = if (
+            baseline != null &&
+            (
+                versionName != baseline.versionName ||
+                    evidence.splitApks.isNotEmpty()
+                )
+        ) {
             buildList {
                 if (
-                    versionName == BrowserProfile.BASELINE_VERSION &&
+                    versionName == baseline.versionName &&
                     evidence.splitApks.isNotEmpty()
                 ) {
                     archives
@@ -167,10 +167,10 @@ class BrowserArchiveEvidenceScanner private constructor(
                         .sorted()
                         .forEach { add("unexpected_split:$it") }
                 }
-                (BrowserProfile.BASELINE_APIS - scan.namespaces).sorted().forEach {
+                (baseline.apis - scan.namespaces).sorted().forEach {
                     add("missing_api:$it")
                 }
-                (scan.namespaces - BrowserProfile.BASELINE_APIS).sorted().forEach {
+                (scan.namespaces - baseline.apis).sorted().forEach {
                     add("added_api:$it")
                 }
             }

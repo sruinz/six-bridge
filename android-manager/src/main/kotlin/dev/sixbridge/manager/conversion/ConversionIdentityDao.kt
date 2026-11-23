@@ -391,6 +391,34 @@ interface ConversionIdentityDao {
 
     @Query(
         """
+        SELECT * FROM conversion_identities
+        WHERE mode = :mode
+          AND lifecycleState = :lifecycleState
+        ORDER BY displayName COLLATE NOCASE, identitySha256
+        """,
+    )
+    suspend fun listByModeAndLifecycle(
+        mode: String,
+        lifecycleState: String,
+    ): List<ConversionIdentityEntity>
+
+    @Query(
+        """
+        SELECT * FROM conversion_identities
+        WHERE logicalSourceIdentity = :logicalSourceIdentity
+          AND mode = :mode
+          AND lifecycleState = :lifecycleState
+        ORDER BY profileMajorVersion DESC, identitySha256
+        """,
+    )
+    suspend fun listByLogicalSourceModeAndLifecycle(
+        logicalSourceIdentity: String,
+        mode: String,
+        lifecycleState: String,
+    ): List<ConversionIdentityEntity>
+
+    @Query(
+        """
         UPDATE conversion_identities
         SET displayName = :displayName,
             lastReservedVersionCode = :lastReservedVersionCode

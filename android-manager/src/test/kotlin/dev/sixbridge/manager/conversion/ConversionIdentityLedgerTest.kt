@@ -668,7 +668,7 @@ class ConversionIdentityLedgerTest {
         }
 
     @Test
-    fun `UseExisting은 손상 hash와 다른 profile 및 passthrough를 거부한다`() = runTest {
+    fun `UseExisting은 손상 hash와 passthrough를 거부하고 이전 메이저 profile의 ACTIVE 대상은 재사용한다`() = runTest {
         val dao = FakeConversionIdentityDao()
         val ledger = ConversionIdentityLedger(dao)
         val converted = stableKey()
@@ -695,15 +695,14 @@ class ConversionIdentityLedgerTest {
                 JOB_ONE,
             )
         }
-        assertFailsWith<IllegalArgumentException> {
-            ledger.resolveSelection(
-                null,
-                31,
-                InstallationIdentityMode.CONVERTED,
-                InstallationIdentitySelection.UseExisting(converted.identitySha256),
-                JOB_ONE,
-            )
-        }
+        val reusedCrossMajor = ledger.resolveSelection(
+            null,
+            31,
+            InstallationIdentityMode.CONVERTED,
+            InstallationIdentitySelection.UseExisting(converted.identitySha256),
+            JOB_ONE,
+        )
+        assertEquals(converted, reusedCrossMajor)
         assertFailsWith<IllegalArgumentException> {
             ledger.resolveSelection(
                 null,
@@ -713,6 +712,52 @@ class ConversionIdentityLedgerTest {
                 JOB_ONE,
             )
         }
+    }
+
+    @Test
+    fun `안정 신원은 브라우저 메이저 업데이트 후에도 기존 ACTIVE 신원을 재사용해 덮어쓰기 업데이트한다`() = runTest {
+        val dao = FakeConversionIdentityDao()
+        val ledger = ConversionIdentityLedger(dao)
+        val storeSource = LogicalSourceIdentity.storeExtensionId("c".repeat(32))
+        val v30Passthrough = InstallationIdentityKey.create(
+            storeSource,
+            30,
+            InstallationIdentityMode.PASSTHROUGH,
+        )
+        dao.insert(entity(v30Passthrough, bindingFor(v30Passthrough)))
+
+        val v30Converted = InstallationIdentityKey.create(
+            LogicalSourceIdentity.storeExtensionId("d".repeat(32)),
+            30,
+            InstallationIdentityMode.CONVERTED,
+        )
+        dao.insert(entity(v30Converted, bindingFor(v30Converted)))
+
+        val resolvedPassthrough = ledger.resolveSelection(
+            logicalSourceIdentity = storeSource,
+            profileMajorVersion = 31,
+            mode = InstallationIdentityMode.PASSTHROUGH,
+            selection = null,
+            ownerToken = JOB_ONE,
+        )
+        val resolvedConverted = ledger.resolveSelection(
+            logicalSourceIdentity = LogicalSourceIdentity.storeExtensionId("d".repeat(32)),
+            profileMajorVersion = 31,
+            mode = InstallationIdentityMode.CONVERTED,
+            selection = null,
+            ownerToken = JOB_TWO,
+        )
+        val brandNew = ledger.resolveSelection(
+            logicalSourceIdentity = LogicalSourceIdentity.storeExtensionId("e".repeat(32)),
+            profileMajorVersion = 31,
+            mode = InstallationIdentityMode.PASSTHROUGH,
+            selection = null,
+            ownerToken = JOB_ONE,
+        )
+
+        assertEquals(v30Passthrough, resolvedPassthrough)
+        assertEquals(v30Converted, resolvedConverted)
+        assertEquals(31, brandNew.profileMajorVersion)
     }
 
     @Test
@@ -818,11 +863,13 @@ class ConversionIdentityLedgerTest {
         )
         dao.insert(entity(other, bindingFor(other)))
 
-        val targets = ledger.listExistingTargets(30)
+        val targets = ledger.listExistingTargets(31)
 
-        assertEquals(1, targets.size)
-        assertEquals(selected.identitySha256, targets.single().identitySha256)
-        assertTrue(targets.single().displayName.isNotBlank())
+        assertEquals(
+            setOf(selected.identitySha256, other.identitySha256),
+            targets.map { it.identitySha256 }.toSet(),
+        )
+        assertTrue(targets.all { it.displayName.isNotBlank() })
     }
 
     @Test
@@ -1501,6 +1548,32 @@ class ConversionIdentityLedgerTest {
             rows.values.filter {
                 it.mode == mode && it.profileMajorVersion == profileMajorVersion
             }.sortedBy(ConversionIdentityEntity::identitySha256)
+        }
+
+        override suspend fun listByModeAndLifecycle(
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = synchronized(rows) {
+            rows.values.filter {
+                it.mode == mode && it.lifecycleState == lifecycleState
+            }.sortedWith(
+                compareBy<ConversionIdentityEntity>({ it.displayName.lowercase() }, { it.identitySha256 }),
+            )
+        }
+
+        override suspend fun listByLogicalSourceModeAndLifecycle(
+            logicalSourceIdentity: String,
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = synchronized(rows) {
+            rows.values.filter {
+                it.logicalSourceIdentity == logicalSourceIdentity &&
+                    it.mode == mode &&
+                    it.lifecycleState == lifecycleState
+            }.sortedWith(
+                compareByDescending<ConversionIdentityEntity> { it.profileMajorVersion }
+                    .thenBy { it.identitySha256 },
+            )
         }
 
         fun force(entity: ConversionIdentityEntity) {

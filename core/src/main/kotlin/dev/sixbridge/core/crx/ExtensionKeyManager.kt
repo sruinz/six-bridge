@@ -40,9 +40,25 @@ class ExtensionKeyManager(
     fun getOrCreateStoreConversionKey(
         originalExtensionId: String,
         profileMajorVersion: Int,
-    ): KeyPair = getOrCreate(
-        storeConversionIdentity(originalExtensionId, profileMajorVersion),
-    )
+    ): KeyPair = getOrCreateStoreConversionIdentityKey(
+        originalExtensionId,
+        profileMajorVersion,
+    ).second
+
+    fun getOrCreateStoreConversionIdentityKey(
+        originalExtensionId: String,
+        profileMajorVersion: Int,
+    ): Pair<String, KeyPair> {
+        val exactIdentity = storeConversionIdentity(originalExtensionId, profileMajorVersion)
+        getExisting(exactIdentity)?.let { return exactIdentity to it }
+        for (major in dev.sixbridge.core.profile.BrowserProfile.SUPPORTED_MAJOR_VERSIONS
+            .filter { it < profileMajorVersion }
+            .sortedDescending()) {
+            val previousIdentity = storeConversionIdentity(originalExtensionId, major)
+            getExisting(previousIdentity)?.let { return previousIdentity to it }
+        }
+        return exactIdentity to getOrCreate(exactIdentity)
+    }
 
     fun getOrCreate(identity: String): KeyPair {
         validateIdentity(identity)

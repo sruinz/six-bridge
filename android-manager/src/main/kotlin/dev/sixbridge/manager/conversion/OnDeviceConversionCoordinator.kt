@@ -651,7 +651,7 @@ internal class OnDeviceConversionCoordinator(
         }
         val identityRequirement = analysis.logicalSourceIdentity?.let {
             IdentityRequirement.Stable(
-                InstallationIdentityKey.create(
+                identities.resolveStableIdentityKey(
                     it,
                     profile.majorVersion,
                     analysis.identityMode,
@@ -746,11 +746,13 @@ internal class OnDeviceConversionCoordinator(
         analysis: ConversionAnalysisSnapshot,
         profileMajorVersion: Int,
     ): IdentityRequirementSnapshot = analysis.logicalSourceIdentity?.let {
-        IdentityRequirementSnapshot.Stable(InstallationIdentityKey.create(
-            it,
-            profileMajorVersion,
-            analysis.identityMode,
-        ).identitySha256.take(12))
+        IdentityRequirementSnapshot.Stable(
+            identities.resolveStableIdentityKey(
+                it,
+                profileMajorVersion,
+                analysis.identityMode,
+            ).identitySha256.take(12),
+        )
     } ?: IdentityRequirementSnapshot.UserSelectionRequired(
         identities.existingTargets(profileMajorVersion).canonicalTargets(),
     )

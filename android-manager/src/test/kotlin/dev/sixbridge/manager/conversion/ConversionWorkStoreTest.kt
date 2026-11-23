@@ -2393,6 +2393,17 @@ class ConversionWorkStoreTest {
             mode: String,
             profileMajorVersion: Int,
         ): List<ConversionIdentityEntity> = emptyList()
+
+        override suspend fun listByModeAndLifecycle(
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
+
+        override suspend fun listByLogicalSourceModeAndLifecycle(
+            logicalSourceIdentity: String,
+            mode: String,
+            lifecycleState: String,
+        ): List<ConversionIdentityEntity> = emptyList()
     }
 
     private class FakeCommittedOutputCleaner : ConversionIdentityCommittedOutputCleaner {

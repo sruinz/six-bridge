@@ -149,7 +149,7 @@ class ConversionIdentityLedger internal constructor(
                 require(selection == null) {
                     "안정적 신원과 수동 대상 선택을 함께 사용할 수 없습니다."
                 }
-                InstallationIdentityKey.create(
+                resolveStableIdentityKey(
                     logicalSourceIdentity,
                     profileMajorVersion,
                     mode,
@@ -182,15 +182,47 @@ class ConversionIdentityLedger internal constructor(
                 require(restored.mode == InstallationIdentityMode.CONVERTED) {
                     "passthrough 신원은 불안정 ZIP 대상이 될 수 없습니다."
                 }
-                require(restored.profileMajorVersion == profileMajorVersion) {
-                    "다른 프로필 주 버전의 대상은 선택할 수 없습니다."
-                }
                 restored
             }
             else -> throw IllegalArgumentException(
                 "안정적 신원이 없는 ZIP은 CreateNew 또는 UseExisting 선택이 필요합니다.",
             )
         }
+    }
+
+    suspend fun resolveStableIdentityKey(
+        logicalSourceIdentity: LogicalSourceIdentity,
+        profileMajorVersion: Int,
+        mode: InstallationIdentityMode,
+    ): InstallationIdentityKey {
+        require(profileMajorVersion > 0) { "프로필 주 버전이 올바르지 않습니다." }
+        val exact = InstallationIdentityKey.create(
+            logicalSourceIdentity,
+            profileMajorVersion,
+            mode,
+        )
+        if (dao.get(exact.identitySha256) != null) {
+            return exact
+        }
+        val active = dao.listByLogicalSourceModeAndLifecycle(
+            logicalSourceIdentity = logicalSourceIdentity.canonicalValue,
+            mode = mode.name,
+            lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
+        ).firstOrNull { it.provisionOwnerToken == null }
+        if (active != null) {
+            return restoreIdentityKey(active, "기존 설치 신원")
+        }
+        if (mode != InstallationIdentityMode.CONVERTED) {
+            val retired = dao.listByLogicalSourceModeAndLifecycle(
+                logicalSourceIdentity = logicalSourceIdentity.canonicalValue,
+                mode = mode.name,
+                lifecycleState = ConversionIdentityLifecycleState.RETIRED.name,
+            ).firstOrNull { it.provisionOwnerToken == null }
+            if (retired != null) {
+                return restoreIdentityKey(retired, "기존 설치 신원")
+            }
+        }
+        return exact
     }
 
     private fun restoreOwnedProvisionalSelection(
@@ -208,9 +240,12 @@ class ConversionIdentityLedger internal constructor(
             "job owner의 PROVISIONAL 설치 신원이 손상되었습니다."
         }
         val restored = restoreIdentityKey(provisional, "job owner의 PROVISIONAL 대상")
-        require(
-            restored.profileMajorVersion == profileMajorVersion && restored.mode == mode,
-        ) {
+        val profileCompatible = if (logicalSourceIdentity != null) {
+            restored.profileMajorVersion <= profileMajorVersion
+        } else {
+            restored.profileMajorVersion == profileMajorVersion
+        }
+        require(profileCompatible && restored.mode == mode) {
             "기존 PROVISIONAL 설치 신원과 같은 profile과 mode로만 재시도할 수 있습니다."
         }
         when {
@@ -807,9 +842,8 @@ class ConversionIdentityLedger internal constructor(
         profileMajorVersion: Int,
     ): List<ExistingConversionTarget> {
         require(profileMajorVersion > 0) { "프로필 주 버전이 올바르지 않습니다." }
-        return dao.listByModeProfileAndLifecycle(
+        return dao.listByModeAndLifecycle(
             mode = InstallationIdentityMode.CONVERTED.name,
-            profileMajorVersion = profileMajorVersion,
             lifecycleState = ConversionIdentityLifecycleState.ACTIVE.name,
         ).map { entity ->
             ExistingConversionTarget(

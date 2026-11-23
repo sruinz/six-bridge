@@ -282,7 +282,7 @@ class CompatibilityAnalyzerTest {
         )
         val unknown = CompatibilityAnalyzer().analyze(
             source,
-            profile.copy(majorVersion = 31),
+            profile.copy(majorVersion = 32),
         )
 
         assertEquals(CompatibilityStatus.BLOCKED, blocked.status)

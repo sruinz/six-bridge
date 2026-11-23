@@ -89,11 +89,11 @@ class SixBridgeCommandTest {
     }
 
     @Test
-    fun `version option reports the v0_1_2 development version`() {
+    fun `version option reports the v0_1_3 development version`() {
         val result = execute("--version")
 
         assertEquals(0, result.exitCode, result.error)
-        assertEquals("SIX Bridge 0.1.2-SNAPSHOT\n", result.output)
+        assertEquals("SIX Bridge 0.1.3-SNAPSHOT\n", result.output)
     }
 
     @Test
@@ -1236,7 +1236,7 @@ class SixBridgeCommandTest {
         val normalProfile = writeProfile(workspace)
         val futureProfile = workspace.resolve("future-profile.json").also { path ->
             val decoded = BrowserProfileJson.decode(normalProfile.readText())
-            path.writeText(BrowserProfileJson.encode(decoded.copy(majorVersion = 31)))
+            path.writeText(BrowserProfileJson.encode(decoded.copy(majorVersion = 32)))
         }
         val cases = listOf(
             "compatible" to (compatibleFixture(workspace.resolve("compatible")) to normalProfile),

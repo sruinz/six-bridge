@@ -116,7 +116,7 @@ class AndroidSamsungBrowserProfileProvider internal constructor(
             return SnapshotLookup.Rejected("signer_mismatch")
         }
         val majorVersion = found.versionName.substringBefore('.').toIntOrNull()
-        if (majorVersion != BrowserProfile.SUPPORTED_MAJOR_VERSION) {
+        if (majorVersion == null || !BrowserProfile.isSupportedMajorVersion(majorVersion)) {
             return SnapshotLookup.Rejected("unsupported_major:${majorVersion ?: 0}")
         }
 
@@ -184,7 +184,7 @@ class AndroidSamsungBrowserProfileProvider internal constructor(
             it.browserPackage == facts.packageName &&
                 it.versionName == facts.versionName &&
                 it.versionCode == facts.versionCode &&
-                it.majorVersion == BrowserProfile.SUPPORTED_MAJOR_VERSION &&
+                BrowserProfile.isSupportedMajorVersion(it.majorVersion) &&
                 it.sourceApkSha256 == facts.baseApkSha256 &&
                 it.installationApkSetSha256 == facts.installationApkSetSha256 &&
                 it.sourceApkSignerSha256 == facts.signerSha256
