@@ -132,7 +132,7 @@ assert_not_contains() {
 
 assert_no_final_directory() {
     local root=$1
-    local final="${root}/.local/releases/v0.1.2"
+    local final="${root}/.local/releases/v0.1.3"
     [[ ! -e "${final}" && ! -L "${final}" ]] || fail "실패한 경우 final release directory가 남았습니다: ${final}"
 }
 
@@ -152,7 +152,7 @@ assert_log_has_no_secret() {
 assert_exact_release_files() {
     local final=$1 actual expected
     actual="$(find "${final}" -maxdepth 1 -mindepth 1 -exec basename {} \; | LC_ALL=C sort)"
-    expected=$'RELEASE-METADATA.json\nRELEASE-NOTES-KO.md\nSHA256SUMS\nSIX-Bridge-0.1.2-macos-unsigned.dmg\nSIX-Bridge-Manager-0.1.2-android.apk'
+    expected=$'RELEASE-METADATA.json\nRELEASE-NOTES-KO.md\nSHA256SUMS\nSIX-Bridge-0.1.3-macos-unsigned.dmg\nSIX-Bridge-Manager-0.1.3-android.apk'
     [[ "${actual}" = "${expected}" ]] || fail "release 파일 구성이 정확히 다섯 개가 아닙니다: ${actual}"
 }
 
@@ -469,8 +469,8 @@ EOF
 #!/usr/bin/env bash
 case "$2" in
   application-id) printf '%s\n' dev.sixbridge.manager ;;
-  version-name) printf '%s\n' 0.1.2 ;;
-  version-code) printf '%s\n' 3 ;;
+  version-name) printf '%s\n' 0.1.3 ;;
+  version-code) printf '%s\n' 4 ;;
   *) exit 63 ;;
 esac
 EOF
@@ -545,19 +545,19 @@ case "$1" in
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
     printf '%s\n' \
       '[Application]' \
-      'app.classpath=$APPDIR/desktop-app-0.1.2-SNAPSHOT-fixture.jar' \
+      'app.classpath=$APPDIR/desktop-app-0.1.3-SNAPSHOT-fixture.jar' \
       'app.mainclass=dev.sixbridge.desktop.MainKt' \
       >"${mountpoint}/SIX Bridge.app/Contents/app/SIX Bridge.cfg"
     mkdir -p "${state_root}/jar-input"
     printf '%s\n' \
       'name=SIX Bridge' \
       'applicationId=dev.sixbridge.desktop' \
-      'version=0.1.2' \
+      'version=0.1.3' \
       'minimumMacOs=13.0' \
       >"${state_root}/jar-input/app.properties"
     (CDPATH= builtin cd -- "${state_root}/jar-input" && \
       /usr/bin/zip -q -X \
-        "${mountpoint}/SIX Bridge.app/Contents/app/desktop-app-0.1.2-SNAPSHOT-fixture.jar" \
+        "${mountpoint}/SIX Bridge.app/Contents/app/desktop-app-0.1.3-SNAPSHOT-fixture.jar" \
         app.properties)
     printf '%s' "${source}" >"${state_source}"
     printf '%s' "${mountpoint}" >"${state_mountpoint}"
@@ -591,8 +591,8 @@ EOF
 #!/usr/bin/env bash
 case "$2" in
   'Print :CFBundleIdentifier') printf '%s\n' dev.sixbridge.desktop ;;
-  'Print :CFBundleShortVersionString') printf '%s\n' 1.0.2 ;;
-  'Print :CFBundleVersion') printf '%s\n' 1.0.2 ;;
+  'Print :CFBundleShortVersionString') printf '%s\n' 1.0.3 ;;
+  'Print :CFBundleVersion') printf '%s\n' 1.0.3 ;;
   'Print :LSMinimumSystemVersion') printf '%s\n' 13.0 ;;
   'Print :CFBundleIconFile') printf '%s\n' 'SIX Bridge.icns' ;;
   *) exit 66 ;;
@@ -708,7 +708,7 @@ case " $* " in
     mkdir -p android-manager/build/outputs/apk/release
     printf '%s\n' android-artifact >android-manager/build/outputs/apk/release/android-manager-release.apk
     if [[ "${SIXBRIDGE_PREPARE_MUTATE_SOURCE:-0}" = 1 ]]; then
-      printf '%s\n' source-mutation >>docs/releases/v0.1.2-ko.md
+      printf '%s\n' source-mutation >>docs/releases/v0.1.3-ko.md
     fi
     if [[ "${SIXBRIDGE_PREPARE_MUTATE_HEAD:-0}" = 1 ]]; then
       /usr/bin/git -c user.name=fixture -c user.email=fixture@example.invalid commit --allow-empty -qm fixture-head-mutation
@@ -721,7 +721,7 @@ case " $* " in
     [[ -z "${SIXBRIDGE_MAC_SIGNING_IDENTITY:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_APPLE_ID:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_PASSWORD:-}" && -z "${SIXBRIDGE_MAC_NOTARIZATION_TEAM_ID:-}" ]] || exit 72
     [[ "${SIXBRIDGE_PREPARE_DMG_BUILD_FAIL:-0}" != 1 ]] || exit 73
     mkdir -p 'desktop-app/build/compose/binaries/main/dmg'
-    printf '%s\n' dmg-artifact >'desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.2.dmg'
+    printf '%s\n' dmg-artifact >'desktop-app/build/compose/binaries/main/dmg/SIX Bridge-1.0.3.dmg'
     ;;
   *) exit 74 ;;
 esac
@@ -746,8 +746,8 @@ setup_case() {
     create_fixture_tools "${CASE_ROOT}"
     [[ ! -e "${ROOT_DIR}/scripts/release-atomic-publish.pl" ]] || \
         cp "${ROOT_DIR}/scripts/release-atomic-publish.pl" "${CASE_ROOT}/scripts/release-atomic-publish.pl"
-    printf '%s\n' '# SIX Bridge v0.1.2 fixture' \
-        >"${CASE_ROOT}/docs/releases/v0.1.2-ko.md"
+    printf '%s\n' '# SIX Bridge v0.1.3 fixture' \
+        >"${CASE_ROOT}/docs/releases/v0.1.3-ko.md"
     cp "${ROOT_DIR}/desktop-app/src/main/package-resources/six-bridge.icns" \
         "${CASE_ROOT}/desktop-app/src/main/package-resources/six-bridge.icns"
     cp "${TEMPLATE_KEYSTORE}" "${CASE_ROOT}/.local/keystore/six-bridge-manager-release.p12"
@@ -772,7 +772,7 @@ run_prepare() {
             SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}" \
             SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
             "$@" \
-            "${CASE_PREPARE_SCRIPT}" 0.1.2
+            "${CASE_PREPARE_SCRIPT}" 0.1.3
     )
 }
 
@@ -800,7 +800,7 @@ if [[ "${SIXBRIDGE_PREPARE_TEST_NORMAL_ONLY:-0}" = 1 ]]; then
     setup_case normal-only
     /bin/mkdir -m 700 -- "${CASE_ROOT}/.local/releases"
     run_prepare
-    normal_final="${CASE_ROOT}/.local/releases/v0.1.2"
+    normal_final="${CASE_ROOT}/.local/releases/v0.1.3"
     assert_exact_release_files "${normal_final}"
     assert_no_release_work_entries "${CASE_ROOT}"
     [[ -z "$(/usr/bin/find "${CASE_ROOT}/.local" -maxdepth 1 \
@@ -891,7 +891,7 @@ expect_failure forged-public-internal-worker '지원하지 않는 release versio
             SIXBRIDGE_PREPARE_LOG="$6" SIXBRIDGE_PREPARE_SIGNER="$7" \
             SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="$8" \
             SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="$8" \
-            "$9" --sixbridge-internal-worker 0.1.2
+            "$9" --sixbridge-internal-worker 0.1.3
     ' forged-worker "${forged_runtime_path}" "${CASE_ROOT}/runtime/jdk" \
         "${CASE_ROOT}/.local/gradle-home" "${CASE_ROOT}" "${CASE_ROOT}/bin" \
         "${CASE_LOG}" "${FIXTURE_SIGNER}" "${RELEASE_PASSWORD}" "${CASE_PREPARE_SCRIPT}"
@@ -1027,7 +1027,7 @@ set +e
 (
     unset SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD
     export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
-    exec "${PREPARE_SCRIPT}" 0.1.2
+    exec "${PREPARE_SCRIPT}" 0.1.3
 ) >"${FIXTURE_ROOT}/preflight-missing-credential.log" 2>&1
 preflight_status=$?
 set -e
@@ -1042,7 +1042,7 @@ if ! run_prepare /usr/bin/env ANDROID_HOME=/caller/poison-sdk \
     cat "${sdk_worker_log}" >&2
     fail '검증된 Android SDK가 verify 이후 final Gradle까지 전달되지 않았습니다.'
 fi
-assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.2"
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.3"
 assert_log_has_no_secret "${sdk_worker_log}"
 
 resolver_root="${FIXTURE_ROOT}/resolver-canonical"
@@ -1303,7 +1303,7 @@ sanitizer_log="${FIXTURE_ROOT}/sanitized-worker-argv.log"
     export SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=argv
     export SIXBRIDGE_PREPARE_READY="${sanitizer_ready}"
     export SIXBRIDGE_PREPARE_CONTINUE="${sanitizer_continue}"
-    exec /usr/bin/env 'BAD-NAME=poison' "${CASE_PREPARE_SCRIPT}" 0.1.2
+    exec /usr/bin/env 'BAD-NAME=poison' "${CASE_PREPARE_SCRIPT}" 0.1.3
 ) >"${sanitizer_log}" 2>&1 &
 sanitizer_parent_pid=$!
 for _ in $(seq 1 100); do [[ -e "${sanitizer_ready}" ]] && break; /bin/sleep 0.05; done
@@ -1327,7 +1327,7 @@ if ! wait "${sanitizer_parent_pid}"; then
     cat "${sanitizer_log}" >&2
     fail 'argv 검사 뒤 sanitized worker가 정상 release를 완료하지 못했습니다.'
 fi
-assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.2"
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.3"
 assert_log_has_no_secret "${sanitizer_log}"
 
 setup_case tty-worker-stdin
@@ -1342,10 +1342,10 @@ set +e
     export SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD="${RELEASE_PASSWORD}"
     export SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}"
     export SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=non-tty-stdin
-    /usr/bin/script -q "${tty_worker_log}" "${CASE_PREPARE_SCRIPT}" 0.1.2
+    /usr/bin/script -q "${tty_worker_log}" "${CASE_PREPARE_SCRIPT}" 0.1.3
 )
 set -e
-assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.2"
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.3"
 assert_log_has_no_secret "${tty_worker_log}"
 
 setup_case 'utf8-worker-한글경로'
@@ -1355,7 +1355,7 @@ if ! run_prepare /usr/bin/env LC_ALL=C SIXBRIDGE_PREPARE_WAIT_IN_VERIFY=utf8-non
     cat "${utf8_worker_log}" >&2
     fail '한글 경로의 JDK 17 worker가 UTF-8 locale로 release를 완료하지 못했습니다.'
 fi
-assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.2"
+assert_exact_release_files "${CASE_ROOT}/.local/releases/v0.1.3"
 assert_log_has_no_secret "${utf8_worker_log}"
 
 setup_case runtime-node-resolution-mismatch
@@ -1374,22 +1374,22 @@ expect_failure missing-credential 'SIXBRIDGE_ANDROID_RELEASE_STORE_PASSWORD' \
         PATH="${CASE_ROOT}/bin:${PATH}" \
         SIXBRIDGE_PREPARE_FIXTURE_BIN="${CASE_ROOT}/bin" SIXBRIDGE_PREPARE_LOG="${CASE_LOG}" \
         SIXBRIDGE_ANDROID_RELEASE_KEY_PASSWORD="${RELEASE_PASSWORD}" \
-        "${CASE_PREPARE_SCRIPT}" 0.1.2
+        "${CASE_PREPARE_SCRIPT}" 0.1.3
 [[ ! -s "${CASE_LOG}" ]] || fail 'missing credential preflight 전에 runtime/build 도구가 실행되었습니다.'
 [[ ! -e "${CASE_ROOT}/.local/gradle-home" ]] || fail 'missing credential preflight 전에 GRADLE_USER_HOME이 생성되었습니다.'
 assert_no_final_directory "${CASE_ROOT}"
 
 setup_case existing-directory
-mkdir -p "${CASE_ROOT}/.local/releases/v0.1.2"
+mkdir -p "${CASE_ROOT}/.local/releases/v0.1.3"
 expect_failure existing-directory '이미 존재' run_prepare
-[[ -d "${CASE_ROOT}/.local/releases/v0.1.2" && ! -L "${CASE_ROOT}/.local/releases/v0.1.2" ]] || \
+[[ -d "${CASE_ROOT}/.local/releases/v0.1.3" && ! -L "${CASE_ROOT}/.local/releases/v0.1.3" ]] || \
     fail '기존 release directory가 보존되지 않았습니다.'
 
 setup_case dangling-symlink
 mkdir -p "${CASE_ROOT}/.local/releases"
-ln -s "${CASE_ROOT}/missing-final" "${CASE_ROOT}/.local/releases/v0.1.2"
+ln -s "${CASE_ROOT}/missing-final" "${CASE_ROOT}/.local/releases/v0.1.3"
 expect_failure dangling-symlink '이미 존재' run_prepare
-[[ -L "${CASE_ROOT}/.local/releases/v0.1.2" ]] || fail '기존 dangling symlink가 보존되지 않았습니다.'
+[[ -L "${CASE_ROOT}/.local/releases/v0.1.3" ]] || fail '기존 dangling symlink가 보존되지 않았습니다.'
 
 setup_case verify-failure
 expect_failure verify-failure '전체 검증' run_prepare /usr/bin/env SIXBRIDGE_PREPARE_VERIFY_FAIL=1
@@ -1420,7 +1420,7 @@ assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case dirty-start
-printf '%s\n' dirty-start >>"${CASE_ROOT}/docs/releases/v0.1.2-ko.md"
+printf '%s\n' dirty-start >>"${CASE_ROOT}/docs/releases/v0.1.3-ko.md"
 expect_failure dirty-start 'clean git worktree' run_prepare
 assert_no_final_directory "${CASE_ROOT}"
 assert_no_release_work_entries "${CASE_ROOT}"
@@ -1469,22 +1469,22 @@ assert_no_final_directory "${CASE_ROOT}"
 setup_case snapshot-barrier-content
 run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=content
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
-snapshot_content_final="${CASE_ROOT}/.local/releases/v0.1.2"
+snapshot_content_final="${CASE_ROOT}/.local/releases/v0.1.3"
 assert_exact_release_files "${snapshot_content_final}"
-assert_not_contains "${snapshot_content_final}/SIX-Bridge-Manager-0.1.2-android.apk" 'snapshot-barrier-tamper' '검증 뒤 stage 변조가 final에 반영되었습니다.'
+assert_not_contains "${snapshot_content_final}/SIX-Bridge-Manager-0.1.3-android.apk" 'snapshot-barrier-tamper' '검증 뒤 stage 변조가 final에 반영되었습니다.'
 
 setup_case snapshot-barrier-directory
 run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=directory
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'snapshot publish barrier가 마지막 검증 뒤 실행되지 않았습니다.'
-snapshot_directory_final="${CASE_ROOT}/.local/releases/v0.1.2"
+snapshot_directory_final="${CASE_ROOT}/.local/releases/v0.1.3"
 assert_exact_release_files "${snapshot_directory_final}"
 
 setup_case publish-final-insertion
 expect_failure publish-final-insertion 'atomic no-replace' \
     run_prepare /usr/bin/env SIXBRIDGE_PREPARE_PUBLISH_BARRIER=final
 [[ -e "${CASE_ROOT}/.local/releases/.fixture-publish-barrier-fired" ]] || fail 'external final insertion barrier가 실행되지 않았습니다.'
-[[ "$(cat "${CASE_ROOT}/.local/releases/v0.1.2/sentinel")" = sentinel ]] || fail '외부 final sentinel이 보존되지 않았습니다.'
-[[ -z "$(find "${CASE_ROOT}/.local/releases/v0.1.2" -name '.sixbridge-*' -print)" ]] || fail '기존 final 아래에 stage가 중첩되었습니다.'
+[[ "$(cat "${CASE_ROOT}/.local/releases/v0.1.3/sentinel")" = sentinel ]] || fail '외부 final sentinel이 보존되지 않았습니다.'
+[[ -z "$(find "${CASE_ROOT}/.local/releases/v0.1.3" -name '.sixbridge-*' -print)" ]] || fail '기존 final 아래에 stage가 중첩되었습니다.'
 assert_no_release_work_entries "${CASE_ROOT}"
 
 setup_case native-publish-content-tamper
@@ -1542,7 +1542,7 @@ run_prepare /usr/bin/env \
     JAVA_TOOL_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" _JAVA_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" \
     JDK_JAVA_OPTIONS="-Dfixture.secret=${SECRET_PROBE}" GRADLE_OPTS="-Dfixture.secret=${SECRET_PROBE}" \
     NODE_OPTIONS="--require=${CASE_ROOT}/bin/poison.js"
-final_one="${CASE_ROOT}/.local/releases/v0.1.2"
+final_one="${CASE_ROOT}/.local/releases/v0.1.3"
 commit_one=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
 assert_exact_release_files "${final_one}"
 assert_call_count "${CASE_LOG}" verify
@@ -1583,7 +1583,7 @@ for signal in HUP INT TERM; do
         SIXBRIDGE_PREPARE_CONTINUE="${signal_continue}" \
         SIXBRIDGE_PREPARE_CHILD_PID="${signal_child}" \
         SIXBRIDGE_PREPARE_TMPDIR_RECORD="${CASE_ROOT}/child-tmpdir" \
-        "${CASE_PREPARE_SCRIPT}" 0.1.2 >"${signal_log}" 2>&1 &
+        "${CASE_PREPARE_SCRIPT}" 0.1.3 >"${signal_log}" 2>&1 &
     signal_pid=$!
     signal_ready_started=${SECONDS}
     for _ in $(seq 1 400); do
@@ -1653,7 +1653,7 @@ for concurrent_pid in ${concurrent_pids}; do
     fi
 done
 [[ "${concurrent_successes}" = 1 ]] || fail "8-way prepare에서 성공은 정확히 하나여야 합니다: ${concurrent_successes}"
-concurrent_final="${CASE_ROOT}/.local/releases/v0.1.2"
+concurrent_final="${CASE_ROOT}/.local/releases/v0.1.3"
 assert_exact_release_files "${concurrent_final}"
 assert_no_release_work_entries "${CASE_ROOT}"
 for index in $(seq 1 8); do assert_log_has_no_secret "${FIXTURE_ROOT}/concurrent-${index}.log"; done
@@ -1664,7 +1664,7 @@ run_prepare
 success_two_status=$?
 set -e
 [[ "${success_two_status}" = 0 ]] || fail "success-two prepare exit status가 0이 아닙니다: ${success_two_status}"
-final_two="${CASE_ROOT}/.local/releases/v0.1.2"
+final_two="${CASE_ROOT}/.local/releases/v0.1.3"
 assert_exact_release_files "${final_two}"
 cmp "${final_one}/RELEASE-METADATA.json" "${final_two}/RELEASE-METADATA.json" || fail '두 root의 metadata가 결정적이지 않습니다.'
 cmp "${final_one}/SHA256SUMS" "${final_two}/SHA256SUMS" || fail '두 root의 checksum이 결정적이지 않습니다.'

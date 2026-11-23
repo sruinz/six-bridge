@@ -334,9 +334,10 @@ Windows x86-64 MSI 구성과 owner-only ACL 코드는 포함되어 있으나,
 ## 공개 배포
 
 SIX Bridge 소스는 [Apache-2.0](LICENSE)으로 제공됩니다. 현재 권장 배포인
-[v0.1.2 다운로드](https://github.com/sruinz/six-bridge/releases/tag/v0.1.2)는 Android
+[v0.1.3 다운로드](https://github.com/sruinz/six-bridge/releases/tag/v0.1.3)는 Android
 관리자 APK와 macOS 미서명·미공증 preview DMG를 제공합니다.
 설치 경고와 검증 절차는 [한글 배포 안내](docs/RELEASE_KO.md),
-변경 내용은 [v0.1.2 릴리스 노트](docs/releases/v0.1.2-ko.md)를 확인하세요.
-이전 배포 내용은 [v0.1.1 역사 릴리스 노트](docs/releases/v0.1.1-ko.md)와
+변경 내용은 [v0.1.3 릴리스 노트](docs/releases/v0.1.3-ko.md)를 확인하세요.
+이전 배포 내용은 [v0.1.2 역사 릴리스 노트](docs/releases/v0.1.2-ko.md),
+[v0.1.1 역사 릴리스 노트](docs/releases/v0.1.1-ko.md)와
 [v0.1.0 역사 릴리스 노트](docs/releases/v0.1.0-ko.md)에 보존되어 있습니다.

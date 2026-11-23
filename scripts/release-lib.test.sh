@@ -219,8 +219,8 @@ case "$1" in
    esac
    app_properties_root=$(/usr/bin/mktemp -d "${state_root}/app-properties.XXXXXX")
    printf 'name=SIX Bridge\napplicationId=dev.sixbridge.desktop\nversion=%s\nminimumMacOs=13.0\n' \
-     "${FAKE_APP_PROPERTIES_VERSION:-0.1.2}" >"${app_properties_root}/app.properties"
-   app_jar="${app_bundle}/Contents/app/desktop-app-0.1.2-SNAPSHOT-${FAKE_APP_JAR_SUFFIX:-fixture}.jar"
+     "${FAKE_APP_PROPERTIES_VERSION:-0.1.3}" >"${app_properties_root}/app.properties"
+   app_jar="${app_bundle}/Contents/app/desktop-app-0.1.3-SNAPSHOT-${FAKE_APP_JAR_SUFFIX:-fixture}.jar"
    if [[ -n "${FAKE_APP_PROPERTIES_ARCHIVE_MODE:-}" ]]; then
      /usr/bin/perl -MIO::Compress::Zip -e '
        use strict;
@@ -293,7 +293,7 @@ case "$1" in
    fi
    if [[ "${FAKE_EXTRA_MATCHING_APP_JAR_SYMLINK:-0}" = 1 ]]; then
      /bin/ln -s -- "$('/usr/bin/basename' "${app_jar}")" \
-       "${app_bundle}/Contents/app/desktop-app-0.1.2-SNAPSHOT-symlink.jar"
+       "${app_bundle}/Contents/app/desktop-app-0.1.3-SNAPSHOT-symlink.jar"
    fi
    app_jar_basename=$(/usr/bin/basename -- "${app_jar}")
    cfg_jar_basename=${FAKE_APP_CFG_JAR_BASENAME:-${app_jar_basename}}
@@ -412,15 +412,15 @@ export FAKE_HDIUTIL_MOUNT_NONCE="${DMG_MOUNT_NONCE}"
 export FAKE_HDIUTIL_STATE_ROOT="${DMG_HDIUTIL_STATE_ROOT}"
 export FAKE_SIGNER="${SIGNER}"
 export FAKE_APPLICATION_ID='dev.sixbridge.manager'
-export FAKE_VERSION_NAME='0.1.2'
-export FAKE_VERSION_CODE='3'
+export FAKE_VERSION_NAME='0.1.3'
+export FAKE_VERSION_CODE='4'
 export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
-export FAKE_PRODUCT_VERSION='1.0.2'
-export FAKE_NATIVE_VERSION='1.0.2'
+export FAKE_PRODUCT_VERSION='1.0.3'
+export FAKE_NATIVE_VERSION='1.0.3'
 export FAKE_MINIMUM_VERSION='13.0'
 export FAKE_ICON_NAME='SIX Bridge.icns'
 export FAKE_DMG_ICON_SOURCE="${ROOT_DIR}/desktop-app/src/main/package-resources/six-bridge.icns"
-export FAKE_APP_PROPERTIES_VERSION='0.1.2'
+export FAKE_APP_PROPERTIES_VERSION='0.1.3'
 create_tools
 
 fake_java_home="${FIXTURE_ROOT}/fake-java-home"
@@ -591,10 +591,10 @@ fi
 release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"
 export FAKE_APKSIGNER_FAIL=1; expect_failure apk-signature 'APK signature verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_FAIL
 export FAKE_APPLICATION_ID='invalid.package'; expect_failure apk-application-id 'application ID' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_APPLICATION_ID='dev.sixbridge.manager'
-export FAKE_VERSION_NAME='0.1.1'; expect_failure apk-old-version-name 'versionName' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_NAME='0.1.2'
+export FAKE_VERSION_NAME='0.1.1'; expect_failure apk-old-version-name 'versionName' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_NAME='0.1.3'
 export FAKE_SIGNER='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'; expect_failure apk-signer 'signer SHA-256' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_SIGNER="${SIGNER}"
 export FAKE_EXTRA_SIGNER=1; expect_failure apk-extra-signer '정확히 하나' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_EXTRA_SIGNER
-export FAKE_VERSION_CODE=2; expect_failure apk-old-version-code 'versionCode' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_CODE=3
+export FAKE_VERSION_CODE=3; expect_failure apk-old-version-code 'versionCode' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; export FAKE_VERSION_CODE=4
 export FAKE_APKSIGNER_REPLACE_PATH="${apk}"; expect_failure apk-race 'artifact changed during verification' release_verify_apk "${apk}" "${SIGNER}" "${stage}" "${container}"; unset FAKE_APKSIGNER_REPLACE_PATH
 make_file "${apk}" apk
 export FAKE_APKSIGNER_SWAP_RESTORE_PATH="${apk}" FAKE_APKSIGNER_REQUIRE_SNAPSHOT=1
@@ -632,7 +632,7 @@ verify_app_properties_contract() {
   export FAKE_APP_PROPERTIES_VERSION='9.9.9'
   expect_failure dmg-app-properties-version 'app.properties version' \
     release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
-  export FAKE_APP_PROPERTIES_VERSION='0.1.2'
+  export FAKE_APP_PROPERTIES_VERSION='0.1.3'
   for archive_mode in missing duplicate oversize non-target-bomb nul double-slash dot-slash drive-prefix absolute parent backslash; do
     export FAKE_APP_PROPERTIES_ARCHIVE_MODE=${archive_mode}
     expect_failure "dmg-app-properties-${archive_mode}" 'app.properties version' \
@@ -643,7 +643,7 @@ verify_app_properties_contract() {
   expect_failure dmg-app-properties-matching-symlink 'desktop app JAR' \
     release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
   unset FAKE_EXTRA_MATCHING_APP_JAR_SYMLINK
-  export FAKE_APP_CFG_JAR_BASENAME='desktop-app-0.1.2-SNAPSHOT-decoy.jar'
+  export FAKE_APP_CFG_JAR_BASENAME='desktop-app-0.1.3-SNAPSHOT-decoy.jar'
   expect_failure dmg-app-properties-launcher-mismatch 'launcher classpath' \
     release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"
   unset FAKE_APP_CFG_JAR_BASENAME
@@ -1436,8 +1436,8 @@ unset FAKE_HDIUTIL_REPLACE_PATH
 make_file "${dmg}" dmg
 export FAKE_BUNDLE_ID='invalid.bundle'; expect_failure dmg-bundle-id 'bundle ID' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_BUNDLE_ID='dev.sixbridge.desktop'
 export FAKE_EXTRA_APP=1; expect_failure dmg-extra-app '정확히 하나' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_EXTRA_APP
-export FAKE_PRODUCT_VERSION=1.0.1; expect_failure dmg-old-package-version 'package version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='1.0.2'
-export FAKE_NATIVE_VERSION=1.0.1; expect_failure dmg-old-native-version 'native package version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_NATIVE_VERSION='1.0.2'
+export FAKE_PRODUCT_VERSION=1.0.1; expect_failure dmg-old-package-version 'package version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_PRODUCT_VERSION='1.0.3'
+export FAKE_NATIVE_VERSION=1.0.1; expect_failure dmg-old-native-version 'native package version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_NATIVE_VERSION='1.0.3'
 export FAKE_MINIMUM_VERSION=12.0; expect_failure dmg-minimum-version 'minimum macOS version' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; export FAKE_MINIMUM_VERSION='13.0'
 export FAKE_CODESIGN_APP_RESULT=unsigned; release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_CODESIGN_APP_RESULT
 export FAKE_CODESIGN_APP_RESULT=developer-id; expect_failure dmg-developer-id-signed 'Developer ID' release_verify_dmg "${dmg}" "${dmg_work}" "${stage}" "${container}"; unset FAKE_CODESIGN_APP_RESULT
@@ -1564,8 +1564,8 @@ make_release_directory() {
     parent="${container}/${name}"
     directory="${parent}/release"
     /bin/mkdir -p "${directory}"; /bin/chmod 700 "${parent}" "${directory}"
-    make_file "${directory}/SIX-Bridge-Manager-0.1.2-android.apk" android
-    make_file "${directory}/SIX-Bridge-0.1.2-macos-unsigned.dmg" macos
+    make_file "${directory}/SIX-Bridge-Manager-0.1.3-android.apk" android
+    make_file "${directory}/SIX-Bridge-0.1.3-macos-unsigned.dmg" macos
     make_file "${directory}/RELEASE-NOTES-KO.md" '한글 릴리스 노트'
     release_write_metadata "${directory}" "${GIT_COMMIT}" "${SIGNER}" "${container}"
     release_write_checksums "${directory}" "${container}"
@@ -1577,14 +1577,14 @@ release_two=$(make_release_directory two)
 /usr/bin/cmp "${release_one}/RELEASE-METADATA.json" "${release_two}/RELEASE-METADATA.json" || fail 'metadata가 root에 따라 달라집니다.'
 /usr/bin/cmp "${release_one}/SHA256SUMS" "${release_two}/SHA256SUMS" || fail 'checksum이 root에 따라 달라집니다.'
 /usr/bin/jq -e --arg signer "${SIGNER}" '
-  .productVersion == "0.1.2" and
-  .android.file == "SIX-Bridge-Manager-0.1.2-android.apk" and
-  .android.versionName == "0.1.2" and .android.versionCode == 3 and
+  .productVersion == "0.1.3" and
+  .android.file == "SIX-Bridge-Manager-0.1.3-android.apk" and
+  .android.versionName == "0.1.3" and .android.versionCode == 4 and
   .android.signerSha256 == $signer and
-  .macos.file == "SIX-Bridge-0.1.2-macos-unsigned.dmg" and
-  .macos.productVersion == "0.1.2" and .macos.nativePackageVersion == "1.0.2"
+  .macos.file == "SIX-Bridge-0.1.3-macos-unsigned.dmg" and
+  .macos.productVersion == "0.1.3" and .macos.nativePackageVersion == "1.0.3"
 ' "${release_one}/RELEASE-METADATA.json" >/dev/null ||
-  fail 'v0.1.2 release metadata 계약이 올바르지 않습니다.'
+  fail 'v0.1.3 release metadata 계약이 올바르지 않습니다.'
 release_verify_directory "${release_one}" "${SIGNER}" "${container}"
 verify_work_rebind_path_record="${FIXTURE_ROOT}/verify-work-rebind.path"
 verify_work_rebind_parked_record="${FIXTURE_ROOT}/verify-work-rebind.parked"
@@ -1651,10 +1651,10 @@ expect_failure directory-extra-file '정확히 다섯 개' release_verify_direct
 
 race_parent="${container}/race"; race_directory="${race_parent}/release"
 /bin/mkdir -p "${race_directory}"; /bin/chmod 700 "${race_parent}" "${race_directory}"
-make_file "${race_directory}/SIX-Bridge-Manager-0.1.2-android.apk" android
-make_file "${race_directory}/SIX-Bridge-0.1.2-macos-unsigned.dmg" macos
+make_file "${race_directory}/SIX-Bridge-Manager-0.1.3-android.apk" android
+make_file "${race_directory}/SIX-Bridge-0.1.3-macos-unsigned.dmg" macos
 make_file "${race_directory}/RELEASE-NOTES-KO.md" note
-export FAKE_SHASUM_REPLACE_PATH="${race_directory}/SIX-Bridge-Manager-0.1.2-android.apk"
+export FAKE_SHASUM_REPLACE_PATH="${race_directory}/SIX-Bridge-Manager-0.1.3-android.apk"
 expect_failure metadata-input-race 'artifact changed during verification' release_write_metadata "${race_directory}" "${GIT_COMMIT}" "${SIGNER}" "${container}"
 unset FAKE_SHASUM_REPLACE_PATH
 

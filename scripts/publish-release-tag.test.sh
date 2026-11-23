@@ -56,14 +56,14 @@ assert_not_contains() {
 }
 
 assert_no_remote_tags() {
-    ! /usr/bin/git --git-dir="${CASE_ORIGIN}" show-ref --verify --quiet refs/tags/v0.1.2 ||
+    ! /usr/bin/git --git-dir="${CASE_ORIGIN}" show-ref --verify --quiet refs/tags/v0.1.3 ||
         fail "${1}: origin tag가 생성되었습니다."
-    ! /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.2 ||
+    ! /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.3 ||
         fail "${1}: github tag가 생성되었습니다."
 }
 
 assert_no_origin_tag() {
-    ! /usr/bin/git --git-dir="${CASE_ORIGIN}" show-ref --verify --quiet refs/tags/v0.1.2 ||
+    ! /usr/bin/git --git-dir="${CASE_ORIGIN}" show-ref --verify --quiet refs/tags/v0.1.3 ||
         fail "${1}: 로컬 origin이 게시 tag로 변경되었습니다."
 }
 
@@ -210,7 +210,7 @@ release_before_tag_push() {
     printf '%s\n' "${tag_oid}" >"${SIXBRIDGE_PUBLISH_FIXTURE_RACE_MARKER}"
     /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" commit --quiet --allow-empty -m fixture-tag-ref-race
     other_commit=$(/usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" rev-parse HEAD)
-    /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" update-ref refs/tags/v0.1.2 "${other_commit}"
+    /usr/bin/git -C "${SIXBRIDGE_RELEASE_PROJECT_ROOT}" update-ref refs/tags/v0.1.3 "${other_commit}"
 }
 EOF
 }
@@ -250,7 +250,7 @@ case "${1:-}" in
     ;;
   ls-remote)
     [[ "$#" = 5 && "${2:-}" = --exit-code && "${3:-}" = --tags &&
-       "${5:-}" = refs/tags/v0.1.2 ]] || exit 72
+       "${5:-}" = refs/tags/v0.1.3 ]] || exit 72
     [[ ! -f "${HOME}/.local/fake-git-ls-remote-error" ]] || exit 128
     remote_store=$(remote_store_for "${4}")
     if tag_oid=$(/usr/bin/git --git-dir="${remote_store}" rev-parse --verify "${5}" 2>/dev/null); then
@@ -266,7 +266,7 @@ case "${1:-}" in
     remote_store=$(remote_store_for "${2}")
     source_oid=${3%%:*}
     destination_ref=${3#*:}
-    [[ "${source_oid}" != "${3}" && "${destination_ref}" = refs/tags/v0.1.2 ]] || exit 75
+    [[ "${source_oid}" != "${3}" && "${destination_ref}" = refs/tags/v0.1.3 ]] || exit 75
     /usr/bin/git --git-dir="${remote_store}" update-ref "${destination_ref}" "${source_oid}"
     ;;
   remote)
@@ -335,8 +335,8 @@ if [[ "${SIXBRIDGE_PUBLISH_FIXTURE_BARRIER_KIND:-}" = analyzer ]]; then
 fi
 case "$2" in
   application-id) printf '%s\n' dev.sixbridge.manager ;;
-  version-name) printf '%s\n' 0.1.2 ;;
-  version-code) printf '%s\n' 3 ;;
+  version-name) printf '%s\n' 0.1.3 ;;
+  version-code) printf '%s\n' 4 ;;
   *) exit 19 ;;
 esac
 EOF
@@ -435,19 +435,19 @@ case "$1" in
     : >"${mountpoint}/SIX Bridge.app/Contents/Info.plist"
     printf '%s\n' \
       '[Application]' \
-      'app.classpath=$APPDIR/desktop-app-0.1.2-SNAPSHOT-fixture.jar' \
+      'app.classpath=$APPDIR/desktop-app-0.1.3-SNAPSHOT-fixture.jar' \
       'app.mainclass=dev.sixbridge.desktop.MainKt' \
       >"${mountpoint}/SIX Bridge.app/Contents/app/SIX Bridge.cfg"
     /bin/mkdir -p "${state_root}/jar-input"
     printf '%s\n' \
       'name=SIX Bridge' \
       'applicationId=dev.sixbridge.desktop' \
-      'version=0.1.2' \
+      'version=0.1.3' \
       'minimumMacOs=13.0' \
       >"${state_root}/jar-input/app.properties"
     (CDPATH= builtin cd -- "${state_root}/jar-input" && \
       /usr/bin/zip -q -X \
-        "${mountpoint}/SIX Bridge.app/Contents/app/desktop-app-0.1.2-SNAPSHOT-fixture.jar" \
+        "${mountpoint}/SIX Bridge.app/Contents/app/desktop-app-0.1.3-SNAPSHOT-fixture.jar" \
         app.properties)
     printf '%s' "${source}" >"${state_source}"
     printf '%s' "${mountpoint}" >"${state_mountpoint}"
@@ -488,8 +488,8 @@ EOF
 #!/usr/bin/env bash
 case "$2" in
   'Print :CFBundleIdentifier') printf '%s\n' dev.sixbridge.desktop ;;
-  'Print :CFBundleShortVersionString') printf '%s\n' 1.0.2 ;;
-  'Print :CFBundleVersion') printf '%s\n' 1.0.2 ;;
+  'Print :CFBundleShortVersionString') printf '%s\n' 1.0.3 ;;
+  'Print :CFBundleVersion') printf '%s\n' 1.0.3 ;;
   'Print :LSMinimumSystemVersion') printf '%s\n' 13.0 ;;
   'Print :CFBundleIconFile') printf '%s\n' 'SIX Bridge.icns' ;;
   *) exit 21 ;;
@@ -511,11 +511,11 @@ EOF
 }
 
 create_release_directory() {
-    local release="${CASE_ROOT}/.local/releases/v0.1.2" commit
+    local release="${CASE_ROOT}/.local/releases/v0.1.3" commit
     /bin/mkdir -p -- "${release}"
     /bin/chmod 700 "${CASE_ROOT}/.local" "${CASE_ROOT}/.local/releases" "${release}"
-    printf android >"${release}/SIX-Bridge-Manager-0.1.2-android.apk"
-    printf macos >"${release}/SIX-Bridge-0.1.2-macos-unsigned.dmg"
+    printf android >"${release}/SIX-Bridge-Manager-0.1.3-android.apk"
+    printf macos >"${release}/SIX-Bridge-0.1.3-macos-unsigned.dmg"
     printf '한글 릴리스 노트\n' >"${release}/RELEASE-NOTES-KO.md"
     commit=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
     SIXBRIDGE_PUBLISH_FIXTURE_BIN="${CASE_ROOT}/bin" \
@@ -593,7 +593,7 @@ run_publish_version() {
 }
 
 run_publish() {
-    run_publish_version 0.1.2
+    run_publish_version 0.1.3
 }
 
 recover_publish_signal_case() {
@@ -629,7 +629,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     setup_case missing-github
     /usr/bin/git -C "${CASE_ROOT}" remote remove github
     expect_failure missing-github '공개 GitHub remote를 읽지 못했습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags missing-github
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail 'github remote 누락 후 원격 작업이 실행됐습니다.'
@@ -639,14 +639,14 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     /usr/bin/git -C "${CASE_ROOT}" remote set-url origin \
         'https://github.com/sruinz/six-bridge.git'
     expect_failure missing-github-origin-canonical '공개 GitHub remote를 읽지 못했습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags missing-github-origin-canonical
 
     setup_case wrong-github-url
     /usr/bin/git -C "${CASE_ROOT}" remote set-url github \
         'https://example.invalid/other.git'
     expect_failure wrong-github-url '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags wrong-github-url
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail '잘못된 github URL 후 원격 작업이 실행됐습니다.'
@@ -655,7 +655,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     /usr/bin/git -C "${CASE_ROOT}" remote set-url --push github \
         'https://example.invalid/other.git'
     expect_failure wrong-github-push-url '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags wrong-github-push-url
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail '잘못된 github push URL 후 원격 작업이 실행됐습니다.'
@@ -664,7 +664,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     /usr/bin/git -C "${CASE_ROOT}" remote set-url --add github \
         'https://example.invalid/other.git'
     expect_failure multiple-github-fetch-urls '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags multiple-github-fetch-urls
 
     setup_case multiple-github-push-urls
@@ -673,14 +673,14 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     /usr/bin/git -C "${CASE_ROOT}" remote set-url --add --push github \
         'https://example.invalid/other.git'
     expect_failure multiple-github-push-urls '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags multiple-github-push-urls
 
     setup_case github-instead-of
     /usr/bin/git -C "${CASE_ROOT}" config \
         url.https://redirect.invalid/public/.insteadOf 'https://github.com/'
     expect_failure github-instead-of '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags github-instead-of
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail 'insteadOf 재작성 검출 후 원격 작업이 실행됐습니다.'
@@ -696,7 +696,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
         fail 'raw URL 우회 fixture가 effective canonical URL을 만들지 못했습니다.'
     expect_failure github-raw-url-rewrite-spoof \
         '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags github-raw-url-rewrite-spoof
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail 'raw URL rewrite 우회 검출 후 원격 작업이 실행됐습니다.'
@@ -705,7 +705,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     HOME="${CASE_ROOT}" /usr/bin/git config --global \
         url.https://redirect.invalid/public/.pushInsteadOf 'https://github.com/'
     expect_failure github-push-instead-of '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags github-push-instead-of
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) ' "${CASE_ROOT}/.local/fake-git.log" ||
         fail 'pushInsteadOf 재작성 검출 후 원격 작업이 실행됐습니다.'
@@ -713,14 +713,14 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     setup_case ls-remote-error
     : >"${CASE_ROOT}/.local/fake-git-ls-remote-error"
     expect_failure ls-remote-error '공개 GitHub remote tag 정보를 확인하지 못했습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags ls-remote-error
 
     setup_case github-main-mismatch
     alternate_commit=$(create_alternate_fixture_commit)
     /usr/bin/git --git-dir="${CASE_GITHUB}" update-ref refs/heads/main "${alternate_commit}"
     expect_failure github-main-mismatch 'main과 공개 GitHub main commit이 다릅니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     assert_no_remote_tags github-main-mismatch
 
     setup_case github-url-between-preflights
@@ -734,7 +734,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     set -e
     prompt_seen=0
     for _ in {1..400}; do
-        if /usr/bin/grep -Fq '계속하려면 v0.1.2 KEY BACKUP COMPLETE' "${between_preflight_log}" 2>/dev/null; then
+        if /usr/bin/grep -Fq '계속하려면 v0.1.3 KEY BACKUP COMPLETE' "${between_preflight_log}" 2>/dev/null; then
             prompt_seen=1
             break
         fi
@@ -749,7 +749,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     }
     /usr/bin/git -C "${CASE_ROOT}" remote set-url github \
         'https://example.invalid/other.git'
-    printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' >&8
+    printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' >&8
     set +e
     wait "${between_preflight_pid}"
     between_preflight_status=$?
@@ -766,10 +766,10 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     PUBLISH_FIXTURE_RACE=remote-url
     expect_failure github-url-before-push \
         '공개 GitHub remote URL이 canonical HTTPS와 일치하지 않습니다.' \
-        'v0.1.2 KEY BACKUP COMPLETE'
+        'v0.1.3 KEY BACKUP COMPLETE'
     PUBLISH_FIXTURE_RACE=''
     assert_no_remote_tags github-url-before-push
-    [[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.2)" = tag ]] ||
+    [[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.3)" = tag ]] ||
         fail 'push 직전 URL 차단 후 local annotated tag가 보존되지 않았습니다.'
     assert_contains "${FIXTURE_ROOT}/github-url-before-push.log" \
         'local tag 상태를 확인하세요.' \
@@ -781,13 +781,13 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
     alternate_commit=$(create_alternate_fixture_commit)
     /usr/bin/git --git-dir="${CASE_ORIGIN}" update-ref refs/heads/main "${alternate_commit}"
     public_success_log="${FIXTURE_ROOT}/public-github-success.log"
-    printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish \
+    printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish \
         >"${public_success_log}" 2>&1 || {
         /bin/cat -- "${public_success_log}" >&2
         fail '공개 GitHub canonical remote 게시가 실패했습니다.'
     }
     assert_no_origin_tag public-github-success
-    [[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.2)" = tag ]] ||
+    [[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.3)" = tag ]] ||
         fail '공개 GitHub 대상에 annotated tag가 생성되지 않았습니다.'
     fake_git_log="${CASE_ROOT}/.local/fake-git.log"
     [[ "$(/usr/bin/grep -Fxc 'remote get-url --all github' "${fake_git_log}")" = 3 ]] ||
@@ -796,9 +796,9 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_REMOTE_ONLY:-0}" = 1 ]]; then
         fail '공개 GitHub push URL 검증이 두 preflight와 push 직전에 실행되지 않았습니다.'
     [[ "$(/usr/bin/grep -Fxc 'fetch --quiet https://github.com/sruinz/six-bridge.git refs/heads/main:refs/remotes/github/main --tags' "${fake_git_log}")" = 2 ]] ||
         fail 'fetch가 두 preflight에서 canonical 공개 GitHub URL만 사용하지 않았습니다.'
-    [[ "$(/usr/bin/grep -Fxc 'ls-remote --exit-code --tags https://github.com/sruinz/six-bridge.git refs/tags/v0.1.2' "${fake_git_log}")" = 2 ]] ||
+    [[ "$(/usr/bin/grep -Fxc 'ls-remote --exit-code --tags https://github.com/sruinz/six-bridge.git refs/tags/v0.1.3' "${fake_git_log}")" = 2 ]] ||
         fail '원격 tag 확인이 canonical 공개 GitHub URL만 사용하지 않았습니다.'
-    [[ "$(/usr/bin/grep -Ec '^push https://github[.]com/sruinz/six-bridge[.]git [0-9a-f]{40}:refs/tags/v0[.]1[.]2$' "${fake_git_log}")" = 1 ]] ||
+    [[ "$(/usr/bin/grep -Ec '^push https://github[.]com/sruinz/six-bridge[.]git [0-9a-f]{40}:refs/tags/v0[.]1[.]3$' "${fake_git_log}")" = 1 ]] ||
         fail 'tag push가 canonical 공개 GitHub URL과 exact tag OID를 사용하지 않았습니다.'
     ! /usr/bin/grep -Eq '^(fetch|ls-remote|push) .*origin' "${fake_git_log}" ||
         fail '공개 게시 중 로컬 origin에 접근했습니다.'
@@ -911,7 +911,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_OUTSIDE_DMG_SIGNAL_ONLY:-0}" = 1 ]]; then
         verifier_tmp="${CASE_ROOT}/.local/publish-tmp"
         push_marker="${CASE_ROOT}/.local/publish-push.marker"
         /bin/mkdir -m 700 -- "${verifier_tmp}"
-        printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' >"${confirmation_file}"
+        printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' >"${confirmation_file}"
         publish_monitor_was_enabled=0
         case $- in *m*) publish_monitor_was_enabled=1 ;; esac
         set -m
@@ -936,7 +936,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_OUTSIDE_DMG_SIGNAL_ONLY:-0}" = 1 ]]; then
                 $SIG{INT} = q{DEFAULT};
                 $SIG{TERM} = q{DEFAULT};
                 exec @ARGV or die qq{publish exec failed: $!\n};
-            ' "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.2 \
+            ' "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.3 \
             <"${confirmation_file}" >"${signal_log}" 2>&1 &
         publish_pid=$!
         [[ "${publish_monitor_was_enabled}" = 1 ]] || set +m
@@ -993,8 +993,8 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_OUTSIDE_DMG_SIGNAL_ONLY:-0}" = 1 ]]; then
         verifier_tmp_count=$(/usr/bin/find "${verifier_tmp}" -mindepth 1 -maxdepth 1 -type f | /usr/bin/awk 'END {print NR + 0}')
         local_tag_left=0
         remote_tag_left=0
-        /usr/bin/git -C "${CASE_ROOT}" show-ref --verify --quiet refs/tags/v0.1.2 && local_tag_left=1
-        /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.2 && remote_tag_left=1
+        /usr/bin/git -C "${CASE_ROOT}" show-ref --verify --quiet refs/tags/v0.1.3 && local_tag_left=1
+        /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.3 && remote_tag_left=1
         push_marker_left=0
         [[ ! -e "${push_marker}" ]] || push_marker_left=1
 
@@ -1039,7 +1039,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_OUTSIDE_DMG_SIGNAL_ONLY:-0}" = 1 ]]; then
     PUBLISH_FIXTURE_BARRIER_KIND=tag-traps
     PUBLISH_FIXTURE_TRAP_RECORD="${CASE_ROOT}/.local/post-verification-traps"
     tag_trap_log="${FIXTURE_ROOT}/post-verification-traps.log"
-    printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${tag_trap_log}" 2>&1 || {
+    printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${tag_trap_log}" 2>&1 || {
         /bin/cat -- "${tag_trap_log}" >&2
         fail 'post-verification trap 해제 게시가 실패했습니다.'
     }
@@ -1059,7 +1059,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_NORMAL_ONLY:-0}" = 1 ]]; then
     setup_case normal-only
     normal_only_log="${FIXTURE_ROOT}/normal-only.log"
     set +e
-    printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${normal_only_log}" 2>&1
+    printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${normal_only_log}" 2>&1
     normal_only_status=$?
     set -e
     [[ "${normal_only_status}" = 0 ]] || {
@@ -1068,10 +1068,10 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_NORMAL_ONLY:-0}" = 1 ]]; then
     }
     [[ "$(/usr/bin/grep -c '^attach$' "${CASE_ROOT}/.local/publish-attach.log")" = 2 ]] ||
         fail 'normal-only 게시가 두 번의 direct preflight DMG 검증을 실행하지 않았습니다.'
-    [[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.2)" = tag ]] ||
+    [[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.3)" = tag ]] ||
         fail 'normal-only local tag가 annotated tag가 아닙니다.'
-    [[ "$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.2)" = \
-       "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2)" ]] ||
+    [[ "$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.3)" = \
+       "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3)" ]] ||
         fail 'normal-only 공개 GitHub annotated tag object가 local과 다릅니다.'
     assert_no_origin_tag normal-only
     cleanup_mount=$(/usr/bin/mktemp -d '/private/tmp/sixbridge-dmg.XXXXXX')
@@ -1145,7 +1145,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_PARENT_SIGNAL_ONLY:-0}" = 1 ]]; then
         detach_log="${CASE_ROOT}/.local/publish-detach.log"
         mount_manifest="${CASE_ROOT}/.local/publish.dmg-mount-manifest"
         push_marker="${CASE_ROOT}/.local/publish-push.marker"
-        printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' >"${confirmation_file}"
+        printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' >"${confirmation_file}"
 
         /usr/bin/env -i \
             PATH="${CASE_ROOT}/bin:/usr/bin:/bin" \
@@ -1166,7 +1166,7 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_PARENT_SIGNAL_ONLY:-0}" = 1 ]]; then
                 $SIG{INT} = q{DEFAULT};
                 $SIG{TERM} = q{DEFAULT};
                 exec @ARGV or die qq{publish exec failed: $!\n};
-            ' "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.2 \
+            ' "${CASE_ROOT}/scripts/publish-release-tag.sh" 0.1.3 \
             <"${confirmation_file}" >"${signal_log}" 2>&1 &
         publish_pid=$!
 
@@ -1227,8 +1227,8 @@ if [[ "${SIXBRIDGE_PUBLISH_TEST_PARENT_SIGNAL_ONLY:-0}" = 1 ]]; then
         [[ ! -e "${expected_parent_work_dir}" ]] || parent_work_left=1
         local_tag_left=0
         remote_tag_left=0
-        /usr/bin/git -C "${CASE_ROOT}" show-ref --verify --quiet refs/tags/v0.1.2 && local_tag_left=1
-        /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.2 && remote_tag_left=1
+        /usr/bin/git -C "${CASE_ROOT}" show-ref --verify --quiet refs/tags/v0.1.3 && local_tag_left=1
+        /usr/bin/git --git-dir="${CASE_GITHUB}" show-ref --verify --quiet refs/tags/v0.1.3 && remote_tag_left=1
         push_marker_left=0
         [[ ! -e "${push_marker}" ]] || push_marker_left=1
 
@@ -1272,7 +1272,7 @@ fi
 
 setup_case work-rebind
 PUBLISH_FIXTURE_BARRIER_KIND=work-rebind
-expect_failure work-rebind 'identity-bound cleanup' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure work-rebind 'identity-bound cleanup' 'v0.1.3 KEY BACKUP COMPLETE'
 work_rebind_path=$(/bin/cat -- "${CASE_ROOT}/.local/publish-work-rebind.path")
 work_rebind_parked=$(/bin/cat -- "${CASE_ROOT}/.local/publish-work-rebind.parked")
 work_rebind_transient=$(/usr/bin/dirname -- "${work_rebind_path}")
@@ -1286,7 +1286,7 @@ PUBLISH_FIXTURE_BARRIER_KIND=''
 setup_case old-version
 old_version_log="${FIXTURE_ROOT}/old-version.log"
 set +e
-printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish_version 0.1.1 \
+printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish_version 0.1.1 \
     >"${old_version_log}" 2>&1
 old_version_status=$?
 set -e
@@ -1297,60 +1297,60 @@ assert_no_remote_tags old-version
 
 setup_case dirty
 printf dirty >>"${CASE_ROOT}/README"
-expect_failure dirty 'worktree가 깨끗하지 않습니다.' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure dirty 'worktree가 깨끗하지 않습니다.' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags dirty
 
 setup_case detached
 /usr/bin/git -C "${CASE_ROOT}" checkout --quiet --detach
-expect_failure detached 'detached HEAD' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure detached 'detached HEAD' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags detached
 
 setup_case wrong-branch
 /usr/bin/git -C "${CASE_ROOT}" checkout --quiet -b release
-expect_failure wrong-branch 'main branch' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure wrong-branch 'main branch' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags wrong-branch
 
 setup_case github-mismatch
 printf local >>"${CASE_ROOT}/README"
 /usr/bin/git -C "${CASE_ROOT}" add README
 /usr/bin/git -C "${CASE_ROOT}" commit --quiet -m local-only
-expect_failure github-mismatch 'main과 공개 GitHub main commit이 다릅니다.' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure github-mismatch 'main과 공개 GitHub main commit이 다릅니다.' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags github-mismatch
 
 setup_case local-tag
-/usr/bin/git -C "${CASE_ROOT}" tag -a v0.1.2 -m existing
-expect_failure local-tag 'local tag가 이미 있습니다.' 'v0.1.2 KEY BACKUP COMPLETE'
+/usr/bin/git -C "${CASE_ROOT}" tag -a v0.1.3 -m existing
+expect_failure local-tag 'local tag가 이미 있습니다.' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags local-tag
 
 setup_case remote-tag
-/usr/bin/git -C "${CASE_ROOT}" tag -a v0.1.2 -m existing
-existing_remote_tag=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.2)
-/usr/bin/git --git-dir="${CASE_GITHUB}" update-ref refs/tags/v0.1.2 \
+/usr/bin/git -C "${CASE_ROOT}" tag -a v0.1.3 -m existing
+existing_remote_tag=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.3)
+/usr/bin/git --git-dir="${CASE_GITHUB}" update-ref refs/tags/v0.1.3 \
     "${existing_remote_tag}"
-/usr/bin/git -C "${CASE_ROOT}" update-ref -d refs/tags/v0.1.2
-expect_failure remote-tag 'remote tag가 이미 있습니다.' 'v0.1.2 KEY BACKUP COMPLETE'
-[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2)" = \
+/usr/bin/git -C "${CASE_ROOT}" update-ref -d refs/tags/v0.1.3
+expect_failure remote-tag 'remote tag가 이미 있습니다.' 'v0.1.3 KEY BACKUP COMPLETE'
+[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3)" = \
    "${existing_remote_tag}" ]] || fail '기존 공개 GitHub tag가 보존되지 않았습니다.'
 assert_no_origin_tag remote-tag
 
 setup_case artifact-extra
-printf extra >"${CASE_ROOT}/.local/releases/v0.1.2/unexpected.txt"
-expect_failure artifact-extra '정확히 다섯 개' 'v0.1.2 KEY BACKUP COMPLETE'
+printf extra >"${CASE_ROOT}/.local/releases/v0.1.3/unexpected.txt"
+expect_failure artifact-extra '정확히 다섯 개' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags artifact-extra
 
 setup_case artifact-specific-extension
-printf fixture >"${CASE_ROOT}/.local/releases/v0.1.2/user-extension-converted.six"
-expect_failure artifact-specific-extension '정확히 다섯 개' 'v0.1.2 KEY BACKUP COMPLETE'
+printf fixture >"${CASE_ROOT}/.local/releases/v0.1.3/user-extension-converted.six"
+expect_failure artifact-specific-extension '정확히 다섯 개' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags artifact-specific-extension
 
 setup_case artifact-missing
-/bin/rm -- "${CASE_ROOT}/.local/releases/v0.1.2/RELEASE-NOTES-KO.md"
-expect_failure artifact-missing '필수 release file' 'v0.1.2 KEY BACKUP COMPLETE'
+/bin/rm -- "${CASE_ROOT}/.local/releases/v0.1.3/RELEASE-NOTES-KO.md"
+expect_failure artifact-missing '필수 release file' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags artifact-missing
 
 setup_case artifact-corrupt
-printf corrupt >>"${CASE_ROOT}/.local/releases/v0.1.2/RELEASE-METADATA.json"
-expect_failure artifact-corrupt 'release metadata 값을 읽지 못했습니다.' 'v0.1.2 KEY BACKUP COMPLETE'
+printf corrupt >>"${CASE_ROOT}/.local/releases/v0.1.3/RELEASE-METADATA.json"
+expect_failure artifact-corrupt 'release metadata 값을 읽지 못했습니다.' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags artifact-corrupt
 
 setup_case wrong-confirmation
@@ -1365,8 +1365,8 @@ setup_case global-identity-without-local-config
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.name
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.email
 global_identity_log="${FIXTURE_ROOT}/global-identity.log"
-printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${global_identity_log}" 2>&1
-[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.2)" = tag ]] || fail '격리된 global identity 정상 case가 annotated 공개 GitHub tag를 만들지 못했습니다.'
+printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${global_identity_log}" 2>&1
+[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.3)" = tag ]] || fail '격리된 global identity 정상 case가 annotated 공개 GitHub tag를 만들지 못했습니다.'
 assert_no_origin_tag global-identity-without-local-config
 
 setup_case no-identity
@@ -1374,26 +1374,26 @@ setup_case no-identity
 /usr/bin/git -C "${CASE_ROOT}" config --unset user.email
 /bin/rm -- "${CASE_ROOT}/.gitconfig"
 printf '[user]\n\tuseConfigOnly = true\n' >"${CASE_ROOT}/.gitconfig"
-expect_failure no-identity 'Git tagger identity' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure no-identity 'Git tagger identity' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags no-identity
 
 setup_case push-failure
 : >"${CASE_ROOT}/.local/fake-git-push-fail"
-expect_failure push-failure 'tag push에 실패했습니다.' 'v0.1.2 KEY BACKUP COMPLETE'
+expect_failure push-failure 'tag push에 실패했습니다.' 'v0.1.3 KEY BACKUP COMPLETE'
 assert_no_remote_tags push-failure
-[[ -n "$(/usr/bin/git -C "${CASE_ROOT}" tag -l v0.1.2)" ]] || fail 'push 실패 뒤 local annotated tag 상태가 남지 않았습니다.'
+[[ -n "$(/usr/bin/git -C "${CASE_ROOT}" tag -l v0.1.3)" ]] || fail 'push 실패 뒤 local annotated tag 상태가 남지 않았습니다.'
 
 setup_case success
 success_log="${FIXTURE_ROOT}/success.log"
-printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${success_log}" 2>&1
-[[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.2)" = tag ]] || fail 'local v0.1.2가 annotated tag가 아닙니다.'
-[[ "$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.2)" = \
-   "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2)" ]] || fail '공개 GitHub annotated tag object가 local과 다릅니다.'
+printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${success_log}" 2>&1
+[[ "$(/usr/bin/git -C "${CASE_ROOT}" cat-file -t refs/tags/v0.1.3)" = tag ]] || fail 'local v0.1.3가 annotated tag가 아닙니다.'
+[[ "$(/usr/bin/git -C "${CASE_ROOT}" rev-parse refs/tags/v0.1.3)" = \
+   "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3)" ]] || fail '공개 GitHub annotated tag object가 local과 다릅니다.'
 assert_no_origin_tag success
-for file in SIX-Bridge-Manager-0.1.2-android.apk SIX-Bridge-0.1.2-macos-unsigned.dmg SHA256SUMS RELEASE-METADATA.json RELEASE-NOTES-KO.md; do
+for file in SIX-Bridge-Manager-0.1.3-android.apk SIX-Bridge-0.1.3-macos-unsigned.dmg SHA256SUMS RELEASE-METADATA.json RELEASE-NOTES-KO.md; do
     assert_contains "${success_log}" "${file}" "정상 출력에 release 파일명이 없습니다: ${file}"
 done
-[[ "$(/usr/bin/grep -Ec '^(SIX-Bridge-Manager-0.1.2-android.apk|SIX-Bridge-0.1.2-macos-unsigned.dmg|SHA256SUMS|RELEASE-METADATA.json|RELEASE-NOTES-KO.md)$' "${success_log}")" = 5 ]] || fail '정상 출력의 exact five filename 목록이 올바르지 않습니다.'
+[[ "$(/usr/bin/grep -Ec '^(SIX-Bridge-Manager-0.1.3-android.apk|SIX-Bridge-0.1.3-macos-unsigned.dmg|SHA256SUMS|RELEASE-METADATA.json|RELEASE-NOTES-KO.md)$' "${success_log}")" = 5 ]] || fail '정상 출력의 exact five filename 목록이 올바르지 않습니다.'
 assert_contains "${success_log}" "${SIGNER}" '정상 출력에 APK signer가 없습니다.'
 assert_contains "${success_log}" '미서명·미공증' '정상 출력에 macOS 미서명 경고가 없습니다.'
 assert_contains "${success_log}" '수동' '정상 출력에 수동 Releases 안내가 없습니다.'
@@ -1404,22 +1404,22 @@ setup_case head-race
 head_race_expected=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
 PUBLISH_FIXTURE_RACE=head
 PUBLISH_FIXTURE_RACE_MARKER="${FIXTURE_ROOT}/head-race.tag-target"
-printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/head-race.log" 2>&1
+printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/head-race.log" 2>&1
 [[ "$(/bin/cat "${PUBLISH_FIXTURE_RACE_MARKER}")" = "${head_race_expected}" ]] || fail 'HEAD race callback이 검증한 commit을 받지 못했습니다.'
-[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.2)" = tag ]] || fail 'HEAD race 공개 GitHub tag가 annotated tag가 아닙니다.'
-[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2^{})" = "${head_race_expected}" ]] || fail 'HEAD 변경 뒤 공개 GitHub tag가 verified commit을 가리키지 않습니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t refs/tags/v0.1.3)" = tag ]] || fail 'HEAD race 공개 GitHub tag가 annotated tag가 아닙니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3^{})" = "${head_race_expected}" ]] || fail 'HEAD 변경 뒤 공개 GitHub tag가 verified commit을 가리키지 않습니다.'
 assert_no_origin_tag head-race
 
 setup_case tag-ref-race
 tag_race_expected=$(/usr/bin/git -C "${CASE_ROOT}" rev-parse HEAD)
 PUBLISH_FIXTURE_RACE=tag-ref
 PUBLISH_FIXTURE_RACE_MARKER="${FIXTURE_ROOT}/tag-ref-race.tag-oid"
-printf '%s\n' 'v0.1.2 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/tag-ref-race.log" 2>&1
+printf '%s\n' 'v0.1.3 KEY BACKUP COMPLETE' | run_publish >"${FIXTURE_ROOT}/tag-ref-race.log" 2>&1
 tag_race_expected_oid=$(/bin/cat "${PUBLISH_FIXTURE_RACE_MARKER}")
-tag_race_remote_oid=$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2)
+tag_race_remote_oid=$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3)
 [[ "${tag_race_remote_oid}" = "${tag_race_expected_oid}" ]] || fail 'local tag ref 교체 뒤 remote가 검증한 annotated tag OID를 받지 않았습니다.'
 [[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" cat-file -t "${tag_race_remote_oid}")" = tag ]] || fail 'tag ref race 공개 GitHub tag가 annotated tag가 아닙니다.'
-[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.2^{})" = "${tag_race_expected}" ]] || fail 'tag ref race 공개 GitHub tag peeled commit이 verified commit과 다릅니다.'
+[[ "$(/usr/bin/git --git-dir="${CASE_GITHUB}" rev-parse refs/tags/v0.1.3^{})" = "${tag_race_expected}" ]] || fail 'tag ref race 공개 GitHub tag peeled commit이 verified commit과 다릅니다.'
 assert_no_origin_tag tag-ref-race
 unset PUBLISH_FIXTURE_RACE PUBLISH_FIXTURE_RACE_MARKER
 
@@ -1429,7 +1429,7 @@ force_push_pattern='git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]-f
 if /usr/bin/grep -Eq -- "(curl|gh[[:space:]].*(release|api)|--force|${force_push_pattern}|tag[[:space:]]+-d)" "${PUBLISH_SCRIPT}"; then
     fail 'publisher에 Release API/force/delete tag 동작이 포함되어 있습니다.'
 fi
-printf '%s\n' 'git push origin -f refs/tags/v0.1.2' | /usr/bin/grep -Eq -- "${force_push_pattern}" ||
+printf '%s\n' 'git push origin -f refs/tags/v0.1.3' | /usr/bin/grep -Eq -- "${force_push_pattern}" ||
     fail 'forced git push negative-control을 검출하지 못했습니다.'
 printf '%s\n' 'stat -f %z artifact' '[[ -f artifact ]]' | /usr/bin/grep -Eq -- "${force_push_pattern}" &&
     fail 'force push 검출이 stat 또는 regular-file 검사에 오탐했습니다.'
